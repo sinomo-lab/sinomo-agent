@@ -2452,8 +2452,8 @@ fn daemon_module_rollout_reconciliation_stable_eq(
         && left.artifact_id == right.artifact_id
         && left.state == right.state
         && left.reason == right.reason
-        && left.candidate_bundle_job_id == right.candidate_bundle_job_id
-        && left.bundle_content_hash == right.bundle_content_hash
+        && left.release_id == right.release_id
+        && left.release_material_hash == right.release_material_hash
         && left.local_runtime_stage == right.local_runtime_stage
 }
 
@@ -2503,8 +2503,8 @@ fn daemon_module_rollout_reconciliation_record(
         artifact_id: desired.rollout_plan.artifact_id.clone(),
         state,
         reason,
-        candidate_bundle_job_id: desired.candidate_bundle_job_id.clone(),
-        bundle_content_hash: desired.bundle_content_hash.clone(),
+        release_id: desired.release_id.clone(),
+        release_material_hash: desired.release_material_hash.clone(),
         local_runtime_stage,
         updated_at: OffsetDateTime::now_utc(),
     })
@@ -2515,42 +2515,39 @@ fn daemon_module_rollout_material_reconciliation(
     node_id: &NodeId,
     desired: &sinomo_network::ClusterModuleRolloutDesiredRecord,
 ) -> Result<(String, String, Option<String>), DaemonError> {
-    let Some(job_id) = desired.candidate_bundle_job_id.as_ref() else {
+    let Some(release_id) = desired.release_id.as_ref() else {
         return Ok((
             "blocked".to_string(),
-            "desired rollout does not reference a candidate bundle job".to_string(),
+            "desired rollout does not reference a release id".to_string(),
             None,
         ));
     };
-    let Some(bundle_record) =
-        sinomo_registry::read_candidate_bundle_registry_record(data_dir, job_id)?
+    let Some(evidence_record) =
+        sinomo_registry::read_artifact_evidence_record(data_dir, release_id)?
     else {
         return Ok((
             "blocked".to_string(),
-            format!("candidate bundle {job_id} is not available in the local registry"),
+            format!("artifact evidence {release_id} is not available in the local registry"),
             None,
         ));
     };
-    if let Some(expected_hash) = desired.bundle_content_hash.as_deref()
-        && bundle_record.bundle_content_hash != expected_hash
+    if let Some(expected_hash) = desired.release_material_hash.as_deref()
+        && evidence_record.content_hash != expected_hash
     {
         return Ok((
             "blocked".to_string(),
             format!(
-                "candidate bundle {job_id} hash {} does not match desired hash {expected_hash}",
-                bundle_record.bundle_content_hash
+                "artifact evidence {release_id} hash {} does not match desired hash {expected_hash}",
+                evidence_record.content_hash
             ),
             None,
         ));
     }
-    let Some(material) =
-        sinomo_registry::read_verified_candidate_rollout_material(data_dir, job_id)?
+    let Some(material) = sinomo_registry::read_verified_release_material(data_dir, release_id)?
     else {
         return Ok((
             "blocked".to_string(),
-            format!(
-                "verified rollout material for candidate bundle {job_id} is not available locally"
-            ),
+            format!("verified release material for release {release_id} is not available locally"),
             None,
         ));
     };
@@ -2560,14 +2557,16 @@ fn daemon_module_rollout_material_reconciliation(
     let trusted_signers = sinomo_registry::read_trusted_artifact_signers(data_dir)?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let preparation = RolloutController::new(node_id.clone())
-        .prepare_and_record_verified_candidate_rollout(
+        .prepare_and_record_verified_artifact_rollout(
             &rollout_paths,
-            sinomo_rollout::VerifiedCandidateRolloutRequest {
+            sinomo_rollout::VerifiedArtifactRolloutRequest {
                 node_id: node_id.clone(),
                 artifact: material.artifact,
                 policy_decision: material.policy_decision,
                 rollout_plan: material.rollout_plan,
-                candidate_bundle: bundle_record,
+                release_id: evidence_record.evidence_id,
+                release_material_hash: material.release_material_hash,
+                evidence_refs: material.evidence_refs,
                 trusted_signers,
                 active_artifact_id: material.active_artifact_id,
             },
@@ -2583,23 +2582,28 @@ fn daemon_module_rollout_material_reconciliation(
 }
 
 fn daemon_verified_rollout_material_mismatch(
-    material: &sinomo_registry::VerifiedCandidateRolloutMaterialRecord,
+    material: &sinomo_registry::VerifiedReleaseMaterialRecord,
     desired: &sinomo_network::ClusterModuleRolloutDesiredRecord,
 ) -> Option<String> {
-    if Some(&material.candidate_bundle_job_id) != desired.candidate_bundle_job_id.as_ref() {
+    if Some(&material.release_id) != desired.release_id.as_ref() {
         return Some(format!(
-            "verified rollout material references candidate bundle {}, but desired references {}",
-            material.candidate_bundle_job_id,
+            "verified release material references release {}, but desired references {}",
+            material.release_id,
             desired
-                .candidate_bundle_job_id
+                .release_id
                 .as_ref()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "none".to_string())
         ));
     }
+    if Some(&material.release_material_hash) != desired.release_material_hash.as_ref() {
+        return Some(
+            "verified release material hash does not match desired release hash".to_string(),
+        );
+    }
     if material.rollout_plan != desired.rollout_plan {
         return Some(
-            "verified rollout material rollout plan does not match desired rollout plan"
+            "verified release material rollout plan does not match desired rollout plan"
                 .to_string(),
         );
     }
@@ -3187,8 +3191,7 @@ mod tests {
             sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
         let rollout_plan_id =
             sinomo_core::Id::from_legacy_named("rollout_daemon_desired_blocked").expect("rollout");
-        let bundle_job_id =
-            sinomo_core::Id::from_legacy_named("candidate_bundle_missing").expect("job");
+        let release_id = sinomo_core::Id::from_legacy_named("release_missing").expect("release");
         let desired = sinomo_network::ClusterModuleRolloutDesiredRecord {
             cluster_id: cluster_id.clone(),
             state: "active".to_string(),
@@ -3205,9 +3208,9 @@ mod tests {
                 rollback_policy: sinomo_core::RollbackPolicy::default(),
             },
             requested_by_node_id: node.clone(),
-            candidate_bundle_job_id: Some(bundle_job_id.clone()),
-            bundle_content_hash: Some("blake3:candidate".to_string()),
-            evidence_refs: vec!["registry://candidate-bundle/candidate_bundle_missing".to_string()],
+            release_id: Some(release_id.clone()),
+            release_material_hash: Some("blake3:release".to_string()),
+            evidence_refs: vec!["registry://artifact-evidence/release_missing".to_string()],
             requested_at: Some("2026-06-01T00:00:00Z".to_string()),
             updated_at: OffsetDateTime::now_utc(),
         };
@@ -3228,10 +3231,7 @@ mod tests {
         assert_eq!(records[0].module_id, module_id);
         assert_eq!(records[0].rollout_plan_id, rollout_plan_id);
         assert_eq!(records[0].state, "blocked");
-        assert_eq!(
-            records[0].candidate_bundle_job_id.as_ref(),
-            Some(&bundle_job_id)
-        );
+        assert_eq!(records[0].release_id.as_ref(), Some(&release_id));
         assert!(
             records[0]
                 .reason
@@ -3298,29 +3298,29 @@ mod tests {
             promotion_steps_bps: vec![500],
             rollback_policy: sinomo_core::RollbackPolicy::default(),
         };
-        let bundle_job_id =
-            sinomo_core::Id::from_legacy_named("candidate_bundle_prepared").expect("job");
-        let bundle_ref = format!("registry://candidate-bundle/{bundle_job_id}");
+        let release_id = sinomo_core::Id::from_legacy_named("release_prepared").expect("release");
+        let release_ref = format!("registry://artifact-evidence/{release_id}");
         let (artifact, signer) = signed_daemon_test_artifact(
             &root,
             "daemon-prepared-signer",
             &artifact_id,
             &module_id,
             "blake3:candidate",
-            vec![bundle_ref.clone()],
+            vec![release_ref.clone()],
         );
-        let bundle_record = daemon_test_candidate_bundle_record(
+        let evidence_record = daemon_test_artifact_evidence_record(
             &root,
-            &bundle_job_id,
-            "blake3:candidate",
-            vec![bundle_ref.clone()],
+            &release_id,
+            "blake3:release",
+            vec![release_ref.clone()],
         );
-        sinomo_registry::write_candidate_bundle_registry_record(&root, &bundle_record)
-            .expect("write bundle record");
+        sinomo_registry::write_artifact_evidence_record(&root, &evidence_record)
+            .expect("write evidence record");
         sinomo_registry::write_trusted_artifact_signers(&root, std::slice::from_ref(&signer))
             .expect("write trusted signer");
-        let material = sinomo_registry::VerifiedCandidateRolloutMaterialRecord {
-            candidate_bundle_job_id: bundle_job_id.clone(),
+        let material = sinomo_registry::VerifiedReleaseMaterialRecord {
+            release_id: release_id.clone(),
+            release_material_hash: "blake3:release".to_string(),
             artifact: artifact.clone(),
             policy_decision: sinomo_core::PolicyDecision {
                 decision_id: sinomo_core::Id::from_legacy_named("policy_daemon_prepared")
@@ -3335,19 +3335,19 @@ mod tests {
             },
             rollout_plan: rollout_plan.clone(),
             active_artifact_id: active_artifact_id.clone(),
-            evidence_refs: vec![bundle_ref.clone()],
+            evidence_refs: vec![release_ref.clone()],
             registered_at: OffsetDateTime::now_utc(),
         };
-        sinomo_registry::write_verified_candidate_rollout_material(&root, &material)
+        sinomo_registry::write_verified_release_material(&root, &material)
             .expect("write rollout material");
         let desired = sinomo_network::ClusterModuleRolloutDesiredRecord {
             cluster_id: cluster_id.clone(),
             state: "active".to_string(),
             rollout_plan: rollout_plan.clone(),
             requested_by_node_id: node.clone(),
-            candidate_bundle_job_id: Some(bundle_job_id.clone()),
-            bundle_content_hash: Some("blake3:candidate".to_string()),
-            evidence_refs: vec![bundle_ref],
+            release_id: Some(release_id.clone()),
+            release_material_hash: Some("blake3:release".to_string()),
+            evidence_refs: vec![release_ref],
             requested_at: Some("2026-06-01T00:00:00Z".to_string()),
             updated_at: OffsetDateTime::now_utc(),
         };
@@ -3366,10 +3366,7 @@ mod tests {
         assert_eq!(reconciliations[0].cluster_id, cluster_id);
         assert_eq!(reconciliations[0].node_id, node);
         assert_eq!(reconciliations[0].state, "prepared");
-        assert_eq!(
-            reconciliations[0].candidate_bundle_job_id.as_ref(),
-            Some(&bundle_job_id)
-        );
+        assert_eq!(reconciliations[0].release_id.as_ref(), Some(&release_id));
         assert_eq!(
             reconciliations[0].local_runtime_stage.as_deref(),
             Some("shadow")
@@ -3448,8 +3445,8 @@ mod tests {
             state: "active".to_string(),
             rollout_plan: plan.clone(),
             requested_by_node_id: node.clone(),
-            candidate_bundle_job_id: None,
-            bundle_content_hash: None,
+            release_id: None,
+            release_material_hash: None,
             evidence_refs: Vec::new(),
             requested_at: Some("2026-06-01T00:00:00Z".to_string()),
             updated_at: OffsetDateTime::now_utc(),
@@ -3769,28 +3766,30 @@ mod tests {
         (artifact, signer)
     }
 
-    fn daemon_test_candidate_bundle_record(
+    fn daemon_test_artifact_evidence_record(
         root: &Path,
-        job_id: &sinomo_core::Id,
-        bundle_content_hash: &str,
+        evidence_id: &sinomo_core::Id,
+        content_hash: &str,
         evidence_refs: Vec<String>,
-    ) -> sinomo_registry::CandidateBundleRegistryRecord {
-        let bundle_path = root.join("candidate-bundles").join(job_id.as_str());
-        sinomo_registry::CandidateBundleRegistryRecord {
-            job_id: job_id.clone(),
-            bundle_path: bundle_path.display().to_string(),
-            bundle_content_hash: bundle_content_hash.to_string(),
+    ) -> sinomo_registry::ArtifactEvidenceRecord {
+        let evidence_path = root.join("artifact-evidence").join(evidence_id.as_str());
+        sinomo_registry::ArtifactEvidenceRecord {
+            evidence_id: evidence_id.clone(),
+            evidence_kind: "daemon-test-release".to_string(),
+            evidence_path: evidence_path.display().to_string(),
+            content_hash: content_hash.to_string(),
             content_manifest_path: None,
             attestation_path: None,
             evidence_refs,
-            verification: sinomo_registry::CandidateBundleIntegrityReport {
-                job_id: job_id.clone(),
-                bundle_path: bundle_path.display().to_string(),
-                declared_content_hash: Some(bundle_content_hash.to_string()),
-                recomputed_content_hash: Some(bundle_content_hash.to_string()),
+            verification: sinomo_registry::ArtifactEvidenceIntegrityReport {
+                evidence_id: evidence_id.clone(),
+                evidence_kind: "daemon-test-release".to_string(),
+                evidence_path: evidence_path.display().to_string(),
+                declared_content_hash: Some(content_hash.to_string()),
+                recomputed_content_hash: Some(content_hash.to_string()),
                 content_manifest_path: None,
                 attestation_path: None,
-                checks: vec![sinomo_registry::CandidateBundleIntegrityCheck {
+                checks: vec![sinomo_registry::ArtifactEvidenceIntegrityCheck {
                     name: "daemon-test-integrity".to_string(),
                     passed: true,
                     detail: "daemon test fixture is pre-verified".to_string(),

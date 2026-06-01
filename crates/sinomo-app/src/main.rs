@@ -38,7 +38,7 @@ use sinomo_runtime::policy::{PolicyEngine, PolicyInput};
 use sinomo_runtime::registry::{ArtifactRegistry, CandidateRecord, RegistryEntry, RegistryStatus};
 use sinomo_runtime::rollout::{RolloutController, RolloutObservation};
 use sinomo_runtime::sandbox::{
-    SandboxCommand, SandboxHarness, SandboxRunRequest, SandboxWorkspaceSnapshot,
+    SandboxCommand, SandboxHarness, SandboxRunRequest, SandboxRunSubject, SandboxWorkspaceSnapshot,
 };
 use sinomo_runtime::sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
 use sinomo_trigger::RuleBasedTrigger;
@@ -188,7 +188,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let sandbox = SandboxHarness::new(workstation.node_id.clone());
     let sandbox_result = sandbox.run(SandboxRunRequest {
-        job: evolution_job.clone(),
+        subject: SandboxRunSubject {
+            subject_id: evolution_job.job_id.clone(),
+            workspace_id: evolution_job.scope.workspace_id.clone(),
+            description: evolution_job.objective.clone(),
+        },
         candidate_artifact_id: candidate_artifact_id.clone(),
         workspace_snapshot: SandboxWorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
@@ -438,7 +442,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         module_manifest,
         provenance: ArtifactProvenance {
             produced_by: ActorRef {
-                kind: ActorKind::EvolutionOrchestrator,
+                kind: ActorKind::Operator,
                 id: "sinomo-app-phase2".to_string(),
             },
             source_event_id: Some(receipt.event_id.clone()),

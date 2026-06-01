@@ -1638,7 +1638,7 @@ fn artifact_trust_material_failure(artifact: &ArtifactManifest) -> Option<String
         return None;
     }
     Some(
-        "artifact is missing supported signature or verified registry/candidate-bundle attestation"
+        "artifact is missing supported signature or verified artifact-evidence attestation"
             .to_string(),
     )
 }
@@ -1666,9 +1666,9 @@ fn has_supported_content_hash(content_hash: &str) -> bool {
 }
 
 fn is_supported_attestation_ref(attestation: &str) -> bool {
-    attestation.ends_with("candidate-bundle-registry-record.json")
-        || attestation.ends_with("bundle-attestation.json")
-        || attestation.starts_with("registry://candidate-bundle/")
+    attestation.ends_with("artifact-evidence-record.json")
+        || attestation.ends_with("attestation.json")
+        || attestation.starts_with("registry://artifact-evidence/")
         || attestation.starts_with("in-toto:")
 }
 
@@ -1938,12 +1938,12 @@ mod tests {
             module_manifest: ModuleManifest::r3_wasm(module_id.clone(), "0.1.0", "trigger"),
             provenance: ArtifactProvenance {
                 produced_by: ActorRef {
-                    kind: ActorKind::EvolutionOrchestrator,
+                    kind: ActorKind::Operator,
                     id: "phase2-test".to_string(),
                 },
                 source_event_id: None,
                 build_log_artifact_id: None,
-                attestations: vec!["bundle/candidate-bundle-registry-record.json".to_string()],
+                attestations: vec!["bundle/artifact-evidence-record.json".to_string()],
             },
         };
         let request = LoadRequest {
@@ -1995,7 +1995,7 @@ mod tests {
             module_manifest: ModuleManifest::r3_wasm(module_id.clone(), "0.1.0", "trigger"),
             provenance: ArtifactProvenance {
                 produced_by: ActorRef {
-                    kind: ActorKind::EvolutionOrchestrator,
+                    kind: ActorKind::Operator,
                     id: "phase2-test".to_string(),
                 },
                 source_event_id: None,
@@ -2055,7 +2055,7 @@ mod tests {
             module_manifest: ModuleManifest::r3_wasm(module_id.clone(), "0.1.0", "trigger"),
             provenance: ArtifactProvenance {
                 produced_by: ActorRef {
-                    kind: ActorKind::EvolutionOrchestrator,
+                    kind: ActorKind::Operator,
                     id: "phase2-test".to_string(),
                 },
                 source_event_id: None,
@@ -3069,7 +3069,7 @@ mod tests {
             module_manifest: ModuleManifest::r3_wasm(module_id.clone(), "0.1.0", "trigger"),
             provenance: ArtifactProvenance {
                 produced_by: ActorRef {
-                    kind: ActorKind::EvolutionOrchestrator,
+                    kind: ActorKind::Operator,
                     id: "phase2-test".to_string(),
                 },
                 source_event_id: None,

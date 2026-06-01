@@ -3,9 +3,8 @@
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
     Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric, EvaluationOutcome,
-    EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass, MetricValue,
-    ModuleReplayReportRef, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
-    VerificationCommand, VerificationPlan,
+    EvaluationScorecard, EventEnvelope, EventKind, Id, LatencyClass, MetricValue, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_events::{EventId, ReplayQuery};
 use sinomo_module::{ArtifactId, ModuleReplayReport};
@@ -28,7 +27,31 @@ use std::{
 use thiserror::Error;
 use time::OffsetDateTime;
 
-type EvolutionJobId = Id;
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct VerificationPlan {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<VerificationCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub module_replay_reports: Vec<ModuleReplayReportRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct VerificationCommand {
+    pub name: String,
+    pub command: String,
+    pub expected_exit_code: i32,
+    pub gate: EvaluationGate,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleReplayReportRef {
+    pub name: String,
+    pub report_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_artifact_id: Option<ArtifactId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_artifact_id: Option<ArtifactId>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CommandEvaluationSpec {
@@ -787,7 +810,7 @@ impl LocalEvalHarness {
 
     pub fn scorecard_event(
         &self,
-        job_id: Option<EvolutionJobId>,
+        subject_id: Option<Id>,
         scorecard: &EvaluationScorecard,
     ) -> EventEnvelope {
         EventEnvelope::new(
@@ -805,7 +828,7 @@ impl LocalEvalHarness {
             ),
         )
         .with_payload(serde_json::json!({
-            "job_id": job_id,
+            "subject_id": subject_id,
             "scorecard": scorecard,
             "outcome": scorecard.outcome,
             "candidate_artifact_id": scorecard.candidate_artifact_id,

@@ -355,14 +355,14 @@ The CLI should make the bootstrap loop easy to run manually, while the library k
 
 Suggested crate ownership:
 
-- `sinomo-core`: stable R0 data contracts.
+- `sinomo-core`: stable low-level R0 data contracts. It should not contain self-evolution job, mutation packet, candidate bundle, or approval lifecycle schemas.
 - `sinomo-runtime`: explicit R0/R1 boundary facade; aggregates only R0/R1 crates and must not depend on R2 services or applications.
 - `sinomo-events`: append/replay event substrate.
-- `sinomo-evolution`: R2 evolution service; orchestrator, model-driven proposal flow, candidate lifecycle, and human-facing bootstrap behavior. Stable job, packet, scorecard, artifact, policy, and rollout contracts stay below it in R0/R1 crates.
+- `sinomo-evolution`: R2 evolution service; orchestrator, model-driven proposal flow, candidate lifecycle, and human-facing bootstrap behavior. Evolution-specific job, packet, candidate bundle, campaign, and approval contracts live here. Shared scorecard, artifact, policy, rollout, registry evidence, and sandbox workload contracts stay below it as generic R0/R1 functionality.
 - `sinomo-eval`: command execution and scorecard production.
 - `sinomo-policy`: approval requirements and eventual autonomous promotion policy.
-- `sinomo-registry`: candidate and artifact records.
-- `sinomo-sandbox`: execution requests/results, with hardening deferred.
+- `sinomo-registry`: generic artifact, artifact-evidence, release-material, and signer records.
+- `sinomo-sandbox`: generic execution workload requests/results, with hardening deferred.
 - `sinomo-cli` or `sinomo`: thin user-facing command wrapper.
 
 Every workspace crate should declare `[package.metadata.sinomo] ring = "..."`. Architecture tests should keep the cut mechanical: R0/R1 crates cannot depend on R2 or application crates, R2/application crates must cross through `sinomo-runtime` instead of directly depending on R0/R1 crates, and `sinomo-runtime` can aggregate only R0/R1 crates.

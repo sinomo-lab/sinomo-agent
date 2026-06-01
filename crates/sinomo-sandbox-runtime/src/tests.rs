@@ -1,6 +1,5 @@
 use super::*;
 use crate::internal::*;
-use sinomo_core::{EvaluationGate, EvolutionJobStatus, EvolutionScope, RollbackPolicy, TrustRing};
 use sinomo_dfs::{
     DfsMetadataShardId, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService,
 };
@@ -29,39 +28,14 @@ use support::*;
 #[test]
 fn sandbox_run_passes_when_scope_and_commands_pass() {
     let workspace_id = WorkspaceId::from_legacy_named("workspace_candidate").expect("workspace");
-    let job = EvolutionJob {
-        job_id: EvolutionJobId::from_legacy_named("evojob_candidate").expect("job"),
-        objective: "improve trigger".to_string(),
-        target_ring: TrustRing::R3SandboxedModule,
-        target_module_id: None,
-        edit_scope: sinomo_core::EditScope {
-            workspace_root: workspace_id.to_string(),
-            intended_paths: vec!["crates/sinomo-trigger/**".to_string()],
-            notes: "sandbox unit test".to_string(),
-        },
-        verification: sinomo_core::VerificationPlan {
-            commands: vec![sinomo_core::VerificationCommand {
-                name: "unit tests".to_string(),
-                command: "cargo test -p sinomo-trigger".to_string(),
-                expected_exit_code: 0,
-                gate: EvaluationGate::ReplayTests,
-            }],
-            module_replay_reports: Vec::new(),
-        },
-        recovery: sinomo_core::RecoveryPlan::default(),
-        scope: EvolutionScope {
-            workspace_id: Some(workspace_id.clone()),
-            allowed_paths: vec!["crates/sinomo-trigger/**".to_string()],
-            forbidden_paths: Vec::new(),
-        },
-        status: EvolutionJobStatus::Scoped,
-        required_gates: vec![EvaluationGate::ReplayTests],
-        rollback_policy: RollbackPolicy::default(),
-    };
 
     let result = SandboxHarness::new(NodeId::from_legacy_named("node_desktop").expect("node")).run(
         SandboxRunRequest {
-            job,
+            subject: SandboxRunSubject {
+                subject_id: EvolutionJobId::from_legacy_named("evojob_candidate").expect("job"),
+                workspace_id: Some(workspace_id.clone()),
+                description: "improve trigger".to_string(),
+            },
             candidate_artifact_id: ArtifactId::from_legacy_named("artifact_candidate")
                 .expect("artifact"),
             workspace_snapshot: SandboxWorkspaceSnapshot {

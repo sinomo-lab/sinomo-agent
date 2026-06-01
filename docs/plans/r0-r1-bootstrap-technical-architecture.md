@@ -4,6 +4,8 @@
 
 This document turns the R0/R1 bootstrap direction into an implementation proposal.
 
+Status note: this document is historical. The current architecture keeps self-evolution optional and R2-owned. `sinomo-core` and the R1 crates must not define `EvolutionJob`, `MutationPacket`, `CandidateBundleManifest`, or approval lifecycle records; those live in `sinomo-evolution`. R0/R1 crates provide generic foundation contracts such as IDs, events, scorecards, artifacts, artifact evidence, release material, policy decisions, rollout plans, sandbox workloads, and module loader state.
+
 The goal is to build the smallest real self-evolution core that can help Sinomo evolve and expand its own R0/R1 foundation under human supervision in a disposable VM. This is called bootstrap because it is the first phase, but the core interfaces should be general and expandable from the beginning. Production hardening, strict containment, distributed rollout, and R3 module infrastructure are deferred.
 
 The first useful system should be able to:
@@ -24,15 +26,15 @@ accept objective
 
 The repository already has most of the broad shapes:
 
-- `sinomo-core`: IDs, events, trust rings, evolution jobs, scorecards, artifacts, policy decisions.
+- `sinomo-core`: IDs, events, trust rings, scorecards, artifacts, policy decisions, and other foundation contracts.
 - `sinomo-runtime`: explicit R0/R1 boundary facade that aggregates only foundation crates.
 - `sinomo-events`: in-memory append/replay event store.
 - `sinomo-evolution`: R2 evolution service with opportunity-to-job planning and candidate workspace behavior.
 - `sinomo-eval`: command scorecard skeleton.
 - `sinomo-lm`: R2 HTTP and process language model providers, including Codex CLI and Claude Code style providers.
 - `sinomo-policy`: policy decision skeleton.
-- `sinomo-registry`: candidate and artifact record skeleton.
-- `sinomo-sandbox`: sandbox run request/result skeleton.
+- `sinomo-registry`: generic artifact, artifact-evidence, release-material, and signer records.
+- `sinomo-sandbox`: generic sandbox workload request/result skeleton.
 - `sinomo-cli`: provider auth/test commands.
 
 The bootstrap work should avoid replacing this foundation. Instead, turn the existing broad shapes into a minimal executable core. Temporary scaffolding is allowed where useful, but stable data types should be designed for the long-term self-evolution system and placed in R0/R1 crates when they fit. R2 services can depend on R0/R1, but R0/R1 crates must not depend back on R2 or application crates.
@@ -1103,7 +1105,7 @@ After the smallest loop works, add:
 
 ## Settled Design Questions
 
-1. Stable self-evolution types should go into `sinomo-core` when they fit. Avoid a separate bootstrap-only data model.
+1. Self-evolution types stay in `sinomo-evolution`; only generic foundation types belong in `sinomo-core` or R1 crates.
 2. `evolve propose` should use a separate repository checkout or git worktree from day one.
 3. Model calls should use a common provider flag and route through `sinomo-lm`.
 4. Candidate bundles should live under `SINOMO_DATA_DIR`.

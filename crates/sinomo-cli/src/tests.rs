@@ -76,7 +76,10 @@ use super::{
     write_sandbox_policy_config_for_node,
 };
 use base64::Engine;
-use sinomo_evolution::EvolutionJobId;
+use sinomo_evolution::{
+    CandidateBundleManifest, CandidateDecisionOutcome, EvolutionJobId, ModuleReplayReportRef,
+    VerificationCommand,
+};
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
 };
@@ -4279,7 +4282,7 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
     )
     .expect("mutation packet");
     let job_id = EvolutionJobId::from_legacy_named("evojob_module_rollout_material").expect("job");
-    let manifest = sinomo_runtime::core::CandidateBundleManifest {
+    let manifest = CandidateBundleManifest {
         job_id: job_id.clone(),
         bundle_path: bundle_dir.display().to_string(),
         created_at: OffsetDateTime::now_utc(),
@@ -4350,15 +4353,13 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
     )
     .expect("register module artifact with rollout material");
 
-    let material_path =
-        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(&manifest);
+    let material_path = bundle_dir.join(sinomo_runtime::registry::RELEASE_MATERIAL_RELATIVE_PATH);
     assert!(material_path.exists());
-    let material: sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord =
-        serde_json::from_str(
-            &std::fs::read_to_string(&material_path).expect("rollout material json"),
-        )
-        .expect("rollout material");
-    assert_eq!(material.candidate_bundle_job_id, job_id);
+    let material: sinomo_runtime::registry::VerifiedReleaseMaterialRecord = serde_json::from_str(
+        &std::fs::read_to_string(&material_path).expect("rollout material json"),
+    )
+    .expect("rollout material");
+    assert_eq!(material.release_id, job_id);
     assert_eq!(material.artifact.artifact_id, artifact_id);
     assert_eq!(material.artifact.module_id, module_id);
     assert_eq!(
@@ -4387,7 +4388,7 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
             .provenance
             .attestations
             .iter()
-            .any(|evidence| evidence == &format!("registry://candidate-bundle/{job_id}"))
+            .any(|evidence| evidence == &format!("registry://artifact-evidence/{job_id}"))
     );
     sinomo_runtime::module::verify_artifact_signature(&material.artifact)
         .expect("artifact signature verifies");
@@ -4468,14 +4469,14 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
                     "README.md".to_string(),
                     SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL.to_string(),
                 ],
-                verification_commands: vec![sinomo_runtime::core::VerificationCommand {
+                verification_commands: vec![VerificationCommand {
                     name: "generate-module-replay-report".to_string(),
                     command: "sinomo-test:module-replay".to_string(),
                     expected_exit_code: 0,
                     gate: sinomo_runtime::core::EvaluationGate::ReplayTests,
                 }],
                 benchmark_gates: Vec::new(),
-                module_replay_reports: vec![sinomo_runtime::core::ModuleReplayReportRef {
+                module_replay_reports: vec![ModuleReplayReportRef {
                     name: "candidate-flow-replay".to_string(),
                     report_path: SELF_EVOLUTION_MODULE_REPLAY_REPORT_REL.to_string(),
                     baseline_artifact_id: Some(active_artifact_id.clone()),
@@ -4592,13 +4593,11 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
     )
     .expect("register module artifact");
 
-    let material_path =
-        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(&record.bundle);
-    let material: sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord =
-        serde_json::from_str(
-            &std::fs::read_to_string(&material_path).expect("candidate rollout material"),
-        )
-        .expect("material json");
+    let material_path = bundle_dir.join(sinomo_runtime::registry::RELEASE_MATERIAL_RELATIVE_PATH);
+    let material: sinomo_runtime::registry::VerifiedReleaseMaterialRecord = serde_json::from_str(
+        &std::fs::read_to_string(&material_path).expect("candidate rollout material"),
+    )
+    .expect("material json");
     let signer_public_key =
         sinomo_runtime::module::artifact_signature_signer_public_key(&material.artifact)
             .expect("material signer");
@@ -4615,7 +4614,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
     let recorded = sinomo_evolution::decide_stored_evolution_job(
         &evolution_paths,
         record.clone(),
-        sinomo_runtime::core::CandidateDecisionOutcome::Approved,
+        CandidateDecisionOutcome::Approved,
         "test-reviewer",
         "approve verified low-risk module artifact",
     )
@@ -4630,14 +4629,12 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
         check.name == "candidate-verified-rollout-material"
             && check.outcome == EvaluationOutcome::Passed
     }));
-    let bundle_record =
-        sinomo_runtime::registry::read_candidate_bundle_registry_record(&root, &job_id)
-            .expect("read bundle record")
-            .expect("bundle record");
-    let durable_material =
-        sinomo_runtime::registry::read_verified_candidate_rollout_material(&root, &job_id)
-            .expect("read durable material")
-            .expect("durable material");
+    let artifact_evidence = sinomo_runtime::registry::read_artifact_evidence_record(&root, &job_id)
+        .expect("read artifact evidence")
+        .expect("artifact evidence");
+    let durable_material = sinomo_runtime::registry::read_verified_release_material(&root, &job_id)
+        .expect("read durable material")
+        .expect("durable material");
 
     let cluster_paths = sinomo_runtime::network::ClusterPaths::new(&data_dir);
     cluster_paths.ensure().expect("cluster paths");
@@ -4664,9 +4661,9 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
         state: "active".to_string(),
         rollout_plan: durable_material.rollout_plan.clone(),
         requested_by_node_id: node_id.clone(),
-        candidate_bundle_job_id: Some(job_id.clone()),
-        bundle_content_hash: Some(bundle_record.bundle_content_hash.clone()),
-        evidence_refs: vec![format!("registry://candidate-bundle/{job_id}")],
+        release_id: Some(job_id.clone()),
+        release_material_hash: Some(artifact_evidence.content_hash.clone()),
+        evidence_refs: vec![format!("registry://artifact-evidence/{job_id}")],
         requested_at: Some("2026-06-01T00:00:00Z".to_string()),
         updated_at: OffsetDateTime::now_utc(),
     };
@@ -4687,10 +4684,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
     let runtime_state = read_rollout_runtime_state(&SelfRolloutPaths::new(&root))
         .expect("read rollout runtime")
         .expect("rollout runtime");
-    assert_eq!(
-        reconciliations[0].candidate_bundle_job_id.as_ref(),
-        Some(&job_id)
-    );
+    assert_eq!(reconciliations[0].release_id.as_ref(), Some(&job_id));
     assert_eq!(
         runtime_state.loader_state.active_artifact_id,
         active_artifact_id
@@ -4884,7 +4878,7 @@ struct SelfEvolutionModuleReplayCommandRunner {
 impl sinomo_runtime::eval::CommandRunner for SelfEvolutionModuleReplayCommandRunner {
     fn run(
         &self,
-        command: &sinomo_runtime::core::VerificationCommand,
+        command: &sinomo_runtime::eval::VerificationCommand,
         cwd: &Path,
     ) -> Result<sinomo_runtime::eval::CommandRunResult, sinomo_runtime::eval::EvalError> {
         if command.command != "sinomo-test:module-replay" {

@@ -3150,11 +3150,9 @@ fn cluster_module_rollout_desired_syncs_to_kv() {
             rollback_policy: RollbackPolicy::default(),
         },
         requested_by_node_id: node_id,
-        candidate_bundle_job_id: Some(
-            sinomo_core::Id::from_legacy_named("candidate_bundle_job").expect("job"),
-        ),
-        bundle_content_hash: Some("blake3:candidate".to_string()),
-        evidence_refs: vec!["registry://candidate-bundle/candidate_bundle_job".to_string()],
+        release_id: Some(sinomo_core::Id::from_legacy_named("release_job").expect("release")),
+        release_material_hash: Some("blake3:release".to_string()),
+        evidence_refs: vec!["registry://artifact-evidence/release_job".to_string()],
         requested_at: Some("2026-06-01T00:00:00Z".to_string()),
         updated_at: now,
     };
@@ -3215,11 +3213,9 @@ fn cluster_module_rollout_reconciliation_syncs_to_kv() {
         module_id: module_id.clone(),
         artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate").expect("artifact"),
         state: "blocked".to_string(),
-        reason: "candidate bundle is not available locally".to_string(),
-        candidate_bundle_job_id: Some(
-            sinomo_core::Id::from_legacy_named("candidate_bundle_job").expect("job"),
-        ),
-        bundle_content_hash: Some("blake3:candidate".to_string()),
+        reason: "release material is not available locally".to_string(),
+        release_id: Some(sinomo_core::Id::from_legacy_named("release_job").expect("release")),
+        release_material_hash: Some("blake3:release".to_string()),
         local_runtime_stage: None,
         updated_at: now,
     };
@@ -4800,7 +4796,7 @@ fn routes_session_events_to_participants() {
         time::OffsetDateTime::now_utc(),
         NodeId::from_legacy_named("node_mobile").expect("node"),
         Source::new("test.route").expect("source"),
-        EventKind::new("evolution.job.scoped").expect("kind"),
+        EventKind::new("workflow.job.scoped").expect("kind"),
         Salience::new(0.8).expect("salience"),
         Confidence::new(1.0).expect("confidence"),
         RoutingMetadata::new(

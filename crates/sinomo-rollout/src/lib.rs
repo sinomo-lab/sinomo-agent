@@ -22,7 +22,7 @@ pub use controller::{
     AppliedRolloutTransition, DEFAULT_SHADOW_TELEMETRY_LIMIT, RolloutAction, RolloutController,
     RolloutDecision, RolloutObservation, RolloutRuntimeState, RolloutStage,
     RolloutTelemetryAdvanceOptions, RolloutTelemetryAdvanceResult, RolloutTelemetryAdvanceStatus,
-    VerifiedCandidateRolloutPreparation, VerifiedCandidateRolloutRequest,
+    VerifiedArtifactRolloutPreparation, VerifiedArtifactRolloutRequest,
     canary_telemetry_scorecard_from_event_store, canary_telemetry_scorecard_from_events,
     shadow_telemetry_scorecard_from_event_store, shadow_telemetry_scorecard_from_events,
 };

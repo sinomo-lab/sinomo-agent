@@ -271,9 +271,9 @@ mod tests {
     }
 
     #[test]
-    fn self_evolution_event_families_are_open_namespaced_events() {
+    fn open_namespaced_event_families_validate() {
         for kind in [
-            "evolution.job.scoped",
+            "workflow.job.scoped",
             "module.shadow.decision",
             "artifact.registered",
             "eval.completed",

@@ -4915,13 +4915,13 @@ fn sandbox_module_artifact_write_rollout_material_if_requested(
     let bundle = read_sandbox_module_candidate_bundle_manifest(&options.candidate_bundle_path)?;
     let identity = sinomo_runtime::node::load_or_create_main_node_identity(data_dir_root)?;
     let candidate_bundle_ref = format!("candidate-bundle://{}", bundle.job_id);
-    let registry_candidate_bundle_ref = format!("registry://candidate-bundle/{}", bundle.job_id);
+    let registry_artifact_evidence_ref = format!("registry://artifact-evidence/{}", bundle.job_id);
     let sandbox_artifact_ref = format!("sandbox://module-artifact/{artifact_id}");
-    let material_path =
-        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(&bundle);
+    let material_path = PathBuf::from(&bundle.bundle_path)
+        .join(sinomo_runtime::registry::RELEASE_MATERIAL_RELATIVE_PATH);
     let mut evidence_refs = options.evidence_refs.clone();
     evidence_refs.push(candidate_bundle_ref.clone());
-    evidence_refs.push(registry_candidate_bundle_ref);
+    evidence_refs.push(registry_artifact_evidence_ref);
     evidence_refs.push(sandbox_artifact_ref.clone());
     evidence_refs.push(artifact_path.display().to_string());
     evidence_refs.sort();
@@ -4956,8 +4956,9 @@ fn sandbox_module_artifact_write_rollout_material_if_requested(
                 detail: format!("failed to sign sandbox module artifact manifest: {source}"),
             })?,
     );
-    let material = sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord {
-        candidate_bundle_job_id: bundle.job_id.clone(),
+    let material = sinomo_runtime::registry::VerifiedReleaseMaterialRecord {
+        release_id: bundle.job_id.clone(),
+        release_material_hash: bundle.bundle_content_hash.clone().unwrap_or_default(),
         artifact: artifact.clone(),
         policy_decision: sinomo_runtime::core::PolicyDecision {
             decision_id: options.policy_decision_id.clone().unwrap_or_else(|| {
@@ -5014,7 +5015,7 @@ fn sandbox_module_artifact_write_rollout_material_if_requested(
 
 fn read_sandbox_module_candidate_bundle_manifest(
     path: &Path,
-) -> Result<sinomo_runtime::core::CandidateBundleManifest, CliError> {
+) -> Result<sinomo_evolution::CandidateBundleManifest, CliError> {
     let manifest_path = if path.is_dir() {
         path.join("manifest.json")
     } else {

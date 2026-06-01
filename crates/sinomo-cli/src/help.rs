@@ -265,7 +265,7 @@ pub(super) fn print_sandbox_help() {
         "  sinomo sandbox module-artifact register --artifact <artifact-id> [--interface <version>] [--component-model] [--abi preview1|wasix] [--sandbox <sandbox-id>] [--argv <arg>] [--cwd <path>] [--env NAME=VALUE] [--timeout-ms <ms>] [--candidate-bundle <bundle-dir> --module <module-id> --active-artifact <artifact-id>] <module.wasm>"
     );
     println!(
-        "      Register a sandbox-backed module artifact in the local data dir; with candidate-bundle flags, also write verified-rollout-material.json for approval."
+        "      Register a sandbox-backed module artifact in the local data dir; with candidate-bundle flags, also write release-material.json for approval."
     );
     println!("  sinomo sandbox module-replay run --fixture <fixture.json> --report <report.json>");
     println!(

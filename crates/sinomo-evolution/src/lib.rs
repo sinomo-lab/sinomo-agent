@@ -3,10 +3,12 @@
 mod engine;
 pub mod persistence;
 pub mod tools;
+mod types;
 
 pub use engine::*;
 pub use persistence::*;
 pub use tools::*;
+pub use types::*;
 
 pub type EvolutionJobId = sinomo_runtime::core::Id;
 pub type TaskId = sinomo_runtime::core::Id;

@@ -2,7 +2,7 @@
 //!
 //! The facade provides path-based operations without Unix user/group permission
 //! semantics. It is intended for services such as static web servers and
-//! rollout/self-evolution tools that need stable mkdir/list/stat/read/write
+//! rollout and higher-level automation tools that need stable mkdir/list/stat/read/write
 //! behavior over SIFS while the lower DFS layers handle placement, receipts,
 //! repair, and metadata journaling.
 

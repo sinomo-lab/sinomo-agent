@@ -2,11 +2,11 @@ use crate::{CandidateWorkspace, EvolutionJobId, parse_git_status_paths, shell_co
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::core::{
     Confidence, EvaluationGate, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingHint,
-    RoutingMetadata, RoutingScope, Salience, Source, VerificationCommand,
+    RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_runtime::eval::{
     CommandControlAction, CommandControlRegistry, CommandRunResult, CommandRunner,
-    LocalCommandRunner, NoopCommandRunObserver,
+    LocalCommandRunner, NoopCommandRunObserver, VerificationCommand,
 };
 use sinomo_runtime::events::EventId;
 use sinomo_runtime::node::NodeId;

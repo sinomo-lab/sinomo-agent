@@ -10,7 +10,7 @@
 /// R0 continuity-root contracts.
 ///
 /// These are the smallest durable contracts that must remain understandable
-/// across standby handoff, rollback, recovery, and future self-evolution.
+/// across standby handoff, rollback, recovery, and high-level automation.
 pub mod r0 {
     pub use sinomo_core as core;
     pub use sinomo_core::*;
@@ -134,7 +134,8 @@ mod tests {
                 "rollout/telemetry-advance-state.sobj",
                 "rollout/telemetry-gates.sobj",
                 "registry/trusted-artifact-signers.json",
-                "registry/candidate-bundles/evojob_verified_candidate.json",
+                "registry/artifact-evidence/release_verified.json",
+                "registry/verified-release-material/release_verified.json",
                 "bin/sinomo",
                 "startup/sinomo-daemon.service",
             ])

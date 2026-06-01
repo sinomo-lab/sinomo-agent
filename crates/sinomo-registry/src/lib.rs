@@ -2,9 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactManifest, CandidateBundleAttestation, CandidateBundleContentManifest,
-    CandidateBundleFileDigest, CandidateBundleManifest, EvaluationScorecard, Id, PolicyAction,
-    PolicyDecision, RolloutPlan, TrustRing,
+    ArtifactManifest, EvaluationScorecard, Id, PolicyAction, PolicyDecision, RolloutPlan, TrustRing,
 };
 use sinomo_kv::{KvEntry, KvOp, KvTxn};
 use sinomo_module::{
@@ -18,11 +16,9 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 pub const TRUSTED_ARTIFACT_SIGNERS_RELATIVE_PATH: &str = "registry/trusted-artifact-signers.json";
-pub const CANDIDATE_BUNDLE_REGISTRY_RECORDS_RELATIVE_DIR: &str = "registry/candidate-bundles";
-pub const VERIFIED_CANDIDATE_ROLLOUT_MATERIAL_RELATIVE_DIR: &str =
-    "registry/verified-rollout-material";
-pub const CANDIDATE_BUNDLE_VERIFIED_ROLLOUT_MATERIAL_RELATIVE_PATH: &str =
-    "verified-rollout-material.json";
+pub const ARTIFACT_EVIDENCE_RECORDS_RELATIVE_DIR: &str = "registry/artifact-evidence";
+pub const VERIFIED_RELEASE_MATERIAL_RELATIVE_DIR: &str = "registry/verified-release-material";
+pub const RELEASE_MATERIAL_RELATIVE_PATH: &str = "release-material.json";
 pub const CLUSTER_TRUSTED_ARTIFACT_SIGNER_PREFIX: &str =
     "/cluster/registry/trusted-artifact-signers/";
 
@@ -51,24 +47,115 @@ pub struct CandidateRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CandidateBundleRegistryRecord {
-    pub job_id: Id,
-    pub bundle_path: String,
-    pub bundle_content_hash: String,
+pub struct ArtifactEvidenceManifest {
+    pub evidence_id: Id,
+    pub evidence_kind: String,
+    pub evidence_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_content_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_manifest_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attestation_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
-    pub verification: CandidateBundleIntegrityReport,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ArtifactEvidenceRecord {
+    pub evidence_id: Id,
+    pub evidence_kind: String,
+    pub evidence_path: String,
+    pub content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    pub verification: ArtifactEvidenceIntegrityReport,
     #[serde(with = "time::serde::rfc3339")]
     pub registered_at: OffsetDateTime,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct VerifiedCandidateRolloutMaterialRecord {
-    pub candidate_bundle_job_id: Id,
+pub struct ArtifactEvidenceIntegrityReport {
+    pub evidence_id: Id,
+    pub evidence_kind: String,
+    pub evidence_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recomputed_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<ArtifactEvidenceIntegrityCheck>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub verified_at: OffsetDateTime,
+}
+
+impl ArtifactEvidenceIntegrityReport {
+    pub fn is_valid(&self) -> bool {
+        !self.checks.is_empty() && self.checks.iter().all(|check| check.passed)
+    }
+
+    pub fn failed_checks(&self) -> Vec<String> {
+        self.checks
+            .iter()
+            .filter(|check| !check.passed)
+            .map(|check| check.name.clone())
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ArtifactEvidenceIntegrityCheck {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ArtifactEvidenceContentManifest {
+    #[serde(rename = "evidence_path", alias = "bundle_path")]
+    pub evidence_path: String,
+    pub generated_at: String,
+    #[serde(rename = "content_hash", alias = "bundle_content_hash")]
+    pub content_hash: String,
+    pub hash_algorithm: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ArtifactEvidenceFileDigest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ArtifactEvidenceFileDigest {
+    pub path: String,
+    pub bytes: u64,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ArtifactEvidenceAttestation {
+    pub statement_type: String,
+    pub predicate_type: String,
+    pub subject: ArtifactEvidenceSubject,
+    #[serde(default)]
+    pub predicate: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ArtifactEvidenceSubject {
+    pub name: String,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct VerifiedReleaseMaterialRecord {
+    pub release_id: Id,
+    pub release_material_hash: String,
     pub artifact: ArtifactManifest,
     pub policy_decision: PolicyDecision,
     pub rollout_plan: RolloutPlan,
@@ -80,18 +167,18 @@ pub struct VerifiedCandidateRolloutMaterialRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct VerifiedCandidateRolloutMaterialValidationReport {
-    pub candidate_bundle_job_id: Id,
+pub struct VerifiedReleaseMaterialValidationReport {
+    pub release_id: Id,
     pub artifact_id: ArtifactId,
     pub module_id: ModuleId,
     pub rollout_plan_id: Id,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<VerifiedCandidateRolloutMaterialValidationCheck>,
+    pub checks: Vec<VerifiedReleaseMaterialValidationCheck>,
     #[serde(with = "time::serde::rfc3339")]
     pub verified_at: OffsetDateTime,
 }
 
-impl VerifiedCandidateRolloutMaterialValidationReport {
+impl VerifiedReleaseMaterialValidationReport {
     pub fn is_valid(&self) -> bool {
         !self.checks.is_empty() && self.checks.iter().all(|check| check.passed)
     }
@@ -106,46 +193,7 @@ impl VerifiedCandidateRolloutMaterialValidationReport {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct VerifiedCandidateRolloutMaterialValidationCheck {
-    pub name: String,
-    pub passed: bool,
-    pub detail: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct CandidateBundleIntegrityReport {
-    pub job_id: Id,
-    pub bundle_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub declared_content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recomputed_content_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_manifest_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attestation_path: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub checks: Vec<CandidateBundleIntegrityCheck>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub verified_at: OffsetDateTime,
-}
-
-impl CandidateBundleIntegrityReport {
-    pub fn is_valid(&self) -> bool {
-        !self.checks.is_empty() && self.checks.iter().all(|check| check.passed)
-    }
-
-    pub fn failed_checks(&self) -> Vec<String> {
-        self.checks
-            .iter()
-            .filter(|check| !check.passed)
-            .map(|check| check.name.clone())
-            .collect()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct CandidateBundleIntegrityCheck {
+pub struct VerifiedReleaseMaterialValidationCheck {
     pub name: String,
     pub passed: bool,
     pub detail: String,
@@ -244,7 +292,7 @@ pub enum RegistryStatus {
 #[derive(Clone, Debug, Default)]
 pub struct ArtifactRegistry {
     candidate_records: BTreeMap<ArtifactId, CandidateRecord>,
-    candidate_bundles: BTreeMap<Id, CandidateBundleRegistryRecord>,
+    artifact_evidence_records: BTreeMap<Id, ArtifactEvidenceRecord>,
     entries: BTreeMap<ArtifactId, RegistryEntry>,
     latest_by_module: BTreeMap<ModuleId, ArtifactId>,
     trusted_signers: BTreeMap<String, TrustedArtifactSigner>,
@@ -284,43 +332,48 @@ impl ArtifactRegistry {
         Ok(())
     }
 
-    pub fn register_verified_candidate_bundle(
+    pub fn register_verified_artifact_evidence(
         &mut self,
-        manifest: &CandidateBundleManifest,
-    ) -> Result<&CandidateBundleRegistryRecord, RegistryError> {
-        if self.candidate_bundles.contains_key(&manifest.job_id) {
-            return Err(RegistryError::DuplicateCandidateBundle {
-                job_id: manifest.job_id.clone(),
+        manifest: &ArtifactEvidenceManifest,
+    ) -> Result<&ArtifactEvidenceRecord, RegistryError> {
+        if self
+            .artifact_evidence_records
+            .contains_key(&manifest.evidence_id)
+        {
+            return Err(RegistryError::DuplicateArtifactEvidence {
+                evidence_id: manifest.evidence_id.clone(),
             });
         }
 
-        let verification = verify_candidate_bundle_integrity(manifest)?;
+        let verification = verify_artifact_evidence_integrity(manifest)?;
         if !verification.is_valid() {
-            return Err(RegistryError::CandidateBundleIntegrityFailed {
-                job_id: manifest.job_id.clone(),
+            return Err(RegistryError::ArtifactEvidenceIntegrityFailed {
+                evidence_id: manifest.evidence_id.clone(),
                 failed_checks: verification.failed_checks(),
             });
         }
 
-        let record = CandidateBundleRegistryRecord {
-            job_id: manifest.job_id.clone(),
-            bundle_path: manifest.bundle_path.clone(),
-            bundle_content_hash: verification
+        let record = ArtifactEvidenceRecord {
+            evidence_id: manifest.evidence_id.clone(),
+            evidence_kind: manifest.evidence_kind.clone(),
+            evidence_path: manifest.evidence_path.clone(),
+            content_hash: verification
                 .recomputed_content_hash
                 .clone()
-                .unwrap_or_else(|| manifest.bundle_content_hash.clone().unwrap_or_default()),
+                .unwrap_or_else(|| manifest.declared_content_hash.clone().unwrap_or_default()),
             content_manifest_path: manifest.content_manifest_path.clone(),
             attestation_path: manifest.attestation_path.clone(),
-            evidence_refs: candidate_bundle_evidence_refs(manifest),
+            evidence_refs: manifest.evidence_refs.clone(),
             verification,
             registered_at: OffsetDateTime::now_utc(),
         };
-        let job_id = record.job_id.clone();
-        self.candidate_bundles.insert(job_id.clone(), record);
+        let evidence_id = record.evidence_id.clone();
+        self.artifact_evidence_records
+            .insert(evidence_id.clone(), record);
         Ok(self
-            .candidate_bundles
-            .get(&job_id)
-            .expect("candidate bundle inserted"))
+            .artifact_evidence_records
+            .get(&evidence_id)
+            .expect("artifact evidence record inserted"))
     }
 
     pub fn register_trusted_artifact_signer(
@@ -365,15 +418,16 @@ impl ArtifactRegistry {
         Ok(count)
     }
 
-    pub fn load_candidate_bundle_records_from_data_dir(
+    pub fn load_artifact_evidence_records_from_data_dir(
         &mut self,
         data_dir_root: impl AsRef<Path>,
     ) -> Result<usize, RegistryError> {
-        let records = read_candidate_bundle_registry_records(data_dir_root)?;
+        let records = read_artifact_evidence_records(data_dir_root)?;
         let count = records.len();
-        self.candidate_bundles.clear();
+        self.artifact_evidence_records.clear();
         for record in records {
-            self.candidate_bundles.insert(record.job_id.clone(), record);
+            self.artifact_evidence_records
+                .insert(record.evidence_id.clone(), record);
         }
         Ok(count)
     }
@@ -396,8 +450,8 @@ impl ArtifactRegistry {
         self.candidate_records.get(artifact_id)
     }
 
-    pub fn candidate_bundle(&self, job_id: &Id) -> Option<&CandidateBundleRegistryRecord> {
-        self.candidate_bundles.get(job_id)
+    pub fn artifact_evidence(&self, evidence_id: &Id) -> Option<&ArtifactEvidenceRecord> {
+        self.artifact_evidence_records.get(evidence_id)
     }
 
     pub fn entry(&self, artifact_id: &ArtifactId) -> Option<&RegistryEntry> {
@@ -411,14 +465,15 @@ impl ArtifactRegistry {
     }
 }
 
-pub fn verify_candidate_bundle_integrity(
-    manifest: &CandidateBundleManifest,
-) -> Result<CandidateBundleIntegrityReport, RegistryError> {
-    let bundle_root = PathBuf::from(&manifest.bundle_path);
-    let mut report = CandidateBundleIntegrityReport {
-        job_id: manifest.job_id.clone(),
-        bundle_path: manifest.bundle_path.clone(),
-        declared_content_hash: manifest.bundle_content_hash.clone(),
+pub fn verify_artifact_evidence_integrity(
+    manifest: &ArtifactEvidenceManifest,
+) -> Result<ArtifactEvidenceIntegrityReport, RegistryError> {
+    let evidence_root = PathBuf::from(&manifest.evidence_path);
+    let mut report = ArtifactEvidenceIntegrityReport {
+        evidence_id: manifest.evidence_id.clone(),
+        evidence_kind: manifest.evidence_kind.clone(),
+        evidence_path: manifest.evidence_path.clone(),
+        declared_content_hash: manifest.declared_content_hash.clone(),
         recomputed_content_hash: None,
         content_manifest_path: manifest.content_manifest_path.clone(),
         attestation_path: manifest.attestation_path.clone(),
@@ -427,23 +482,23 @@ pub fn verify_candidate_bundle_integrity(
     };
 
     let Some(content_manifest_path) = &manifest.content_manifest_path else {
-        report.checks.push(integrity_check(
+        report.checks.push(artifact_evidence_integrity_check(
             "content-manifest-path-present",
             false,
-            "candidate manifest does not reference bundle-content-manifest.json",
+            "artifact evidence manifest does not reference a content manifest",
         ));
         return Ok(report);
     };
-    report.checks.push(integrity_check(
+    report.checks.push(artifact_evidence_integrity_check(
         "content-manifest-path-present",
         true,
-        "candidate manifest references bundle content manifest",
+        "artifact evidence manifest references a content manifest",
     ));
 
-    let content_manifest_path = bundle_artifact_path(&bundle_root, content_manifest_path);
-    let content_manifest: CandidateBundleContentManifest =
-        read_json_bundle_artifact(&content_manifest_path)?;
-    report.checks.push(integrity_check(
+    let content_manifest_path = evidence_artifact_path(&evidence_root, content_manifest_path);
+    let content_manifest: ArtifactEvidenceContentManifest =
+        read_json_evidence_artifact(&content_manifest_path)?;
+    report.checks.push(artifact_evidence_integrity_check(
         "content-manifest-hash-algorithm",
         content_manifest.hash_algorithm == "blake3",
         format!(
@@ -451,71 +506,71 @@ pub fn verify_candidate_bundle_integrity(
             content_manifest.hash_algorithm
         ),
     ));
-    report.checks.push(integrity_check(
-        "content-manifest-bundle-path",
-        content_manifest.bundle_path == manifest.bundle_path,
-        "content manifest bundle path matches candidate manifest",
+    report.checks.push(artifact_evidence_integrity_check(
+        "content-manifest-evidence-path",
+        content_manifest.evidence_path == manifest.evidence_path,
+        "content manifest evidence path matches artifact evidence manifest",
     ));
 
-    let recomputed_files = build_candidate_bundle_file_digests(&bundle_root)?;
-    let recomputed_content_hash = bundle_content_hash(&recomputed_files);
+    let recomputed_files = build_artifact_evidence_file_digests(&evidence_root)?;
+    let recomputed_content_hash = artifact_evidence_content_hash(&recomputed_files);
     report.recomputed_content_hash = Some(recomputed_content_hash.clone());
-    report.checks.push(integrity_check(
+    report.checks.push(artifact_evidence_integrity_check(
         "content-manifest-files-match",
         content_manifest.files == recomputed_files,
         "content manifest covers every non-control file with matching digest and byte count",
     ));
-    report.checks.push(integrity_check(
+    report.checks.push(artifact_evidence_integrity_check(
         "content-manifest-hash-matches-recomputed",
-        content_manifest.bundle_content_hash == recomputed_content_hash,
-        "content manifest aggregate hash matches recomputed bundle hash",
+        content_manifest.content_hash == recomputed_content_hash,
+        "content manifest aggregate hash matches recomputed evidence hash",
     ));
-    report.checks.push(integrity_check(
-        "candidate-manifest-hash-matches-recomputed",
-        manifest.bundle_content_hash.as_deref() == Some(recomputed_content_hash.as_str()),
-        "candidate manifest aggregate hash matches recomputed bundle hash",
+    report.checks.push(artifact_evidence_integrity_check(
+        "evidence-manifest-hash-matches-recomputed",
+        manifest.declared_content_hash.as_deref() == Some(recomputed_content_hash.as_str()),
+        "artifact evidence manifest aggregate hash matches recomputed evidence hash",
     ));
 
     let Some(attestation_path) = &manifest.attestation_path else {
-        report.checks.push(integrity_check(
-            "attestation-path-present",
-            false,
-            "candidate manifest does not reference bundle-attestation.json",
+        report.checks.push(artifact_evidence_integrity_check(
+            "attestation-path-optional",
+            true,
+            "artifact evidence manifest does not require an attestation",
         ));
         return Ok(report);
     };
-    report.checks.push(integrity_check(
+    report.checks.push(artifact_evidence_integrity_check(
         "attestation-path-present",
         true,
-        "candidate manifest references bundle attestation",
+        "artifact evidence manifest references an attestation",
     ));
 
-    let attestation_path = bundle_artifact_path(&bundle_root, attestation_path);
-    let attestation: CandidateBundleAttestation = read_json_bundle_artifact(&attestation_path)?;
-    report.checks.push(integrity_check(
+    let attestation_path = evidence_artifact_path(&evidence_root, attestation_path);
+    let attestation: ArtifactEvidenceAttestation = read_json_evidence_artifact(&attestation_path)?;
+    report.checks.push(artifact_evidence_integrity_check(
         "attestation-statement-type",
         attestation.statement_type == "https://in-toto.io/Statement/v1",
         format!("statement type is `{}`", attestation.statement_type),
     ));
-    report.checks.push(integrity_check(
-        "attestation-predicate-type",
-        attestation.predicate_type
-            == "https://sinomo.net/attestations/evolution-candidate-bundle/v1",
-        format!("predicate type is `{}`", attestation.predicate_type),
-    ));
-    report.checks.push(integrity_check(
+    report.checks.push(artifact_evidence_integrity_check(
         "attestation-subject-hash",
         attestation.subject.digest == recomputed_content_hash,
-        "attestation subject digest matches recomputed bundle hash",
+        "attestation subject digest matches recomputed evidence hash",
     ));
-    report.checks.push(integrity_check(
-        "attestation-job-id",
-        attestation.predicate.job_id == manifest.job_id,
-        "attestation predicate job id matches candidate manifest",
-    ));
-    report.checks.push(integrity_check(
+    let artifact_refs = attestation
+        .predicate
+        .get("artifact_refs")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    report.checks.push(artifact_evidence_integrity_check(
         "attestation-artifact-refs-exist",
-        artifact_refs_exist(&bundle_root, &attestation.predicate.artifact_refs),
+        artifact_evidence_refs_exist(&evidence_root, &artifact_refs),
         "all filesystem artifact refs named by the attestation exist",
     ));
 
@@ -653,48 +708,45 @@ pub fn write_trusted_artifact_signers(
     Ok(path)
 }
 
-pub fn candidate_bundle_registry_records_dir(data_dir_root: impl AsRef<Path>) -> PathBuf {
+pub fn artifact_evidence_records_dir(data_dir_root: impl AsRef<Path>) -> PathBuf {
     data_dir_root
         .as_ref()
-        .join(CANDIDATE_BUNDLE_REGISTRY_RECORDS_RELATIVE_DIR)
+        .join(ARTIFACT_EVIDENCE_RECORDS_RELATIVE_DIR)
 }
 
-pub fn candidate_bundle_registry_record_path(
-    data_dir_root: impl AsRef<Path>,
-    job_id: &Id,
-) -> PathBuf {
-    candidate_bundle_registry_records_dir(data_dir_root).join(format!("{}.json", job_id.as_str()))
+pub fn artifact_evidence_record_path(data_dir_root: impl AsRef<Path>, evidence_id: &Id) -> PathBuf {
+    artifact_evidence_records_dir(data_dir_root).join(format!("{}.json", evidence_id.as_str()))
 }
 
-pub fn read_candidate_bundle_registry_record(
+pub fn read_artifact_evidence_record(
     data_dir_root: impl AsRef<Path>,
-    job_id: &Id,
-) -> Result<Option<CandidateBundleRegistryRecord>, RegistryError> {
-    let path = candidate_bundle_registry_record_path(data_dir_root, job_id);
+    evidence_id: &Id,
+) -> Result<Option<ArtifactEvidenceRecord>, RegistryError> {
+    let path = artifact_evidence_record_path(data_dir_root, evidence_id);
     match fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).map(Some).map_err(|source| {
-            RegistryError::CandidateBundleRecordStoreParse {
+            RegistryError::ArtifactEvidenceRecordStoreParse {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             }
         }),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(RegistryError::CandidateBundleRecordStoreRead {
+        Err(source) => Err(RegistryError::ArtifactEvidenceRecordStoreRead {
             path: path.display().to_string(),
             detail: source.to_string(),
         }),
     }
 }
 
-pub fn read_candidate_bundle_registry_records(
+pub fn read_artifact_evidence_records(
     data_dir_root: impl AsRef<Path>,
-) -> Result<Vec<CandidateBundleRegistryRecord>, RegistryError> {
-    let dir = candidate_bundle_registry_records_dir(data_dir_root);
+) -> Result<Vec<ArtifactEvidenceRecord>, RegistryError> {
+    let dir = artifact_evidence_records_dir(data_dir_root);
     let entries = match fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(source) => {
-            return Err(RegistryError::CandidateBundleRecordStoreRead {
+            return Err(RegistryError::ArtifactEvidenceRecordStoreRead {
                 path: dir.display().to_string(),
                 detail: source.to_string(),
             });
@@ -702,7 +754,7 @@ pub fn read_candidate_bundle_registry_records(
     };
     let mut paths = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| RegistryError::CandidateBundleRecordStoreRead {
+        let entry = entry.map_err(|source| RegistryError::ArtifactEvidenceRecordStoreRead {
             path: dir.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -719,13 +771,13 @@ pub fn read_candidate_bundle_registry_records(
     let mut records = Vec::with_capacity(paths.len());
     for path in paths {
         let content = fs::read_to_string(&path).map_err(|source| {
-            RegistryError::CandidateBundleRecordStoreRead {
+            RegistryError::ArtifactEvidenceRecordStoreRead {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             }
         })?;
         records.push(serde_json::from_str(&content).map_err(|source| {
-            RegistryError::CandidateBundleRecordStoreParse {
+            RegistryError::ArtifactEvidenceRecordStoreParse {
                 path: path.display().to_string(),
                 detail: source.to_string(),
             }
@@ -734,58 +786,52 @@ pub fn read_candidate_bundle_registry_records(
     Ok(records)
 }
 
-pub fn write_candidate_bundle_registry_record(
+pub fn write_artifact_evidence_record(
     data_dir_root: impl AsRef<Path>,
-    record: &CandidateBundleRegistryRecord,
+    record: &ArtifactEvidenceRecord,
 ) -> Result<PathBuf, RegistryError> {
-    let path = candidate_bundle_registry_record_path(data_dir_root, &record.job_id);
+    let path = artifact_evidence_record_path(data_dir_root, &record.evidence_id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| {
-            RegistryError::CandidateBundleRecordStoreWrite {
+            RegistryError::ArtifactEvidenceRecordStoreWrite {
                 path: parent.display().to_string(),
                 detail: source.to_string(),
             }
         })?;
     }
     let content = serde_json::to_string_pretty(record).map_err(|source| {
-        RegistryError::CandidateBundleRecordStoreParse {
+        RegistryError::ArtifactEvidenceRecordStoreParse {
             path: path.display().to_string(),
             detail: source.to_string(),
         }
     })?;
-    fs::write(&path, content).map_err(|source| RegistryError::CandidateBundleRecordStoreWrite {
-        path: path.display().to_string(),
-        detail: source.to_string(),
+    fs::write(&path, content).map_err(|source| {
+        RegistryError::ArtifactEvidenceRecordStoreWrite {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }
     })?;
     Ok(path)
 }
 
-pub fn verified_candidate_rollout_material_dir(data_dir_root: impl AsRef<Path>) -> PathBuf {
+pub fn verified_release_material_dir(data_dir_root: impl AsRef<Path>) -> PathBuf {
     data_dir_root
         .as_ref()
-        .join(VERIFIED_CANDIDATE_ROLLOUT_MATERIAL_RELATIVE_DIR)
+        .join(VERIFIED_RELEASE_MATERIAL_RELATIVE_DIR)
 }
 
-pub fn verified_candidate_rollout_material_path(
-    data_dir_root: impl AsRef<Path>,
-    job_id: &Id,
-) -> PathBuf {
-    verified_candidate_rollout_material_dir(data_dir_root).join(format!("{}.json", job_id.as_str()))
+pub fn verified_release_material_path(data_dir_root: impl AsRef<Path>, release_id: &Id) -> PathBuf {
+    verified_release_material_dir(data_dir_root).join(format!("{}.json", release_id.as_str()))
 }
 
-pub fn candidate_bundle_verified_rollout_material_path(
-    manifest: &CandidateBundleManifest,
-) -> PathBuf {
-    bundle_artifact_path(
-        &PathBuf::from(&manifest.bundle_path),
-        CANDIDATE_BUNDLE_VERIFIED_ROLLOUT_MATERIAL_RELATIVE_PATH,
-    )
+pub fn release_material_path(evidence_root: impl AsRef<Path>) -> PathBuf {
+    evidence_artifact_path(evidence_root.as_ref(), RELEASE_MATERIAL_RELATIVE_PATH)
 }
 
-pub fn read_candidate_bundle_verified_rollout_material(
-    manifest: &CandidateBundleManifest,
-) -> Result<Option<VerifiedCandidateRolloutMaterialRecord>, RegistryError> {
-    let path = candidate_bundle_verified_rollout_material_path(manifest);
+pub fn read_release_material_from_path(
+    path: impl AsRef<Path>,
+) -> Result<Option<VerifiedReleaseMaterialRecord>, RegistryError> {
+    let path = path.as_ref();
     match fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).map(Some).map_err(|source| {
             RegistryError::VerifiedRolloutMaterialStoreParse {
@@ -801,11 +847,11 @@ pub fn read_candidate_bundle_verified_rollout_material(
     }
 }
 
-pub fn read_verified_candidate_rollout_material(
+pub fn read_verified_release_material(
     data_dir_root: impl AsRef<Path>,
-    job_id: &Id,
-) -> Result<Option<VerifiedCandidateRolloutMaterialRecord>, RegistryError> {
-    let path = verified_candidate_rollout_material_path(data_dir_root, job_id);
+    release_id: &Id,
+) -> Result<Option<VerifiedReleaseMaterialRecord>, RegistryError> {
+    let path = verified_release_material_path(data_dir_root, release_id);
     match fs::read_to_string(&path) {
         Ok(content) => serde_json::from_str(&content).map(Some).map_err(|source| {
             RegistryError::VerifiedRolloutMaterialStoreParse {
@@ -821,12 +867,11 @@ pub fn read_verified_candidate_rollout_material(
     }
 }
 
-pub fn write_verified_candidate_rollout_material(
+pub fn write_verified_release_material(
     data_dir_root: impl AsRef<Path>,
-    record: &VerifiedCandidateRolloutMaterialRecord,
+    record: &VerifiedReleaseMaterialRecord,
 ) -> Result<PathBuf, RegistryError> {
-    let path =
-        verified_candidate_rollout_material_path(data_dir_root, &record.candidate_bundle_job_id);
+    let path = verified_release_material_path(data_dir_root, &record.release_id);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| {
             RegistryError::VerifiedRolloutMaterialStoreWrite {
@@ -850,34 +895,42 @@ pub fn write_verified_candidate_rollout_material(
     Ok(path)
 }
 
-pub fn validate_verified_candidate_rollout_material(
-    material: &VerifiedCandidateRolloutMaterialRecord,
-    candidate_bundle: &CandidateBundleRegistryRecord,
+pub fn validate_verified_release_material(
+    material: &VerifiedReleaseMaterialRecord,
+    evidence: &ArtifactEvidenceRecord,
     trusted_signers: &[TrustedArtifactSigner],
-) -> VerifiedCandidateRolloutMaterialValidationReport {
+) -> VerifiedReleaseMaterialValidationReport {
     let mut checks = Vec::new();
     checks.push(verified_rollout_material_check(
-        "candidate-bundle-job-id",
-        material.candidate_bundle_job_id == candidate_bundle.job_id,
+        "release-id",
+        material.release_id == evidence.evidence_id,
         format!(
-            "material references {}, candidate bundle is {}",
-            material.candidate_bundle_job_id, candidate_bundle.job_id
+            "material references {}, evidence record is {}",
+            material.release_id, evidence.evidence_id
         ),
     ));
     checks.push(verified_rollout_material_check(
-        "candidate-bundle-integrity",
-        candidate_bundle.verification.is_valid(),
-        if candidate_bundle.verification.is_valid() {
+        "artifact-evidence-integrity",
+        evidence.verification.is_valid(),
+        if evidence.verification.is_valid() {
             format!(
-                "candidate bundle integrity is valid with hash {}",
-                candidate_bundle.bundle_content_hash
+                "artifact evidence integrity is valid with hash {}",
+                evidence.content_hash
             )
         } else {
             format!(
-                "candidate bundle integrity failed: {}",
-                candidate_bundle.verification.failed_checks().join(", ")
+                "artifact evidence integrity failed: {}",
+                evidence.verification.failed_checks().join(", ")
             )
         },
+    ));
+    checks.push(verified_rollout_material_check(
+        "release-material-hash",
+        material.release_material_hash == evidence.content_hash,
+        format!(
+            "material hash {} evidence hash {}",
+            material.release_material_hash, evidence.content_hash
+        ),
     ));
     checks.push(verified_rollout_material_check(
         "artifact-rollout-artifact-id",
@@ -935,8 +988,8 @@ pub fn validate_verified_candidate_rollout_material(
         ),
     ));
 
-    VerifiedCandidateRolloutMaterialValidationReport {
-        candidate_bundle_job_id: material.candidate_bundle_job_id.clone(),
+    VerifiedReleaseMaterialValidationReport {
+        release_id: material.release_id.clone(),
         artifact_id: material.artifact.artifact_id.clone(),
         module_id: material.artifact.module_id.clone(),
         rollout_plan_id: material.rollout_plan.rollout_plan_id.clone(),
@@ -945,21 +998,20 @@ pub fn validate_verified_candidate_rollout_material(
     }
 }
 
-pub fn verify_and_write_verified_candidate_rollout_material(
+pub fn verify_and_write_verified_release_material(
     data_dir_root: impl AsRef<Path>,
-    record: &VerifiedCandidateRolloutMaterialRecord,
-    candidate_bundle: &CandidateBundleRegistryRecord,
+    record: &VerifiedReleaseMaterialRecord,
+    evidence: &ArtifactEvidenceRecord,
     trusted_signers: &[TrustedArtifactSigner],
-) -> Result<(PathBuf, VerifiedCandidateRolloutMaterialValidationReport), RegistryError> {
-    let report =
-        validate_verified_candidate_rollout_material(record, candidate_bundle, trusted_signers);
+) -> Result<(PathBuf, VerifiedReleaseMaterialValidationReport), RegistryError> {
+    let report = validate_verified_release_material(record, evidence, trusted_signers);
     if !report.is_valid() {
         return Err(RegistryError::VerifiedRolloutMaterialInvalid {
-            job_id: record.candidate_bundle_job_id.clone(),
+            release_id: record.release_id.clone(),
             failed_checks: report.failed_checks(),
         });
     }
-    let path = write_verified_candidate_rollout_material(data_dir_root, record)?;
+    let path = write_verified_release_material(data_dir_root, record)?;
     Ok((path, report))
 }
 
@@ -1044,30 +1096,30 @@ pub fn register_storage_paths(
     layout.register_escape_path(
         "sinomo-registry",
         StorageRing::R1,
-        CANDIDATE_BUNDLE_REGISTRY_RECORDS_RELATIVE_DIR,
-        "verified candidate bundle registry records use dynamic evolution job id files",
+        ARTIFACT_EVIDENCE_RECORDS_RELATIVE_DIR,
+        "verified artifact evidence records use dynamic evidence id files",
     )?;
     layout.register_escape_path(
         "sinomo-registry",
         StorageRing::R1,
-        VERIFIED_CANDIDATE_ROLLOUT_MATERIAL_RELATIVE_DIR,
-        "verified rollout material records use dynamic evolution job id files",
+        VERIFIED_RELEASE_MATERIAL_RELATIVE_DIR,
+        "verified release material records use dynamic release id files",
     )
 }
 
-fn build_candidate_bundle_file_digests(
-    bundle_root: &Path,
-) -> Result<Vec<CandidateBundleFileDigest>, RegistryError> {
+fn build_artifact_evidence_file_digests(
+    evidence_root: &Path,
+) -> Result<Vec<ArtifactEvidenceFileDigest>, RegistryError> {
     let mut files = Vec::new();
-    collect_candidate_bundle_file_digests(bundle_root, bundle_root, &mut files)?;
+    collect_artifact_evidence_file_digests(evidence_root, evidence_root, &mut files)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
-fn collect_candidate_bundle_file_digests(
-    bundle_root: &Path,
+fn collect_artifact_evidence_file_digests(
+    evidence_root: &Path,
     path: &Path,
-    files: &mut Vec<CandidateBundleFileDigest>,
+    files: &mut Vec<ArtifactEvidenceFileDigest>,
 ) -> Result<(), RegistryError> {
     let entries = fs::read_dir(path).map_err(|source| RegistryError::BundleArtifactRead {
         path: path.display().to_string(),
@@ -1080,19 +1132,22 @@ fn collect_candidate_bundle_file_digests(
         })?;
         let entry_path = entry.path();
         if entry_path.is_dir() {
-            collect_candidate_bundle_file_digests(bundle_root, &entry_path, files)?;
+            collect_artifact_evidence_file_digests(evidence_root, &entry_path, files)?;
         } else if entry_path.is_file() {
-            let relative = bundle_relative_path(bundle_root, &entry_path);
-            if is_bundle_integrity_control_file(&relative) {
+            let relative = evidence_relative_path(evidence_root, &entry_path);
+            if is_artifact_evidence_control_file(&relative) {
                 continue;
             }
-            files.push(file_digest(&entry_path, relative)?);
+            files.push(artifact_evidence_file_digest(&entry_path, relative)?);
         }
     }
     Ok(())
 }
 
-fn file_digest(path: &Path, relative: String) -> Result<CandidateBundleFileDigest, RegistryError> {
+fn artifact_evidence_file_digest(
+    path: &Path,
+    relative: String,
+) -> Result<ArtifactEvidenceFileDigest, RegistryError> {
     let mut file = fs::File::open(path).map_err(|source| RegistryError::BundleArtifactRead {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -1113,14 +1168,14 @@ fn file_digest(path: &Path, relative: String) -> Result<CandidateBundleFileDiges
         bytes = bytes.saturating_add(read as u64);
         hasher.update(&buffer[..read]);
     }
-    Ok(CandidateBundleFileDigest {
+    Ok(ArtifactEvidenceFileDigest {
         path: relative,
         bytes,
         digest: format!("blake3:{}", hasher.finalize().to_hex()),
     })
 }
 
-fn bundle_content_hash(files: &[CandidateBundleFileDigest]) -> String {
+fn artifact_evidence_content_hash(files: &[ArtifactEvidenceFileDigest]) -> String {
     let mut hasher = blake3::Hasher::new();
     for file in files {
         hasher.update(file.path.as_bytes());
@@ -1133,7 +1188,7 @@ fn bundle_content_hash(files: &[CandidateBundleFileDigest]) -> String {
     format!("blake3:{}", hasher.finalize().to_hex())
 }
 
-fn read_json_bundle_artifact<T: for<'de> Deserialize<'de>>(
+fn read_json_evidence_artifact<T: for<'de> Deserialize<'de>>(
     path: &Path,
 ) -> Result<T, RegistryError> {
     let content = fs::read_to_string(path).map_err(|source| RegistryError::BundleArtifactRead {
@@ -1146,17 +1201,17 @@ fn read_json_bundle_artifact<T: for<'de> Deserialize<'de>>(
     })
 }
 
-fn bundle_artifact_path(bundle_root: &Path, path: &str) -> PathBuf {
+fn evidence_artifact_path(evidence_root: &Path, path: &str) -> PathBuf {
     let artifact_path = PathBuf::from(path);
     if artifact_path.is_absolute() {
         artifact_path
     } else {
-        bundle_root.join(artifact_path)
+        evidence_root.join(artifact_path)
     }
 }
 
-fn bundle_relative_path(bundle_root: &Path, path: &Path) -> String {
-    path.strip_prefix(bundle_root)
+fn evidence_relative_path(evidence_root: &Path, path: &Path) -> String {
+    path.strip_prefix(evidence_root)
         .unwrap_or(path)
         .components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -1164,57 +1219,36 @@ fn bundle_relative_path(bundle_root: &Path, path: &Path) -> String {
         .join("/")
 }
 
-fn is_bundle_integrity_control_file(path: &str) -> bool {
+fn is_artifact_evidence_control_file(path: &str) -> bool {
     matches!(
         path,
         "manifest.json"
             | "job.json"
             | "record.json"
+            | "content-manifest.json"
+            | "attestation.json"
             | "bundle-content-manifest.json"
             | "bundle-attestation.json"
-            | "candidate-bundle-registry-record.json"
+            | "artifact-evidence-record.json"
             | "candidate-summary.md"
             | "approval-decision.json"
+            | RELEASE_MATERIAL_RELATIVE_PATH
     )
 }
 
-fn artifact_refs_exist(bundle_root: &Path, refs: &[String]) -> bool {
+fn artifact_evidence_refs_exist(evidence_root: &Path, refs: &[String]) -> bool {
     refs.iter().all(|artifact_ref| {
-        let path = bundle_artifact_path(bundle_root, artifact_ref);
+        let path = evidence_artifact_path(evidence_root, artifact_ref);
         path.exists()
     })
 }
 
-fn candidate_bundle_evidence_refs(manifest: &CandidateBundleManifest) -> Vec<String> {
-    let mut refs = vec![manifest.mutation_packet_path.clone()];
-    refs.extend(manifest.job_path.iter().cloned());
-    refs.extend(manifest.model_output_path.iter().cloned());
-    refs.extend(manifest.agent_run_path.iter().cloned());
-    refs.extend(manifest.agent_summary_path.iter().cloned());
-    refs.extend(manifest.benchmark_results_path.iter().cloned());
-    refs.extend(manifest.resource_usage_path.iter().cloned());
-    refs.extend(manifest.content_manifest_path.iter().cloned());
-    refs.extend(manifest.attestation_path.iter().cloned());
-    refs.extend(manifest.registry_record_path.iter().cloned());
-    refs.extend(manifest.changed_files_path.iter().cloned());
-    refs.extend(manifest.diff_path.iter().cloned());
-    refs.extend(manifest.scorecard_path.iter().cloned());
-    refs.extend(manifest.candidate_summary_path.iter().cloned());
-    refs.extend(manifest.decision_path.iter().cloned());
-    refs.extend(manifest.command_logs.iter().map(|log| log.log_path.clone()));
-    let rollout_material_path = candidate_bundle_verified_rollout_material_path(manifest);
-    if rollout_material_path.exists() {
-        refs.push(rollout_material_path.display().to_string());
-    }
-    refs
-}
-
-fn integrity_check(
+fn artifact_evidence_integrity_check(
     name: impl Into<String>,
     passed: bool,
     detail: impl Into<String>,
-) -> CandidateBundleIntegrityCheck {
-    CandidateBundleIntegrityCheck {
+) -> ArtifactEvidenceIntegrityCheck {
+    ArtifactEvidenceIntegrityCheck {
         name: name.into(),
         passed,
         detail: detail.into(),
@@ -1237,8 +1271,8 @@ fn verified_rollout_material_check(
     name: impl Into<String>,
     passed: bool,
     detail: impl Into<String>,
-) -> VerifiedCandidateRolloutMaterialValidationCheck {
-    VerifiedCandidateRolloutMaterialValidationCheck {
+) -> VerifiedReleaseMaterialValidationCheck {
+    VerifiedReleaseMaterialValidationCheck {
         name: name.into(),
         passed,
         detail: detail.into(),
@@ -1251,18 +1285,18 @@ pub enum RegistryError {
     DuplicateArtifact { artifact_id: ArtifactId },
     #[error("duplicate candidate artifact: {artifact_id}")]
     DuplicateCandidate { artifact_id: ArtifactId },
-    #[error("duplicate candidate bundle: {job_id}")]
-    DuplicateCandidateBundle { job_id: Id },
+    #[error("duplicate artifact evidence: {evidence_id}")]
+    DuplicateArtifactEvidence { evidence_id: Id },
     #[error("duplicate trusted artifact signer: {public_key}")]
     DuplicateTrustedSigner { public_key: String },
-    #[error("candidate bundle integrity failed for {job_id}: {failed_checks:?}")]
-    CandidateBundleIntegrityFailed {
-        job_id: Id,
+    #[error("artifact evidence integrity failed for {evidence_id}: {failed_checks:?}")]
+    ArtifactEvidenceIntegrityFailed {
+        evidence_id: Id,
         failed_checks: Vec<String>,
     },
-    #[error("candidate bundle artifact `{path}` could not be read: {detail}")]
+    #[error("artifact evidence `{path}` could not be read: {detail}")]
     BundleArtifactRead { path: String, detail: String },
-    #[error("candidate bundle artifact `{path}` could not be parsed: {detail}")]
+    #[error("artifact evidence `{path}` could not be parsed: {detail}")]
     BundleArtifactParse { path: String, detail: String },
     #[error("trusted signer store `{path}` could not be read: {detail}")]
     TrustedSignerStoreRead { path: String, detail: String },
@@ -1270,21 +1304,21 @@ pub enum RegistryError {
     TrustedSignerStoreWrite { path: String, detail: String },
     #[error("trusted signer store `{path}` could not be parsed: {detail}")]
     TrustedSignerStoreParse { path: String, detail: String },
-    #[error("candidate bundle registry store `{path}` could not be read: {detail}")]
-    CandidateBundleRecordStoreRead { path: String, detail: String },
-    #[error("candidate bundle registry store `{path}` could not be written: {detail}")]
-    CandidateBundleRecordStoreWrite { path: String, detail: String },
-    #[error("candidate bundle registry store `{path}` could not be parsed: {detail}")]
-    CandidateBundleRecordStoreParse { path: String, detail: String },
+    #[error("artifact evidence record store `{path}` could not be read: {detail}")]
+    ArtifactEvidenceRecordStoreRead { path: String, detail: String },
+    #[error("artifact evidence record store `{path}` could not be written: {detail}")]
+    ArtifactEvidenceRecordStoreWrite { path: String, detail: String },
+    #[error("artifact evidence record store `{path}` could not be parsed: {detail}")]
+    ArtifactEvidenceRecordStoreParse { path: String, detail: String },
     #[error("verified rollout material store `{path}` could not be read: {detail}")]
     VerifiedRolloutMaterialStoreRead { path: String, detail: String },
     #[error("verified rollout material store `{path}` could not be written: {detail}")]
     VerifiedRolloutMaterialStoreWrite { path: String, detail: String },
     #[error("verified rollout material store `{path}` could not be parsed: {detail}")]
     VerifiedRolloutMaterialStoreParse { path: String, detail: String },
-    #[error("verified rollout material for {job_id} failed validation: {failed_checks:?}")]
+    #[error("verified release material for {release_id} failed validation: {failed_checks:?}")]
     VerifiedRolloutMaterialInvalid {
-        job_id: Id,
+        release_id: Id,
         failed_checks: Vec<String>,
     },
     #[error("trusted signer `{public_key}` could not be encoded for cluster KV: {detail}")]
@@ -1305,15 +1339,12 @@ pub enum RegistryError {
 mod tests {
     use super::*;
     use sinomo_core::{
-        ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CandidateBundleAttestation,
-        CandidateBundleContentManifest, CandidateBundleManifest, CandidateBundlePredicate,
-        CandidateBundleSubject, CapabilityDiff, EvaluationOutcome, Id, ModuleManifest,
-        PolicyAction, PolicyDecision, TrustRing,
+        ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, Id,
+        ModuleManifest, PolicyAction, PolicyDecision, RollbackPolicy, RolloutStrategy, TrustRing,
     };
     use std::path::{Path, PathBuf};
 
     type PolicyDecisionId = Id;
-    type EvolutionJobId = Id;
 
     #[test]
     fn registry_tracks_latest_approved_artifact_for_module() {
@@ -1331,8 +1362,8 @@ mod tests {
             module_manifest: ModuleManifest::r3_wasm(module_id.clone(), "0.1.0", "trigger"),
             provenance: ArtifactProvenance {
                 produced_by: ActorRef {
-                    kind: ActorKind::EvolutionOrchestrator,
-                    id: "phase2-test".to_string(),
+                    kind: ActorKind::Operator,
+                    id: "registry-test".to_string(),
                 },
                 source_event_id: None,
                 build_log_artifact_id: None,
@@ -1344,9 +1375,7 @@ mod tests {
         registry
             .register_candidate(CandidateRecord {
                 artifact: artifact.clone(),
-                source_job_id: Some(
-                    EvolutionJobId::from_legacy_named("evojob_candidate").expect("job"),
-                ),
+                source_job_id: None,
                 scorecard: None,
                 evidence_refs: vec!["sandbox://run/local".to_string()],
                 registered_at: OffsetDateTime::now_utc(),
@@ -1376,98 +1405,74 @@ mod tests {
     }
 
     #[test]
-    fn registry_verifies_and_registers_candidate_bundle_provenance() {
-        let root = unique_test_root("verified-bundle");
-        let mut manifest = write_candidate_bundle_fixture(&root);
-        fs::write(root.join("candidate-summary.md"), "# Candidate Summary\n")
-            .expect("write candidate summary");
-        fs::write(
-            root.join("approval-decision.json"),
-            "{\"outcome\":\"approved\"}\n",
-        )
-        .expect("write approval decision");
-        fs::write(
-            root.join("candidate-bundle-registry-record.json"),
-            "{\"placeholder\":true}\n",
-        )
-        .expect("write registry record");
-        fs::write(root.join("job.json"), "{\"status\":\"approved\"}\n").expect("write job");
-        fs::write(root.join("record.json"), "{\"decision\":\"approved\"}\n")
-            .expect("write stored record");
-        manifest.registry_record_path = Some(
-            root.join("candidate-bundle-registry-record.json")
-                .display()
-                .to_string(),
-        );
+    fn registry_verifies_and_registers_artifact_evidence() {
+        let root = unique_test_root("verified-evidence");
+        let manifest = write_artifact_evidence_fixture(&root);
 
-        let report = verify_candidate_bundle_integrity(&manifest).expect("verify bundle");
+        let report = verify_artifact_evidence_integrity(&manifest).expect("verify evidence");
         assert!(report.is_valid(), "{:?}", report.failed_checks());
         assert_eq!(
             report.recomputed_content_hash.as_deref(),
-            manifest.bundle_content_hash.as_deref()
+            manifest.declared_content_hash.as_deref()
         );
 
         let mut registry = ArtifactRegistry::new();
         let record = registry
-            .register_verified_candidate_bundle(&manifest)
-            .expect("register verified bundle");
-        assert_eq!(record.job_id, manifest.job_id);
+            .register_verified_artifact_evidence(&manifest)
+            .expect("register verified evidence");
+        assert_eq!(record.evidence_id, manifest.evidence_id);
         assert_eq!(
-            record.bundle_content_hash,
-            manifest.bundle_content_hash.clone().expect("content hash")
+            record.content_hash,
+            manifest
+                .declared_content_hash
+                .clone()
+                .expect("content hash")
         );
-        assert!(
-            record
-                .evidence_refs
-                .iter()
-                .any(|artifact| artifact.ends_with("mutation-packet.json"))
-        );
-        assert!(registry.candidate_bundle(&manifest.job_id).is_some());
+        assert!(registry.artifact_evidence(&manifest.evidence_id).is_some());
 
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn candidate_bundle_registry_records_round_trip_through_data_dir_store() {
-        let root = unique_test_root("candidate-bundle-record-store");
-        let bundle_root = root.join("bundle");
-        let manifest = write_candidate_bundle_fixture(&bundle_root);
+    fn artifact_evidence_records_round_trip_through_data_dir_store() {
+        let root = unique_test_root("artifact-evidence-record-store");
+        let evidence_root = root.join("evidence");
+        let manifest = write_artifact_evidence_fixture(&evidence_root);
         let mut registry = ArtifactRegistry::new();
         let record = registry
-            .register_verified_candidate_bundle(&manifest)
-            .expect("register verified bundle")
+            .register_verified_artifact_evidence(&manifest)
+            .expect("register verified evidence")
             .clone();
 
         assert!(
-            read_candidate_bundle_registry_record(&root, &record.job_id)
+            read_artifact_evidence_record(&root, &record.evidence_id)
                 .expect("missing registry record")
                 .is_none()
         );
-        let path =
-            write_candidate_bundle_registry_record(&root, &record).expect("write registry record");
+        let path = write_artifact_evidence_record(&root, &record).expect("write registry record");
         assert_eq!(
             path,
-            candidate_bundle_registry_record_path(&root, &record.job_id)
+            artifact_evidence_record_path(&root, &record.evidence_id)
         );
-        assert!(path.starts_with(root.join(CANDIDATE_BUNDLE_REGISTRY_RECORDS_RELATIVE_DIR)));
+        assert!(path.starts_with(root.join(ARTIFACT_EVIDENCE_RECORDS_RELATIVE_DIR)));
 
-        let loaded = read_candidate_bundle_registry_record(&root, &record.job_id)
+        let loaded = read_artifact_evidence_record(&root, &record.evidence_id)
             .expect("read registry record")
             .expect("registry record");
         assert_eq!(loaded, record);
 
-        let records = read_candidate_bundle_registry_records(&root).expect("list records");
+        let records = read_artifact_evidence_records(&root).expect("list records");
         assert_eq!(records, vec![record.clone()]);
 
         let mut loaded_registry = ArtifactRegistry::new();
         let loaded_count = loaded_registry
-            .load_candidate_bundle_records_from_data_dir(&root)
+            .load_artifact_evidence_records_from_data_dir(&root)
             .expect("load registry records");
         assert_eq!(loaded_count, 1);
         assert!(
             loaded_registry
-                .candidate_bundle(&record.job_id)
-                .is_some_and(|loaded| loaded.bundle_content_hash == record.bundle_content_hash)
+                .artifact_evidence(&record.evidence_id)
+                .is_some_and(|loaded| loaded.content_hash == record.content_hash)
         );
 
         let _ = fs::remove_dir_all(root);
@@ -1477,10 +1482,11 @@ mod tests {
     fn verified_rollout_material_records_round_trip_through_data_dir_store() {
         let root = unique_test_root("registry-rollout-material-store");
         let (artifact, _signer) = signed_artifact_fixture("rollout-material-signer");
-        let job_id = Id::from_legacy_named("evojob_rollout_material").expect("job");
+        let release_id = Id::from_legacy_named("release_material").expect("release");
         let active_artifact_id = Id::from_legacy_named("artifact_active").expect("active");
-        let record = VerifiedCandidateRolloutMaterialRecord {
-            candidate_bundle_job_id: job_id.clone(),
+        let record = VerifiedReleaseMaterialRecord {
+            release_id: release_id.clone(),
+            release_material_hash: "blake3:release".to_string(),
             artifact: artifact.clone(),
             policy_decision: PolicyDecision {
                 decision_id: PolicyDecisionId::from_legacy_named("policy_material")
@@ -1502,41 +1508,38 @@ mod tests {
                 target_nodes: Vec::new(),
                 initial_weight_bps: 0,
                 promotion_steps_bps: vec![500],
-                rollback_policy: sinomo_core::RollbackPolicy::default(),
+                rollback_policy: RollbackPolicy::default(),
             },
             active_artifact_id,
-            evidence_refs: vec!["registry://candidate-bundle/evojob_rollout_material".to_string()],
+            evidence_refs: vec!["registry://artifact-evidence/release_material".to_string()],
             registered_at: OffsetDateTime::now_utc(),
         };
 
-        let path = write_verified_candidate_rollout_material(&root, &record)
-            .expect("write rollout material");
-        let loaded = read_verified_candidate_rollout_material(&root, &job_id)
+        let path = write_verified_release_material(&root, &record).expect("write rollout material");
+        let loaded = read_verified_release_material(&root, &release_id)
             .expect("read rollout material")
             .expect("rollout material");
 
-        assert_eq!(
-            path,
-            verified_candidate_rollout_material_path(&root, &job_id)
-        );
+        assert_eq!(path, verified_release_material_path(&root, &release_id));
         assert_eq!(loaded, record);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn verified_rollout_material_validation_requires_bundle_match_and_trusted_signature() {
+    fn verified_rollout_material_validation_requires_evidence_match_and_trusted_signature() {
         let root = unique_test_root("registry-rollout-material-validation");
-        let bundle_root = root.join("bundle");
-        let manifest = write_candidate_bundle_fixture(&bundle_root);
+        let evidence_root = root.join("evidence");
+        let manifest = write_artifact_evidence_fixture(&evidence_root);
         let mut registry = ArtifactRegistry::new();
-        let bundle_record = registry
-            .register_verified_candidate_bundle(&manifest)
-            .expect("register bundle")
+        let evidence_record = registry
+            .register_verified_artifact_evidence(&manifest)
+            .expect("register evidence")
             .clone();
         let (artifact, signer) = signed_artifact_fixture("rollout-material-validation-signer");
         let active_artifact_id = Id::from_legacy_named("artifact_active").expect("active");
-        let material = VerifiedCandidateRolloutMaterialRecord {
-            candidate_bundle_job_id: bundle_record.job_id.clone(),
+        let material = VerifiedReleaseMaterialRecord {
+            release_id: evidence_record.evidence_id.clone(),
+            release_material_hash: evidence_record.content_hash.clone(),
             artifact: artifact.clone(),
             policy_decision: PolicyDecision {
                 decision_id: PolicyDecisionId::from_legacy_named("policy_material_validation")
@@ -1555,66 +1558,61 @@ mod tests {
                 artifact_id: artifact.artifact_id.clone(),
                 module_id: artifact.module_id.clone(),
                 target_ring: artifact.target_ring.clone(),
-                strategy: sinomo_core::RolloutStrategy::Shadow,
+                strategy: RolloutStrategy::Shadow,
                 target_nodes: Vec::new(),
                 initial_weight_bps: 0,
                 promotion_steps_bps: vec![500],
-                rollback_policy: sinomo_core::RollbackPolicy::default(),
+                rollback_policy: RollbackPolicy::default(),
             },
             active_artifact_id,
-            evidence_refs: bundle_record.evidence_refs.clone(),
+            evidence_refs: evidence_record.evidence_refs.clone(),
             registered_at: OffsetDateTime::now_utc(),
         };
 
-        let report = validate_verified_candidate_rollout_material(
+        let report = validate_verified_release_material(
             &material,
-            &bundle_record,
+            &evidence_record,
             std::slice::from_ref(&signer),
         );
         assert!(report.is_valid(), "{:?}", report.failed_checks());
-        let (path, write_report) = verify_and_write_verified_candidate_rollout_material(
+        let (path, write_report) = verify_and_write_verified_release_material(
             &root,
             &material,
-            &bundle_record,
+            &evidence_record,
             &[signer],
         )
         .expect("write validated material");
         assert!(path.exists());
         assert!(write_report.is_valid());
 
-        let unsigned_report =
-            validate_verified_candidate_rollout_material(&material, &bundle_record, &[]);
+        let unsigned_report = validate_verified_release_material(&material, &evidence_record, &[]);
         assert!(!unsigned_report.is_valid());
         assert!(
             unsigned_report
                 .failed_checks()
                 .contains(&"artifact-signature-authorized".to_string())
         );
-        let mut wrong_job = material.clone();
-        wrong_job.candidate_bundle_job_id =
-            Id::from_legacy_named("evojob_wrong_material").expect("wrong job");
-        let wrong_job_report =
-            validate_verified_candidate_rollout_material(&wrong_job, &bundle_record, &[]);
-        assert!(!wrong_job_report.is_valid());
+        let mut wrong_release = material.clone();
+        wrong_release.release_id = Id::from_legacy_named("release_wrong").expect("wrong release");
+        let wrong_release_report =
+            validate_verified_release_material(&wrong_release, &evidence_record, &[]);
+        assert!(!wrong_release_report.is_valid());
         assert!(
-            wrong_job_report
+            wrong_release_report
                 .failed_checks()
-                .contains(&"candidate-bundle-job-id".to_string())
+                .contains(&"release-id".to_string())
         );
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn registry_rejects_tampered_candidate_bundle() {
-        let root = unique_test_root("tampered-bundle");
-        let manifest = write_candidate_bundle_fixture(&root);
-        fs::write(
-            root.join("mutation-packet.json"),
-            "{\"objective\":\"tampered\"}\n",
-        )
-        .expect("tamper bundle");
+    fn registry_rejects_tampered_artifact_evidence() {
+        let root = unique_test_root("tampered-evidence");
+        let manifest = write_artifact_evidence_fixture(&root);
+        fs::write(root.join("artifact.json"), "{\"objective\":\"tampered\"}\n")
+            .expect("tamper evidence");
 
-        let report = verify_candidate_bundle_integrity(&manifest).expect("verify bundle");
+        let report = verify_artifact_evidence_integrity(&manifest).expect("verify evidence");
         assert!(!report.is_valid());
         assert!(
             report
@@ -1624,11 +1622,11 @@ mod tests {
 
         let mut registry = ArtifactRegistry::new();
         let error = registry
-            .register_verified_candidate_bundle(&manifest)
-            .expect_err("tampered bundle is rejected");
+            .register_verified_artifact_evidence(&manifest)
+            .expect_err("tampered evidence is rejected");
         assert!(matches!(
             error,
-            RegistryError::CandidateBundleIntegrityFailed { .. }
+            RegistryError::ArtifactEvidenceIntegrityFailed { .. }
         ));
 
         let _ = fs::remove_dir_all(root);
@@ -1803,30 +1801,23 @@ mod tests {
         (artifact, signer)
     }
 
-    fn write_candidate_bundle_fixture(root: &Path) -> CandidateBundleManifest {
-        fs::create_dir_all(root).expect("create bundle root");
-        let job_id = EvolutionJobId::from_legacy_named("evojob_registry_bundle").expect("job");
-        let mutation_packet_path = root.join("mutation-packet.json");
-        let changed_files_path = root.join("changed-files.json");
-        let diff_path = root.join("diff.patch");
-        let scorecard_path = root.join("scorecard.json");
+    fn write_artifact_evidence_fixture(root: &Path) -> ArtifactEvidenceManifest {
+        fs::create_dir_all(root).expect("create evidence root");
+        let evidence_id = Id::from_legacy_named("evidence_registry").expect("evidence");
+        let artifact_path = root.join("artifact.json");
         fs::write(
-            &mutation_packet_path,
-            "{\"objective\":\"verify registry bundle\"}\n",
+            &artifact_path,
+            "{\"objective\":\"verify registry evidence\"}\n",
         )
-        .expect("write mutation packet");
-        fs::write(&changed_files_path, "[\"crates/example/src/lib.rs\"]\n")
-            .expect("write changed files");
-        fs::write(&diff_path, "diff --git a/example b/example\n").expect("write diff");
-        fs::write(&scorecard_path, "{\"outcome\":\"passed\"}\n").expect("write scorecard");
+        .expect("write artifact evidence");
 
-        let files = build_candidate_bundle_file_digests(root).expect("digest bundle");
-        let content_hash = bundle_content_hash(&files);
-        let content_manifest_path = root.join("bundle-content-manifest.json");
-        let content_manifest = CandidateBundleContentManifest {
-            bundle_path: root.display().to_string(),
+        let files = build_artifact_evidence_file_digests(root).expect("digest evidence");
+        let content_hash = artifact_evidence_content_hash(&files);
+        let content_manifest_path = root.join("content-manifest.json");
+        let content_manifest = ArtifactEvidenceContentManifest {
+            evidence_path: root.display().to_string(),
             generated_at: "2026-06-01T00:00:00Z".to_string(),
-            bundle_content_hash: content_hash.clone(),
+            content_hash: content_hash.clone(),
             hash_algorithm: "blake3".to_string(),
             files,
         };
@@ -1836,32 +1827,18 @@ mod tests {
         )
         .expect("write content manifest");
 
-        let attestation_path = root.join("bundle-attestation.json");
-        let attestation = CandidateBundleAttestation {
+        let attestation_path = root.join("attestation.json");
+        let attestation = ArtifactEvidenceAttestation {
             statement_type: "https://in-toto.io/Statement/v1".to_string(),
-            predicate_type: "https://sinomo.net/attestations/evolution-candidate-bundle/v1"
-                .to_string(),
-            subject: CandidateBundleSubject {
-                name: format!("candidate-bundle:{job_id}"),
+            predicate_type: "https://sinomo.net/attestations/artifact-evidence/v1".to_string(),
+            subject: ArtifactEvidenceSubject {
+                name: format!("artifact-evidence:{evidence_id}"),
                 digest: content_hash.clone(),
             },
-            predicate: CandidateBundlePredicate {
-                job_id: job_id.clone(),
-                objective: "verify registry bundle".to_string(),
-                target_ring: TrustRing::R2TrustedService,
-                produced_by: "sinomo-evolution".to_string(),
-                mutation_worker: "agent-loop".to_string(),
-                provider: Some("test-provider".to_string()),
-                model: Some("test-model".to_string()),
-                source_workspace: "/source".to_string(),
-                candidate_worktree: root.join("worktree").display().to_string(),
-                candidate_branch: "sinomo/evolution/evojob_registry_bundle".to_string(),
-                source_revision: Some("git:test".to_string()),
-                verification_outcome: Some(EvaluationOutcome::Passed),
-                changed_files: vec!["crates/example/src/lib.rs".to_string()],
-                artifact_refs: vec![mutation_packet_path.display().to_string()],
-                generated_at: "2026-06-01T00:00:00Z".to_string(),
-            },
+            predicate: serde_json::json!({
+                "artifact_refs": [artifact_path.display().to_string()],
+                "generated_at": "2026-06-01T00:00:00Z",
+            }),
         };
         fs::write(
             &attestation_path,
@@ -1869,27 +1846,14 @@ mod tests {
         )
         .expect("write attestation");
 
-        CandidateBundleManifest {
-            job_id,
-            bundle_path: root.display().to_string(),
-            created_at: OffsetDateTime::now_utc(),
-            mutation_packet_path: mutation_packet_path.display().to_string(),
-            job_path: None,
-            model_output_path: None,
-            agent_run_path: None,
-            agent_summary_path: None,
-            benchmark_results_path: None,
-            resource_usage_path: None,
+        ArtifactEvidenceManifest {
+            evidence_id,
+            evidence_kind: "test-evidence".to_string(),
+            evidence_path: root.display().to_string(),
+            declared_content_hash: Some(content_hash),
             content_manifest_path: Some(content_manifest_path.display().to_string()),
             attestation_path: Some(attestation_path.display().to_string()),
-            registry_record_path: None,
-            bundle_content_hash: Some(content_hash),
-            changed_files_path: Some(changed_files_path.display().to_string()),
-            diff_path: Some(diff_path.display().to_string()),
-            scorecard_path: Some(scorecard_path.display().to_string()),
-            candidate_summary_path: None,
-            decision_path: None,
-            command_logs: Vec::new(),
+            evidence_refs: vec![artifact_path.display().to_string()],
         }
     }
 }

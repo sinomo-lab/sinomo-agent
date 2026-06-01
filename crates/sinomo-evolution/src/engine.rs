@@ -1,16 +1,21 @@
 //! Core autonomous self-evolution planning and orchestration.
 
 use crate::{
-    EvolutionJobId, EvolutionPaths, EvolutionPersistenceError, RecordedCandidateDecision,
-    RecordedCandidateVerification, StoredEvolutionJob, WorkspaceId,
-    record_candidate_decision_with_preflight, record_candidate_verification, write_bundle_manifest,
-    write_stored_job,
+    CandidateApprovalPreflightCheck, CandidateApprovalPreflightReport, CandidateBundleAttestation,
+    CandidateBundleContentManifest, CandidateBundleFileDigest, CandidateBundleManifest,
+    CandidateBundlePredicate, CandidateBundleSubject, CandidateDecisionOutcome, CommandLogRef,
+    EditScope, EvolutionJob, EvolutionJobId, EvolutionJobStatus, EvolutionPaths,
+    EvolutionPersistenceError, EvolutionScope, FileExcerpt, ModuleReplayReportRef,
+    MutationOutputContract, MutationPacket, RecordedCandidateDecision,
+    RecordedCandidateVerification, RecoveryPlan, StoredEvolutionJob, VerificationCommand,
+    VerificationPlan, WorkspaceId, record_candidate_decision_with_preflight,
+    record_candidate_verification, write_bundle_manifest, write_stored_job,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_agent::{
-    Agent, AgentConfig, AgentContextBudget, AgentEvolutionContext, AgentLoopInput, AgentModelEvent,
-    AgentPolicyBundle, AgentRole, AgentStoragePaths, AgentToolRegistry, BoundedContext,
-    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
+    Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentLoopInput,
+    AgentModelEvent, AgentPolicyBundle, AgentRole, AgentStoragePaths, AgentToolRegistry,
+    BoundedContext, FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
     InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
     user_interaction_input_event,
 };
@@ -26,15 +31,9 @@ use sinomo_lm::{
     normalize_model_provider,
 };
 use sinomo_runtime::core::{
-    CandidateApprovalPreflightCheck, CandidateApprovalPreflightReport, CandidateBundleAttestation,
-    CandidateBundleContentManifest, CandidateBundleFileDigest, CandidateBundleManifest,
-    CandidateBundlePredicate, CandidateBundleSubject, CandidateDecisionOutcome, CommandLogRef,
-    Confidence, ContextPacket, EditScope, EvaluationGate, EvaluationMetric, EvaluationOutcome,
-    EvaluationScorecard, EventEnvelope, EventKind, EvolutionJob, EvolutionJobStatus,
-    EvolutionScope, FileExcerpt, LatencyClass, MetricValue, ModuleReplayReportRef,
-    MutationOutputContract, MutationPacket, PrivacyClass, RecoveryPlan, RollbackPolicy,
-    RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing, VerificationCommand,
-    VerificationPlan,
+    Confidence, ContextPacket, EvaluationGate, EvaluationMetric, EvaluationOutcome,
+    EvaluationScorecard, EventEnvelope, EventKind, LatencyClass, MetricValue, PrivacyClass,
+    RollbackPolicy, RoutingHint, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_runtime::eval::{CommandRunResult, CommandRunner, ExecutingEvalHarness};
 use sinomo_runtime::events::{EventId, SessionId};
@@ -46,10 +45,10 @@ use sinomo_runtime::module::{
 };
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::registry::{
-    ArtifactRegistry, CANDIDATE_BUNDLE_VERIFIED_ROLLOUT_MATERIAL_RELATIVE_PATH,
-    CandidateBundleRegistryRecord, read_candidate_bundle_verified_rollout_material,
-    read_trusted_artifact_signers, validate_verified_candidate_rollout_material,
-    verify_and_write_verified_candidate_rollout_material, verify_candidate_bundle_integrity,
+    ArtifactEvidenceManifest, ArtifactEvidenceRecord, ArtifactRegistry,
+    RELEASE_MATERIAL_RELATIVE_PATH, VerifiedReleaseMaterialRecord, read_release_material_from_path,
+    read_trusted_artifact_signers, validate_verified_release_material,
+    verify_and_write_verified_release_material, verify_artifact_evidence_integrity,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -4773,13 +4772,7 @@ where
             session,
             latest_event,
             async_update: None,
-            evolution_context: Some(AgentEvolutionContext {
-                job: None,
-                mutation_packet: Some(packet.clone()),
-                candidate_bundle: bundle.cloned(),
-                verification_results: Vec::new(),
-                candidate_evidence: Vec::new(),
-            }),
+            context_attachments: vec![evolution_agent_context_attachment(packet, bundle)],
             tool_specs: default_coding_agent_tools(),
         };
         let run = agent
@@ -4867,6 +4860,24 @@ fn agent_stop_reason_label(reason: &sinomo_agent::AgentStopReason) -> String {
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| format!("{reason:?}"))
+}
+
+fn evolution_agent_context_attachment(
+    packet: &MutationPacket,
+    bundle: Option<&CandidateBundleManifest>,
+) -> AgentContextAttachment {
+    AgentContextAttachment {
+        kind: "sinomo.evolution.mutation".to_string(),
+        summary: format!("mutation packet for evolution job {}", packet.job_id),
+        payload_json: serde_json::json!({
+            "job_id": &packet.job_id,
+            "objective": &packet.objective,
+            "target_ring": &packet.target_ring,
+            "edit_scope": &packet.edit_scope,
+            "verification": &packet.verification,
+            "candidate_bundle": bundle,
+        }),
+    }
 }
 
 fn agent_model_usage_totals(events: &[AgentModelEvent]) -> (u64, u64) {
@@ -5313,7 +5324,7 @@ where
         );
         let (mut scorecard, command_results) = self
             .evaluator
-            .run_verification_plan(verification_plan, &candidate_workspace.path)?;
+            .run_verification_plan(verification_plan.into(), &candidate_workspace.path)?;
         for result in &command_results {
             let log_ref = write_command_log_via_store(&self.bundles, &bundle, result)?;
             bundle.command_logs.push(log_ref);
@@ -5468,9 +5479,10 @@ fn is_bundle_integrity_control_file(path: &str) -> bool {
             | "record.json"
             | "bundle-content-manifest.json"
             | "bundle-attestation.json"
-            | "candidate-bundle-registry-record.json"
+            | "artifact-evidence-record.json"
             | "candidate-summary.md"
             | "approval-decision.json"
+            | RELEASE_MATERIAL_RELATIVE_PATH
     )
 }
 
@@ -5572,14 +5584,31 @@ fn candidate_bundle_artifact_refs(bundle: &CandidateBundleManifest) -> Vec<Strin
     refs.extend(bundle.diff_path.iter().cloned());
     refs.extend(bundle.scorecard_path.iter().cloned());
     refs.extend(bundle.command_logs.iter().map(|log| log.log_path.clone()));
-    let rollout_material_path =
-        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(bundle);
+    let rollout_material_path = candidate_bundle_release_material_path(bundle);
     if rollout_material_path.exists() {
         refs.push(rollout_material_path.display().to_string());
     }
     refs.sort();
     refs.dedup();
     refs
+}
+
+fn candidate_bundle_release_material_path(bundle: &CandidateBundleManifest) -> PathBuf {
+    PathBuf::from(&bundle.bundle_path).join(RELEASE_MATERIAL_RELATIVE_PATH)
+}
+
+fn candidate_bundle_artifact_evidence_manifest(
+    bundle: &CandidateBundleManifest,
+) -> ArtifactEvidenceManifest {
+    ArtifactEvidenceManifest {
+        evidence_id: bundle.job_id.clone(),
+        evidence_kind: "evolution-candidate-bundle".to_string(),
+        evidence_path: bundle.bundle_path.clone(),
+        declared_content_hash: bundle.bundle_content_hash.clone(),
+        content_manifest_path: bundle.content_manifest_path.clone(),
+        attestation_path: bundle.attestation_path.clone(),
+        evidence_refs: candidate_bundle_artifact_refs(bundle),
+    }
 }
 
 fn write_json_file_for_bundle<T: Serialize>(path: &Path, value: &T) -> Result<(), BundleError> {
@@ -6288,7 +6317,7 @@ pub fn verify_stored_evolution_job<R: CommandRunner>(
     harness: &ExecutingEvalHarness<R>,
 ) -> Result<RecordedCandidateVerification, EvolutionError> {
     let (scorecard, results) = harness.run_verification_plan(
-        record.job.verification.clone(),
+        record.job.verification.clone().into(),
         &record.candidate_workspace.path,
     )?;
     record_candidate_verification(paths, record, &scorecard, &results).map_err(Into::into)
@@ -6437,7 +6466,8 @@ fn approval_preflight_report(
 fn candidate_bundle_integrity_preflight_check(
     record: &StoredEvolutionJob,
 ) -> CandidateApprovalPreflightCheck {
-    match verify_candidate_bundle_integrity(&record.bundle) {
+    let evidence_manifest = candidate_bundle_artifact_evidence_manifest(&record.bundle);
+    match verify_artifact_evidence_integrity(&evidence_manifest) {
         Ok(report) if report.is_valid() => CandidateApprovalPreflightCheck {
             name: "candidate-bundle-integrity".to_string(),
             outcome: EvaluationOutcome::Passed,
@@ -6473,7 +6503,9 @@ fn candidate_verified_rollout_material_preflight_check(
     paths: &EvolutionPaths,
     record: &StoredEvolutionJob,
 ) -> CandidateApprovalPreflightCheck {
-    let material = match read_candidate_bundle_verified_rollout_material(&record.bundle) {
+    let material = match read_release_material_from_path(candidate_bundle_release_material_path(
+        &record.bundle,
+    )) {
         Ok(Some(material)) => material,
         Ok(None) => {
             return CandidateApprovalPreflightCheck {
@@ -6481,7 +6513,7 @@ fn candidate_verified_rollout_material_preflight_check(
                 outcome: EvaluationOutcome::Passed,
                 summary: format!(
                     "candidate bundle does not contain `{}`",
-                    CANDIDATE_BUNDLE_VERIFIED_ROLLOUT_MATERIAL_RELATIVE_PATH
+                    RELEASE_MATERIAL_RELATIVE_PATH
                 ),
             };
         }
@@ -6495,8 +6527,9 @@ fn candidate_verified_rollout_material_preflight_check(
     };
 
     let mut registry = ArtifactRegistry::new();
-    let candidate_bundle = match registry.register_verified_candidate_bundle(&record.bundle) {
-        Ok(candidate_bundle) => candidate_bundle.clone(),
+    let evidence_manifest = candidate_bundle_artifact_evidence_manifest(&record.bundle);
+    let artifact_evidence = match registry.register_verified_artifact_evidence(&evidence_manifest) {
+        Ok(artifact_evidence) => artifact_evidence.clone(),
         Err(error) => {
             return CandidateApprovalPreflightCheck {
                 name: "candidate-verified-rollout-material".to_string(),
@@ -6517,11 +6550,13 @@ fn candidate_verified_rollout_material_preflight_check(
             };
         }
     };
-    let report = validate_verified_candidate_rollout_material(
-        &material,
-        &candidate_bundle,
-        &trusted_signers,
+    let material = materialize_candidate_verified_rollout_material(
+        material,
+        &record.bundle,
+        &artifact_evidence,
     );
+    let report =
+        validate_verified_release_material(&material, &artifact_evidence, &trusted_signers);
     CandidateApprovalPreflightCheck {
         name: "candidate-verified-rollout-material".to_string(),
         outcome: if report.is_valid() {
@@ -6670,18 +6705,15 @@ fn failed_preflight_summary(report: &CandidateApprovalPreflightReport) -> String
 fn write_candidate_bundle_registry_record(
     paths: &EvolutionPaths,
     record: &mut StoredEvolutionJob,
-) -> Result<CandidateBundleRegistryRecord, EvolutionError> {
+) -> Result<ArtifactEvidenceRecord, EvolutionError> {
     let mut registry = ArtifactRegistry::new();
+    let evidence_manifest = candidate_bundle_artifact_evidence_manifest(&record.bundle);
     let registry_record = registry
-        .register_verified_candidate_bundle(&record.bundle)?
+        .register_verified_artifact_evidence(&evidence_manifest)?
         .clone();
-    let path =
-        PathBuf::from(&record.bundle.bundle_path).join("candidate-bundle-registry-record.json");
+    let path = PathBuf::from(&record.bundle.bundle_path).join("artifact-evidence-record.json");
     write_json_file_for_bundle(&path, &registry_record)?;
-    sinomo_runtime::registry::write_candidate_bundle_registry_record(
-        &paths.data_dir,
-        &registry_record,
-    )?;
+    sinomo_runtime::registry::write_artifact_evidence_record(&paths.data_dir, &registry_record)?;
     record.bundle.registry_record_path = Some(path.display().to_string());
     Ok(registry_record)
 }
@@ -6689,43 +6721,59 @@ fn write_candidate_bundle_registry_record(
 fn write_candidate_verified_rollout_material_if_present(
     paths: &EvolutionPaths,
     record: &StoredEvolutionJob,
-    candidate_bundle: &CandidateBundleRegistryRecord,
+    artifact_evidence: &ArtifactEvidenceRecord,
 ) -> Result<Option<PathBuf>, EvolutionError> {
-    let Some(mut material) = read_candidate_bundle_verified_rollout_material(&record.bundle)?
+    let Some(material) =
+        read_release_material_from_path(candidate_bundle_release_material_path(&record.bundle))?
     else {
         return Ok(None);
     };
-    material.registered_at = OffsetDateTime::now_utc();
-    material.evidence_refs = candidate_verified_rollout_material_evidence_refs(
-        material.evidence_refs,
+    let material = materialize_candidate_verified_rollout_material(
+        material,
         &record.bundle,
-        candidate_bundle,
+        artifact_evidence,
     );
     let trusted_signers = read_trusted_artifact_signers(&paths.data_dir)?;
-    let (path, _report) = verify_and_write_verified_candidate_rollout_material(
+    let (path, _report) = verify_and_write_verified_release_material(
         &paths.data_dir,
         &material,
-        candidate_bundle,
+        artifact_evidence,
         &trusted_signers,
     )?;
     Ok(Some(path))
 }
 
+fn materialize_candidate_verified_rollout_material(
+    mut material: VerifiedReleaseMaterialRecord,
+    bundle: &CandidateBundleManifest,
+    artifact_evidence: &ArtifactEvidenceRecord,
+) -> VerifiedReleaseMaterialRecord {
+    material.registered_at = OffsetDateTime::now_utc();
+    material.release_id = artifact_evidence.evidence_id.clone();
+    material.release_material_hash = artifact_evidence.content_hash.clone();
+    material.evidence_refs = candidate_verified_rollout_material_evidence_refs(
+        material.evidence_refs,
+        bundle,
+        artifact_evidence,
+    );
+    material
+}
+
 fn candidate_verified_rollout_material_evidence_refs(
     mut refs: Vec<String>,
     bundle: &CandidateBundleManifest,
-    candidate_bundle: &CandidateBundleRegistryRecord,
+    artifact_evidence: &ArtifactEvidenceRecord,
 ) -> Vec<String> {
     refs.push(format!(
-        "registry://candidate-bundle/{}",
-        candidate_bundle.job_id
+        "registry://artifact-evidence/{}",
+        artifact_evidence.evidence_id
     ));
     refs.push(
-        sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(bundle)
+        candidate_bundle_release_material_path(bundle)
             .display()
             .to_string(),
     );
-    refs.extend(candidate_bundle.evidence_refs.iter().cloned());
+    refs.extend(artifact_evidence.evidence_refs.iter().cloned());
     refs.extend(bundle.registry_record_path.iter().cloned());
     refs.sort();
     refs.dedup();
@@ -7035,15 +7083,15 @@ impl EvolutionPlanner {
             objective: opportunity.objective,
             target_ring: opportunity.target_ring,
             target_module_id: opportunity.target_module_id,
-            edit_scope: sinomo_runtime::core::EditScope {
+            edit_scope: EditScope {
                 workspace_root: opportunity.workspace_id.to_string(),
                 intended_paths: opportunity.allowed_paths.clone(),
                 notes: "planner-scoped evolution opportunity".to_string(),
             },
-            verification: sinomo_runtime::core::VerificationPlan {
+            verification: VerificationPlan {
                 commands: required_gates
                     .iter()
-                    .map(|gate| sinomo_runtime::core::VerificationCommand {
+                    .map(|gate| VerificationCommand {
                         name: format!("{gate:?}"),
                         command: "cargo check".to_string(),
                         expected_exit_code: 0,
@@ -7052,7 +7100,7 @@ impl EvolutionPlanner {
                     .collect(),
                 module_replay_reports: Vec::new(),
             },
-            recovery: sinomo_runtime::core::RecoveryPlan::default(),
+            recovery: RecoveryPlan::default(),
             scope: EvolutionScope {
                 allowed_paths: opportunity.allowed_paths.clone(),
                 forbidden_paths: opportunity.forbidden_paths.clone(),
@@ -9975,17 +10023,14 @@ mod tests {
         assert!(registry_record_path.exists());
         let registry_record =
             fs::read_to_string(&registry_record_path).expect("registry record artifact");
-        assert!(registry_record.contains("\"bundle_content_hash\""));
+        assert!(registry_record.contains("\"content_hash\""));
         let durable_registry_record_path =
-            sinomo_runtime::registry::candidate_bundle_registry_record_path(
-                &data_root,
-                &record.job.job_id,
-            );
+            sinomo_runtime::registry::artifact_evidence_record_path(&data_root, &record.job.job_id);
         assert!(durable_registry_record_path.exists());
         assert!(
             fs::read_to_string(&durable_registry_record_path)
                 .expect("durable registry record")
-                .contains("\"bundle_content_hash\"")
+                .contains("\"content_hash\"")
         );
         let summary_path = recorded
             .record
@@ -10003,7 +10048,7 @@ mod tests {
         assert!(
             fs::read_to_string(&summary_path)
                 .expect("candidate summary")
-                .contains("candidate-bundle-registry-record.json")
+                .contains("artifact-evidence-record.json")
         );
         assert!(
             fs::read_to_string(recorded.decision_path)
@@ -10038,10 +10083,7 @@ mod tests {
             std::slice::from_ref(&signer),
         )
         .expect("write trusted signer");
-        let material_path =
-            sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(
-                &record.bundle,
-            );
+        let material_path = candidate_bundle_release_material_path(&record.bundle);
         fs::write(
             &material_path,
             serde_json::to_string_pretty(&material).expect("material json"),
@@ -10066,19 +10108,18 @@ mod tests {
         )
         .expect("approve candidate with rollout material");
 
-        let durable_material_path =
-            sinomo_runtime::registry::verified_candidate_rollout_material_path(
-                &data_root,
-                &record.job.job_id,
-            );
+        let durable_material_path = sinomo_runtime::registry::verified_release_material_path(
+            &data_root,
+            &record.job.job_id,
+        );
         assert!(durable_material_path.exists());
-        let durable_material = sinomo_runtime::registry::read_verified_candidate_rollout_material(
+        let durable_material = sinomo_runtime::registry::read_verified_release_material(
             &data_root,
             &record.job.job_id,
         )
         .expect("read durable material")
         .expect("durable material");
-        assert_eq!(durable_material.candidate_bundle_job_id, record.job.job_id);
+        assert_eq!(durable_material.release_id, record.job.job_id);
         assert_eq!(
             durable_material.artifact.artifact_id,
             material.artifact.artifact_id
@@ -10088,7 +10129,7 @@ mod tests {
                 .evidence_refs
                 .iter()
                 .any(|evidence| evidence
-                    == &format!("registry://candidate-bundle/{}", record.job.job_id))
+                    == &format!("registry://artifact-evidence/{}", record.job.job_id))
         );
         let preflight = recorded
             .record
@@ -10133,10 +10174,7 @@ mod tests {
         let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
         let (material, _signer) =
             rollout_material_fixture(&data_root, &record.job.job_id, "approval-untrusted-signer");
-        let material_path =
-            sinomo_runtime::registry::candidate_bundle_verified_rollout_material_path(
-                &record.bundle,
-            );
+        let material_path = candidate_bundle_release_material_path(&record.bundle);
         fs::write(
             &material_path,
             serde_json::to_string_pretty(&material).expect("material json"),
@@ -10175,7 +10213,7 @@ mod tests {
                 && check.outcome == EvaluationOutcome::Failed
         }));
         assert!(
-            sinomo_runtime::registry::read_verified_candidate_rollout_material(
+            sinomo_runtime::registry::read_verified_release_material(
                 &data_root,
                 &record.job.job_id,
             )
@@ -10951,7 +10989,7 @@ index 3b18e51..6320cd2 100644
         job_id: &EvolutionJobId,
         signer_id: &str,
     ) -> (
-        sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord,
+        sinomo_runtime::registry::VerifiedReleaseMaterialRecord,
         sinomo_runtime::registry::TrustedArtifactSigner,
     ) {
         let identity_path = root.join(format!("{signer_id}.identity.sobj"));
@@ -10980,7 +11018,7 @@ index 3b18e51..6320cd2 100644
             ),
             provenance: sinomo_runtime::core::ArtifactProvenance {
                 produced_by: sinomo_runtime::core::ActorRef {
-                    kind: sinomo_runtime::core::ActorKind::EvolutionOrchestrator,
+                    kind: sinomo_runtime::core::ActorKind::Operator,
                     id: "sinomo-evolution-test".to_string(),
                 },
                 source_event_id: None,
@@ -10997,8 +11035,9 @@ index 3b18e51..6320cd2 100644
             identity.public_key,
             "approval test signer",
         );
-        let material = sinomo_runtime::registry::VerifiedCandidateRolloutMaterialRecord {
-            candidate_bundle_job_id: job_id.clone(),
+        let material = sinomo_runtime::registry::VerifiedReleaseMaterialRecord {
+            release_id: job_id.clone(),
+            release_material_hash: String::new(),
             artifact: artifact.clone(),
             policy_decision: sinomo_runtime::core::PolicyDecision {
                 decision_id: Id::from_legacy_named("policy_rollout_material").expect("policy"),

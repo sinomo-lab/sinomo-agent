@@ -517,7 +517,7 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
             latest_event: message.clone(),
             context,
             async_update: None,
-            evolution_context: None,
+            context_attachments: Vec::new(),
             tool_specs: sinomo_agent::default_main_agent_tools(),
         };
         let requested = interaction_event(

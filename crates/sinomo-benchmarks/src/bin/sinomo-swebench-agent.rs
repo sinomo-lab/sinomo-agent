@@ -174,7 +174,7 @@ fn run() -> Result<(), String> {
         session,
         latest_event,
         async_update: None,
-        evolution_context: None,
+        context_attachments: Vec::new(),
         tool_specs: default_coding_agent_tools(),
     };
     let run = agent.run(&input).map_err(|source| source.to_string())?;

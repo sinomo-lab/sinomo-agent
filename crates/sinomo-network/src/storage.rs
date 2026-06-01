@@ -370,9 +370,9 @@ pub struct ClusterModuleRolloutDesiredRecord {
     pub rollout_plan: sinomo_core::RolloutPlan,
     pub requested_by_node_id: NodeId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_bundle_job_id: Option<sinomo_core::Id>,
+    pub release_id: Option<sinomo_core::Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle_content_hash: Option<String>,
+    pub release_material_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,9 +391,9 @@ pub struct ClusterModuleRolloutReconciliationRecord {
     pub state: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_bundle_job_id: Option<sinomo_core::Id>,
+    pub release_id: Option<sinomo_core::Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bundle_content_hash: Option<String>,
+    pub release_material_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_runtime_stage: Option<String>,
     #[serde(with = "time::serde::rfc3339")]

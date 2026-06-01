@@ -289,8 +289,8 @@ pub struct AgentLoopInput {
     pub context: BoundedContext,
     #[serde(default)]
     pub async_update: Option<AsyncTaskUpdate>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evolution_context: Option<AgentEvolutionContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_attachments: Vec<AgentContextAttachment>,
     #[serde(default)]
     pub tool_specs: Vec<AgentToolSpec>,
 }
@@ -1221,7 +1221,7 @@ mod tests {
             latest_event,
             context,
             async_update: None,
-            evolution_context: None,
+            context_attachments: Vec::new(),
             tool_specs: default_main_agent_tools(),
         };
         let agent_loop = MainAgentLoop::new(
@@ -1303,7 +1303,7 @@ mod tests {
                 result_ref: None,
                 next_action_hint: AsyncTaskNextAction::ContinueSilently,
             }),
-            evolution_context: None,
+            context_attachments: Vec::new(),
             tool_specs: default_main_agent_tools(),
         };
         let agent_loop = MainAgentLoop::new(

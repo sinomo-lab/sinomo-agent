@@ -7,9 +7,6 @@ use sinomo_agent::{
     InteractionSession, InteractionSurface, InteractionSurfaceKind, MainAgentLoop,
     interaction_event, interaction_model_request, user_interaction_input_event,
 };
-use sinomo_evolution::EvolutionJobId;
-#[cfg(test)]
-use sinomo_evolution::is_terminal_status;
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
     CampaignBundlePaths, CampaignProposalInput, CandidateDecisionOptions,
@@ -33,6 +30,9 @@ use sinomo_evolution::{
     write_campaign_iteration_evaluation, write_campaign_schedule_dry_run,
     write_campaign_stage_evaluation, write_report_record,
 };
+use sinomo_evolution::{CandidateDecisionOutcome, EvolutionJobId};
+#[cfg(test)]
+use sinomo_evolution::{EvolutionJobStatus, is_terminal_status};
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
     DeepSeekProvider, GeminiProvider, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY,
@@ -54,13 +54,11 @@ use sinomo_pytorch::{
     PytorchDevice, PytorchMode, RemotePytorchRuntime, RemotePytorchRuntimeConfig,
     is_loopback_http_endpoint,
 };
-#[cfg(test)]
-use sinomo_runtime::core::EvolutionJobStatus;
 use sinomo_runtime::core::{
-    CandidateDecisionOutcome, ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite,
-    ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
-    ClusterNodeRole, ClusterNodeRolloutStatus, EvaluationOutcome, EvaluationScorecard,
-    EventEnvelope, RollbackTrigger, TrustRing,
+    ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
+    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
+    ClusterNodeRolloutStatus, EvaluationOutcome, EvaluationScorecard, EventEnvelope,
+    RollbackTrigger, TrustRing,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::read_cluster_kv_snapshot as daemon_read_cluster_kv_snapshot;
@@ -743,7 +741,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         latest_event: input_event,
         context,
         async_update: None,
-        evolution_context: None,
+        context_attachments: Vec::new(),
         tool_specs: sinomo_agent::default_main_agent_tools(),
     };
     let provider = options.provider.clone();

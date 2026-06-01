@@ -20,8 +20,8 @@ use sinomo_lm::{
     LanguageModelToolSpec, inferred_model_context_window_tokens,
 };
 use sinomo_runtime::core::{
-    CandidateBundleManifest, Confidence, EventEnvelope, EventKind, EvolutionJob, LatencyClass,
-    MutationPacket, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
+    Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source,
 };
 use sinomo_runtime::events::{EventId, SessionId};
 use sinomo_runtime::local::SinomoDataDir;
@@ -510,36 +510,11 @@ impl Default for AgentVerificationState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct AgentEvolutionContext {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job: Option<EvolutionJob>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutation_packet: Option<MutationPacket>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_bundle: Option<CandidateBundleManifest>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verification_results: Vec<AgentEvolutionVerificationResult>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub candidate_evidence: Vec<AgentCandidateEvidence>,
-}
-
-impl AgentEvolutionContext {
-    pub fn for_job(job: EvolutionJob) -> Self {
-        Self {
-            job: Some(job),
-            mutation_packet: None,
-            candidate_bundle: None,
-            verification_results: Vec::new(),
-            candidate_evidence: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct AgentEvolutionVerificationResult {
-    pub command: String,
-    pub status: AgentVerificationState,
+pub struct AgentContextAttachment {
+    pub kind: String,
     pub summary: String,
+    #[serde(default)]
+    pub payload_json: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -568,11 +543,9 @@ pub enum AgentCandidateEvidence {
 pub struct AgentCandidateEvidenceBundle {
     pub bundle_id: TaskId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub job_id: Option<TaskId>,
+    pub context_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutation_packet_job_id: Option<TaskId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub candidate_bundle_path: Option<String>,
+    pub context_summary: Option<String>,
     pub final_response: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<AgentCandidateEvidence>,
@@ -595,8 +568,8 @@ pub struct TurnContext {
     pub loaded_instruction_files: Vec<InstructionFileContext>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_references: Vec<PromptReferenceContext>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evolution_job_facts: Option<AgentEvolutionContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_attachments: Vec<AgentContextAttachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub available_tool_specs: Vec<AgentToolDescriptor>,
     pub budget_estimate: ContextBudgetEstimate,
@@ -647,7 +620,7 @@ pub struct ContextBudgetEstimate {
     #[serde(default)]
     pub prompt_reference_bytes: usize,
     #[serde(default)]
-    pub evolution_context_bytes: usize,
+    pub context_attachment_bytes: usize,
     pub total_bytes: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_bytes: Option<usize>,
@@ -1055,10 +1028,7 @@ impl ContextAssembler {
         let prompt_reference_bytes = serde_json::to_vec(&prompt_references)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
-        let evolution_context_bytes = input
-            .evolution_context
-            .as_ref()
-            .and_then(|context| serde_json::to_vec(context).ok())
+        let context_attachment_bytes = serde_json::to_vec(&input.context_attachments)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
         let session_projection_bytes = session_projection
@@ -1121,11 +1091,11 @@ impl ContextAssembler {
                 priority: 1,
             });
         }
-        if evolution_context_bytes > 0 {
+        if context_attachment_bytes > 0 {
             lanes.push(ContextBudgetLane {
-                kind: "evolution_context".to_string(),
-                label: "evolution job and candidate evidence".to_string(),
-                bytes: evolution_context_bytes,
+                kind: "context_attachments".to_string(),
+                label: "typed context attachments".to_string(),
+                bytes: context_attachment_bytes,
                 priority: 1,
             });
         }
@@ -1139,7 +1109,7 @@ impl ContextAssembler {
             workspace_facts_bytes,
             instruction_file_bytes,
             prompt_reference_bytes,
-            evolution_context_bytes,
+            context_attachment_bytes,
             total_bytes: system_instructions.len()
                 + session_projection_bytes
                 + transcript_bytes
@@ -1147,7 +1117,7 @@ impl ContextAssembler {
                 + workspace_facts_bytes
                 + instruction_file_bytes
                 + prompt_reference_bytes
-                + evolution_context_bytes,
+                + context_attachment_bytes,
             max_context_bytes: config.context_budget.max_context_bytes,
             compaction_threshold_bytes: config.context_budget.compaction_threshold_bytes(),
             lanes,
@@ -1183,11 +1153,11 @@ impl ContextAssembler {
         }
         included.extend(instruction_sources);
         included.extend(prompt_reference_sources);
-        if input.evolution_context.is_some() {
+        if !input.context_attachments.is_empty() {
             included.push(ContextSource {
-                kind: "evolution_context".to_string(),
-                label: "evolution job, mutation, verification, and candidate evidence".to_string(),
-                bytes: budget_estimate.evolution_context_bytes,
+                kind: "context_attachments".to_string(),
+                label: "typed context attachments".to_string(),
+                bytes: budget_estimate.context_attachment_bytes,
             });
         }
         if input.async_update.is_some() {
@@ -1232,7 +1202,7 @@ impl ContextAssembler {
             workspace_facts,
             loaded_instruction_files,
             prompt_references,
-            evolution_job_facts: input.evolution_context.clone(),
+            context_attachments: input.context_attachments.clone(),
             available_tool_specs: tool_descriptors,
             budget_estimate,
             report,
@@ -3256,11 +3226,8 @@ impl<M: InteractionModel> Agent<M> {
         )?;
         events.push(completed_event);
 
-        let candidate_evidence_bundle = build_candidate_evidence_bundle(
-            input.evolution_context.as_ref(),
-            &final_decision,
-            &items,
-        );
+        let candidate_evidence_bundle =
+            build_candidate_evidence_bundle(&input.context_attachments, &final_decision, &items);
 
         Ok(AgentRun {
             final_decision,
@@ -3790,7 +3757,7 @@ fn render_turn_context_message(
         "workspace_facts": turn_context.workspace_facts,
         "loaded_instruction_files": turn_context.loaded_instruction_files,
         "prompt_references": turn_context.prompt_references,
-        "evolution_job_facts": turn_context.evolution_job_facts,
+        "context_attachments": turn_context.context_attachments,
         "async_update": input.async_update,
         "context_budget_estimate": turn_context.budget_estimate,
         "context_report_id": turn_context.report.report_id,
@@ -4255,19 +4222,14 @@ fn verification_command_from_tool_outcome(outcome: &AgentToolOutcome) -> String 
 }
 
 fn build_candidate_evidence_bundle(
-    evolution_context: Option<&AgentEvolutionContext>,
+    context_attachments: &[AgentContextAttachment],
     final_decision: &AgentLoopDecision,
     items: &[AgentItem],
 ) -> Option<AgentCandidateEvidenceBundle> {
-    let context = evolution_context?;
-    let mut evidence = context.candidate_evidence.clone();
-    evidence.extend(context.verification_results.iter().map(|result| {
-        AgentCandidateEvidence::Verification {
-            command: result.command.clone(),
-            status: result.status.clone(),
-            summary: result.summary.clone(),
-        }
-    }));
+    if context_attachments.is_empty() {
+        return None;
+    }
+    let mut evidence = Vec::new();
     for item in items {
         match item {
             AgentItem::PatchSnapshot {
@@ -4297,30 +4259,12 @@ fn build_candidate_evidence_bundle(
 
     Some(AgentCandidateEvidenceBundle {
         bundle_id: TaskId::generate(),
-        job_id: context
-            .job
-            .as_ref()
-            .map(|job| job.job_id.clone())
-            .or_else(|| {
-                context
-                    .candidate_bundle
-                    .as_ref()
-                    .map(|manifest| manifest.job_id.clone())
-            })
-            .or_else(|| {
-                context
-                    .mutation_packet
-                    .as_ref()
-                    .map(|packet| packet.job_id.clone())
-            }),
-        mutation_packet_job_id: context
-            .mutation_packet
-            .as_ref()
-            .map(|packet| packet.job_id.clone()),
-        candidate_bundle_path: context
-            .candidate_bundle
-            .as_ref()
-            .map(|manifest| manifest.bundle_path.clone()),
+        context_kind: context_attachments
+            .first()
+            .map(|context| context.kind.clone()),
+        context_summary: context_attachments
+            .first()
+            .map(|context| context.summary.clone()),
         final_response: final_decision.text.clone(),
         evidence,
     })
@@ -4597,7 +4541,7 @@ mod tests {
                 packet: sinomo_runtime::core::ContextPacket::default(),
             },
             async_update: None,
-            evolution_context: None,
+            context_attachments: Vec::new(),
             tool_specs: default_coding_agent_tools(),
         }
     }
@@ -7291,18 +7235,20 @@ old
     }
 
     #[test]
-    fn turn_context_renders_evolution_context_for_model() {
-        let mut input = agent_input("continue the evolution job");
-        input.evolution_context = Some(AgentEvolutionContext {
-            job: None,
-            mutation_packet: None,
-            candidate_bundle: None,
-            verification_results: vec![AgentEvolutionVerificationResult {
-                command: "cargo test -p sinomo-agent".to_string(),
-                status: AgentVerificationState::Passed,
-                summary: "baseline passed".to_string(),
-            }],
-            candidate_evidence: Vec::new(),
+    fn turn_context_renders_context_attachments_for_model() {
+        let mut input = agent_input("continue the attached job");
+        input.context_attachments.push(AgentContextAttachment {
+            kind: "sinomo.evolution.mutation".to_string(),
+            summary: "candidate verification context".to_string(),
+            payload_json: serde_json::json!({
+                "verification_results": [
+                    {
+                        "command": "cargo test -p sinomo-agent",
+                        "status": "passed",
+                        "summary": "baseline passed"
+                    }
+                ]
+            }),
         });
         let agent = Agent::new(
             SequencedModel::new([r#"{
@@ -7319,17 +7265,17 @@ old
         let context = agent.assemble_context(&input, &[], 0).expect("context");
         let request = agent.request(&input, &[], 0).expect("request");
 
-        assert!(context.evolution_job_facts.is_some());
+        assert_eq!(context.context_attachments.len(), 1);
         assert!(
             context
                 .report
                 .included
                 .iter()
-                .any(|source| source.kind == "evolution_context")
+                .any(|source| source.kind == "context_attachments")
         );
-        assert!(context.budget_estimate.evolution_context_bytes > 0);
+        assert!(context.budget_estimate.context_attachment_bytes > 0);
         assert!(request.messages.iter().any(|message| {
-            message.content.contains("evolution_job_facts")
+            message.content.contains("context_attachments")
                 && message.content.contains("cargo test -p sinomo-agent")
         }));
     }
@@ -7376,12 +7322,12 @@ old
         let agent = Agent::new(model, "fake", "fake")
             .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
         let mut input = agent_input("build a candidate");
-        input.evolution_context = Some(AgentEvolutionContext {
-            job: None,
-            mutation_packet: None,
-            candidate_bundle: None,
-            verification_results: Vec::new(),
-            candidate_evidence: Vec::new(),
+        input.context_attachments.push(AgentContextAttachment {
+            kind: "sinomo.evolution.mutation".to_string(),
+            summary: "candidate mutation context".to_string(),
+            payload_json: serde_json::json!({
+                "objective": "build a candidate"
+            }),
         });
 
         let run = agent.run(&input).expect("run");

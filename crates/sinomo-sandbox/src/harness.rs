@@ -26,8 +26,17 @@ pub struct SandboxCommandResult {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SandboxRunSubject {
+    pub subject_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxRunRequest {
-    pub job: EvolutionJob,
+    pub subject: SandboxRunSubject,
     pub candidate_artifact_id: ArtifactId,
     pub workspace_snapshot: SandboxWorkspaceSnapshot,
     pub limits: ModuleResourceLimits,
@@ -37,7 +46,7 @@ pub struct SandboxRunRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SandboxRunResult {
-    pub job_id: Id,
+    pub subject_id: Id,
     pub candidate_artifact_id: ArtifactId,
     pub status: SandboxRunStatus,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -66,9 +75,8 @@ impl SandboxHarness {
 
     pub fn run(&self, request: SandboxRunRequest) -> SandboxRunResult {
         let mut violations = Vec::new();
-        if request.job.scope.workspace_id.as_ref() != Some(&request.workspace_snapshot.workspace_id)
-        {
-            violations.push("job scope workspace does not match sandbox snapshot".to_string());
+        if request.subject.workspace_id.as_ref() != Some(&request.workspace_snapshot.workspace_id) {
+            violations.push("subject workspace does not match sandbox snapshot".to_string());
         }
         if request.limits.cpu_ms == 0 || request.limits.memory_mb == 0 {
             violations.push("resource limits must be non-zero".to_string());
@@ -94,7 +102,7 @@ impl SandboxHarness {
         };
 
         SandboxRunResult {
-            job_id: request.job.job_id,
+            subject_id: request.subject.subject_id,
             candidate_artifact_id: request.candidate_artifact_id,
             status,
             violations,
@@ -128,7 +136,7 @@ impl SandboxHarness {
             ),
         )
         .with_payload(serde_json::json!({
-            "job_id": result.job_id,
+            "subject_id": result.subject_id,
             "candidate_artifact_id": result.candidate_artifact_id,
             "status": result.status,
             "violations": result.violations,

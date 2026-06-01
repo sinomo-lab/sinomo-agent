@@ -15,8 +15,8 @@ pub(crate) use crate::store::*;
 pub(crate) use crate::toolchain::*;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use sinomo_core::{
-    Confidence, EventEnvelope, EventKind, EvolutionJob, Id, LatencyClass, ModuleResourceLimits,
-    PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
+    Confidence, EventEnvelope, EventKind, Id, LatencyClass, ModuleResourceLimits, PrivacyClass,
+    RoutingMetadata, RoutingScope, Salience, Source,
 };
 pub(crate) use sinomo_dfs::{
     DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions, NetworkedDfsService,

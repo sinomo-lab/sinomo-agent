@@ -23,9 +23,7 @@ use sinomo_module::{
     module_loader_state_path, verify_artifact_signature, write_module_loader_runtime_state,
 };
 use sinomo_node::NodeId;
-use sinomo_registry::{
-    CandidateBundleRegistryRecord, TrustedArtifactSigner, authorize_artifact_signature,
-};
+use sinomo_registry::{TrustedArtifactSigner, authorize_artifact_signature};
 use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -494,26 +492,29 @@ pub enum RolloutAction {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct VerifiedCandidateRolloutRequest {
+pub struct VerifiedArtifactRolloutRequest {
     pub node_id: NodeId,
     pub artifact: ArtifactManifest,
     pub policy_decision: PolicyDecision,
     pub rollout_plan: RolloutPlan,
-    pub candidate_bundle: CandidateBundleRegistryRecord,
+    pub release_id: sinomo_core::Id,
+    pub release_material_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_signers: Vec<TrustedArtifactSigner>,
     pub active_artifact_id: ArtifactId,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct VerifiedCandidateRolloutPreparation {
+pub struct VerifiedArtifactRolloutPreparation {
     pub accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_decision: Option<LoadDecision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_state: Option<RolloutRuntimeState>,
-    pub candidate_bundle_job_id: sinomo_core::Id,
-    pub bundle_content_hash: String,
+    pub release_id: sinomo_core::Id,
+    pub release_material_hash: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_refs: Vec<String>,
     pub reason: String,
@@ -537,25 +538,25 @@ impl RolloutController {
         Self { node_id }
     }
 
-    pub fn prepare_verified_candidate_rollout(
+    pub fn prepare_verified_artifact_rollout(
         &self,
-        request: VerifiedCandidateRolloutRequest,
-    ) -> VerifiedCandidateRolloutPreparation {
-        if let Some(reason) = verified_candidate_rollout_blocker(&self.node_id, &request) {
-            return VerifiedCandidateRolloutPreparation {
+        request: VerifiedArtifactRolloutRequest,
+    ) -> VerifiedArtifactRolloutPreparation {
+        if let Some(reason) = verified_artifact_rollout_blocker(&self.node_id, &request) {
+            return VerifiedArtifactRolloutPreparation {
                 accepted: false,
                 load_decision: None,
                 initial_state: None,
-                candidate_bundle_job_id: request.candidate_bundle.job_id,
-                bundle_content_hash: request.candidate_bundle.bundle_content_hash,
-                evidence_refs: request.candidate_bundle.evidence_refs,
+                release_id: request.release_id,
+                release_material_hash: request.release_material_hash,
+                evidence_refs: request.evidence_refs,
                 reason,
             };
         }
 
-        let candidate_bundle_job_id = request.candidate_bundle.job_id.clone();
-        let bundle_content_hash = request.candidate_bundle.bundle_content_hash.clone();
-        let evidence_refs = request.candidate_bundle.evidence_refs.clone();
+        let release_id = request.release_id.clone();
+        let release_material_hash = request.release_material_hash.clone();
+        let evidence_refs = request.evidence_refs.clone();
         let load_decision =
             match ModuleLoader::new(self.node_id.clone()).evaluate_load(LoadRequest {
                 node_id: request.node_id,
@@ -565,12 +566,12 @@ impl RolloutController {
             }) {
                 Ok(decision) => decision,
                 Err(error) => {
-                    return VerifiedCandidateRolloutPreparation {
+                    return VerifiedArtifactRolloutPreparation {
                         accepted: false,
                         load_decision: None,
                         initial_state: None,
-                        candidate_bundle_job_id,
-                        bundle_content_hash,
+                        release_id,
+                        release_material_hash,
                         evidence_refs,
                         reason: error.to_string(),
                     };
@@ -587,32 +588,32 @@ impl RolloutController {
         };
         let reason = if accepted {
             format!(
-                "verified candidate bundle {} prepared for rollout; loader action {:?}",
-                candidate_bundle_job_id, load_decision.action
+                "verified release {} prepared for rollout; loader action {:?}",
+                release_id, load_decision.action
             )
         } else {
             format!(
-                "loader rejected verified candidate bundle {}: {}",
-                candidate_bundle_job_id, load_decision.reason
+                "loader rejected verified release {}: {}",
+                release_id, load_decision.reason
             )
         };
-        VerifiedCandidateRolloutPreparation {
+        VerifiedArtifactRolloutPreparation {
             accepted,
             load_decision: Some(load_decision),
             initial_state,
-            candidate_bundle_job_id,
-            bundle_content_hash,
+            release_id,
+            release_material_hash,
             evidence_refs,
             reason,
         }
     }
 
-    pub fn prepare_and_record_verified_candidate_rollout(
+    pub fn prepare_and_record_verified_artifact_rollout(
         &self,
         paths: &SelfRolloutPaths,
-        request: VerifiedCandidateRolloutRequest,
-    ) -> Result<VerifiedCandidateRolloutPreparation, crate::RolloutError> {
-        let preparation = self.prepare_verified_candidate_rollout(request);
+        request: VerifiedArtifactRolloutRequest,
+    ) -> Result<VerifiedArtifactRolloutPreparation, crate::RolloutError> {
+        let preparation = self.prepare_verified_artifact_rollout(request);
         if let Some(state) = &preparation.initial_state {
             write_rollout_runtime_state(paths, state)?;
         }
@@ -1099,9 +1100,9 @@ fn append_rollout_transition_event(
     Ok(())
 }
 
-fn verified_candidate_rollout_blocker(
+fn verified_artifact_rollout_blocker(
     node_id: &NodeId,
-    request: &VerifiedCandidateRolloutRequest,
+    request: &VerifiedArtifactRolloutRequest,
 ) -> Option<String> {
     if &request.node_id != node_id {
         return Some(format!(
@@ -1109,22 +1110,16 @@ fn verified_candidate_rollout_blocker(
             request.node_id, node_id
         ));
     }
-    if !request.candidate_bundle.verification.is_valid() {
-        return Some(format!(
-            "candidate bundle verification failed: {:?}",
-            request.candidate_bundle.verification.failed_checks()
-        ));
-    }
     if let Err(error) = verify_artifact_signature(&request.artifact) {
         return Some(format!(
-            "artifact signature verification failed for verified candidate rollout: {error}"
+            "artifact signature verification failed for verified artifact rollout: {error}"
         ));
     }
     let signer_authorization =
         authorize_artifact_signature(&request.artifact, &request.trusted_signers);
     if !signer_authorization.is_authorized() {
         return Some(format!(
-            "artifact signer is not authorized for verified candidate rollout: {:?}",
+            "artifact signer is not authorized for verified artifact rollout: {:?}",
             signer_authorization.failed_checks()
         ));
     }
@@ -1154,27 +1149,28 @@ fn verified_candidate_rollout_blocker(
     if request.policy_decision.target_ring != request.artifact.target_ring {
         return Some("policy decision target ring does not match artifact manifest".to_string());
     }
-    if !artifact_references_candidate_bundle(&request.artifact, &request.candidate_bundle) {
+    if request.release_material_hash.trim().is_empty() {
+        return Some("release material hash is empty".to_string());
+    }
+    if request.evidence_refs.is_empty() {
+        return Some("verified artifact rollout carries no evidence refs".to_string());
+    }
+    if !artifact_references_release_evidence(&request.artifact, request) {
         return Some(
-            "artifact provenance does not reference the verified candidate bundle record"
-                .to_string(),
+            "artifact provenance does not reference the verified release evidence".to_string(),
         );
     }
     None
 }
 
-fn artifact_references_candidate_bundle(
+fn artifact_references_release_evidence(
     artifact: &ArtifactManifest,
-    candidate_bundle: &CandidateBundleRegistryRecord,
+    request: &VerifiedArtifactRolloutRequest,
 ) -> bool {
-    let registry_ref = format!("registry://candidate-bundle/{}", candidate_bundle.job_id);
+    let registry_ref = format!("registry://artifact-evidence/{}", request.release_id);
     artifact.provenance.attestations.iter().any(|attestation| {
         attestation == &registry_ref
-            || candidate_bundle
-                .attestation_path
-                .as_deref()
-                .is_some_and(|path| attestation == path)
-            || candidate_bundle
+            || request
                 .evidence_refs
                 .iter()
                 .any(|reference| attestation == reference)
@@ -1285,10 +1281,6 @@ mod tests {
     use sinomo_events::EventStore;
     use sinomo_module::{
         ModuleId, read_module_loader_runtime_state, sign_artifact_manifest_with_node_identity,
-    };
-    use sinomo_registry::{
-        CandidateBundleIntegrityCheck, CandidateBundleIntegrityReport,
-        CandidateBundleRegistryRecord,
     };
 
     #[test]
@@ -2048,37 +2040,40 @@ mod tests {
     }
 
     #[test]
-    fn verified_candidate_bundle_prepares_shadow_rollout() {
+    fn verified_artifact_release_prepares_shadow_rollout() {
         let root = unique_temp("sinomo-rollout-verified-preparation");
         let paths = SelfRolloutPaths::new(&root);
         let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
-        let bundle = candidate_bundle_record("blake3:candidate");
+        let release_id = sinomo_core::Id::from_legacy_named("release_verified").expect("release");
+        let release_ref = format!("registry://artifact-evidence/{release_id}");
         let (artifact, signer) = signed_artifact_manifest(
             &artifact_id,
             &module_id,
             "blake3:candidate",
-            vec![format!("registry://candidate-bundle/{}", bundle.job_id)],
+            vec![release_ref.clone()],
         );
-        let request = VerifiedCandidateRolloutRequest {
+        let request = VerifiedArtifactRolloutRequest {
             node_id: node.clone(),
             artifact,
             policy_decision: allow_policy(&artifact_id),
             rollout_plan: rollout_plan(&node, &artifact_id, &module_id),
-            candidate_bundle: bundle.clone(),
+            release_id: release_id.clone(),
+            release_material_hash: "blake3:release".to_string(),
+            evidence_refs: vec![release_ref],
             trusted_signers: vec![signer],
             active_artifact_id: ArtifactId::from_legacy_named("artifact_active").expect("artifact"),
         };
 
         let preparation = RolloutController::new(node)
-            .prepare_and_record_verified_candidate_rollout(&paths, request)
+            .prepare_and_record_verified_artifact_rollout(&paths, request)
             .expect("prepare verified rollout");
 
         assert!(preparation.accepted);
-        assert_eq!(preparation.candidate_bundle_job_id, bundle.job_id);
-        assert_eq!(preparation.bundle_content_hash, "blake3:candidate");
+        assert_eq!(preparation.release_id, release_id);
+        assert_eq!(preparation.release_material_hash, "blake3:release");
         assert!(
             preparation
                 .load_decision
@@ -2221,32 +2216,35 @@ mod tests {
     }
 
     #[test]
-    fn verified_candidate_rollout_accepts_distinct_artifact_and_bundle_hashes() {
+    fn verified_artifact_rollout_accepts_distinct_artifact_and_release_hashes() {
         let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
-        let bundle = candidate_bundle_record("blake3:candidate");
+        let release_id = sinomo_core::Id::from_legacy_named("release_verified").expect("release");
+        let release_ref = format!("registry://artifact-evidence/{release_id}");
         let (artifact, signer) = signed_artifact_manifest(
             &artifact_id,
             &module_id,
             "blake3:different",
-            vec![format!("registry://candidate-bundle/{}", bundle.job_id)],
+            vec![release_ref.clone()],
         );
-        let request = VerifiedCandidateRolloutRequest {
+        let request = VerifiedArtifactRolloutRequest {
             node_id: node.clone(),
             artifact,
             policy_decision: allow_policy(&artifact_id),
             rollout_plan: rollout_plan(&node, &artifact_id, &module_id),
-            candidate_bundle: bundle,
+            release_id,
+            release_material_hash: "blake3:release".to_string(),
+            evidence_refs: vec![release_ref],
             trusted_signers: vec![signer],
             active_artifact_id: ArtifactId::from_legacy_named("artifact_active").expect("artifact"),
         };
 
-        let preparation = RolloutController::new(node).prepare_verified_candidate_rollout(request);
+        let preparation = RolloutController::new(node).prepare_verified_artifact_rollout(request);
 
         assert!(preparation.accepted, "{}", preparation.reason);
-        assert_eq!(preparation.bundle_content_hash, "blake3:candidate");
+        assert_eq!(preparation.release_material_hash, "blake3:release");
         assert!(
             preparation
                 .load_decision
@@ -2256,28 +2254,31 @@ mod tests {
     }
 
     #[test]
-    fn verified_candidate_rollout_rejects_unsigned_artifact() {
+    fn verified_artifact_rollout_rejects_unsigned_artifact() {
         let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
-        let bundle = candidate_bundle_record("blake3:candidate");
-        let request = VerifiedCandidateRolloutRequest {
+        let release_id = sinomo_core::Id::from_legacy_named("release_verified").expect("release");
+        let release_ref = format!("registry://artifact-evidence/{release_id}");
+        let request = VerifiedArtifactRolloutRequest {
             node_id: node.clone(),
             artifact: artifact_manifest(
                 &artifact_id,
                 &module_id,
                 "blake3:candidate",
-                vec![format!("registry://candidate-bundle/{}", bundle.job_id)],
+                vec![release_ref.clone()],
             ),
             policy_decision: allow_policy(&artifact_id),
             rollout_plan: rollout_plan(&node, &artifact_id, &module_id),
-            candidate_bundle: bundle,
+            release_id,
+            release_material_hash: "blake3:release".to_string(),
+            evidence_refs: vec![release_ref],
             trusted_signers: Vec::new(),
             active_artifact_id: ArtifactId::from_legacy_named("artifact_active").expect("artifact"),
         };
 
-        let preparation = RolloutController::new(node).prepare_verified_candidate_rollout(request);
+        let preparation = RolloutController::new(node).prepare_verified_artifact_rollout(request);
 
         assert!(!preparation.accepted);
         assert!(preparation.load_decision.is_none());
@@ -2285,66 +2286,36 @@ mod tests {
     }
 
     #[test]
-    fn verified_candidate_rollout_rejects_unauthorized_signer() {
+    fn verified_artifact_rollout_rejects_unauthorized_signer() {
         let node = NodeId::from_legacy_named("node_desktop").expect("node");
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
-        let bundle = candidate_bundle_record("blake3:candidate");
+        let release_id = sinomo_core::Id::from_legacy_named("release_verified").expect("release");
+        let release_ref = format!("registry://artifact-evidence/{release_id}");
         let (artifact, _signer) = signed_artifact_manifest(
             &artifact_id,
             &module_id,
             "blake3:candidate",
-            vec![format!("registry://candidate-bundle/{}", bundle.job_id)],
+            vec![release_ref.clone()],
         );
-        let request = VerifiedCandidateRolloutRequest {
+        let request = VerifiedArtifactRolloutRequest {
             node_id: node.clone(),
             artifact,
             policy_decision: allow_policy(&artifact_id),
             rollout_plan: rollout_plan(&node, &artifact_id, &module_id),
-            candidate_bundle: bundle,
+            release_id,
+            release_material_hash: "blake3:release".to_string(),
+            evidence_refs: vec![release_ref],
             trusted_signers: Vec::new(),
             active_artifact_id: ArtifactId::from_legacy_named("artifact_active").expect("artifact"),
         };
 
-        let preparation = RolloutController::new(node).prepare_verified_candidate_rollout(request);
+        let preparation = RolloutController::new(node).prepare_verified_artifact_rollout(request);
 
         assert!(!preparation.accepted);
         assert!(preparation.load_decision.is_none());
         assert!(preparation.reason.contains("artifact-signer-known"));
-    }
-
-    fn candidate_bundle_record(bundle_content_hash: &str) -> CandidateBundleRegistryRecord {
-        let job_id = sinomo_core::Id::from_legacy_named("evojob_verified_candidate").expect("job");
-        CandidateBundleRegistryRecord {
-            job_id: job_id.clone(),
-            bundle_path: "/tmp/candidate-bundle".to_string(),
-            bundle_content_hash: bundle_content_hash.to_string(),
-            content_manifest_path: Some(
-                "/tmp/candidate-bundle/bundle-content-manifest.json".to_string(),
-            ),
-            attestation_path: Some("/tmp/candidate-bundle/bundle-attestation.json".to_string()),
-            evidence_refs: vec![
-                "/tmp/candidate-bundle/candidate-bundle-registry-record.json".to_string(),
-            ],
-            verification: CandidateBundleIntegrityReport {
-                job_id,
-                bundle_path: "/tmp/candidate-bundle".to_string(),
-                declared_content_hash: Some(bundle_content_hash.to_string()),
-                recomputed_content_hash: Some(bundle_content_hash.to_string()),
-                content_manifest_path: Some(
-                    "/tmp/candidate-bundle/bundle-content-manifest.json".to_string(),
-                ),
-                attestation_path: Some("/tmp/candidate-bundle/bundle-attestation.json".to_string()),
-                checks: vec![CandidateBundleIntegrityCheck {
-                    name: "content-manifest-hash-matches-recomputed".to_string(),
-                    passed: true,
-                    detail: "ok".to_string(),
-                }],
-                verified_at: OffsetDateTime::now_utc(),
-            },
-            registered_at: OffsetDateTime::now_utc(),
-        }
     }
 
     fn artifact_manifest(

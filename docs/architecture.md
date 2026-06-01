@@ -344,6 +344,8 @@ R0 should remain tiny and continuity-focused. R1 should be boring in behavior bu
 
 The crate graph now makes this trust-ring cut explicit. Each workspace crate declares `[package.metadata.sinomo] ring = "..."` in its `Cargo.toml`, and `sinomo-runtime` is the R0/R1 boundary facade. R0/R1 crates must not depend on R2 services or application crates. R2 services and application crates must cross the foundation boundary through the `sinomo-runtime` facade instead of depending directly on R0/R1 crates.
 
+Self-evolution is intentionally above this foundation. `sinomo-evolution` is an R2 service that owns evolution jobs, mutation packets, candidate bundles, approval records, and campaign state. R0/R1 crates expose generic primitives such as events, artifacts, scorecards, registry evidence, rollout plans, sandbox workloads, and module loader state; they do not know whether those primitives were produced by self-evolution, an operator, or another future delivery system.
+
 Initial crate ownership:
 
 | Group | Crates |
@@ -627,7 +629,6 @@ Early types:
 - `ArtifactProvenance`
 - `CapabilityDiff`
 - `PolicyDecision`
-- `EvolutionJob`
 - `EvaluationScorecard`
 - `RolloutPlan`
 - `RollbackPolicy`
@@ -1109,7 +1110,7 @@ PostgreSQL tables should track:
 
 Artifact content should be immutable. A rollback should point to a known-good artifact rather than mutating the failed artifact in place.
 
-The registry is R1 infrastructure. Candidate code may produce a candidate bundle, but only trusted registry and policy paths can make it loadable.
+The registry is R1 infrastructure. Higher-level systems may produce candidate bundles or other evidence packages, but only trusted registry and policy paths can convert generic artifact evidence and signed release material into something loadable.
 
 ### Semantic Retrieval
 
