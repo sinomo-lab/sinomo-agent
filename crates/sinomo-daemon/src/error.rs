@@ -26,6 +26,23 @@ pub enum DaemonError {
     ClusterReadOnly { detail: String },
 }
 
+impl From<sinomo_service::ServiceError> for DaemonError {
+    fn from(error: sinomo_service::ServiceError) -> Self {
+        use sinomo_service::ServiceError;
+        match error {
+            ServiceError::Network(source) => source.into(),
+            ServiceError::Kv(source) => source.into(),
+            ServiceError::NotClustered(route) => DaemonError::ClusterReadOnly {
+                detail: format!("service route {route} requires an initialized cluster"),
+            },
+            ServiceError::UnknownRoute(route) => DaemonError::Parse {
+                detail: format!("unknown service route: {route}"),
+            },
+            ServiceError::Service(detail) => DaemonError::Parse { detail },
+        }
+    }
+}
+
 impl From<sinomo_node::NodeIdentityError> for DaemonError {
     fn from(error: sinomo_node::NodeIdentityError) -> Self {
         match error {

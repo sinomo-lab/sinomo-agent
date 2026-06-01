@@ -5789,9 +5789,11 @@ dependencies = [
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-sandbox-runtime",
+ "sinomo-service",
  "sinomo-storage",
  "thiserror 2.0.18",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -6153,6 +6155,23 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "webc",
+]
+
+[[package]]
+name = "sinomo-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-core",
+ "sinomo-dfs",
+ "sinomo-kv",
+ "sinomo-local",
+ "sinomo-network",
+ "sinomo-rollout",
+ "sinomo-sandbox",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

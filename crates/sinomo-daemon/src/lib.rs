@@ -9,6 +9,7 @@ mod install;
 mod paths;
 mod process;
 mod rollout;
+mod service_adapter;
 mod status;
 
 pub use auth::{
@@ -82,10 +83,9 @@ pub use control::{
     run_daemon_control_loop, write_daemon_rpc_response_frame,
 };
 pub use dfs::{
-    DaemonDfsEndpointTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
-    DaemonDfsMetadataReplicationOutcome, DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport,
-    ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
-    handle_daemon_dfs_expose_config, handle_daemon_dfs_inspection,
+    DaemonDfsEndpointTransport, DaemonDfsMetadataReplicationOutcome,
+    DaemonDfsMetadataReplicationReport, DaemonDfsSmokeReport, ensure_default_distributed_dfs,
+    ensure_default_local_dfs_expose, handle_daemon_dfs_expose_config, handle_daemon_dfs_inspection,
     handle_daemon_dfs_metadata_journal_batch, handle_daemon_dfs_metadata_snapshot_install,
     handle_daemon_dfs_protocol_frame, handle_daemon_dfs_status,
     log_dfs_metadata_replication_report, publish_default_dfs_metadata_journal,
@@ -141,6 +141,7 @@ pub use rollout::{
     wait_for_main_daemon_health, wait_for_shadow_rollout_health,
     write_rollout_main_failure_diagnostics,
 };
+pub use sinomo_dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 pub use status::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
     DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonProbeStatus,

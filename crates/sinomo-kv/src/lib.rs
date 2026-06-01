@@ -48,6 +48,7 @@ struct ObjectFileWriteMark {
     hash: blake3::Hash,
     len: u64,
     modified: Option<SystemTime>,
+    ino: u64,
 }
 
 /// Cache of last-written object files. The cluster directory holding these WAL /
@@ -67,16 +68,31 @@ fn record_object_file_mark(
     hash: blake3::Hash,
     len: u64,
     modified: Option<SystemTime>,
+    ino: u64,
 ) {
     if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(path) {
+            cache.clear();
+        }
         cache.insert(
             path.to_path_buf(),
             ObjectFileWriteMark {
                 hash,
                 len,
                 modified,
+                ino,
             },
         );
+    }
+}
+
+/// Captures the `(mtime, inode)` of `path` for the write-mark cache. Returns
+/// `(None, 0)` when the file can't be stat'd, which records an entry that can
+/// never be trusted (mtime `None`) — forcing the slow path on the next call.
+fn file_modified_and_ino(path: &Path) -> (Option<SystemTime>, u64) {
+    match fs::metadata(path) {
+        Ok(metadata) => (metadata.modified().ok(), file_ino(&metadata)),
+        Err(_) => (None, 0),
     }
 }
 
@@ -443,13 +459,12 @@ impl KvWalPaths {
 }
 
 /// Process-wide memoization of parsed materialized snapshots, keyed by file path
-/// and validated by (mtime, len). Lets repeated reads of an unchanged snapshot
+/// and validated by file identity. Lets repeated reads of an unchanged snapshot
 /// skip the disk read + deserialization entirely — the dominant idle read cost.
 /// The writer updates this on every write, so intra-process reads are always
-/// coherent; cross-process edits are caught by the (mtime, len) validation.
+/// coherent; cross-process edits are caught by identity validation.
 struct MaterializedSnapshotCacheEntry {
-    mtime: Option<SystemTime>,
-    len: u64,
+    identity: FileIdentity,
     snapshot: Arc<KvSnapshot>,
 }
 
@@ -462,44 +477,70 @@ fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, Materialized
     MATERIALIZED_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn file_identity(path: &Path) -> Option<(Option<SystemTime>, u64)> {
-    let metadata = fs::metadata(path).ok()?;
-    Some((metadata.modified().ok(), metadata.len()))
-}
-
-fn cache_lookup_snapshot(
-    path: &Path,
+/// Identity used to validate a cached file parse. Every persisted object/snapshot
+/// file is written via a temp file + atomic rename, so a rewrite always lands on a
+/// fresh inode. Including `ino` closes the window where two writes share an mtime
+/// (filesystem mtime granularity) *and* an identical length — which `(mtime, len)`
+/// alone cannot distinguish, so a stale parse could otherwise be served. The
+/// comparison is all-or-nothing (derived `PartialEq`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileIdentity {
     mtime: Option<SystemTime>,
     len: u64,
-) -> Option<Arc<KvSnapshot>> {
+    ino: u64,
+}
+
+/// Upper bound on entries kept in each process-global file cache. The live set of
+/// snapshot/object-file paths is tiny in normal operation; this cap only guards
+/// against unbounded growth under pathological path churn. On overflow the whole
+/// map is dropped (cold cache), which is always correct — these caches are pure
+/// memoization validated against the file on every lookup.
+const FILE_CACHE_CAPACITY: usize = 4096;
+
+fn file_ino(metadata: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::ino(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileIdentity {
+        mtime: metadata.modified().ok(),
+        len: metadata.len(),
+        ino: file_ino(&metadata),
+    })
+}
+
+fn cache_lookup_snapshot(path: &Path, identity: FileIdentity) -> Option<Arc<KvSnapshot>> {
     let guard = materialized_snapshot_cache().lock().ok()?;
     let entry = guard.get(path)?;
-    // mtime is the primary key; require it to be present and equal so we never
-    // serve a cache hit we cannot validate.
-    if entry.mtime.is_some() && entry.mtime == mtime && entry.len == len {
+    // mtime is the primary key; require it to be present so we never serve a hit
+    // we cannot validate, then require the full identity (mtime, len, inode).
+    if identity.mtime.is_some() && entry.identity == identity {
         Some(entry.snapshot.clone())
     } else {
         None
     }
 }
 
-fn cache_store_snapshot(
-    path: &Path,
-    mtime: Option<SystemTime>,
-    len: u64,
-    snapshot: Arc<KvSnapshot>,
-) {
-    if mtime.is_none() {
+fn cache_store_snapshot(path: &Path, identity: FileIdentity, snapshot: Arc<KvSnapshot>) {
+    if identity.mtime.is_none() {
         return;
     }
     if let Ok(mut guard) = materialized_snapshot_cache().lock() {
+        if guard.len() >= FILE_CACHE_CAPACITY && !guard.contains_key(path) {
+            guard.clear();
+        }
         guard.insert(
             path.to_path_buf(),
-            MaterializedSnapshotCacheEntry {
-                mtime,
-                len,
-                snapshot,
-            },
+            MaterializedSnapshotCacheEntry { identity, snapshot },
         );
     }
 }
@@ -538,14 +579,14 @@ impl KvMaterializedCache {
 
     pub fn read_snapshot(&self) -> Result<KvSnapshot, KvError> {
         let identity = file_identity(&self.path);
-        if let Some((mtime, len)) = identity
-            && let Some(cached) = cache_lookup_snapshot(&self.path, mtime, len)
+        if let Some(identity) = identity
+            && let Some(cached) = cache_lookup_snapshot(&self.path, identity)
         {
             return Ok((*cached).clone());
         }
         let snapshot = read_object_file::<KvSnapshot>(&self.path)?;
-        if let Some((mtime, len)) = identity {
-            cache_store_snapshot(&self.path, mtime, len, Arc::new(snapshot.clone()));
+        if let Some(identity) = identity {
+            cache_store_snapshot(&self.path, identity, Arc::new(snapshot.clone()));
         }
         Ok(snapshot)
     }
@@ -571,8 +612,8 @@ impl KvMaterializedCache {
     /// reads hit memory rather than re-reading the file.
     fn write_and_cache(&self, snapshot: KvSnapshot) -> Result<(), KvError> {
         write_object_file(&self.path, &snapshot)?;
-        if let Some((mtime, len)) = file_identity(&self.path) {
-            cache_store_snapshot(&self.path, mtime, len, Arc::new(snapshot));
+        if let Some(identity) = file_identity(&self.path) {
+            cache_store_snapshot(&self.path, identity, Arc::new(snapshot));
         }
         Ok(())
     }
@@ -2435,6 +2476,7 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         && let Ok(metadata) = fs::metadata(path)
         && metadata.len() == mark.len
         && metadata.modified().ok() == mark.modified
+        && file_ino(&metadata) == mark.ino
     {
         return Ok(());
     }
@@ -2443,10 +2485,8 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
     // changed by another writer (e.g. a shadow daemon sharing the cluster dir).
     if fs::read(path).is_ok_and(|existing| existing == content) {
         // Already current: record the mark so subsequent calls take the fast path.
-        let modified = fs::metadata(path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
-        record_object_file_mark(path, content_hash, content.len() as u64, modified);
+        let (modified, ino) = file_modified_and_ino(path);
+        record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
         return Ok(());
     }
 
@@ -2490,10 +2530,8 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         detail: source.to_string(),
     })?;
     sync_directory(parent)?;
-    let modified = fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok());
-    record_object_file_mark(path, content_hash, content.len() as u64, modified);
+    let (modified, ino) = file_modified_and_ino(path);
+    record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
     Ok(())
 }
 
@@ -4109,6 +4147,110 @@ mod tests {
                 .any(|window| window == b"broken")
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn snapshot_cache_validates_full_identity_and_stays_bounded() {
+        // Inode discrimination: a same-(mtime, len) rewrite lands on a fresh inode
+        // (temp + atomic rename), so it must miss rather than serve a stale parse.
+        let path = temp_raft_root("kv-snapshot-cache-identity").join("snap.sobj");
+        let snapshot = Arc::new(InProcessKvStore::new().snapshot());
+        let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
+        let id = FileIdentity {
+            mtime,
+            len: 4096,
+            ino: 11,
+        };
+        cache_store_snapshot(&path, id, snapshot.clone());
+
+        assert!(
+            cache_lookup_snapshot(&path, id).is_some(),
+            "exact identity must hit"
+        );
+        assert!(
+            cache_lookup_snapshot(&path, FileIdentity { ino: 12, ..id }).is_none(),
+            "same mtime+len but a new inode must miss (closes the mtime-granularity window)"
+        );
+        assert!(
+            cache_lookup_snapshot(&path, FileIdentity { len: 4097, ..id }).is_none(),
+            "a different length must miss"
+        );
+        assert!(
+            cache_lookup_snapshot(&path, FileIdentity { mtime: None, ..id }).is_none(),
+            "an unverifiable mtime must never hit"
+        );
+        materialized_snapshot_cache()
+            .lock()
+            .expect("cache")
+            .remove(&path);
+
+        // Capacity bound: inserting past the cap must never grow the map beyond it.
+        // (Asserted as an invariant — robust even while other tests touch the cache.)
+        for i in 0..(FILE_CACHE_CAPACITY + 64) {
+            let path = std::path::PathBuf::from(format!("/sinomo-kv-cap-test/{i}.sobj"));
+            cache_store_snapshot(
+                &path,
+                FileIdentity {
+                    mtime,
+                    len: 1,
+                    ino: i as u64,
+                },
+                snapshot.clone(),
+            );
+        }
+        let len = materialized_snapshot_cache().lock().expect("cache").len();
+        assert!(
+            len <= FILE_CACHE_CAPACITY,
+            "materialized snapshot cache must stay within capacity, got {len}"
+        );
+    }
+
+    #[test]
+    fn concurrent_write_object_file_to_same_path_is_safe() {
+        let root = temp_raft_root("kv-concurrent-object-file");
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("object.sobj");
+        let value: Vec<u32> = vec![7, 8, 9, 10];
+
+        let threads = 8usize;
+        let writes_per_thread = 32usize;
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let path = path.clone();
+            let value = value.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..writes_per_thread {
+                    write_object_file(&path, &value).expect("write object file");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+
+        let read: Vec<u32> = read_object_file(&path).expect("read object file");
+        assert_eq!(
+            read, value,
+            "concurrent identical writes must leave valid, complete content"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(&root)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.contains(".tmp-"))
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temporary object files should remain, found {leftover:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn temp_raft_root(prefix: &str) -> std::path::PathBuf {

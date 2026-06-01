@@ -4686,8 +4686,28 @@ fn in_process_transport_rejects_unknown_targets() {
     );
 }
 
-#[test]
-fn network_service_delivers_event_and_processes_ack() {
+/// Look up a delivery's current status via a spawned service's ledger snapshot.
+async fn delivery_status<T, S>(
+    service: &NetworkServiceHandle<T, S>,
+    delivery_id: RouteDeliveryId,
+) -> DeliveryStatus
+where
+    T: NetworkTransport + Send + 'static,
+    S: EventStore + Send + 'static,
+{
+    service
+        .ledger_records()
+        .await
+        .expect("ledger")
+        .into_iter()
+        .find(|record| record.delivery.delivery_id == delivery_id)
+        .expect("record")
+        .delivery
+        .status
+}
+
+#[tokio::test]
+async fn network_service_delivers_event_and_processes_ack() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let session_id = SessionId::from_legacy_named("sess_network").expect("session");
@@ -4703,10 +4723,8 @@ fn network_service_delivers_event_and_processes_ack() {
     registry
         .join_session(session_id.clone(), node_b.clone())
         .expect("join b");
-    let mut service_a = NetworkService::new(registry.clone(), transport_a);
-    let mut service_b = NetworkService::new(registry, transport_b);
+
     let mut store_a = InMemoryEventStore::new();
-    let mut store_b = InMemoryEventStore::new();
     let event = fixture_event("evt_service_delivery", node_a.clone()).with_session(session_id);
     let receipt = store_a.append(event).expect("append");
     let stored = store_a
@@ -4715,21 +4733,20 @@ fn network_service_delivers_event_and_processes_ack() {
         .pop()
         .expect("stored");
 
-    let deliveries = service_a.enqueue_event(&stored).expect("enqueue");
-    assert_eq!(deliveries.len(), 2);
-    assert_eq!(service_a.pump_outbound().expect("send"), 2);
+    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store_a);
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
 
-    let outcomes = service_b
-        .process_incoming(&mut store_b)
-        .expect("process event");
+    let deliveries = service_a.enqueue_event(stored).await.expect("enqueue");
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(service_a.pump_outbound().await.expect("send"), 2);
+
+    let outcomes = service_b.process_incoming().await.expect("process event");
     assert_eq!(outcomes.len(), 1);
+    let store_b = service_b.shutdown().await;
     assert_eq!(store_b.len(), 1);
 
-    let ack_outcomes = service_a
-        .process_incoming(&mut store_a)
-        .expect("process ack");
+    let ack_outcomes = service_a.process_incoming().await.expect("process ack");
     assert_eq!(ack_outcomes.len(), 2);
-    assert_eq!(store_a.len(), 1);
     assert_eq!(
         ack_outcomes
             .iter()
@@ -4738,16 +4755,19 @@ fn network_service_delivers_event_and_processes_ack() {
         1
     );
     let delivered = service_a
-        .ledger()
-        .records()
+        .ledger_records()
+        .await
+        .expect("ledger")
         .into_iter()
         .filter(|record| record.delivery.status == DeliveryStatus::Delivered)
         .count();
     assert_eq!(delivered, 1);
+    let store_a = service_a.shutdown().await;
+    assert_eq!(store_a.len(), 1);
 }
 
-#[test]
-fn delivery_ledger_suppresses_duplicate_event_targets() {
+#[tokio::test]
+async fn delivery_ledger_suppresses_duplicate_event_targets() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
@@ -4755,7 +4775,6 @@ fn delivery_ledger_suppresses_duplicate_event_targets() {
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
-    let mut service = NetworkService::new(registry, transport_a);
     let mut store = InMemoryEventStore::new();
     let event = fixture_event("evt_duplicate_delivery", node_a.clone()).with_target_node(node_b);
     let receipt = store.append(event).expect("append");
@@ -4764,58 +4783,74 @@ fn delivery_ledger_suppresses_duplicate_event_targets() {
         .expect("replay")
         .pop()
         .expect("stored");
+    let service = NetworkService::new(registry, transport_a).spawn(store);
 
-    assert_eq!(service.enqueue_event(&stored).expect("first").len(), 1);
-    assert_eq!(service.enqueue_event(&stored).expect("duplicate").len(), 0);
-    assert_eq!(service.ledger().records().len(), 1);
+    assert_eq!(
+        service
+            .enqueue_event(stored.clone())
+            .await
+            .expect("first")
+            .len(),
+        1
+    );
+    assert_eq!(
+        service
+            .enqueue_event(stored)
+            .await
+            .expect("duplicate")
+            .len(),
+        0
+    );
+    assert_eq!(service.ledger_records().await.expect("ledger").len(), 1);
+    service.shutdown().await;
 }
 
-#[test]
-fn inbound_duplicate_event_is_acked_without_duplicate_append() {
+#[tokio::test]
+async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
-    let transport_a = network.add_node(node_a.clone());
+    // A bare transport handle injects the duplicate frames; only the receiver runs as
+    // a service actor.
+    let mut transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
-    let mut service_a = NetworkService::new(registry.clone(), transport_a);
-    let mut service_b = NetworkService::new(registry, transport_b);
-    let event = fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b);
-    let mut store_b = InMemoryEventStore::new();
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let event =
+        fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b.clone());
 
     for frame_id in [1, 2] {
         let frame = NetworkFrame {
             frame_id: NetworkFrameId(frame_id),
             source_node_id: node_a.clone(),
-            target_node_id: service_b.transport.local_node_id().clone(),
+            target_node_id: node_b.clone(),
             message: MeshMessage {
                 message_id: MeshMessageId(frame_id),
                 origin_node_id: node_a.clone(),
-                target_node_id: service_b.transport.local_node_id().clone(),
+                target_node_id: node_b.clone(),
                 body: MeshMessageBody::Event {
                     delivery_id: RouteDeliveryId(1),
                     event: Box::new(event.clone()),
                 },
             },
         };
-        service_a
-            .transport
-            .send(service_b.transport.local_node_id(), frame)
-            .expect("send duplicate");
+        transport_a.send(&node_b, frame).expect("send duplicate");
     }
 
     let outcomes = service_b
-        .process_incoming(&mut store_b)
+        .process_incoming()
+        .await
         .expect("process duplicates");
     assert!(matches!(outcomes[0], InboundOutcome::EventAccepted { .. }));
     assert!(matches!(outcomes[1], InboundOutcome::EventDuplicate { .. }));
+    let store_b = service_b.shutdown().await;
     assert_eq!(store_b.len(), 1);
 }
 
-#[test]
-fn retry_policy_marks_delivery_failed_after_max_attempts() {
+#[tokio::test]
+async fn retry_policy_marks_delivery_failed_after_max_attempts() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
@@ -4823,8 +4858,6 @@ fn retry_policy_marks_delivery_failed_after_max_attempts() {
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
-    let mut service = NetworkService::new(registry, transport_a)
-        .with_retry_policy(RetryPolicy { max_attempts: 2 });
     let mut store = InMemoryEventStore::new();
     let event = fixture_event("evt_retry_failed", node_a.clone()).with_target_node(node_b);
     let receipt = store.append(event).expect("append");
@@ -4833,31 +4866,26 @@ fn retry_policy_marks_delivery_failed_after_max_attempts() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let delivery = service.enqueue_event(&stored).expect("enqueue")[0].clone();
+    let service = NetworkService::new(registry, transport_a)
+        .with_retry_policy(RetryPolicy { max_attempts: 2 })
+        .spawn(store);
+    let delivery = service.enqueue_event(stored).await.expect("enqueue")[0].clone();
 
-    assert!(service.pump_outbound().is_ok());
+    assert!(service.pump_outbound().await.is_ok());
     assert_eq!(
-        service
-            .ledger()
-            .record(&delivery.delivery_id)
-            .unwrap()
-            .delivery
-            .status,
+        delivery_status(&service, delivery.delivery_id).await,
         DeliveryStatus::Retrying
     );
     let error = service
         .pump_outbound()
+        .await
         .expect_err("final attempt should return send failure");
     assert!(matches!(error, NetworkError::UnknownNode { .. }));
     assert_eq!(
-        service
-            .ledger()
-            .record(&delivery.delivery_id)
-            .unwrap()
-            .delivery
-            .status,
+        delivery_status(&service, delivery.delivery_id).await,
         DeliveryStatus::Failed
     );
+    service.shutdown().await;
 }
 
 #[test]
@@ -4949,8 +4977,8 @@ fn missed_heartbeats_degrade_then_mark_offline_without_removing_session() {
     assert_eq!(registry.session_nodes(&session_id), vec![node_a]);
 }
 
-#[test]
-fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
+#[tokio::test]
+async fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
@@ -4958,8 +4986,6 @@ fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
-    let mut service_a = NetworkService::new(registry.clone(), transport_a)
-        .with_retry_policy(RetryPolicy { max_attempts: 2 });
     let mut store_a = InMemoryEventStore::new();
     let event =
         fixture_event("evt_recovery_requeue", node_a.clone()).with_target_node(node_b.clone());
@@ -4969,29 +4995,28 @@ fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let delivery_id = service_a.enqueue_event(&stored).expect("enqueue")[0].delivery_id;
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .with_retry_policy(RetryPolicy { max_attempts: 2 })
+        .spawn(store_a);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
-    assert_eq!(service_a.pump_outbound().expect("first attempt"), 0);
-    assert!(service_a.pump_outbound().is_err());
+    assert_eq!(service_a.pump_outbound().await.expect("first attempt"), 0);
+    assert!(service_a.pump_outbound().await.is_err());
     assert_eq!(
-        service_a
-            .ledger()
-            .record(&delivery_id)
-            .expect("record")
-            .delivery
-            .status,
+        delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Failed
     );
 
     let transport_b = network.add_node(node_b.clone());
-    let mut service_b = NetworkService::new(registry, transport_b);
-    let mut store_b = InMemoryEventStore::new();
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
     service_b
-        .send_heartbeat(&node_a, 42)
+        .send_heartbeat(node_a.clone(), 42)
+        .await
         .expect("send heartbeat");
 
     let outcomes = service_a
-        .process_incoming(&mut store_a)
+        .process_incoming()
+        .await
         .expect("process heartbeat");
     assert!(matches!(
         outcomes.as_slice(),
@@ -5002,19 +5027,17 @@ fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
         }]
     ));
     assert_eq!(
-        service_a
-            .ledger()
-            .record(&delivery_id)
-            .expect("record")
-            .delivery
-            .status,
+        delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Retrying
     );
 
-    assert_eq!(service_a.pump_outbound().expect("drain recovered"), 1);
+    assert_eq!(service_a.pump_outbound().await.expect("drain recovered"), 1);
+    service_a.shutdown().await;
     service_b
-        .process_incoming(&mut store_b)
+        .process_incoming()
+        .await
         .expect("receive recovered event");
+    let store_b = service_b.shutdown().await;
     assert_eq!(store_b.len(), 1);
 }
 
@@ -5053,8 +5076,8 @@ fn session_routing_excludes_offline_participants() {
     assert_eq!(deliveries[0].target_node_id, node_a);
 }
 
-#[test]
-fn direct_target_offline_buffers_instead_of_sending() {
+#[tokio::test]
+async fn direct_target_offline_buffers_instead_of_sending() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
     let network = InProcessNetwork::new();
@@ -5068,7 +5091,6 @@ fn direct_target_offline_buffers_instead_of_sending() {
             .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
             .expect("miss heartbeat");
     }
-    let mut service = NetworkService::new(registry, transport_a);
     let mut store = InMemoryEventStore::new();
     let event =
         fixture_event("evt_direct_offline", node_a.clone()).with_target_node(node_b.clone());
@@ -5078,19 +5100,16 @@ fn direct_target_offline_buffers_instead_of_sending() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let delivery_id = service.enqueue_event(&stored).expect("enqueue")[0].delivery_id;
+    let service = NetworkService::new(registry, transport_a).spawn(store);
+    let delivery_id = service.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
-    assert_eq!(service.pump_outbound().expect("buffer offline"), 0);
+    assert_eq!(service.pump_outbound().await.expect("buffer offline"), 0);
     assert_eq!(transport_b.drain_incoming().expect("drain").len(), 0);
     assert_eq!(
-        service
-            .ledger()
-            .record(&delivery_id)
-            .expect("record")
-            .delivery
-            .status,
+        delivery_status(&service, delivery_id).await,
         DeliveryStatus::Retrying
     );
+    service.shutdown().await;
 }
 
 #[test]

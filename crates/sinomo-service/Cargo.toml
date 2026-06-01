@@ -1,0 +1,27 @@
+[package]
+name = "sinomo-service"
+version.workspace = true
+description = "Host-agnostic Sinomo service seam: trait, context, and registry for object-RPC control-plane services"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-kv = { path = "../sinomo-kv" }
+sinomo-local = { path = "../sinomo-local" }
+sinomo-network = { path = "../sinomo-network" }
+sinomo-rollout = { path = "../sinomo-rollout" }
+sinomo-sandbox = { path = "../sinomo-sandbox" }
+
+[dev-dependencies]
+serde.workspace = true
+tokio = { version = "1.44", features = ["macros", "rt", "rt-multi-thread", "time"] }

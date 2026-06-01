@@ -16,6 +16,56 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+/// A DFS operator inspection request (status / filesystem / path / object / conflicts /
+/// repair). Host-agnostic contract: the same request drives in-process and daemon paths.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DaemonDfsInspectionRequest {
+    Status,
+    FileSystem {
+        file_system_id: DfsFileSystemId,
+    },
+    Path {
+        file_system_id: DfsFileSystemId,
+        path: String,
+    },
+    Object {
+        object_id: DfsObjectId,
+    },
+    Conflicts {
+        file_system_id: Option<DfsFileSystemId>,
+        object_id: Option<DfsObjectId>,
+    },
+    Repair {
+        file_system_id: Option<DfsFileSystemId>,
+        object_id: Option<DfsObjectId>,
+    },
+}
+
+/// The response to a [`DaemonDfsInspectionRequest`].
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DaemonDfsInspectionResponse {
+    Status {
+        status: DfsOperatorStatus,
+    },
+    FileSystem {
+        file_system: Option<DfsOperatorFileSystemView>,
+    },
+    Path {
+        object: Option<DfsOperatorObjectView>,
+    },
+    Object {
+        object: Option<DfsOperatorObjectView>,
+    },
+    Conflicts {
+        conflicts: Vec<DfsConflictRecord>,
+    },
+    Repair {
+        repairs: Vec<DfsOperatorRepairView>,
+    },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsOperatorStatus {
     pub file_system_count: usize,

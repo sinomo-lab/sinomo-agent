@@ -1,5 +1,6 @@
 //! SIFS-backed agent sandbox contracts and local harness primitives.
 
+mod backend;
 mod commands;
 mod constants;
 mod events;
@@ -17,6 +18,7 @@ mod storage;
 mod store;
 mod toolchain;
 
+pub use backend::*;
 pub use commands::*;
 pub use constants::*;
 pub use events::*;
