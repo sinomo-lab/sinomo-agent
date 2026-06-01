@@ -1788,9 +1788,27 @@ pub fn read_cluster_connectivity_graph(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
     let now = OffsetDateTime::now_utc();
+    let local_records = read_local_cluster_connectivity_records(paths)?
+        .into_iter()
+        .filter(|record| cluster_network_record_live(record.expires_at, now))
+        .collect::<Vec<_>>();
+    // A node's own live probe results are authoritative for ITS outgoing edges. Drop any
+    // KV-published edge whose source we hold local records for: those KV edges can be stale
+    // (e.g. a `healthy` edge published before the node moved behind a segment boundary and
+    // can no longer reach the target). Keeping both -- they differ by endpoint_id so the
+    // exact-key dedup below does not collapse them -- would let routing treat an
+    // unreachable voter as a directly-reachable next hop and dial it instead of relaying
+    // through the bridge. Other sources' edges (the remote topology) are taken from KV.
+    let local_sources = local_records
+        .iter()
+        .map(|record| record.source_node_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
     let mut records_by_key =
         BTreeMap::<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>::new();
     for record in read_cluster_connectivity_graph_from_kv(paths)? {
+        if local_sources.contains(&record.source_node_id) {
+            continue;
+        }
         records_by_key.insert(
             (
                 record.source_node_id.clone(),
@@ -1800,17 +1818,15 @@ pub fn read_cluster_connectivity_graph(
             record,
         );
     }
-    for record in read_local_cluster_connectivity_records(paths)? {
-        if cluster_network_record_live(record.expires_at, now) {
-            records_by_key.insert(
-                (
-                    record.source_node_id.clone(),
-                    record.target_node_id.clone(),
-                    record.endpoint_id.clone(),
-                ),
-                record,
-            );
-        }
+    for record in local_records {
+        records_by_key.insert(
+            (
+                record.source_node_id.clone(),
+                record.target_node_id.clone(),
+                record.endpoint_id.clone(),
+            ),
+            record,
+        );
     }
     let mut records = records_by_key.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut records);
