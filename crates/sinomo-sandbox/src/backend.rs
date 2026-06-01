@@ -145,6 +145,13 @@ impl LocalSandboxBackend {
             store: LocalSandboxInstanceStore::new(runtime_root),
         }
     }
+
+    /// Build a local backend over an existing instance store. `LocalSandboxInstanceStore` is a
+    /// cheap `Clone` (just a runtime-root path), so callers holding a `&store` can route
+    /// through the shared backend without restructuring (e.g. CLI handlers and their tests).
+    pub fn with_store(store: LocalSandboxInstanceStore) -> Self {
+        Self { store }
+    }
 }
 
 /// Error for routes the local (daemonless) backend cannot serve — mediated HTTP and

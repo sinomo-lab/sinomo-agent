@@ -1,6 +1,6 @@
 use super::*;
 use sinomo_runtime::events::EventStore;
-use sinomo_runtime::sandbox::SandboxFileSystem;
+use sinomo_runtime::sandbox::{LocalSandboxBackend, SandboxBackend, SandboxFileSystem};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
@@ -5835,22 +5835,23 @@ pub(crate) fn sandbox_create_with_store(
     options: SandboxCreateOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let sandbox_id = options
-        .sandbox_id
-        .clone()
-        .unwrap_or_else(sinomo_runtime::sandbox::SandboxId::generate);
-    let (mut manifest, layout) = store.create(
-        sandbox_id,
-        options.toolchain_id.clone(),
-        OffsetDateTime::now_utc(),
-    )?;
-    manifest.temp_policy = options.temp_policy.clone();
-    if let Some(memory_mb) = options.memory_mb {
-        manifest.limits.memory_mb = memory_mb;
-    }
-    apply_sandbox_create_limit_options(&mut manifest.limits, &options);
-    manifest.mounts = options.mounts;
-    store.save_manifest(&manifest)?;
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.create(sinomo_runtime::sandbox::SandboxCreateInstanceRequest {
+        sandbox_id: options.sandbox_id,
+        toolchain_id: options.toolchain_id,
+        temp_policy: options.temp_policy,
+        memory_mb: options.memory_mb,
+        wall_time_ms: options.wall_time_ms,
+        max_input_bytes: options.max_input_bytes,
+        max_output_bytes: options.max_output_bytes,
+        max_workspace_bytes: options.max_workspace_bytes,
+        max_written_bytes_per_command: options.max_written_bytes_per_command,
+        max_file_count: options.max_file_count,
+        mounts: options.mounts,
+    })?;
+    let manifest = response.manifest;
+    // The backend returns only the manifest; recover the on-disk layout for the local summary.
+    let layout = store.layout(&manifest.sandbox_id);
 
     println!("sandbox created: {}", manifest.sandbox_id);
     println!("workspace: {}", manifest.workspace_root);
@@ -5909,30 +5910,6 @@ pub(crate) fn sandbox_create_with_daemon(options: SandboxCreateOptions) -> Resul
         response.decode_body().map_err(CliError::from)?;
     print_sandbox_manifest_summary(&response.manifest, None);
     Ok(())
-}
-
-fn apply_sandbox_create_limit_options(
-    limits: &mut sinomo_runtime::sandbox::SandboxResourceLimits,
-    options: &SandboxCreateOptions,
-) {
-    if let Some(wall_time_ms) = options.wall_time_ms {
-        limits.wall_time_ms = wall_time_ms;
-    }
-    if let Some(max_input_bytes) = options.max_input_bytes {
-        limits.max_input_bytes = max_input_bytes;
-    }
-    if let Some(max_output_bytes) = options.max_output_bytes {
-        limits.max_output_bytes = max_output_bytes;
-    }
-    if let Some(max_workspace_bytes) = options.max_workspace_bytes {
-        limits.max_workspace_bytes = max_workspace_bytes;
-    }
-    if let Some(max_written_bytes_per_command) = options.max_written_bytes_per_command {
-        limits.max_written_bytes_per_command = max_written_bytes_per_command;
-    }
-    if let Some(max_file_count) = options.max_file_count {
-        limits.max_file_count = max_file_count;
-    }
 }
 
 #[cfg(test)]
@@ -6372,8 +6349,14 @@ pub(crate) fn sandbox_status_with_store(
     options: SandboxStatusOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let (manifest, layout) = store.load(&options.sandbox_id)?;
-    print_sandbox_manifest_summary(&manifest, Some(&layout));
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.status(sinomo_runtime::sandbox::SandboxStatusRequest {
+        sandbox_id: options.sandbox_id,
+    })?;
+    // The backend returns only the manifest; recover the on-disk layout for the local summary
+    // (the daemon path has no layout and passes None).
+    let layout = store.layout(&response.manifest.sandbox_id);
+    print_sandbox_manifest_summary(&response.manifest, Some(&layout));
     Ok(())
 }
 
@@ -6408,15 +6391,17 @@ pub(crate) fn sandbox_config_with_store(
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
     validate_sandbox_config_env_options(&options)?;
-    let (mut manifest, layout) = store.load(&options.sandbox_id)?;
-    if let Some(cwd) = options.cwd.as_ref() {
-        let fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
-        sinomo_runtime::sandbox::validate_sandbox_working_directory(&fs, cwd)?;
-    }
-    apply_sandbox_config_options(&mut manifest, options);
-    manifest.updated_at = OffsetDateTime::now_utc();
-    store.save_manifest(&manifest)?;
-    print_sandbox_manifest_summary(&manifest, Some(&store.layout(&manifest.sandbox_id)));
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.update(sinomo_runtime::sandbox::SandboxUpdateInstanceRequest {
+        sandbox_id: options.sandbox_id,
+        cwd: options.cwd,
+        env_set: options.env_set,
+        env_unset: options.env_unset,
+    })?;
+    print_sandbox_manifest_summary(
+        &response.manifest,
+        Some(&store.layout(&response.manifest.sandbox_id)),
+    );
     Ok(())
 }
 
@@ -6448,19 +6433,6 @@ pub(crate) fn sandbox_config_with_daemon(options: SandboxConfigOptions) -> Resul
         response.decode_body().map_err(CliError::from)?;
     print_sandbox_manifest_summary(&response.manifest, None);
     Ok(())
-}
-
-fn apply_sandbox_config_options(
-    manifest: &mut sinomo_runtime::sandbox::SandboxInstanceManifest,
-    options: SandboxConfigOptions,
-) {
-    if let Some(cwd) = options.cwd {
-        manifest.cwd = cwd;
-    }
-    for key in options.env_unset {
-        manifest.env.remove(&key);
-    }
-    manifest.env.extend(options.env_set);
 }
 
 fn validate_sandbox_config_env_options(options: &SandboxConfigOptions) -> Result<(), CliError> {
@@ -6614,9 +6586,12 @@ pub(crate) fn sandbox_ls_with_store(
     options: SandboxLsOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let (_manifest, layout) = store.load(&options.sandbox_id)?;
-    let sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
-    for entry in sandbox_fs.list(&options.path)? {
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.list(sinomo_runtime::sandbox::SandboxListRequest {
+        sandbox_id: options.sandbox_id,
+        path: options.path,
+    })?;
+    for entry in response.entries {
         let kind = if entry.metadata.is_dir {
             "dir "
         } else {
@@ -6643,12 +6618,15 @@ pub(crate) fn sandbox_cat_with_store(
     options: SandboxCatOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let (_manifest, layout) = store.load(&options.sandbox_id)?;
-    let sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
-    let bytes = sandbox_fs.read(&options.path, options.range)?;
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.read(sinomo_runtime::sandbox::SandboxReadRequest {
+        sandbox_id: options.sandbox_id,
+        path: options.path,
+        range: options.range,
+    })?;
     io::stdout()
         .lock()
-        .write_all(&bytes)
+        .write_all(&response.bytes)
         .map_err(CliError::stdio)
 }
 
@@ -6679,62 +6657,57 @@ pub(crate) fn sandbox_write_with_store_and_event_store<S>(
 where
     S: EventStore,
 {
-    let (manifest, layout) = store.load(&options.sandbox_id)?;
-    let mut sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
-    if let Err(error) = sinomo_runtime::sandbox::validate_sandbox_write_resource_limits(
-        &sandbox_fs,
-        &options.path,
-        bytes.len() as u64,
-        &manifest.limits,
-    ) {
-        if let sinomo_runtime::sandbox::SandboxFsError::QuotaExceeded {
-            kind,
-            actual,
-            limit,
-        } = &error
-        {
-            let event = sinomo_runtime::sandbox::sandbox_resource_exhausted_event(
-                NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
-                    detail: format!("invalid sandbox CLI node id: {source}"),
-                })?,
-                &options.sandbox_id,
-                "sandbox-write",
-                kind.clone(),
-                *actual,
-                *limit,
-            );
-            event_store.append(event)?;
+    // Route the validate+write through the shared backend; the local event emission stays
+    // here, keyed off the returned error type (QuotaExceeded -> resource-exhausted;
+    // ReadOnly -> write-denial, via the helper), matching the prior split-step behavior.
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let sandbox_id = options.sandbox_id.clone();
+    let path = options.path.clone();
+    let byte_len = bytes.len() as u64;
+    match backend.write(sinomo_runtime::sandbox::SandboxWriteRequest {
+        sandbox_id: options.sandbox_id,
+        path: options.path,
+        bytes,
+    }) {
+        Ok(_response) => {
+            if !sinomo_runtime::sandbox::sandbox_path_is_virtual_device_sink(&path) {
+                let event = sinomo_runtime::sandbox::sandbox_file_written_event(
+                    NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
+                        detail: format!("invalid sandbox CLI node id: {source}"),
+                    })?,
+                    &sandbox_id,
+                    &path,
+                    byte_len,
+                );
+                event_store.append(event)?;
+            }
+            println!("wrote {byte_len} bytes to {path}");
+            Ok(())
         }
-        append_local_sandbox_write_denial_event(
-            event_store,
-            &options.sandbox_id,
-            &options.path,
-            &error,
-        )?;
-        return Err(error.into());
+        Err(sinomo_runtime::sandbox::SandboxBackendError::Fs(error)) => {
+            if let sinomo_runtime::sandbox::SandboxFsError::QuotaExceeded {
+                kind,
+                actual,
+                limit,
+            } = &error
+            {
+                let event = sinomo_runtime::sandbox::sandbox_resource_exhausted_event(
+                    NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
+                        detail: format!("invalid sandbox CLI node id: {source}"),
+                    })?,
+                    &sandbox_id,
+                    "sandbox-write",
+                    kind.clone(),
+                    *actual,
+                    *limit,
+                );
+                event_store.append(event)?;
+            }
+            append_local_sandbox_write_denial_event(event_store, &sandbox_id, &path, &error)?;
+            Err(error.into())
+        }
+        Err(other) => Err(other.into()),
     }
-    if let Err(error) = sandbox_fs.write(&options.path, &bytes) {
-        append_local_sandbox_write_denial_event(
-            event_store,
-            &options.sandbox_id,
-            &options.path,
-            &error,
-        )?;
-        return Err(error.into());
-    }
-    if !sinomo_runtime::sandbox::sandbox_path_is_virtual_device_sink(&options.path) {
-        let event = sinomo_runtime::sandbox::sandbox_file_written_event(
-            NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
-                detail: format!("invalid sandbox CLI node id: {source}"),
-            })?,
-            &options.sandbox_id,
-            &options.path,
-            bytes.len() as u64,
-        );
-        event_store.append(event)?;
-    }
-    println!("wrote {} bytes to {}", bytes.len(), options.path);
-    Ok(())
 }
 
 fn append_local_sandbox_write_denial_event<S>(
@@ -7140,10 +7113,13 @@ pub(crate) fn sandbox_checkpoint_with_store(
     options: SandboxCheckpointOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let checkpoint = store.create_checkpoint(&options.sandbox_id, OffsetDateTime::now_utc())?;
-    println!("checkpoint: {}", checkpoint.checkpoint_id);
-    println!("sandbox: {}", checkpoint.sandbox_id);
-    println!("manifest: {}", checkpoint.manifest_ref);
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.checkpoint(sinomo_runtime::sandbox::SandboxCheckpointRequest {
+        sandbox_id: options.sandbox_id,
+    })?;
+    println!("checkpoint: {}", response.checkpoint.checkpoint_id);
+    println!("sandbox: {}", response.checkpoint.sandbox_id);
+    println!("manifest: {}", response.checkpoint.manifest_ref);
     Ok(())
 }
 
@@ -7181,14 +7157,15 @@ pub(crate) fn sandbox_resume_with_store(
     options: SandboxResumeOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let (manifest, _layout) = store.resume_checkpoint(
-        &options.sandbox_id,
-        &options.checkpoint_id,
-        OffsetDateTime::now_utc(),
-    )?;
-    println!("sandbox resumed: {}", manifest.sandbox_id);
-    println!("checkpoint: {}", options.checkpoint_id);
-    println!("workspace: {}", manifest.workspace_root);
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let checkpoint_id = options.checkpoint_id.clone();
+    let response = backend.resume(sinomo_runtime::sandbox::SandboxResumeRequest {
+        sandbox_id: options.sandbox_id,
+        checkpoint_id: options.checkpoint_id,
+    })?;
+    println!("sandbox resumed: {}", response.manifest.sandbox_id);
+    println!("checkpoint: {checkpoint_id}");
+    println!("workspace: {}", response.manifest.workspace_root);
     Ok(())
 }
 
@@ -7225,11 +7202,13 @@ pub(crate) fn sandbox_reboot_with_store(
     options: SandboxRebootOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    let (manifest, _layout, cleared_tmp) =
-        store.reboot_session(&options.sandbox_id, OffsetDateTime::now_utc())?;
-    println!("sandbox rebooted: {}", manifest.sandbox_id);
-    println!("workspace: {}", manifest.workspace_root);
-    println!("tmp cleared: {cleared_tmp}");
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.reboot(sinomo_runtime::sandbox::SandboxRebootRequest {
+        sandbox_id: options.sandbox_id,
+    })?;
+    println!("sandbox rebooted: {}", response.manifest.sandbox_id);
+    println!("workspace: {}", response.manifest.workspace_root);
+    println!("tmp cleared: {}", response.cleared_tmp);
     Ok(())
 }
 
@@ -7265,8 +7244,11 @@ pub(crate) fn sandbox_destroy_with_store(
     options: SandboxDestroyOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
 ) -> Result<(), CliError> {
-    store.destroy(&options.sandbox_id)?;
-    println!("sandbox destroyed: {}", options.sandbox_id);
+    let mut backend = LocalSandboxBackend::with_store(store.clone());
+    let response = backend.destroy(sinomo_runtime::sandbox::SandboxDestroyRequest {
+        sandbox_id: options.sandbox_id,
+    })?;
+    println!("sandbox destroyed: {}", response.sandbox_id);
     Ok(())
 }
 
