@@ -180,7 +180,7 @@ fn local_shell_command_from_call(
     #[cfg(windows)]
     let (program, args): (&str, Vec<String>) = ("cmd", vec!["/C".to_string(), command.clone()]);
     #[cfg(not(windows))]
-    let (program, args): (&str, Vec<String>) = ("sh", vec!["-lc".to_string(), command.clone()]);
+    let (program, args): (&str, Vec<String>) = local_shell_program_and_args(command.clone());
     run_local_command_with_options(
         config,
         program,
@@ -195,6 +195,23 @@ fn local_shell_command_from_call(
             ..LocalCommandOptions::default()
         },
     )
+}
+
+#[cfg(not(windows))]
+fn local_shell_program_and_args(command: String) -> (&'static str, Vec<String>) {
+    if Path::new("/bin/bash").exists() || Path::new("/usr/bin/bash").exists() {
+        (
+            "bash",
+            vec![
+                "-o".to_string(),
+                "pipefail".to_string(),
+                "-lc".to_string(),
+                command,
+            ],
+        )
+    } else {
+        ("sh", vec!["-lc".to_string(), command])
+    }
 }
 
 fn with_coding_evidence(

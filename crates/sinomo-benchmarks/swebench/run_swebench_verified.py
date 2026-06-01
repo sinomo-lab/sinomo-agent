@@ -31,6 +31,31 @@ def load_suite(path: Path) -> dict:
     return suite
 
 
+def select_suite_instances(suite: dict, *, instance_id: str | None, limit: int | None) -> dict:
+    instances = list(suite.get("instances", []))
+    original_count = len(instances)
+    if instance_id:
+        instances = [item for item in instances if item["instance_id"] == instance_id]
+        if not instances:
+            raise SystemExit(f"{instance_id} is not present in {suite['name']}")
+    if limit is not None:
+        if limit < 1:
+            raise SystemExit("--limit must be at least 1")
+        instances = instances[:limit]
+    if not instances:
+        raise SystemExit("selected suite is empty")
+    if len(instances) == original_count:
+        return suite
+    selected = dict(suite)
+    selected["name"] = f"{suite['name']}-selected-{len(instances)}"
+    selected["instances"] = instances
+    selected["selection"] = (
+        f"{suite.get('selection', 'unspecified selection')}; "
+        f"runtime selection contains {len(instances)} of {original_count} instances"
+    )
+    return selected
+
+
 def suite_filter_regex(instance_ids: list[str]) -> str:
     return "^(" + "|".join(re.escape(instance_id) for instance_id in instance_ids) + ")$"
 
@@ -164,13 +189,21 @@ def run_mini(args: argparse.Namespace, suite: dict) -> Path:
     return output_dir / "preds.json"
 
 
-def evaluate_predictions(args: argparse.Namespace, predictions_path: Path) -> None:
+def evaluate_predictions(args: argparse.Namespace, predictions_path: Path, suite: dict) -> None:
+    evaluation_dir = args.results_dir / "evaluation"
+    if not args.dry_run:
+        evaluation_dir.mkdir(parents=True, exist_ok=True)
+    instance_ids = [item["instance_id"] for item in suite["instances"]]
     command = [
         sys.executable,
         "-m",
         "swebench.harness.run_evaluation",
         "--dataset_name",
         "princeton-nlp/SWE-bench_Verified",
+        "--split",
+        suite["split"],
+        "--instance_ids",
+        *instance_ids,
         "--predictions_path",
         str(predictions_path),
         "--max_workers",
@@ -178,7 +211,7 @@ def evaluate_predictions(args: argparse.Namespace, predictions_path: Path) -> No
         "--run_id",
         args.run_id,
     ]
-    run_command(command, cwd=REPO_ROOT, dry_run=args.dry_run)
+    run_command(command, cwd=evaluation_dir, dry_run=args.dry_run)
 
 
 def print_plan(args: argparse.Namespace, suite: dict) -> None:
@@ -206,6 +239,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", type=Path, default=DEFAULT_SUITE)
     parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--instance-id", help="run only one checked-in suite instance")
+    parser.add_argument("--limit", type=int, help="run only the first N checked-in suite instances")
     parser.add_argument("--mode", choices=["plan", "sinomo", "mini", "both"], default="plan")
     parser.add_argument("--provider", default="deepseek")
     parser.add_argument("--model", default="deepseek-v4-flash")
@@ -227,6 +262,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     suite = load_suite(args.suite)
+    suite = select_suite_instances(suite, instance_id=args.instance_id, limit=args.limit)
     print_plan(args, suite)
     predictions_path: Path | None = None
     if args.mode in {"sinomo", "both"}:
@@ -236,7 +272,7 @@ def main() -> int:
     if args.evaluate:
         if predictions_path is None:
             predictions_path = args.results_dir / "sinomo" / "predictions.jsonl"
-        evaluate_predictions(args, predictions_path)
+        evaluate_predictions(args, predictions_path, suite)
     return 0
 
 

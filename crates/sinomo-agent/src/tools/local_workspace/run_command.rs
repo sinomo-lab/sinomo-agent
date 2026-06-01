@@ -28,9 +28,19 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             "type": "object",
             "required": ["command"],
             "properties": {
-                "command": { "type": "string" },
-                "cwd": { "type": "string" },
-                "timeout_ms": { "type": "integer", "minimum": 1 }
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to run. Avoid pipelines for verification unless the shell status still reflects the command that matters."
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Optional workspace-relative directory. Omit this to run at the workspace root; do not use evidence artifact paths."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional timeout in milliseconds."
+                }
             }
         }))
 }

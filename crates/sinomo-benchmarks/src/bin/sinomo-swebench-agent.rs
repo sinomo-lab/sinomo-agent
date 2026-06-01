@@ -82,6 +82,7 @@ struct SweBenchAgentReport {
     model: String,
     workspace: String,
     prediction_path: String,
+    run_trace_path: String,
     patch_bytes: usize,
     stop_reason: String,
     model_turns: usize,
@@ -183,6 +184,8 @@ fn run() -> Result<(), String> {
         model_patch: patch.clone(),
     };
     write_json(&options.prediction_out, &prediction)?;
+    let run_trace_path = options.report_out.with_extension("run.json");
+    write_json(&run_trace_path, &run)?;
     let report = SweBenchAgentReport {
         task: SweBenchTaskReport {
             repo: task.repo,
@@ -194,6 +197,7 @@ fn run() -> Result<(), String> {
         model: options.model,
         workspace: options.workspace.display().to_string(),
         prediction_path: options.prediction_out.display().to_string(),
+        run_trace_path: run_trace_path.display().to_string(),
         patch_bytes: patch.len(),
         stop_reason: format!("{:?}", run.stop_reason),
         model_turns: run.model_turns.len(),

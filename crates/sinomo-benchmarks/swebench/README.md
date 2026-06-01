@@ -27,10 +27,13 @@ python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py \
   --mode sinomo \
   --provider deepseek \
   --model deepseek-v4-flash \
+  --limit 1 \
   --max-steps 20
 ```
 
-The Sinomo path prepares local Git checkouts, runs `sinomo-swebench-agent` inside each checkout with local workspace tools, writes per-instance reports under `benchmark-results/swebench/sinomo`, and writes `predictions.jsonl` in SWE-bench prediction format.
+The Sinomo path prepares local Git checkouts, runs `sinomo-swebench-agent` inside each checkout with local workspace tools, writes per-instance reports and full `*.run.json` traces under `benchmark-results/swebench/sinomo`, and writes `predictions.jsonl` in SWE-bench prediction format.
+
+Use `--limit 1` for a first smoke run or `--instance-id <id>` to rerun a specific checked-in instance.
 
 ## mini-SWE-agent Baseline
 
@@ -56,3 +59,4 @@ python -m swebench.harness.run_evaluation \
 ```
 
 The Python runner can run this command after the Sinomo pass with `--evaluate`.
+When `--evaluate` is used, SWE-bench summary files and per-instance logs are written under `<results-dir>/evaluation`.

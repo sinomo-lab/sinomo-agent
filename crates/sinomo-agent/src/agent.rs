@@ -3697,8 +3697,8 @@ fn project_agent_item_to_transcript_item(
                 "kind": "prior_tool_result",
                 "status": status,
                 "summary": summary,
-                "output": output,
-                "evidence": evidence,
+                "output": model_visible_tool_output(None, &output),
+                "evidence": model_visible_tool_evidence(&evidence),
             }))
             .map(|content| AgentTranscriptItem::tool(step_index, call_id, content))
             .map_err(|source| AgentError::ModelRequest {
@@ -3807,11 +3807,154 @@ fn render_tool_results(
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "tool_results",
         "step_index": step_index,
-        "results": results,
+        "results": results
+            .iter()
+            .map(model_visible_tool_outcome)
+            .collect::<Vec<_>>(),
     }))
     .map_err(|source| AgentError::ModelRequest {
         detail: source.to_string(),
     })
+}
+
+fn model_visible_tool_outcome(outcome: &AgentToolOutcome) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "call_id": outcome.call_id,
+        "step_index": outcome.step_index,
+        "call_index": outcome.call_index,
+        "call": outcome.call,
+        "status": outcome.status,
+        "summary": outcome.summary,
+        "output": model_visible_tool_output(Some(outcome.call.tool.as_str()), &outcome.output),
+        "evidence": model_visible_tool_evidence(&outcome.evidence),
+    });
+    if let Some(event_id) = &outcome.event_id
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("event_id".to_string(), serde_json::json!(event_id));
+    }
+    value
+}
+
+fn model_visible_tool_output(
+    tool_name: Option<&str>,
+    output: &serde_json::Value,
+) -> serde_json::Value {
+    let mut value = output.clone();
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let looks_like_patch_output = tool_name == Some("apply_patch")
+        || object.contains_key("diff") && object.contains_key("changed_files");
+    if looks_like_patch_output && let Some(diff) = object.get_mut("diff") {
+        *diff = model_visible_patch_diff(diff);
+    }
+    value
+}
+
+fn model_visible_tool_evidence(evidence: &AgentToolEvidence) -> serde_json::Value {
+    let artifacts = evidence
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            serde_json::json!({
+                "kind": artifact.kind,
+                "label": artifact.label,
+                "media_type": artifact.media_type,
+                "uri_omitted": true,
+            })
+        })
+        .collect::<Vec<_>>();
+    let records = evidence
+        .records
+        .iter()
+        .map(|record| {
+            serde_json::json!({
+                "kind": record.kind,
+                "data": model_visible_evidence_record_data(&record.kind, &record.data),
+            })
+        })
+        .collect::<Vec<_>>();
+    let execution = evidence.execution.as_ref().map(|execution| {
+        serde_json::json!({
+            "environment": execution.environment,
+            "exit_code": execution.exit_code,
+            "cwd_omitted": execution.cwd.is_some(),
+        })
+    });
+    let mut value = serde_json::json!({
+        "policy": evidence.policy,
+        "output": evidence.output,
+        "artifacts": artifacts,
+        "execution": execution,
+        "records": records,
+    });
+    if !evidence.metadata.is_null()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "metadata_omitted".to_string(),
+            serde_json::json!({
+                "reason": "tool evidence metadata is stored in the run trace and omitted from model-visible context"
+            }),
+        );
+    }
+    value
+}
+
+fn model_visible_evidence_record_data(kind: &str, data: &serde_json::Value) -> serde_json::Value {
+    if kind == AGENT_CODING_EVIDENCE_KIND {
+        let mut value = data.clone();
+        if let Some(object) = value.as_object_mut() {
+            let removed_patch_ref = object.remove("patch_ref").is_some();
+            let removed_diff_ref = object.remove("diff_ref").is_some();
+            let removed_refs = removed_patch_ref || removed_diff_ref;
+            if removed_refs {
+                object.insert("artifact_refs_omitted".to_string(), serde_json::json!(true));
+            }
+        }
+        return value;
+    }
+    if kind == "patch_diff" {
+        return serde_json::json!({
+            "files": patch_diff_file_summaries(data),
+            "content_omitted": true,
+            "omitted_bytes": data.to_string().len(),
+        });
+    }
+    data.clone()
+}
+
+fn model_visible_patch_diff(diff: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "files": patch_diff_file_summaries(diff),
+        "content_omitted": true,
+        "omitted_bytes": diff.to_string().len(),
+    })
+}
+
+fn patch_diff_file_summaries(diff: &serde_json::Value) -> Vec<serde_json::Value> {
+    diff.get("files")
+        .and_then(serde_json::Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .map(|file| {
+                    serde_json::json!({
+                        "status": file.get("status"),
+                        "path": file.get("path"),
+                        "added_lines": file.get("added_lines"),
+                        "removed_lines": file.get("removed_lines"),
+                        "diff_omitted_bytes": file
+                            .get("diff")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::len)
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_agent_model_decision(
@@ -4232,8 +4375,8 @@ fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
 mod tests {
     use super::*;
     use crate::{
-        AgentTool, AgentToolKind, AgentToolRequest, AgentToolResult, AgentToolSpec,
-        InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+        AgentTool, AgentToolArtifactRef, AgentToolKind, AgentToolRequest, AgentToolResult,
+        AgentToolSpec, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
         default_agent_tool_descriptors, default_coding_agent_tools, user_interaction_input_event,
     };
     use sinomo_lm::LanguageModelError;
@@ -5454,6 +5597,85 @@ mod tests {
     }
 
     #[test]
+    fn render_tool_results_keeps_large_evidence_out_of_model_context() {
+        let outcome = AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index: 3,
+            call_index: 0,
+            call: AgentToolCall {
+                tool: "apply_patch".to_string(),
+                input: serde_json::json!({ "patch": "*** Begin Patch\n*** End Patch" }),
+                r#async: false,
+                summary: "patch".to_string(),
+            },
+            status: AgentToolStatus::Succeeded,
+            summary: "Success. Updated the following files:\nM hello.txt".to_string(),
+            output: serde_json::json!({
+                "changed_files": ["hello.txt"],
+                "diff": {
+                    "files": [{
+                        "status": "M",
+                        "path": "hello.txt",
+                        "added_lines": 1,
+                        "removed_lines": 1,
+                        "diff": "large diff body that should not return to the model"
+                    }],
+                    "unified": "large unified diff body that should not return to the model"
+                }
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::policy_only(true, "allowed")
+                .with_artifact(AgentToolArtifactRef::new(
+                    "diff",
+                    "/tmp/sinomo-agent/evidence/apply-patch.diff",
+                ))
+                .with_record(
+                    AGENT_CODING_EVIDENCE_KIND,
+                    &AgentCodingToolEvidence {
+                        patch_ref: Some("/tmp/sinomo-agent/evidence/apply-patch.patch".to_string()),
+                        diff_ref: Some("/tmp/sinomo-agent/evidence/apply-patch.diff".to_string()),
+                        diff_summary: Some("M hello.txt".to_string()),
+                        changed_files: vec!["hello.txt".to_string()],
+                        verification_state: AgentVerificationState::NotRun,
+                    },
+                )
+                .with_record_value(
+                    "patch_diff",
+                    serde_json::json!({
+                        "files": [{
+                            "status": "M",
+                            "path": "hello.txt",
+                            "added_lines": 1,
+                            "removed_lines": 1,
+                            "diff": "large patch evidence diff that should not return to the model"
+                        }]
+                    }),
+                )
+                .with_metadata(serde_json::json!({
+                    "workspace_root": "/tmp/sinomo-agent/workspace"
+                })),
+        };
+
+        let rendered = render_tool_results(3, &[outcome]).expect("render");
+
+        assert!(rendered.contains("\"hello.txt\""));
+        assert!(rendered.contains("\"content_omitted\": true"));
+        assert!(rendered.contains("\"uri_omitted\": true"));
+        assert!(rendered.contains("\"metadata_omitted\""));
+        assert!(
+            !rendered.contains("/tmp/sinomo-agent/evidence"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("/tmp/sinomo-agent/workspace"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("large diff body"));
+        assert!(!rendered.contains("large unified diff body"));
+        assert!(!rendered.contains("large patch evidence diff"));
+    }
+
+    #[test]
     fn tool_planner_composes_runtime_and_session_descriptors() {
         let agent = Agent::new(
             SequencedModel::new(std::iter::empty::<String>()),
@@ -5844,6 +6066,60 @@ mod tests {
     }
 
     #[test]
+    fn local_workspace_read_file_supports_one_based_line_ranges() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-read-line-range-{}",
+            TaskId::generate()
+        ));
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("sample.txt"), "one\ntwo\nthree\nfour\n").expect("seed file");
+        let registry = AgentToolRegistry::local_workspace(&root);
+        let input = agent_input("read range");
+        let call = AgentToolCall {
+            tool: "read_file".to_string(),
+            input: serde_json::json!({
+                "path": "sample.txt",
+                "start_line": 2,
+                "end_line": 3
+            }),
+            r#async: false,
+            summary: "read lines".to_string(),
+        };
+
+        let outcome = registry.execute(&input.session, 0, 0, &call);
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            outcome
+                .output
+                .get("content")
+                .and_then(serde_json::Value::as_str),
+            Some("two\nthree\n")
+        );
+        assert_eq!(
+            outcome
+                .output
+                .pointer("/line_range/returned_start_line")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            outcome
+                .output
+                .pointer("/line_range/returned_end_line")
+                .and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            outcome
+                .output
+                .get("total_lines")
+                .and_then(serde_json::Value::as_u64),
+            Some(4)
+        );
+    }
+
+    #[test]
     fn local_workspace_registry_preserves_truncated_read_evidence() {
         let data_dir = SinomoDataDir::new(
             std::env::temp_dir().join(format!("sinomo-agent-test-{}", TaskId::generate())),
@@ -5978,6 +6254,44 @@ mod tests {
             Some("subdir")
         );
         assert!(outcome.summary.contains("timed out after 40 ms"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn local_workspace_run_command_uses_pipefail_when_bash_is_available() {
+        if !Path::new("/bin/bash").exists() && !Path::new("/usr/bin/bash").exists() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-command-pipefail-{}",
+            TaskId::generate()
+        ));
+        fs::create_dir_all(&root).expect("workspace");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
+        );
+        let input = agent_input("command pipefail");
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "false | true" }),
+                r#async: false,
+                summary: "run pipeline".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Failed);
+        assert_eq!(
+            outcome
+                .output
+                .get("success")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
     }
 
     #[test]

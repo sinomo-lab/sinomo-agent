@@ -156,7 +156,7 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ReadFile,
             "read_file",
-            "Read a workspace file into model-visible text with a bounded byte budget.",
+            "Read a workspace file or one-based line range into model-visible text with a bounded byte budget; prefer line ranges for focused snippets.",
             false,
         ),
         AgentToolSpec::new(
@@ -168,13 +168,13 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ApplyPatch,
             "apply_patch",
-            "Apply a scoped patch to workspace files available in the current sandbox.",
+            "Apply a scoped Codex patch to workspace files. Use `@@` or `@@ <exact context>` hunk headers, not git unified range headers.",
             true,
         ),
         AgentToolSpec::new(
             AgentToolKind::RunShellCommand,
             "run_command",
-            "Run a bounded workspace command in the current sandbox.",
+            "Run a bounded workspace command in the current sandbox. Omit cwd unless using a workspace subdirectory; do not use evidence artifact paths as cwd.",
             true,
         ),
         AgentToolSpec::new(

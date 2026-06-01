@@ -7,8 +7,11 @@ use crate::{
     PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
 };
 use reqwest::blocking::Client;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{
+    ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT,
+};
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-v4-flash";
 pub const DEEPSEEK_V4_PRO_MODEL: &str = "deepseek-v4-pro";
@@ -50,7 +53,7 @@ impl DeepSeekProvider {
     pub fn new(config: DeepSeekConfig) -> Self {
         Self {
             config,
-            http: Client::new(),
+            http: deepseek_http_client(),
         }
     }
 
@@ -107,6 +110,19 @@ impl Default for DeepSeekProvider {
     }
 }
 
+fn deepseek_http_client() -> Client {
+    Client::builder()
+        .http1_only()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(600))
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .build()
+        .unwrap_or_else(|_| Client::new())
+}
+
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::parse_declared_context_window_tokens(model).or_else(|| {
         let model = model.to_ascii_lowercase();
@@ -151,9 +167,25 @@ impl LanguageModelProvider for DeepSeekProvider {
                 detail: source.to_string(),
             })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        let body =
+            response
+                .text()
+                .map_err(|source| LanguageModelError::ProviderInvocationFailed {
+                    provider: Self::PROVIDER_ID.to_string(),
+                    model: model.clone(),
+                    detail: format!(
+                        "failed to read DeepSeek response body: {source}; debug: {source:?}"
+                    ),
+                })?;
+
+        if !status.is_success() {
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model,
@@ -161,11 +193,15 @@ impl LanguageModelProvider for DeepSeekProvider {
             });
         }
 
-        let value = response.json::<serde_json::Value>().map_err(|source| {
+        let value = serde_json::from_str::<serde_json::Value>(&body).map_err(|source| {
             LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
                 model: model.clone(),
-                detail: source.to_string(),
+                detail: format!(
+                    "failed to parse DeepSeek Chat Completions API response as JSON \
+                     (HTTP {status}, content-type {content_type}): {source}; body prefix: {}",
+                    body.chars().take(2048).collect::<String>()
+                ),
             }
         })?;
         let content = extract_deepseek_response_text(&value);
@@ -204,6 +240,7 @@ fn deepseek_headers(
 ) -> Result<HeaderMap, LanguageModelError> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static("Sinomo/0.1"));
     headers.insert(

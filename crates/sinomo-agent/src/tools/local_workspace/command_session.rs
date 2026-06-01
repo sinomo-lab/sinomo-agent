@@ -266,9 +266,10 @@ fn start_command_session(
         .unwrap_or(DEFAULT_COMMAND_SESSION_TIMEOUT_MS);
 
     #[cfg(windows)]
-    let (program, args): (&str, Vec<&str>) = ("cmd", vec!["/C", &command_text]);
+    let (program, args): (&str, Vec<String>) =
+        ("cmd", vec!["/C".to_string(), command_text.clone()]);
     #[cfg(not(windows))]
-    let (program, args): (&str, Vec<&str>) = ("sh", vec!["-lc", &command_text]);
+    let (program, args): (&str, Vec<String>) = local_shell_program_and_args(command_text.clone());
 
     let mut command = Command::new(program);
     command
