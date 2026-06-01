@@ -4,6 +4,7 @@ use crate::{
     DaemonLock, DaemonPaths, authenticate_daemon_control_request,
     create_cluster_invite_challenge_proof, daemon_paths_are_shadow, daemon_rpc_command,
     ensure_daemon_status_cluster, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
+    forward_cluster_invite_challenge_to_voter,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
@@ -158,9 +159,22 @@ where
         };
         let proof = match create_cluster_invite_challenge_proof(paths, &challenge) {
             Ok(proof) => proof,
-            Err(_error) => {
-                stream.shutdown_both();
-                return Ok(false);
+            Err(local_error) => {
+                // This node holds the invite but is not itself a proof-capable channel/issuer
+                // (e.g. a bridge introducer named in an invite minted before it joined). Relay
+                // the challenge to a reachable voter, which can produce an issuer-signed proof,
+                // and pass that back to the joiner. Only if that also fails do we close.
+                match forward_cluster_invite_challenge_to_voter(paths, &challenge) {
+                    Ok(proof) => proof,
+                    Err(forward_error) => {
+                        eprintln!(
+                            "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
+                            challenge.invite_id
+                        );
+                        stream.shutdown_both();
+                        return Ok(false);
+                    }
+                }
             }
         };
         let response = sinomo_network::ObjectRpcResponse::encode_body(

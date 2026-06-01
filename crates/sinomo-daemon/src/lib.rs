@@ -48,6 +48,7 @@ pub use cluster::{
     commit_cluster_raft_command_with_quorum, daemon_cluster_registration_if_initialized,
     daemon_cluster_status_from_local_state, default_cluster_invite_introducers,
     elect_cluster_raft_leader, ensure_daemon_status_cluster, expire_cluster_network_records_in_kv,
+    forward_cluster_invite_challenge_to_voter,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,

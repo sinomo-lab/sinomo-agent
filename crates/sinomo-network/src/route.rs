@@ -69,6 +69,31 @@ pub fn cluster_route_next_hop(
     None
 }
 
+/// The next hop `local` should send a relay toward `target`.
+///
+/// Prefers the first hop of a fully-known route ([`cluster_route_next_hop`]). When no full
+/// path is known it falls back to any directly-reachable neighbor not in `excluded`, letting
+/// that hop re-route with its own (fuller) connectivity graph. This is what carries traffic
+/// for a freshly-joined cross-segment learner: it knows it can reach the bridge it joined
+/// through, but not the bridge's *onward* edges (those records were published after its join
+/// snapshot and it cannot receive ongoing KV replication across the segment), so its own BFS
+/// dead-ends at the bridge. `excluded` is the relay's visited set (and, at the origin, the
+/// local node itself) so the fallback never bounces back along the path; the TTL bounds any
+/// remaining flailing toward a genuinely unreachable target.
+pub fn cluster_route_first_hop_best_effort(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+    excluded: &[NodeId],
+) -> Option<NodeId> {
+    if let Some(route) = cluster_route_next_hop(graph, local, target) {
+        return Some(route.next_hop);
+    }
+    graph.reachable_targets(local).into_iter().find(|candidate| {
+        candidate != target && candidate != local && !excluded.contains(candidate)
+    })
+}
+
 /// An inner cluster RPC wrapped for hop-by-hop delivery toward `target_node_id`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RelayEnvelope {
@@ -137,13 +162,18 @@ pub fn relay_decision(
     if envelope.ttl == 0 {
         return RelayDecision::Drop("relay ttl exhausted".to_string());
     }
-    match cluster_route_next_hop(graph, local, &envelope.target_node_id) {
-        Some(route) => {
+    match cluster_route_first_hop_best_effort(
+        graph,
+        local,
+        &envelope.target_node_id,
+        &envelope.visited,
+    ) {
+        Some(next_hop) => {
             let mut forwarded = envelope.clone();
             forwarded.ttl = envelope.ttl - 1;
             forwarded.visited.push(local.clone());
             RelayDecision::Forward {
-                next_hop: route.next_hop,
+                next_hop,
                 envelope: forwarded,
             }
         }
@@ -255,6 +285,25 @@ mod tests {
         let (a, b, c) = (nid("node_a"), nid("node_b"), nid("node_c"));
         let g = graph(vec![edge(&a, &b, ClusterConnectivityState::Healthy)]);
         assert_eq!(cluster_route_next_hop(&g, &a, &c), None);
+    }
+
+    #[test]
+    fn best_effort_relays_through_reachable_neighbor_without_full_path() {
+        let (a, b, c) = (nid("node_a"), nid("node_b"), nid("node_c"));
+        // A can reach B but does not know B's onward edge to C (a freshly-joined learner that
+        // has the bridge as a reachable neighbor but not the bridge's published routes), so
+        // the full BFS dead-ends. Best-effort still hands off to B, which re-routes onward.
+        let g = graph(vec![edge(&a, &b, ClusterConnectivityState::Healthy)]);
+        assert_eq!(cluster_route_next_hop(&g, &a, &c), None);
+        assert_eq!(
+            cluster_route_first_hop_best_effort(&g, &a, &c, &[]),
+            Some(b.clone())
+        );
+        // It honors the visited/excluded set, so a hop never bounces back along the path.
+        assert_eq!(
+            cluster_route_first_hop_best_effort(&g, &a, &c, std::slice::from_ref(&b)),
+            None
+        );
     }
 
     #[test]
