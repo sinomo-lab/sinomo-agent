@@ -25,6 +25,9 @@ ROLE="${ROLE:-joiner}"
 CLUSTER_NAME="${CLUSTER_NAME:-dev-cluster}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-60}"
+JOIN_ATTEMPTS="${JOIN_ATTEMPTS:-12}"
+JOIN_RETRY_DELAY="${JOIN_RETRY_DELAY:-5}"
+MAIN_PORT="${MAIN_PORT:-21353}"
 
 export SINOMO_DATA_DIR="$DATA"
 # This segmented test cluster runs with iroh off by default so segmentation is real.
@@ -52,6 +55,34 @@ wait_for_tcp() {
   exec 3>&- 2>/dev/null || true
 }
 
+# Join the cluster in the background AFTER our own daemon is listening, so downstream nodes
+# can reach us as their introducer while we join our own upstream. The CLI join is itself
+# synchronous (it blocks until the introducer -- which forwards to a voter -- confirms the
+# registration), so this logs the real outcome; it just no longer blocks daemon startup.
+join_in_background() {
+  if ! wait_for_tcp "127.0.0.1:$MAIN_PORT" "$JOIN_TIMEOUT"; then
+    log "WARN: local daemon never came up on :$MAIN_PORT; staying unclustered"; return
+  fi
+  if [ -z "${JOIN_INVITE:-}" ] || [ -z "${INTRODUCER:-}" ]; then
+    log "WARN: no JOIN_INVITE/INTRODUCER set; staying unclustered"; return
+  fi
+  if ! wait_for_file "$JOIN_INVITE" "$JOIN_TIMEOUT"; then
+    log "WARN: invite $JOIN_INVITE never appeared (<=${JOIN_TIMEOUT}s); staying unclustered"; return
+  fi
+  if ! wait_for_tcp "$INTRODUCER" "$JOIN_TIMEOUT"; then
+    log "WARN: introducer $INTRODUCER unreachable (<=${JOIN_TIMEOUT}s); staying unclustered"; return
+  fi
+  log "joining cluster as '$NODE_NAME' via introducer $INTRODUCER"
+  for attempt in $(seq 1 "$JOIN_ATTEMPTS"); do
+    if "$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME"; then
+      log "joined cluster (attempt $attempt)"; return
+    fi
+    log "join attempt $attempt/$JOIN_ATTEMPTS via $INTRODUCER failed; retrying in ${JOIN_RETRY_DELAY}s (upstream bridge may still be joining)"
+    sleep "$JOIN_RETRY_DELAY"
+  done
+  log "WARN: cluster join via $INTRODUCER did not succeed after $JOIN_ATTEMPTS attempts; staying unclustered"
+}
+
 # 1. Managed rollout source repo: symlink to the image's pre-built source tree (/sinomo-src)
 #    so any in-container rollout build reuses its warm target/ (incremental, not cold).
 if [ ! -e "$DATA/source/sinomo" ]; then
@@ -68,35 +99,34 @@ if [ ! -f "$DATA/cluster/state.sobj" ]; then
       log "FATAL: seed cluster init failed"; exit 1
     fi
   else
-    if [ -z "${JOIN_INVITE:-}" ] || [ -z "${INTRODUCER:-}" ]; then
-      log "WARN: no JOIN_INVITE/INTRODUCER set; starting unclustered"
-    elif ! wait_for_file "$JOIN_INVITE" "$JOIN_TIMEOUT"; then
-      log "WARN: invite $JOIN_INVITE never appeared (<=${JOIN_TIMEOUT}s); starting unclustered (an upstream segment likely failed to form)"
-    elif ! wait_for_tcp "$INTRODUCER" "$JOIN_TIMEOUT"; then
-      log "WARN: introducer $INTRODUCER unreachable (<=${JOIN_TIMEOUT}s); starting unclustered"
-    else
-      log "joining cluster as '$NODE_NAME' via introducer $INTRODUCER"
-      if "$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME"; then
-        log "joined cluster"
-      else
-        log "WARN: cluster join via $INTRODUCER failed; starting unclustered (EXPECTED across segments without routing)"
-      fi
-    fi
+    # Defer the join until the daemon is up (launched below), so this node is reachable as
+    # an introducer for its downstream segment while it joins its own upstream introducer.
+    DEFER_JOIN=1
   fi
 
-  # Seed and bridge nodes (re)publish an invite naming themselves as introducer, so the
-  # next segment has a reachable peer to attempt joining through. Best-effort: this needs
-  # cluster state, which a node that failed to join will not have.
-  if [ -n "${PUBLISH_INVITE:-}" ] && [ -n "${PUBLISH_INTRODUCER:-}" ]; then
-    log "publishing join invite (introducer $PUBLISH_INTRODUCER) -> $PUBLISH_INVITE"
-    "$BIN" cluster invite --introducer "$PUBLISH_INTRODUCER" --ttl-seconds 86400 --output "$PUBLISH_INVITE" \
-      || log "WARN: invite publish failed (node is not a cluster member yet)"
+  # The seed (a voter) publishes a join invite for EACH segment, naming the reachable
+  # bridge as that segment's introducer. PUBLISH_INVITES is a space-separated list of
+  # "introducer-host:port=output-file". Only a voter can mint invites, so the bridge
+  # learners do not publish; they relay the joins they receive on to a voter.
+  if [ -n "${PUBLISH_INVITES:-}" ]; then
+    for spec in $PUBLISH_INVITES; do
+      introducer="${spec%%=*}"; output="${spec##*=}"
+      log "publishing join invite (introducer $introducer) -> $output"
+      "$BIN" cluster invite --introducer "$introducer" --ttl-seconds 86400 --output "$output" \
+        || log "WARN: failed to publish invite for introducer $introducer"
+    done
   fi
 else
   log "existing cluster state found; skipping formation"
 fi
 
-# 3. Run the shadow supervisor as PID 1; it starts and supervises the main daemon.
+# 3. Start the daemon first (so we are reachable as an introducer), then run the deferred
+#    join in the background once our control port is listening.
+if [ "${DEFER_JOIN:-0}" = 1 ]; then
+  join_in_background &
+fi
+
+# Run the shadow supervisor as PID 1; it starts and supervises the main daemon.
 export SINOMO_SHADOW_MAIN_BINARY="$BIN"
 export SINOMO_SHADOW_MAIN_HOST=0.0.0.0
 export SINOMO_SHADOW_MAIN_PORT=21353

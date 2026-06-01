@@ -36,8 +36,10 @@ services:
       NODE_NAME: node1
       CLUSTER_NAME: dev-cluster
       SINOMO_DISABLE_IROH: "1"
-      PUBLISH_INVITE: /shared/seg-a-invite.json
-      PUBLISH_INTRODUCER: node1:21353
+      # The seed (voter) publishes a join invite for every segment, each naming the
+      # reachable bridge as that segment's introducer (node2,3 reach node1; node4 reaches
+      # node3; node5,6 reach node4). Bridge learners cannot mint invites, so only node1 does.
+      PUBLISH_INVITES: "node1:21353=/shared/seg-a-invite.json node3:21353=/shared/seg-ab-invite.json node4:21353=/shared/seg-b-invite.json"
     volumes: [node1-data:/data, invite:/shared]
     networks: [seg_a]
 
@@ -67,8 +69,6 @@ services:
       SINOMO_DISABLE_IROH: "1"
       INTRODUCER: node1:21353
       JOIN_INVITE: /shared/seg-a-invite.json
-      PUBLISH_INVITE: /shared/seg-ab-invite.json
-      PUBLISH_INTRODUCER: node3:21353
     volumes: [node3-data:/data, invite:/shared]
     networks: [seg_a, seg_ab]
 
@@ -84,8 +84,6 @@ services:
       SINOMO_DISABLE_IROH: "1"
       INTRODUCER: node3:21353
       JOIN_INVITE: /shared/seg-ab-invite.json
-      PUBLISH_INVITE: /shared/seg-b-invite.json
-      PUBLISH_INTRODUCER: node4:21353
     volumes: [node4-data:/data, invite:/shared]
     networks: [seg_ab, seg_b]
 
