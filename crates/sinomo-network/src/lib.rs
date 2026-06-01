@@ -6,6 +6,7 @@ mod lan;
 mod object;
 mod peer;
 mod roaming;
+mod route;
 mod rpc;
 mod storage;
 
@@ -15,6 +16,7 @@ pub use lan::*;
 pub use object::*;
 pub use peer::*;
 pub use roaming::*;
+pub use route::*;
 pub use rpc::*;
 pub use storage::*;
 

@@ -517,6 +517,21 @@ impl ClusterConnectivityGraph {
     pub fn quality_rank(&self, endpoint: &ClusterEndpointRecord) -> u8 {
         cluster_route_connectivity_quality_rank(self.state_for_endpoint(endpoint))
     }
+
+    /// Node ids directly reachable from `source` per a non-`Unreachable` connectivity
+    /// record (over any endpoint), excluding `source` itself. This is the adjacency the
+    /// multi-hop route discovery in [`crate::route`] walks over the cluster-wide graph.
+    pub fn reachable_targets(&self, source: &NodeId) -> std::collections::BTreeSet<NodeId> {
+        self.records
+            .values()
+            .filter(|record| {
+                &record.source_node_id == source
+                    && record.target_node_id != *source
+                    && record.state != ClusterConnectivityState::Unreachable
+            })
+            .map(|record| record.target_node_id.clone())
+            .collect()
+    }
 }
 
 pub fn build_cluster_network_info_record(
