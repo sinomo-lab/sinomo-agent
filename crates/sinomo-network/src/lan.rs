@@ -82,6 +82,13 @@ pub fn discover_interface_ip_candidates() -> Vec<IpAddr> {
     candidates
 }
 
+/// Whether iroh transport is disabled for this process via the `SINOMO_DISABLE_IROH`
+/// environment variable (`=1`). Lets a deployment run on direct LAN transports only --
+/// e.g. the segmented network test cluster -- without starting or advertising iroh.
+pub fn iroh_disabled_by_env() -> bool {
+    std::env::var("SINOMO_DISABLE_IROH").ok().as_deref() == Some("1")
+}
+
 pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
     discover_public_ip_candidates_from_hosts(&[("api.ipify.org", "/"), ("ifconfig.me", "/ip")])
 }

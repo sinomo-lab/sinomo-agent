@@ -236,10 +236,18 @@ pub fn create_cluster_invite_challenge_proof(
                 && member.state.is_authorized()
         })
         .ok_or(DaemonError::AuthDenied)?;
-    if !invite.communication_channels.iter().any(|channel| {
+    // The responder is authorized to answer this challenge if it is named as a communication
+    // channel, OR if it is the invite's issuer -- a voter whose key signs the whole invite and
+    // is its root of trust. The issuer case is what lets a voter answer a challenge relayed to
+    // it by a non-channel bridge introducer that was named in an invite minted before the
+    // bridge joined (so the bridge is absent from `communication_channels`).
+    let is_issuer = invite.issuer_node_id == local_member.node_id
+        && invite.issuer_public_key == identity.public_key;
+    let is_channel = invite.communication_channels.iter().any(|channel| {
         channel.endpoint.node_id == local_member.node_id
             && channel.node_public_key == identity.public_key
-    }) {
+    });
+    if !is_issuer && !is_channel {
         return Err(DaemonError::AuthDenied);
     }
     let timestamp = OffsetDateTime::now_utc()
@@ -288,11 +296,15 @@ pub fn verify_cluster_invite_challenge_proof(
     if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
         return Err(DaemonError::AuthExpired);
     }
-    if !invite
+    // Accept a proof signed by a known communication-channel key, or by the invite's issuer
+    // key (which signs the invite itself, so an issuer-signed proof -- e.g. relayed back
+    // through a non-channel bridge introducer -- is at least as trustworthy as a channel key).
+    let responder_is_issuer = proof.responder_public_key == invite.issuer_public_key;
+    let responder_is_channel = invite
         .communication_channels
         .iter()
-        .any(|channel| channel.node_public_key == proof.responder_public_key)
-    {
+        .any(|channel| channel.node_public_key == proof.responder_public_key);
+    if !responder_is_issuer && !responder_is_channel {
         return Err(DaemonError::AuthDenied);
     }
     let public_key = URL_SAFE_NO_PAD
@@ -438,6 +450,18 @@ pub fn authorize_authenticated_daemon_command(
             authenticated.signer.can_run_admin_command()
         }
         command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE) => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
+        command if command == daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE) => {
+            // A relay envelope is forwarded on behalf of another node by any authenticated
+            // cluster member (e.g. a bridge learner relaying a joiner's challenge toward a
+            // voter). The wrapped inner request carries its own signature/invite-proof and is
+            // authorized independently when it is finally delivered and dispatched locally.
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local

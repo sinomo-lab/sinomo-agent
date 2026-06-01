@@ -1,63 +1,135 @@
 #!/usr/bin/env bash
-# Sinomo dev-cluster node entrypoint.
+# Sinomo SEGMENTED dev-cluster node entrypoint.
 #
-# Forms (or rejoins) the cluster, then runs the shadow supervisor as PID 1.
-# Roles (set via the ROLE env var in docker-compose):
-#   seed   - bootstraps the cluster and publishes a join invite to /shared
-#   joiner - waits for the invite + the seed daemon, then joins
-set -euo pipefail
+# Forms (or rejoins) the cluster best-effort, then runs the shadow supervisor as PID 1.
+# This cluster is partitioned into network segments with only node3<->node4 bridging them,
+# and iroh is disabled -- so cross-segment joins are EXPECTED TO FAIL until native routing
+# exists. Every node therefore joins best-effort (a failed/timed-out join is logged, not
+# fatal) and always ends up running its daemon, so all nodes stay up and LAN-discoverable.
+#
+# Per-node env (set in docker-compose.yml):
+#   ROLE                seed | joiner
+#   NODE_NAME           cluster node name
+#   CLUSTER_NAME        cluster name (seed only)
+#   INTRODUCER          reachable host:port to join through (joiners)
+#   JOIN_INVITE         invite file to read when joining (joiners)
+#   PUBLISH_INVITE      invite file to (re)publish with PUBLISH_INTRODUCER (seed + bridges)
+#   PUBLISH_INTRODUCER  introducer host:port to advertise in the published invite
+#   SINOMO_DISABLE_IROH "1" => run on direct LAN transports only (default here)
+set -uo pipefail   # NOTE: not -e; cross-segment join failures are expected and handled.
 
 BIN=/usr/local/bin/sinomo
 DATA=/data
 SRC=/sinomo-src
-INVITE=/shared/invite.json
 ROLE="${ROLE:-joiner}"
-SEED_HOST="${SEED_HOST:-node1:21353}"
 CLUSTER_NAME="${CLUSTER_NAME:-dev-cluster}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
+JOIN_TIMEOUT="${JOIN_TIMEOUT:-60}"
+JOIN_ATTEMPTS="${JOIN_ATTEMPTS:-12}"
+JOIN_RETRY_DELAY="${JOIN_RETRY_DELAY:-5}"
+MAIN_PORT="${MAIN_PORT:-21353}"
 
 export SINOMO_DATA_DIR="$DATA"
+# This segmented test cluster runs with iroh off by default so segmentation is real.
+export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
 
 log() { echo "[entrypoint $(hostname)] $*"; }
 
-# 1. Managed rollout source repo (so `rollout apply`/`cluster` can build in-container).
-#    Symlink it to the image's pre-built source tree (/sinomo-src) instead of
-#    importing a fresh copy. The rollout then builds *in* /sinomo-src, reusing its
-#    already-warm target/ — so an in-container rollout build is incremental
-#    (seconds) rather than recompiling the vendored wasmer/WASIX crates from cold
-#    (minutes). /sinomo-src is a real git repo (see Dockerfile), so the rollout
-#    treats it as an initialized managed source repo.
+# Wait up to $2 seconds for a file to appear; returns 1 on timeout.
+wait_for_file() {
+  local path="$1" timeout="${2:-$JOIN_TIMEOUT}" i=0
+  while [ ! -f "$path" ]; do
+    i=$((i + 1)); [ "$i" -ge "$timeout" ] && return 1
+    sleep 1
+  done
+}
+
+# Wait up to $2 seconds for a host:port to accept a TCP connection; returns 1 on timeout.
+wait_for_tcp() {
+  local hostport="$1" timeout="${2:-$JOIN_TIMEOUT}" host port i=0
+  host="${hostport%%:*}"; port="${hostport##*:}"
+  while ! (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; do
+    i=$((i + 1)); [ "$i" -ge "$timeout" ] && return 1
+    sleep 1
+  done
+  exec 3>&- 2>/dev/null || true
+}
+
+# Join the cluster in the background AFTER our own daemon is listening, so downstream nodes
+# can reach us as their introducer while we join our own upstream. The CLI join is itself
+# synchronous (it blocks until the introducer -- which forwards to a voter -- confirms the
+# registration), so this logs the real outcome; it just no longer blocks daemon startup.
+join_in_background() {
+  if ! wait_for_tcp "127.0.0.1:$MAIN_PORT" "$JOIN_TIMEOUT"; then
+    log "WARN: local daemon never came up on :$MAIN_PORT; staying unclustered"; return
+  fi
+  if [ -z "${JOIN_INVITE:-}" ] || [ -z "${INTRODUCER:-}" ]; then
+    log "WARN: no JOIN_INVITE/INTRODUCER set; staying unclustered"; return
+  fi
+  if ! wait_for_file "$JOIN_INVITE" "$JOIN_TIMEOUT"; then
+    log "WARN: invite $JOIN_INVITE never appeared (<=${JOIN_TIMEOUT}s); staying unclustered"; return
+  fi
+  if ! wait_for_tcp "$INTRODUCER" "$JOIN_TIMEOUT"; then
+    log "WARN: introducer $INTRODUCER unreachable (<=${JOIN_TIMEOUT}s); staying unclustered"; return
+  fi
+  log "joining cluster as '$NODE_NAME' via introducer $INTRODUCER"
+  for attempt in $(seq 1 "$JOIN_ATTEMPTS"); do
+    if "$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME"; then
+      log "joined cluster (attempt $attempt)"; return
+    fi
+    log "join attempt $attempt/$JOIN_ATTEMPTS via $INTRODUCER failed; retrying in ${JOIN_RETRY_DELAY}s (upstream bridge may still be joining)"
+    sleep "$JOIN_RETRY_DELAY"
+  done
+  log "WARN: cluster join via $INTRODUCER did not succeed after $JOIN_ATTEMPTS attempts; staying unclustered"
+}
+
+# 1. Managed rollout source repo: symlink to the image's pre-built source tree (/sinomo-src)
+#    so any in-container rollout build reuses its warm target/ (incremental, not cold).
 if [ ! -e "$DATA/source/sinomo" ]; then
   log "linking managed rollout source repo -> $SRC (shared warm build cache)"
   mkdir -p "$DATA/source"
   ln -s "$SRC" "$DATA/source/sinomo"
 fi
 
-# 2. Cluster formation (only on first boot).
+# 2. Cluster formation (only on first boot). Best-effort: never exit on a join failure.
 if [ ! -f "$DATA/cluster/state.sobj" ]; then
   if [ "$ROLE" = "seed" ]; then
     log "bootstrapping cluster '$CLUSTER_NAME'"
-    "$BIN" cluster init --name "$CLUSTER_NAME"
-    log "publishing join invite (introducer $SEED_HOST) -> $INVITE"
-    "$BIN" cluster invite --introducer "$SEED_HOST" --ttl-seconds 86400 --output "$INVITE"
+    if ! "$BIN" cluster init --name "$CLUSTER_NAME"; then
+      log "FATAL: seed cluster init failed"; exit 1
+    fi
   else
-    log "waiting for join invite at $INVITE"
-    while [ ! -f "$INVITE" ]; do sleep 1; done
-    seed_host="${SEED_HOST%%:*}"; seed_port="${SEED_HOST##*:}"
-    log "waiting for seed daemon $seed_host:$seed_port"
-    until (exec 3<>"/dev/tcp/$seed_host/$seed_port") 2>/dev/null; do sleep 1; done
-    exec 3>&- 2>/dev/null || true
-    log "joining cluster as '$NODE_NAME'"
-    "$BIN" cluster join "$INVITE" --name "$NODE_NAME"
+    # Defer the join until the daemon is up (launched below), so this node is reachable as
+    # an introducer for its downstream segment while it joins its own upstream introducer.
+    DEFER_JOIN=1
+  fi
+
+  # The seed (a voter) publishes a join invite for EACH segment, naming the reachable
+  # bridge as that segment's introducer. PUBLISH_INVITES is a space-separated list of
+  # "introducer-host:port=output-file". Only a voter can mint invites, so the bridge
+  # learners do not publish; they relay the joins they receive on to a voter.
+  if [ -n "${PUBLISH_INVITES:-}" ]; then
+    for spec in $PUBLISH_INVITES; do
+      introducer="${spec%%=*}"; output="${spec##*=}"
+      log "publishing join invite (introducer $introducer) -> $output"
+      "$BIN" cluster invite --introducer "$introducer" --ttl-seconds 86400 --output "$output" \
+        || log "WARN: failed to publish invite for introducer $introducer"
+    done
   fi
 else
   log "existing cluster state found; skipping formation"
 fi
 
-# 3. Run the shadow supervisor as PID 1; it starts and supervises the main daemon.
+# 3. Start the daemon first (so we are reachable as an introducer), then run the deferred
+#    join in the background once our control port is listening.
+if [ "${DEFER_JOIN:-0}" = 1 ]; then
+  join_in_background &
+fi
+
+# Run the shadow supervisor as PID 1; it starts and supervises the main daemon.
 export SINOMO_SHADOW_MAIN_BINARY="$BIN"
 export SINOMO_SHADOW_MAIN_HOST=0.0.0.0
 export SINOMO_SHADOW_MAIN_PORT=21353
 export SINOMO_SHADOW_START_DELAY_MS=0
-log "starting shadow supervisor on 0.0.0.0:21354 (main on 0.0.0.0:21353)"
+log "starting shadow supervisor on 0.0.0.0:21354 (main on 0.0.0.0:21353, iroh disabled=$SINOMO_DISABLE_IROH)"
 exec "$BIN" daemon shadow run --host 0.0.0.0 --port 21354

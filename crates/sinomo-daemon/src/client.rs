@@ -111,14 +111,43 @@ pub fn send_daemon_rpc_to_endpoint(
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
-    sinomo_network::send_daemon_rpc_to_cluster_endpoint(
-        endpoint,
-        &daemon_rpc_command(&request.route),
-        Some(&signed),
-        request,
-        timeout,
-    )
-    .map_err(DaemonError::from)
+    let command = daemon_rpc_command(&request.route);
+    // If our own connectivity graph already knows this endpoint is unreachable (e.g. a
+    // cross-segment voter), skip the direct dial -- it would otherwise burn the entire timeout
+    // on a connect that cannot succeed, often past the caller's patience -- and relay straight
+    // away through a reachable bridge.
+    if !crate::cluster::cluster_endpoint_is_known_unreachable(endpoint) {
+        match sinomo_network::send_daemon_rpc_to_cluster_endpoint(
+            endpoint,
+            &command,
+            Some(&signed),
+            request,
+            timeout,
+        ) {
+            Ok(response) => return Ok(response),
+            Err(direct_error) => {
+                // Direct dial failed. If the connectivity graph offers a multi-hop route to the
+                // target node through a reachable bridge, relay the (already signed) request one
+                // hop closer; otherwise surface the original error.
+                return match crate::cluster::relay_request_to_endpoint(
+                    endpoint, request, &signed, &command, timeout,
+                ) {
+                    Some(result) => result,
+                    None => Err(DaemonError::from(direct_error)),
+                };
+            }
+        }
+    }
+    match crate::cluster::relay_request_to_endpoint(endpoint, request, &signed, &command, timeout) {
+        Some(result) => result,
+        None => Err(DaemonError::Network {
+            address: endpoint.address.clone(),
+            detail: format!(
+                "endpoint {} is unreachable and no relay route is available",
+                endpoint.node_id
+            ),
+        }),
+    }
 }
 
 pub fn fetch_daemon_status_from_endpoint(

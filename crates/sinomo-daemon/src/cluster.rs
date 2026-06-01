@@ -1,5 +1,6 @@
 use crate::{
-    AuthenticatedDaemonCommand, DaemonClusterRegistration, DaemonClusterStatus, DaemonError,
+    AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
+    DaemonClusterRegistration, DaemonClusterStatus, DaemonError,
     DaemonPaths, DaemonProbeStatus, DaemonRunOptions, IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST,
     SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
@@ -398,6 +399,10 @@ pub fn start_daemon_iroh_proxy_if_clustered(
     cluster: Option<&DaemonClusterStatus>,
     label: &str,
 ) -> Result<(), DaemonError> {
+    if sinomo_network::iroh_disabled_by_env() {
+        println!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
+        return Ok(());
+    }
     let paths = paths.clone();
     let options = options.clone();
     let mut cluster = cluster.cloned();
@@ -516,10 +521,13 @@ pub fn start_shadow_daemon_status_publisher(paths: &DaemonPaths) -> Result<(), D
     thread::Builder::new()
         .name("sinomo-shadow-status".to_string())
         .spawn(move || {
+            let iroh_disabled = sinomo_network::iroh_disabled_by_env();
             loop {
                 thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
-                if let Err(error) = refresh_daemon_iroh_repair_route(&status_paths) {
-                    eprintln!("sinomo shadow daemon iroh repair route tick failed: {error}");
+                if !iroh_disabled {
+                    if let Err(error) = refresh_daemon_iroh_repair_route(&status_paths) {
+                        eprintln!("sinomo shadow daemon iroh repair route tick failed: {error}");
+                    }
                 }
                 if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
                     eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
@@ -805,6 +813,14 @@ pub fn handle_daemon_cluster_join_request(
         });
     }
 
+    if !sinomo_network::cluster_raft_local_is_voter(&state) {
+        // This introducer is a non-voter (e.g. a bridge learner) and may not register
+        // members itself. Forward the validated join to a reachable voter -- relayed across
+        // segments by the routing-aware send -- so the voter performs the authoritative
+        // registration. This is what lets a node join through a reachable bridge.
+        return forward_cluster_join_registration_to_voter(&cluster_paths, &state, &request);
+    }
+
     let timestamp = time::OffsetDateTime::now_utc();
     let mut accepted_state = state.clone();
     for mut member in request.members {
@@ -828,6 +844,84 @@ pub fn handle_daemon_cluster_join_request(
         detail: "join registered".to_string(),
         state: accepted_state,
         kv_snapshot: Some(snapshot),
+    })
+}
+
+/// Forward a validated join registration to a reachable voter (the only node authorized to
+/// register members) via the routing-aware send, which relays it across network segments
+/// when no voter is directly reachable. Used when this introducer is not itself a voter.
+fn forward_cluster_join_registration_to_voter(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    request: &ClusterJoinRegistrationRequest,
+) -> Result<ClusterJoinRegistrationResponse, DaemonError> {
+    let rpc_request = sinomo_network::ObjectRpcRequest::encode_body(
+        sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE,
+        sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
+    )?;
+    let mut failures = Vec::new();
+    for voter in cluster_raft_live_voter_targets(paths, state) {
+        match crate::send_daemon_rpc_to_endpoint(&voter, &rpc_request, DAEMON_CLUSTER_RELAY_TIMEOUT)
+        {
+            Ok(response) => return response.decode_body().map_err(DaemonError::from),
+            Err(error) => {
+                failures.push(format!("{} ({:?}): {error}", voter.address, voter.transport))
+            }
+        }
+    }
+    Err(DaemonError::ClusterReadOnly {
+        detail: format!(
+            "join introducer is not a voter and could not forward the join to any voter{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
+    })
+}
+
+/// A bridge introducer named in an invite minted before it joined is not itself a
+/// proof-capable channel/issuer, so it cannot answer a join challenge. Relay the challenge to
+/// a reachable voter (the invite issuer can produce an issuer-signed proof) and return that
+/// proof. The routing-aware send relays the challenge across segments when no voter is
+/// directly reachable, so e.g. node4 (reaching the voter only via node3) can still serve a
+/// challenge for node5/node6.
+pub fn forward_cluster_invite_challenge_to_voter(
+    paths: &DaemonPaths,
+    challenge: &ClusterInviteChallengeRequest,
+) -> Result<ClusterInviteChallengeProof, DaemonError> {
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let rpc_request = sinomo_network::ObjectRpcRequest::encode_body(
+        sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+        sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        challenge,
+    )?;
+    let mut failures = Vec::new();
+    for voter in cluster_raft_live_voter_targets(&cluster_paths, &state) {
+        match crate::send_daemon_rpc_to_endpoint(&voter, &rpc_request, DAEMON_CLUSTER_RELAY_TIMEOUT)
+        {
+            Ok(response) => return response.decode_body().map_err(DaemonError::from),
+            Err(error) => {
+                failures.push(format!("{} ({:?}): {error}", voter.address, voter.transport))
+            }
+        }
+    }
+    Err(DaemonError::ClusterReadOnly {
+        detail: format!(
+            "join challenge introducer is not a channel/issuer and could not relay the challenge to any voter{}",
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        ),
     })
 }
 
@@ -3062,6 +3156,144 @@ fn forward_cluster_kv_txn_to_voter(
             }
         ),
     }))
+}
+
+/// Per-hop timeout for a relayed cluster RPC. The first hop waits for the whole downstream
+/// chain, so this is generous; the relay TTL bounds the number of hops.
+const DAEMON_CLUSTER_RELAY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Handle a `CLUSTER_RELAY_ROUTE` request. Runs the pure routing decision, then either
+/// delivers the wrapped request locally (when this node is the target) by re-injecting it
+/// through the daemon's own control port, or forwards it one hop closer to the target over
+/// the connectivity graph. The inner request's response flows back along the relay chain.
+pub fn handle_daemon_cluster_relay_request(
+    paths: &DaemonPaths,
+    envelope: sinomo_network::RelayEnvelope,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let graph = sinomo_network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
+    match sinomo_network::relay_decision(&envelope, &state.local_node_id, &graph) {
+        sinomo_network::RelayDecision::DeliverLocal => {
+            // We are the target: re-inject the original signed request through our own
+            // control port so it passes the normal authentication + dispatch path.
+            let inner = &envelope.inner;
+            let inner_rpc = inner.rpc.as_ref().ok_or_else(|| DaemonError::Network {
+                address: "relay-local".to_string(),
+                detail: "relayed request carried no rpc payload".to_string(),
+            })?;
+            let port = daemon_options_from_status(&read_daemon_status(paths)?).port;
+            let local_address = daemon_connect_address("127.0.0.1", port);
+            sinomo_network::send_daemon_rpc_raw(
+                &local_address,
+                &inner.command,
+                inner.auth.as_deref(),
+                inner_rpc,
+                DAEMON_CLUSTER_RELAY_TIMEOUT,
+            )
+            .map_err(DaemonError::from)
+        }
+        sinomo_network::RelayDecision::Forward { next_hop, envelope } => {
+            let endpoint = cluster_relay_next_hop_endpoint(&cluster_paths, &state, &next_hop)
+                .ok_or_else(|| DaemonError::Network {
+                    address: next_hop.to_string(),
+                    detail: "relay next hop has no reachable endpoint".to_string(),
+                })?;
+            let outer = envelope.into_request().map_err(DaemonError::from)?;
+            crate::send_daemon_rpc_to_endpoint(&endpoint, &outer, DAEMON_CLUSTER_RELAY_TIMEOUT)
+        }
+        sinomo_network::RelayDecision::Drop(reason) => {
+            sinomo_network::ObjectRpcResponse::encode_error(
+                sinomo_network::CLUSTER_RELAY_ROUTE,
+                format!("relay dropped: {reason}"),
+            )
+            .map_err(DaemonError::from)
+        }
+    }
+}
+
+/// The best (connectivity-ordered) reachable endpoint to relay a hop through `node_id`.
+fn cluster_relay_next_hop_endpoint(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> Option<ClusterEndpointRecord> {
+    sinomo_network::cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .find(|endpoint| endpoint.node_id == *node_id)
+}
+
+/// On a failed direct dial to `endpoint`, attempt to relay the already-signed `request`
+/// one hop closer to `endpoint.node_id` through a reachable bridge, per the cluster
+/// connectivity graph. Returns `None` when no route is known (the caller keeps the
+/// original error); relay envelopes are never themselves re-relayed. The next hop's relay
+/// handler delivers locally or forwards onward, and its response flows back here.
+/// Whether the local node's connectivity graph already records `endpoint` as `Unreachable`.
+/// Used to skip a doomed direct dial (which would burn the whole timeout) in favor of relaying.
+/// Returns `false` on any read error or when the edge is unknown, so callers fall back to the
+/// normal direct-then-relay path rather than mis-skipping a reachable endpoint.
+pub(crate) fn cluster_endpoint_is_known_unreachable(endpoint: &ClusterEndpointRecord) -> bool {
+    let Ok(data_dir) = SinomoDataDir::from_env_or_home() else {
+        return false;
+    };
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let Ok(state) = sinomo_network::read_cluster_state_without_kv(&cluster_paths) else {
+        return false;
+    };
+    let graph = sinomo_network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
+    matches!(
+        graph.state_for_endpoint(endpoint),
+        Some(sinomo_network::ClusterConnectivityState::Unreachable)
+    )
+}
+
+pub(crate) fn relay_request_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &sinomo_network::ObjectRpcRequest,
+    request_auth: &[u8],
+    request_command: &str,
+    timeout: Duration,
+) -> Option<Result<sinomo_network::ObjectRpcResponse, DaemonError>> {
+    if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
+        return None;
+    }
+    let data_dir = SinomoDataDir::from_env_or_home().ok()?;
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths).ok()?;
+    let next_hop_id = sinomo_network::cluster_route_first_hop_best_effort(
+        &sinomo_network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state),
+        &state.local_node_id,
+        &endpoint.node_id,
+        &[],
+    )?;
+    let next_hop = cluster_relay_next_hop_endpoint(&cluster_paths, &state, &next_hop_id)?;
+    let inner = sinomo_network::DaemonControlRequest::authenticated_rpc(
+        request_command.to_string(),
+        request.clone(),
+        request_auth.to_vec(),
+    );
+    let mut envelope =
+        sinomo_network::RelayEnvelope::new(state.cluster_id.clone(), endpoint.node_id.clone(), inner);
+    // Put the origin on the visited path so a downstream best-effort hop never bounces back.
+    envelope.visited.push(state.local_node_id.clone());
+    let outer = match envelope.into_request() {
+        Ok(outer) => outer,
+        Err(error) => return Some(Err(DaemonError::from(error))),
+    };
+    let outer_auth = match crate::sign_daemon_rpc_request_for_local_node(&outer) {
+        Ok(auth) => auth,
+        Err(error) => return Some(Err(error)),
+    };
+    Some(
+        sinomo_network::send_daemon_rpc_to_cluster_endpoint(
+            &next_hop,
+            &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
+            Some(&outer_auth),
+            &outer,
+            timeout,
+        )
+        .map_err(DaemonError::from),
+    )
 }
 
 fn cluster_raft_live_voter_targets(
