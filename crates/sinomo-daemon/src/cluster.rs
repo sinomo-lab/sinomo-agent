@@ -398,6 +398,10 @@ pub fn start_daemon_iroh_proxy_if_clustered(
     cluster: Option<&DaemonClusterStatus>,
     label: &str,
 ) -> Result<(), DaemonError> {
+    if sinomo_network::iroh_disabled_by_env() {
+        println!("sinomo {label} iroh disabled (SINOMO_DISABLE_IROH)");
+        return Ok(());
+    }
     let paths = paths.clone();
     let options = options.clone();
     let mut cluster = cluster.cloned();
@@ -516,10 +520,13 @@ pub fn start_shadow_daemon_status_publisher(paths: &DaemonPaths) -> Result<(), D
     thread::Builder::new()
         .name("sinomo-shadow-status".to_string())
         .spawn(move || {
+            let iroh_disabled = sinomo_network::iroh_disabled_by_env();
             loop {
                 thread::sleep(DAEMON_CLUSTER_PUBLISH_INTERVAL);
-                if let Err(error) = refresh_daemon_iroh_repair_route(&status_paths) {
-                    eprintln!("sinomo shadow daemon iroh repair route tick failed: {error}");
+                if !iroh_disabled {
+                    if let Err(error) = refresh_daemon_iroh_repair_route(&status_paths) {
+                        eprintln!("sinomo shadow daemon iroh repair route tick failed: {error}");
+                    }
                 }
                 if let Err(error) = refresh_daemon_node_status_in_kv(&status_paths) {
                     eprintln!("sinomo shadow daemon cluster status tick failed: {error}");
