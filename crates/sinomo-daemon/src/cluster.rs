@@ -3071,6 +3071,71 @@ fn forward_cluster_kv_txn_to_voter(
     }))
 }
 
+/// Per-hop timeout for a relayed cluster RPC. The first hop waits for the whole downstream
+/// chain, so this is generous; the relay TTL bounds the number of hops.
+const DAEMON_CLUSTER_RELAY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Handle a `CLUSTER_RELAY_ROUTE` request. Runs the pure routing decision, then either
+/// delivers the wrapped request locally (when this node is the target) by re-injecting it
+/// through the daemon's own control port, or forwards it one hop closer to the target over
+/// the connectivity graph. The inner request's response flows back along the relay chain.
+pub fn handle_daemon_cluster_relay_request(
+    paths: &DaemonPaths,
+    envelope: sinomo_network::RelayEnvelope,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
+    let graph = sinomo_network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
+    match sinomo_network::relay_decision(&envelope, &state.local_node_id, &graph) {
+        sinomo_network::RelayDecision::DeliverLocal => {
+            // We are the target: re-inject the original signed request through our own
+            // control port so it passes the normal authentication + dispatch path.
+            let inner = &envelope.inner;
+            let inner_rpc = inner.rpc.as_ref().ok_or_else(|| DaemonError::Network {
+                address: "relay-local".to_string(),
+                detail: "relayed request carried no rpc payload".to_string(),
+            })?;
+            let port = daemon_options_from_status(&read_daemon_status(paths)?).port;
+            let local_address = daemon_connect_address("127.0.0.1", port);
+            sinomo_network::send_daemon_rpc_raw(
+                &local_address,
+                &inner.command,
+                inner.auth.as_deref(),
+                inner_rpc,
+                DAEMON_CLUSTER_RELAY_TIMEOUT,
+            )
+            .map_err(DaemonError::from)
+        }
+        sinomo_network::RelayDecision::Forward { next_hop, envelope } => {
+            let endpoint = cluster_relay_next_hop_endpoint(&cluster_paths, &state, &next_hop)
+                .ok_or_else(|| DaemonError::Network {
+                    address: next_hop.to_string(),
+                    detail: "relay next hop has no reachable endpoint".to_string(),
+                })?;
+            let outer = envelope.into_request().map_err(DaemonError::from)?;
+            crate::send_daemon_rpc_to_endpoint(&endpoint, &outer, DAEMON_CLUSTER_RELAY_TIMEOUT)
+        }
+        sinomo_network::RelayDecision::Drop(reason) => {
+            sinomo_network::ObjectRpcResponse::encode_error(
+                sinomo_network::CLUSTER_RELAY_ROUTE,
+                format!("relay dropped: {reason}"),
+            )
+            .map_err(DaemonError::from)
+        }
+    }
+}
+
+/// The best (connectivity-ordered) reachable endpoint to relay a hop through `node_id`.
+fn cluster_relay_next_hop_endpoint(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+) -> Option<ClusterEndpointRecord> {
+    sinomo_network::cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .find(|endpoint| endpoint.node_id == *node_id)
+}
+
 fn cluster_raft_live_voter_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,

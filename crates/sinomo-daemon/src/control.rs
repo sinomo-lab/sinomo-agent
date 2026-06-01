@@ -8,7 +8,8 @@ use crate::{
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
     handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_member_publish_request,
-    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
+    handle_daemon_cluster_relay_request, handle_daemon_finalize_shadow_rollout,
+    prune_local_cluster_raft_uncommitted_tail,
     read_daemon_status, run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
@@ -489,6 +490,18 @@ pub fn handle_daemon_connection(
                     &result,
                 )
                 .map_err(DaemonError::from)?;
+                write_daemon_rpc_response_frame(stream, response)?;
+                Ok(false)
+            }
+            command if command == daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE) => {
+                let request = require_daemon_rpc_request(
+                    rpc_request,
+                    sinomo_network::CLUSTER_RELAY_ROUTE,
+                    sinomo_network::CLUSTER_ROUTING_RPC_CATEGORY,
+                )?;
+                let envelope = sinomo_network::RelayEnvelope::from_request(&request)
+                    .map_err(DaemonError::from)?;
+                let response = handle_daemon_cluster_relay_request(paths, envelope)?;
                 write_daemon_rpc_response_frame(stream, response)?;
                 Ok(false)
             }
