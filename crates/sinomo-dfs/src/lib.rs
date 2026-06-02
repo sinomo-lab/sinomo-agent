@@ -40,18 +40,19 @@ pub use local_owned::{
 };
 pub use metadata_backend::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus,
-    DfsDentryPageCursor, DfsDirFragmentId, DfsDirFragmentRecord, DfsDirectoryPage,
-    DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord, DfsMetadataBackend,
-    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation,
+    DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
+    DfsConflictScanPage, DfsConflictStatus, DfsDentryPageCursor, DfsDirFragmentId,
+    DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
+    DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation,
     DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus, DfsMetadataShardId,
     DfsMetadataShardStatus, DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
     DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
     DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
-    DfsTombstoneCompactionReport, DfsWriteIntentPage, DfsWriteIntentPageCursor,
-    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
+    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
+    DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
+    DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
+    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
+    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
     LocalShardedMetadataBackend, MetadataBackendError,
 };
 use namespace::metadata_path;

@@ -497,6 +497,46 @@ pub struct DfsWriteIntentScanPage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectVersionScanCursor {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectVersionScanPage {
+    pub versions: Vec<DfsObjectVersionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsObjectVersionScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaReceiptScanCursor {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub replica_node_id: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaReceiptScanPage {
+    pub receipts: Vec<DfsReplicaReceiptRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsReplicaReceiptScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsConflictScanCursor {
+    pub object_id: DfsObjectId,
+    pub conflict_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsConflictScanPage {
+    pub conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsConflictScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsDirectoryPageCursor {
     pub path: String,
     pub object_id: DfsObjectId,
@@ -1388,88 +1428,50 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsWriteIntentScanCursor>,
         max_entries: usize,
     ) -> Result<DfsWriteIntentScanPage>;
-    /// Returns every version record in the backend. The default aggregates per
-    /// object so any backend stays correct; backends with a materialized table
-    /// should override this with a single scan to avoid per-object queries.
+    fn version_records_page(
+        &self,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectVersionScanPage>;
+    fn receipt_records_page(
+        &self,
+        after: Option<&DfsReplicaReceiptScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsReplicaReceiptScanPage>;
+    fn conflict_records_page(
+        &self,
+        after: Option<&DfsConflictScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictScanPage>;
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
         let mut versions = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut version_cursor = None;
-                    loop {
-                        let version_page = self.versions_for_object_page(
-                            &object.object_id,
-                            version_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        versions.extend(version_page.versions);
-                        let Some(next_cursor) = version_page.next_cursor else {
-                            break;
-                        };
-                        version_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page =
+                self.version_records_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(versions)
     }
-    /// Returns every replica receipt in the backend. See [`Self::all_versions`].
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
         let mut receipts = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut version_cursor = None;
-                    loop {
-                        let version_page = self.versions_for_object_page(
-                            &object.object_id,
-                            version_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        for version in version_page.versions {
-                            let mut receipt_cursor = None;
-                            loop {
-                                let receipt_page = self.receipts_for_version_page(
-                                    &object.object_id,
-                                    &version.version,
-                                    receipt_cursor.as_ref(),
-                                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                                )?;
-                                receipts.extend(receipt_page.receipts);
-                                let Some(next_cursor) = receipt_page.next_cursor else {
-                                    break;
-                                };
-                                receipt_cursor = Some(next_cursor);
-                            }
-                        }
-                        let Some(next_cursor) = version_page.next_cursor else {
-                            break;
-                        };
-                        version_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page =
+                self.receipt_records_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            receipts.extend(page.receipts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(receipts)
     }
@@ -1507,37 +1509,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         }
         Ok(intents)
     }
-    /// Returns every conflict record in the backend. See [`Self::all_versions`].
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
         let mut conflicts = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut conflict_cursor = None;
-                    loop {
-                        let conflict_page = self.conflicts_for_object_page(
-                            &object.object_id,
-                            conflict_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        conflicts.extend(conflict_page.conflicts);
-                        let Some(next_cursor) = conflict_page.next_cursor else {
-                            break;
-                        };
-                        conflict_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page =
+                self.conflict_records_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(conflicts)
     }
@@ -3991,6 +3975,195 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn version_records_page(
+        &self,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectVersionScanPage {
+                versions: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut versions = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, DfsVersion)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_versions = 0usize;
+            loop {
+                let page = backend.version_records_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for version in page.versions {
+                    let Some(object) = backend.get_object(&version.object_id)? else {
+                        continue;
+                    };
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    if seen.insert((version.object_id.clone(), version.version.clone())) {
+                        versions.push(version);
+                        shard_versions = shard_versions.saturating_add(1);
+                    }
+                    if shard_versions > max_entries {
+                        break;
+                    }
+                }
+                if shard_versions > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        versions.sort_by(|left, right| {
+            object_version_scan_key(left).cmp(&object_version_scan_key(right))
+        });
+        let has_more = versions.len() > max_entries;
+        if has_more {
+            versions.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            versions.last().map(object_version_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsObjectVersionScanPage {
+            versions,
+            next_cursor,
+        })
+    }
+
+    fn receipt_records_page(
+        &self,
+        after: Option<&DfsReplicaReceiptScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsReplicaReceiptScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsReplicaReceiptScanPage {
+                receipts: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut receipts = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, DfsVersion, NodeId)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_receipts = 0usize;
+            loop {
+                let page = backend.receipt_records_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for receipt in page.receipts {
+                    let Some(object) = backend.get_object(&receipt.receipt.object_id)? else {
+                        continue;
+                    };
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    let key = (
+                        receipt.receipt.object_id.clone(),
+                        receipt.receipt.committed_version.clone(),
+                        receipt.replica_node_id.clone(),
+                    );
+                    if seen.insert(key) {
+                        receipts.push(receipt);
+                        shard_receipts = shard_receipts.saturating_add(1);
+                    }
+                    if shard_receipts > max_entries {
+                        break;
+                    }
+                }
+                if shard_receipts > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        receipts.sort_by(|left, right| {
+            replica_receipt_scan_key(left).cmp(&replica_receipt_scan_key(right))
+        });
+        let has_more = receipts.len() > max_entries;
+        if has_more {
+            receipts.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            receipts.last().map(replica_receipt_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsReplicaReceiptScanPage {
+            receipts,
+            next_cursor,
+        })
+    }
+
+    fn conflict_records_page(
+        &self,
+        after: Option<&DfsConflictScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsConflictScanPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut conflicts = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_conflicts = 0usize;
+            loop {
+                let page = backend.conflict_records_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for conflict in page.conflicts {
+                    let Some(object) = backend.get_object(&conflict.object_id)? else {
+                        continue;
+                    };
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    if seen.insert((conflict.object_id.clone(), conflict.conflict_id.clone())) {
+                        conflicts.push(conflict);
+                        shard_conflicts = shard_conflicts.saturating_add(1);
+                    }
+                    if shard_conflicts > max_entries {
+                        break;
+                    }
+                }
+                if shard_conflicts > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        conflicts.sort_by(|left, right| conflict_scan_key(left).cmp(&conflict_scan_key(right)));
+        let has_more = conflicts.len() > max_entries;
+        if has_more {
+            conflicts.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            conflicts.last().map(conflict_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsConflictScanPage {
+            conflicts,
+            next_cursor,
+        })
+    }
+
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -6432,14 +6605,87 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         })
     }
 
-    fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
+    fn version_records_page(
+        &self,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectVersionScanPage {
+                versions: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.versions.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded((after.object_id.clone(), after.version.clone())),
+            None => Included((id_lower_bound(), id_lower_bound())),
+        };
+        let mut versions = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_version), version) in
+            tables.versions.range((start, Unbounded))
+        {
+            if record_object_id != &version.object_id || record_version != &version.version {
+                continue;
+            }
+            if versions.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(object_version_scan_cursor(version));
+            versions.push(version.clone());
+        }
+        Ok(DfsObjectVersionScanPage {
+            versions,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
-    fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
+    fn receipt_records_page(
+        &self,
+        after: Option<&DfsReplicaReceiptScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsReplicaReceiptScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsReplicaReceiptScanPage {
+                receipts: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.receipts.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded((
+                after.object_id.clone(),
+                after.version.clone(),
+                after.replica_node_id.clone(),
+            )),
+            None => Included((id_lower_bound(), id_lower_bound(), id_lower_bound())),
+        };
+        let mut receipts = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_version, record_replica_node_id), receipt) in
+            tables.receipts.range((start, Unbounded))
+        {
+            if record_object_id != &receipt.receipt.object_id
+                || record_version != &receipt.receipt.committed_version
+                || record_replica_node_id != &receipt.replica_node_id
+            {
+                continue;
+            }
+            if receipts.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(replica_receipt_scan_cursor(receipt));
+            receipts.push(receipt.clone());
+        }
+        Ok(DfsReplicaReceiptScanPage {
+            receipts,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
@@ -6456,9 +6702,44 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         Ok(intents)
     }
 
-    fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
+    fn conflict_records_page(
+        &self,
+        after: Option<&DfsConflictScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsConflictScanPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.conflicts.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded((after.object_id.clone(), after.conflict_id.clone())),
+            None => Included((id_lower_bound(), String::new())),
+        };
+        let mut conflicts = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_conflict_id), conflict) in
+            tables.conflicts.range((start, Unbounded))
+        {
+            if record_object_id != &conflict.object_id
+                || record_conflict_id != &conflict.conflict_id
+            {
+                continue;
+            }
+            if conflicts.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(conflict_scan_cursor(conflict));
+            conflicts.push(conflict.clone());
+        }
+        Ok(DfsConflictScanPage {
+            conflicts,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
@@ -7989,6 +8270,17 @@ fn object_version_page_cursor(version: &DfsObjectVersionRecord) -> DfsObjectVers
     }
 }
 
+fn object_version_scan_cursor(version: &DfsObjectVersionRecord) -> DfsObjectVersionScanCursor {
+    DfsObjectVersionScanCursor {
+        object_id: version.object_id.clone(),
+        version: version.version.clone(),
+    }
+}
+
+fn object_version_scan_key(version: &DfsObjectVersionRecord) -> (DfsObjectId, DfsVersion) {
+    (version.object_id.clone(), version.version.clone())
+}
+
 fn object_version_page_cursor_with_shard(
     mut cursor: DfsObjectVersionPageCursor,
     shard_id: &DfsMetadataShardId,
@@ -8011,6 +8303,24 @@ fn replica_receipt_page_cursor(receipt: &DfsReplicaReceiptRecord) -> DfsReplicaR
         replica_node_id: receipt.replica_node_id.clone(),
         shard_id: None,
     }
+}
+
+fn replica_receipt_scan_cursor(receipt: &DfsReplicaReceiptRecord) -> DfsReplicaReceiptScanCursor {
+    DfsReplicaReceiptScanCursor {
+        object_id: receipt.receipt.object_id.clone(),
+        version: receipt.receipt.committed_version.clone(),
+        replica_node_id: receipt.replica_node_id.clone(),
+    }
+}
+
+fn replica_receipt_scan_key(
+    receipt: &DfsReplicaReceiptRecord,
+) -> (DfsObjectId, DfsVersion, NodeId) {
+    (
+        receipt.receipt.object_id.clone(),
+        receipt.receipt.committed_version.clone(),
+        receipt.replica_node_id.clone(),
+    )
 }
 
 fn replica_receipt_page_cursor_with_shard(
@@ -8063,6 +8373,17 @@ fn write_intent_page_cursor(intent: &DfsWriteIntentRecord) -> DfsWriteIntentPage
         intent_id: intent.intent_id.clone(),
         shard_id: None,
     }
+}
+
+fn conflict_scan_cursor(conflict: &DfsConflictRecord) -> DfsConflictScanCursor {
+    DfsConflictScanCursor {
+        object_id: conflict.object_id.clone(),
+        conflict_id: conflict.conflict_id.clone(),
+    }
+}
+
+fn conflict_scan_key(conflict: &DfsConflictRecord) -> (DfsObjectId, String) {
+    (conflict.object_id.clone(), conflict.conflict_id.clone())
 }
 
 fn write_intent_scan_key(intent: &DfsWriteIntentRecord) -> (OffsetDateTime, String, DfsObjectId) {
@@ -10353,6 +10674,27 @@ mod tests {
                 .map(|shard_id| shard_id.0.as_str()),
             Some("services")
         );
+        let first_version_scan = backend
+            .version_records_page(None, 2)
+            .expect("first version scan page");
+        assert_eq!(first_version_scan.versions.len(), 2);
+        assert!(first_version_scan.next_cursor.is_some());
+        let second_version_scan = backend
+            .version_records_page(first_version_scan.next_cursor.as_ref(), 2)
+            .expect("second version scan page");
+        assert_eq!(second_version_scan.versions.len(), 1);
+        assert!(second_version_scan.next_cursor.is_none());
+        let scanned_versions = first_version_scan
+            .versions
+            .into_iter()
+            .chain(second_version_scan.versions)
+            .map(|version_record| version_record.version)
+            .collect::<Vec<_>>();
+        let mut expected_versions = (0..3)
+            .map(|index| version(&format!("version_{index}")))
+            .collect::<Vec<_>>();
+        expected_versions.sort();
+        assert_eq!(scanned_versions, expected_versions);
 
         for index in 0..3 {
             let receipt = DfsReplicaReceiptRecord {
@@ -10381,6 +10723,27 @@ mod tests {
                 .map(|shard_id| shard_id.0.as_str()),
             Some("services")
         );
+        let first_receipt_scan = backend
+            .receipt_records_page(None, 2)
+            .expect("first receipt scan page");
+        assert_eq!(first_receipt_scan.receipts.len(), 2);
+        assert!(first_receipt_scan.next_cursor.is_some());
+        let second_receipt_scan = backend
+            .receipt_records_page(first_receipt_scan.next_cursor.as_ref(), 2)
+            .expect("second receipt scan page");
+        assert_eq!(second_receipt_scan.receipts.len(), 1);
+        assert!(second_receipt_scan.next_cursor.is_none());
+        let scanned_receipts = first_receipt_scan
+            .receipts
+            .into_iter()
+            .chain(second_receipt_scan.receipts)
+            .map(|receipt| receipt.replica_node_id)
+            .collect::<Vec<_>>();
+        let mut expected_receipts = (0..3)
+            .map(|index| node(&format!("node_replica_{index}")))
+            .collect::<Vec<_>>();
+        expected_receipts.sort();
+        assert_eq!(scanned_receipts, expected_receipts);
 
         for index in 0..3 {
             let intent = DfsWriteIntentRecord {
@@ -10430,6 +10793,47 @@ mod tests {
             .map(|intent| intent.intent_id)
             .collect::<Vec<_>>();
         assert_eq!(scanned_intent_ids, vec!["intent-0", "intent-1", "intent-2"]);
+
+        for index in 0..3 {
+            let conflict = DfsConflictRecord {
+                conflict_id: format!("conflict-{index}"),
+                file_system_id: file.file_system_id.clone(),
+                object_id: file.object_id.clone(),
+                path: file.path.clone(),
+                base_version: Some(version("version_0")),
+                local_version: version(&format!("version_local_{index}")),
+                remote_version: version(&format!("version_remote_{index}")),
+                detected_by_node_id: node("node_owner"),
+                reason: format!("conflict {index}"),
+                local_content_hash: Some(format!("blake3:local-{index}")),
+                remote_content_hash: Some(format!("blake3:remote-{index}")),
+                created_by_intent_id: None,
+                strategy: Some("branch".to_string()),
+                status: DfsConflictStatus::Open,
+                detected_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            backend.put_conflict(&conflict).expect("conflict");
+        }
+        let first_conflict_scan = backend
+            .conflict_records_page(None, 2)
+            .expect("first conflict scan page");
+        assert_eq!(first_conflict_scan.conflicts.len(), 2);
+        assert!(first_conflict_scan.next_cursor.is_some());
+        let second_conflict_scan = backend
+            .conflict_records_page(first_conflict_scan.next_cursor.as_ref(), 2)
+            .expect("second conflict scan page");
+        assert_eq!(second_conflict_scan.conflicts.len(), 1);
+        assert!(second_conflict_scan.next_cursor.is_none());
+        let scanned_conflicts = first_conflict_scan
+            .conflicts
+            .into_iter()
+            .chain(second_conflict_scan.conflicts)
+            .map(|conflict| conflict.conflict_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scanned_conflicts,
+            vec!["conflict-0", "conflict-1", "conflict-2"]
+        );
 
         cleanup(&root);
     }
@@ -12214,6 +12618,20 @@ mod tests {
                 .map(|version| version.version)
                 .collect::<Vec<_>>()
         );
+        let mut version_scan_cursor = None;
+        let mut scanned_versions = Vec::new();
+        loop {
+            let page = backend
+                .version_records_page(version_scan_cursor.as_ref(), 2)
+                .expect("version scan page");
+            assert!(page.versions.len() <= 2);
+            scanned_versions.extend(page.versions.into_iter().map(|version| version.version));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            version_scan_cursor = Some(next_cursor);
+        }
+        assert_eq!(scanned_versions, paged_versions);
 
         for index in 0..5 {
             let receipt = DfsReplicaReceiptRecord {
@@ -12262,6 +12680,24 @@ mod tests {
                 .map(|receipt| receipt.replica_node_id)
                 .collect::<Vec<_>>()
         );
+        let mut receipt_scan_cursor = None;
+        let mut scanned_receipts = Vec::new();
+        loop {
+            let page = backend
+                .receipt_records_page(receipt_scan_cursor.as_ref(), 2)
+                .expect("receipt scan page");
+            assert!(page.receipts.len() <= 2);
+            scanned_receipts.extend(
+                page.receipts
+                    .into_iter()
+                    .map(|receipt| receipt.replica_node_id),
+            );
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            receipt_scan_cursor = Some(next_cursor);
+        }
+        assert_eq!(scanned_receipts, paged_receipts);
 
         for index in 0..5 {
             let intent = DfsWriteIntentRecord {
@@ -14351,6 +14787,26 @@ mod tests {
                 .expect("empty conflict page")
                 .conflicts
                 .is_empty()
+        );
+        let first_scan_page = backend
+            .conflict_records_page(None, 1)
+            .expect("first conflict scan page");
+        assert_eq!(first_scan_page.conflicts, vec![conflict.clone()]);
+        let second_scan_page = backend
+            .conflict_records_page(first_scan_page.next_cursor.as_ref(), 1)
+            .expect("second conflict scan page");
+        assert_eq!(second_scan_page.conflicts, vec![conflict_b.clone()]);
+        assert!(second_scan_page.next_cursor.is_none());
+        assert!(
+            backend
+                .conflict_records_page(None, 0)
+                .expect("empty conflict scan")
+                .conflicts
+                .is_empty()
+        );
+        assert_eq!(
+            backend.all_conflicts().expect("all conflicts"),
+            vec![conflict.clone(), conflict_b.clone()]
         );
 
         let resolved = backend
