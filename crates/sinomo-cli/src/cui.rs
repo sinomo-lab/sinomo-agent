@@ -14,12 +14,14 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "native-models")]
 use sinomo_models::minicpm_v46::{
     DEFAULT_MODEL_ID as MINICPM_V46_DEFAULT_MODEL_ID, MiniCpmV46Config,
     MiniCpmV46ForConditionalGeneration, Qwen3_5TextCache,
 };
 use std::io::IsTerminal;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "native-models")]
 use tokenizers::Tokenizer;
@@ -29,6 +31,7 @@ const RUST_MINICPM_V46_PROVIDER_ID: &str = "sinomo-models";
 const DEFAULT_RUST_MINICPM_V46_CACHE_SUBDIR: &str = "openbmb--MiniCPM-V-4_6";
 const FILE_BROWSER_PREVIEW_MAX_BYTES: u64 = 64 * 1024;
 const FILE_BROWSER_PREVIEW_MAX_LINES: usize = 200;
+const TUI_SESSION_SCHEMA_VERSION: u32 = 1;
 
 pub fn run_cui() -> Result<(), CliError> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -193,26 +196,53 @@ fn new_interaction_runtime<H: InteractionEventHandler>(
     handler: H,
     daemon: Option<&DaemonStatus>,
 ) -> Result<InteractionRuntime<InMemoryEventStore, H>, CliError> {
-    let node_id = daemon
-        .and_then(|status| status.cluster.as_ref())
-        .map(|cluster| cluster.node_id.clone())
-        .unwrap_or_else(|| NodeId::from_legacy_named("node_cli").expect("valid node id"));
-    let session = InteractionSession::new(
-        SessionId::generate(),
-        node_id,
-        InteractionSurface::new("surface.cli", InteractionSurfaceKind::CommandLine),
-    );
+    let session = interaction_session_for_daemon(daemon, SessionId::generate());
     let mut runtime = InteractionRuntime::new(InMemoryEventStore::new(), handler, session.clone());
     runtime.append_session_context(daemon_context_event(&session, daemon))?;
     Ok(runtime)
 }
 
-fn run_cui_tui_with_handler_and_daemon<H: InteractionEventHandler>(
+fn interaction_session_for_daemon(
+    daemon: Option<&DaemonStatus>,
+    session_id: SessionId,
+) -> InteractionSession {
+    let node_id = daemon
+        .and_then(|status| status.cluster.as_ref())
+        .map(|cluster| cluster.node_id.clone())
+        .unwrap_or_else(|| NodeId::from_legacy_named("node_cli").expect("valid node id"));
+    InteractionSession::new(
+        session_id,
+        node_id,
+        InteractionSurface::new("surface.cli", InteractionSurfaceKind::CommandLine),
+    )
+}
+
+fn new_tui_interaction_runtime<H: TuiAgentRuntimeControl>(
+    handler: H,
+    daemon: Option<&DaemonStatus>,
+    session_store: &TuiSessionStore,
+) -> Result<InteractionRuntime<JsonlEventStore, H>, CliError> {
+    let session = interaction_session_for_daemon(daemon, SessionId::generate());
+    let store = JsonlEventStore::new(session_store.events_path_for_session(&session.session_id));
+    let mut runtime = InteractionRuntime::new(store, handler, session.clone());
+    runtime.append_session_context(daemon_context_event(&session, daemon))?;
+    Ok(runtime)
+}
+
+fn run_cui_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
     handler: H,
     daemon: Option<DaemonStatus>,
 ) -> Result<(), CliError> {
-    let mut runtime = new_interaction_runtime(handler, daemon.as_ref())?;
-    let mut state = CuiTuiState::new(runtime.session(), daemon.as_ref());
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let session_store = TuiSessionStore::for_data_dir(&data_dir);
+    let mut runtime = new_tui_interaction_runtime(handler, daemon.as_ref(), &session_store)?;
+    let mut state = CuiTuiState::new(
+        runtime.session(),
+        daemon.as_ref(),
+        runtime.handler.tui_agent_runtime_info(),
+    );
+    session_store.save_state(runtime.session(), &state)?;
     let mut terminal = TuiTerminalSession::enter()?;
 
     terminal.draw(&state)?;
@@ -232,11 +262,38 @@ fn run_cui_tui_with_handler_and_daemon<H: InteractionEventHandler>(
                             &mut runtime,
                             &mut state,
                             &mut terminal,
+                            &data_dir,
+                            &session_store,
+                            daemon.as_ref(),
                             "/quit".to_string(),
                         )?;
                     }
                     TuiInputAction::Submit(line) => {
-                        submit_tui_input(&mut runtime, &mut state, &mut terminal, line)?;
+                        submit_tui_input(
+                            &mut runtime,
+                            &mut state,
+                            &mut terminal,
+                            &data_dir,
+                            &session_store,
+                            daemon.as_ref(),
+                            line,
+                        )?;
+                    }
+                    TuiInputAction::OpenSessions => {
+                        open_tui_session_list_view(&runtime, &mut state, &session_store)?;
+                    }
+                    TuiInputAction::Resume(session_id) => {
+                        for output in resume_tui_session(
+                            &mut runtime,
+                            &mut state,
+                            &session_store,
+                            &data_dir,
+                            daemon.as_ref(),
+                            session_id,
+                        )? {
+                            state.apply_output(output);
+                        }
+                        session_store.save_state(runtime.session(), &state)?;
                     }
                 }
                 terminal.draw(&state)?;
@@ -253,15 +310,42 @@ fn run_cui_tui_with_handler_and_daemon<H: InteractionEventHandler>(
     Ok(())
 }
 
-fn submit_tui_input<H: InteractionEventHandler>(
-    runtime: &mut InteractionRuntime<InMemoryEventStore, H>,
+fn submit_tui_input<H: TuiAgentRuntimeControl>(
+    runtime: &mut InteractionRuntime<JsonlEventStore, H>,
     state: &mut CuiTuiState,
     terminal: &mut TuiTerminalSession,
+    data_dir: &SinomoDataDir,
+    session_store: &TuiSessionStore,
+    daemon: Option<&DaemonStatus>,
     line: String,
 ) -> Result<(), CliError> {
-    if let Some(command) = parse_tui_slash_command(&line)? {
+    let command = match parse_tui_slash_command(&line) {
+        Ok(command) => command,
+        Err(error) => {
+            state.begin_submission(&line);
+            state.apply_output(InteractionOutput::Line(format!("command failed: {error}")));
+            state.finish_submission();
+            session_store.save_state(runtime.session(), state)?;
+            terminal.draw(state)?;
+            return Ok(());
+        }
+    };
+    if let Some(command) = command {
         state.begin_submission(&line);
-        state.apply_tui_slash_command(command);
+        let outputs =
+            apply_tui_slash_command(runtime, state, data_dir, session_store, daemon, command);
+        match outputs {
+            Ok(outputs) => {
+                for output in outputs {
+                    state.apply_output(output);
+                }
+            }
+            Err(error) => {
+                state.apply_output(InteractionOutput::Line(format!("command failed: {error}")));
+            }
+        }
+        state.finish_submission();
+        session_store.save_state(runtime.session(), state)?;
         terminal.draw(state)?;
         return Ok(());
     }
@@ -284,10 +368,18 @@ fn submit_tui_input<H: InteractionEventHandler>(
     if let Some(error) = render_error {
         return Err(error);
     }
-    for output in result? {
-        state.apply_output(output);
+    match result {
+        Ok(outputs) => {
+            for output in outputs {
+                state.apply_output(output);
+            }
+        }
+        Err(error) => {
+            state.apply_output(InteractionOutput::Line(format!("model failed: {error}")));
+        }
     }
     state.finish_submission();
+    session_store.save_state(runtime.session(), state)?;
     Ok(())
 }
 
@@ -336,6 +428,8 @@ impl Drop for TuiTerminalSession {
 enum TuiInputAction {
     None,
     Submit(String),
+    OpenSessions,
+    Resume(SessionId),
     Exit,
 }
 
@@ -351,6 +445,210 @@ struct TuiCompletionState {
 enum CuiTuiViewMode {
     Chat,
     Files,
+    Sessions,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct TuiSessionRecord {
+    schema_version: u32,
+    session: InteractionSession,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+    title: String,
+    message_count: usize,
+    ended: bool,
+    runtime_info: TuiAgentRuntimeInfo,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct TuiSessionTranscript {
+    schema_version: u32,
+    messages: Vec<TuiMessage>,
+}
+
+#[derive(Clone, Debug)]
+struct TuiSessionStore {
+    root: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiSessionListState {
+    sessions: Vec<TuiSessionRecord>,
+    selected: usize,
+}
+
+impl TuiSessionListState {
+    fn new(sessions: Vec<TuiSessionRecord>, current_session_id: &str) -> Self {
+        let selected = sessions
+            .iter()
+            .position(|session| session.session.session_id.to_string() == current_session_id)
+            .unwrap_or(0);
+        Self { sessions, selected }
+    }
+
+    fn selected_session_id(&self) -> Option<SessionId> {
+        self.sessions
+            .get(self.selected)
+            .map(|record| record.session.session_id.clone())
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.sessions.len() - 1;
+        if delta.is_negative() {
+            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.selected = self.selected.saturating_add(delta as usize).min(last);
+        }
+    }
+}
+
+impl TuiSessionStore {
+    fn for_data_dir(data_dir: &SinomoDataDir) -> Self {
+        Self {
+            root: data_dir.root().join("events").join("tui").join("sessions"),
+        }
+    }
+
+    fn session_dir(&self, session_id: &SessionId) -> PathBuf {
+        self.root.join(session_id.to_string())
+    }
+
+    fn record_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir(session_id).join("session.json")
+    }
+
+    fn transcript_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir(session_id).join("transcript.json")
+    }
+
+    fn events_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir(session_id).join("events.jsonl")
+    }
+
+    fn save_state(
+        &self,
+        session: &InteractionSession,
+        state: &CuiTuiState,
+    ) -> Result<(), CliError> {
+        let now = OffsetDateTime::now_utc();
+        let existing = self.load_record(&session.session_id)?;
+        let created_at = existing
+            .as_ref()
+            .map(|record| record.created_at)
+            .unwrap_or(now);
+        let record = TuiSessionRecord {
+            schema_version: TUI_SESSION_SCHEMA_VERSION,
+            session: session.clone(),
+            created_at,
+            updated_at: now,
+            title: tui_session_title(&state.messages),
+            message_count: state.messages.len(),
+            ended: state.exit_requested,
+            runtime_info: state.runtime_info.clone(),
+        };
+        write_tui_json_atomic(&self.record_path_for_session(&session.session_id), &record)?;
+        let transcript = TuiSessionTranscript {
+            schema_version: TUI_SESSION_SCHEMA_VERSION,
+            messages: state.messages.clone(),
+        };
+        write_tui_json_atomic(
+            &self.transcript_path_for_session(&session.session_id),
+            &transcript,
+        )
+    }
+
+    fn load_record(&self, session_id: &SessionId) -> Result<Option<TuiSessionRecord>, CliError> {
+        let path = self.record_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let record: TuiSessionRecord =
+            serde_json::from_str(&contents).map_err(|source| CliError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if record.schema_version != TUI_SESSION_SCHEMA_VERSION {
+            return Err(CliError::Json {
+                path: path.display().to_string(),
+                detail: format!("unsupported TUI session schema {}", record.schema_version),
+            });
+        }
+        Ok(Some(record))
+    }
+
+    fn load_transcript(&self, session_id: &SessionId) -> Result<Option<Vec<TuiMessage>>, CliError> {
+        let path = self.transcript_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let contents = fs::read_to_string(&path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let transcript: TuiSessionTranscript =
+            serde_json::from_str(&contents).map_err(|source| CliError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if transcript.schema_version != TUI_SESSION_SCHEMA_VERSION {
+            return Err(CliError::Json {
+                path: path.display().to_string(),
+                detail: format!(
+                    "unsupported TUI transcript schema {}",
+                    transcript.schema_version
+                ),
+            });
+        }
+        Ok(Some(transcript.messages))
+    }
+
+    fn load_session(&self, session_id: &SessionId) -> Result<TuiSessionRecord, CliError> {
+        self.load_record(session_id)?
+            .ok_or_else(|| CliError::Parse {
+                detail: format!("unknown session `{session_id}`"),
+            })
+    }
+
+    fn list_sessions(&self) -> Result<Vec<TuiSessionRecord>, CliError> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(&self.root).map_err(|source| CliError::Io {
+            path: self.root.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut sessions = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| CliError::Io {
+                path: self.root.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Ok(session_id) = SessionId::from_str(&name) else {
+                continue;
+            };
+            if let Some(record) = self.load_record(&session_id)? {
+                sessions.push(record);
+            }
+        }
+        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        Ok(sessions)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -612,9 +910,68 @@ impl FileBrowserPrompt {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiSlashCommand {
     Files { target: PathBuf },
+    Model(TuiModelCommand),
+    Sessions,
+    Resume { session_id: SessionId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiModelCommand {
+    Status,
+    Use(TuiModelSelection),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TuiModelSelection {
+    provider: String,
+    model: String,
+    account: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct TuiAgentRuntimeInfo {
+    agent: String,
+    provider: String,
+    model: String,
+    account: Option<String>,
+}
+
+impl TuiAgentRuntimeInfo {
+    fn model_label(&self) -> String {
+        match self
+            .account
+            .as_deref()
+            .filter(|account| !account.is_empty())
+        {
+            Some(account) => format!("{}/{}@{}", self.provider, self.model, account),
+            None => format!("{}/{}", self.provider, self.model),
+        }
+    }
+}
+
+impl Default for TuiAgentRuntimeInfo {
+    fn default() -> Self {
+        Self {
+            agent: "main-agent".to_string(),
+            provider: MINICPM_PROVIDER_ID.to_string(),
+            model: MINICPM_DEFAULT_MODEL.to_string(),
+            account: None,
+        }
+    }
+}
+
+trait TuiAgentRuntimeControl: InteractionEventHandler {
+    fn tui_agent_runtime_info(&self) -> TuiAgentRuntimeInfo;
+
+    fn switch_tui_model(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        selection: TuiModelSelection,
+        daemon_connected: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError>;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 enum TuiMessageKind {
     User,
     Command,
@@ -624,7 +981,7 @@ enum TuiMessageKind {
     Error,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct TuiMessage {
     kind: TuiMessageKind,
     text: String,
@@ -635,10 +992,13 @@ struct CuiTuiState {
     session_id: String,
     node_id: String,
     daemon_label: String,
+    daemon_connected: bool,
     cluster_label: Option<String>,
+    runtime_info: TuiAgentRuntimeInfo,
     view_mode: CuiTuiViewMode,
     file_browser: Option<FileBrowserState>,
     file_prompt: Option<FileBrowserPrompt>,
+    session_list: Option<TuiSessionListState>,
     input: String,
     input_cursor: usize,
     messages: Vec<TuiMessage>,
@@ -650,7 +1010,11 @@ struct CuiTuiState {
 }
 
 impl CuiTuiState {
-    fn new(session: &InteractionSession, daemon: Option<&DaemonStatus>) -> Self {
+    fn new(
+        session: &InteractionSession,
+        daemon: Option<&DaemonStatus>,
+        runtime_info: TuiAgentRuntimeInfo,
+    ) -> Self {
         let daemon_label = daemon
             .map(|status| format!("daemon pid={} address={}", status.pid, status.address))
             .unwrap_or_else(|| "daemon not connected".to_string());
@@ -661,10 +1025,13 @@ impl CuiTuiState {
             session_id: session.session_id.to_string(),
             node_id: session.node_id.to_string(),
             daemon_label,
+            daemon_connected: daemon.is_some(),
             cluster_label,
+            runtime_info,
             view_mode: CuiTuiViewMode::Chat,
             file_browser: None,
             file_prompt: None,
+            session_list: None,
             input: String::new(),
             input_cursor: 0,
             messages: Vec::new(),
@@ -691,7 +1058,11 @@ impl CuiTuiState {
                 self.toggle_file_browser();
                 TuiInputAction::None
             }
+            KeyCode::F(3) => TuiInputAction::OpenSessions,
             _ if self.view_mode == CuiTuiViewMode::Files => self.apply_file_browser_key_event(key),
+            _ if self.view_mode == CuiTuiViewMode::Sessions => {
+                self.apply_session_list_key_event(key)
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -761,6 +1132,66 @@ impl CuiTuiState {
                 self.insert_char(character);
                 TuiInputAction::None
             }
+            _ => TuiInputAction::None,
+        }
+    }
+
+    fn apply_session_list_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_session_list();
+                TuiInputAction::None
+            }
+            KeyCode::Enter => self
+                .session_list
+                .as_ref()
+                .and_then(TuiSessionListState::selected_session_id)
+                .map(TuiInputAction::Resume)
+                .unwrap_or(TuiInputAction::None),
+            KeyCode::Up => {
+                if let Some(list) = self.session_list.as_mut() {
+                    list.move_selection(-1);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Down => {
+                if let Some(list) = self.session_list.as_mut() {
+                    list.move_selection(1);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::PageUp => {
+                if let Some(list) = self.session_list.as_mut() {
+                    list.move_selection(-8);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::PageDown => {
+                if let Some(list) = self.session_list.as_mut() {
+                    list.move_selection(8);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Home => {
+                if let Some(list) = self.session_list.as_mut() {
+                    list.selected = 0;
+                }
+                TuiInputAction::None
+            }
+            KeyCode::End => {
+                if let Some(list) = self.session_list.as_mut()
+                    && !list.sessions.is_empty()
+                {
+                    list.selected = list.sessions.len() - 1;
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => self
+                .session_list
+                .as_ref()
+                .and_then(TuiSessionListState::selected_session_id)
+                .map(TuiInputAction::Resume)
+                .unwrap_or(TuiInputAction::None),
             _ => TuiInputAction::None,
         }
     }
@@ -898,10 +1329,8 @@ impl CuiTuiState {
         }
     }
 
-    fn apply_tui_slash_command(&mut self, command: TuiSlashCommand) {
-        match command {
-            TuiSlashCommand::Files { target } => self.open_file_browser_at(target),
-        }
+    fn update_runtime_info(&mut self, runtime_info: TuiAgentRuntimeInfo) {
+        self.runtime_info = runtime_info;
     }
 
     fn open_file_browser_current_dir(&mut self) {
@@ -940,6 +1369,55 @@ impl CuiTuiState {
         self.input_cursor = 0;
         self.completions = None;
         self.status = "listening".to_string();
+    }
+
+    fn open_session_list(&mut self, sessions: Vec<TuiSessionRecord>) {
+        let count = sessions.len();
+        self.view_mode = CuiTuiViewMode::Sessions;
+        self.file_prompt = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.session_list = Some(TuiSessionListState::new(sessions, &self.session_id));
+        self.status = format!("showing {count} session(s)");
+    }
+
+    fn close_session_list(&mut self) {
+        self.view_mode = CuiTuiViewMode::Chat;
+        self.session_list = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.status = "listening".to_string();
+    }
+
+    fn replace_session(
+        &mut self,
+        session: &InteractionSession,
+        runtime_info: TuiAgentRuntimeInfo,
+        mut messages: Vec<TuiMessage>,
+    ) {
+        if messages.is_empty() {
+            messages.push(TuiMessage {
+                kind: TuiMessageKind::System,
+                text: "main agent session resumed".to_string(),
+            });
+        }
+        self.session_id = session.session_id.to_string();
+        self.node_id = session.node_id.to_string();
+        self.runtime_info = runtime_info;
+        self.view_mode = CuiTuiViewMode::Chat;
+        self.file_browser = None;
+        self.file_prompt = None;
+        self.session_list = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.messages = messages;
+        self.stream_message = None;
+        self.scrollback = 0;
+        self.exit_requested = false;
+        self.status = "session resumed".to_string();
     }
 
     fn with_file_browser(
@@ -1015,6 +1493,9 @@ impl CuiTuiState {
                 .as_ref()
                 .map(FileBrowserPrompt::title)
                 .unwrap_or("Files");
+        }
+        if self.view_mode == CuiTuiViewMode::Sessions {
+            return "Sessions";
         }
         "Message"
     }
@@ -1107,7 +1588,7 @@ impl CuiTuiState {
         self.stream_message = None;
         if let Some(text) = line.strip_prefix("sinomo: ") {
             self.push_message(TuiMessageKind::Agent, text);
-        } else if line.starts_with("command failed:") {
+        } else if line.starts_with("command failed:") || line.starts_with("model failed:") {
             self.push_message(TuiMessageKind::Error, line);
         } else {
             self.push_message(TuiMessageKind::System, line);
@@ -1128,7 +1609,9 @@ impl CuiTuiState {
     }
 
     fn insert_str(&mut self, text: &str) {
-        if self.view_mode == CuiTuiViewMode::Files && self.file_prompt.is_none() {
+        if (self.view_mode == CuiTuiViewMode::Files && self.file_prompt.is_none())
+            || self.view_mode == CuiTuiViewMode::Sessions
+        {
             return;
         }
         for character in text.chars() {
@@ -1319,7 +1802,291 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
         [command, ..] if command == "files" => Err(CliError::Parse {
             detail: "usage: /files [path]".to_string(),
         }),
+        [command, rest @ ..] if command == "model" => parse_tui_model_command(rest),
+        [command] if command == "sessions" => Ok(Some(TuiSlashCommand::Sessions)),
+        [command, ..] if command == "sessions" => Err(CliError::Parse {
+            detail: "usage: /sessions".to_string(),
+        }),
+        [command, session_id] if command == "resume" => {
+            let session_id = SessionId::from_str(session_id).map_err(|source| CliError::Parse {
+                detail: format!("invalid session id `{session_id}`: {source}"),
+            })?;
+            Ok(Some(TuiSlashCommand::Resume { session_id }))
+        }
+        [command, ..] if command == "resume" => Err(CliError::Parse {
+            detail: "usage: /resume <session-id>".to_string(),
+        }),
         _ => Ok(None),
+    }
+}
+
+fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
+    runtime: &mut InteractionRuntime<JsonlEventStore, H>,
+    state: &mut CuiTuiState,
+    data_dir: &SinomoDataDir,
+    session_store: &TuiSessionStore,
+    daemon: Option<&DaemonStatus>,
+    command: TuiSlashCommand,
+) -> Result<Vec<InteractionOutput>, CliError> {
+    match command {
+        TuiSlashCommand::Files { target } => {
+            state.open_file_browser_at(target);
+            Ok(vec![InteractionOutput::Line(
+                "opened file browser".to_string(),
+            )])
+        }
+        TuiSlashCommand::Model(TuiModelCommand::Status) => {
+            let info = runtime.handler.tui_agent_runtime_info();
+            state.update_runtime_info(info.clone());
+            Ok(tui_model_status_outputs(&info))
+        }
+        TuiSlashCommand::Model(TuiModelCommand::Use(selection)) => {
+            let info =
+                runtime
+                    .handler
+                    .switch_tui_model(data_dir, selection, state.daemon_connected)?;
+            state.update_runtime_info(info.clone());
+            Ok(vec![InteractionOutput::Line(format!(
+                "model switched: {} {}",
+                info.agent,
+                info.model_label()
+            ))])
+        }
+        TuiSlashCommand::Sessions => {
+            let count = open_tui_session_list_view(runtime, state, session_store)?;
+            Ok(vec![InteractionOutput::Line(format!(
+                "loaded {count} session(s)"
+            ))])
+        }
+        TuiSlashCommand::Resume { session_id } => {
+            resume_tui_session(runtime, state, session_store, data_dir, daemon, session_id)
+        }
+    }
+}
+
+fn open_tui_session_list_view<H: TuiAgentRuntimeControl>(
+    runtime: &InteractionRuntime<JsonlEventStore, H>,
+    state: &mut CuiTuiState,
+    session_store: &TuiSessionStore,
+) -> Result<usize, CliError> {
+    session_store.save_state(runtime.session(), state)?;
+    let sessions = session_store.list_sessions()?;
+    let count = sessions.len();
+    state.open_session_list(sessions);
+    Ok(count)
+}
+
+fn resume_tui_session<H: TuiAgentRuntimeControl>(
+    runtime: &mut InteractionRuntime<JsonlEventStore, H>,
+    state: &mut CuiTuiState,
+    session_store: &TuiSessionStore,
+    data_dir: &SinomoDataDir,
+    daemon: Option<&DaemonStatus>,
+    session_id: SessionId,
+) -> Result<Vec<InteractionOutput>, CliError> {
+    if runtime.session().session_id == session_id {
+        state.close_session_list();
+        return Ok(vec![InteractionOutput::Line(format!(
+            "session already active: {session_id}"
+        ))]);
+    }
+
+    session_store.save_state(runtime.session(), state)?;
+    let record = session_store.load_session(&session_id)?;
+    let mut outputs = Vec::new();
+    let restored_info = restore_tui_session_runtime_info(
+        &mut runtime.handler,
+        data_dir,
+        state.daemon_connected,
+        &record.runtime_info,
+        &mut outputs,
+    );
+    runtime.replace_store_and_session(
+        JsonlEventStore::new(session_store.events_path_for_session(&session_id)),
+        record.session.clone(),
+    );
+    runtime.append_session_context(daemon_context_event(&record.session, daemon))?;
+    let messages = session_store
+        .load_transcript(&session_id)?
+        .unwrap_or_else(Vec::new);
+    state.replace_session(&record.session, restored_info, messages);
+    outputs.insert(
+        0,
+        InteractionOutput::Line(format!("resumed session: {}", record.session.session_id)),
+    );
+    Ok(outputs)
+}
+
+fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
+    handler: &mut H,
+    data_dir: &SinomoDataDir,
+    daemon_connected: bool,
+    info: &TuiAgentRuntimeInfo,
+    outputs: &mut Vec<InteractionOutput>,
+) -> TuiAgentRuntimeInfo {
+    let provider =
+        normalize_tui_model_provider(&info.provider).unwrap_or_else(|_| info.provider.clone());
+    let selection = TuiModelSelection {
+        provider,
+        model: info.model.clone(),
+        account: info
+            .account
+            .clone()
+            .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+    };
+    match handler.switch_tui_model(data_dir, selection, daemon_connected) {
+        Ok(info) => info,
+        Err(error) => {
+            outputs.push(InteractionOutput::Line(format!(
+                "model restore failed: {error}"
+            )));
+            handler.tui_agent_runtime_info()
+        }
+    }
+}
+
+fn tui_model_status_outputs(info: &TuiAgentRuntimeInfo) -> Vec<InteractionOutput> {
+    vec![
+        InteractionOutput::Line(format!("agent: {}", info.agent)),
+        InteractionOutput::Line(format!("provider: {}", info.provider)),
+        InteractionOutput::Line(format!("model: {}", info.model)),
+        InteractionOutput::Line(format!(
+            "account: {}",
+            info.account.as_deref().unwrap_or("default")
+        )),
+    ]
+}
+
+fn parse_tui_model_command(args: &[String]) -> Result<Option<TuiSlashCommand>, CliError> {
+    match args {
+        [] => Ok(Some(TuiSlashCommand::Model(TuiModelCommand::Status))),
+        [command] if command == "status" => {
+            Ok(Some(TuiSlashCommand::Model(TuiModelCommand::Status)))
+        }
+        [command, ..] if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Err(tui_model_usage_error())
+        }
+        [command, rest @ ..] if command == "use" => Ok(Some(TuiSlashCommand::Model(
+            TuiModelCommand::Use(parse_tui_model_selection(rest)?),
+        ))),
+        _ => Ok(Some(TuiSlashCommand::Model(TuiModelCommand::Use(
+            parse_tui_model_selection(args)?,
+        )))),
+    }
+}
+
+fn parse_tui_model_selection(args: &[String]) -> Result<TuiModelSelection, CliError> {
+    let mut provider = None;
+    let mut model = None;
+    let mut account = None;
+    let mut named_provider_model = false;
+    let mut positional_provider_model = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" => {
+                if positional_provider_model {
+                    return Err(tui_model_mixed_form_error());
+                }
+                named_provider_model = true;
+                provider = Some(tui_model_option_value(args, index, "--provider")?);
+                index += 2;
+            }
+            "--model" => {
+                if positional_provider_model {
+                    return Err(tui_model_mixed_form_error());
+                }
+                named_provider_model = true;
+                model = Some(tui_model_option_value(args, index, "--model")?);
+                index += 2;
+            }
+            "--account" => {
+                account = Some(tui_model_option_value(args, index, "--account")?);
+                index += 2;
+            }
+            value if value.starts_with("--") => {
+                return Err(CliError::Parse {
+                    detail: format!("unknown /model option `{value}`"),
+                });
+            }
+            value if provider.is_none() => {
+                if named_provider_model {
+                    return Err(tui_model_mixed_form_error());
+                }
+                positional_provider_model = true;
+                provider = Some(value.to_string());
+                index += 1;
+            }
+            value if model.is_none() => {
+                if named_provider_model {
+                    return Err(tui_model_mixed_form_error());
+                }
+                positional_provider_model = true;
+                model = Some(value.to_string());
+                index += 1;
+            }
+            value => {
+                return Err(CliError::Parse {
+                    detail: format!("unexpected /model argument `{value}`"),
+                });
+            }
+        }
+    }
+    let provider = provider.ok_or_else(tui_model_usage_error)?;
+    let provider = normalize_tui_model_provider(&provider)?;
+    let model = model.ok_or_else(tui_model_usage_error)?;
+    let model = if provider == MINICPM_PROVIDER_ID || provider == RUST_MINICPM_V46_PROVIDER_ID {
+        model
+    } else {
+        normalize_model_id_for_provider(&provider, &model)
+    };
+    let account = normalize_provider_account_name(account.as_deref());
+    Ok(TuiModelSelection {
+        provider,
+        model,
+        account,
+    })
+}
+
+fn tui_model_mixed_form_error() -> CliError {
+    CliError::Parse {
+        detail:
+            "usage: do not mix positional /model <provider> <model> with --provider/--model options"
+                .to_string(),
+    }
+}
+
+fn tui_model_option_value(args: &[String], index: usize, option: &str) -> Result<String, CliError> {
+    let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) else {
+        return Err(CliError::Parse {
+            detail: format!("{option} requires a value"),
+        });
+    };
+    Ok(value.clone())
+}
+
+fn tui_model_usage_error() -> CliError {
+    CliError::Parse {
+        detail: "usage: /model <provider> <model> [--account <account>] or /model status"
+            .to_string(),
+    }
+}
+
+fn normalize_tui_model_provider(provider: &str) -> Result<String, CliError> {
+    let provider = provider.trim();
+    match provider {
+        value
+            if value.eq_ignore_ascii_case("minicpm")
+                || value.eq_ignore_ascii_case(MINICPM_PROVIDER_ID) =>
+        {
+            Ok(MINICPM_PROVIDER_ID.to_string())
+        }
+        value if value.eq_ignore_ascii_case(RUST_MINICPM_V46_PROVIDER_ID) => {
+            Ok(RUST_MINICPM_V46_PROVIDER_ID.to_string())
+        }
+        _ => normalize_model_provider(provider).ok_or_else(|| CliError::Parse {
+            detail: format!("unknown provider `{provider}`"),
+        }),
     }
 }
 
@@ -1531,13 +2298,129 @@ fn format_file_size(size: u64) -> String {
     }
 }
 
+fn tui_session_title(messages: &[TuiMessage]) -> String {
+    messages
+        .iter()
+        .find(|message| message.kind == TuiMessageKind::User && !message.text.trim().is_empty())
+        .or_else(|| {
+            messages
+                .iter()
+                .find(|message| !message.text.trim().is_empty())
+        })
+        .map(|message| truncate_tui_text(message.text.trim(), 80))
+        .unwrap_or_else(|| "New TUI session".to_string())
+}
+
+fn truncate_tui_text(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, character) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("...");
+            return output;
+        }
+        output.push(character);
+    }
+    output
+}
+
+fn format_tui_timestamp(value: OffsetDateTime) -> String {
+    value.format(&Rfc3339).unwrap_or_else(|_| value.to_string())
+}
+
+fn write_tui_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), CliError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(value).map_err(|source| CliError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session");
+    let tmp_path = path.with_file_name(format!(".{file_name}.{}.tmp", SessionId::generate()));
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|source| CliError::Io {
+                path: tmp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.write_all(&bytes).map_err(|source| CliError::Io {
+            path: tmp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        file.sync_all().map_err(|source| CliError::Io {
+            path: tmp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    replace_tui_file(&tmp_path, path)
+}
+
+#[cfg(not(windows))]
+fn replace_tui_file(source: &Path, target: &Path) -> Result<(), CliError> {
+    fs::rename(source, target).map_err(|source_error| CliError::Io {
+        path: target.display().to_string(),
+        detail: source_error.to_string(),
+    })
+}
+
+#[cfg(windows)]
+fn replace_tui_file(source: &Path, target: &Path) -> Result<(), CliError> {
+    match fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(error) if target.exists() => {
+            fs::remove_file(target).map_err(|remove_error| CliError::Io {
+                path: target.display().to_string(),
+                detail: remove_error.to_string(),
+            })?;
+            fs::rename(source, target).map_err(|rename_error| CliError::Io {
+                path: target.display().to_string(),
+                detail: format!(
+                    "{error}; retry after removing existing file failed: {rename_error}"
+                ),
+            })
+        }
+        Err(error) => Err(CliError::Io {
+            path: target.display().to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
 fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
     let area = frame.area();
+    if state.view_mode == CuiTuiViewMode::Sessions {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Min(1),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        render_tui_header(frame, chunks[0], state);
+        render_tui_session_list(frame, chunks[1], state);
+        render_tui_input(frame, chunks[2], state);
+        render_tui_status(frame, chunks[3], state);
+        return;
+    }
     if state.view_mode == CuiTuiViewMode::Files {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
+                Constraint::Length(5),
                 Constraint::Min(1),
                 Constraint::Length(3),
                 Constraint::Length(1),
@@ -1558,7 +2441,7 @@ fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Min(1),
             Constraint::Length(completion_height),
             Constraint::Length(3),
@@ -1601,6 +2484,13 @@ fn render_tui_header(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
         Line::from(vec![
             Span::styled("runtime ", Style::default().fg(Color::DarkGray)),
             Span::raw(state.daemon_label.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("agent ", Style::default().fg(Color::DarkGray)),
+            Span::raw(state.runtime_info.agent.clone()),
+            Span::raw("  "),
+            Span::styled("model ", Style::default().fg(Color::DarkGray)),
+            Span::raw(state.runtime_info.model_label()),
         ]),
     ]);
     let block = Block::default()
@@ -1681,6 +2571,83 @@ fn render_tui_completions(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState
         )
     } else {
         "Slash Commands".to_string()
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_tui_session_list(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    let Some(list) = &state.session_list else {
+        let block = Block::default()
+            .title("Sessions")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+        frame.render_widget(
+            Paragraph::new("session list is not loaded").block(block),
+            area,
+        );
+        return;
+    };
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    let (visible_start, visible_end) =
+        completion_visible_range(list.sessions.len(), Some(list.selected), visible_height);
+    let lines = list
+        .sessions
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end.saturating_sub(visible_start))
+        .map(|(index, record)| {
+            let selected = list.selected == index;
+            let base_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if record.ended {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let detail_style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "> " } else { "  " };
+            let active = if record.session.session_id.to_string() == state.session_id {
+                "active"
+            } else if record.ended {
+                "ended "
+            } else {
+                "open  "
+            };
+            Line::from(vec![
+                Span::styled(marker, base_style),
+                Span::styled(active, detail_style),
+                Span::styled(" ", detail_style),
+                Span::styled(record.session.session_id.to_string(), base_style),
+                Span::styled("  ", detail_style),
+                Span::styled(format_tui_timestamp(record.updated_at), detail_style),
+                Span::styled("  ", detail_style),
+                Span::styled(record.runtime_info.model_label(), detail_style),
+                Span::styled("  ", detail_style),
+                Span::styled(truncate_tui_text(&record.title, 72), base_style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let title = if visible_start > 0 || visible_end < list.sessions.len() {
+        format!(
+            "Sessions {}-{}/{}",
+            visible_start + 1,
+            visible_end,
+            list.sessions.len()
+        )
+    } else {
+        "Sessions".to_string()
     };
     let block = Block::default()
         .title(title)
@@ -1862,6 +2829,23 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
+    if state.view_mode == CuiTuiViewMode::Sessions {
+        let line = Line::from(vec![
+            Span::styled(
+                state.status.clone(),
+                status_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
+            Span::raw(" move   "),
+            Span::styled("Enter/r", Style::default().fg(Color::DarkGray)),
+            Span::raw(" resume   "),
+            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::raw(" chat"),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let line = Line::from(vec![
         Span::styled(
             state.status.clone(),
@@ -1876,6 +2860,8 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
         Span::raw(" accept   "),
         Span::styled("Esc", Style::default().fg(Color::DarkGray)),
         Span::raw(" quit   "),
+        Span::styled("F3", Style::default().fg(Color::DarkGray)),
+        Span::raw(" sessions   "),
         Span::styled("PgUp/PgDn", Style::default().fg(Color::DarkGray)),
         Span::raw(" scroll"),
     ]);
@@ -1938,7 +2924,7 @@ mod tui_tests {
             NodeId::from_legacy_named("node_test").expect("node"),
             InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
         );
-        CuiTuiState::new(&session, None)
+        CuiTuiState::new(&session, None, TuiAgentRuntimeInfo::default())
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -2006,6 +2992,25 @@ mod tui_tests {
         assert_eq!(state.messages[2].kind, TuiMessageKind::Error);
         assert!(state.exit_requested);
         assert_eq!(state.status, "ending session");
+    }
+
+    #[test]
+    fn tui_state_marks_model_failures_as_errors() {
+        let mut state = fixture_tui_state();
+
+        state.begin_submission("hello");
+        state.apply_output(InteractionOutput::Line(
+            "model failed: backend rejected request".to_string(),
+        ));
+        state.finish_submission();
+
+        assert_eq!(state.messages[1].kind, TuiMessageKind::User);
+        assert_eq!(state.messages[2].kind, TuiMessageKind::Error);
+        assert_eq!(
+            state.messages[2].text,
+            "model failed: backend rejected request"
+        );
+        assert_eq!(state.status, "listening");
     }
 
     #[test]
@@ -2182,6 +3187,189 @@ mod tui_tests {
         );
         assert!(parse_tui_slash_command("/help").expect("parse").is_none());
     }
+
+    #[test]
+    fn tui_session_commands_parse_list_and_resume() {
+        let session_id = SessionId::generate();
+        assert_eq!(
+            parse_tui_slash_command("/sessions")
+                .expect("parse")
+                .expect("sessions"),
+            TuiSlashCommand::Sessions
+        );
+        assert_eq!(
+            parse_tui_slash_command(&format!("/resume {session_id}"))
+                .expect("parse")
+                .expect("resume"),
+            TuiSlashCommand::Resume { session_id }
+        );
+        assert!(parse_tui_slash_command("/resume not-a-session").is_err());
+    }
+
+    #[test]
+    fn tui_session_store_saves_lists_and_loads_transcript() {
+        let root = temp_file_browser_root("sessions");
+        let data_dir = SinomoDataDir::new(root.clone());
+        let store = TuiSessionStore::for_data_dir(&data_dir);
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_test").expect("node"),
+            InteractionSurface::new("surface.test", InteractionSurfaceKind::CommandLine),
+        );
+        let mut state = CuiTuiState::new(&session, None, TuiAgentRuntimeInfo::default());
+        state.push_message(TuiMessageKind::User, "continue previous work");
+        state.push_message(TuiMessageKind::Agent, "ok");
+
+        store.save_state(&session, &state).expect("save");
+        let sessions = store.list_sessions().expect("list");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session.session_id, session.session_id);
+        assert_eq!(sessions[0].title, "continue previous work");
+        let transcript = store
+            .load_transcript(&session.session_id)
+            .expect("load")
+            .expect("transcript");
+        assert_eq!(transcript, state.messages);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_session_list_selects_and_resumes_with_enter() {
+        let session_a = SessionId::generate();
+        let session_b = SessionId::generate();
+        let mut state = fixture_tui_state();
+        state.open_session_list(vec![
+            TuiSessionRecord {
+                schema_version: TUI_SESSION_SCHEMA_VERSION,
+                session: InteractionSession::new(
+                    session_a.clone(),
+                    NodeId::from_legacy_named("node_a").expect("node"),
+                    InteractionSurface::new("surface.a", InteractionSurfaceKind::CommandLine),
+                ),
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+                title: "first".to_string(),
+                message_count: 1,
+                ended: false,
+                runtime_info: TuiAgentRuntimeInfo::default(),
+            },
+            TuiSessionRecord {
+                schema_version: TUI_SESSION_SCHEMA_VERSION,
+                session: InteractionSession::new(
+                    session_b.clone(),
+                    NodeId::from_legacy_named("node_b").expect("node"),
+                    InteractionSurface::new("surface.b", InteractionSurfaceKind::CommandLine),
+                ),
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: OffsetDateTime::now_utc(),
+                title: "second".to_string(),
+                message_count: 1,
+                ended: false,
+                runtime_info: TuiAgentRuntimeInfo::default(),
+            },
+        ]);
+
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Down)),
+            TuiInputAction::None
+        );
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Enter)),
+            TuiInputAction::Resume(session_b)
+        );
+    }
+
+    #[test]
+    fn tui_model_command_accepts_status_and_switch_forms() {
+        assert_eq!(
+            parse_tui_slash_command("/model")
+                .expect("parse")
+                .expect("status"),
+            TuiSlashCommand::Model(TuiModelCommand::Status)
+        );
+        assert_eq!(
+            parse_tui_slash_command("/model status")
+                .expect("parse")
+                .expect("status"),
+            TuiSlashCommand::Model(TuiModelCommand::Status)
+        );
+        assert_eq!(
+            parse_tui_slash_command("/model use codex gpt-5 --account work")
+                .expect("parse")
+                .expect("selection"),
+            TuiSlashCommand::Model(TuiModelCommand::Use(TuiModelSelection {
+                provider: "codex".to_string(),
+                model: "gpt-5".to_string(),
+                account: "work".to_string(),
+            }))
+        );
+        assert_eq!(
+            parse_tui_slash_command("/model --provider openai --model gpt-4.1")
+                .expect("parse")
+                .expect("selection"),
+            TuiSlashCommand::Model(TuiModelCommand::Use(TuiModelSelection {
+                provider: "openai".to_string(),
+                model: "gpt-4.1".to_string(),
+                account: "default".to_string(),
+            }))
+        );
+        assert_eq!(
+            parse_tui_slash_command("/model use MiniCPM openbmb/MiniCPM-V-4_5")
+                .expect("parse")
+                .expect("selection"),
+            TuiSlashCommand::Model(TuiModelCommand::Use(TuiModelSelection {
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: "openbmb/MiniCPM-V-4_5".to_string(),
+                account: "default".to_string(),
+            }))
+        );
+        assert!(parse_tui_slash_command("/model --provider --model gpt-5").is_err());
+    }
+
+    #[test]
+    fn tui_model_command_rejects_malformed_quick_switches() {
+        assert!(parse_tui_slash_command("/model list").is_err());
+        assert!(parse_tui_slash_command("/model runtime").is_err());
+        assert!(parse_tui_slash_command("/model default --provider codex --model gpt-5").is_err());
+        assert!(
+            parse_tui_slash_command("/models list")
+                .expect("parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tui_model_switch_replaces_active_handler_model() {
+        let root = temp_file_browser_root("model-switch");
+        let data_dir = SinomoDataDir::new(root.clone());
+        let mut handler = MainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+
+        let info = handler
+            .switch_tui_model(
+                &data_dir,
+                TuiModelSelection {
+                    provider: "codex".to_string(),
+                    model: "gpt-5".to_string(),
+                    account: "default".to_string(),
+                },
+                false,
+            )
+            .expect("switch");
+
+        assert_eq!(info.agent, "main-agent");
+        assert_eq!(info.provider, "codex");
+        assert_eq!(info.model, "gpt-5");
+        assert_eq!(info.account.as_deref(), Some("default"));
+        assert_eq!(handler.tui_agent_runtime_info(), info);
+
+        fs::remove_dir_all(root).ok();
+    }
 }
 
 pub trait InteractionEventHandler {
@@ -2241,6 +3429,11 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
     pub fn append_session_context(&mut self, event: EventEnvelope) -> Result<(), CliError> {
         self.store.append(event)?;
         Ok(())
+    }
+
+    pub fn replace_store_and_session(&mut self, store: S, session: InteractionSession) {
+        self.store = store;
+        self.session = session;
     }
 
     pub fn store(&self) -> &S {
@@ -2304,6 +3497,40 @@ impl DefaultMainAgentChatModel {
             })
         }
     }
+
+    fn runtime_info_for_config(runtime_config: &ModelRuntimeConfig) -> TuiAgentRuntimeInfo {
+        if runtime_config.pytorch_bridge.endpoint.is_some() {
+            return TuiAgentRuntimeInfo {
+                agent: "main-agent".to_string(),
+                provider: MINICPM_PROVIDER_ID.to_string(),
+                model: MINICPM_DEFAULT_MODEL.to_string(),
+                account: None,
+            };
+        }
+        TuiAgentRuntimeInfo {
+            agent: "main-agent".to_string(),
+            provider: default_main_agent_chat_model_provider().to_string(),
+            model: default_main_agent_chat_model_id().to_string(),
+            account: None,
+        }
+    }
+
+    fn configured(
+        data_dir: &SinomoDataDir,
+        provider: String,
+        model: String,
+        account: Option<sinomo_lm::ProviderAccountConfig>,
+        runtime_config: ModelRuntimeConfig,
+    ) -> Self {
+        Self::Configured(ConfiguredInteractionModel {
+            data_dir: data_dir.clone(),
+            provider,
+            model,
+            account,
+            runtime_config,
+            managed_pytorch: std::sync::Mutex::new(None),
+        })
+    }
 }
 
 impl InteractionModel for DefaultMainAgentChatModel {
@@ -2362,6 +3589,9 @@ impl ThinkingControl {
 pub struct MainAgentInteractionHandler<M> {
     agent: MainAgentLoop<M>,
     thinking: ThinkingControl,
+    provider: String,
+    model_name: String,
+    account: Option<String>,
 }
 
 #[derive(Default)]
@@ -2425,9 +3655,14 @@ fn visible_thinking_prefix(content: &str, prompt_started_thinking: bool) -> Opti
 
 impl<M: InteractionModel> MainAgentInteractionHandler<M> {
     pub fn new(model: M, provider: impl Into<String>, model_name: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let model_name = model_name.into();
         Self {
-            agent: MainAgentLoop::new(model, provider, model_name),
+            agent: MainAgentLoop::new(model, provider.clone(), model_name.clone()),
             thinking: ThinkingControl::default(),
+            provider,
+            model_name,
+            account: None,
         }
     }
 
@@ -2437,10 +3672,38 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         model_name: impl Into<String>,
         thinking: ThinkingControl,
     ) -> Self {
+        let provider = provider.into();
+        let model_name = model_name.into();
         Self {
-            agent: MainAgentLoop::new(model, provider, model_name),
+            agent: MainAgentLoop::new(model, provider.clone(), model_name.clone()),
             thinking,
+            provider,
+            model_name,
+            account: None,
         }
+    }
+
+    fn runtime_info(&self) -> TuiAgentRuntimeInfo {
+        TuiAgentRuntimeInfo {
+            agent: "main-agent".to_string(),
+            provider: self.provider.clone(),
+            model: self.model_name.clone(),
+            account: self.account.clone(),
+        }
+    }
+
+    fn replace_model(
+        &mut self,
+        model: M,
+        provider: String,
+        model_name: String,
+        account: Option<String>,
+    ) -> TuiAgentRuntimeInfo {
+        self.agent = MainAgentLoop::new(model, provider.clone(), model_name.clone());
+        self.provider = provider;
+        self.model_name = model_name;
+        self.account = account;
+        self.runtime_info()
     }
 }
 
@@ -2450,6 +3713,7 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
         runtime_config: ModelRuntimeConfig,
     ) -> Result<Self, CliError> {
         let thinking = ThinkingControl::default();
+        let runtime_info = DefaultMainAgentChatModel::runtime_info_for_config(&runtime_config);
         let model = DefaultMainAgentChatModel::from_runtime_config(
             data_dir,
             runtime_config,
@@ -2457,10 +3721,111 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
         );
         Ok(Self::with_thinking(
             model,
-            RUST_MINICPM_V46_PROVIDER_ID,
-            default_main_agent_chat_model_id(),
+            runtime_info.provider,
+            runtime_info.model,
             thinking,
         ))
+    }
+
+    fn switch_to_selection(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        selection: TuiModelSelection,
+        daemon_connected: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        with_cui_model_config_mode(daemon_connected, || {
+            let (runtime_config, _) = load_model_runtime_config_for_node(data_dir)?;
+            match selection.provider.as_str() {
+                RUST_MINICPM_V46_PROVIDER_ID => {
+                    let info = DefaultMainAgentChatModel::runtime_info_for_config(&runtime_config);
+                    let model = DefaultMainAgentChatModel::from_runtime_config(
+                        data_dir,
+                        runtime_config,
+                        self.thinking.clone(),
+                    );
+                    Ok(self.replace_model(model, info.provider, info.model, info.account))
+                }
+                MINICPM_PROVIDER_ID => {
+                    let model_name = if selection.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
+                        MINICPM_DEFAULT_MODEL.to_string()
+                    } else {
+                        selection.model
+                    };
+                    let model = DefaultMainAgentChatModel::configured(
+                        data_dir,
+                        MINICPM_PROVIDER_ID.to_string(),
+                        model_name.clone(),
+                        None,
+                        runtime_config,
+                    );
+                    Ok(
+                        self.replace_model(
+                            model,
+                            MINICPM_PROVIDER_ID.to_string(),
+                            model_name,
+                            None,
+                        ),
+                    )
+                }
+                provider => {
+                    let (config, _) = load_model_config_for_node(data_dir)?;
+                    let account =
+                        provider_account_config(&config, provider, Some(&selection.account))
+                            .cloned();
+                    let model = DefaultMainAgentChatModel::configured(
+                        data_dir,
+                        provider.to_string(),
+                        selection.model.clone(),
+                        account,
+                        runtime_config,
+                    );
+                    Ok(self.replace_model(
+                        model,
+                        provider.to_string(),
+                        selection.model,
+                        Some(selection.account),
+                    ))
+                }
+            }
+        })
+    }
+}
+
+impl TuiAgentRuntimeControl for MainAgentInteractionHandler<DefaultMainAgentChatModel> {
+    fn tui_agent_runtime_info(&self) -> TuiAgentRuntimeInfo {
+        self.runtime_info()
+    }
+
+    fn switch_tui_model(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        selection: TuiModelSelection,
+        daemon_connected: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.switch_to_selection(data_dir, selection, daemon_connected)
+    }
+}
+
+fn with_cui_model_config_mode<T>(
+    daemon_connected: bool,
+    f: impl FnOnce() -> Result<T, CliError>,
+) -> Result<T, CliError> {
+    if daemon_connected || cli_force_local_mode() {
+        return f();
+    }
+
+    let _guard = enter_cli_force_local_mode(true);
+    f()
+}
+
+fn default_main_agent_chat_model_provider() -> &'static str {
+    #[cfg(feature = "native-models")]
+    {
+        RUST_MINICPM_V46_PROVIDER_ID
+    }
+    #[cfg(not(feature = "native-models"))]
+    {
+        MINICPM_PROVIDER_ID
     }
 }
 

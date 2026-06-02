@@ -1380,7 +1380,7 @@ fn codex_json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
 
 fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Value {
     let instructions = codex_request_instructions(request);
-    let input: Vec<serde_json::Value> = request
+    let mut input: Vec<serde_json::Value> = request
         .messages
         .iter()
         .filter(|message| message.role != CodexRole::System)
@@ -1398,6 +1398,17 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
             })
         })
         .collect();
+    if request.response_format == LanguageModelResponseFormat::JsonObject
+        && !openai_responses_input_mentions_json(request)
+    {
+        input.insert(
+            0,
+            serde_json::json!({
+                "role": "user",
+                "content": "Return a valid JSON object. Do not include non-JSON text.",
+            }),
+        );
+    }
     let mut payload = serde_json::json!({
         "model": request.model,
         "input": input,
@@ -1412,6 +1423,36 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
         payload["text"] = serde_json::json!({ "format": { "type": "json_object" } });
     }
     payload
+}
+
+fn openai_responses_input_mentions_json(request: &CodexModelRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .filter(|message| message.role != CodexRole::System)
+        .any(codex_message_mentions_json)
+}
+
+fn codex_message_mentions_json(message: &CodexMessage) -> bool {
+    if !matches!(message.role, CodexRole::User | CodexRole::Assistant) {
+        return false;
+    }
+    if message.content.to_ascii_lowercase().contains("json") {
+        return true;
+    }
+    message
+        .raw_item
+        .as_ref()
+        .is_some_and(json_value_mentions_json)
+}
+
+fn json_value_mentions_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => text.to_ascii_lowercase().contains("json"),
+        serde_json::Value::Array(values) => values.iter().any(json_value_mentions_json),
+        serde_json::Value::Object(values) => values.values().any(json_value_mentions_json),
+        _ => false,
+    }
 }
 
 fn codex_request_instructions(request: &CodexModelRequest) -> String {
@@ -1983,12 +2024,41 @@ mod tests {
         assert_eq!(payload["instructions"], "system prompt");
         assert_eq!(payload["model"], CODEX_DEFAULT_MODEL);
         assert_eq!(payload["tools"][0]["name"], "read_context");
-        assert_eq!(payload["input"][1]["type"], "reasoning");
-        assert_eq!(payload["input"][2]["type"], "function_call_output");
+        assert!(
+            payload["input"][0]["content"]
+                .as_str()
+                .expect("json reminder")
+                .contains("JSON")
+        );
+        assert_eq!(payload["input"][2]["type"], "reasoning");
+        assert_eq!(payload["input"][3]["type"], "function_call_output");
         assert!(payload.get("temperature").is_none());
         assert!(payload.get("max_output_tokens").is_none());
         assert_eq!(payload["text"]["format"]["type"], "json_object");
         assert_eq!(payload["stream"], true);
+    }
+
+    #[test]
+    fn openai_responses_json_payload_does_not_duplicate_json_reminder() {
+        let payload = openai_responses_codex_payload(&CodexModelRequest {
+            model: CODEX_DEFAULT_MODEL.to_string(),
+            messages: vec![
+                CodexMessage::system("system prompt"),
+                CodexMessage::user("Return JSON for this decision."),
+            ],
+            tools: Vec::new(),
+            temperature: Some(0.2),
+            max_output_tokens: Some(100),
+            response_format: LanguageModelResponseFormat::JsonObject,
+            metadata: serde_json::Value::Null,
+        });
+
+        assert_eq!(payload["input"].as_array().expect("input").len(), 1);
+        assert_eq!(
+            payload["input"][0]["content"],
+            "Return JSON for this decision."
+        );
+        assert_eq!(payload["text"]["format"]["type"], "json_object");
     }
 
     #[test]

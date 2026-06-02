@@ -23,6 +23,7 @@ pub(crate) enum SlashCompletionKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlashCommandCompletionLayer {
+    #[cfg(test)]
     Standard,
     Tui,
 }
@@ -62,6 +63,24 @@ struct CompletionToken {
     start: usize,
     end: usize,
 }
+
+#[derive(Clone, Debug)]
+struct TuiModelCatalog {
+    provider: String,
+    detail: String,
+    models: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedTuiModelCatalogs {
+    loaded_at: std::time::Instant,
+    catalogs: Vec<TuiModelCatalog>,
+}
+
+const TUI_MODEL_CATALOG_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+static TUI_MODEL_CATALOG_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<CachedTuiModelCatalogs>>,
+> = std::sync::OnceLock::new();
 
 const BOOLEAN_CHOICES: &[ValueChoice] = &[
     ValueChoice {
@@ -200,7 +219,8 @@ const THINKING_CHOICES: &[ValueChoice] = &[
     },
 ];
 
-pub(crate) fn slash_completions(input: &str, cursor: usize) -> Option<SlashCompletionSet> {
+#[cfg(test)]
+fn slash_completions(input: &str, cursor: usize) -> Option<SlashCompletionSet> {
     slash_completions_for_layer(input, cursor, SlashCommandCompletionLayer::Standard)
 }
 
@@ -214,6 +234,12 @@ pub(crate) fn slash_completions_for_layer(
     }
 
     let (tokens, replace_start, replace_end, prefix) = completion_tokens(input, cursor)?;
+    if layer == SlashCommandCompletionLayer::Tui
+        && let Some(completions) =
+            tui_model_quick_completions(&tokens, replace_start, replace_end, &prefix)
+    {
+        return Some(completions);
+    }
     let mut registry = slash_command_registry();
     if layer == SlashCommandCompletionLayer::Tui {
         apply_tui_slash_command_layer(&mut registry);
@@ -466,6 +492,324 @@ fn push_word_item(
         insert: Some(insert),
         kind,
     });
+}
+
+#[derive(Default)]
+struct TuiModelCompletionContext {
+    provider: Option<String>,
+    model: Option<String>,
+    account: Option<String>,
+}
+
+fn tui_model_quick_completions(
+    tokens: &[CompletionToken],
+    replace_start: usize,
+    replace_end: usize,
+    prefix: &str,
+) -> Option<SlashCompletionSet> {
+    let first = tokens.first()?;
+    if first.text != "model" {
+        return None;
+    }
+    if tokens.len() == 1 && replace_start <= first.end {
+        return None;
+    }
+
+    let before = tokens_before_current(tokens, replace_start);
+    let mut args = before.into_iter().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "use") {
+        args.remove(0);
+    }
+
+    let catalogs = tui_model_catalogs();
+    let context = tui_model_completion_context(&args);
+    let mut items = Vec::new();
+
+    if let Some(option) = pending_tui_model_option(&args) {
+        if !prefix.starts_with("--") {
+            match option {
+                "--provider" => push_tui_model_provider_items(&mut items, &catalogs, prefix),
+                "--model" => push_tui_model_model_items(
+                    &mut items,
+                    &catalogs,
+                    context.provider.as_deref(),
+                    prefix,
+                ),
+                "--account" if prefix.is_empty() => {
+                    push_hint_item(&mut items, "account", "provider account")
+                }
+                _ => {}
+            }
+        }
+    } else if prefix.starts_with("--") {
+        push_tui_model_option_items(&mut items, &context, prefix);
+    } else if context.provider.is_none() {
+        push_tui_model_provider_items(&mut items, &catalogs, prefix);
+    } else if context.model.is_none() {
+        push_tui_model_model_items(&mut items, &catalogs, context.provider.as_deref(), prefix);
+    } else if prefix.is_empty() {
+        push_tui_model_option_items(&mut items, &context, prefix);
+    }
+
+    if items.is_empty() {
+        return None;
+    }
+    Some(SlashCompletionSet {
+        replace_start,
+        replace_end,
+        items,
+    })
+}
+
+fn tui_model_completion_context(args: &[String]) -> TuiModelCompletionContext {
+    let mut context = TuiModelCompletionContext::default();
+    let mut index = 0;
+    while let Some(token) = args.get(index) {
+        match token.as_str() {
+            "--provider" => {
+                if let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) {
+                    context.provider = Some(value.clone());
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            "--model" => {
+                if let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) {
+                    context.model = Some(value.clone());
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            "--account" => {
+                if let Some(value) = args.get(index + 1).filter(|value| !value.starts_with("--")) {
+                    context.account = Some(value.clone());
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            value if value.starts_with("--") => {
+                index += 1;
+            }
+            value if context.provider.is_none() => {
+                context.provider = Some(value.to_string());
+                index += 1;
+            }
+            value if context.model.is_none() => {
+                context.model = Some(value.to_string());
+                index += 1;
+            }
+            _ => {
+                index += 1;
+            }
+        }
+    }
+    context
+}
+
+fn pending_tui_model_option(args: &[String]) -> Option<&'static str> {
+    match args.last().map(String::as_str) {
+        Some("--provider") => Some("--provider"),
+        Some("--model") => Some("--model"),
+        Some("--account") => Some("--account"),
+        _ => None,
+    }
+}
+
+fn push_tui_model_provider_items(
+    items: &mut Vec<SlashCompletionItem>,
+    catalogs: &[TuiModelCatalog],
+    prefix: &str,
+) {
+    for catalog in catalogs {
+        push_word_item(
+            items,
+            &catalog.provider,
+            &catalog.detail,
+            SlashCompletionKind::Value,
+            prefix,
+            true,
+        );
+    }
+}
+
+fn push_tui_model_model_items(
+    items: &mut Vec<SlashCompletionItem>,
+    catalogs: &[TuiModelCatalog],
+    provider: Option<&str>,
+    prefix: &str,
+) {
+    let Some(provider) = provider else {
+        if prefix.is_empty() {
+            push_hint_item(items, "model", "model id");
+        }
+        return;
+    };
+    let Some(catalog) = find_tui_model_catalog(catalogs, provider) else {
+        if prefix.is_empty() {
+            push_hint_item(items, "model", "model id");
+        }
+        return;
+    };
+    if catalog.models.is_empty() {
+        if prefix.is_empty() {
+            push_hint_item(items, "model", "model id");
+        }
+        return;
+    }
+    for model in &catalog.models {
+        push_word_item(
+            items,
+            model,
+            "available model",
+            SlashCompletionKind::Value,
+            prefix,
+            true,
+        );
+    }
+}
+
+fn push_tui_model_option_items(
+    items: &mut Vec<SlashCompletionItem>,
+    context: &TuiModelCompletionContext,
+    prefix: &str,
+) {
+    if context.provider.is_none() {
+        push_word_item(
+            items,
+            "--provider",
+            "provider id",
+            SlashCompletionKind::Option,
+            prefix,
+            true,
+        );
+    }
+    if context.model.is_none() {
+        push_word_item(
+            items,
+            "--model",
+            "model id",
+            SlashCompletionKind::Option,
+            prefix,
+            true,
+        );
+    }
+    if context.account.is_none() {
+        push_word_item(
+            items,
+            "--account",
+            "provider account",
+            SlashCompletionKind::Option,
+            prefix,
+            true,
+        );
+    }
+}
+
+fn push_hint_item(items: &mut Vec<SlashCompletionItem>, label: &str, detail: &str) {
+    items.push(SlashCompletionItem {
+        label: label.to_string(),
+        detail: detail.to_string(),
+        insert: None,
+        kind: SlashCompletionKind::Hint,
+    });
+}
+
+fn find_tui_model_catalog<'a>(
+    catalogs: &'a [TuiModelCatalog],
+    provider: &str,
+) -> Option<&'a TuiModelCatalog> {
+    let provider = provider.trim();
+    if provider.eq_ignore_ascii_case("minicpm")
+        || provider.eq_ignore_ascii_case(sinomo_pytorch::MINICPM_PROVIDER_ID)
+    {
+        return catalogs
+            .iter()
+            .find(|catalog| catalog.provider == "minicpm");
+    }
+    if let Some(provider) = sinomo_lm::normalize_model_provider(provider) {
+        return catalogs.iter().find(|catalog| catalog.provider == provider);
+    }
+    catalogs
+        .iter()
+        .find(|catalog| catalog.provider.eq_ignore_ascii_case(provider))
+}
+
+fn tui_model_catalogs() -> Vec<TuiModelCatalog> {
+    let cache = TUI_MODEL_CATALOG_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(cached) = guard
+            .as_ref()
+            .filter(|cached| cached.loaded_at.elapsed() < TUI_MODEL_CATALOG_TTL)
+        {
+            return cached.catalogs.clone();
+        }
+        let catalogs = build_tui_model_catalogs();
+        *guard = Some(CachedTuiModelCatalogs {
+            loaded_at: std::time::Instant::now(),
+            catalogs: catalogs.clone(),
+        });
+        return catalogs;
+    }
+    build_tui_model_catalogs()
+}
+
+fn build_tui_model_catalogs() -> Vec<TuiModelCatalog> {
+    let mut catalogs = Vec::new();
+    push_tui_model_catalog(
+        &mut catalogs,
+        TuiModelCatalog {
+            provider: "minicpm".to_string(),
+            detail: "local MiniCPM runtime".to_string(),
+            models: vec![sinomo_pytorch::MINICPM_DEFAULT_MODEL.to_string()],
+        },
+    );
+
+    #[cfg(not(test))]
+    if let Ok(remote_catalogs) = sinomo_lm::collect_provider_model_catalogs(
+        sinomo_lm::default_model_provider_ids().iter().copied(),
+        false,
+    ) {
+        for catalog in remote_catalogs {
+            push_tui_model_catalog(
+                &mut catalogs,
+                TuiModelCatalog {
+                    detail: tui_model_provider_detail(&catalog.provider).to_string(),
+                    provider: catalog.provider,
+                    models: catalog.models,
+                },
+            );
+        }
+    }
+
+    catalogs.sort_by(|left, right| left.provider.cmp(&right.provider));
+    catalogs
+}
+
+fn push_tui_model_catalog(catalogs: &mut Vec<TuiModelCatalog>, mut catalog: TuiModelCatalog) {
+    catalog.models.sort();
+    catalog.models.dedup();
+    if let Some(existing) = catalogs
+        .iter_mut()
+        .find(|existing| existing.provider == catalog.provider)
+    {
+        existing.models.extend(catalog.models);
+        existing.models.sort();
+        existing.models.dedup();
+        return;
+    }
+    catalogs.push(catalog);
+}
+
+#[cfg(not(test))]
+fn tui_model_provider_detail(provider: &str) -> &'static str {
+    PROVIDER_CHOICES
+        .iter()
+        .find(|choice| choice.value == provider)
+        .map(|choice| choice.detail)
+        .unwrap_or("available model provider")
 }
 
 fn slash_command_registry() -> CommandSpec {
@@ -825,16 +1169,42 @@ fn slash_command_registry() -> CommandSpec {
 
 fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
     registry.children.extend(tui_slash_command_layer());
+    if let Some(model) = registry
+        .children
+        .iter_mut()
+        .find(|command| command.word == "model")
+    {
+        model.detail = "switch the active TUI chat model";
+        model.children.clear();
+        model.options.clear();
+        model.values = vec![value("provider", "available model provider", &[])];
+    }
 }
 
 fn tui_slash_command_layer() -> Vec<CommandSpec> {
-    vec![cmd(
-        "files",
-        "open the local TUI file browser",
-        vec![],
-        vec![],
-        vec![value("path", "directory or file to open", &[])],
-    )]
+    vec![
+        cmd(
+            "files",
+            "open the local TUI file browser",
+            vec![],
+            vec![],
+            vec![value("path", "directory or file to open", &[])],
+        ),
+        cmd(
+            "sessions",
+            "open the local TUI session list",
+            vec![],
+            vec![],
+            vec![],
+        ),
+        cmd(
+            "resume",
+            "resume a local TUI session",
+            vec![],
+            vec![],
+            vec![value("session-id", "session id from /sessions", &[])],
+        ),
+    ]
 }
 
 fn dfs_children() -> Vec<CommandSpec> {
@@ -1667,7 +2037,103 @@ mod tests {
             .expect("completions");
 
         assert!(completions.items.iter().any(|item| item.label == "files"));
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == "sessions")
+        );
+        assert!(completions.items.iter().any(|item| item.label == "resume"));
         assert!(completions.items.iter().any(|item| item.label == "cluster"));
+    }
+
+    #[test]
+    fn tui_slash_completion_adds_session_resume_hint() {
+        let completions = slash_completions_for_layer(
+            "/resume ",
+            "/resume ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("resume hint");
+
+        assert!(
+            completions.items.iter().any(|item| {
+                item.kind == SlashCompletionKind::Hint && item.label == "session-id"
+            })
+        );
+    }
+
+    #[test]
+    fn tui_slash_completion_adds_model_switch_commands() {
+        let completions = slash_completions_for_layer(
+            "/model ",
+            "/model ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("model completions");
+
+        assert!(completions.items.iter().any(|item| item.label == "minicpm"));
+        assert!(!completions.items.iter().any(|item| item.label == "use"));
+        assert!(!completions.items.iter().any(|item| item.label == "list"));
+
+        let completions = slash_completions_for_layer(
+            "/model minicpm ",
+            "/model minicpm ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("model choices");
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == sinomo_pytorch::MINICPM_DEFAULT_MODEL)
+        );
+
+        let model_prefix = &sinomo_pytorch::MINICPM_DEFAULT_MODEL[..8];
+        let input = format!("/model minicpm {model_prefix}");
+        let completions =
+            slash_completions_for_layer(&input, input.len(), SlashCommandCompletionLayer::Tui)
+                .expect("filtered model choices");
+        assert_eq!(completions.items.len(), 1);
+        assert_eq!(
+            completions.items[0].label,
+            sinomo_pytorch::MINICPM_DEFAULT_MODEL
+        );
+
+        let input = format!(
+            "/model minicpm {} --a",
+            sinomo_pytorch::MINICPM_DEFAULT_MODEL
+        );
+        let completions =
+            slash_completions_for_layer(&input, input.len(), SlashCommandCompletionLayer::Tui)
+                .expect("account option");
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == "--account")
+        );
+
+        let completions = slash_completions_for_layer(
+            "/model --provider ",
+            "/model --provider ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("provider option values");
+        assert!(completions.items.iter().any(|item| item.label == "minicpm"));
+
+        let completions = slash_completions_for_layer(
+            "/model --provider minicpm --model ",
+            "/model --provider minicpm --model ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("model option values");
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == sinomo_pytorch::MINICPM_DEFAULT_MODEL)
+        );
     }
 
     #[test]
