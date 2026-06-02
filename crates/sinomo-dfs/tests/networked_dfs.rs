@@ -7778,12 +7778,17 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
         created_by_event_id: None,
         last_modified_by_event_id: None,
     };
-    let bytes = (0..200_000)
+    let chunk_size = 64 * 1024;
+    let bytes = (0..(chunk_size * 66 + 17))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
     let offset = 70_003_u64;
     let max_bytes = 4096_usize;
     let expected = bytes[offset as usize..offset as usize + max_bytes].to_vec();
+    let chunked_offset = 17_u64;
+    let chunked_max_bytes = chunk_size * 64 + 4096;
+    let chunked_expected =
+        bytes[chunked_offset as usize..chunked_offset as usize + chunked_max_bytes].to_vec();
 
     owner_dfs
         .add_file_system(file_system.clone())
@@ -7802,14 +7807,6 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
     reader_dfs
         .add_object_metadata(owner_metadata.clone())
         .expect("replicate metadata");
-
-    let too_large = reader_dfs
-        .request_remote_object_range_read(&object_id, 0, 65_537)
-        .expect_err("oversized range window should be rejected");
-    assert!(
-        too_large.to_string().contains("exceeds inline limit"),
-        "{too_large}"
-    );
 
     assert_eq!(
         reader_dfs
@@ -7858,6 +7855,118 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
         reader_dfs
             .read_local_object(&object_id)
             .expect("range read should not cache full object")
+            .is_none()
+    );
+
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_range_read(&object_id, chunked_offset, chunked_max_bytes)
+            .expect("request chunked range read"),
+        vec![owner.clone()]
+    );
+    let first_served = owner_dfs
+        .process_incoming()
+        .expect("owner serves first range window");
+    assert!(first_served.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id: served_object_id,
+                result: DfsReadResult::RangeFound(data),
+                ..
+            } if served_object_id == &object_id
+                && data.object_id == object_id
+                && data.version == version
+                && data.content_hash == owner_metadata.content_hash
+                && data.offset == chunked_offset
+                && data.total_size_bytes == bytes.len() as u64
+                && data.bytes.is_empty()
+        )
+    }));
+    let first_reader_events = reader_dfs
+        .process_incoming()
+        .expect("reader accepts first range window");
+    assert!(
+        !first_reader_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteReadCompleted {
+                    object_id: completed_object_id,
+                    result: DfsReadResult::RangeFound(_),
+                    ..
+                } if completed_object_id == &object_id
+            )
+        }),
+        "first range window must not complete the read"
+    );
+    let mut chunked_actual = Vec::new();
+    let mut saw_range_complete = false;
+    for event in &first_reader_events {
+        if let NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+            object_id: chunk_object_id,
+            source_node_id,
+            version: chunk_version,
+            content_hash,
+            range_offset,
+            range_size_bytes,
+            object_total_size_bytes,
+            bytes: chunk_bytes,
+            complete,
+            ..
+        } = event
+        {
+            assert_eq!(chunk_object_id, &object_id);
+            assert_eq!(source_node_id, &owner);
+            assert_eq!(chunk_version, &version);
+            assert_eq!(content_hash, &owner_metadata.content_hash);
+            assert_eq!(*range_offset, chunked_offset);
+            assert_eq!(*range_size_bytes, chunked_expected.len() as u64);
+            assert_eq!(*object_total_size_bytes, bytes.len() as u64);
+            chunked_actual.extend_from_slice(chunk_bytes);
+            saw_range_complete |= *complete;
+        }
+    }
+    assert_eq!(chunked_actual.len(), chunk_size * 64);
+    assert!(!saw_range_complete);
+
+    let second_served = owner_dfs
+        .process_incoming()
+        .expect("owner serves continuation range window");
+    assert!(
+        second_served.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteReadServed {
+                    object_id: served_object_id,
+                    result: DfsReadResult::RangeFound(data),
+                    ..
+                } if served_object_id == &object_id && data.bytes.is_empty()
+            )
+        }),
+        "reader should request a range continuation after the first window, got {second_served:?}"
+    );
+    let second_reader_events = reader_dfs
+        .process_incoming()
+        .expect("reader accepts continuation range window");
+    for event in &second_reader_events {
+        if let NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+            object_id: chunk_object_id,
+            bytes: chunk_bytes,
+            complete,
+            ..
+        } = event
+        {
+            assert_eq!(chunk_object_id, &object_id);
+            chunked_actual.extend_from_slice(chunk_bytes);
+            saw_range_complete |= *complete;
+        }
+    }
+    assert!(saw_range_complete);
+    assert_eq!(chunked_actual, chunked_expected);
+    assert!(
+        reader_dfs
+            .read_local_object(&object_id)
+            .expect("chunked range read should not cache full object")
             .is_none()
     );
 
@@ -8202,6 +8311,8 @@ fn networked_dfs_rejects_read_chunk_size_that_disagrees_with_metadata() {
         object_id: object_id.clone(),
         version,
         content_hash: reader_metadata.content_hash,
+        range_offset: None,
+        object_total_size_bytes: None,
         total_size_bytes: large_bytes.len() as u64 + 1,
         chunk_index: 0,
         total_chunks: 1,
@@ -8323,6 +8434,8 @@ fn networked_dfs_rejects_read_chunk_count_that_disagrees_with_declared_size() {
         object_id: object_id.clone(),
         version,
         content_hash: Some(content_hash),
+        range_offset: None,
+        object_total_size_bytes: None,
         total_size_bytes: 1,
         chunk_index: 0,
         total_chunks: u32::MAX,
@@ -8435,6 +8548,8 @@ fn networked_dfs_rejects_read_chunk_hash_mismatch() {
         object_id: object_id.clone(),
         version,
         content_hash: Some(expected_content_hash),
+        range_offset: None,
+        object_total_size_bytes: None,
         total_size_bytes: bytes.len() as u64,
         chunk_index: 0,
         total_chunks: 1,

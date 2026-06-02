@@ -59,6 +59,10 @@ pub struct DfsReadResponseChunk {
     pub version: DfsVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_total_size_bytes: Option<u64>,
     pub total_size_bytes: u64,
     pub chunk_index: u32,
     pub total_chunks: u32,

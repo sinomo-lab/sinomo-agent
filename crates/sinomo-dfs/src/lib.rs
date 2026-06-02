@@ -1393,8 +1393,21 @@ struct NetworkedDfsReadStream {
     reader: ObjectVersionReader,
 }
 
+struct NetworkedDfsRangeReadStream {
+    data: DfsReadRangeData,
+    range_size_bytes: u64,
+    reader: ObjectVersionReader,
+}
+
 enum NetworkedDfsReadStreamOutcome {
     Found(NetworkedDfsReadStream),
+    PendingReplication,
+    Conflicted { conflicts: Vec<DfsConflictReadView> },
+    NotFound,
+}
+
+enum NetworkedDfsRangeReadStreamOutcome {
+    Found(NetworkedDfsRangeReadStream),
     PendingReplication,
     Conflicted { conflicts: Vec<DfsConflictReadView> },
     NotFound,
@@ -1562,6 +1575,20 @@ pub enum NetworkedDfsServiceEvent {
         object_id: DfsObjectId,
         requester_node_id: NodeId,
         result: DfsReadResult,
+    },
+    RemoteRangeReadChunkReceived {
+        request_id: String,
+        object_id: DfsObjectId,
+        source_node_id: NodeId,
+        version: DfsVersion,
+        content_hash: Option<String>,
+        range_offset: u64,
+        range_size_bytes: u64,
+        object_total_size_bytes: u64,
+        chunk_index: u32,
+        total_chunks: u32,
+        bytes: Vec<u8>,
+        complete: bool,
     },
     RemoteReadCompleted {
         request_id: String,
@@ -1840,9 +1867,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .pending_reads
             .values()
             .filter_map(|pending| {
-                pending
-                    .content_size_bytes
-                    .map(|size_bytes| chunk_prefix_bytes(size_bytes, pending.next_chunk_index))
+                pending.content_size_bytes.map(|size_bytes| {
+                    let transfer_size_bytes = match (pending.range_offset, pending.range_max_bytes)
+                    {
+                        (Some(offset), Some(max_bytes)) => {
+                            range_transfer_size_bytes(size_bytes, offset, max_bytes)
+                        }
+                        _ => size_bytes,
+                    };
+                    chunk_prefix_bytes(transfer_size_bytes, pending.next_chunk_index)
+                })
             })
             .fold(0_u64, |total, bytes| total.saturating_add(bytes));
         let incoming_transfer_bytes = self
@@ -3467,13 +3501,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<NodeId>, DfsError> {
-        if max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "remote DFS range read window {max_bytes} exceeds inline limit {DFS_BLOB_INLINE_LIMIT_BYTES}"
-                ),
-            });
-        }
         self.request_remote_object_read_inner(object_id, Some((offset, max_bytes)))
     }
 
@@ -3541,7 +3568,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         range: Option<(u64, usize)>,
     ) -> Result<bool, DfsError> {
         let request_id = self.next_request_id();
+        let chunked_range =
+            range.is_some_and(|(_, max_bytes)| max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES);
         let (start_chunk_index, max_chunks, window_end_chunk_index) = match range {
+            Some(_) if chunked_range => (
+                0,
+                DFS_READ_CHUNK_WINDOW_SIZE,
+                Self::read_window_end_chunk_index(0, DFS_READ_CHUNK_WINDOW_SIZE),
+            ),
             Some(_) => (0, 0, None),
             None => (
                 0,
@@ -3585,10 +3619,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         request_id: &str,
         pending: &PendingNetworkedRead,
     ) -> bool {
-        pending.range_offset.is_none()
-            && pending.range_max_bytes.is_none()
-            && (pending.next_chunk_index > 0
-                || self.incoming_read_transfers.contains_key(request_id))
+        pending.next_chunk_index > 0 || self.incoming_read_transfers.contains_key(request_id)
     }
 
     fn retry_remote_read_request_to(
@@ -3605,8 +3636,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::ReadRequest(DfsReadRequest {
                 request_id: request_id.to_string(),
                 object_id: pending.object_id.clone(),
-                range_offset: None,
-                range_max_bytes: None,
+                range_offset: pending.range_offset,
+                range_max_bytes: pending.range_max_bytes,
                 start_chunk_index,
                 max_chunks,
             }),
@@ -4002,6 +4033,89 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Ok(NetworkedDfsReadStreamOutcome::PendingReplication)
         } else {
             Ok(NetworkedDfsReadStreamOutcome::NotFound)
+        }
+    }
+
+    fn open_local_current_object_range_stream_with_state(
+        &self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<NetworkedDfsRangeReadStreamOutcome, DfsError> {
+        let object = self.current_read_object_metadata(object_id)?;
+        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        if !open_conflicts.is_empty() {
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Conflicted {
+                conflicts: open_conflicts
+                    .into_iter()
+                    .map(DfsConflictReadView::from)
+                    .collect(),
+            });
+        }
+
+        if let Ok(manifest) = self
+            .content
+            .read_manifest(object.object_id.as_str(), object.version.as_str())
+            && object
+                .content_hash
+                .as_ref()
+                .is_none_or(|expected_hash| expected_hash == &manifest.content_hash)
+        {
+            let range_offset = offset.min(manifest.size_bytes);
+            let (manifest, reader) = self.content.open_object_version_range_stream(
+                object.object_id.as_str(),
+                object.version.as_str(),
+                range_offset,
+                max_bytes,
+            )?;
+            let range_size_bytes = reader.size_bytes();
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
+                NetworkedDfsRangeReadStream {
+                    data: DfsReadRangeData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(manifest.content_hash),
+                        offset: range_offset,
+                        total_size_bytes: manifest.size_bytes,
+                        bytes: Vec::new(),
+                    },
+                    range_size_bytes,
+                    reader,
+                },
+            ));
+        }
+
+        if let Some(expected_hash) = object.content_hash.as_ref()
+            && let Ok(reader) =
+                self.content
+                    .open_blob_range_stream(expected_hash, offset, max_bytes)
+            && object
+                .content_size_bytes
+                .is_none_or(|expected_size| expected_size == reader.size_bytes())
+        {
+            let object_total_size_bytes = reader.size_bytes();
+            let range_offset = reader.offset();
+            let range_size_bytes = reader.remaining_bytes();
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
+                NetworkedDfsRangeReadStream {
+                    data: DfsReadRangeData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(expected_hash.clone()),
+                        offset: range_offset,
+                        total_size_bytes: object_total_size_bytes,
+                        bytes: Vec::new(),
+                    },
+                    range_size_bytes,
+                    reader: ObjectVersionReader::from_blob_range(reader),
+                },
+            ));
+        }
+
+        if object.content_hash.is_some() {
+            Ok(NetworkedDfsRangeReadStreamOutcome::PendingReplication)
+        } else {
+            Ok(NetworkedDfsRangeReadStreamOutcome::NotFound)
         }
     }
 
@@ -9215,21 +9329,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         request: DfsReadRequest,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let requested_range = match (request.range_offset, request.range_max_bytes) {
-            (Some(offset), Some(max_bytes)) if max_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES => {
-                Ok(Some((offset, max_bytes)))
-            }
-            (Some(_), Some(max_bytes)) => Err(format!(
-                "remote DFS range read window {max_bytes} exceeds inline limit {DFS_BLOB_INLINE_LIMIT_BYTES}"
-            )),
+            (Some(offset), Some(max_bytes)) => Ok(Some((offset, max_bytes))),
             (None, None) => Ok(None),
             _ => Err("DFS read range request must include both offset and max bytes".to_string()),
-        };
-        let requested_range = if requested_range.as_ref().is_ok_and(Option::is_some)
-            && (request.start_chunk_index != 0 || request.max_chunks != 0)
-        {
-            Err("DFS read range request cannot include chunk window fields".to_string())
-        } else {
-            requested_range
         };
         let mut sent_chunked_response = false;
         let result = match requested_range {
@@ -9245,23 +9347,60 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
                 Ok(_) => match range {
                     Some((offset, max_bytes)) => {
-                        match self.read_local_object_range_with_state(
-                            &request.object_id,
-                            offset,
-                            max_bytes,
-                            false,
-                        )? {
-                            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                                DfsReadResult::RangeFound(data)
-                            }
-                            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                                DfsReadResult::Rejected {
-                                    reason: read_conflicts_reason(conflicts),
+                        let chunked_range = max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES
+                            || request.start_chunk_index != 0
+                            || request.max_chunks != 0;
+                        if chunked_range {
+                            match self.open_local_current_object_range_stream_with_state(
+                                &request.object_id,
+                                offset,
+                                max_bytes,
+                            )? {
+                                NetworkedDfsRangeReadStreamOutcome::Found(stream)
+                                    if stream.range_size_bytes > 0 =>
+                                {
+                                    self.send_networked_range_read_response_chunks_from_reader(
+                                        &requester_node_id,
+                                        &request,
+                                        &stream.data,
+                                        stream.range_size_bytes,
+                                        stream.reader,
+                                    )?;
+                                    sent_chunked_response = true;
+                                    DfsReadResult::RangeFound(stream.data)
+                                }
+                                NetworkedDfsRangeReadStreamOutcome::Found(stream) => {
+                                    DfsReadResult::RangeFound(stream.data)
+                                }
+                                NetworkedDfsRangeReadStreamOutcome::Conflicted { conflicts } => {
+                                    DfsReadResult::Rejected {
+                                        reason: read_conflicts_reason(conflicts),
+                                    }
+                                }
+                                NetworkedDfsRangeReadStreamOutcome::PendingReplication
+                                | NetworkedDfsRangeReadStreamOutcome::NotFound => {
+                                    DfsReadResult::NotFound
                                 }
                             }
-                            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
-                            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
-                            | NetworkedDfsRangeReadOutcome::NotFound => DfsReadResult::NotFound,
+                        } else {
+                            match self.read_local_object_range_with_state(
+                                &request.object_id,
+                                offset,
+                                max_bytes,
+                                false,
+                            )? {
+                                NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+                                    DfsReadResult::RangeFound(data)
+                                }
+                                NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+                                    DfsReadResult::Rejected {
+                                        reason: read_conflicts_reason(conflicts),
+                                    }
+                                }
+                                NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+                                | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
+                                | NetworkedDfsRangeReadOutcome::NotFound => DfsReadResult::NotFound,
+                            }
                         }
                     }
                     None => {
@@ -9352,6 +9491,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         };
         match &result {
             DfsReadResult::Found(_) if sent_chunked_response => {}
+            DfsReadResult::RangeFound(_) if sent_chunked_response => {}
             DfsReadResult::Found(data) if data.bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES => {
                 self.send_networked_read_response_chunks(&requester_node_id, &request, data)?;
             }
@@ -9397,6 +9537,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: request.object_id.clone(),
                     version: data.version.clone(),
                     content_hash: data.content_hash.clone(),
+                    range_offset: None,
+                    object_total_size_bytes: None,
                     total_size_bytes: data.bytes.len() as u64,
                     chunk_index: chunk_index as u32,
                     total_chunks,
@@ -9444,7 +9586,87 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: request.object_id.clone(),
                     version: data.version.clone(),
                     content_hash: data.content_hash.clone(),
+                    range_offset: None,
+                    object_total_size_bytes: None,
                     total_size_bytes,
+                    chunk_index,
+                    total_chunks,
+                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
+                    bytes: buffer[..chunk_len].to_vec(),
+                }),
+            )?;
+            if !sent {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_networked_range_read_response_chunks_from_reader(
+        &mut self,
+        requester_node_id: &NodeId,
+        request: &DfsReadRequest,
+        data: &DfsReadRangeData,
+        range_size_bytes: u64,
+        mut reader: ObjectVersionReader,
+    ) -> Result<(), DfsError> {
+        let total_chunks = blob_chunk_count_for_size(range_size_bytes)?;
+        let max_chunks = if request.max_chunks == 0 {
+            DFS_READ_CHUNK_WINDOW_SIZE
+        } else {
+            request.max_chunks
+        };
+        let end_chunk_index =
+            fetch_response_window_end(request.start_chunk_index, total_chunks, max_chunks);
+        if end_chunk_index <= request.start_chunk_index {
+            return Ok(());
+        }
+        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
+        let mut skip_bytes =
+            u64::from(request.start_chunk_index).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64);
+        while skip_bytes > 0 {
+            let chunk_len = skip_bytes.min(DFS_BLOB_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
+                message: format!(
+                    "DFS range read skip is too large to fit in memory: {chunk_len} bytes"
+                ),
+            })?;
+            reader
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|source| DfsError::ContentStore {
+                    message: format!(
+                        "failed to skip blob {:?} range prefix for read continuation: {}",
+                        data.content_hash, source
+                    ),
+                })?;
+            skip_bytes = skip_bytes.saturating_sub(chunk_len as u64);
+        }
+        for chunk_index in request.start_chunk_index..end_chunk_index {
+            let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+            let chunk_len = (range_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
+                message: format!(
+                    "DFS range read chunk is too large to fit in memory: {chunk_len} bytes"
+                ),
+            })?;
+            reader
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|source| DfsError::ContentStore {
+                    message: format!(
+                        "failed to read blob {:?} range chunk {}: {}",
+                        data.content_hash, chunk_index, source
+                    ),
+                })?;
+            let sent = self.send_dfs_message_if_routable(
+                requester_node_id,
+                DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
+                    request_id: request.request_id.clone(),
+                    object_id: request.object_id.clone(),
+                    version: data.version.clone(),
+                    content_hash: data.content_hash.clone(),
+                    range_offset: Some(data.offset),
+                    object_total_size_bytes: Some(data.total_size_bytes),
+                    total_size_bytes: range_size_bytes,
                     chunk_index,
                     total_chunks,
                     chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
@@ -9880,6 +10102,225 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn handle_networked_range_read_response_chunk(
+        &mut self,
+        source_node_id: NodeId,
+        chunk: DfsReadResponseChunk,
+        pending: PendingNetworkedRead,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        let request_id = chunk.request_id.clone();
+        let object_id = chunk.object_id.clone();
+        let version = chunk.version.clone();
+        let content_hash = chunk.content_hash.clone();
+        let Some(requested_offset) = pending.range_offset else {
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "range read chunk is missing requested offset state".to_string(),
+                },
+            }));
+        };
+        let Some(requested_max_bytes) = pending.range_max_bytes else {
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "range read chunk is missing requested max bytes state".to_string(),
+                },
+            }));
+        };
+        if pending.version != chunk.version || pending.content_hash != chunk.content_hash {
+            self.pending_reads.remove(&chunk.request_id);
+            self.mark_remote_read_location_missing(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                &source_node_id,
+            )?;
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "stale DFS range read response chunk".to_string(),
+                },
+            }));
+        }
+        if self.pending_read_metadata_advanced(&pending)? {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "stale DFS range read response: object metadata advanced".to_string(),
+                },
+            }));
+        }
+        if !self.pending_read_source_still_current(&pending, &source_node_id)? {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "stale DFS range read response: source is no longer a current location"
+                        .to_string(),
+                },
+            }));
+        }
+        let Some(object_total_size_bytes) = chunk.object_total_size_bytes else {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "chunked DFS range read response is missing object size".to_string(),
+                },
+            }));
+        };
+        if let Some(expected_size) = pending.content_size_bytes
+            && expected_size != object_total_size_bytes
+        {
+            self.pending_reads.remove(&chunk.request_id);
+            self.mark_remote_read_location_missing(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                &source_node_id,
+            )?;
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response object size does not match metadata: expected {expected_size}, actual {object_total_size_bytes}"
+                    ),
+                },
+            }));
+        }
+        let expected_range_offset = requested_offset.min(object_total_size_bytes);
+        if chunk.range_offset != Some(expected_range_offset) {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response offset mismatch: expected {expected_range_offset}, actual {:?}",
+                        chunk.range_offset
+                    ),
+                },
+            }));
+        }
+        let expected_range_size_bytes = range_transfer_size_bytes(
+            object_total_size_bytes,
+            requested_offset,
+            requested_max_bytes,
+        );
+        if chunk.total_size_bytes != expected_range_size_bytes {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response size mismatch: expected {expected_range_size_bytes}, actual {}",
+                        chunk.total_size_bytes
+                    ),
+                },
+            }));
+        }
+        if chunk.chunk_index != pending.next_chunk_index {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response is out of order: expected chunk {}, actual {}",
+                        pending.next_chunk_index, chunk.chunk_index
+                    ),
+                },
+            }));
+        }
+        if let Err(error) = validate_chunk_bytes(
+            "chunked DFS range read response",
+            chunk.total_size_bytes,
+            chunk.chunk_index,
+            chunk.total_chunks,
+            &chunk.bytes,
+        )
+        .and_then(|()| {
+            validate_chunk_hash(
+                "chunked DFS range read response",
+                chunk.chunk_index,
+                &chunk.bytes,
+                chunk.chunk_hash.as_deref(),
+            )
+        }) {
+            self.pending_reads.remove(&chunk.request_id);
+            self.mark_remote_read_location_missing(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                &source_node_id,
+            )?;
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: error.to_string(),
+                },
+            }));
+        }
+        let next_chunk_index = chunk.chunk_index.saturating_add(1);
+        let complete = next_chunk_index >= chunk.total_chunks;
+        if complete {
+            self.pending_reads.remove(&chunk.request_id);
+        } else if let Some(pending) = self.pending_reads.get_mut(&chunk.request_id) {
+            pending.next_chunk_index = next_chunk_index;
+        }
+        let total_chunks = chunk.total_chunks;
+        let chunk_index = chunk.chunk_index;
+        let bytes = chunk.bytes;
+        if !complete
+            && let Some(event) = self.request_next_read_window_if_due(
+                &request_id,
+                &source_node_id,
+                next_chunk_index,
+                total_chunks,
+            )?
+        {
+            return Ok(Some(event));
+        }
+        Ok(Some(
+            NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+                request_id,
+                object_id,
+                source_node_id,
+                version,
+                content_hash,
+                range_offset: expected_range_offset,
+                range_size_bytes: expected_range_size_bytes,
+                object_total_size_bytes,
+                chunk_index,
+                total_chunks,
+                bytes,
+                complete,
+            },
+        ))
+    }
+
     fn handle_networked_read_response_chunk(
         &mut self,
         source_node_id: NodeId,
@@ -9928,16 +10369,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }));
         }
         if pending.range_offset.is_some() || pending.range_max_bytes.is_some() {
-            self.pending_reads.remove(&chunk.request_id);
-            self.incoming_read_transfers.remove(&chunk.request_id);
-            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
-                request_id: chunk.request_id,
-                object_id: chunk.object_id,
-                source_node_id,
-                result: DfsReadResult::Rejected {
-                    reason: "unexpected chunked DFS read response for range request".to_string(),
-                },
-            }));
+            return self.handle_networked_range_read_response_chunk(source_node_id, chunk, pending);
         }
         if pending.version != chunk.version || pending.content_hash != chunk.content_hash {
             self.pending_reads.remove(&chunk.request_id);
@@ -10323,9 +10755,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let Some(pending) = self.pending_reads.get(request_id).cloned() else {
             return Ok(None);
         };
-        if pending.range_offset.is_some() || pending.range_max_bytes.is_some() {
-            return Ok(None);
-        }
         let Some(window_end) = pending.window_end_chunk_index else {
             return Ok(None);
         };
@@ -10337,8 +10766,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::ReadRequest(DfsReadRequest {
                 request_id: request_id.to_string(),
                 object_id: pending.object_id.clone(),
-                range_offset: None,
-                range_max_bytes: None,
+                range_offset: pending.range_offset,
+                range_max_bytes: pending.range_max_bytes,
                 start_chunk_index: next_chunk_index,
                 max_chunks: DFS_READ_CHUNK_WINDOW_SIZE,
             }),
@@ -12920,6 +13349,16 @@ fn blob_chunk_len(total_size_bytes: u64, chunk_index: u32) -> Result<usize, DfsE
 
 fn chunk_prefix_bytes(total_size_bytes: u64, chunk_count: u32) -> u64 {
     total_size_bytes.min(u64::from(chunk_count).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64))
+}
+
+fn range_transfer_size_bytes(
+    object_total_size_bytes: u64,
+    requested_offset: u64,
+    requested_max_bytes: usize,
+) -> u64 {
+    let start = requested_offset.min(object_total_size_bytes);
+    let max_bytes = u64::try_from(requested_max_bytes).unwrap_or(u64::MAX);
+    object_total_size_bytes.saturating_sub(start).min(max_bytes)
 }
 
 fn fetch_response_window_end(start_chunk_index: u32, total_chunks: u32, max_chunks: u32) -> u32 {
