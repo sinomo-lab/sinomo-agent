@@ -840,6 +840,16 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
         self.metadata.add_object(object)
     }
 
+    pub fn add_object_metadata_batch(
+        &mut self,
+        objects: impl IntoIterator<Item = DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        for object in objects {
+            self.metadata.add_object(object)?;
+        }
+        Ok(())
+    }
+
     pub fn put_local_object(
         &mut self,
         mut object: DfsObjectMetadata,
@@ -2604,6 +2614,83 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         );
         self.track_metadata_tombstone(&object);
         self.metadata.add_object(object)
+    }
+
+    pub fn add_object_metadata_batch(
+        &mut self,
+        objects: impl IntoIterator<Item = DfsObjectMetadata>,
+    ) -> Result<(), DfsError> {
+        let mut grouped =
+            BTreeMap::<DfsFileSystemId, Vec<(DfsObjectMetadata, DfsObjectVersionRecord)>>::new();
+        for mut object in objects {
+            normalize_current_locations(&mut object.current_locations);
+            let size_bytes = self.object_content_size_hint(&object)?;
+            let version = object_version_record(&object, size_bytes);
+            grouped
+                .entry(object.file_system_id.clone())
+                .or_default()
+                .push((object, version));
+        }
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            for (file_system_id, records) in &grouped {
+                if backend.get_file_system(file_system_id)?.is_none() {
+                    let Some((object, _)) = records.first() else {
+                        continue;
+                    };
+                    backend.put_file_system(&DfsFileSystem {
+                        file_system_id: file_system_id.clone(),
+                        display_name: file_system_id.to_string(),
+                        owner_node_id: object.owner_node_id.clone(),
+                        subtree_policies: Vec::new(),
+                    })?;
+                }
+
+                let mut transaction_objects = Vec::new();
+                let mut transaction_versions = Vec::new();
+                for (object, version) in records {
+                    if backend.get_object(&object.object_id)?.as_ref() != Some(object) {
+                        transaction_objects.push(object.clone());
+                    }
+                    let mut version = version.clone();
+                    if let Some(existing) =
+                        backend.get_version(&version.object_id, &version.version)?
+                    {
+                        version.created_at = existing.created_at;
+                        if existing == version {
+                            continue;
+                        }
+                    }
+                    transaction_versions.push(version);
+                }
+                if transaction_objects.is_empty() && transaction_versions.is_empty() {
+                    continue;
+                }
+                backend.apply_namespace_transaction(&DfsNamespaceTransaction {
+                    transaction_id: namespace_transaction_id_for_batch(
+                        "visible-batch",
+                        file_system_id,
+                        &transaction_objects,
+                        &transaction_versions,
+                    ),
+                    file_system_id: file_system_id.clone(),
+                    objects: transaction_objects,
+                    versions: transaction_versions,
+                    created_at: OffsetDateTime::now_utc(),
+                })?;
+            }
+        }
+        for (_, records) in grouped {
+            for (object, _) in records {
+                self.coordinator.set_committed_version(
+                    object.file_system_id.clone(),
+                    object.object_id.clone(),
+                    object.version.clone(),
+                );
+                self.track_metadata_tombstone(&object);
+                self.metadata.add_object(object)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn add_transient_object_metadata(
@@ -11268,6 +11355,55 @@ fn namespace_transaction_id_for_object(
         "namespace_{}_{}",
         kind,
         blake3::hash(format!("{object_id}\0{version}").as_bytes()).to_hex()
+    )
+}
+
+fn namespace_transaction_id_for_batch(
+    kind: &str,
+    file_system_id: &DfsFileSystemId,
+    objects: &[DfsObjectMetadata],
+    versions: &[DfsObjectVersionRecord],
+) -> String {
+    let mut input = format!("{file_system_id}\0{}\0{}\0", objects.len(), versions.len());
+    for object in objects {
+        input.push_str(object.object_id.as_str());
+        input.push('\0');
+        input.push_str(object.version.as_str());
+        input.push('\0');
+        input.push_str(&object.path);
+        input.push('\0');
+        input.push_str(&format!("{:?}", object.kind));
+        input.push('\0');
+        input.push_str(object.content_hash.as_deref().unwrap_or(""));
+        input.push('\0');
+        input.push_str(
+            &object
+                .content_size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
+        );
+        input.push('\0');
+    }
+    for version in versions {
+        input.push_str(version.object_id.as_str());
+        input.push('\0');
+        input.push_str(version.version.as_str());
+        input.push('\0');
+        input.push_str(version.content_hash.as_deref().unwrap_or(""));
+        input.push('\0');
+        input.push_str(
+            &version
+                .size_bytes
+                .map(|size| size.to_string())
+                .unwrap_or_default(),
+        );
+        input.push('\0');
+        input.push_str(if version.visible { "visible" } else { "hidden" });
+        input.push('\0');
+    }
+    format!(
+        "namespace_{kind}_{}",
+        blake3::hash(input.as_bytes()).to_hex()
     )
 }
 

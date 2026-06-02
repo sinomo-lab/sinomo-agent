@@ -29,6 +29,7 @@ struct Args {
     blob_range_bytes: usize,
     network_blob_bytes: u64,
     list_page_size: usize,
+    metadata_batch_size: usize,
     keep: bool,
 }
 
@@ -58,6 +59,7 @@ struct BenchDefaults {
     blob_range_bytes: usize,
     network_blob_bytes: u64,
     list_page_size: usize,
+    metadata_batch_size: usize,
 }
 
 impl Scenario {
@@ -116,6 +118,7 @@ impl Preset {
                 blob_range_bytes: 1024 * 1024,
                 network_blob_bytes: 8 * 1024 * 1024,
                 list_page_size: 1024,
+                metadata_batch_size: 1024,
             },
             Self::Scale => BenchDefaults {
                 files: 100_000,
@@ -125,6 +128,7 @@ impl Preset {
                 blob_range_bytes: 8 * 1024 * 1024,
                 network_blob_bytes: 512 * 1024 * 1024,
                 list_page_size: 4096,
+                metadata_batch_size: 4096,
             },
             Self::Production => BenchDefaults {
                 files: 1_000_000,
@@ -134,6 +138,7 @@ impl Preset {
                 blob_range_bytes: 16 * 1024 * 1024,
                 network_blob_bytes: 4 * 1024 * 1024 * 1024,
                 list_page_size: 4096,
+                metadata_batch_size: 4096,
             },
         }
     }
@@ -192,6 +197,10 @@ impl Args {
         )?;
         let mut list_page_size =
             env_usize("SINOMO_DFS_BENCH_LIST_PAGE_SIZE", defaults.list_page_size)?;
+        let mut metadata_batch_size = env_usize(
+            "SINOMO_DFS_BENCH_METADATA_BATCH_SIZE",
+            defaults.metadata_batch_size,
+        )?;
         let mut keep = false;
 
         while let Some(arg) = args.next() {
@@ -207,6 +216,7 @@ impl Args {
                     blob_range_bytes = defaults.blob_range_bytes;
                     network_blob_bytes = defaults.network_blob_bytes;
                     list_page_size = defaults.list_page_size;
+                    metadata_batch_size = defaults.metadata_batch_size;
                 }
                 "--root" => root = Some(PathBuf::from(required_value(&arg, args.next())?)),
                 "--files" => files = parse_usize(&arg, args.next())?,
@@ -219,6 +229,7 @@ impl Args {
                 }
                 "--network-blob-bytes" => network_blob_bytes = parse_byte_count(&arg, args.next())?,
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
+                "--metadata-batch-size" => metadata_batch_size = parse_usize(&arg, args.next())?,
                 "--keep" => keep = true,
                 "--bench" => {}
                 "--help" | "-h" => {
@@ -234,6 +245,9 @@ impl Args {
         }
         if list_page_size == 0 {
             return Err("--list-page-size must be greater than zero".into());
+        }
+        if metadata_batch_size == 0 {
+            return Err("--metadata-batch-size must be greater than zero".into());
         }
 
         let (root, explicit_root) = match root {
@@ -253,6 +267,7 @@ impl Args {
             blob_range_bytes,
             network_blob_bytes,
             list_page_size,
+            metadata_batch_size,
             keep,
         })
     }
@@ -277,6 +292,7 @@ impl Args {
                 "blob_range_bytes": self.blob_range_bytes,
                 "network_blob_bytes": self.network_blob_bytes,
                 "list_page_size": self.list_page_size,
+                "metadata_batch_size": self.metadata_batch_size,
                 "keep": self.keep,
             }),
         );
@@ -314,14 +330,24 @@ fn run_namespace(args: &Args) -> BenchResult<()> {
 
     let payload_size = args.file_bytes as u64;
     let create_start = Instant::now();
+    let mut batch = Vec::with_capacity(args.metadata_batch_size);
+    let mut batches = 0usize;
     for index in 0..args.files {
-        dfs.add_object_metadata(file_metadata(
+        batch.push(file_metadata(
             &node,
             index,
             args.dirs,
             Some(valid_fake_hash(index)),
             Some(payload_size),
-        )?)?;
+        )?);
+        if batch.len() >= args.metadata_batch_size {
+            dfs.add_object_metadata_batch(batch.drain(..))?;
+            batches = batches.saturating_add(1);
+        }
+    }
+    if !batch.is_empty() {
+        dfs.add_object_metadata_batch(batch.drain(..))?;
+        batches = batches.saturating_add(1);
     }
     let create_elapsed = create_start.elapsed();
     emit(
@@ -330,6 +356,8 @@ fn run_namespace(args: &Args) -> BenchResult<()> {
         json!({
             "files": args.files,
             "dirs": args.dirs,
+            "metadata_batch_size": args.metadata_batch_size,
+            "metadata_batches": batches,
             "files_per_second": rate(args.files as u64, create_elapsed),
         }),
     );
@@ -551,14 +579,24 @@ fn run_metadata_replication(args: &Args) -> BenchResult<()> {
 
     let populate_start = Instant::now();
     owner_dfs.add_file_system(DfsFileSystem::sifs(owner.clone()))?;
+    let mut batch = Vec::with_capacity(args.metadata_batch_size);
+    let mut batches = 0usize;
     for index in 0..args.files {
-        owner_dfs.add_object_metadata(file_metadata(
+        batch.push(file_metadata(
             &owner,
             index,
             args.dirs,
             Some(valid_fake_hash(index)),
             Some(args.file_bytes as u64),
-        )?)?;
+        )?);
+        if batch.len() >= args.metadata_batch_size {
+            owner_dfs.add_object_metadata_batch(batch.drain(..))?;
+            batches = batches.saturating_add(1);
+        }
+    }
+    if !batch.is_empty() {
+        owner_dfs.add_object_metadata_batch(batch.drain(..))?;
+        batches = batches.saturating_add(1);
     }
     let populate_elapsed = populate_start.elapsed();
     emit(
@@ -566,6 +604,8 @@ fn run_metadata_replication(args: &Args) -> BenchResult<()> {
         populate_elapsed,
         json!({
             "files": args.files,
+            "metadata_batch_size": args.metadata_batch_size,
+            "metadata_batches": batches,
             "primary_files_per_second": rate(args.files as u64, populate_elapsed),
         }),
     );
@@ -993,6 +1033,7 @@ fn print_help() {
            --blob-range-bytes BYTES\n\
            --network-blob-bytes BYTES\n\
            --list-page-size COUNT\n\
+           --metadata-batch-size COUNT\n\
            --keep\n\
          \n\
          Environment defaults:\n\
@@ -1001,7 +1042,8 @@ fn print_help() {
            SINOMO_DFS_BENCH_FILE_BYTES, SINOMO_DFS_BENCH_BLOB_BYTES,\n\
            SINOMO_DFS_BENCH_BLOB_RANGE_BYTES,\n\
            SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES,\n\
-           SINOMO_DFS_BENCH_LIST_PAGE_SIZE\n\
+           SINOMO_DFS_BENCH_LIST_PAGE_SIZE,\n\
+           SINOMO_DFS_BENCH_METADATA_BATCH_SIZE\n\
          \n\
          Presets:\n\
            smoke: 10k files, 64 MiB local blob, 8 MiB network blob\n\

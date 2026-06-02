@@ -270,6 +270,74 @@ fn put_local_object_version_from_reader_streams_to_content_store() {
 }
 
 #[test]
+fn add_object_metadata_batch_persists_visible_versions_in_one_transaction() {
+    let root = temp_root("add-object-metadata-batch-visible-versions");
+    let owner = NodeId::from_legacy_named("node_batch_visible_owner").expect("node");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+
+    let objects = (0..3)
+        .map(|index| {
+            let mut object = file_metadata(owner.clone());
+            object.object_id = DfsObjectId::from_legacy_named(format!("obj_batch_visible_{index}"))
+                .expect("object");
+            object.path = format!("/services/batch-visible/file-{index}.txt");
+            object.content_hash = Some(format!("blake3:{index:064x}"));
+            object.content_size_bytes = Some(128 + index);
+            object.version =
+                DfsVersion::from_legacy_named(format!("version_batch_visible_{index}"))
+                    .expect("version");
+            object
+        })
+        .collect::<Vec<_>>();
+
+    dfs.add_object_metadata_batch(objects.clone())
+        .expect("metadata batch");
+
+    let backend = dfs.metadata_backend().expect("metadata backend");
+    let entries = backend.journal_since(0).expect("journal");
+    assert_eq!(
+        entries.len(),
+        2,
+        "filesystem plus one namespace transaction"
+    );
+    let transaction = entries
+        .iter()
+        .find_map(|entry| match &entry.mutation {
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } => Some(transaction),
+            _ => None,
+        })
+        .expect("namespace transaction");
+    assert_eq!(transaction.objects.len(), objects.len());
+    assert_eq!(transaction.versions.len(), objects.len());
+
+    for object in &objects {
+        assert_eq!(
+            backend.get_object(&object.object_id).expect("object"),
+            Some(object.clone())
+        );
+        let version = backend
+            .get_version(&object.object_id, &object.version)
+            .expect("version")
+            .expect("visible version");
+        assert_eq!(version.content_hash, object.content_hash);
+        assert_eq!(version.size_bytes, object.content_size_bytes);
+        assert!(version.visible);
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn metadata_replication_cursor_advances_only_after_replica_ack() {
     let root = temp_root("metadata-replication-cursor-after-ack");
     let primary = NodeId::from_legacy_named("node_meta_primary").expect("primary");

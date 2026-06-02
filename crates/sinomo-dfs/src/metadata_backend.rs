@@ -920,6 +920,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn get_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<Option<DfsFileSystem>>;
     fn list_file_systems(&self) -> Result<Vec<DfsFileSystem>>;
     fn put_object(&mut self, object: &DfsObjectMetadata) -> Result<DfsMetadataJournalEntry>;
+    fn put_objects(
+        &mut self,
+        objects: &[DfsObjectMetadata],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let mut entries = Vec::with_capacity(objects.len());
+        for object in objects {
+            entries.push(self.put_object(object)?);
+        }
+        Ok(entries)
+    }
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>>;
     fn get_object_by_path(
         &self,
@@ -4996,6 +5006,50 @@ impl LocalJsonMetadataBackend {
         Ok(entry)
     }
 
+    fn write_journal_entries_unlocked(
+        &mut self,
+        mutations: Vec<DfsMetadataMutation>,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if mutations.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut next_sequence = self
+            .next_sequence
+            .max(fast_next_journal_sequence(&self.root)?);
+        let mut entries = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            entries.push(DfsMetadataJournalEntry {
+                shard_id: self.shard_id.clone(),
+                sequence: next_sequence,
+                created_at: OffsetDateTime::now_utc(),
+                mutation,
+            });
+            next_sequence = next_sequence.saturating_add(1);
+        }
+
+        let mut chunk_start = 0usize;
+        while chunk_start < entries.len() {
+            let segment_id = journal_segment_id(entries[chunk_start].sequence);
+            let mut chunk_end = chunk_start + 1;
+            while chunk_end < entries.len()
+                && journal_segment_id(entries[chunk_end].sequence) == segment_id
+            {
+                chunk_end += 1;
+            }
+            let chunk = entries[chunk_start..chunk_end].iter().collect::<Vec<_>>();
+            append_segmented_journal_entries(&self.root, &chunk)?;
+            self.next_sequence = entries[chunk_end - 1].sequence.saturating_add(1);
+            write_json_atomic(
+                &self.journal_head_path(),
+                &DfsMetadataJournalHead {
+                    next_sequence: self.next_sequence,
+                },
+            )?;
+            chunk_start = chunk_end;
+        }
+        Ok(entries)
+    }
+
     fn ensure_local_materialization_cursor(&self) -> Result<()> {
         if self.local_materialization_cursor_path().is_file() {
             return Ok(());
@@ -5535,6 +5589,59 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         self.materialize_object_indexes_with_previous(&object, previous.as_ref(), entry.sequence)?;
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
+    }
+
+    fn put_objects(
+        &mut self,
+        objects: &[DfsObjectMetadata],
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        if objects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _lock = self.begin_metadata_write()?;
+        let objects = objects
+            .iter()
+            .map(normalized_object_metadata)
+            .collect::<Vec<_>>();
+        for object in &objects {
+            if self.get_file_system(&object.file_system_id)?.is_none() {
+                return Err(MetadataBackendError::UnknownFileSystem {
+                    file_system_id: object.file_system_id.clone(),
+                });
+            }
+        }
+        let entries = self.write_journal_entries_unlocked(
+            objects
+                .iter()
+                .map(|object| DfsMetadataMutation::PutObject {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    path: object.path.clone(),
+                    object: Some(object.clone()),
+                })
+                .collect(),
+        )?;
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        for object in &objects {
+            let previous = self.get_object(&object.object_id)?;
+            if let Err(error) = self.plan_object_index_table_ops_with_previous(
+                object,
+                previous.as_ref(),
+                &mut table_ops,
+                &mut rollback,
+            ) {
+                rollback.rollback(&mut self.tables);
+                return Err(error);
+            }
+        }
+        let last_sequence = entries
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or_else(|| self.next_sequence.saturating_sub(1));
+        self.append_preapplied_table_ops(last_sequence, table_ops, rollback)?;
+        self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
+        Ok(entries)
     }
 
     fn get_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsObjectMetadata>> {
@@ -9289,6 +9396,62 @@ mod tests {
         let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(1).expect("journal").len(), 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_batches_object_metadata_into_one_table_batch() {
+        let root = temp_root("local_backend_batches_object_metadata_into_one_table_batch");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let objects = (0..3)
+            .map(|index| {
+                let mut object = object(version(&format!("version_batch_{index}")));
+                object.object_id =
+                    DfsObjectId::from_legacy_named(format!("obj_batch_{index}")).expect("object");
+                object.path = format!("docs/file-{index}.md");
+                object
+            })
+            .collect::<Vec<_>>();
+        let entries = backend.put_objects(&objects).expect("object batch");
+
+        assert_eq!(entries.len(), objects.len());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            backend.journal_since(1).expect("journal").len(),
+            objects.len()
+        );
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            2,
+            "filesystem write should use one table batch and the object group should use one more"
+        );
+        for object in &objects {
+            assert_eq!(
+                backend.get_object(&object.object_id).expect("get object"),
+                Some(object.clone())
+            );
+        }
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .count_objects_for_file_system(&file_system.file_system_id)
+                .expect("count objects"),
+            objects.len()
+        );
 
         cleanup(&root);
     }

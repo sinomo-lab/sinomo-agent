@@ -94,6 +94,7 @@ cargo bench -p sinomo-dfs --bench scale -- \
 ```
 
 The benchmark prints one JSON object per measured step. Byte-sized flags such as `--blob-bytes`, `--blob-range-bytes`, and `--network-blob-bytes` accept suffixes like `MiB` and `GiB`, so expensive one-off runs can be narrowed without changing source code.
+Namespace-load and metadata-replication setup use grouped metadata commits by default; tune `--metadata-batch-size` when comparing write-amplification changes.
 
 ### Networked DFS Service
 
