@@ -5327,7 +5327,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .collect();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
-                let sent = self.send_stage_blob_if_routable(
+                let outcome = self.send_stage_blob_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
                     &updated_intent.intent_id,
@@ -5336,14 +5336,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     updated_intent.base_version.clone(),
                     &request.target_version,
                     &manifest.content_hash,
-                    &bytes,
+                    manifest.size_bytes,
+                    0,
+                    DFS_STAGE_CHUNK_WINDOW_SIZE,
                     Some(object.clone()),
                 )?;
-                if sent {
-                    self.record_stage_inflight(
+                if outcome.sent {
+                    self.record_stage_window_progress(
                         &updated_intent.intent_id,
                         &replica_node_id,
                         request_id,
+                        outcome,
                     );
                 } else {
                     self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
@@ -12483,6 +12486,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
+    #[cfg(test)]
     fn send_stage_blob_if_routable(
         &mut self,
         target_node_id: &NodeId,

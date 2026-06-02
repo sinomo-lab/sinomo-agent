@@ -2309,14 +2309,14 @@ fn operational_metrics_report_transfer_window_progress() {
     let total_chunks = DFS_STAGE_CHUNK_WINDOW_SIZE + 2;
     let bytes = vec![0x5a; total_chunks as usize * DFS_BLOB_CHUNK_BYTES];
     let write = owner_dfs
-        .write_distributed_eventual_from_reader(
+        .write_distributed_eventual(
             DfsWriteRequest {
                 file_system_id: sifs_file_system_id(),
                 object_id: object_id.clone(),
                 target_version,
                 requesting_node_id: owner.clone(),
             },
-            std::io::Cursor::new(bytes),
+            bytes,
             vec![owner.clone(), replica.clone()],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
         )
