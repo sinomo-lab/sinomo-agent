@@ -14,15 +14,15 @@ use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
     LocalRolloutArtifacts, MainExitObservation, PendingShadowRolloutContext,
     ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutFailureDiagnostics, RolloutMainActivation,
-    SelfRolloutPaths, classify_main_exit, deploy_managed_source_bundle, ensure_rollout_layout,
-    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
-    read_tail_lossy, record_activation_failure, record_main_activation_staged,
-    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
-    record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
-    rollout_artifact_suffix, rollout_build_dev_binary, rollout_diagnostics_report,
-    rollout_main_activation_path, rollout_remote_repo_path, rollout_shadow_finalize_path,
-    rollout_staged_main_binary, rollout_staged_shadow_binary, source_heads_match,
-    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
+    SelfRolloutPaths, classify_main_exit, clear_rollout_status, deploy_managed_source_bundle,
+    ensure_rollout_layout, managed_source_status, read_pending_shadow_rollout,
+    read_rollout_main_activation, read_tail_lossy, record_activation_failure,
+    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
+    record_rollout_main_exit, record_shadow_rollout_finalized, remove_main_activation,
+    remove_shadow_finalize, rollout_artifact_suffix, rollout_build_dev_binary,
+    rollout_diagnostics_report, rollout_main_activation_path, rollout_remote_repo_path,
+    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
+    source_heads_match, stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
     stage_rollout_file_with_retry, write_json, write_main_activation, write_rollout_status,
 };
 use std::env;
@@ -1272,6 +1272,26 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
     record_shadow_rollout_finalized(&rollout_paths, &finalize, status, &detail)?;
     remove_shadow_finalize(&rollout_paths);
     Ok(format!("{status}: {detail}\n"))
+}
+
+pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let rollout_paths = SelfRolloutPaths::new(&data_dir);
+    let cleared = clear_rollout_status(&rollout_paths)?;
+    if let Err(error) = crate::refresh_daemon_node_status_in_kv(paths) {
+        eprintln!("sinomo daemon rollout status clear publish failed: {error}");
+    }
+    if cleared {
+        Ok(format!(
+            "cleared rollout status at {}\n",
+            rollout_paths.state.display()
+        ))
+    } else {
+        Ok(format!(
+            "no rollout status to clear at {}\n",
+            rollout_paths.state.display()
+        ))
+    }
 }
 
 /// Maximum time to keep retrying the known-good supervisor binary during rollout

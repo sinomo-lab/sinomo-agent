@@ -13,6 +13,7 @@ pub(crate) enum RolloutCliCommand {
     TelemetryGatesShow,
     TelemetryGatesSet(RolloutTelemetryGateSetOptions),
     Diagnostics(RolloutOptions),
+    ClearStatus(RolloutOptions),
     Status,
 }
 
@@ -154,6 +155,9 @@ pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand
         }
         Some((command, rest)) if matches!(command.as_str(), "diagnostics" | "diag") => {
             Ok(RolloutCliCommand::Diagnostics(parse_rollout_options(rest)?))
+        }
+        Some((command, rest)) if matches!(command.as_str(), "clear-status" | "clear-state") => {
+            Ok(RolloutCliCommand::ClearStatus(parse_rollout_options(rest)?))
         }
         Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
         _ => Err(CliError::Usage),
@@ -485,6 +489,7 @@ pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), 
         RolloutCliCommand::TelemetryGatesShow => rollout_telemetry_gates_show(),
         RolloutCliCommand::TelemetryGatesSet(options) => rollout_telemetry_gates_set(options),
         RolloutCliCommand::Diagnostics(options) => rollout_diagnostics(options),
+        RolloutCliCommand::ClearStatus(options) => rollout_clear_status(options),
         RolloutCliCommand::Status => rollout_status(),
     }
 }
@@ -825,6 +830,44 @@ pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliErro
         {
             Ok(response) => print!("{response}"),
             Err(error) => println!("failed: {error}"),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn rollout_clear_status(options: RolloutOptions) -> Result<(), CliError> {
+    if options.targets.is_empty() {
+        if let Some(status) = default_main_daemon_status()? {
+            match daemon_send_daemon_rollout_clear_status(
+                &status.address,
+                CLUSTER_HEALTH_PROBE_TIMEOUT,
+            )
+            .map_err(CliError::from)
+            {
+                Ok(response) => {
+                    print!("{response}");
+                    return Ok(());
+                }
+                Err(error) => eprintln!(
+                    "warning: could not clear rollout status through local daemon: {error}; clearing local state file directly"
+                ),
+            }
+        }
+        let paths = rollout_paths_from_defaults()?;
+        if clear_rollout_status(&paths)? {
+            println!("cleared rollout status at {}", paths.state.display());
+        } else {
+            println!("no rollout status to clear at {}", paths.state.display());
+        }
+        return Ok(());
+    }
+
+    for target in unique_rollout_targets(options.targets) {
+        match daemon_send_daemon_rollout_clear_status(&target, CLUSTER_HEALTH_PROBE_TIMEOUT)
+            .map_err(CliError::from)
+        {
+            Ok(response) => print!("{target}: {response}"),
+            Err(error) => println!("{target}: failed: {error}"),
         }
     }
     Ok(())

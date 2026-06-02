@@ -738,6 +738,13 @@ fn slash_command_registry() -> CommandSpec {
                         vec![],
                     ),
                     cmd(
+                        "clear-status",
+                        "clear stale rollout status",
+                        vec![],
+                        opts(&["--target"]),
+                        vec![],
+                    ),
+                    cmd(
                         "status",
                         "show rollout paths and state",
                         vec![],

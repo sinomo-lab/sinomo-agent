@@ -580,6 +580,17 @@ pub fn write_rollout_status(
     write_object(&rollout_paths.state, status)
 }
 
+pub fn clear_rollout_status(rollout_paths: &SelfRolloutPaths) -> Result<bool, RolloutError> {
+    match fs::remove_file(&rollout_paths.state) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(RolloutError::Io {
+            path: rollout_paths.state.display().to_string(),
+            detail: error.to_string(),
+        }),
+    }
+}
+
 pub fn read_rollout_runtime_state(
     rollout_paths: &SelfRolloutPaths,
 ) -> Result<Option<RolloutRuntimeState>, RolloutError> {
@@ -932,6 +943,44 @@ mod tests {
             read_rollout_status(&paths).expect("status"),
             Some(replacement)
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn clear_rollout_status_removes_only_status_state() {
+        let root = unique_temp("sinomo-rollout-clear-status");
+        let paths = SelfRolloutPaths::new(&root);
+        fs::create_dir_all(&paths.root).expect("rollout root");
+        write_rollout_status(
+            &paths,
+            &ClusterNodeRolloutStatus {
+                status: "main-staged".to_string(),
+                mode: Some("cluster-remote-build".to_string()),
+                detail: None,
+                phase: Some("main-staged".to_string()),
+                progress_current: Some(5),
+                progress_total: Some(5),
+                progress_message: None,
+                source: None,
+                requested_at: None,
+                staged_at: None,
+                updated_at: None,
+                failed_at: None,
+                diagnostics: None,
+                stdout_log: None,
+                stderr_log: None,
+                stdout_tail: None,
+                stderr_tail: None,
+            },
+        )
+        .expect("status");
+        fs::write(rollout_shadow_finalize_path(&paths), b"pending shadow").expect("pending");
+
+        assert!(clear_rollout_status(&paths).expect("clear existing"));
+        assert_eq!(read_rollout_status(&paths).expect("status"), None);
+        assert!(rollout_shadow_finalize_path(&paths).exists());
+        assert!(!clear_rollout_status(&paths).expect("clear missing"));
+
         fs::remove_dir_all(root).ok();
     }
 

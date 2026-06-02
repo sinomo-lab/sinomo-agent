@@ -676,6 +676,19 @@ pub fn send_daemon_finalize_shadow_rollout_request(
     response.decode_body().map_err(DaemonError::from)
 }
 
+pub fn send_daemon_rollout_clear_status(
+    address: &str,
+    timeout: Duration,
+) -> Result<String, DaemonError> {
+    let request = ObjectRpcRequest::encode_body(
+        sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE,
+        sinomo_network::ROLLOUT_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc(address, &request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
 pub fn send_daemon_rollout_diagnostics(
     address: &str,
     timeout: Duration,

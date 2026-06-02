@@ -158,6 +158,10 @@ pub(super) fn print_rollout_help() {
     println!(
         "      Fetch rollout state, build logs, and candidate stdout/stderr tails from a daemon."
     );
+    println!("  sinomo rollout clear-status [--target <host:port>]");
+    println!(
+        "      Clear stale rollout status from the local data dir or a daemon target without deleting pending rollout artifacts."
+    );
     println!("  sinomo rollout status");
     println!("      Show source, binary, and rollout state paths.");
 }

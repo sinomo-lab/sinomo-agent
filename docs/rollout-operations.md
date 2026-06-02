@@ -173,6 +173,15 @@ cat ~/.sinomo/rollout/build.log
 ls -lt ~/.sinomo/rollout/logs
 ```
 
+Clear a stale rollout status after independently verifying the daemon process is healthy:
+
+```sh
+sinomo rollout clear-status
+sinomo rollout clear-status --target 192.168.1.154:21353
+```
+
+This removes only `rollout/state.sobj`. It does not delete pending rollout artifacts.
+
 ## Recovery
 
 If local rollout leaves the main daemon stopped but the shadow daemon is still running, first check status:

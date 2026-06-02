@@ -4,13 +4,14 @@ use crate::{
     DaemonLock, DaemonPaths, authenticate_daemon_control_request,
     create_cluster_invite_challenge_proof, daemon_paths_are_shadow, daemon_rpc_command,
     ensure_daemon_status_cluster, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
-    forward_cluster_invite_challenge_to_voter, handle_daemon_cluster_invite_publish_request,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_watch_drain_request,
-    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
-    handle_daemon_cluster_member_publish_request, handle_daemon_cluster_relay_request,
-    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
-    read_daemon_status, run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
+    forward_cluster_invite_challenge_to_voter, handle_daemon_clear_rollout_status,
+    handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
+    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_member_publish_request,
+    handle_daemon_cluster_relay_request, handle_daemon_finalize_shadow_rollout,
+    prune_local_cluster_raft_uncommitted_tail, read_daemon_status, run_daemon_dfs_maintenance_tick,
+    start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_node::NodeId;
@@ -482,6 +483,24 @@ pub fn handle_daemon_connection(
                 let response = handle_daemon_finalize_shadow_rollout(paths)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
                     sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE,
+                    &response,
+                )
+                .map_err(DaemonError::from)?;
+                write_daemon_rpc_response_frame(stream, response)?;
+                Ok(false)
+            }
+            command
+                if command == daemon_rpc_command(sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE) =>
+            {
+                let request = require_daemon_rpc_request(
+                    rpc_request,
+                    sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE,
+                    sinomo_network::ROLLOUT_RPC_CATEGORY,
+                )?;
+                let _: () = request.decode_body().map_err(DaemonError::from)?;
+                let response = handle_daemon_clear_rollout_status(paths)?;
+                let response = sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE,
                     &response,
                 )
                 .map_err(DaemonError::from)?;

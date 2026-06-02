@@ -12835,6 +12835,18 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
     );
     assert_eq!(
         parse_rollout_command(&[
+            "clear-status".to_string(),
+            "--target".to_string(),
+            "192.0.2.11:21353".to_string(),
+        ])
+        .expect("clear-status"),
+        RolloutCliCommand::ClearStatus(RolloutOptions {
+            targets: vec!["192.0.2.11:21353".to_string()],
+            ..RolloutOptions::default()
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&[
             "advance".to_string(),
             "--node".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d5".to_string(),

@@ -114,6 +114,7 @@ Approved evolution decisions commit the candidate worktree and fast-forward the 
 - `sinomo rollout export-source --repo <path>` merges managed source changes, including self-evolution commits, back into an external git checkout.
 - `sinomo rollout apply-external [--repo <path>]` imports external changes, then builds and applies the managed source.
 - `sinomo rollout apply` builds `$SINOMO_DATA_DIR/source/sinomo` with `cargo build -p sinomo`.
+- `sinomo rollout clear-status [--target <host:port>]` removes stale rollout status without deleting pending rollout artifacts.
 - `sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--remote-repo <path>]` supports development clusters where each node has been installed with `sinomo install`. Compatible targets can receive a binary built by the initiating CLI. Cross-platform repo rollouts use remote build: the target daemon builds from its own managed source and stages candidate bytes under its rollout directory. `--remote-repo` points at the target node's local checkout; when omitted, the daemon uses `$SINOMO_DATA_DIR/source/sinomo`.
 - The build log is written to `$SINOMO_DATA_DIR/rollout/build.log`.
 - The produced binary is copied atomically to stable `$SINOMO_DATA_DIR/bin/sinomo` and `$SINOMO_DATA_DIR/bin/sinomo-shadow` executables.
