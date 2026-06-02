@@ -43,6 +43,8 @@ pub(crate) struct PendingNetworkedRead {
     pub(crate) content_size_bytes: Option<u64>,
     pub(crate) range_offset: Option<u64>,
     pub(crate) range_max_bytes: Option<usize>,
+    pub(crate) next_chunk_index: u32,
+    pub(crate) window_end_chunk_index: Option<u32>,
     pub(crate) target_node_id: NodeId,
     pub(crate) next_retry_at: Instant,
 }
@@ -105,6 +107,10 @@ impl InProgressReadTransfer {
         self.assembler
             .insert_chunk(chunk_index, &bytes)
             .map_err(DfsError::from)
+    }
+
+    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+        self.assembler.contiguous_received_chunk_count()
     }
 }
 

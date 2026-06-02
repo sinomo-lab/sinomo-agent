@@ -39,6 +39,10 @@ pub struct DfsReadRequest {
     pub range_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub start_chunk_index: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_chunks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

@@ -7865,6 +7865,150 @@ fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
 }
 
 #[test]
+fn networked_dfs_large_remote_read_windows_and_continues() {
+    let owner = NodeId::from_legacy_named("node_windowed_read_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_windowed_read_reader").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_windowed_remote_read").expect("object");
+    let version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let root = temp_root("networked_read_windowed");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id,
+        path: "windowed-read.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    let chunk_size = 64 * 1024;
+    let total_chunks = 66;
+    let bytes = (0..(chunk_size * (total_chunks - 1) + 17))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    reader_dfs
+        .add_file_system(file_system)
+        .expect("reader filesystem");
+    owner_dfs
+        .put_local_object_version(metadata, &bytes)
+        .expect("seed owner");
+    reader_dfs
+        .add_object_metadata(
+            owner_dfs
+                .metadata()
+                .object(&object_id)
+                .expect("owner metadata")
+                .clone(),
+        )
+        .expect("replicate metadata");
+
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_read(&object_id)
+            .expect("request windowed read"),
+        vec![owner.clone()]
+    );
+    let first_served = owner_dfs
+        .process_incoming()
+        .expect("owner serves first read window");
+    assert!(first_served.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id: served_object_id,
+                result: DfsReadResult::Found(DfsReadData { bytes, .. }),
+                ..
+            } if served_object_id == &object_id && bytes.is_empty()
+        )
+    }));
+    let first_reader_events = reader_dfs
+        .process_incoming()
+        .expect("reader accepts first read window");
+    assert!(
+        !first_reader_events.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteReadCompleted {
+                    object_id: completed_object_id,
+                    result: DfsReadResult::Found(_),
+                    ..
+                } if completed_object_id == &object_id
+            )
+        }),
+        "first window must not complete the read"
+    );
+
+    let second_served = owner_dfs
+        .process_incoming()
+        .expect("owner serves continuation read window");
+    assert!(
+        second_served.iter().any(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteReadServed {
+                    object_id: served_object_id,
+                    result: DfsReadResult::Found(DfsReadData { bytes, .. }),
+                    ..
+                } if served_object_id == &object_id && bytes.is_empty()
+            )
+        }),
+        "reader should request a continuation after the first window, got {second_served:?}"
+    );
+    let completed = reader_dfs
+        .process_incoming()
+        .expect("reader assembles continuation chunks");
+    assert!(completed.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result: DfsReadResult::Found(DfsReadData { bytes, .. }),
+                ..
+            } if completed_object_id == &object_id && bytes.is_empty()
+        )
+    }));
+    assert!(matches!(
+        reader_dfs
+            .read_local_object_with_state(&object_id, false)
+            .expect("windowed read cached"),
+        NetworkedDfsReadOutcome::Found { data, .. } if data.bytes == bytes
+    ));
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_rejects_read_chunks_after_content_size_metadata_advances() {
     let owner = NodeId::from_legacy_named("node_size_advance_owner").expect("node");
     let reader = NodeId::from_legacy_named("node_size_advance_reader").expect("node");

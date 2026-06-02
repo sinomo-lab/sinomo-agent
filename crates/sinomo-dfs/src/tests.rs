@@ -3155,6 +3155,8 @@ fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
                                 object_id: object_id.clone(),
                                 range_offset: None,
                                 range_max_bytes: None,
+                                start_chunk_index: 0,
+                                max_chunks: 0,
                             }),
                         )
                         .expect("valid read request"),
@@ -3555,6 +3557,8 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             content_size_bytes: Some(70_000),
             range_offset: None,
             range_max_bytes: None,
+            next_chunk_index: 0,
+            window_end_chunk_index: None,
             target_node_id: owner,
             next_retry_at: Instant::now()
                 - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
@@ -3640,6 +3644,8 @@ fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
             content_size_bytes: Some(bytes.len() as u64),
             range_offset: None,
             range_max_bytes: None,
+            next_chunk_index: 0,
+            window_end_chunk_index: None,
             target_node_id: owner.clone(),
             next_retry_at: Instant::now()
                 - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
@@ -4464,6 +4470,8 @@ fn remote_read_content_mismatch_prunes_stale_location() {
             content_size_bytes: Some(b"expected remote bytes".len() as u64),
             range_offset: None,
             range_max_bytes: None,
+            next_chunk_index: 0,
+            window_end_chunk_index: None,
             target_node_id: source.clone(),
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
         },
@@ -4597,6 +4605,8 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             content_size_bytes: Some(70_000),
             range_offset: None,
             range_max_bytes: None,
+            next_chunk_index: 0,
+            window_end_chunk_index: None,
             target_node_id: replica.clone(),
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
         },
@@ -4808,6 +4818,8 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
             content_size_bytes: Some(70_000),
             range_offset: None,
             range_max_bytes: None,
+            next_chunk_index: 0,
+            window_end_chunk_index: None,
             target_node_id: reader,
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
         },
@@ -7174,6 +7186,8 @@ fn chunked_read_response_to_unroutable_requester_stops_after_first_unsent_chunk(
             object_id: object_id.clone(),
             range_offset: None,
             range_max_bytes: None,
+            start_chunk_index: 0,
+            max_chunks: 0,
         },
         &DfsReadData {
             object_id,
