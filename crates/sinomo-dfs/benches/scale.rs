@@ -730,6 +730,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     let owner = node("node_dfs_bench_net_owner");
     let replica = node("node_dfs_bench_net_replica");
     let reader = node("node_dfs_bench_net_reader");
+    let range_reader = node("node_dfs_bench_net_range_reader");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -972,6 +973,158 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             "reader_process_loops": read_process_loops,
             "verification_range_bytes": cached_range,
             "reader_metrics": reader_metrics,
+        }),
+    );
+
+    let range_bytes = byte_count_to_usize(
+        "network range read bytes",
+        args.network_blob_bytes.min(args.blob_range_bytes as u64),
+    )?;
+    let range_offset = args.network_blob_bytes.saturating_sub(range_bytes as u64) / 2;
+    let mut range_reader_dfs = NetworkedDfsService::new(
+        network.add_node(range_reader.clone()),
+        LocalContentStore::new(root.join("range-reader-content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("range-reader-metadata"),
+    )?)?;
+    range_reader_dfs.add_file_system(DfsFileSystem::sifs(owner.clone()))?;
+    let mut range_reader_object = owner_dfs
+        .metadata()
+        .object(&object_id)
+        .ok_or("owner metadata missing committed network blob object for range read")?
+        .clone();
+    range_reader_object.current_locations = vec![owner.clone()];
+    range_reader_dfs.add_object_metadata(range_reader_object)?;
+
+    let range_start = Instant::now();
+    let requested_range_sources =
+        range_reader_dfs.request_remote_object_range_read(&object_id, range_offset, range_bytes)?;
+    if requested_range_sources.is_empty() {
+        return Err("remote range read benchmark could not route initial read request".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
+    let mut owner_range_events = 0usize;
+    let mut reader_range_events = 0usize;
+    let mut range_process_loops = 0usize;
+    let mut range_chunks = 0usize;
+    let mut received_range_bytes = 0u64;
+    loop {
+        let owner_events = owner_dfs.process_incoming()?;
+        let reader_events = range_reader_dfs.process_incoming()?;
+        owner_range_events = owner_range_events.saturating_add(owner_events.len());
+        reader_range_events = reader_range_events.saturating_add(reader_events.len());
+        range_process_loops = range_process_loops.saturating_add(1);
+        let mut completed = false;
+        for event in &reader_events {
+            match event {
+                NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+                    object_id: chunk_object_id,
+                    content_hash,
+                    range_offset: chunk_range_offset,
+                    range_size_bytes,
+                    object_total_size_bytes,
+                    bytes,
+                    complete,
+                    ..
+                } if chunk_object_id == &object_id => {
+                    if content_hash != &expected_content_hash {
+                        return Err(format!(
+                            "remote range read chunk used unexpected content hash {:?}, expected {:?}",
+                            content_hash, expected_content_hash
+                        )
+                        .into());
+                    }
+                    if *chunk_range_offset != range_offset {
+                        return Err(format!(
+                            "remote range read chunk offset mismatch: expected {range_offset}, actual {chunk_range_offset}"
+                        )
+                        .into());
+                    }
+                    if *range_size_bytes != range_bytes as u64 {
+                        return Err(format!(
+                            "remote range read chunk size mismatch: expected {range_bytes}, actual {range_size_bytes}"
+                        )
+                        .into());
+                    }
+                    if *object_total_size_bytes != args.network_blob_bytes {
+                        return Err(format!(
+                            "remote range read object size mismatch: expected {}, actual {object_total_size_bytes}",
+                            args.network_blob_bytes
+                        )
+                        .into());
+                    }
+                    received_range_bytes = received_range_bytes.saturating_add(bytes.len() as u64);
+                    range_chunks = range_chunks.saturating_add(1);
+                    completed |= *complete;
+                }
+                NetworkedDfsServiceEvent::RemoteReadCompleted {
+                    object_id: completed_object_id,
+                    result: DfsReadResult::RangeFound(data),
+                    ..
+                } if completed_object_id == &object_id => {
+                    if data.content_hash != expected_content_hash {
+                        return Err(format!(
+                            "remote inline range read used unexpected content hash {:?}, expected {:?}",
+                            data.content_hash, expected_content_hash
+                        )
+                        .into());
+                    }
+                    if data.offset != range_offset || data.bytes.len() != range_bytes {
+                        return Err(format!(
+                            "remote inline range read mismatch: expected offset {range_offset} bytes {range_bytes}, actual offset {} bytes {}",
+                            data.offset,
+                            data.bytes.len()
+                        )
+                        .into());
+                    }
+                    received_range_bytes =
+                        received_range_bytes.saturating_add(data.bytes.len() as u64);
+                    completed = true;
+                }
+                NetworkedDfsServiceEvent::RemoteReadCompleted {
+                    object_id: completed_object_id,
+                    result,
+                    ..
+                } if completed_object_id == &object_id => {
+                    return Err(format!(
+                        "remote range read benchmark completed without range bytes: {result:?}"
+                    )
+                    .into());
+                }
+                _ => {}
+            }
+        }
+        if completed {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("remote range read benchmark did not complete before timeout".into());
+        }
+        if owner_events.is_empty() && reader_events.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let range_elapsed = range_start.elapsed();
+    let range_reader_metrics = range_reader_dfs.operational_metrics()?;
+    let range_cached_full_object = range_reader_dfs.read_local_object(&object_id)?.is_some();
+    emit(
+        "network_blob_remote_range_read",
+        range_elapsed,
+        json!({
+            "object_bytes": args.network_blob_bytes,
+            "range_offset": range_offset,
+            "requested_bytes": range_bytes,
+            "received_bytes": received_range_bytes,
+            "chunks": range_chunks,
+            "mib_per_second": mib_per_second(received_range_bytes, range_elapsed),
+            "initial_sources": requested_range_sources,
+            "owner_events": owner_range_events,
+            "reader_events": reader_range_events,
+            "reader_process_loops": range_process_loops,
+            "cached_full_object": range_cached_full_object,
+            "reader_metrics": range_reader_metrics,
         }),
     );
 

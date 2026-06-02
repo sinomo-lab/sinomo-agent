@@ -4041,6 +4041,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         offset: u64,
         max_bytes: usize,
+        start_chunk_index: u32,
     ) -> Result<NetworkedDfsRangeReadStreamOutcome, DfsError> {
         let object = self.current_read_object_metadata(object_id)?;
         let open_conflicts = self.open_conflicts_for_object(object_id)?;
@@ -4062,13 +4063,20 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .is_none_or(|expected_hash| expected_hash == &manifest.content_hash)
         {
             let range_offset = offset.min(manifest.size_bytes);
+            let range_size_bytes =
+                range_transfer_size_bytes(manifest.size_bytes, offset, max_bytes);
+            let window_prefix_bytes = chunk_prefix_bytes(range_size_bytes, start_chunk_index);
+            let window_offset = range_offset.saturating_add(window_prefix_bytes);
+            let window_max_bytes = dfs_byte_count_to_usize(
+                "DFS range read window",
+                range_size_bytes.saturating_sub(window_prefix_bytes),
+            )?;
             let (manifest, reader) = self.content.open_object_version_range_stream(
                 object.object_id.as_str(),
                 object.version.as_str(),
-                range_offset,
-                max_bytes,
+                window_offset,
+                window_max_bytes,
             )?;
-            let range_size_bytes = reader.size_bytes();
             return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
                 NetworkedDfsRangeReadStream {
                     data: DfsReadRangeData {
@@ -4086,16 +4094,26 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
 
         if let Some(expected_hash) = object.content_hash.as_ref()
-            && let Ok(reader) =
-                self.content
-                    .open_blob_range_stream(expected_hash, offset, max_bytes)
+            && let Ok(reader) = self.content.open_blob_stream(expected_hash)
             && object
                 .content_size_bytes
                 .is_none_or(|expected_size| expected_size == reader.size_bytes())
         {
             let object_total_size_bytes = reader.size_bytes();
-            let range_offset = reader.offset();
-            let range_size_bytes = reader.remaining_bytes();
+            let range_offset = offset.min(object_total_size_bytes);
+            let range_size_bytes =
+                range_transfer_size_bytes(object_total_size_bytes, offset, max_bytes);
+            let window_prefix_bytes = chunk_prefix_bytes(range_size_bytes, start_chunk_index);
+            let window_offset = range_offset.saturating_add(window_prefix_bytes);
+            let window_max_bytes = dfs_byte_count_to_usize(
+                "DFS range read window",
+                range_size_bytes.saturating_sub(window_prefix_bytes),
+            )?;
+            let reader = self.content.open_blob_range_stream(
+                expected_hash,
+                window_offset,
+                window_max_bytes,
+            )?;
             return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
                 NetworkedDfsRangeReadStream {
                     data: DfsReadRangeData {
@@ -9355,6 +9373,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                                 &request.object_id,
                                 offset,
                                 max_bytes,
+                                request.start_chunk_index,
                             )? {
                                 NetworkedDfsRangeReadStreamOutcome::Found(stream)
                                     if stream.range_size_bytes > 0 =>
@@ -9622,25 +9641,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             return Ok(());
         }
         let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        let mut skip_bytes =
-            u64::from(request.start_chunk_index).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64);
-        while skip_bytes > 0 {
-            let chunk_len = skip_bytes.min(DFS_BLOB_CHUNK_BYTES as u64);
-            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
-                message: format!(
-                    "DFS range read skip is too large to fit in memory: {chunk_len} bytes"
-                ),
-            })?;
-            reader
-                .read_exact(&mut buffer[..chunk_len])
-                .map_err(|source| DfsError::ContentStore {
-                    message: format!(
-                        "failed to skip blob {:?} range prefix for read continuation: {}",
-                        data.content_hash, source
-                    ),
-                })?;
-            skip_bytes = skip_bytes.saturating_sub(chunk_len as u64);
-        }
         for chunk_index in request.start_chunk_index..end_chunk_index {
             let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
             let chunk_len = (range_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
@@ -13359,6 +13359,12 @@ fn range_transfer_size_bytes(
     let start = requested_offset.min(object_total_size_bytes);
     let max_bytes = u64::try_from(requested_max_bytes).unwrap_or(u64::MAX);
     object_total_size_bytes.saturating_sub(start).min(max_bytes)
+}
+
+fn dfs_byte_count_to_usize(label: &str, value: u64) -> Result<usize, DfsError> {
+    usize::try_from(value).map_err(|_| DfsError::Distributed {
+        message: format!("{label} byte count is too large for this platform: {value}"),
+    })
 }
 
 fn fetch_response_window_end(start_chunk_index: u32, total_chunks: u32, max_chunks: u32) -> u32 {
