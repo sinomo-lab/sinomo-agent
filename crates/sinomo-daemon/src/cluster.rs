@@ -1290,23 +1290,14 @@ impl ClusterNetworkMaintenance {
             self.last_probe = now;
             if !cluster_is_solo {
                 let records = self.probe_connectivity(&cluster_paths, &state);
-                // Skip the raft append when connectivity is unchanged — otherwise every
-                // probe cycle re-puts identical records (with fresh timestamps) and
-                // rewrites the KV snapshot even on a fully idle cluster.
-                let unchanged = sinomo_network::cluster_connectivity_sync_is_noop(
+                // Connectivity is a hot, transient routing signal. Keep probe
+                // observations process-local so flapping or roaming peers do not
+                // rewrite raft/KV snapshots while the cluster is otherwise idle.
+                let _ = sinomo_network::write_local_cluster_connectivity_records(
                     &cluster_paths,
                     &state.local_node_id,
                     &records,
-                )
-                .unwrap_or(false);
-                if !unchanged {
-                    self.idle_stats.incr_kv_publish_connectivity();
-                    let _ = sync_cluster_connectivity_records_to_kv(
-                        &cluster_paths,
-                        &state.local_node_id,
-                        records,
-                    );
-                }
+                );
             }
         }
 

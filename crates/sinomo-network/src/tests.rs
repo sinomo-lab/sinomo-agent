@@ -859,6 +859,62 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
 }
 
 #[test]
+fn local_connectivity_records_are_in_memory_not_disk() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-memory-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_memory").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_memory_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_memory_b").expect("node b");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity memory",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.61:21353".to_string(), 10);
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+
+    write_local_cluster_connectivity_records(&paths, &node_a, std::slice::from_ref(&record))
+        .expect("write local connectivity");
+
+    assert!(
+        !paths.connectivity_local.exists(),
+        "local connectivity observations must not be persisted to disk"
+    );
+    assert_eq!(
+        read_local_cluster_connectivity_records(&paths).expect("read local"),
+        vec![record.clone()]
+    );
+    assert_eq!(
+        read_cluster_connectivity_graph(&paths).expect("read merged graph"),
+        vec![record]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-public-tcp-sort-{}",

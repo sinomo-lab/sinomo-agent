@@ -18,6 +18,9 @@ const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
+    Mutex<HashMap<PathBuf, Vec<ClusterConnectivityRecord>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Per-path record of the last content `write_object_file` wrote (or confirmed
 /// already on disk), used to skip the read-back + compare when nothing changed.
@@ -1903,11 +1906,17 @@ pub fn read_cluster_connectivity_graph(
 pub fn read_local_cluster_connectivity_records(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    if !paths.connectivity_local.exists() {
-        return Ok(Vec::new());
-    }
     let now = OffsetDateTime::now_utc();
-    let mut records: Vec<ClusterConnectivityRecord> = read_object_file(&paths.connectivity_local)?;
+    let mut cache =
+        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+            .lock()
+            .map_err(|error| NetworkError::Io {
+                operation: "lock local cluster connectivity cache".to_string(),
+                detail: error.to_string(),
+            })?;
+    let local_records = cache.entry(paths.root.clone()).or_default();
+    local_records.retain(|record| cluster_network_record_live(record.expires_at, now));
+    let mut records = local_records.clone();
     records.retain(|record| cluster_network_record_live(record.expires_at, now));
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
@@ -1919,8 +1928,16 @@ pub fn write_local_cluster_connectivity_records(
     records: &[ClusterConnectivityRecord],
 ) -> Result<(), NetworkError> {
     let now = OffsetDateTime::now_utc();
-    let mut merged = read_local_cluster_connectivity_records(paths)?
-        .into_iter()
+    let mut cache =
+        LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+            .lock()
+            .map_err(|error| NetworkError::Io {
+                operation: "lock local cluster connectivity cache".to_string(),
+                detail: error.to_string(),
+            })?;
+    let local_records = cache.entry(paths.root.clone()).or_default();
+    let mut merged = local_records
+        .iter()
         .filter(|record| cluster_network_record_live(record.expires_at, now))
         .map(|record| {
             (
@@ -1929,7 +1946,7 @@ pub fn write_local_cluster_connectivity_records(
                     record.target_node_id.clone(),
                     record.endpoint_id.clone(),
                 ),
-                record,
+                record.clone(),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -1949,7 +1966,8 @@ pub fn write_local_cluster_connectivity_records(
     }
     let mut merged = merged.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut merged);
-    write_object_file(&paths.connectivity_local, &merged)
+    *local_records = merged;
+    Ok(())
 }
 
 fn sort_cluster_connectivity_records(records: &mut [ClusterConnectivityRecord]) {
