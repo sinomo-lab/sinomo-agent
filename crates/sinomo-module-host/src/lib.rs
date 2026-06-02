@@ -56,9 +56,20 @@ pub struct NativeModule {
     _library: Library,
     descriptor: NativeModuleDescriptor,
     invoke: SinomoModuleInvokeFn,
-    shutdown: SinomoModuleShutdownFn,
+    shutdown: Option<SinomoModuleShutdownFn>,
     free_buffer: SinomoModuleFreeBufferFn,
     callbacks: Box<NativeModuleHostCallbackState>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeModuleUnloadReport {
+    pub module_id: String,
+    pub interface_version: String,
+    pub shutdown_called: bool,
+    pub shutdown_ok: bool,
+    pub shutdown_status: Option<SinomoModuleStatusCode>,
+    pub detail: String,
+    pub library_handle_released: bool,
 }
 
 impl NativeModule {
@@ -158,7 +169,7 @@ impl NativeModule {
             _library: library,
             descriptor,
             invoke,
-            shutdown,
+            shutdown: Some(shutdown),
             free_buffer,
             callbacks,
         })
@@ -203,13 +214,55 @@ impl NativeModule {
         decode_sobj(&response_bytes)
             .map_err(|source| NativeModuleHostError::Object(source.to_string()))
     }
+
+    /// Release this native module handle after calling its shutdown hook.
+    ///
+    /// Dynamic-library unloading is platform and module dependent. This method
+    /// makes the unload attempt explicit and returns the module's shutdown
+    /// status, then drops the library handle so `libloading` can perform its
+    /// best-effort unload.
+    pub fn unload(mut self) -> NativeModuleUnloadReport {
+        let mut report = self.shutdown_module("explicit unload");
+        drop(self);
+        report.library_handle_released = true;
+        report
+    }
+
+    fn shutdown_module(&mut self, reason: &str) -> NativeModuleUnloadReport {
+        let Some(shutdown) = self.shutdown.take() else {
+            return NativeModuleUnloadReport {
+                module_id: self.descriptor.module_id.clone(),
+                interface_version: self.descriptor.interface_version.clone(),
+                shutdown_called: false,
+                shutdown_ok: true,
+                shutdown_status: None,
+                detail: format!("native module already shut down before {reason}"),
+                library_handle_released: false,
+            };
+        };
+        if let Ok(mut callbacks) = self.callbacks.callbacks.lock() {
+            *callbacks = None;
+        }
+        let status = unsafe { shutdown() };
+        NativeModuleUnloadReport {
+            module_id: self.descriptor.module_id.clone(),
+            interface_version: self.descriptor.interface_version.clone(),
+            shutdown_called: true,
+            shutdown_ok: status == SINOMO_MODULE_STATUS_OK,
+            shutdown_status: Some(status),
+            detail: if status == SINOMO_MODULE_STATUS_OK {
+                format!("native module shutdown completed during {reason}")
+            } else {
+                format!("native module shutdown returned status {status} during {reason}")
+            },
+            library_handle_released: false,
+        }
+    }
 }
 
 impl Drop for NativeModule {
     fn drop(&mut self) {
-        unsafe {
-            let _ = (self.shutdown)();
-        }
+        let _ = self.shutdown_module("drop");
     }
 }
 

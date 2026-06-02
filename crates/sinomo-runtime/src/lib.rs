@@ -130,6 +130,7 @@ mod tests {
                 "sandbox/module-artifacts/artifact_candidate.wasm",
                 "sandbox/module-wasm-artifacts.sobj",
                 "module/loader-state/01kr3d54d45zkm0p0xgps8k7mt.sobj",
+                "module/lifecycle/unload-records/01kr3d54d45zkm0p0xgps8k7mt.sobj",
                 "module/local-command-artifacts.sobj",
                 "rollout/runtime-state.sobj",
                 "rollout/telemetry-advance-state.sobj",

@@ -37,6 +37,10 @@ impl SandboxWasixModuleCommandRunner {
         Self { module }
     }
 
+    pub fn unload(self) -> sinomo_module_host::NativeModuleUnloadReport {
+        self.module.unload()
+    }
+
     pub fn validate_sinomo_module_v1_component_contract(
         &self,
         wasm: impl AsRef<[u8]>,

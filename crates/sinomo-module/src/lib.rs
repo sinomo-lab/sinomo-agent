@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::{
     ArtifactManifest, Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric,
     EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, HotSwapState, LatencyClass,
-    MetricValue, ModuleLoaderState, PolicyAction, PolicyDecision, PrivacyClass, RolloutPlan,
-    RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    MetricValue, ModuleKind, ModuleLoaderState, PolicyAction, PolicyDecision, PrivacyClass,
+    RolloutPlan, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_events::{EventId, EventStore, EventStoreError, StoredEvent};
 use sinomo_node::{NodeId, NodeIdentity};
@@ -129,6 +129,26 @@ pub struct NativeDylibModuleLoaderState {
     pub native_abi_version: u32,
     pub interface_version: String,
     pub activated_at: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleUnloadRecord {
+    pub module_id: ModuleId,
+    pub backend: ModuleKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<ArtifactId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_name: Option<String>,
+    pub state_removed: bool,
+    pub runtime_unload_attempted: bool,
+    pub runtime_unload_succeeded: bool,
+    pub runtime_unload_detail: String,
+    pub unloaded_at: String,
     pub source: String,
 }
 
@@ -1028,6 +1048,18 @@ pub fn native_dylib_module_loader_state_path(
     native_dylib_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
 }
 
+pub fn module_lifecycle_dir(data_dir_root: &Path) -> PathBuf {
+    data_dir_root.join("module").join("lifecycle")
+}
+
+pub fn module_unload_record_dir(data_dir_root: &Path) -> PathBuf {
+    module_lifecycle_dir(data_dir_root).join("unload-records")
+}
+
+pub fn module_unload_record_path(data_dir_root: &Path, module_id: &ModuleId) -> PathBuf {
+    module_unload_record_dir(data_dir_root).join(format!("{module_id}.sobj"))
+}
+
 pub fn module_local_command_registry_path(data_dir_root: &Path) -> PathBuf {
     data_dir_root
         .join("module")
@@ -1071,6 +1103,48 @@ pub fn write_native_dylib_module_loader_state(
 ) -> Result<PathBuf, ModuleLoaderStoreError> {
     let path = native_dylib_module_loader_state_path(data_dir_root, &state.module_id);
     write_object(&path, state)?;
+    Ok(path)
+}
+
+pub fn remove_native_dylib_module_loader_state(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> Result<Option<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
+    let path = native_dylib_module_loader_state_path(data_dir_root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let state = read_object(&path)?;
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ModuleLoaderStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    }
+    Ok(Some(state))
+}
+
+pub fn read_module_unload_record(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> Result<Option<ModuleUnloadRecord>, ModuleLoaderStoreError> {
+    let path = module_unload_record_path(data_dir_root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_object(&path).map(Some)
+}
+
+pub fn write_module_unload_record(
+    data_dir_root: &Path,
+    record: &ModuleUnloadRecord,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let path = module_unload_record_path(data_dir_root, &record.module_id);
+    write_object(&path, record)?;
     Ok(path)
 }
 
@@ -2060,6 +2134,12 @@ pub fn register_storage_paths(
         "module/cache/native-dylib",
         "content-addressed native dynamic-library module cache",
     )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/lifecycle/unload-records",
+        "node-local best-effort module unload records keyed by module id",
+    )?;
     layout.register_sinomo_object(
         "sinomo-module",
         StorageRing::R1,
@@ -2078,6 +2158,24 @@ pub fn register_storage_paths(
         .field("interface_version", "String")
         .field("activated_at", "String")
         .field("source", "String"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/lifecycle/unload-records/example.sobj",
+        sinomo_storage::ObjectSchema::new("ModuleUnloadRecord", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("module_id", "ModuleId")
+            .field("backend", "ModuleKind")
+            .field("artifact_id", "Option<ArtifactId>")
+            .field("content_hash", "Option<String>")
+            .field("cache_key", "Option<String>")
+            .field("library_name", "Option<String>")
+            .field("state_removed", "bool")
+            .field("runtime_unload_attempted", "bool")
+            .field("runtime_unload_succeeded", "bool")
+            .field("runtime_unload_detail", "String")
+            .field("unloaded_at", "String")
+            .field("source", "String"),
     )?;
     layout.register_sinomo_object(
         "sinomo-module",
@@ -2187,6 +2285,65 @@ mod tests {
             .expect("read state")
             .expect("state");
         assert_eq!(read_back, state);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_dylib_loader_state_removal_records_unload() {
+        let root = unique_temp("native-dylib-unload-state");
+        let module_id = ModuleId::from_legacy_named("module.sandbox.wasix").expect("module");
+        let state = NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: Some(
+                ArtifactId::from_legacy_named("artifact_wasix_dylib").expect("artifact"),
+            ),
+            content_hash: "blake3:abc".to_string(),
+            cache_key: "module/sandbox/wasix".to_string(),
+            library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo.sandbox.wasix.v1".to_string(),
+            activated_at: module_loader_applied_at_now(),
+            source: "local".to_string(),
+        };
+        write_native_dylib_module_loader_state(&root, &state).expect("write state");
+
+        let removed = remove_native_dylib_module_loader_state(&root, &module_id)
+            .expect("remove state")
+            .expect("removed state");
+        assert_eq!(removed, state);
+        assert!(
+            read_native_dylib_module_loader_state(&root, &module_id)
+                .expect("read removed state")
+                .is_none()
+        );
+        assert!(
+            remove_native_dylib_module_loader_state(&root, &module_id)
+                .expect("remove missing state")
+                .is_none()
+        );
+
+        let record = ModuleUnloadRecord {
+            module_id: module_id.clone(),
+            backend: sinomo_core::ModuleKind::NativeDylib,
+            artifact_id: removed.artifact_id.clone(),
+            content_hash: Some(removed.content_hash.clone()),
+            cache_key: Some(removed.cache_key.clone()),
+            library_name: Some(removed.library_name.clone()),
+            state_removed: true,
+            runtime_unload_attempted: true,
+            runtime_unload_succeeded: true,
+            runtime_unload_detail: "native module shutdown completed during explicit unload"
+                .to_string(),
+            unloaded_at: module_loader_applied_at_now(),
+            source: "test".to_string(),
+        };
+        let path = write_module_unload_record(&root, &record).expect("write unload record");
+        assert_eq!(path, module_unload_record_path(&root, &module_id));
+        let read_back = read_module_unload_record(&root, &module_id)
+            .expect("read unload record")
+            .expect("record");
+        assert_eq!(read_back, record);
         let _ = fs::remove_dir_all(root);
     }
 

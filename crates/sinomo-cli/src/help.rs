@@ -179,10 +179,16 @@ pub(super) fn print_module_help() {
     println!(
         "      Install a trusted native module into the content-addressed local cache and activate it from descriptor metadata."
     );
+    println!("  sinomo module native-dylib unload --module <module-id>");
+    println!(
+        "      Remove node-local native module activation state and best-effort release a cached native handle."
+    );
     println!(
         "  sinomo module wasix activate [--artifact <artifact-id>] [--library-name <file-name>] [--source <text>] <library>"
     );
     println!("      Activate the trusted WASIX sandbox runtime module as module.sandbox.wasix.");
+    println!("  sinomo module wasix unload");
+    println!("      Unload the active trusted WASIX sandbox runtime module state.");
 }
 
 pub(super) fn print_dfs_help() {

@@ -11,11 +11,13 @@ pub(crate) enum ModuleCliCommand {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ModuleNativeDylibCliCommand {
     Activate(ModuleNativeDylibActivateOptions),
+    Unload(ModuleNativeDylibUnloadOptions),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ModuleWasixCliCommand {
     Activate(ModuleWasixActivateOptions),
+    Unload,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
@@ -35,6 +37,11 @@ pub(crate) struct ModuleWasixActivateOptions {
     pub(crate) artifact_id: Option<sinomo_runtime::module::ArtifactId>,
     pub(crate) library_name: Option<String>,
     pub(crate) source: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct ModuleNativeDylibUnloadOptions {
+    pub(crate) module_id: sinomo_runtime::module::ModuleId,
 }
 
 pub(crate) fn parse_module_command(args: &[String]) -> Result<ModuleCliCommand, CliError> {
@@ -62,6 +69,9 @@ fn parse_module_native_dylib_command(args: &[String]) -> Result<ModuleCliCommand
                 rest,
             )?),
         )),
+        Some((command, rest)) if command == "unload" => Ok(ModuleCliCommand::NativeDylib(
+            ModuleNativeDylibCliCommand::Unload(parse_module_native_dylib_unload_options(rest)?),
+        )),
         _ => Err(CliError::Usage),
     }
 }
@@ -71,6 +81,9 @@ fn parse_module_wasix_command(args: &[String]) -> Result<ModuleCliCommand, CliEr
         Some((command, rest)) if command == "activate" => Ok(ModuleCliCommand::Wasix(
             ModuleWasixCliCommand::Activate(parse_module_wasix_activate_options(rest)?),
         )),
+        Some((command, [])) if command == "unload" => {
+            Ok(ModuleCliCommand::Wasix(ModuleWasixCliCommand::Unload))
+        }
         _ => Err(CliError::Usage),
     }
 }
@@ -191,6 +204,36 @@ fn parse_module_wasix_activate_options(
     })
 }
 
+fn parse_module_native_dylib_unload_options(
+    args: &[String],
+) -> Result<ModuleNativeDylibUnloadOptions, CliError> {
+    let mut module_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--module" | "--module-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                module_id = Some(parse_cli_module_id(value)?);
+            }
+            value if value.starts_with('-') => return Err(CliError::Usage),
+            value => {
+                if module_id.is_none() {
+                    module_id = Some(parse_cli_module_id(value)?);
+                } else {
+                    return Err(CliError::Usage);
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(ModuleNativeDylibUnloadOptions {
+        module_id: module_id.ok_or(CliError::Usage)?,
+    })
+}
+
 pub(crate) fn run_module_cli_command(command: ModuleCliCommand) -> Result<(), CliError> {
     match command {
         ModuleCliCommand::Help => {
@@ -200,9 +243,13 @@ pub(crate) fn run_module_cli_command(command: ModuleCliCommand) -> Result<(), Cl
         ModuleCliCommand::NativeDylib(ModuleNativeDylibCliCommand::Activate(options)) => {
             activate_native_dylib_module(options)
         }
+        ModuleCliCommand::NativeDylib(ModuleNativeDylibCliCommand::Unload(options)) => {
+            unload_native_dylib_module(options)
+        }
         ModuleCliCommand::Wasix(ModuleWasixCliCommand::Activate(options)) => {
             activate_wasix_native_module(options)
         }
+        ModuleCliCommand::Wasix(ModuleWasixCliCommand::Unload) => unload_wasix_native_module(),
     }
 }
 
@@ -219,6 +266,14 @@ fn activate_wasix_native_module(options: ModuleWasixActivateOptions) -> Result<(
         cache_key: Some("module/sandbox/wasix".to_string()),
         library_name: options.library_name,
         source: options.source,
+    })
+}
+
+fn unload_wasix_native_module() -> Result<(), CliError> {
+    unload_native_dylib_module(ModuleNativeDylibUnloadOptions {
+        module_id: parse_cli_module_id(
+            sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID,
+        )?,
     })
 }
 
@@ -314,6 +369,113 @@ fn activate_native_dylib_module(options: ModuleNativeDylibActivateOptions) -> Re
     println!("hash: {}", state.content_hash);
     println!("cache: {}", cache_path.display());
     println!("state: {}", state_path.display());
+    Ok(())
+}
+
+fn unload_native_dylib_module(options: ModuleNativeDylibUnloadOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let module_id = options.module_id;
+    let previous_state = sinomo_runtime::module::remove_native_dylib_module_loader_state(
+        &data_dir.root(),
+        &module_id,
+    )
+    .map_err(module_loader_store_error_to_cli)?;
+
+    let mut artifact_id = None;
+    let mut content_hash = None;
+    let mut cache_key = None;
+    let mut library_name = None;
+    let mut runtime_unload_attempted = false;
+    let mut runtime_unload_succeeded = previous_state.is_none();
+    let mut runtime_unload_detail = "no active native-dylib loader state".to_string();
+    let mut cache_path = None;
+
+    if let Some(state) = previous_state.as_ref() {
+        artifact_id = state.artifact_id.clone();
+        content_hash = Some(state.content_hash.clone());
+        cache_key = Some(state.cache_key.clone());
+        library_name = Some(state.library_name.clone());
+        let path = sinomo_runtime::module_host::native_module_cache_path(
+            data_dir.root(),
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        cache_path = Some(path.clone());
+        if path.exists() {
+            runtime_unload_attempted = true;
+            match unsafe {
+                sinomo_runtime::module_host::NativeModule::load_from_content_addressed_path(
+                    &path,
+                    &state.content_hash,
+                )
+            } {
+                Ok(module) => {
+                    let report = module.unload();
+                    runtime_unload_succeeded = report.shutdown_ok && report.library_handle_released;
+                    runtime_unload_detail = format!(
+                        "{}; library_handle_released={}",
+                        report.detail, report.library_handle_released
+                    );
+                }
+                Err(error) => {
+                    runtime_unload_succeeded = false;
+                    runtime_unload_detail =
+                        format!("load cached native module for unload probe: {error}");
+                }
+            }
+        } else {
+            runtime_unload_detail = format!(
+                "cached native module library not found at {}; active state was still removed",
+                path.display()
+            );
+        }
+    }
+
+    let record = sinomo_runtime::module::ModuleUnloadRecord {
+        module_id: module_id.clone(),
+        backend: sinomo_runtime::core::ModuleKind::NativeDylib,
+        artifact_id,
+        content_hash,
+        cache_key,
+        library_name,
+        state_removed: previous_state.is_some(),
+        runtime_unload_attempted,
+        runtime_unload_succeeded,
+        runtime_unload_detail: runtime_unload_detail.clone(),
+        unloaded_at: sinomo_runtime::module::module_loader_applied_at_now(),
+        source: "local-cli".to_string(),
+    };
+    let record_path = sinomo_runtime::module::write_module_unload_record(&data_dir.root(), &record)
+        .map_err(module_loader_store_error_to_cli)?;
+
+    println!("module-state-id: {module_id}");
+    println!(
+        "state: {}",
+        if previous_state.is_some() {
+            "removed"
+        } else {
+            "not-active"
+        }
+    );
+    if let Some(cache_path) = cache_path.as_ref() {
+        println!("cache: {}", cache_path.display());
+    }
+    println!(
+        "runtime-unload: {}",
+        if runtime_unload_attempted {
+            if runtime_unload_succeeded {
+                "ok"
+            } else {
+                "failed"
+            }
+        } else {
+            "skipped"
+        }
+    );
+    println!("detail: {runtime_unload_detail}");
+    println!("record: {}", record_path.display());
     Ok(())
 }
 

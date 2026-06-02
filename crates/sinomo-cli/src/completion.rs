@@ -2020,33 +2020,51 @@ fn module_children() -> Vec<CommandSpec> {
         cmd(
             "native-dylib",
             "manage trusted native-dylib modules",
-            vec![cmd(
-                "activate",
-                "install and activate a trusted native module",
-                vec![],
-                opts(&[
-                    "--module",
-                    "--artifact",
-                    "--interface",
-                    "--cache-key",
-                    "--library-name",
-                    "--source",
-                ]),
-                vec![value("library", "native dynamic library path", &[])],
-            )],
+            vec![
+                cmd(
+                    "activate",
+                    "install and activate a trusted native module",
+                    vec![],
+                    opts(&[
+                        "--module",
+                        "--artifact",
+                        "--interface",
+                        "--cache-key",
+                        "--library-name",
+                        "--source",
+                    ]),
+                    vec![value("library", "native dynamic library path", &[])],
+                ),
+                cmd(
+                    "unload",
+                    "remove activation state and best-effort unload a native module",
+                    vec![],
+                    opts(&["--module"]),
+                    vec![value("module-id", "native module id", &[])],
+                ),
+            ],
             vec![],
             vec![],
         ),
         cmd(
             "wasix",
             "manage the WASIX sandbox runtime module",
-            vec![cmd(
-                "activate",
-                "activate module.sandbox.wasix from a native library",
-                vec![],
-                opts(&["--artifact", "--library-name", "--source"]),
-                vec![value("library", "WASIX native dynamic library path", &[])],
-            )],
+            vec![
+                cmd(
+                    "activate",
+                    "activate module.sandbox.wasix from a native library",
+                    vec![],
+                    opts(&["--artifact", "--library-name", "--source"]),
+                    vec![value("library", "WASIX native dynamic library path", &[])],
+                ),
+                cmd(
+                    "unload",
+                    "remove module.sandbox.wasix activation state",
+                    vec![],
+                    vec![],
+                    vec![],
+                ),
+            ],
             vec![],
             vec![],
         ),
@@ -2421,6 +2439,27 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.label == "--library-name")
+        );
+
+        let wasix_commands =
+            slash_completions("/module wasix ", "/module wasix ".len()).expect("wasix commands");
+        assert!(
+            wasix_commands
+                .items
+                .iter()
+                .any(|item| item.label == "unload")
+        );
+
+        let unload_options = slash_completions(
+            "/module native-dylib unload --",
+            "/module native-dylib unload --".len(),
+        )
+        .expect("native unload options");
+        assert!(
+            unload_options
+                .items
+                .iter()
+                .any(|item| item.label == "--module")
         );
     }
 

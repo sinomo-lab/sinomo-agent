@@ -102,6 +102,10 @@ impl SandboxWasixNativeModule {
         self.module.descriptor()
     }
 
+    pub fn unload(self) -> sinomo_module_host::NativeModuleUnloadReport {
+        self.module.unload()
+    }
+
     pub fn invoke(
         &self,
         request: &SandboxWasixNativeRequest,
