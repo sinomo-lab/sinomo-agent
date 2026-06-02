@@ -2184,7 +2184,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                                 DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
                             )?;
                         for intent in intent_page.intents {
-                            intents.push(intent);
+                            self.coordinator
+                                .observe_restored_intent_id(&intent.intent_id);
+                            if write_intent_status_requires_hydrate_restore(&intent.status) {
+                                intents.push(intent);
+                            }
                         }
                         let Some(next_cursor) = intent_page.next_cursor else {
                             break;
@@ -12748,6 +12752,15 @@ fn distributed_intent_state_from_status(status: &DfsWriteIntentStatus) -> DfsWri
         DfsWriteIntentStatus::Conflict => DfsWriteIntentState::Conflict,
         DfsWriteIntentStatus::Aborted => DfsWriteIntentState::Aborted,
     }
+}
+
+fn write_intent_status_requires_hydrate_restore(status: &DfsWriteIntentStatus) -> bool {
+    matches!(
+        status,
+        DfsWriteIntentStatus::Staging
+            | DfsWriteIntentStatus::ReceiptsPending
+            | DfsWriteIntentStatus::Committed
+    )
 }
 
 fn repair_retry_delay_ticks(attempts: u32) -> u64 {

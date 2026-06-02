@@ -1586,11 +1586,11 @@ fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
             DfsWriteRequest {
                 file_system_id: sifs_file_system_id(),
                 object_id: object_id.clone(),
-                target_version: version_2,
-                requesting_node_id: owner,
+                target_version: version_2.clone(),
+                requesting_node_id: owner.clone(),
             },
             b"aborted pending bytes".to_vec(),
-            vec![dfs.node_id().clone(), replica],
+            vec![dfs.node_id().clone(), replica.clone()],
             DfsReplicationPolicy::new(2, 2).expect("policy"),
         )
         .expect("pending write");
@@ -1606,12 +1606,19 @@ fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
 
     dfs.hydrate_from_metadata_backend().expect("rehydrate");
 
+    let restored_aborted_intent = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .get_intent(&object_id, &intent_id)
+        .expect("aborted intent lookup")
+        .expect("aborted intent remains durable");
     assert_eq!(
-        dfs.coordinator()
-            .intent(&intent_id)
-            .expect("restored aborted intent")
-            .state,
-        DfsWriteIntentState::Aborted
+        restored_aborted_intent.status,
+        DfsWriteIntentStatus::Aborted
+    );
+    assert!(
+        dfs.coordinator().intent(&intent_id).is_none(),
+        "closed aborted intents should advance restored ID state without occupying coordinator memory"
     );
     assert_eq!(
         dfs.metadata()
@@ -1623,6 +1630,27 @@ fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
     assert!(
         !dfs.pending_writes.contains_key(&intent_id),
         "rehydration must not resurrect pending state for aborted writes"
+    );
+    let next_write = dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2,
+                requesting_node_id: owner,
+            },
+            b"aborted pending bytes".to_vec(),
+            vec![dfs.node_id().clone(), replica],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("retry pending write");
+    let next_intent_id = match next_write {
+        NetworkedDfsWriteOutcome::Pending { intent_id, .. } => intent_id,
+        other => panic!("expected retry pending write, got {other:?}"),
+    };
+    assert_ne!(
+        next_intent_id, intent_id,
+        "hydration must observe closed intent ids so new writes do not reuse them"
     );
     std::fs::remove_dir_all(root).ok();
 }

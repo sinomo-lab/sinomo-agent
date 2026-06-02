@@ -391,6 +391,10 @@ impl DistributedEventualCoordinator {
         Ok(())
     }
 
+    pub fn observe_restored_intent_id(&mut self, intent_id: &str) {
+        self.advance_next_intent_id(intent_id);
+    }
+
     pub fn restore_durable_receipt(
         &mut self,
         intent_id: &str,
