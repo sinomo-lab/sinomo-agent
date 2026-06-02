@@ -1474,6 +1474,35 @@ fn write_rollout_progress_line(line: &str, last_len: &mut usize) -> Result<(), C
     Ok(())
 }
 
+fn rollout_terminal_response(
+    status: &ClusterNodeRolloutStatus,
+) -> Option<ClusterRolloutBinaryResponse> {
+    let terminal = status.phase.as_deref() == Some("shadow-finalized")
+        || matches!(
+            status.status.as_str(),
+            "failed" | "rejected" | "rolled-back"
+        );
+    if !terminal {
+        return None;
+    }
+    Some(ClusterRolloutBinaryResponse {
+        status: status.status.clone(),
+        detail: status
+            .detail
+            .clone()
+            .or_else(|| status.progress_message.clone())
+            .unwrap_or_else(|| {
+                status
+                    .phase
+                    .clone()
+                    .unwrap_or_else(|| status.status.clone())
+            }),
+        main_binary: PathBuf::new(),
+        shadow_binary: PathBuf::new(),
+        source_head: None,
+    })
+}
+
 fn send_rollout_request_with_progress<F>(
     target: &RolloutTarget,
     operation: &'static str,
@@ -1512,6 +1541,11 @@ where
                 );
                 write_rollout_progress_line(&line, &mut last_len)?;
                 drew_progress = true;
+                if let Some(response) = rollout_status.as_ref().and_then(rollout_terminal_response)
+                {
+                    println!();
+                    return Ok(response);
+                }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if drew_progress {

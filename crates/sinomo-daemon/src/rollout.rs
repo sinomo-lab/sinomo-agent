@@ -1240,6 +1240,97 @@ fn stop_shadow_supervisor_for_rollout(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ensure_shadow_supervisor_running_from_installed_path(
+    data_dir: &Path,
+    shadow_binary: &Path,
+    main_binary: &Path,
+    main_host: &str,
+    main_port: u16,
+    shadow_host: &str,
+    shadow_port: u16,
+    deadline: Duration,
+) -> Result<(), DaemonError> {
+    ensure_shadow_supervisor_running(
+        data_dir,
+        shadow_binary,
+        main_binary,
+        main_host,
+        main_port,
+        shadow_host,
+        shadow_port,
+        deadline,
+    )?;
+    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    let running = match probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => status,
+        DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => status,
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+            return Err(DaemonError::Network {
+                address: daemon_connect_address(shadow_host, shadow_port),
+                detail: "shadow supervisor did not report status after rollout start".to_string(),
+            });
+        }
+    };
+    if running
+        .executable
+        .as_ref()
+        .is_some_and(|executable| sinomo_rollout::same_path_if_exists(executable, shadow_binary))
+    {
+        return Ok(());
+    }
+    stop_shadow_supervisor_for_rollout(
+        &shadow_paths,
+        Duration::from_secs(15),
+        DAEMON_PROBE_TIMEOUT,
+    )?;
+    ensure_shadow_supervisor_running(
+        data_dir,
+        shadow_binary,
+        main_binary,
+        main_host,
+        main_port,
+        shadow_host,
+        shadow_port,
+        deadline,
+    )?;
+    let running = match probe_daemon_status(&shadow_paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => status,
+        DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => status,
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+            return Err(DaemonError::Network {
+                address: daemon_connect_address(shadow_host, shadow_port),
+                detail: "shadow supervisor did not report status after stable-path restart"
+                    .to_string(),
+            });
+        }
+    };
+    if running
+        .executable
+        .as_ref()
+        .is_some_and(|executable| sinomo_rollout::same_path_if_exists(executable, shadow_binary))
+    {
+        Ok(())
+    } else {
+        Err(DaemonError::Network {
+            address: daemon_connect_address(shadow_host, shadow_port),
+            detail: format!(
+                "shadow supervisor started from {}, expected {}",
+                running
+                    .executable
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unknown executable".to_string()),
+                shadow_binary.display()
+            ),
+        })
+    }
+}
+
 pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<String, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
@@ -1269,7 +1360,7 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
                 STABLE_BINARY_COPY_RETRY_INTERVAL,
             )?;
         }
-        ensure_shadow_supervisor_running(
+        ensure_shadow_supervisor_running_from_installed_path(
             data_dir,
             &finalize.shadow_binary,
             &finalize.main_binary,
@@ -1292,7 +1383,7 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
             STABLE_BINARY_COPY_TIMEOUT,
             STABLE_BINARY_COPY_RETRY_INTERVAL,
         );
-        match ensure_shadow_supervisor_running(
+        match ensure_shadow_supervisor_running_from_installed_path(
             data_dir,
             &finalize.shadow_binary,
             &finalize.main_binary,
