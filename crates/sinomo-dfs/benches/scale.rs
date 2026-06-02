@@ -6,7 +6,7 @@ use sinomo_dfs::{
     DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsRangeReadOutcome,
     NetworkedDfsService, NetworkedDfsServiceEvent,
 };
-use sinomo_network::InProcessNetwork;
+use sinomo_network::{InProcessNetwork, NetworkTransport};
 use sinomo_node::NodeId;
 use std::env;
 use std::fs;
@@ -46,6 +46,7 @@ enum Scenario {
     MetadataReplication,
     Blob,
     NetworkBlob,
+    NetworkWriteAt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,8 +81,9 @@ impl Scenario {
             "metadata-replication" => Ok(Self::MetadataReplication),
             "blob" => Ok(Self::Blob),
             "network-blob" => Ok(Self::NetworkBlob),
+            "network-write-at" => Ok(Self::NetworkWriteAt),
             _ => Err(format!(
-                "unknown scenario `{value}`; use all, namespace, posix-create, posix-write-at, metadata-replication, blob, or network-blob"
+                "unknown scenario `{value}`; use all, namespace, posix-create, posix-write-at, metadata-replication, blob, network-blob, or network-write-at"
             )
             .into()),
         }
@@ -96,6 +98,7 @@ impl Scenario {
             Self::MetadataReplication => "metadata-replication",
             Self::Blob => "blob",
             Self::NetworkBlob => "network-blob",
+            Self::NetworkWriteAt => "network-write-at",
         }
     }
 }
@@ -174,6 +177,7 @@ fn main() -> BenchResult<()> {
             run_metadata_replication(&args)?;
             run_blob(&args)?;
             run_network_blob(&args)?;
+            run_network_write_at(&args)?;
         }
         Scenario::Namespace => run_namespace(&args)?,
         Scenario::PosixCreate => run_posix_create(&args)?,
@@ -181,6 +185,7 @@ fn main() -> BenchResult<()> {
         Scenario::MetadataReplication => run_metadata_replication(&args)?,
         Scenario::Blob => run_blob(&args)?,
         Scenario::NetworkBlob => run_network_blob(&args)?,
+        Scenario::NetworkWriteAt => run_network_write_at(&args)?,
     }
     if !args.keep && !args.explicit_root {
         remove_dir_all_if_exists(&args.root)?;
@@ -1293,6 +1298,200 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     Ok(())
 }
 
+fn run_network_write_at(args: &Args) -> BenchResult<()> {
+    let root = args.scenario_root("network-write-at");
+    remove_dir_all_if_exists(&root)?;
+    fs::create_dir_all(&root)?;
+
+    let owner = node("node_dfs_bench_net_write_at_owner");
+    let replica = node("node_dfs_bench_net_write_at_replica");
+    let object_id = DfsObjectId::from_legacy_named("dfsbenchnetwriteat").expect("object id");
+    let base_version = DfsVersion::from_legacy_named("versionnetwriteatbase").expect("version");
+    let path = "/services/dfs-scale/network-write-at.bin";
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("owner"),
+        root.join("owner-metadata"),
+    )?)?;
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        LocalContentStore::new(root.join("replica-content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("replica"),
+        root.join("replica-metadata"),
+    )?)?;
+
+    owner_dfs.bootstrap_distributed_sifs()?;
+    replica_dfs.bootstrap_distributed_sifs()?;
+    let base_start = Instant::now();
+    let owner_base = owner_dfs.content().put_object_version_from_reader(
+        object_id.as_str(),
+        base_version.as_str(),
+        RepeatingReader::new(args.blob_bytes),
+    )?;
+    let replica_base = replica_dfs.content().put_object_version_from_reader(
+        object_id.as_str(),
+        base_version.as_str(),
+        RepeatingReader::new(args.blob_bytes),
+    )?;
+    if owner_base.content_hash != replica_base.content_hash {
+        return Err("network write_at base content diverged between owner and replica".into());
+    }
+    let mut object = file_metadata(
+        &owner,
+        0,
+        1,
+        Some(owner_base.content_hash),
+        Some(args.blob_bytes),
+    )?;
+    object.object_id = object_id.clone();
+    object.path = path.to_string();
+    object.version = base_version;
+    object.current_locations = vec![owner.clone(), replica.clone()];
+    owner_dfs.add_object_metadata(object.clone())?;
+    replica_dfs.add_object_metadata(object)?;
+    let base_elapsed = base_start.elapsed();
+    emit(
+        "network_write_at_base_seed",
+        base_elapsed,
+        json!({
+            "bytes": args.blob_bytes,
+            "mib_per_second": mib_per_second(args.blob_bytes.saturating_mul(2), base_elapsed),
+        }),
+    );
+
+    let policy = DfsReplicationPolicy::new(2, 2)?;
+    let patch_start = Instant::now();
+    let mut owner_events = 0usize;
+    let mut replica_events = 0usize;
+    let mut process_loops = 0usize;
+    let mut patched_bytes = 0u64;
+    let mut last_offset = 0u64;
+    let mut last_patch = Vec::new();
+    for index in 0..args.write_at_ops {
+        let offset = write_at_offset(index, args.blob_bytes, args.write_at_bytes);
+        let patch = patch_bytes(index, args.write_at_bytes);
+        let previous_version = bench_object_metadata(&owner_dfs, &object_id)?
+            .version
+            .clone();
+        owner_dfs.posix_write_file_at(
+            path,
+            offset,
+            &patch,
+            DfsWriteOptions {
+                policy: policy.clone(),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: false,
+            },
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
+        loop {
+            let replica_batch = replica_dfs.process_incoming()?;
+            let owner_batch = owner_dfs.process_incoming()?;
+            let replica_commit_batch = replica_dfs.process_incoming()?;
+            owner_events = owner_events.saturating_add(owner_batch.len());
+            replica_events = replica_events
+                .saturating_add(replica_batch.len())
+                .saturating_add(replica_commit_batch.len());
+            process_loops = process_loops.saturating_add(1);
+            let owner_object = bench_object_metadata(&owner_dfs, &object_id)?;
+            let replica_object = bench_object_metadata(&replica_dfs, &object_id)?;
+            if owner_object.version != previous_version
+                && replica_object.version == owner_object.version
+                && replica_object.content_hash == owner_object.content_hash
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    format!("network write_at op {index} did not commit before timeout").into(),
+                );
+            }
+            if owner_batch.is_empty() && replica_batch.is_empty() && replica_commit_batch.is_empty()
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        patched_bytes = patched_bytes.saturating_add(patch.len() as u64);
+        last_offset = offset;
+        last_patch = patch;
+    }
+    let patch_elapsed = patch_start.elapsed();
+    let owner_object = bench_object_metadata(&owner_dfs, &object_id)?;
+    let replica_object = bench_object_metadata(&replica_dfs, &object_id)?;
+    let owner_manifest = owner_dfs
+        .content()
+        .read_manifest(object_id.as_str(), owner_object.version.as_str())?;
+    let replica_manifest = replica_dfs
+        .content()
+        .read_manifest(object_id.as_str(), replica_object.version.as_str())?;
+    let owner_logical_blob_materialized =
+        owner_dfs.content().has_blob(&owner_manifest.content_hash)?;
+    let replica_logical_blob_materialized = replica_dfs
+        .content()
+        .has_blob(&replica_manifest.content_hash)?;
+    let owner_metrics = owner_dfs.operational_metrics()?;
+    let replica_metrics = replica_dfs.operational_metrics()?;
+    emit(
+        "network_write_at_patches",
+        patch_elapsed,
+        json!({
+            "base_bytes": args.blob_bytes,
+            "ops": args.write_at_ops,
+            "patch_bytes": args.write_at_bytes,
+            "patched_bytes": patched_bytes,
+            "ops_per_second": rate(args.write_at_ops as u64, patch_elapsed),
+            "mib_per_second": mib_per_second(patched_bytes, patch_elapsed),
+            "owner_events": owner_events,
+            "replica_events": replica_events,
+            "process_loops": process_loops,
+            "owner_extent_count": owner_manifest.extents.len(),
+            "replica_extent_count": replica_manifest.extents.len(),
+            "owner_logical_blob_materialized": owner_logical_blob_materialized,
+            "replica_logical_blob_materialized": replica_logical_blob_materialized,
+            "owner_metrics": owner_metrics,
+            "replica_metrics": replica_metrics,
+        }),
+    );
+
+    let verify_start = Instant::now();
+    let owner_verify = owner_dfs.posix_read_file_range(path, last_offset, last_patch.len())?;
+    let replica_verify = match replica_dfs.read_local_object_range_with_state(
+        &object_id,
+        last_offset,
+        last_patch.len(),
+        false,
+    )? {
+        NetworkedDfsRangeReadOutcome::Found { data, .. } => data.bytes,
+        other => {
+            return Err(format!(
+                "network write_at benchmark could not read replica verification range: {other:?}"
+            )
+            .into());
+        }
+    };
+    if owner_verify != last_patch || replica_verify != last_patch {
+        return Err("network write_at verification range did not match final patch".into());
+    }
+    let verify_elapsed = verify_start.elapsed();
+    emit(
+        "network_write_at_verify_range_read",
+        verify_elapsed,
+        json!({
+            "offset": last_offset,
+            "bytes": last_patch.len(),
+            "mib_per_second": mib_per_second(last_patch.len() as u64, verify_elapsed),
+        }),
+    );
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default)]
 struct ReplicaWorkerReport {
     event_count: usize,
@@ -1364,6 +1563,25 @@ fn write_at_offset(index: usize, object_size_bytes: u64, patch_bytes: usize) -> 
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^= value >> 31;
     value % (max_start + 1)
+}
+
+fn patch_bytes(index: usize, len: usize) -> Vec<u8> {
+    let mut reader = RepeatingReader::with_seed(len as u64, index as u64);
+    let mut bytes = vec![0_u8; len];
+    reader
+        .read_exact(&mut bytes)
+        .expect("in-memory patch reader should fill requested bytes");
+    bytes
+}
+
+fn bench_object_metadata<T: NetworkTransport>(
+    dfs: &NetworkedDfsService<T>,
+    object_id: &DfsObjectId,
+) -> BenchResult<DfsObjectMetadata> {
+    match dfs.metadata().object(object_id) {
+        Some(object) => Ok(object.clone()),
+        None => Err(format!("benchmark object metadata missing for {object_id}").into()),
+    }
 }
 
 fn emit(name: &str, elapsed: std::time::Duration, fields: serde_json::Value) {
@@ -1505,7 +1723,7 @@ fn print_help() {
         "Usage: cargo bench -p sinomo-dfs --bench scale -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --scenario all|namespace|posix-create|posix-write-at|metadata-replication|blob|network-blob\n\
+           --scenario all|namespace|posix-create|posix-write-at|metadata-replication|blob|network-blob|network-write-at\n\
            --preset smoke|scale|production\n\
            --root PATH\n\
            --files COUNT\n\
