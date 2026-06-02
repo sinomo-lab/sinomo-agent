@@ -1474,9 +1474,34 @@ fn write_rollout_progress_line(line: &str, last_len: &mut usize) -> Result<(), C
     Ok(())
 }
 
-fn rollout_terminal_response(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RolloutProgressExpectation {
+    pub(crate) source: String,
+    pub(crate) requested_at: String,
+    pub(crate) source_head: Option<String>,
+}
+
+impl RolloutProgressExpectation {
+    fn matches(&self, status: &ClusterNodeRolloutStatus) -> bool {
+        status.source.as_deref() == Some(self.source.as_str())
+            && status.requested_at.as_deref() == Some(self.requested_at.as_str())
+    }
+}
+
+pub(crate) fn rollout_status_matches_expectation(
     status: &ClusterNodeRolloutStatus,
+    expectation: &RolloutProgressExpectation,
+) -> bool {
+    expectation.matches(status)
+}
+
+pub(crate) fn rollout_terminal_response(
+    status: &ClusterNodeRolloutStatus,
+    expectation: &RolloutProgressExpectation,
 ) -> Option<ClusterRolloutBinaryResponse> {
+    if !expectation.matches(status) {
+        return None;
+    }
     let terminal = status.phase.as_deref() == Some("shadow-finalized")
         || matches!(
             status.status.as_str(),
@@ -1499,13 +1524,14 @@ fn rollout_terminal_response(
             }),
         main_binary: PathBuf::new(),
         shadow_binary: PathBuf::new(),
-        source_head: None,
+        source_head: expectation.source_head.clone(),
     })
 }
 
 fn send_rollout_request_with_progress<F>(
     target: &RolloutTarget,
     operation: &'static str,
+    expectation: RolloutProgressExpectation,
     send: F,
 ) -> Result<ClusterRolloutBinaryResponse, CliError>
 where
@@ -1532,7 +1558,8 @@ where
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let rollout_status = read_rollout_target_status(&target_for_poll)
                     .ok()
-                    .and_then(|status| status.rollout);
+                    .and_then(|status| status.rollout)
+                    .filter(|status| rollout_status_matches_expectation(status, &expectation));
                 let line = format_rollout_progress_line(
                     target.label(),
                     operation,
@@ -1541,7 +1568,9 @@ where
                 );
                 write_rollout_progress_line(&line, &mut last_len)?;
                 drew_progress = true;
-                if let Some(response) = rollout_status.as_ref().and_then(rollout_terminal_response)
+                if let Some(response) = rollout_status
+                    .as_ref()
+                    .and_then(|status| rollout_terminal_response(status, &expectation))
                 {
                     println!();
                     return Ok(response);
@@ -1586,7 +1615,12 @@ pub(crate) fn send_daemon_rollout_binary(
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     let request = request.clone();
-    send_rollout_request_with_progress(target, "binary rollout", move |target| {
+    let expectation = RolloutProgressExpectation {
+        source: request.source.clone(),
+        requested_at: request.requested_at.clone(),
+        source_head: None,
+    };
+    send_rollout_request_with_progress(target, "binary rollout", expectation, move |target| {
         send_daemon_rollout_binary_direct(&target, &request)
     })
 }
@@ -1609,7 +1643,12 @@ pub(crate) fn send_daemon_rollout_build(
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
     let request = request.clone();
-    send_rollout_request_with_progress(target, "remote build", move |target| {
+    let expectation = RolloutProgressExpectation {
+        source: request.source.clone(),
+        requested_at: request.requested_at.clone(),
+        source_head: request.source_head.clone(),
+    };
+    send_rollout_request_with_progress(target, "remote build", expectation, move |target| {
         send_daemon_rollout_build_direct(&target, &request)
     })
 }

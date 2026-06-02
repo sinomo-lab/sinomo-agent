@@ -10,23 +10,23 @@ use super::{
     ModelBackedInteractionHandler, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
     ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
     RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    RolloutTelemetryGateSetOptions, SandboxCliCommand, SandboxToolchainVerifyMakeOptions,
-    SandboxToolchainVerifyMakepkgOptions, SandboxToolchainVerifyTccOptions, SelfRolloutPaths,
-    UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
-    apply_cluster_raft_role, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    cui_default_daemon_status, daemon_advertised_endpoints_for_state,
-    daemon_handle_daemon_sandbox_checkpoint, daemon_handle_daemon_sandbox_create,
-    daemon_handle_daemon_sandbox_destroy, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_handle_daemon_sandbox_http_fetch_to_file, daemon_handle_daemon_sandbox_import_busybox,
-    daemon_handle_daemon_sandbox_list, daemon_handle_daemon_sandbox_read,
-    daemon_handle_daemon_sandbox_reboot, daemon_handle_daemon_sandbox_resume,
-    daemon_handle_daemon_sandbox_run_process_plan,
+    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, SandboxCliCommand,
+    SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
+    SandboxToolchainVerifyTccOptions, SelfRolloutPaths, UninstallOptions,
+    advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
+    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
+    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
+    compact_default_invite_introducers, cui_default_daemon_status,
+    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_checkpoint,
+    daemon_handle_daemon_sandbox_create, daemon_handle_daemon_sandbox_destroy,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_handle_daemon_sandbox_http_fetch_to_file,
+    daemon_handle_daemon_sandbox_import_busybox, daemon_handle_daemon_sandbox_list,
+    daemon_handle_daemon_sandbox_read, daemon_handle_daemon_sandbox_reboot,
+    daemon_handle_daemon_sandbox_resume, daemon_handle_daemon_sandbox_run_process_plan,
     daemon_handle_daemon_sandbox_run_process_plan_stream,
     daemon_handle_daemon_sandbox_run_toolchain_stream, daemon_handle_daemon_sandbox_status,
     daemon_handle_daemon_sandbox_toolchain_add_artifact,
@@ -57,9 +57,9 @@ use super::{
     read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
     rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
-    rollout_progress_bar, rollout_target_endpoint_for_main,
+    rollout_progress_bar, rollout_status_matches_expectation, rollout_target_endpoint_for_main,
     rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    rollout_telemetry_gates_set_with_data_dir, run_cui_with_handler_io,
+    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_cui_with_handler_io,
     run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
     sandbox_cat_with_store, sandbox_checkpoint_with_store, sandbox_config_with_store,
     sandbox_create_with_store, sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
@@ -13008,6 +13008,70 @@ fn rollout_progress_line_includes_phase_message_and_elapsed_time() {
         ),
         "node-a: [=========...............]  40% building - cargo build running (12s)"
     );
+}
+
+#[test]
+fn rollout_status_expectation_rejects_stale_terminal_progress() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-06-02T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let status = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "accepted".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("old rollout completed".to_string()),
+        phase: Some("shadow-finalized".to_string()),
+        progress_current: Some(5),
+        progress_total: Some(5),
+        progress_message: Some("shadow rollout finalized".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-06-02T00:00:00Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+
+    assert!(!rollout_status_matches_expectation(&status, &expectation));
+    assert!(rollout_terminal_response(&status, &expectation).is_none());
+}
+
+#[test]
+fn rollout_terminal_response_preserves_expected_source_head() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-06-02T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let status = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "accepted".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("shadow rollout finalized".to_string()),
+        phase: Some("shadow-finalized".to_string()),
+        progress_current: Some(5),
+        progress_total: Some(5),
+        progress_message: Some("shadow rollout finalized".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-06-02T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+
+    assert!(rollout_status_matches_expectation(&status, &expectation));
+    let response = rollout_terminal_response(&status, &expectation).expect("terminal response");
+    assert_eq!(response.status, "accepted");
+    assert_eq!(response.source_head.as_deref(), Some("head-new"));
 }
 
 #[test]
