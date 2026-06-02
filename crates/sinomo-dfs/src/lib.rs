@@ -5198,23 +5198,28 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 continue;
             }
 
-            let reader = match self.open_pending_write_blob_stream(&pending) {
-                Ok(reader) => reader,
-                Err(_) => {
-                    let fetch_requested =
-                        self.request_repair_blob_from_alternate(&job, &pending)?;
-                    if !fetch_requested {
-                        self.record_repair_retry_scheduled(
-                            &job.intent_id,
-                            &job.missing_replica_node_id,
-                        );
-                    }
-                    continue;
+            if self.open_pending_write_blob_stream(&pending).is_err() {
+                let fetch_requested = self.request_repair_blob_from_alternate(&job, &pending)?;
+                if !fetch_requested {
+                    self.record_repair_retry_scheduled(
+                        &job.intent_id,
+                        &job.missing_replica_node_id,
+                    );
                 }
-            };
-            let request_id = self.next_request_id();
+                continue;
+            }
+            let start_chunk_index = pending
+                .repair_next_chunk_indexes
+                .get(&job.missing_replica_node_id)
+                .copied()
+                .unwrap_or(0);
+            let request_id = pending
+                .repair_inflight_request_ids
+                .get(&job.missing_replica_node_id)
+                .cloned()
+                .unwrap_or_else(|| self.next_request_id());
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
-            let sent = self.send_repair_replica_from_reader_if_routable(
+            let outcome = self.send_repair_replica_window_if_routable(
                 &job.missing_replica_node_id,
                 request_id.clone(),
                 &job.intent_id,
@@ -5225,15 +5230,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     .and_then(|intent| intent.base_version.clone()),
                 &pending.version,
                 &pending.content_hash,
-                reader,
+                pending.size_bytes,
+                start_chunk_index,
+                DFS_STAGE_CHUNK_WINDOW_SIZE,
                 object_metadata,
             )?;
 
-            if sent {
-                self.record_repair_inflight(
+            if outcome.sent {
+                self.record_repair_window_progress(
                     &job.intent_id,
                     &job.missing_replica_node_id,
                     request_id,
+                    outcome,
                 );
                 scheduled.push(job);
             } else {
@@ -9444,6 +9452,40 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending
                 .repair_inflight_request_ids
                 .insert(replica_node_id.clone(), request_id);
+            pending.repair_next_chunk_indexes.remove(replica_node_id);
+        }
+    }
+
+    fn record_repair_window_progress(
+        &mut self,
+        intent_id: &str,
+        replica_node_id: &NodeId,
+        request_id: String,
+        outcome: StageBlobSendOutcome,
+    ) {
+        if outcome.complete {
+            self.record_repair_inflight(intent_id, replica_node_id, request_id);
+            if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+                pending.repair_next_chunk_indexes.remove(replica_node_id);
+            }
+            return;
+        }
+
+        let tick = self.repair_retry_tick;
+        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+            let state = pending
+                .repair_retries
+                .entry(replica_node_id.clone())
+                .or_default();
+            state.attempts = state.attempts.saturating_add(1);
+            state.inflight = false;
+            state.next_retry_tick = tick;
+            pending
+                .repair_inflight_request_ids
+                .insert(replica_node_id.clone(), request_id);
+            pending
+                .repair_next_chunk_indexes
+                .insert(replica_node_id.clone(), outcome.next_chunk_index);
         }
     }
 
@@ -9460,6 +9502,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             state.inflight = false;
             state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
             pending.repair_inflight_request_ids.remove(replica_node_id);
+            pending.repair_next_chunk_indexes.remove(replica_node_id);
         }
     }
 
@@ -9467,6 +9510,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
             pending.repair_retries.remove(replica_node_id);
             pending.repair_inflight_request_ids.remove(replica_node_id);
+            pending.repair_next_chunk_indexes.remove(replica_node_id);
         }
     }
 
@@ -9647,15 +9691,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            let reader = match self.open_pending_write_blob_stream(&pending) {
-                Ok(reader) => reader,
-                Err(_) => {
-                    self.record_repair_retry_scheduled(intent_id, &replica_node_id);
-                    continue;
-                }
-            };
-            let request_id = self.next_request_id();
-            let sent = self.send_repair_replica_from_reader_if_routable(
+            if self.open_pending_write_blob_stream(&pending).is_err() {
+                self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+                continue;
+            }
+            let start_chunk_index = pending
+                .repair_next_chunk_indexes
+                .get(&replica_node_id)
+                .copied()
+                .unwrap_or(0);
+            let request_id = pending
+                .repair_inflight_request_ids
+                .get(&replica_node_id)
+                .cloned()
+                .unwrap_or_else(|| self.next_request_id());
+            let outcome = self.send_repair_replica_window_if_routable(
                 &replica_node_id,
                 request_id.clone(),
                 intent_id,
@@ -9664,13 +9714,20 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 intent.base_version.clone(),
                 &pending.version,
                 &pending.content_hash,
-                reader,
+                pending.size_bytes,
+                start_chunk_index,
+                DFS_STAGE_CHUNK_WINDOW_SIZE,
                 committed_metadata.clone(),
             )?;
-            if !sent {
-                self.record_repair_retry_scheduled(intent_id, &replica_node_id);
+            if outcome.sent {
+                self.record_repair_window_progress(
+                    intent_id,
+                    &replica_node_id,
+                    request_id,
+                    outcome,
+                );
             } else {
-                self.record_repair_inflight(intent_id, &replica_node_id, request_id);
+                self.record_repair_retry_scheduled(intent_id, &replica_node_id);
             }
         }
         Ok(())
@@ -10976,6 +11033,131 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn send_repair_replica_window_if_routable(
+        &mut self,
+        target_node_id: &NodeId,
+        request_id: String,
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        expected_base_version: Option<DfsVersion>,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        start_chunk_index: u32,
+        max_chunks: u32,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<StageBlobSendOutcome, DfsError> {
+        if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            let (_, mut reader) = self.content.open_object_version_range_stream(
+                object_id.as_str(),
+                version.as_str(),
+                0,
+                usize::try_from(total_size_bytes).unwrap_or(usize::MAX),
+            )?;
+            let bytes = read_small_blob_from_reader(content_hash, total_size_bytes, &mut reader)?;
+            let sent = self.send_best_effort_message_if_routable(
+                target_node_id,
+                DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                    request_id,
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    expected_base_version,
+                    version: version.clone(),
+                    content_hash: content_hash.to_string(),
+                    bytes,
+                    object_metadata,
+                }),
+            )?;
+            return Ok(StageBlobSendOutcome {
+                sent,
+                complete: sent,
+                next_chunk_index: 0,
+            });
+        }
+
+        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+        if start_chunk_index >= total_chunks {
+            return Ok(StageBlobSendOutcome {
+                sent: true,
+                complete: true,
+                next_chunk_index: total_chunks,
+            });
+        }
+        let max_chunks = max_chunks.max(1);
+        let end_chunk_index = start_chunk_index
+            .saturating_add(max_chunks)
+            .min(total_chunks);
+        let start_offset = u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+        let end_offset = if end_chunk_index >= total_chunks {
+            total_size_bytes
+        } else {
+            u64::from(end_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64
+        };
+        let range_len = usize::try_from(end_offset.saturating_sub(start_offset)).map_err(|_| {
+            DfsError::Distributed {
+                message: format!(
+                    "DFS repair chunk window is too large: {start_offset}..{end_offset}"
+                ),
+            }
+        })?;
+        let (manifest, mut reader) = self.content.open_object_version_range_stream(
+            object_id.as_str(),
+            version.as_str(),
+            start_offset,
+            range_len,
+        )?;
+        if manifest.content_hash != content_hash {
+            return Err(DfsError::ContentHashMismatch {
+                expected: content_hash.to_string(),
+                actual: manifest.content_hash,
+            });
+        }
+        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
+        for chunk_index in start_chunk_index..end_chunk_index {
+            let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
+            reader
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|source| DfsError::ContentStore {
+                    message: format!(
+                        "failed to read blob {content_hash} repair chunk {chunk_index}: {source}"
+                    ),
+                })?;
+            let sent = self.send_best_effort_message_if_routable(
+                target_node_id,
+                DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
+                    request_id: request_id.clone(),
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    expected_base_version: expected_base_version.clone(),
+                    version: version.clone(),
+                    content_hash: content_hash.to_string(),
+                    total_size_bytes,
+                    chunk_index,
+                    total_chunks,
+                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
+                    bytes: buffer[..chunk_len].to_vec(),
+                    object_metadata: object_metadata.clone(),
+                }),
+            )?;
+            if !sent {
+                return Ok(StageBlobSendOutcome {
+                    sent: false,
+                    complete: false,
+                    next_chunk_index: chunk_index,
+                });
+            }
+        }
+        Ok(StageBlobSendOutcome {
+            sent: true,
+            complete: end_chunk_index >= total_chunks,
+            next_chunk_index: end_chunk_index,
+        })
+    }
+
     fn send_best_effort_message_if_routable(
         &mut self,
         target_node_id: &NodeId,
@@ -11036,74 +11218,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     total_chunks,
                     chunk_hash: Some(chunk_hash(chunk)),
                     bytes: chunk.to_vec(),
-                    object_metadata: object_metadata.clone(),
-                }),
-            )?;
-            if !sent {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    fn send_repair_replica_from_reader_if_routable(
-        &mut self,
-        target_node_id: &NodeId,
-        request_id: String,
-        intent_id: &str,
-        file_system_id: &DfsFileSystemId,
-        object_id: &DfsObjectId,
-        expected_base_version: Option<DfsVersion>,
-        version: &DfsVersion,
-        content_hash: &str,
-        mut reader: ObjectVersionReader,
-        object_metadata: Option<DfsObjectMetadata>,
-    ) -> Result<bool, DfsError> {
-        let total_size_bytes = reader.size_bytes();
-        if total_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
-            let bytes = read_small_blob_from_reader(content_hash, total_size_bytes, &mut reader)?;
-            return self.send_best_effort_message_if_routable(
-                target_node_id,
-                DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
-                    request_id,
-                    intent_id: intent_id.to_string(),
-                    file_system_id: file_system_id.clone(),
-                    object_id: object_id.clone(),
-                    expected_base_version,
-                    version: version.clone(),
-                    content_hash: content_hash.to_string(),
-                    bytes,
-                    object_metadata,
-                }),
-            );
-        }
-
-        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
-        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in 0..total_chunks {
-            let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
-            reader
-                .read_exact(&mut buffer[..chunk_len])
-                .map_err(|source| DfsError::ContentStore {
-                    message: format!(
-                        "failed to read blob {content_hash} repair chunk {chunk_index}: {source}"
-                    ),
-                })?;
-            let sent = self.send_best_effort_message_if_routable(
-                target_node_id,
-                DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
-                    request_id: request_id.clone(),
-                    intent_id: intent_id.to_string(),
-                    file_system_id: file_system_id.clone(),
-                    object_id: object_id.clone(),
-                    expected_base_version: expected_base_version.clone(),
-                    version: version.clone(),
-                    content_hash: content_hash.to_string(),
-                    total_size_bytes,
-                    chunk_index,
-                    total_chunks,
-                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
-                    bytes: buffer[..chunk_len].to_vec(),
                     object_metadata: object_metadata.clone(),
                 }),
             )?;
@@ -11257,6 +11371,7 @@ fn pending_networked_write(
         stage_inflight_request_ids: BTreeMap::new(),
         stage_next_chunk_indexes: BTreeMap::new(),
         repair_inflight_request_ids: BTreeMap::new(),
+        repair_next_chunk_indexes: BTreeMap::new(),
         fetch_inflight_from: BTreeSet::new(),
         fetch_inflight_request_ids: BTreeMap::new(),
         fetch_inflight_started_ticks: BTreeMap::new(),

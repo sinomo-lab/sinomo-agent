@@ -2578,6 +2578,7 @@ fn committed_pending_write_cleanup_drops_stale_stage_inflight_state() {
             )]),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -2658,6 +2659,7 @@ fn apply_committed_intent_tolerates_missing_local_repair_blob() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -2717,6 +2719,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
         stage_inflight_request_ids: BTreeMap::new(),
         stage_next_chunk_indexes: BTreeMap::new(),
         repair_inflight_request_ids: BTreeMap::new(),
+        repair_next_chunk_indexes: BTreeMap::new(),
         fetch_inflight_from: BTreeSet::new(),
         fetch_inflight_request_ids: BTreeMap::new(),
         fetch_inflight_started_ticks: BTreeMap::new(),
@@ -2777,6 +2780,7 @@ fn write_outcome_uses_backend_current_metadata_after_pending_state_is_removed() 
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -4370,6 +4374,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([replica.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(
                 replica.clone(),
@@ -4594,6 +4599,7 @@ fn stale_fetch_request_expiry_wakes_stage_and_repair_retries() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id)]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -4683,6 +4689,7 @@ fn fetch_rejection_wakes_stage_and_repair_retries() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -4791,6 +4798,7 @@ fn fetch_store_failure_wakes_stage_and_repair_retries() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -4909,6 +4917,7 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -5001,6 +5010,7 @@ fn chunked_fetch_store_failure_is_rejected_without_hard_error() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -5112,6 +5122,7 @@ fn chunked_fetch_response_reuses_existing_local_blob_without_rehashing_payload()
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -5220,6 +5231,7 @@ fn chunked_fetch_response_teaches_unknown_pending_write_size() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::from([source.clone()]),
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
@@ -5317,6 +5329,7 @@ fn repair_retry_schedule_does_not_double_count_completed_inflight_attempt() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -5385,6 +5398,7 @@ fn repair_response_conflicting_receipt_preserves_retry_state() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -5785,6 +5799,7 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -6217,6 +6232,142 @@ fn chunked_repair_to_unroutable_target_stops_after_first_unsent_chunk() {
         "large repair should stop after the first unroutable chunk send"
     );
     assert_eq!(dfs.next_message_id, 2);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repair_replica_window_resumes_large_chunk_transfer() {
+    let root = temp_root("repair-window-resumes-large-chunks");
+    let owner = NodeId::from_legacy_named("node_repair_window_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_repair_window_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_window").expect("object");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let version = DfsVersion::from_legacy_named("version_2").expect("version");
+    let total_chunks = DFS_STAGE_CHUNK_WINDOW_SIZE + 2;
+    let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
+    let bytes = (0..bytes_len)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+    let mut replica_transport = network.add_node(replica.clone());
+    let manifest = dfs
+        .content
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+        .expect("store large repair content");
+
+    let first = dfs
+        .send_repair_replica_window_if_routable(
+            &replica,
+            "dfs_net_req_repair_window".to_string(),
+            "dfs_intent_repair_window",
+            &file_system_id,
+            &object_id,
+            None,
+            &version,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            0,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+            None,
+        )
+        .expect("send first repair window");
+    assert_eq!(
+        first,
+        StageBlobSendOutcome {
+            sent: true,
+            complete: false,
+            next_chunk_index: DFS_STAGE_CHUNK_WINDOW_SIZE,
+        }
+    );
+    let first_chunks = replica_transport
+        .drain_incoming()
+        .expect("first repair frames")
+        .into_iter()
+        .filter_map(|frame| {
+            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
+                return None;
+            };
+            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
+                DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_chunks.len(), DFS_STAGE_CHUNK_WINDOW_SIZE as usize);
+    assert_eq!(first_chunks.first().expect("first chunk").chunk_index, 0);
+    assert_eq!(
+        first_chunks
+            .last()
+            .expect("last first-window chunk")
+            .chunk_index,
+        DFS_STAGE_CHUNK_WINDOW_SIZE - 1
+    );
+    assert!(
+        first_chunks
+            .iter()
+            .all(|chunk| chunk.total_chunks == total_chunks)
+    );
+
+    let second = dfs
+        .send_repair_replica_window_if_routable(
+            &replica,
+            "dfs_net_req_repair_window".to_string(),
+            "dfs_intent_repair_window",
+            &file_system_id,
+            &object_id,
+            None,
+            &version,
+            &manifest.content_hash,
+            manifest.size_bytes,
+            first.next_chunk_index,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+            None,
+        )
+        .expect("send second repair window");
+    assert_eq!(
+        second,
+        StageBlobSendOutcome {
+            sent: true,
+            complete: true,
+            next_chunk_index: total_chunks,
+        }
+    );
+    let second_chunks = replica_transport
+        .drain_incoming()
+        .expect("second repair frames")
+        .into_iter()
+        .filter_map(|frame| {
+            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
+                return None;
+            };
+            match protocol.decode::<DfsNetworkMessage>().expect("decode DFS") {
+                DfsNetworkMessage::RepairReplicaChunk(chunk) => Some(chunk),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        second_chunks.len(),
+        (total_chunks - DFS_STAGE_CHUNK_WINDOW_SIZE) as usize
+    );
+    assert_eq!(
+        second_chunks
+            .first()
+            .expect("first resumed chunk")
+            .chunk_index,
+        DFS_STAGE_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        second_chunks
+            .last()
+            .expect("last second-window chunk")
+            .chunk_index,
+        total_chunks - 1
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -7346,6 +7497,7 @@ fn duplicate_committed_intent_application_does_not_recommit_visible_version() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
@@ -7445,6 +7597,7 @@ fn committed_intent_repairs_already_current_stale_locations() {
             stage_inflight_request_ids: BTreeMap::new(),
             stage_next_chunk_indexes: BTreeMap::new(),
             repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
             fetch_inflight_from: BTreeSet::new(),
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
