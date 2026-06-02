@@ -546,14 +546,14 @@ impl<'a> DfsOperatorInspector<'a> {
         let mut objects = Vec::new();
         self.for_filtered_objects(Some(file_system_id), None, |object| {
             let intents = intents_for_object_from_backend(backend, &object.object_id)?;
-            let conflicts = backend.conflicts_for_object(&object.object_id)?;
+            let has_open_conflict = object_has_open_conflict(backend, &object.object_id)?;
             let repairs = repairs_for_object_from_backend(backend, &object, &intents)?;
             objects.push(DfsAgentObjectSummary {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 version: object.version.clone(),
                 content_hash: object.content_hash.clone(),
-                state: agent_state_for(&object, &intents, &conflicts, &repairs),
+                state: agent_state_from_flags(&object, &intents, has_open_conflict, &repairs),
             });
             Ok(())
         })?;
@@ -927,6 +927,31 @@ fn repairs_for_object_from_backend(
     ))
 }
 
+fn object_has_open_conflict(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+) -> Result<bool, MetadataBackendError> {
+    let mut cursor = None;
+    loop {
+        let page = backend.conflicts_for_object_page(
+            object_id,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        if page
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.status == DfsConflictStatus::Open)
+        {
+            return Ok(true);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(false);
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
 fn repairs_from_intents_and_receipts(
     object: &DfsObjectMetadata,
     intents: &[DfsWriteIntentRecord],
@@ -1097,10 +1122,19 @@ fn agent_state_for(
     conflicts: &[DfsConflictRecord],
     repairs: &[DfsOperatorRepairView],
 ) -> DfsAgentObjectState {
-    if conflicts
+    let has_open_conflict = conflicts
         .iter()
-        .any(|conflict| conflict.status == DfsConflictStatus::Open)
-    {
+        .any(|conflict| conflict.status == DfsConflictStatus::Open);
+    agent_state_from_flags(object, intents, has_open_conflict, repairs)
+}
+
+fn agent_state_from_flags(
+    object: &DfsObjectMetadata,
+    intents: &[DfsWriteIntentRecord],
+    has_open_conflict: bool,
+    repairs: &[DfsOperatorRepairView],
+) -> DfsAgentObjectState {
+    if has_open_conflict {
         return DfsAgentObjectState::Conflicted;
     }
     if intents
