@@ -2050,7 +2050,22 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     fn child_objects_for_sifs_dir(&self, path: &str) -> Result<Vec<DfsObjectMetadata>> {
         let file_system_id = sifs_file_system_id();
         if let Some(backend) = self.metadata_backend.as_ref() {
-            return Ok(backend.child_objects_for_directory(&file_system_id, path)?);
+            let mut children = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = backend.child_objects_for_directory_page(
+                    &file_system_id,
+                    path,
+                    cursor.as_ref(),
+                    POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+                )?;
+                children.extend(page.objects);
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+            return Ok(children);
         }
         let prefix = if path == "/" {
             "/".to_string()

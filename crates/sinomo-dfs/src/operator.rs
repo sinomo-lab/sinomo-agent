@@ -17,6 +17,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 const OPERATOR_OBJECT_SCAN_PAGE_SIZE: usize = 1024;
+const OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE: usize = 1024;
 const DEFAULT_OPERATOR_INSPECTION_LIMIT: usize = 1024;
 const MAX_OPERATOR_INSPECTION_LIMIT: usize = 10_000;
 
@@ -246,17 +247,16 @@ impl<'a> DfsOperatorInspector<'a> {
         let Some(object) = self.backend.get_object(object_id)? else {
             return Ok(None);
         };
-        let versions = self.backend.versions_for_object(object_id)?;
+        let versions = versions_for_object_from_backend(self.backend, object_id)?;
         let mut receipts = Vec::new();
         let mut receipts_by_version = BTreeMap::new();
         for version in &versions {
-            let version_receipts = self
-                .backend
-                .receipts_for_version(object_id, &version.version)?;
+            let version_receipts =
+                receipts_for_version_from_backend(self.backend, object_id, &version.version)?;
             receipts_by_version.insert(version.version.clone(), version_receipts.clone());
             receipts.extend(version_receipts);
         }
-        let intents = self.backend.intents_for_object(object_id)?;
+        let intents = intents_for_object_from_backend(self.backend, object_id)?;
         let conflicts = self.backend.conflicts_for_object(object_id)?;
         let repairs = repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version);
         let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
@@ -414,7 +414,7 @@ impl<'a> DfsOperatorInspector<'a> {
         let backend = self.backend;
         let mut repairs = Vec::new();
         self.for_filtered_objects(file_system_id, object_id, |object| {
-            let intents = backend.intents_for_object(&object.object_id)?;
+            let intents = intents_for_object_from_backend(backend, &object.object_id)?;
             repairs.extend(repairs_for_object_from_backend(backend, &object, &intents)?);
             Ok(())
         })?;
@@ -545,7 +545,7 @@ impl<'a> DfsOperatorInspector<'a> {
         let backend = self.backend;
         let mut objects = Vec::new();
         self.for_filtered_objects(Some(file_system_id), None, |object| {
-            let intents = backend.intents_for_object(&object.object_id)?;
+            let intents = intents_for_object_from_backend(backend, &object.object_id)?;
             let conflicts = backend.conflicts_for_object(&object.object_id)?;
             let repairs = repairs_for_object_from_backend(backend, &object, &intents)?;
             objects.push(DfsAgentObjectSummary {
@@ -722,7 +722,7 @@ impl<'a> DfsOperatorInspector<'a> {
         limit: usize,
         output: &mut Vec<DfsOperatorRepairView>,
     ) -> Result<bool, MetadataBackendError> {
-        let intents = self.backend.intents_for_object(&object.object_id)?;
+        let intents = intents_for_object_from_backend(self.backend, &object.object_id)?;
         let mut repairs = repairs_for_object_from_backend(self.backend, object, &intents)?;
         repairs.sort_by(repair_view_order);
         let mut emitted = 0usize;
@@ -834,6 +834,71 @@ fn repair_is_after_cursor(
     }
 }
 
+fn versions_for_object_from_backend(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+) -> Result<Vec<DfsObjectVersionRecord>, MetadataBackendError> {
+    let mut versions = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = backend.versions_for_object_page(
+            object_id,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        versions.extend(page.versions);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(versions)
+}
+
+fn receipts_for_version_from_backend(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+) -> Result<Vec<DfsReplicaReceiptRecord>, MetadataBackendError> {
+    let mut receipts = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = backend.receipts_for_version_page(
+            object_id,
+            version,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        receipts.extend(page.receipts);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(receipts)
+}
+
+fn intents_for_object_from_backend(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+) -> Result<Vec<DfsWriteIntentRecord>, MetadataBackendError> {
+    let mut intents = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = backend.intents_for_object_page(
+            object_id,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        intents.extend(page.intents);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(intents)
+}
+
 fn repairs_for_object_from_backend(
     backend: &dyn DfsMetadataBackend,
     object: &DfsObjectMetadata,
@@ -847,7 +912,11 @@ fn repairs_for_object_from_backend(
         if !receipts_by_version.contains_key(&intent.target_version) {
             receipts_by_version.insert(
                 intent.target_version.clone(),
-                backend.receipts_for_version(&intent.object_id, &intent.target_version)?,
+                receipts_for_version_from_backend(
+                    backend,
+                    &intent.object_id,
+                    &intent.target_version,
+                )?,
             );
         }
     }
