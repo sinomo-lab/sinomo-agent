@@ -106,6 +106,54 @@ fn object_rpc_frame_transport_serves_binary_request_response() {
 }
 
 #[test]
+fn cluster_kv_txn_rpc_preserves_nested_sobj_values_as_raw_bytes() {
+    #[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct ClusterConfigFixture {
+        name: String,
+        value: u64,
+    }
+
+    let record = ClusterConfigFixture {
+        name: "runtime".to_string(),
+        value: 42,
+    };
+    let op = KvOp::put_serde("/config/test/runtime", &record, None).expect("typed kv op");
+    let raw_value = match &op {
+        KvOp::Put { value, .. } => value.clone(),
+        _ => unreachable!("put_serde must produce a put op"),
+    };
+    assert!(raw_value.starts_with(sinomo_object::MAGIC));
+    assert!(
+        !raw_value.starts_with(b"U09CSg"),
+        "typed KV values must be raw SOBJ bytes, not base64 text"
+    );
+
+    let txn = KvTxn {
+        compares: Vec::new(),
+        success: vec![op],
+        failure: Vec::new(),
+    };
+    let request =
+        ObjectRpcRequest::encode_body(CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_RPC_CATEGORY, &txn)
+            .expect("encode txn request");
+    assert!(
+        request
+            .body
+            .windows(raw_value.len())
+            .any(|window| window == raw_value.as_slice()),
+        "cluster RPC encoding must embed nested KV values verbatim instead of base64 wrapping them"
+    );
+
+    let decoded: KvTxn = request.decode_body().expect("decode txn request");
+    let decoded_value = match decoded.success.first().expect("put op") {
+        KvOp::Put { value, .. } => value,
+        _ => unreachable!("expected put op"),
+    };
+    assert_eq!(decoded_value, &raw_value);
+    assert!(decoded_value.starts_with(sinomo_object::MAGIC));
+}
+
+#[test]
 fn async_object_frame_helpers_round_trip_binary_payloads() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

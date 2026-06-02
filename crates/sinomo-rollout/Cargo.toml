@@ -13,7 +13,7 @@ ring = "r1"
 
 [dependencies]
 serde.workspace = true
-serde_bytes = "0.11"
+serde_bytes.workspace = true
 serde_json.workspace = true
 time.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }

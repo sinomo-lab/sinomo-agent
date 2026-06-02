@@ -27,20 +27,22 @@ pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_
 /// zero. Replay protection is bounded by the signed-command clock-skew freshness
 /// check, so the only behavioral change is that a process restart forgets nonces
 /// from the trailing skew window — which the freshness check already constrains.
-static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, BTreeMap<String, OffsetDateTime>>>> =
+static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, BTreeMap<Vec<u8>, OffsetDateTime>>>> =
     OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SignedDaemonCommand {
     pub protocol: String,
     pub node_id: String,
-    pub public_key: String,
+    #[serde(with = "serde_bytes")]
+    pub public_key: Vec<u8>,
     pub timestamp: String,
     pub nonce: String,
     pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rpc_body_sha256: Option<String>,
-    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub rpc_body_sha256: Option<Vec<u8>>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +50,7 @@ pub struct AuthenticatedDaemonCommand {
     pub command: String,
     pub signer: DaemonSignerAuthority,
     pub signer_node_id: String,
+    /// Existing cluster membership state stores node public keys as URL-safe base64 strings.
     pub signer_public_key: String,
 }
 
@@ -111,14 +114,16 @@ pub fn sign_daemon_rpc_request_from_data_dir(
     )
 }
 
-pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> String {
-    URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, &request.body).as_ref())
+pub fn daemon_rpc_body_sha256(request: &sinomo_network::ObjectRpcRequest) -> Vec<u8> {
+    digest::digest(&digest::SHA256, &request.body)
+        .as_ref()
+        .to_vec()
 }
 
 fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
     data_dir: &SinomoDataDir,
     command: &str,
-    rpc_body_sha256: Option<String>,
+    rpc_body_sha256: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, DaemonError> {
     let identity = load_or_create_main_node_identity(&data_dir.root())?;
     let node_id = sinomo_network::read_cluster_state(&ClusterPaths::new(data_dir))
@@ -129,24 +134,25 @@ fn sign_daemon_command_from_data_dir_with_rpc_body_sha256(
         .unwrap_or_else(|_| "unknown".to_string());
     let nonce = format!("{}-{}", std::process::id(), auth_nonce_suffix());
     let key_pair = identity.key_pair()?;
+    let public_key = daemon_auth_decode_public_key(&identity.public_key)?;
     let signing_payload = daemon_auth_signing_payload(
         &node_id,
-        &identity.public_key,
+        &public_key,
         &timestamp,
         &nonce,
         command,
         rpc_body_sha256.as_deref(),
     );
-    let signature = key_pair.sign(signing_payload.as_bytes());
+    let signature = key_pair.sign(&signing_payload);
     let envelope = SignedDaemonCommand {
         protocol: DAEMON_AUTH_PROTOCOL.to_string(),
         node_id,
-        public_key: identity.public_key,
+        public_key,
         timestamp,
         nonce,
         command: command.to_string(),
         rpc_body_sha256,
-        signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
+        signature: signature.as_ref().to_vec(),
     };
     sinomo_network::SinomoObjectCodec::default()
         .encode(&envelope)
@@ -174,11 +180,12 @@ fn authenticate_daemon_control_request_with_rpc_request(
     verify_daemon_rpc_body_binding(&envelope, rpc_request)?;
     let signer = verify_signed_daemon_command(paths, &envelope, rpc_request)?;
     remember_daemon_auth_nonce(paths, &envelope)?;
+    let signer_public_key = daemon_auth_encode_public_key(&envelope.public_key);
     let authenticated = AuthenticatedDaemonCommand {
         command: envelope.command,
         signer,
         signer_node_id: envelope.node_id,
-        signer_public_key: envelope.public_key,
+        signer_public_key,
     };
     authorize_authenticated_daemon_command(&authenticated)?;
     Ok(authenticated)
@@ -197,7 +204,8 @@ fn verify_daemon_rpc_body_binding(
         };
     };
     let request = rpc_request.ok_or(DaemonError::AuthDenied)?;
-    if expected == daemon_rpc_body_sha256(request) {
+    let actual = daemon_rpc_body_sha256(request);
+    if expected == actual.as_slice() {
         Ok(())
     } else {
         Err(DaemonError::AuthDenied)
@@ -521,12 +529,6 @@ fn verify_signed_daemon_command(
     if envelope.nonce.trim().is_empty() || envelope.command.trim().is_empty() {
         return Err(DaemonError::AuthDenied);
     }
-    let public_key = URL_SAFE_NO_PAD
-        .decode(envelope.public_key.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(envelope.signature.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)?;
     let signing_payload = daemon_auth_signing_payload(
         &envelope.node_id,
         &envelope.public_key,
@@ -535,24 +537,37 @@ fn verify_signed_daemon_command(
         &envelope.command,
         envelope.rpc_body_sha256.as_deref(),
     );
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(signing_payload.as_bytes(), &signature)
+    UnparsedPublicKey::new(&ED25519, &envelope.public_key)
+        .verify(&signing_payload, &envelope.signature)
         .map_err(|_| DaemonError::AuthDenied)?;
     authorize_daemon_signer(paths, envelope, rpc_request)
 }
 
 fn daemon_auth_signing_payload(
     node_id: &str,
-    public_key: &str,
+    public_key: &[u8],
     timestamp: &str,
     nonce: &str,
     command: &str,
-    rpc_body_sha256: Option<&str>,
-) -> String {
-    format!(
-        "{DAEMON_AUTH_PROTOCOL}\n{node_id}\n{public_key}\n{timestamp}\n{nonce}\n{command}\n{}",
-        rpc_body_sha256.unwrap_or_default()
-    )
+    rpc_body_sha256: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(DAEMON_AUTH_PROTOCOL.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(node_id.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(public_key);
+    payload.push(b'\n');
+    payload.extend_from_slice(timestamp.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(nonce.as_bytes());
+    payload.push(b'\n');
+    payload.extend_from_slice(command.as_bytes());
+    payload.push(b'\n');
+    if let Some(rpc_body_sha256) = rpc_body_sha256 {
+        payload.extend_from_slice(rpc_body_sha256);
+    }
+    payload
 }
 
 fn authorize_daemon_signer(
@@ -560,6 +575,7 @@ fn authorize_daemon_signer(
     envelope: &SignedDaemonCommand,
     rpc_request: Option<&sinomo_network::ObjectRpcRequest>,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
+    let envelope_public_key = daemon_auth_encode_public_key(&envelope.public_key);
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
@@ -567,10 +583,10 @@ fn authorize_daemon_signer(
     let identity_paths = NodeIdentityPaths::new(data_dir);
     let main_identity = load_existing_node_identity(&identity_paths.main)?;
     let shadow_identity = load_optional_node_identity(&identity_paths.shadow)?;
-    if envelope.public_key == main_identity.public_key
+    if envelope_public_key == main_identity.public_key
         || shadow_identity
             .as_ref()
-            .is_some_and(|identity| envelope.public_key == identity.public_key)
+            .is_some_and(|identity| envelope_public_key == identity.public_key)
     {
         return Ok(DaemonSignerAuthority::Local);
     }
@@ -580,7 +596,7 @@ fn authorize_daemon_signer(
         let state = sinomo_network::read_cluster_state(&cluster_paths)?;
         if let Some(member) = state.members.iter().find(|member| {
             member.node_id.as_str() == envelope.node_id
-                && member.node_public_key == envelope.public_key
+                && member.node_public_key == envelope_public_key
                 && member.state.is_authorized()
         }) {
             return Ok(
@@ -597,7 +613,7 @@ fn authorize_daemon_signer(
     }
 
     if envelope.command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE) {
-        authorize_cluster_join_rpc_signer(paths, rpc_request, &envelope.public_key)?;
+        authorize_cluster_join_rpc_signer(paths, rpc_request, &envelope_public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
     Err(DaemonError::AuthDenied)
@@ -787,8 +803,22 @@ fn remember_daemon_auth_nonce(
     Ok(())
 }
 
-fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> String {
-    format!("{}:{}", envelope.public_key, envelope.nonce)
+fn daemon_auth_decode_public_key(public_key: &str) -> Result<Vec<u8>, DaemonError> {
+    URL_SAFE_NO_PAD
+        .decode(public_key.as_bytes())
+        .map_err(|_| DaemonError::AuthDenied)
+}
+
+fn daemon_auth_encode_public_key(public_key: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(public_key)
+}
+
+fn daemon_auth_nonce_key(envelope: &SignedDaemonCommand) -> Vec<u8> {
+    let mut key = Vec::with_capacity(envelope.public_key.len() + 1 + envelope.nonce.len());
+    key.extend_from_slice(&envelope.public_key);
+    key.push(0);
+    key.extend_from_slice(envelope.nonce.as_bytes());
+    key
 }
 
 fn auth_nonce_suffix() -> String {
@@ -819,26 +849,69 @@ mod tests {
         SignedDaemonCommand {
             protocol: DAEMON_AUTH_PROTOCOL.to_string(),
             node_id: "node_test".to_string(),
-            public_key: "public-key".to_string(),
+            public_key: b"public-key".to_vec(),
             timestamp: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .expect("timestamp"),
             nonce: nonce.to_string(),
             command: daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE),
             rpc_body_sha256: None,
-            signature: "signature".to_string(),
+            signature: b"signature".to_vec(),
         }
     }
 
-    fn unique_auth_test_paths(name: &str) -> DaemonPaths {
-        let root = std::env::temp_dir().join(format!(
+    fn unique_auth_test_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
             "{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos()
-        ));
-        DaemonPaths::with_root(root)
+        ))
+    }
+
+    fn unique_auth_test_paths(name: &str) -> DaemonPaths {
+        DaemonPaths::with_root(unique_auth_test_root(name))
+    }
+
+    fn has_byte_window(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn signed_daemon_rpc_auth_uses_binary_body_hash_and_signature() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-binary");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_network::DAEMON_STATUS_ROUTE,
+            sinomo_network::DAEMON_RPC_CATEGORY,
+            &(),
+        )
+        .expect("rpc request");
+
+        let auth_bytes =
+            sign_daemon_rpc_request_from_data_dir(&data_dir, &request).expect("sign rpc auth");
+        let auth: SignedDaemonCommand = sinomo_network::SinomoObjectCodec::default()
+            .decode(&auth_bytes)
+            .expect("decode signed auth");
+        let expected_hash = daemon_rpc_body_sha256(&request);
+
+        assert_eq!(
+            auth.rpc_body_sha256.as_deref(),
+            Some(expected_hash.as_slice())
+        );
+        assert_eq!(auth.public_key.len(), 32);
+        assert_eq!(auth.rpc_body_sha256.as_ref().map(Vec::len), Some(32));
+        assert_eq!(auth.signature.len(), 64);
+
+        let public_key_base64 = URL_SAFE_NO_PAD.encode(&auth.public_key);
+        let hash_base64 = URL_SAFE_NO_PAD.encode(&expected_hash);
+        let signature_base64 = URL_SAFE_NO_PAD.encode(&auth.signature);
+        assert!(!has_byte_window(&auth_bytes, public_key_base64.as_bytes()));
+        assert!(!has_byte_window(&auth_bytes, hash_base64.as_bytes()));
+        assert!(!has_byte_window(&auth_bytes, signature_base64.as_bytes()));
     }
 
     #[test]

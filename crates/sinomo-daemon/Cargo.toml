@@ -23,6 +23,7 @@ fs2.workspace = true
 ring = "0.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-dfs = { path = "../sinomo-dfs" }
