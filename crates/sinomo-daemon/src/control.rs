@@ -325,6 +325,17 @@ pub fn run_daemon_control_loop(
                 .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
                 .unwrap_or(maintenance_started);
             loop {
+                if maintenance_label == "daemon" {
+                    match handle_daemon_finalize_shadow_rollout(&maintenance_paths) {
+                        Ok(response) if !response.starts_with("no pending shadow rollout") => {
+                            print!("sinomo {maintenance_label} rollout finalization: {response}");
+                        }
+                        Ok(_) => {}
+                        Err(error) => eprintln!(
+                            "sinomo {maintenance_label} shadow rollout finalization tick failed: {error}"
+                        ),
+                    }
+                }
                 if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
                     eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
                 }
