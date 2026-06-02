@@ -1,10 +1,10 @@
 use serde_json::json;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
-    DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult, DfsReplicationPolicy, DfsVersion,
-    DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsRangeReadOutcome,
-    NetworkedDfsService, NetworkedDfsServiceEvent,
+    DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsNamespaceJobStatus, DfsObjectId,
+    DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult, DfsReplicationPolicy,
+    DfsVersion, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
+    NetworkedDfsRangeReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
 };
 use sinomo_network::{InProcessNetwork, NetworkTransport};
 use sinomo_node::NodeId;
@@ -33,6 +33,7 @@ struct Args {
     write_at_bytes: usize,
     list_page_size: usize,
     metadata_batch_size: usize,
+    namespace_job_steps: usize,
     network_timeout_secs: u64,
     keep: bool,
 }
@@ -45,6 +46,7 @@ enum Scenario {
     PosixRead,
     PosixWriteAt,
     MetadataReplication,
+    DirectoryJobs,
     Blob,
     NetworkBlob,
     NetworkWriteAt,
@@ -69,6 +71,7 @@ struct BenchDefaults {
     write_at_bytes: usize,
     list_page_size: usize,
     metadata_batch_size: usize,
+    namespace_job_steps: usize,
     network_timeout_secs: u64,
 }
 
@@ -81,11 +84,12 @@ impl Scenario {
             "posix-read" => Ok(Self::PosixRead),
             "posix-write-at" => Ok(Self::PosixWriteAt),
             "metadata-replication" => Ok(Self::MetadataReplication),
+            "directory-jobs" => Ok(Self::DirectoryJobs),
             "blob" => Ok(Self::Blob),
             "network-blob" => Ok(Self::NetworkBlob),
             "network-write-at" => Ok(Self::NetworkWriteAt),
             _ => Err(format!(
-                "unknown scenario `{value}`; use all, namespace, posix-create, posix-read, posix-write-at, metadata-replication, blob, network-blob, or network-write-at"
+                "unknown scenario `{value}`; use all, namespace, posix-create, posix-read, posix-write-at, metadata-replication, directory-jobs, blob, network-blob, or network-write-at"
             )
             .into()),
         }
@@ -99,6 +103,7 @@ impl Scenario {
             Self::PosixRead => "posix-read",
             Self::PosixWriteAt => "posix-write-at",
             Self::MetadataReplication => "metadata-replication",
+            Self::DirectoryJobs => "directory-jobs",
             Self::Blob => "blob",
             Self::NetworkBlob => "network-blob",
             Self::NetworkWriteAt => "network-write-at",
@@ -137,6 +142,7 @@ impl Preset {
                 write_at_bytes: 4 * 1024,
                 list_page_size: 1024,
                 metadata_batch_size: 1024,
+                namespace_job_steps: 1024,
                 network_timeout_secs: 60,
             },
             Self::Scale => BenchDefaults {
@@ -150,6 +156,7 @@ impl Preset {
                 write_at_bytes: 16 * 1024,
                 list_page_size: 4096,
                 metadata_batch_size: 4096,
+                namespace_job_steps: 4096,
                 network_timeout_secs: 300,
             },
             Self::Production => BenchDefaults {
@@ -163,6 +170,7 @@ impl Preset {
                 write_at_bytes: 64 * 1024,
                 list_page_size: 4096,
                 metadata_batch_size: 4096,
+                namespace_job_steps: 4096,
                 network_timeout_secs: 1800,
             },
         }
@@ -179,6 +187,7 @@ fn main() -> BenchResult<()> {
             run_posix_read(&args)?;
             run_posix_write_at(&args)?;
             run_metadata_replication(&args)?;
+            run_directory_jobs(&args)?;
             run_blob(&args)?;
             run_network_blob(&args)?;
             run_network_write_at(&args)?;
@@ -188,6 +197,7 @@ fn main() -> BenchResult<()> {
         Scenario::PosixRead => run_posix_read(&args)?,
         Scenario::PosixWriteAt => run_posix_write_at(&args)?,
         Scenario::MetadataReplication => run_metadata_replication(&args)?,
+        Scenario::DirectoryJobs => run_directory_jobs(&args)?,
         Scenario::Blob => run_blob(&args)?,
         Scenario::NetworkBlob => run_network_blob(&args)?,
         Scenario::NetworkWriteAt => run_network_write_at(&args)?,
@@ -240,6 +250,10 @@ impl Args {
             "SINOMO_DFS_BENCH_METADATA_BATCH_SIZE",
             defaults.metadata_batch_size,
         )?;
+        let mut namespace_job_steps = env_usize(
+            "SINOMO_DFS_BENCH_NAMESPACE_JOB_STEPS",
+            defaults.namespace_job_steps,
+        )?;
         let mut network_timeout_secs = env_u64(
             "SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS",
             defaults.network_timeout_secs,
@@ -262,6 +276,7 @@ impl Args {
                     write_at_bytes = defaults.write_at_bytes;
                     list_page_size = defaults.list_page_size;
                     metadata_batch_size = defaults.metadata_batch_size;
+                    namespace_job_steps = defaults.namespace_job_steps;
                     network_timeout_secs = defaults.network_timeout_secs;
                 }
                 "--root" => root = Some(PathBuf::from(required_value(&arg, args.next())?)),
@@ -281,6 +296,7 @@ impl Args {
                 }
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
                 "--metadata-batch-size" => metadata_batch_size = parse_usize(&arg, args.next())?,
+                "--namespace-job-steps" => namespace_job_steps = parse_usize(&arg, args.next())?,
                 "--network-timeout-secs" => network_timeout_secs = parse_u64(&arg, args.next())?,
                 "--keep" => keep = true,
                 "--bench" => {}
@@ -300,6 +316,9 @@ impl Args {
         }
         if metadata_batch_size == 0 {
             return Err("--metadata-batch-size must be greater than zero".into());
+        }
+        if namespace_job_steps == 0 {
+            return Err("--namespace-job-steps must be greater than zero".into());
         }
         if network_timeout_secs == 0 {
             return Err("--network-timeout-secs must be greater than zero".into());
@@ -331,6 +350,7 @@ impl Args {
             write_at_bytes,
             list_page_size,
             metadata_batch_size,
+            namespace_job_steps,
             network_timeout_secs,
             keep,
         })
@@ -359,6 +379,7 @@ impl Args {
                 "write_at_bytes": self.write_at_bytes,
                 "list_page_size": self.list_page_size,
                 "metadata_batch_size": self.metadata_batch_size,
+                "namespace_job_steps": self.namespace_job_steps,
                 "network_timeout_secs": self.network_timeout_secs,
                 "keep": self.keep,
             }),
@@ -912,6 +933,178 @@ fn run_metadata_replication(args: &Args) -> BenchResult<()> {
             "replica_objects": replica_objects,
         }),
     );
+
+    Ok(())
+}
+
+fn run_directory_jobs(args: &Args) -> BenchResult<()> {
+    let root = args.scenario_root("directory-jobs");
+    remove_dir_all_if_exists(&root)?;
+    fs::create_dir_all(&root)?;
+
+    let node = node("node_dfs_bench_directory_jobs");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(root.join("content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("metadata"),
+    )?)?;
+
+    let clear_root = "/services/dfs-scale/clear-job";
+    let rename_old_root = "/services/dfs-scale/rename-job-old";
+    let rename_new_root = "/services/dfs-scale/rename-job-new";
+
+    let setup_start = Instant::now();
+    dfs.bootstrap_distributed_sifs()?;
+    create_tree_dirs(&mut dfs, clear_root, args.dirs)?;
+    create_tree_dirs(&mut dfs, rename_old_root, args.dirs)?;
+    emit(
+        "directory_jobs_setup",
+        setup_start.elapsed(),
+        json!({
+            "dirs_per_tree": args.dirs,
+            "root": root,
+        }),
+    );
+
+    let populate_start = Instant::now();
+    let clear_metadata_batches = populate_tree_metadata(
+        &mut dfs,
+        &node,
+        "clear",
+        clear_root,
+        args.files,
+        args.dirs,
+        args.file_bytes,
+        args.metadata_batch_size,
+        0,
+    )?;
+    let rename_metadata_batches = populate_tree_metadata(
+        &mut dfs,
+        &node,
+        "rename",
+        rename_old_root,
+        args.files,
+        args.dirs,
+        args.file_bytes,
+        args.metadata_batch_size,
+        args.files,
+    )?;
+    let populate_elapsed = populate_start.elapsed();
+    emit(
+        "directory_jobs_populate_metadata",
+        populate_elapsed,
+        json!({
+            "files_per_tree": args.files,
+            "dirs_per_tree": args.dirs,
+            "metadata_batch_size": args.metadata_batch_size,
+            "clear_metadata_batches": clear_metadata_batches,
+            "rename_metadata_batches": rename_metadata_batches,
+            "files_per_second": rate(args.files.saturating_mul(2) as u64, populate_elapsed),
+        }),
+    );
+
+    let clear_start = Instant::now();
+    let mut clear_job =
+        dfs.posix_clear_dir_recursive_bounded(clear_root, args.namespace_job_steps)?;
+    let mut clear_batches = 1usize;
+    while clear_job.status != DfsNamespaceJobStatus::Completed {
+        clear_job =
+            dfs.posix_resume_namespace_job_bounded(&clear_job.job_id, args.namespace_job_steps)?;
+        clear_batches = clear_batches.saturating_add(1);
+    }
+    let clear_elapsed = clear_start.elapsed();
+    emit(
+        "directory_jobs_recursive_clear",
+        clear_elapsed,
+        json!({
+            "files": args.files,
+            "dirs": args.dirs,
+            "max_steps_per_batch": args.namespace_job_steps,
+            "job_batches": clear_batches,
+            "processed_objects": clear_job.processed_object_count,
+            "objects_per_second": rate(clear_job.processed_object_count, clear_elapsed),
+        }),
+    );
+
+    let clear_verify_start = Instant::now();
+    let (clear_remaining_entries, clear_verify_pages) =
+        count_directory_entries_paged(&dfs, clear_root, args.list_page_size)?;
+    let clear_verify_elapsed = clear_verify_start.elapsed();
+    emit(
+        "directory_jobs_recursive_clear_verify_paged",
+        clear_verify_elapsed,
+        json!({
+            "remaining_entries": clear_remaining_entries,
+            "pages": clear_verify_pages,
+            "page_size": args.list_page_size,
+        }),
+    );
+    if clear_remaining_entries != 0 {
+        return Err(format!(
+            "recursive clear left {clear_remaining_entries} visible entries under {clear_root}"
+        )
+        .into());
+    }
+
+    let rename_start = Instant::now();
+    let mut rename_job = dfs.posix_rename_directory_bounded(
+        rename_old_root,
+        rename_new_root,
+        args.namespace_job_steps,
+    )?;
+    let mut rename_batches = 1usize;
+    while rename_job.status != DfsNamespaceJobStatus::Completed {
+        rename_job =
+            dfs.posix_resume_namespace_job_bounded(&rename_job.job_id, args.namespace_job_steps)?;
+        rename_batches = rename_batches.saturating_add(1);
+    }
+    let rename_elapsed = rename_start.elapsed();
+    emit(
+        "directory_jobs_rename_subtree",
+        rename_elapsed,
+        json!({
+            "files": args.files,
+            "dirs": args.dirs,
+            "max_steps_per_batch": args.namespace_job_steps,
+            "job_batches": rename_batches,
+            "processed_objects": rename_job.processed_object_count,
+            "objects_per_second": rate(rename_job.processed_object_count, rename_elapsed),
+        }),
+    );
+
+    let rename_verify_start = Instant::now();
+    let rename_listing =
+        count_tree_entries_paged(&dfs, rename_new_root, args.dirs, args.list_page_size)?;
+    let rename_verify_elapsed = rename_verify_start.elapsed();
+    emit(
+        "directory_jobs_rename_verify_paged",
+        rename_verify_elapsed,
+        json!({
+            "expected_dirs": args.dirs,
+            "expected_files": args.files,
+            "root_entries": rename_listing.root_entries,
+            "file_entries": rename_listing.file_entries,
+            "pages": rename_listing.pages,
+            "page_size": args.list_page_size,
+            "entries_per_second": rate(
+                rename_listing
+                    .root_entries
+                    .saturating_add(rename_listing.file_entries) as u64,
+                rename_verify_elapsed
+            ),
+        }),
+    );
+    if rename_listing.root_entries != args.dirs || rename_listing.file_entries != args.files {
+        return Err(format!(
+            "renamed tree verification mismatch: root entries {} expected {}, file entries {} expected {}",
+            rename_listing.root_entries, args.dirs, rename_listing.file_entries, args.files
+        )
+        .into());
+    }
 
     Ok(())
 }
@@ -1616,6 +1809,137 @@ struct ReplicaWorkerReport {
     metrics: Option<DfsOperationalMetrics>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct TreeListingReport {
+    root_entries: usize,
+    file_entries: usize,
+    pages: usize,
+}
+
+fn create_tree_dirs<T: NetworkTransport>(
+    dfs: &mut NetworkedDfsService<T>,
+    root_path: &str,
+    dirs: usize,
+) -> BenchResult<()> {
+    dfs.posix_mkdir_all(root_path)?;
+    for dir_index in 0..dirs {
+        dfs.posix_mkdir_all(&tree_dir_path(root_path, dir_index))?;
+    }
+    Ok(())
+}
+
+fn populate_tree_metadata<T: NetworkTransport>(
+    dfs: &mut NetworkedDfsService<T>,
+    owner: &NodeId,
+    label: &str,
+    root_path: &str,
+    files: usize,
+    dirs: usize,
+    file_bytes: usize,
+    batch_size: usize,
+    hash_offset: usize,
+) -> BenchResult<usize> {
+    let mut batch = Vec::with_capacity(batch_size);
+    let mut batches = 0usize;
+    for index in 0..files {
+        batch.push(tree_file_metadata(
+            owner,
+            label,
+            root_path,
+            index,
+            dirs,
+            file_bytes,
+            hash_offset.saturating_add(index),
+        )?);
+        if batch.len() >= batch_size {
+            dfs.add_object_metadata_batch(batch.drain(..))?;
+            batches = batches.saturating_add(1);
+        }
+    }
+    if !batch.is_empty() {
+        dfs.add_object_metadata_batch(batch.drain(..))?;
+        batches = batches.saturating_add(1);
+    }
+    Ok(batches)
+}
+
+fn tree_file_metadata(
+    owner: &NodeId,
+    label: &str,
+    root_path: &str,
+    index: usize,
+    dirs: usize,
+    file_bytes: usize,
+    hash_index: usize,
+) -> BenchResult<DfsObjectMetadata> {
+    Ok(DfsObjectMetadata {
+        object_id: DfsObjectId::from_legacy_named(format!("dfsbench{label}obj{index:016x}"))?,
+        file_system_id: sifs_id(),
+        path: format!(
+            "{}/file-{index:08}.bin",
+            tree_dir_path(root_path, index % dirs)
+        ),
+        kind: DfsObjectKind::File,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: Some(valid_fake_hash(hash_index)),
+        content_size_bytes: Some(file_bytes as u64),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: index as u64,
+        created_at_unix_nanos: index as u64,
+        changed_at_unix_nanos: index as u64,
+        version: DfsVersion::from_legacy_named(format!("dfsbench{label}ver{index:016x}"))?,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    })
+}
+
+fn count_tree_entries_paged<T: NetworkTransport>(
+    dfs: &NetworkedDfsService<T>,
+    root_path: &str,
+    dirs: usize,
+    page_size: usize,
+) -> BenchResult<TreeListingReport> {
+    let (root_entries, root_pages) = count_directory_entries_paged(dfs, root_path, page_size)?;
+    let mut report = TreeListingReport {
+        root_entries,
+        pages: root_pages,
+        ..TreeListingReport::default()
+    };
+    for dir_index in 0..dirs {
+        let (entries, pages) =
+            count_directory_entries_paged(dfs, &tree_dir_path(root_path, dir_index), page_size)?;
+        report.file_entries = report.file_entries.saturating_add(entries);
+        report.pages = report.pages.saturating_add(pages);
+    }
+    Ok(report)
+}
+
+fn count_directory_entries_paged<T: NetworkTransport>(
+    dfs: &NetworkedDfsService<T>,
+    path: &str,
+    page_size: usize,
+) -> BenchResult<(usize, usize)> {
+    let mut entries = 0usize;
+    let mut pages = 0usize;
+    let mut cursor = None;
+    loop {
+        let page = dfs.posix_list_dir_page(path, cursor.as_ref(), page_size)?;
+        entries = entries.saturating_add(page.entries.len());
+        pages = pages.saturating_add(1);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok((entries, pages))
+}
+
 fn file_metadata(
     owner: &NodeId,
     index: usize,
@@ -1649,6 +1973,10 @@ fn file_metadata(
 
 fn bench_dir(index: usize) -> String {
     format!("/services/dfs-scale/dir-{index:04}")
+}
+
+fn tree_dir_path(root_path: &str, index: usize) -> String {
+    format!("{}/dir-{index:04}", root_path.trim_end_matches('/'))
 }
 
 fn sifs_id() -> DfsFileSystemId {
@@ -1838,7 +2166,7 @@ fn print_help() {
         "Usage: cargo bench -p sinomo-dfs --bench scale -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --scenario all|namespace|posix-create|posix-read|posix-write-at|metadata-replication|blob|network-blob|network-write-at\n\
+           --scenario all|namespace|posix-create|posix-read|posix-write-at|metadata-replication|directory-jobs|blob|network-blob|network-write-at\n\
            --preset smoke|scale|production\n\
            --root PATH\n\
            --files COUNT\n\
@@ -1851,6 +2179,7 @@ fn print_help() {
            --write-at-bytes BYTES\n\
            --list-page-size COUNT\n\
            --metadata-batch-size COUNT\n\
+           --namespace-job-steps COUNT\n\
            --network-timeout-secs SECONDS\n\
            --keep\n\
          \n\
@@ -1863,6 +2192,7 @@ fn print_help() {
            SINOMO_DFS_BENCH_WRITE_AT_OPS, SINOMO_DFS_BENCH_WRITE_AT_BYTES,\n\
            SINOMO_DFS_BENCH_LIST_PAGE_SIZE,\n\
            SINOMO_DFS_BENCH_METADATA_BATCH_SIZE,\n\
+           SINOMO_DFS_BENCH_NAMESPACE_JOB_STEPS,\n\
            SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS\n\
          \n\
          Presets:\n\
