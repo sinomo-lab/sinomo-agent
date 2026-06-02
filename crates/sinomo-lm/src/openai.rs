@@ -2,10 +2,11 @@ use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api
 use crate::{
     LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelError,
     LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelProviderInfo, LanguageModelProviderToolSpec, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
-    LanguageModelRole, LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
-    LanguageModelUsage, PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
+    LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelProviderToolSpec,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat,
+    LanguageModelResponseItem, LanguageModelRole, LanguageModelToolCall, LanguageModelToolChoice,
+    LanguageModelToolSpec, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
+    apply_provider_vendor_options_to_payload, render_plain_prompt, selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -17,6 +18,7 @@ pub struct OpenAiConfig {
     pub default_model: String,
     pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
+    pub options: LanguageModelProviderOptions,
 }
 
 impl Default for OpenAiConfig {
@@ -29,6 +31,7 @@ impl Default for OpenAiConfig {
                 "SINOMO_OPENAI_CREDENTIALS_FILE",
                 OpenAiProvider::PROVIDER_ID,
             ),
+            options: LanguageModelProviderOptions::default(),
         }
     }
 }
@@ -134,7 +137,11 @@ impl LanguageModelProvider for OpenAiProvider {
             .http
             .post(url)
             .headers(openai_headers(&api_key, Self::PROVIDER_ID, &model)?)
-            .json(&openai_responses_payload(request, &model))
+            .json(&openai_responses_payload(
+                request,
+                &model,
+                &self.config.options,
+            ))
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -208,7 +215,11 @@ fn openai_headers(
     Ok(headers)
 }
 
-fn openai_responses_payload(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
+fn openai_responses_payload(
+    request: &LanguageModelRequest,
+    model: &str,
+    options: &LanguageModelProviderOptions,
+) -> serde_json::Value {
     let instructions = request
         .messages
         .iter()
@@ -251,6 +262,22 @@ fn openai_responses_payload(request: &LanguageModelRequest, model: &str) -> serd
     if let Some(parallel_tool_calls) = request.parallel_tool_calls {
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
     }
+    if let Some(effort) = options
+        .reasoning_effort
+        .and_then(|effort| effort.as_openai_responses_value())
+    {
+        payload["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+    if let Some(verbosity) = options.text_verbosity {
+        if !payload
+            .get("text")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            payload["text"] = serde_json::json!({});
+        }
+        payload["text"]["verbosity"] = serde_json::json!(verbosity.as_config_value());
+    }
+    apply_provider_vendor_options_to_payload(&mut payload, options);
     payload
 }
 
@@ -429,6 +456,7 @@ fn parse_tool_arguments(arguments: Option<&serde_json::Value>) -> serde_json::Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ProviderReasoningEffort, ProviderTextVerbosity};
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -457,7 +485,11 @@ mod tests {
 
     #[test]
     fn payload_uses_responses_shape() {
-        let payload = openai_responses_payload(&request(), "gpt-5.2-codex");
+        let payload = openai_responses_payload(
+            &request(),
+            "gpt-5.2-codex",
+            &LanguageModelProviderOptions::default(),
+        );
 
         assert_eq!(payload["model"], "gpt-5.2-codex");
         assert_eq!(payload["store"], false);
@@ -492,7 +524,11 @@ mod tests {
         });
         request.parallel_tool_calls = Some(false);
 
-        let payload = openai_responses_payload(&request, "gpt-5.2-codex");
+        let payload = openai_responses_payload(
+            &request,
+            "gpt-5.2-codex",
+            &LanguageModelProviderOptions::default(),
+        );
 
         assert_eq!(payload["tools"][0]["type"], "function");
         assert_eq!(payload["tools"][0]["name"], "read_file");
@@ -528,7 +564,11 @@ mod tests {
             name: "apply_patch".to_string(),
         });
 
-        let payload = openai_responses_payload(&request, "gpt-5.2-codex");
+        let payload = openai_responses_payload(
+            &request,
+            "gpt-5.2-codex",
+            &LanguageModelProviderOptions::default(),
+        );
 
         assert_eq!(payload["tools"][0]["type"], "custom");
         assert_eq!(payload["tools"][0]["name"], "apply_patch");
@@ -537,6 +577,24 @@ mod tests {
         assert!(payload["tools"][0].get("parameters").is_none());
         assert_eq!(payload["tool_choice"]["type"], "custom");
         assert_eq!(payload["tool_choice"]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn payload_applies_provider_options() {
+        let mut options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::High),
+            text_verbosity: Some(ProviderTextVerbosity::Low),
+            ..LanguageModelProviderOptions::default()
+        };
+        options
+            .vendor_options
+            .insert("reasoning.summary".to_string(), "auto".to_string());
+
+        let payload = openai_responses_payload(&request(), "gpt-5.2-codex", &options);
+
+        assert_eq!(payload["reasoning"]["effort"], "high");
+        assert_eq!(payload["reasoning"]["summary"], "auto");
+        assert_eq!(payload["text"]["verbosity"], "low");
     }
 
     #[test]

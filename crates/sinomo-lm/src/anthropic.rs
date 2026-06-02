@@ -1,9 +1,10 @@
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
-    render_plain_prompt, selected_model,
+    LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelRequest,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage,
+    PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload, render_plain_prompt,
+    selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -15,6 +16,7 @@ pub struct AnthropicConfig {
     pub default_model: String,
     pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
+    pub options: LanguageModelProviderOptions,
 }
 
 impl Default for AnthropicConfig {
@@ -27,6 +29,7 @@ impl Default for AnthropicConfig {
                 "SINOMO_ANTHROPIC_CREDENTIALS_FILE",
                 AnthropicProvider::PROVIDER_ID,
             ),
+            options: LanguageModelProviderOptions::default(),
         }
     }
 }
@@ -133,7 +136,11 @@ impl LanguageModelProvider for AnthropicProvider {
             .http
             .post(url)
             .headers(anthropic_headers(&api_key, Self::PROVIDER_ID, &model)?)
-            .json(&anthropic_messages_payload(request, &model))
+            .json(&anthropic_messages_payload(
+                request,
+                &model,
+                &self.config.options,
+            ))
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -202,7 +209,11 @@ fn anthropic_headers(
     Ok(headers)
 }
 
-fn anthropic_messages_payload(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
+fn anthropic_messages_payload(
+    request: &LanguageModelRequest,
+    model: &str,
+    options: &LanguageModelProviderOptions,
+) -> serde_json::Value {
     let system = request
         .messages
         .iter()
@@ -231,9 +242,20 @@ fn anthropic_messages_payload(request: &LanguageModelRequest, model: &str) -> se
         }));
     }
 
+    let thinking_budget = options.reasoning_budget_tokens;
+    let adaptive_effort = options
+        .reasoning_effort
+        .and_then(|effort| effort.as_anthropic_effort_value());
+    let mut max_tokens = request.max_output_tokens.unwrap_or(1024);
+    if let Some(budget) = thinking_budget
+        && max_tokens <= budget
+    {
+        max_tokens = budget.saturating_add(1024);
+    }
+
     let mut payload = serde_json::json!({
         "model": model,
-        "max_tokens": request.max_output_tokens.unwrap_or(1024),
+        "max_tokens": max_tokens,
         "messages": messages,
     });
     if !system.is_empty() {
@@ -242,6 +264,21 @@ fn anthropic_messages_payload(request: &LanguageModelRequest, model: &str) -> se
     if let Some(temperature) = request.temperature {
         payload["temperature"] = serde_json::json!(temperature);
     }
+    if let Some(budget) = thinking_budget
+        && budget > 0
+    {
+        payload["thinking"] = serde_json::json!({
+            "type": "enabled",
+            "budget_tokens": budget,
+        });
+    }
+    if thinking_budget.is_none() && adaptive_effort.is_some() {
+        payload["thinking"] = serde_json::json!({ "type": "adaptive" });
+    }
+    if let Some(effort) = adaptive_effort {
+        payload["output_config"] = serde_json::json!({ "effort": effort });
+    }
+    apply_provider_vendor_options_to_payload(&mut payload, options);
     payload
 }
 
@@ -262,6 +299,7 @@ fn extract_anthropic_text(value: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProviderReasoningEffort;
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -290,12 +328,50 @@ mod tests {
 
     #[test]
     fn payload_uses_messages_shape() {
-        let payload = anthropic_messages_payload(&request(), "claude-sonnet-4-20250514");
+        let payload = anthropic_messages_payload(
+            &request(),
+            "claude-sonnet-4-20250514",
+            &LanguageModelProviderOptions::default(),
+        );
 
         assert_eq!(payload["model"], "claude-sonnet-4-20250514");
         assert_eq!(payload["system"], "Return JSON only.");
         assert_eq!(payload["messages"][0]["role"], "user");
         assert_eq!(payload["max_tokens"], 200);
+    }
+
+    #[test]
+    fn payload_applies_adaptive_effort_options() {
+        let mut options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::High),
+            ..LanguageModelProviderOptions::default()
+        };
+        options
+            .vendor_options
+            .insert("metadata.trace".to_string(), "true".to_string());
+
+        let payload = anthropic_messages_payload(&request(), "claude-sonnet-4-20250514", &options);
+
+        assert_eq!(payload["thinking"]["type"], "adaptive");
+        assert_eq!(payload["output_config"]["effort"], "high");
+        assert_eq!(payload["max_tokens"], 200);
+        assert_eq!(payload["metadata"]["trace"], true);
+    }
+
+    #[test]
+    fn payload_applies_explicit_thinking_budget_options() {
+        let options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::Max),
+            reasoning_budget_tokens: Some(10_000),
+            ..LanguageModelProviderOptions::default()
+        };
+
+        let payload = anthropic_messages_payload(&request(), "claude-sonnet-4-20250514", &options);
+
+        assert_eq!(payload["thinking"]["type"], "enabled");
+        assert_eq!(payload["thinking"]["budget_tokens"], 10_000);
+        assert_eq!(payload["output_config"]["effort"], "max");
+        assert_eq!(payload["max_tokens"], 11_024);
     }
 
     #[test]

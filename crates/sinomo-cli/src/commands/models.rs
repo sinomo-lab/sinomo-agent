@@ -12,12 +12,43 @@ pub(crate) enum ModelsCliCommand {
     Help,
     List(ModelListOptions),
     Default(ModelDefaultOptions),
+    Options(ModelOptionsCliCommand),
     Runtime(ModelRuntimeCliCommand),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ModelListOptions {
     pub(crate) provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum ModelOptionsCliCommand {
+    Show(ModelOptionsTarget),
+    Set(ModelOptionsSetOptions),
+    Clear(ModelOptionsTarget),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelOptionsTarget {
+    pub(crate) provider: Option<String>,
+    pub(crate) account: String,
+    pub(crate) model: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ModelOptionsSetOptions {
+    pub(crate) target: ModelOptionsTarget,
+    pub(crate) reasoning_effort: Option<ModelOptionValueUpdate<ProviderReasoningEffort>>,
+    pub(crate) reasoning_budget_tokens: Option<ModelOptionValueUpdate<u32>>,
+    pub(crate) text_verbosity: Option<ModelOptionValueUpdate<ProviderTextVerbosity>>,
+    pub(crate) vendor_options: Vec<(String, String)>,
+    pub(crate) clear_vendor_options: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ModelOptionValueUpdate<T> {
+    Set(T),
+    Clear,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -51,11 +82,222 @@ pub(crate) fn parse_models_command(args: &[String]) -> Result<ModelsCliCommand, 
         Some((command, rest)) if command == "default" => Ok(ModelsCliCommand::Default(
             parse_model_default_options(rest)?,
         )),
+        Some((command, rest)) if command == "options" => Ok(ModelsCliCommand::Options(
+            parse_model_options_command(rest)?,
+        )),
         Some((command, rest)) if command == "runtime" => Ok(ModelsCliCommand::Runtime(
             parse_models_runtime_command(rest)?,
         )),
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_model_options_command(
+    args: &[String],
+) -> Result<ModelOptionsCliCommand, CliError> {
+    match args.split_first() {
+        None => Ok(ModelOptionsCliCommand::Show(parse_model_options_target(
+            &[],
+            false,
+        )?)),
+        Some((command, rest)) if matches!(command.as_str(), "show" | "help" | "--help" | "-h") => {
+            Ok(ModelOptionsCliCommand::Show(parse_model_options_target(
+                rest, false,
+            )?))
+        }
+        Some((command, rest)) if command == "set" => Ok(ModelOptionsCliCommand::Set(
+            parse_model_options_set_options(rest)?,
+        )),
+        Some((command, rest)) if command == "clear" => Ok(ModelOptionsCliCommand::Clear(
+            parse_model_options_target(rest, true)?,
+        )),
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn parse_model_options_target(
+    args: &[String],
+    require_provider: bool,
+) -> Result<ModelOptionsTarget, CliError> {
+    let mut provider = None;
+    let mut account = DEFAULT_PROVIDER_ACCOUNT.to_string();
+    let mut model = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                provider =
+                    Some(
+                        normalize_model_provider(value).ok_or_else(|| CliError::Parse {
+                            detail: format!("unknown provider `{value}`"),
+                        })?,
+                    );
+                index += 2;
+            }
+            "--account" => {
+                account = normalize_provider_account_name(Some(
+                    args.get(index + 1).ok_or(CliError::Usage)?.as_str(),
+                ));
+                index += 2;
+            }
+            "--model" => {
+                model = Some(
+                    args.get(index + 1)
+                        .ok_or(CliError::Usage)?
+                        .trim()
+                        .to_string(),
+                );
+                index += 2;
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    if require_provider && provider.is_none() {
+        return Err(CliError::Parse {
+            detail: "--provider is required".to_string(),
+        });
+    }
+    let model = match (provider.as_deref(), model) {
+        (Some(provider), Some(model)) => Some(normalize_model_id_for_provider(provider, &model)),
+        (_, model) => model,
+    };
+    Ok(ModelOptionsTarget {
+        provider,
+        account,
+        model,
+    })
+}
+
+pub(crate) fn parse_model_options_set_options(
+    args: &[String],
+) -> Result<ModelOptionsSetOptions, CliError> {
+    let mut options = ModelOptionsSetOptions {
+        target: ModelOptionsTarget {
+            account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            ..ModelOptionsTarget::default()
+        },
+        ..ModelOptionsSetOptions::default()
+    };
+    let mut raw_model = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--provider" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.target.provider = Some(normalize_model_provider(value).ok_or_else(
+                    || CliError::Parse {
+                        detail: format!("unknown provider `{value}`"),
+                    },
+                )?);
+                index += 2;
+            }
+            "--account" => {
+                options.target.account = normalize_provider_account_name(Some(
+                    args.get(index + 1).ok_or(CliError::Usage)?.as_str(),
+                ));
+                index += 2;
+            }
+            "--model" => {
+                raw_model = Some(
+                    args.get(index + 1)
+                        .ok_or(CliError::Usage)?
+                        .trim()
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--reasoning-effort" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.reasoning_effort = Some(parse_option_update(value, |value| {
+                    value
+                        .parse::<ProviderReasoningEffort>()
+                        .map_err(|detail| CliError::Parse { detail })
+                })?);
+                index += 2;
+            }
+            "--reasoning-budget-tokens" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.reasoning_budget_tokens = Some(parse_option_update(value, |value| {
+                    value.parse::<u32>().map_err(|source| CliError::Parse {
+                        detail: format!("invalid reasoning budget `{value}`: {source}"),
+                    })
+                })?);
+                index += 2;
+            }
+            "--text-verbosity" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                options.text_verbosity = Some(parse_option_update(value, |value| {
+                    value
+                        .parse::<ProviderTextVerbosity>()
+                        .map_err(|detail| CliError::Parse { detail })
+                })?);
+                index += 2;
+            }
+            "--vendor-option" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                let (key, value) = parse_vendor_option(value)?;
+                options.vendor_options.push((key, value));
+                index += 2;
+            }
+            "--clear-vendor-option" => {
+                let value = args.get(index + 1).ok_or(CliError::Usage)?;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(CliError::Parse {
+                        detail: "--clear-vendor-option requires a key".to_string(),
+                    });
+                }
+                options.clear_vendor_options.push(value.to_string());
+                index += 2;
+            }
+            _ => return Err(CliError::Usage),
+        }
+    }
+    let provider = options
+        .target
+        .provider
+        .as_deref()
+        .ok_or_else(|| CliError::Parse {
+            detail: "--provider is required".to_string(),
+        })?;
+    options.target.model = raw_model.map(|model| normalize_model_id_for_provider(provider, &model));
+    if options.reasoning_effort.is_none()
+        && options.reasoning_budget_tokens.is_none()
+        && options.text_verbosity.is_none()
+        && options.vendor_options.is_empty()
+        && options.clear_vendor_options.is_empty()
+    {
+        return Err(CliError::Parse {
+            detail: "no model options were provided".to_string(),
+        });
+    }
+    Ok(options)
+}
+
+fn parse_option_update<T>(
+    value: &str,
+    parse: impl FnOnce(&str) -> Result<T, CliError>,
+) -> Result<ModelOptionValueUpdate<T>, CliError> {
+    match value.trim() {
+        "clear" | "unset" | "default" => Ok(ModelOptionValueUpdate::Clear),
+        value => parse(value).map(ModelOptionValueUpdate::Set),
+    }
+}
+
+fn parse_vendor_option(value: &str) -> Result<(String, String), CliError> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Err(CliError::Parse {
+            detail: "--vendor-option requires key=value".to_string(),
+        });
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(CliError::Parse {
+            detail: "--vendor-option requires a non-empty key".to_string(),
+        });
+    }
+    Ok((key.to_string(), value.trim().to_string()))
 }
 
 pub(crate) fn parse_models_runtime_command(
@@ -275,6 +517,7 @@ pub(crate) fn run_models_command(command: ModelsCliCommand) -> Result<(), CliErr
         ModelsCliCommand::Help => models_help(),
         ModelsCliCommand::List(options) => models_list(options),
         ModelsCliCommand::Default(options) => models_default(options),
+        ModelsCliCommand::Options(command) => models_options(command),
         ModelsCliCommand::Runtime(command) => models_runtime(command),
     }
 }
@@ -369,6 +612,265 @@ pub(crate) fn models_default_with_data_dir(
     );
     println!("config: {}", config_path.display());
     Ok(())
+}
+
+pub(crate) fn models_options(command: ModelOptionsCliCommand) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    match command {
+        ModelOptionsCliCommand::Show(target) => {
+            let (config, path) = load_model_config_for_node(&data_dir)?;
+            print_model_options(&config, &target);
+            println!("config: {}", path.display());
+            Ok(())
+        }
+        ModelOptionsCliCommand::Set(options) => {
+            let (mut config, _) = load_model_config_for_node(&data_dir)?;
+            let provider = options
+                .target
+                .provider
+                .clone()
+                .expect("set parser requires provider");
+            let account = mutable_provider_account(&mut config, &provider, &options.target.account);
+            let scope = model_options_scope(account, options.target.model.as_deref());
+            apply_model_options_set(scope, &options);
+            let path = write_model_config_for_node(&data_dir, &config)?;
+            println!("model provider options updated");
+            print_model_options(
+                &config,
+                &ModelOptionsTarget {
+                    provider: Some(provider),
+                    account: options.target.account,
+                    model: options.target.model,
+                },
+            );
+            println!("config: {}", path.display());
+            if model_config_uses_cluster(&data_dir) {
+                println!("kv key: {LM_PROVIDER_CONFIG_KV_KEY}");
+            } else {
+                println!("mode: local");
+            }
+            Ok(())
+        }
+        ModelOptionsCliCommand::Clear(target) => {
+            let (mut config, _) = load_model_config_for_node(&data_dir)?;
+            let provider = target
+                .provider
+                .clone()
+                .expect("clear parser requires provider");
+            clear_model_options(
+                &mut config,
+                &provider,
+                &target.account,
+                target.model.as_deref(),
+            );
+            let path = write_model_config_for_node(&data_dir, &config)?;
+            println!("model provider options cleared");
+            print_model_options(
+                &config,
+                &ModelOptionsTarget {
+                    provider: Some(provider),
+                    account: target.account,
+                    model: target.model,
+                },
+            );
+            println!("config: {}", path.display());
+            if model_config_uses_cluster(&data_dir) {
+                println!("kv key: {LM_PROVIDER_CONFIG_KV_KEY}");
+            } else {
+                println!("mode: local");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_model_options(config: &ModelConfig, target: &ModelOptionsTarget) {
+    match target.provider.as_deref() {
+        Some(provider) => {
+            let account = config.accounts.iter().find(|candidate| {
+                candidate.provider == provider
+                    && normalize_provider_account_name(Some(&candidate.account)) == target.account
+            });
+            println!("model provider options:");
+            println!("  provider: {provider}");
+            println!("  account: {}", target.account);
+            if let Some(model) = target.model.as_deref() {
+                println!("  model: {model}");
+            }
+            match account {
+                Some(account) => {
+                    let options = if let Some(model) = target.model.as_deref() {
+                        provider_options_for_model(Some(account), model)
+                    } else {
+                        account.options.clone()
+                    };
+                    print_language_model_provider_options("  ", &options);
+                }
+                None => {
+                    println!("  status: not configured");
+                    print_language_model_provider_options(
+                        "  ",
+                        &LanguageModelProviderOptions::default(),
+                    );
+                }
+            }
+        }
+        None => {
+            println!("model provider options:");
+            if config.accounts.is_empty() {
+                println!("  no provider accounts are configured");
+                return;
+            }
+            for account in &config.accounts {
+                println!(
+                    "  {}:{}",
+                    account.provider,
+                    normalize_provider_account_name(Some(&account.account))
+                );
+                print_language_model_provider_options("    ", &account.options);
+                for model_options in &account.model_options {
+                    println!("    model: {}", model_options.model);
+                    print_language_model_provider_options("      ", &model_options.options);
+                }
+            }
+        }
+    }
+}
+
+fn print_language_model_provider_options(prefix: &str, options: &LanguageModelProviderOptions) {
+    println!(
+        "{prefix}reasoning effort: {}",
+        options
+            .reasoning_effort
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
+    println!(
+        "{prefix}reasoning budget tokens: {}",
+        options
+            .reasoning_budget_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
+    println!(
+        "{prefix}text verbosity: {}",
+        options
+            .text_verbosity
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
+    if options.vendor_options.is_empty() {
+        println!("{prefix}vendor options: none");
+    } else {
+        println!("{prefix}vendor options:");
+        for (key, value) in &options.vendor_options {
+            println!("{prefix}  {key}={value}");
+        }
+    }
+}
+
+fn mutable_provider_account<'a>(
+    config: &'a mut ModelConfig,
+    provider: &str,
+    account: &str,
+) -> &'a mut ProviderAccountConfig {
+    let account = normalize_provider_account_name(Some(account));
+    if let Some(index) = config.accounts.iter().position(|candidate| {
+        candidate.provider == provider
+            && normalize_provider_account_name(Some(&candidate.account)) == account
+    }) {
+        return &mut config.accounts[index];
+    }
+    config.accounts.push(ProviderAccountConfig {
+        provider: provider.to_string(),
+        account,
+        default_model: None,
+        api_base_url: None,
+        api_key: None,
+        enabled: true,
+        options: LanguageModelProviderOptions::default(),
+        model_options: Vec::new(),
+    });
+    config.accounts.last_mut().expect("pushed provider account")
+}
+
+fn model_options_scope<'a>(
+    account: &'a mut ProviderAccountConfig,
+    model: Option<&str>,
+) -> &'a mut LanguageModelProviderOptions {
+    let Some(model) = model else {
+        return &mut account.options;
+    };
+    let model = normalize_model_id_for_provider(&account.provider, model);
+    if let Some(index) = account
+        .model_options
+        .iter()
+        .position(|candidate| candidate.model == model)
+    {
+        return &mut account.model_options[index].options;
+    }
+    account.model_options.push(LanguageModelModelOptions {
+        model,
+        options: LanguageModelProviderOptions::default(),
+    });
+    &mut account
+        .model_options
+        .last_mut()
+        .expect("pushed model options")
+        .options
+}
+
+fn apply_model_options_set(
+    options: &mut LanguageModelProviderOptions,
+    updates: &ModelOptionsSetOptions,
+) {
+    if let Some(update) = &updates.reasoning_effort {
+        match update {
+            ModelOptionValueUpdate::Set(value) => options.reasoning_effort = Some(*value),
+            ModelOptionValueUpdate::Clear => options.reasoning_effort = None,
+        }
+    }
+    if let Some(update) = &updates.reasoning_budget_tokens {
+        match update {
+            ModelOptionValueUpdate::Set(value) => options.reasoning_budget_tokens = Some(*value),
+            ModelOptionValueUpdate::Clear => options.reasoning_budget_tokens = None,
+        }
+    }
+    if let Some(update) = &updates.text_verbosity {
+        match update {
+            ModelOptionValueUpdate::Set(value) => options.text_verbosity = Some(*value),
+            ModelOptionValueUpdate::Clear => options.text_verbosity = None,
+        }
+    }
+    for (key, value) in &updates.vendor_options {
+        options.vendor_options.insert(key.clone(), value.clone());
+    }
+    for key in &updates.clear_vendor_options {
+        options.vendor_options.remove(key);
+    }
+}
+
+fn clear_model_options(
+    config: &mut ModelConfig,
+    provider: &str,
+    account: &str,
+    model: Option<&str>,
+) {
+    let account = normalize_provider_account_name(Some(account));
+    let Some(account) = config.accounts.iter_mut().find(|candidate| {
+        candidate.provider == provider
+            && normalize_provider_account_name(Some(&candidate.account)) == account
+    }) else {
+        return;
+    };
+    if let Some(model) = model {
+        let model = normalize_model_id_for_provider(provider, model);
+        account
+            .model_options
+            .retain(|candidate| candidate.model != model);
+    } else {
+        account.options = LanguageModelProviderOptions::default();
+    }
 }
 
 pub(crate) fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {

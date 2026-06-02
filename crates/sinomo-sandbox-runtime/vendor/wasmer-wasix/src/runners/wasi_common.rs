@@ -40,10 +40,15 @@ pub(crate) struct CommonWasiOptions {
     pub(crate) is_home_mapped: bool,
     pub(crate) injected_packages: Vec<BinaryPackage>,
     pub(crate) capabilities: Capabilities,
+    #[cfg_attr(not(feature = "journal"), allow(dead_code))]
     pub(crate) read_only_journals: Vec<Arc<DynReadableJournal>>,
+    #[cfg_attr(not(feature = "journal"), allow(dead_code))]
     pub(crate) writable_journals: Vec<Arc<DynJournal>>,
+    #[cfg_attr(not(feature = "journal"), allow(dead_code))]
     pub(crate) snapshot_on: Vec<SnapshotTrigger>,
+    #[cfg_attr(not(feature = "journal"), allow(dead_code))]
     pub(crate) snapshot_interval: Option<std::time::Duration>,
+    #[cfg_attr(not(feature = "journal"), allow(dead_code))]
     pub(crate) stop_running_after_snapshot: bool,
     pub(crate) skip_stdio_during_bootstrap: bool,
     pub(crate) current_dir: Option<PathBuf>,

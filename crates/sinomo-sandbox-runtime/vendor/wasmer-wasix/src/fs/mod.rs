@@ -1526,6 +1526,7 @@ impl WasiFs {
 
     /// finds the number of directories between the fd and the inode if they're connected
     /// expects inode to point to a directory
+    #[allow(dead_code)]
     pub(crate) fn path_depth_from_fd(&self, fd: WasiFd, inode: InodeGuard) -> Result<usize, Errno> {
         let mut counter = 0;
         let base_inode = self.get_fd_inode(fd)?;

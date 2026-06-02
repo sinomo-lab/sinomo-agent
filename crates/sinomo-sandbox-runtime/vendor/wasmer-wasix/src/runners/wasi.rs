@@ -13,10 +13,11 @@ use crate::{
     Runtime, WasiEnvBuilder, WasiError, WasiRuntimeError,
     bin_factory::BinaryPackage,
     capabilities::Capabilities,
-    journal::{DynJournal, DynReadableJournal, SnapshotTrigger},
     runners::{MappedDirectory, MountedDirectory, wasi_common::CommonWasiOptions},
     runtime::task_manager::VirtualTaskManagerExt,
 };
+#[cfg(feature = "journal")]
+use crate::journal::{DynJournal, DynReadableJournal, SnapshotTrigger};
 
 use super::wasi_common::{MAPPED_CURRENT_DIR_DEFAULT_PATH, MappedCommand};
 
@@ -349,6 +350,7 @@ impl WasiRunner {
 
         let wasi = webc::metadata::annotations::Wasi::new(program_name);
 
+        #[allow(unused_mut)]
         let mut builder = self.prepare_webc_env(
             program_name,
             &wasi,

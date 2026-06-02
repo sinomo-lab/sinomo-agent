@@ -1,6 +1,7 @@
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelProvider, LanguageModelProviderInfo,
-    LanguageModelRequest, LanguageModelResponse, render_plain_prompt, selected_model,
+    LanguageModelRequest, LanguageModelResponse, ProviderReasoningEffort, render_plain_prompt,
+    selected_model,
 };
 use std::fs;
 use std::io::Write;
@@ -23,6 +24,7 @@ pub struct CodexCliConfig {
     pub color: CodexColor,
     pub working_dir: Option<PathBuf>,
     pub capture_last_message: bool,
+    pub reasoning_effort: Option<ProviderReasoningEffort>,
 }
 
 impl Default for CodexCliConfig {
@@ -39,6 +41,7 @@ impl Default for CodexCliConfig {
             color: CodexColor::Never,
             working_dir: None,
             capture_last_message: true,
+            reasoning_effort: None,
         }
     }
 }
@@ -131,6 +134,14 @@ impl CodexCliProvider {
         if model != CODEX_CLI_DEFAULT_MODEL {
             args.push("--model".to_string());
             args.push(model);
+        }
+        if let Some(effort) = self
+            .config
+            .reasoning_effort
+            .and_then(|effort| effort.as_codex_cli_value())
+        {
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort=\"{effort}\""));
         }
 
         args.extend(self.config.extra_args.iter().cloned());
@@ -332,5 +343,20 @@ mod tests {
         );
         assert!(response.content.contains("user:\nSay hello."));
         fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn command_args_include_reasoning_effort_config() {
+        let provider = CodexCliProvider::new(CodexCliConfig {
+            reasoning_effort: Some(ProviderReasoningEffort::XHigh),
+            ..CodexCliConfig::default()
+        });
+
+        let args = provider.command_args(&request(), None);
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""])
+        );
     }
 }

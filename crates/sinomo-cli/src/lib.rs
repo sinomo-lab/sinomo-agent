@@ -70,19 +70,22 @@ use sinomo_evolution::{CandidateDecisionOutcome, EvolutionJobId};
 use sinomo_evolution::{EvolutionJobStatus, is_terminal_status};
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
-    DeepSeekProvider, GeminiProvider, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KV_KEY,
-    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelProviderUsage, LanguageModelRequest,
-    LanguageModelResponse, ModelConfig, ModelPaths, ModelRuntimeConfig, NvidiaProvider,
-    OpenAiProvider, codex_provider, collect_provider_model_catalogs, collect_provider_usage,
+    DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
+    LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError,
+    LanguageModelModelOptions, LanguageModelProviderOptions, LanguageModelProviderUsage,
+    LanguageModelRequest, LanguageModelResponse, ModelConfig, ModelPaths, ModelRuntimeConfig,
+    NvidiaProvider, OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort,
+    ProviderTextVerbosity, codex_provider, collect_provider_model_catalogs, collect_provider_usage,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
     model_config_from_cluster_kv_snapshot, model_runtime_config_cluster_kv_txn,
     model_runtime_config_from_cluster_kv_snapshot, normalize_model_id_for_provider,
     normalize_model_provider, normalize_provider_account_name, provider_account_config,
-    provider_api_key_from_env, resolve_default_model, save_model_config, save_provider_api_key,
-    save_provider_api_key_in_model_config, subscription_usage_provider_ids,
-    test_provider_account_credentials, test_provider_credentials, write_default_model_config,
+    provider_api_key_from_env, provider_options_for_model, resolve_default_model,
+    save_model_config, save_provider_api_key, save_provider_api_key_in_model_config,
+    subscription_usage_provider_ids, test_provider_account_credentials, test_provider_credentials,
+    write_default_model_config,
 };
 use sinomo_pytorch::{
     MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, ManagedPytorchServer, ManagedPytorchServerConfig,
@@ -195,10 +198,22 @@ use sinomo_runtime::daemon::{
     handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
     handle_daemon_cluster_raft_vote_request,
     handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
+    handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
+};
+#[cfg(not(windows))]
+use sinomo_runtime::daemon::{
+    LocalBinSymlinkStatus, SystemctlUserOutcome,
+    ensure_local_bin_symlink as daemon_ensure_local_bin_symlink,
+};
+#[cfg(windows)]
+use sinomo_runtime::daemon::{
+    UserPathUpdate, ensure_windows_user_path_contains as daemon_ensure_windows_user_path_contains,
+};
+#[cfg(all(test, feature = "sandbox"))]
+use sinomo_runtime::daemon::{
     handle_daemon_sandbox_checkpoint as daemon_handle_daemon_sandbox_checkpoint,
     handle_daemon_sandbox_create as daemon_handle_daemon_sandbox_create,
     handle_daemon_sandbox_destroy as daemon_handle_daemon_sandbox_destroy,
-    handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
     handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
     handle_daemon_sandbox_import_busybox as daemon_handle_daemon_sandbox_import_busybox,
     handle_daemon_sandbox_list as daemon_handle_daemon_sandbox_list,
@@ -216,15 +231,6 @@ use sinomo_runtime::daemon::{
     handle_daemon_sandbox_update as daemon_handle_daemon_sandbox_update,
     handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
     open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
-};
-#[cfg(not(windows))]
-use sinomo_runtime::daemon::{
-    LocalBinSymlinkStatus, SystemctlUserOutcome,
-    ensure_local_bin_symlink as daemon_ensure_local_bin_symlink,
-};
-#[cfg(windows)]
-use sinomo_runtime::daemon::{
-    UserPathUpdate, ensure_windows_user_path_contains as daemon_ensure_windows_user_path_contains,
 };
 use sinomo_runtime::dfs::{
     DfsConflictRecord, DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId,
@@ -307,6 +313,8 @@ use time::format_description::well_known::Rfc3339;
 
 mod commands;
 mod completion;
+mod file_manager;
+mod sifs_file_manager;
 pub(crate) use commands::*;
 pub(crate) use completion::*;
 
@@ -1228,7 +1236,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         context,
         async_update: None,
         context_attachments: Vec::new(),
-        tool_specs: sinomo_agent::default_main_agent_tools(),
+        tool_specs: Vec::new(),
     };
     let provider = options.provider.clone();
     let model = options.model.clone();
@@ -1246,7 +1254,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         println!("{}", agent_decision_json(&decision)?);
     } else {
         println!("{}", decision.text);
-        if !decision.tool_calls.is_empty() || decision.maid_handoff.is_some() {
+        if !decision.tool_calls.is_empty() || decision.background_handoff.is_some() {
             println!("{}", agent_decision_json(&decision)?);
         }
     }

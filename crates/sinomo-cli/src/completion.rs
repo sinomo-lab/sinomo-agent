@@ -93,6 +93,84 @@ const BOOLEAN_CHOICES: &[ValueChoice] = &[
     },
 ];
 
+const REASONING_EFFORT_CHOICES: &[ValueChoice] = &[
+    ValueChoice {
+        value: "none",
+        detail: "explicitly disable reasoning effort",
+    },
+    ValueChoice {
+        value: "minimal",
+        detail: "minimal reasoning effort",
+    },
+    ValueChoice {
+        value: "low",
+        detail: "low reasoning effort",
+    },
+    ValueChoice {
+        value: "medium",
+        detail: "medium reasoning effort",
+    },
+    ValueChoice {
+        value: "high",
+        detail: "high reasoning effort",
+    },
+    ValueChoice {
+        value: "xhigh",
+        detail: "extra-high reasoning effort",
+    },
+    ValueChoice {
+        value: "max",
+        detail: "maximum vendor-supported reasoning effort",
+    },
+    ValueChoice {
+        value: "clear",
+        detail: "remove this configured override",
+    },
+];
+
+const TEXT_VERBOSITY_CHOICES: &[ValueChoice] = &[
+    ValueChoice {
+        value: "low",
+        detail: "low response verbosity",
+    },
+    ValueChoice {
+        value: "medium",
+        detail: "medium response verbosity",
+    },
+    ValueChoice {
+        value: "high",
+        detail: "high response verbosity",
+    },
+    ValueChoice {
+        value: "clear",
+        detail: "remove this configured override",
+    },
+];
+
+const CLEAR_VALUE_CHOICES: &[ValueChoice] = &[ValueChoice {
+    value: "clear",
+    detail: "remove this configured override",
+}];
+
+const TUI_FILE_TARGET_CHOICES: &[ValueChoice] = &[
+    ValueChoice {
+        value: "sifs:/",
+        detail: "browse the SIFS root",
+    },
+    ValueChoice {
+        value: "sifs:/sinomo/nodes",
+        detail: "browse node-owned SIFS files",
+    },
+    ValueChoice {
+        value: "sifs:/services",
+        detail: "browse service-owned SIFS files",
+    },
+    ValueChoice {
+        value: "sifs:/users",
+        detail: "browse user-owned SIFS files",
+    },
+];
+
 const NODE_ROLE_CHOICES: &[ValueChoice] = &[
     ValueChoice {
         value: "workstation",
@@ -234,6 +312,11 @@ pub(crate) fn slash_completions_for_layer(
     }
 
     let (tokens, replace_start, replace_end, prefix) = completion_tokens(input, cursor)?;
+    if layer == SlashCommandCompletionLayer::Tui
+        && tokens.iter().any(|token| token.text == "--local")
+    {
+        return None;
+    }
     if layer == SlashCommandCompletionLayer::Tui
         && let Some(completions) =
             tui_model_quick_completions(&tokens, replace_start, replace_end, &prefix)
@@ -1168,6 +1251,7 @@ fn slash_command_registry() -> CommandSpec {
 }
 
 fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
+    registry.options.retain(|option| option.name != "--local");
     registry.children.extend(tui_slash_command_layer());
     if let Some(model) = registry
         .children
@@ -1185,10 +1269,18 @@ fn tui_slash_command_layer() -> Vec<CommandSpec> {
     vec![
         cmd(
             "files",
-            "open the local TUI file browser",
+            "open the TUI file manager for local files or SIFS",
             vec![],
-            vec![],
-            vec![value("path", "directory or file to open", &[])],
+            vec![option(
+                "--sifs",
+                "browse SIFS instead of local files",
+                Some(value("path", "SIFS path", TUI_FILE_TARGET_CHOICES)),
+            )],
+            vec![value(
+                "path",
+                "local path or sifs:/path to open",
+                TUI_FILE_TARGET_CHOICES,
+            )],
         ),
         cmd(
             "sessions",
@@ -1660,6 +1752,35 @@ fn models_children() -> Vec<CommandSpec> {
             vec![],
         ),
         cmd(
+            "options",
+            "inspect or update provider/model options",
+            vec![
+                cmd(
+                    "show",
+                    "show provider/model options",
+                    vec![],
+                    opts(&["--provider", "--account", "--model"]),
+                    vec![],
+                ),
+                cmd(
+                    "set",
+                    "set provider/model options",
+                    vec![],
+                    model_options_set_opts(),
+                    vec![],
+                ),
+                cmd(
+                    "clear",
+                    "clear provider/model options",
+                    vec![],
+                    opts(&["--provider", "--account", "--model"]),
+                    vec![],
+                ),
+            ],
+            opts(&["--provider", "--account", "--model"]),
+            vec![],
+        ),
+        cmd(
             "runtime",
             "inspect or update local model runtime",
             vec![
@@ -1684,6 +1805,47 @@ fn models_children() -> Vec<CommandSpec> {
             ],
             vec![],
             vec![],
+        ),
+    ]
+}
+
+fn model_options_set_opts() -> Vec<OptionSpec> {
+    vec![
+        option_for_name("--provider"),
+        option_for_name("--account"),
+        option_for_name("--model"),
+        option(
+            "--reasoning-effort",
+            "reasoning effort",
+            Some(value(
+                "effort",
+                "reasoning effort",
+                REASONING_EFFORT_CHOICES,
+            )),
+        ),
+        option(
+            "--reasoning-budget-tokens",
+            "reasoning budget tokens",
+            Some(value(
+                "n|clear",
+                "token budget or clear",
+                CLEAR_VALUE_CHOICES,
+            )),
+        ),
+        option(
+            "--text-verbosity",
+            "text verbosity",
+            Some(value("verbosity", "text verbosity", TEXT_VERBOSITY_CHOICES)),
+        ),
+        option(
+            "--vendor-option",
+            "vendor option key=value",
+            Some(value("key=value", "vendor option key=value", &[])),
+        ),
+        option(
+            "--clear-vendor-option",
+            "clear vendor option",
+            Some(value("key", "vendor option key", &[])),
         ),
     ]
 }
@@ -1931,6 +2093,11 @@ fn option_placeholder(name: &str) -> &'static str {
     match name {
         "--host" => "host",
         "--port" | "--shadow-port" => "port",
+        "--reasoning-effort" => "effort",
+        "--reasoning-budget-tokens" => "n|clear",
+        "--text-verbosity" => "verbosity",
+        "--vendor-option" => "key=value",
+        "--clear-vendor-option" => "key",
         "--repo"
         | "--remote-repo"
         | "--binary"
@@ -2000,6 +2167,11 @@ fn option_detail(name: &str) -> &'static str {
         "--provider" => "provider id",
         "--model" => "model id",
         "--account" => "provider account",
+        "--reasoning-effort" => "reasoning effort",
+        "--reasoning-budget-tokens" => "thinking/reasoning token budget",
+        "--text-verbosity" => "text verbosity",
+        "--vendor-option" => "vendor option key=value",
+        "--clear-vendor-option" => "vendor option key to clear",
         "--host" => "bind or target host",
         "--port" => "port number",
         "--repo" => "repository path",
@@ -2045,6 +2217,26 @@ mod tests {
         );
         assert!(completions.items.iter().any(|item| item.label == "resume"));
         assert!(completions.items.iter().any(|item| item.label == "cluster"));
+    }
+
+    #[test]
+    fn tui_slash_completion_blocks_local_process_option() {
+        let standard = slash_completions("/--", "/--".len()).expect("standard options");
+        assert!(standard.items.iter().any(|item| item.label == "--local"));
+
+        let tui = slash_completions_for_layer("/--", "/--".len(), SlashCommandCompletionLayer::Tui);
+        assert!(
+            tui.as_ref()
+                .is_none_or(|set| !set.items.iter().any(|item| item.label == "--local"))
+        );
+        assert!(
+            slash_completions_for_layer(
+                "/--local ",
+                "/--local ".len(),
+                SlashCommandCompletionLayer::Tui
+            )
+            .is_none()
+        );
     }
 
     #[test]

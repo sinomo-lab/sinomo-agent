@@ -8,16 +8,17 @@ use crate::tools::{
     AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus,
 };
 use crate::{
-    AgentError, AgentLoopDecision, AgentLoopInput, AgentToolCall, AsyncTaskNextAction,
-    InteractionModel, InteractionSession, TaskId, default_main_agent_tools,
+    AgentDefinition, AgentError, AgentLoopDecision, AgentLoopInput, AgentOutputFormat,
+    AgentToolCall, AsyncTaskNextAction, InteractionModel, InteractionSession, TaskId,
+    parse_agent_loop_response, render_agent_system_prompt_with_descriptors,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelMessage,
     LanguageModelProviderToolSpec, LanguageModelRequest, LanguageModelRequestItem,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
-    LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
-    LanguageModelToolSpec, inferred_model_context_window_tokens,
+    LanguageModelResponse, LanguageModelResponseItem, LanguageModelRole, LanguageModelStreamEvent,
+    LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
+    inferred_model_context_window_tokens,
 };
 use sinomo_runtime::core::{
     Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass, RoutingMetadata,
@@ -36,7 +37,7 @@ const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: usize = 4;
 #[serde(rename_all = "kebab-case")]
 pub enum AgentRole {
     Main,
-    Maid,
+    Background,
     Deliberation,
     Evolution,
 }
@@ -1005,7 +1006,8 @@ impl ContextAssembler {
         tool_descriptors: Vec<AgentToolDescriptor>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
-        let system_instructions = agent_system_prompt(&tool_descriptors);
+        let system_instructions =
+            render_agent_system_prompt_with_descriptors(&config.definition, &tool_descriptors);
         let workspace_facts = serde_json::json!({
             "session_id": input.session.session_id,
             "surface": input.session.surface,
@@ -1125,7 +1127,7 @@ impl ContextAssembler {
         let mut included = vec![
             ContextSource {
                 kind: "system_instructions".to_string(),
-                label: "agent_system_prompt".to_string(),
+                label: config.definition.name.clone(),
                 bytes: budget_estimate.system_prompt_bytes,
             },
             ContextSource {
@@ -1928,6 +1930,8 @@ pub(crate) fn agent_item_id(item: &AgentItem) -> TaskId {
 pub struct AgentConfig {
     pub provider: String,
     pub model: String,
+    #[serde(default = "default_agent_config_definition")]
+    pub definition: AgentDefinition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1954,9 +1958,13 @@ impl AgentConfig {
     pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
         let provider = provider.into();
         let model = model.into();
+        let definition = AgentDefinition::coding();
         Self {
             provider,
             model,
+            temperature: definition.temperature,
+            max_output_tokens: definition.max_output_tokens,
+            definition,
             max_steps: None,
             max_tool_calls_per_step: None,
             max_model_repair_attempts: None,
@@ -1964,10 +1972,25 @@ impl AgentConfig {
             workspace_instruction_files: default_workspace_instruction_files(),
             prompt_reference_max_bytes: None,
             prompt_reference_max_entries: None,
-            temperature: Some(0.2),
-            max_output_tokens: None,
             context_budget: AgentContextBudget::default(),
         }
+    }
+
+    pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
+        self.temperature = definition.temperature;
+        self.max_output_tokens = definition.max_output_tokens;
+        self.definition = definition;
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
     }
 
     pub fn with_max_steps(mut self, max_steps: usize) -> Self {
@@ -2002,6 +2025,10 @@ impl AgentConfig {
         self.context_budget = context_budget;
         self
     }
+}
+
+fn default_agent_config_definition() -> AgentDefinition {
+    AgentDefinition::coding()
 }
 
 fn default_workspace_instruction_files() -> Vec<PathBuf> {
@@ -2223,7 +2250,7 @@ impl AgentRole {
     fn policy_label(&self) -> &'static str {
         match self {
             AgentRole::Main => "main",
-            AgentRole::Maid => "maid",
+            AgentRole::Background => "background",
             AgentRole::Deliberation => "deliberation",
             AgentRole::Evolution => "evolution",
         }
@@ -2313,10 +2340,12 @@ impl<M: InteractionModel> Agent<M> {
     pub fn new(model: M, provider: impl Into<String>, model_id: impl Into<String>) -> Self {
         let provider = provider.into();
         let model_id = model_id.into();
+        let config = AgentConfig::new(provider, model_id);
+        let policy = AgentPolicyBundle::default_for_role(config.definition.role.clone());
         Self {
             model,
-            config: AgentConfig::new(provider, model_id),
-            policy: AgentPolicyBundle::default_for_role(AgentRole::Deliberation),
+            config,
+            policy,
             tools: AgentToolRegistry::new(),
             context_assembler: ContextAssembler,
             compactor: AgentCompactor::default(),
@@ -2326,7 +2355,22 @@ impl<M: InteractionModel> Agent<M> {
     }
 
     pub fn with_config(mut self, config: AgentConfig) -> Self {
+        let previous_default_policy =
+            AgentPolicyBundle::default_for_role(self.config.definition.role.clone());
+        if self.policy == previous_default_policy {
+            self.policy = AgentPolicyBundle::default_for_role(config.definition.role.clone());
+        }
         self.config = config;
+        self
+    }
+
+    pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
+        let previous_default_policy =
+            AgentPolicyBundle::default_for_role(self.config.definition.role.clone());
+        if self.policy == previous_default_policy {
+            self.policy = AgentPolicyBundle::default_for_role(definition.role.clone());
+        }
+        self.config = self.config.with_agent_definition(definition);
         self
     }
 
@@ -2901,6 +2945,7 @@ impl<M: InteractionModel> Agent<M> {
                     &response,
                     &language_model_stream_events,
                     &turn_context.available_tool_specs,
+                    &self.config.definition.output_format,
                 ) {
                     Ok(decision) => {
                         let step_model_events = AgentModelEvent::from_model_response(
@@ -3275,7 +3320,7 @@ impl<M: InteractionModel> Agent<M> {
             self.policy.filter_tool_descriptors(all_tool_descriptors);
         let mut context = self.context_assembler.assemble(
             input,
-            AgentRole::Deliberation,
+            self.config.definition.role.clone(),
             &self.config,
             transcript,
             session_projection.cloned(),
@@ -3337,11 +3382,16 @@ impl<M: InteractionModel> Agent<M> {
                 LanguageModelRequestItem::message(message.role.clone(), message.content.clone())
             })
             .collect();
-        let tools = turn_context
+        let tools: Vec<LanguageModelToolSpec> = turn_context
             .available_tool_specs
             .iter()
             .map(language_model_tool_spec_from_agent_tool)
             .collect();
+        let tool_choice = if tools.is_empty() {
+            None
+        } else {
+            Some(LanguageModelToolChoice::Auto)
+        };
 
         Ok(LanguageModelRequest {
             provider: self.config.provider.clone(),
@@ -3349,13 +3399,26 @@ impl<M: InteractionModel> Agent<M> {
             messages,
             items,
             tools,
-            tool_choice: Some(LanguageModelToolChoice::Auto),
+            tool_choice,
             parallel_tool_calls: Some(false),
-            temperature: self.config.temperature,
-            max_output_tokens: self.config.max_output_tokens,
-            response_format: LanguageModelResponseFormat::JsonObject,
+            temperature: self
+                .config
+                .temperature
+                .or(self.config.definition.temperature),
+            max_output_tokens: self
+                .config
+                .max_output_tokens
+                .or(self.config.definition.max_output_tokens),
+            response_format: self
+                .config
+                .definition
+                .output_format
+                .language_model_response_format(),
             metadata: serde_json::json!({
                 "loop": "agent",
+                "agent_name": self.config.definition.name,
+                "agent_role": self.config.definition.role,
+                "agent_output_format": self.config.definition.output_format,
                 "step_index": step_index,
                 "session_id": input.session.session_id,
                 "event_id": input.latest_event.event_id,
@@ -3370,7 +3433,7 @@ impl<M: InteractionModel> Agent<M> {
         AgentToolPlanner::plan(
             self.tools.descriptors(),
             input.tool_specs.clone(),
-            default_main_agent_tools(),
+            self.config.definition.tools.clone(),
             input.tool_specs.is_empty(),
         )
     }
@@ -3422,39 +3485,7 @@ fn language_model_custom_tool_spec_from_agent_tool(
 }
 
 pub fn agent_system_prompt(tools: &[AgentToolDescriptor]) -> String {
-    let tools_json = serde_json::to_string_pretty(tools).expect("tool descriptors serialize");
-    format!(
-        r#"You are Sinomo's deliberation agent model.
-
-You operate inside Sinomo's coding-agent loop. The agent owns tool execution,
-policy, event emission, and session state. Use tools when evidence or workspace
-changes are needed, then continue after tool_result messages arrive.
-
-Return only JSON shaped as:
-{{
-  "response_mode": "answer|acknowledge|clarify|defer|silent",
-  "text": "short user-facing response or a concise working note",
-  "tool_calls": [
-    {{
-      "tool": "tool name",
-      "input": {{}},
-      "async": false,
-      "summary": "why this tool is being used"
-    }}
-  ],
-  "maid_handoff": null,
-  "next_state": "speaking|listening|waiting|delegating|recovering|idle"
-}}
-
-When the next step is clear and no more tools are needed, return an empty
-tool_calls array. If a tool fails or is blocked, recover from the model-visible
-tool_result instead of repeating the same call blindly.
-
-Available agent tools:
-```json
-{tools_json}
-```"#
-    )
+    render_agent_system_prompt_with_descriptors(&AgentDefinition::coding(), tools)
 }
 
 fn render_initial_agent_input(input: &AgentLoopInput) -> Result<String, AgentError> {
@@ -3928,6 +3959,7 @@ fn parse_agent_model_decision(
     response: &LanguageModelResponse,
     stream_events: &[LanguageModelStreamEvent],
     available_tool_specs: &[AgentToolDescriptor],
+    output_format: &AgentOutputFormat,
 ) -> Result<AgentLoopDecision, AgentError> {
     let tool_calls = native_agent_tool_calls(response, stream_events, available_tool_specs);
     if !tool_calls.is_empty() {
@@ -3939,11 +3971,14 @@ fn parse_agent_model_decision(
                 response.content.clone()
             },
             tool_calls,
-            maid_handoff: None,
+            background_handoff: None,
             next_state: crate::AgentInteractionState::Waiting,
         });
     }
-    parse_agent_loop_decision_strict(&response.content)
+    match output_format {
+        AgentOutputFormat::JsonDecision => parse_agent_loop_decision_strict(&response.content),
+        AgentOutputFormat::Text => parse_agent_loop_response(output_format, &response.content),
+    }
 }
 
 fn native_agent_tool_calls(
@@ -4065,8 +4100,8 @@ fn parse_agent_loop_decision_strict(raw: &str) -> Result<AgentLoopDecision, Agen
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok())
             .unwrap_or_default(),
-        maid_handoff: value
-            .get("maid_handoff")
+        background_handoff: value
+            .get("background_handoff")
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
         next_state: value
@@ -4114,7 +4149,7 @@ fn repair_request_for_model_response(
             "response_mode": "answer|acknowledge|clarify|defer|silent",
             "text": "short user-facing response",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "speaking|listening|waiting|delegating|recovering|idle"
         },
         "instruction": "Return only a valid JSON object matching required_response_shape. Do not include markdown fences or explanatory text."
@@ -4323,7 +4358,7 @@ mod tests {
         AgentToolSpec, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
         default_agent_tool_descriptors, default_coding_agent_tools, user_interaction_input_event,
     };
-    use sinomo_lm::LanguageModelError;
+    use sinomo_lm::{LanguageModelError, LanguageModelResponseFormat};
     use sinomo_runtime::events::SessionId;
     use sinomo_runtime::node::NodeId;
     use std::collections::VecDeque;
@@ -4556,6 +4591,8 @@ mod tests {
     fn agent_config_defaults_to_unlimited_runtime_limits() {
         let config = AgentConfig::new("fake", "fake");
 
+        assert_eq!(config.definition.name, "coding-agent");
+        assert_eq!(config.definition.role, AgentRole::Deliberation);
         assert_eq!(config.max_steps, None);
         assert_eq!(config.max_tool_calls_per_step, None);
         assert_eq!(config.max_model_repair_attempts, None);
@@ -4564,6 +4601,96 @@ mod tests {
         assert_eq!(config.prompt_reference_max_entries, None);
         assert_eq!(config.context_budget.max_context_bytes, None);
         assert_eq!(config.context_budget.compaction_threshold_bytes(), None);
+    }
+
+    #[test]
+    fn custom_agent_definition_controls_context_role_prompt_and_default_tools() {
+        let mut input = agent_input("draft docs");
+        input.tool_specs = Vec::new();
+        let definition = AgentDefinition::custom(
+            "docs-agent",
+            AgentRole::Background,
+            "Draft operator docs from visible evidence.",
+        )
+        .with_tool(AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            "draft_doc",
+            "Draft a documentation note from current evidence.",
+            false,
+        ));
+        let config = AgentConfig::new("fake", "fake").with_agent_definition(definition);
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(config);
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+        let request = agent.request(&input, &[], 0).expect("request");
+        let visible_tools: Vec<_> = context
+            .available_tool_specs
+            .iter()
+            .map(|descriptor| descriptor.spec.name.as_str())
+            .collect();
+
+        assert_eq!(context.role, AgentRole::Background);
+        assert!(context.system_instructions.contains("Draft operator docs"));
+        assert!(visible_tools.contains(&"draft_doc"));
+        assert!(!visible_tools.contains(&"read_file"));
+        assert_eq!(
+            request.response_format,
+            LanguageModelResponseFormat::JsonObject
+        );
+        assert!(
+            request.messages[0]
+                .content
+                .contains("Draft operator docs from visible evidence")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("agent_name")
+                .and_then(serde_json::Value::as_str),
+            Some("docs-agent")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("agent_role")
+                .and_then(serde_json::Value::as_str),
+            Some("background")
+        );
+    }
+
+    #[test]
+    fn text_output_agent_definition_returns_plain_final_answer() {
+        let mut input = agent_input("status");
+        input.tool_specs = Vec::new();
+        let definition =
+            AgentDefinition::custom("status-agent", AgentRole::Main, "Answer status plainly.")
+                .with_output_format(AgentOutputFormat::Text);
+        let config = AgentConfig::new("fake", "fake").with_agent_definition(definition);
+        let agent =
+            Agent::new(SequencedModel::new(["Plain status."]), "fake", "fake").with_config(config);
+
+        let run = agent.run(&input).expect("run");
+        let request = agent.model.requests.lock().expect("requests")[0].clone();
+
+        assert_eq!(run.stop_reason, AgentStopReason::FinalDecision);
+        assert_eq!(
+            run.final_decision.response_mode,
+            crate::AgentLoopResponseMode::Answer
+        );
+        assert_eq!(run.final_decision.text, "Plain status.");
+        assert!(run.tool_results.is_empty());
+        assert_eq!(request.response_format, LanguageModelResponseFormat::Text);
+        assert_eq!(request.tool_choice, None);
+        assert!(
+            request.messages[0]
+                .content
+                .contains("Respond directly in plain text")
+        );
     }
 
     #[test]
@@ -4632,14 +4759,14 @@ mod tests {
                     "async": false,
                     "summary": "Inspect workspace metadata."
                 }],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "waiting"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "The workspace evidence is available.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -4676,14 +4803,14 @@ mod tests {
                     "async": false,
                     "summary": "Inspect workspace metadata."
                 }],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "waiting"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "The workspace evidence is available.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -4723,7 +4850,7 @@ mod tests {
             "response_mode": "answer",
             "text": "Done.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#;
         let agent = Agent::new(
@@ -4761,14 +4888,14 @@ mod tests {
                 "async": false,
                 "summary": "Inspect workspace metadata."
             }],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "waiting"
         }"#;
         let final_response = r#"{
             "response_mode": "answer",
             "text": "Done.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#;
         let model = EventfulModel::new([
@@ -4857,7 +4984,7 @@ mod tests {
             "response_mode": "answer",
             "text": "The native tool call completed.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#;
         let model = EventfulModel::new([
@@ -4921,14 +5048,14 @@ mod tests {
                     "async": false,
                     "summary": "Inspect workspace metadata."
                 }],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "waiting"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "Done.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -5119,7 +5246,7 @@ mod tests {
             "response_mode": "answer",
             "text": "Done.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#]);
         let agent = Agent::new(model, "fake", "fake").with_session_store(store.clone());
@@ -5279,7 +5406,7 @@ mod tests {
             "response_mode": "answer",
             "text": "Done.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#]);
         let agent = Agent::new(model, "fake", "fake")
@@ -5360,14 +5487,14 @@ mod tests {
                     "async": false,
                     "summary": "Try a missing tool."
                 }],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "waiting"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "The requested tool is not available.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -5397,7 +5524,7 @@ mod tests {
                 "async": false,
                 "summary": "Inspect workspace metadata."
             }],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "waiting"
         }"#]);
         let config = AgentConfig::new("fake", "fake").with_max_steps(1);
@@ -5420,7 +5547,7 @@ mod tests {
                 "response_mode": "answer",
                 "text": "Recovered.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -5695,14 +5822,14 @@ mod tests {
                     "async": false,
                     "summary": "Search the workspace."
                 }],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "waiting"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "The tool is visible but has no executor.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -5946,14 +6073,14 @@ mod tests {
                     "async": false,
                     "summary": "Try a denied command."
                 }],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "waiting"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "The command was blocked by policy.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -7180,7 +7307,7 @@ old
                 "async": false,
                 "summary": "Patch hello.txt."
             }],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "waiting"
         })
         .to_string();
@@ -7190,7 +7317,7 @@ old
                 "response_mode": "answer",
                 "text": "Patched.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#
             .to_string(),
@@ -7255,7 +7382,7 @@ old
                 "response_mode": "answer",
                 "text": "Done.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#]),
             "fake",
@@ -7301,7 +7428,7 @@ old
                     "summary": "Patch hello.txt."
                 }
             ],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "waiting"
         })
         .to_string();
@@ -7311,7 +7438,7 @@ old
                 "response_mode": "answer",
                 "text": "Candidate is ready.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#
             .to_string(),
@@ -7353,14 +7480,14 @@ old
                 "response_mode": "answer",
                 "text": "First compacted answer.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "Second compacted answer.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);
@@ -7418,7 +7545,7 @@ old
             "response_mode": "answer",
             "text": "Projection-aware answer.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#]);
         let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
@@ -7469,7 +7596,7 @@ old
             "response_mode": "answer",
             "text": "Done.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         }"#]);
         let agent = Agent::new(model, "fake", "fake");
@@ -7513,14 +7640,14 @@ old
                 "response_mode": "answer",
                 "text": "First answer.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
             r#"{
                 "response_mode": "answer",
                 "text": "Second answer.",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             }"#,
         ]);

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This document defines the first agent-system shape for Sinomo: the user-facing main agent, the maintenance-oriented maid agent, the local core model that drives real-time interaction, and the async deliberation, tool, cluster, and self-evolution paths around them.
+This document defines the first agent-system shape for Sinomo: the user-facing main agent, the maintenance-oriented background agent, the local core model that drives real-time interaction, and the async deliberation, tool, cluster, and self-evolution paths around them.
 
 It complements the distributed runtime in [architecture.md](architecture.md), the cluster control plane in [clustering-architecture.md](clustering-architecture.md), the cluster root filesystem in [sifs.md](sifs.md), and controlled mutation in [self-evolution-architecture.md](self-evolution-architecture.md). Current implementation entry points are tracked in [agent-system-implementation.md](agent-system-implementation.md).
 
@@ -30,14 +30,14 @@ Responsibilities:
 - Use local model inference for the real-time loop whenever hardware and policy allow.
 - Use advanced API or CLI models for slow deliberation, planning, research, coding, maintenance planning, and debugging.
 - Start, monitor, summarize, and cancel async work without blocking live conversation.
-- Handoff cluster-operation and system-maintenance work to the maid agent by default.
+- Handoff cluster-operation and system-maintenance work to the background agent by default.
 - Start or request self-evolution when explicitly asked by the user, or when an architectural limitation prevents a bounded fix.
 
 The main agent should not need to reason about low-level cluster mechanics for ordinary user tasks. It sees SIFS as its filesystem, receives useful cluster status summaries, and invokes tools with session-aware defaults. When placement matters, it can target a specific node, device, or SIFS subtree explicitly.
 
-### Maid Agent
+### Background Agent
 
-The maid agent is the maintenance and background-operations agent.
+The background agent is the maintenance and background-operations agent.
 
 Responsibilities:
 
@@ -50,9 +50,9 @@ Responsibilities:
 - Apply minimal bug fixes through the normal self-evolution or rollout path when the scope is clearly operational and bounded.
 - Escalate large functionality changes to self-evolution instead of making broad ad hoc changes.
 
-The maid agent should stay silent most of the time. Its default report target is the main agent, not the user. It may address the user directly only when there is a critical, time-sensitive, dangerous, or destructive issue, or when the main agent is malfunctioning and cannot mediate.
+The background agent should stay silent most of the time. Its default report target is the main agent, not the user. It may address the user directly only when there is a critical, time-sensitive, dangerous, or destructive issue, or when the main agent is malfunctioning and cannot mediate.
 
-The maid agent defaults to a powerful API-hosted or CLI-accessible coding LLM. It is event-woken rather than continuously active. A cluster-wide concurrency limit controls sessions for this agent; the default limit is one active maid session across the whole cluster. Multiple events should coalesce into one wake cycle so routine maintenance does not consume tokens continuously.
+The background agent defaults to a powerful API-hosted or CLI-accessible coding LLM. It is event-woken rather than continuously active. A cluster-wide concurrency limit controls sessions for this agent; the default limit is one active background-agent session across the whole cluster. Multiple events should coalesce into one wake cycle so routine maintenance does not consume tokens continuously.
 
 ## Core Model
 
@@ -94,15 +94,15 @@ Users / Devices / Sessions
           <-> Provider adapters through sinomo-lm
       <-> Cluster-aware tool/action gateway
       <-> SIFS filesystem view
-      <-> Maid handoff queue
+      <-> Background handoff queue
 
 Cluster events / health / storage / logs
-  -> Maid wake aggregator
-  -> Maid agent session
+  -> Background wake aggregator
+  -> Background agent session
   -> Maintenance actions, reports, or self-evolution jobs
 ```
 
-The main agent and maid agent are logical roles. They may run on the same node in a single-machine deployment, but their responsibilities, wake policies, permissions, and reporting paths should remain separate.
+The main agent and background agent are logical roles. They may run on the same node in a single-machine deployment, but their responsibilities, wake policies, permissions, and reporting paths should remain separate.
 
 ## Real-Time Interaction Model
 
@@ -112,7 +112,7 @@ Traditional LLM tool loops block on a request-response cycle. Sinomo should inst
 2. The main agent continuously updates an interaction state: speaking, listening, waiting, delegating, recovering, or idle.
 3. Slow work creates async task records and returns a handle immediately.
 4. Partial progress, completion, failure, and cancellation arrive as new events.
-5. The main agent decides whether each event should change the live conversation, update memory silently, wake the maid, or trigger self-evolution.
+5. The main agent decides whether each event should change the live conversation, update memory silently, wake the background agent, or trigger self-evolution.
 
 Async task status can be injected into the live model stream as steering. The default immediate response after starting a background task is a short hint that the task is running asynchronously and will report back later. The runtime injects this hint right after the ongoing tool call or output stream boundary instead of waiting for the original turn to complete. If MiniCPM-o's native interrupt mechanism works reliably for tool-call progress, the runtime may use that path for lower-latency background-task updates.
 
@@ -188,13 +188,13 @@ Recommended injected response shape:
   "summary": "Short natural-language update for the live agent.",
   "needs_user_attention": false,
   "result_ref": "sifs:/services/tasks/task_.../result.json",
-  "next_action_hint": "continue_silently|tell_user|ask_user|handoff_to_maid|inspect_result"
+  "next_action_hint": "continue_silently|tell_user|ask_user|handoff_to_background|inspect_result"
 }
 ```
 
 The `summary` should be safe to inject into a live stream. Larger outputs, logs, files, or artifacts should be referenced through `result_ref` instead of being inlined. `next_action_hint` is advisory steering, not authority; the main agent still decides how to respond in context.
 
-The main agent should be able to continue speaking with the user while these tasks run. When a result arrives, it is just another event in the session timeline and can be summarized, ignored, acted on, or handed to the maid.
+The main agent should be able to continue speaking with the user while these tasks run. When a result arrives, it is just another event in the session timeline and can be summarized, ignored, acted on, or handed to the background agent.
 
 ## Transcript, Context, and Compaction
 
@@ -254,10 +254,11 @@ Main-agent view:
 
 - The default filesystem root is SIFS.
 - Session context supplies default node, user, workspace, and device targets.
-- Tools choose sensible defaults when the target is obvious.
-- The ordinary model context includes only basic cluster overview information: cluster status, available services, and endpoint information.
-- Cluster inspection tools are available when the main agent needs deeper details.
-- The agent can explicitly target a node, device, or SIFS path when needed.
+- The main agent can start, inspect, and cancel background work without blocking live interaction.
+- The main agent can hand off cluster-health, SIFS file inspection, cleanup, rollout, and maintenance work to the background agent.
+- Direct `cluster_status`, `read_sifs`, `write_sifs`, and `list_sifs` tools are not part of the main-agent default tool set.
+- The background-agent default tool set includes direct cluster status and SIFS read/write/list tools.
+- The ordinary model context includes only basic cluster overview information such as available services and endpoint information.
 
 Tool gateway responsibilities:
 
@@ -272,7 +273,7 @@ Tool gateway responsibilities:
 - Truncate large model-visible output while preserving full-output handles for audit and later inspection.
 - Prefer structured machine-readable output over terminal-only text.
 
-Cluster-operation tasks should be handed to the maid agent unless they are a direct, immediate part of the user's task and safe for the main agent to drive. This keeps cluster details mostly transparent to Sinomo's real-time persona while still preserving explicit control when placement matters.
+Cluster-operation tasks should be handed to the background agent unless they are a direct, immediate part of the user's task and safe for the main agent to drive. This keeps cluster details mostly transparent to Sinomo's real-time persona while still preserving explicit control when placement matters.
 
 The initial deliberation tool set should stay small and auditable:
 
@@ -289,9 +290,9 @@ The initial deliberation tool set should stay small and auditable:
 
 Deferred tool discovery can be added later when the cluster has enough tools that exposing every schema wastes context. Until then, direct visibility plus strict runtime policy is simpler and easier to verify.
 
-## Maid Wake and Event Aggregation
+## Background Wake and Event Aggregation
 
-The maid agent is woken by events, not by polling an expensive model loop.
+The background agent is woken by events, not by polling an expensive model loop.
 
 Wake sources:
 
@@ -309,16 +310,16 @@ Wake sources:
 Wake aggregation rules:
 
 - Events are queued durably and grouped by family, affected node, affected service, workspace, and time window.
-- Normal events wake the maid only once per configurable interval. The default interval is once per day.
-- Emergency events, such as logged errors or dangerous policy incidents, wake the maid immediately.
+- Normal events wake the background agent only once per configurable interval. The default interval is once per day.
+- Emergency events, such as logged errors or dangerous policy incidents, wake the background agent immediately.
 - A wake cycle receives a queued incident bundle, not one isolated event.
-- Cluster-wide maid concurrency defaults to one active session.
-- New non-emergency events remain queued while the current maid session is running and are considered in the next wake cycle.
-- Emergency events that arrive during an active maid session are queued after the current emergency bundle and do not start parallel sessions unless policy explicitly permits it.
-- The event bundle is written to a temporary file instead of being injected directly into the model context. The maid agent receives the file path and uses file tools to inspect, filter, summarize, and act on the queued events.
+- Cluster-wide background concurrency defaults to one active session.
+- New non-emergency events remain queued while the current background-agent session is running and are considered in the next wake cycle.
+- Emergency events that arrive during an active background-agent session are queued after the current emergency bundle and do not start parallel sessions unless policy explicitly permits it.
+- The event bundle is written to a temporary file instead of being injected directly into the model context. The background agent receives the file path and uses file tools to inspect, filter, summarize, and act on the queued events.
 - The temporary file format is LM-friendly JSON: a top-level list of event objects. Sinomo Object remains appropriate for internal storage and transport, but JSON is the handoff format for model-facing event review.
 - Token budgets and wall-clock budgets are explicit per wake cycle.
-- The maid writes a concise report to the main agent unless escalation rules require direct user notification.
+- The background agent writes a concise report to the main agent unless escalation rules require direct user notification.
 
 Example wake condition:
 
@@ -338,7 +339,7 @@ When local models are used, Sinomo should be able to train or adapt them from op
 Collected data classes:
 
 - User interaction streams: text, audio transcripts, speech timing, barge-in points, selected visual summaries, and explicit user corrections.
-- Agent decisions: when Sinomo spoke, stayed silent, interrupted, delegated, asked a question, used a tool, or handed off to the maid.
+- Agent decisions: when Sinomo spoke, stayed silent, interrupted, delegated, asked a question, used a tool, or handed off to the background.
 - Async task traces: task creation, progress, delayed results, cancellations, and user satisfaction signals.
 - Tool traces: structured inputs, outputs, errors, node placement, duration, and policy decisions.
 - Deliberation harness traces: context assembly reports, provider request metadata, normalized stream events, tool-call continuations, compaction events, retries, and final answer evidence.
@@ -368,7 +369,7 @@ Main-agent triggers:
 - The main agent lacks a required tool, skill, or runtime behavior.
 - The interaction model cannot represent the user's workflow cleanly.
 
-Maid-agent triggers:
+Background-agent triggers:
 
 - A system issue cannot be fixed by bounded maintenance.
 - A recurring cluster, DFS, rollout, daemon, or policy failure points to a design flaw.
@@ -377,21 +378,21 @@ Maid-agent triggers:
 
 Self-evolution handoff rules:
 
-- Small operational repairs from the maid go directly to approval. If approved, they go directly to rollout. This path is intended for quick, narrow system fixes and must remain bounded.
-- Until Sinomo has an autonomous approval system, approval for quick maid-driven operational fixes is delegated to a human. This should use the same approval and rollout surfaces as self-evolution.
+- Small operational repairs from the background agent go directly to approval. If approved, they go directly to rollout. This path is intended for quick, narrow system fixes and must remain bounded.
+- Until Sinomo has an autonomous approval system, approval for quick background-driven operational fixes is delegated to a human. This should use the same approval and rollout surfaces as self-evolution.
 - Large functionality changes use the self-evolution architecture.
 - Evolution jobs must have bounded scope, write-set ownership, evaluation gates, rollback policy, and provenance.
 - Mutation packets and implementation runs should be ordinary deliberation-harness sessions with extra job, scope, verification, and rollback context.
 - Verification commands, patch snapshots, changed-file summaries, tool results, and final model claims should be stored as typed candidate evidence.
 - A candidate cannot be treated as successful only because the model says it is done. Verification evidence and policy decisions remain authoritative.
 - The main agent can explain and negotiate user-facing evolution goals.
-- The maid can provide diagnostics, incident bundles, reproduction steps, and operational constraints.
+- The background agent can provide diagnostics, incident bundles, reproduction steps, and operational constraints.
 
 ## Permissions and Reporting
 
-The main agent and maid agent need different defaults.
+The main agent and background agent need different defaults.
 
-| Capability | Main agent | Maid agent |
+| Capability | Main agent | Background agent |
 |---|---|---|
 | Direct user interaction | Default yes | Default no |
 | Real-time speech/video loop | Default yes | No |
@@ -409,10 +410,10 @@ Tool and rollout permissions are runtime decisions. System prompts should tell m
 
 ## Remaining Refinements
 
-- Define the exact JSON schemas for async task updates and maid event-bundle files once the event and task crates stabilize.
+- Define the exact JSON schemas for async task updates and background event-bundle files once the event and task crates stabilize.
 - Define the stable typed transcript and evidence item schema shared by `sinomo-agent`, `sinomo-deliberation`, `sinomo-lm`, and self-evolution jobs.
 - Define the normalized provider stream event enum and the first OpenAI Responses renderer/parser.
 - Define the context assembly report schema and compaction event schema.
 - Define the policy metadata required by tool descriptors before broadening the tool registry.
 - Define the user-facing controls for per-user, per-device, per-session, and per-data-class collection opt-out.
-- Define the human approval UI or CLI flow shared by quick maid fixes and self-evolution rollout approval.
+- Define the human approval UI or CLI flow shared by quick background fixes and self-evolution rollout approval.

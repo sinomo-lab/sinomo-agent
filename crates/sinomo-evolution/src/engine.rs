@@ -4447,6 +4447,7 @@ where
         workspace_config.max_search_matches = 300;
 
         let mut config = AgentConfig::new(self.provider.clone(), self.model.clone())
+            .with_agent_definition(sinomo_agent::AgentDefinition::evolution())
             .with_workspace_root(&workspace.path)
             .with_context_budget(AgentContextBudget::for_loaded_model(
                 &self.provider,

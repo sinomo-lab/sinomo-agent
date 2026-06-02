@@ -46,11 +46,16 @@ sinomo --local models runtime set --pytorch-endpoint ""
 `crates/sinomo-agent` now exposes:
 
 - `main_agent_system_prompt`;
-- `maid_agent_system_prompt`;
+- `background_agent_system_prompt`;
+- `AgentDefinition`;
+- `AgentOutputFormat`;
 - `default_main_agent_tools`;
+- `default_background_agent_tools`;
 - `AsyncTaskUpdate`;
 - `AgentLoopInput`;
 - `AgentLoopDecision`;
+- `BackgroundHandoffRequest`;
+- `BackgroundHandoffPriority`;
 - `MainAgentLoop`;
 - `Agent`;
 - `AgentSession`;
@@ -82,7 +87,7 @@ sinomo --local models runtime set --pytorch-endpoint ""
 - `default_coding_agent_tools`;
 - `default_agent_tool_descriptors`.
 
-The loop asks the model for a JSON decision with user-visible text, optional tool calls, optional maid handoff, and the next interaction state. Quiet async updates can be consumed without calling the model.
+The loop asks the model for a JSON decision with user-visible text, optional tool calls, optional background handoff, and the next interaction state. Quiet async updates can be consumed without calling the model.
 
 `Agent` is the first coding-agent style loop for deliberation and self-evolution work. It normalizes provider calls through `LanguageModelRequest`, keeps both a model-visible transcript and provider-neutral typed `AgentItem` evidence, executes requested tools through a registry/orchestrator boundary, returns tool results as follow-up user messages, and emits `agent.loop.*` events. By default, agent steps, per-step tool calls, model repair attempts, model output tokens, prompt-reference expansion, context size, and compaction are not hard-capped. Runtime layers can tighten those values when a concrete model or session policy provides real limits; model-window inference belongs to `sinomo-lm` provider implementations, and `AgentContextBudget::for_loaded_model` converts loaded model metadata into an optional byte budget plus ratio-based compaction threshold.
 

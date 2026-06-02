@@ -293,6 +293,7 @@ impl WasiModuleTreeHandles {
     /// Helper function to ensure the module isn't dynamically linked, needed since
     /// we only support a subset of WASIX functionality for dynamically linked modules.
     /// Specifically, anything that requires asyncify is not supported right now.
+    #[allow(dead_code)]
     pub(crate) fn ensure_static_module(&self) -> Result<(), ()> {
         match self {
             WasiModuleTreeHandles::Static(_) => Ok(()),

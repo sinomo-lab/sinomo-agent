@@ -1,9 +1,10 @@
 use crate::{
     LanguageModelCreditUsage, LanguageModelError, LanguageModelInvocation, LanguageModelMessage,
-    LanguageModelProvider, LanguageModelProviderInfo, LanguageModelProviderUsage,
-    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelStreamEvent, LanguageModelUsage, LanguageModelUsageLimit,
-    LanguageModelUsageProvider, PROVIDER_DEFAULT_MODEL, selected_model, unix_timestamp,
+    LanguageModelProvider, LanguageModelProviderInfo, LanguageModelProviderOptions,
+    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
+    LanguageModelUsageLimit, LanguageModelUsageProvider, PROVIDER_DEFAULT_MODEL,
+    apply_provider_vendor_options_to_payload, selected_model, unix_timestamp,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -33,6 +34,7 @@ pub struct CodexConfig {
     pub provider_id: String,
     pub default_model: String,
     pub max_iterations: usize,
+    pub options: LanguageModelProviderOptions,
 }
 
 impl Default for CodexConfig {
@@ -41,6 +43,7 @@ impl Default for CodexConfig {
             provider_id: CODEX_PROVIDER_ID.to_string(),
             default_model: CODEX_DEFAULT_MODEL.to_string(),
             max_iterations: 12,
+            options: LanguageModelProviderOptions::default(),
         }
     }
 }
@@ -962,6 +965,7 @@ where
                 max_output_tokens: request.max_output_tokens,
                 response_format: request.response_format.clone(),
                 metadata: request.metadata.clone(),
+                options: self.config.options.clone(),
             };
             let response = self.client.complete_streaming(&codex_request, on_event)?;
             if response.tool_calls.is_empty() {
@@ -1022,6 +1026,11 @@ pub struct CodexModelRequest {
     pub response_format: LanguageModelResponseFormat,
     #[serde(default)]
     pub metadata: serde_json::Value,
+    #[serde(
+        default,
+        skip_serializing_if = "LanguageModelProviderOptions::is_default"
+    )]
+    pub options: LanguageModelProviderOptions,
 }
 
 impl CodexModelRequest {
@@ -1422,6 +1431,23 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
     if request.response_format == LanguageModelResponseFormat::JsonObject {
         payload["text"] = serde_json::json!({ "format": { "type": "json_object" } });
     }
+    if let Some(effort) = request
+        .options
+        .reasoning_effort
+        .and_then(|effort| effort.as_openai_responses_value())
+    {
+        payload["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+    if let Some(verbosity) = request.options.text_verbosity {
+        if !payload
+            .get("text")
+            .is_some_and(serde_json::Value::is_object)
+        {
+            payload["text"] = serde_json::json!({});
+        }
+        payload["text"]["verbosity"] = serde_json::json!(verbosity.as_config_value());
+    }
+    apply_provider_vendor_options_to_payload(&mut payload, &request.options);
     payload
 }
 
@@ -1874,7 +1900,7 @@ fn parse_function_call_item(item: &serde_json::Value) -> Option<CodexToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PROVIDER_DEFAULT_MODEL;
+    use crate::{PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort, ProviderTextVerbosity};
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
@@ -2019,6 +2045,7 @@ mod tests {
             max_output_tokens: Some(100),
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::Value::Null,
+            options: LanguageModelProviderOptions::default(),
         });
 
         assert_eq!(payload["instructions"], "system prompt");
@@ -2051,6 +2078,7 @@ mod tests {
             max_output_tokens: Some(100),
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::Value::Null,
+            options: LanguageModelProviderOptions::default(),
         });
 
         assert_eq!(payload["input"].as_array().expect("input").len(), 1);
@@ -2071,6 +2099,7 @@ mod tests {
             max_output_tokens: None,
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::Value::Null,
+            options: LanguageModelProviderOptions::default(),
         };
 
         assert_eq!(
@@ -2089,9 +2118,37 @@ mod tests {
             max_output_tokens: None,
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::Value::Null,
+            options: LanguageModelProviderOptions::default(),
         });
 
         assert_eq!(payload["instructions"], CODEX_DEFAULT_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn openai_responses_payload_applies_provider_options() {
+        let mut options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::XHigh),
+            text_verbosity: Some(ProviderTextVerbosity::Medium),
+            ..LanguageModelProviderOptions::default()
+        };
+        options
+            .vendor_options
+            .insert("metadata.reason".to_string(), "\"test\"".to_string());
+
+        let payload = openai_responses_codex_payload(&CodexModelRequest {
+            model: CODEX_DEFAULT_MODEL.to_string(),
+            messages: vec![CodexMessage::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_output_tokens: None,
+            response_format: LanguageModelResponseFormat::Text,
+            metadata: serde_json::Value::Null,
+            options,
+        });
+
+        assert_eq!(payload["reasoning"]["effort"], "xhigh");
+        assert_eq!(payload["text"]["verbosity"], "medium");
+        assert_eq!(payload["metadata"]["reason"], "test");
     }
 
     #[test]

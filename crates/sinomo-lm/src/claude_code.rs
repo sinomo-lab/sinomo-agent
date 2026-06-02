@@ -1,6 +1,7 @@
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelProvider, LanguageModelProviderInfo,
-    LanguageModelRequest, LanguageModelResponse, render_plain_prompt, selected_model,
+    LanguageModelRequest, LanguageModelResponse, ProviderReasoningEffort, render_plain_prompt,
+    selected_model,
 };
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -16,6 +17,7 @@ pub struct ClaudeCodeConfig {
     pub max_turns: Option<u32>,
     pub no_session_persistence: bool,
     pub working_dir: Option<PathBuf>,
+    pub reasoning_effort: Option<ProviderReasoningEffort>,
 }
 
 impl Default for ClaudeCodeConfig {
@@ -28,6 +30,7 @@ impl Default for ClaudeCodeConfig {
             max_turns: Some(10),
             no_session_persistence: true,
             working_dir: None,
+            reasoning_effort: None,
         }
     }
 }
@@ -90,6 +93,14 @@ impl ClaudeCodeProvider {
         }
         if self.config.no_session_persistence {
             args.push("--no-session-persistence".to_string());
+        }
+        if let Some(effort) = self
+            .config
+            .reasoning_effort
+            .and_then(|effort| effort.as_claude_code_value())
+        {
+            args.push("--effort".to_string());
+            args.push(effort.to_string());
         }
 
         let model = selected_model(&self.config.model, request);
@@ -245,5 +256,17 @@ mod tests {
         );
         assert!(response.content.contains("user:\nSay hello."));
         fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn command_args_include_reasoning_effort() {
+        let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
+            reasoning_effort: Some(ProviderReasoningEffort::Max),
+            ..ClaudeCodeConfig::default()
+        });
+
+        let args = provider.command_args(&request());
+
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "max"]));
     }
 }

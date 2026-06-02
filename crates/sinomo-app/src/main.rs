@@ -11,7 +11,8 @@ use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, ClaudeCodeConfig, ClaudeCodeProvider, CodexCliConfig,
     CodexCliProvider, CommandLanguageModelProvider, GeminiConfig, GeminiProvider,
     GitHubCopilotCliConfig, GitHubCopilotCliProvider, GitHubCopilotConfig, GitHubCopilotProvider,
-    LanguageModelProvider, OpenAiConfig, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
+    LanguageModelProvider, LanguageModelProviderOptions, OpenAiConfig, OpenAiProvider,
+    PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_runtime::api::ApiService;
@@ -663,6 +664,7 @@ fn configured_deliberation_model()
             default_model: model.clone(),
             api_key: None,
             credentials_path: AnthropicConfig::default().credentials_path,
+            options: LanguageModelProviderOptions::default(),
         });
 
         return Ok(Some(ConfiguredDeliberationModel {
@@ -700,6 +702,7 @@ fn configured_deliberation_model()
             default_model: model.clone(),
             api_key: None,
             credentials_path: OpenAiConfig::default().credentials_path,
+            options: LanguageModelProviderOptions::default(),
         });
 
         return Ok(Some(ConfiguredDeliberationModel {

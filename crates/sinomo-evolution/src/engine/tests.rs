@@ -4141,7 +4141,7 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
                 "async": false,
                 "summary": "Update hello fixture."
             }],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "waiting"
         })
         .to_string(),
@@ -4149,7 +4149,7 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
             "response_mode": "answer",
             "text": "Changed hello.txt from old to new. Verification not requested.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         })
         .to_string(),

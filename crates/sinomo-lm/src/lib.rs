@@ -45,11 +45,13 @@ pub use openai::{OpenAiConfig, OpenAiProvider};
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::kv::{KvEntry, KvOp, KvSnapshot, KvTxn, decode_kv_value};
 use sinomo_runtime::local::SinomoDataDir;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -356,6 +358,200 @@ pub struct ProviderAccountConfig {
     pub api_key: Option<String>,
     #[serde(default = "provider_account_enabled_default")]
     pub enabled: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "LanguageModelProviderOptions::is_default"
+    )]
+    pub options: LanguageModelProviderOptions,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_options: Vec<LanguageModelModelOptions>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LanguageModelProviderOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ProviderReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_verbosity: Option<ProviderTextVerbosity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vendor_options: BTreeMap<String, String>,
+}
+
+impl LanguageModelProviderOptions {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn merge(&self, overrides: &Self) -> Self {
+        let mut merged = self.clone();
+        if overrides.reasoning_effort.is_some() {
+            merged.reasoning_effort = overrides.reasoning_effort;
+        }
+        if overrides.reasoning_budget_tokens.is_some() {
+            merged.reasoning_budget_tokens = overrides.reasoning_budget_tokens;
+        }
+        if overrides.text_verbosity.is_some() {
+            merged.text_verbosity = overrides.text_verbosity;
+        }
+        for (key, value) in &overrides.vendor_options {
+            merged.vendor_options.insert(key.clone(), value.clone());
+        }
+        merged
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LanguageModelModelOptions {
+    pub model: String,
+    #[serde(
+        default,
+        skip_serializing_if = "LanguageModelProviderOptions::is_default"
+    )]
+    pub options: LanguageModelProviderOptions,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh", alias = "x-high", alias = "extra-high")]
+    XHigh,
+    Max,
+}
+
+impl ProviderReasoningEffort {
+    pub const VALUES: &'static [&'static str] =
+        &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    pub(crate) fn as_openai_responses_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh | Self::Max => Some("xhigh"),
+        }
+    }
+
+    pub(crate) fn as_codex_cli_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh | Self::Max => Some("xhigh"),
+        }
+    }
+
+    pub(crate) fn as_claude_code_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Minimal | Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+
+    pub(crate) fn as_anthropic_effort_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::Minimal | Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_config_value())
+    }
+}
+
+impl FromStr for ProviderReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "disabled" => Ok(Self::None),
+            "minimal" | "min" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" | "x-high" | "extra-high" => Ok(Self::XHigh),
+            "max" | "maximum" => Ok(Self::Max),
+            _ => Err(format!(
+                "invalid reasoning effort `{value}`; expected one of {}",
+                Self::VALUES.join("|")
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderTextVerbosity {
+    Low,
+    Medium,
+    High,
+}
+
+impl ProviderTextVerbosity {
+    pub const VALUES: &'static [&'static str] = &["low", "medium", "high"];
+
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderTextVerbosity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_config_value())
+    }
+}
+
+impl FromStr for ProviderTextVerbosity {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => Err(format!(
+                "invalid text verbosity `{value}`; expected one of {}",
+                Self::VALUES.join("|")
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -768,6 +964,30 @@ pub fn provider_account_config<'a>(
     })
 }
 
+pub fn provider_options_for_model(
+    account: Option<&ProviderAccountConfig>,
+    model: &str,
+) -> LanguageModelProviderOptions {
+    let Some(account) = account else {
+        return LanguageModelProviderOptions::default();
+    };
+    let mut options = account.options.clone();
+    let normalized_model = normalize_model_id_for_provider(&account.provider, model);
+    let effective_model = effective_model_name(&account.provider, model);
+    for model_options in &account.model_options {
+        let option_model = normalize_model_id_for_provider(&account.provider, &model_options.model);
+        let option_effective_model = effective_model_name(&account.provider, &model_options.model);
+        if option_model == normalized_model
+            || option_model == effective_model
+            || option_effective_model == normalized_model
+            || option_effective_model == effective_model
+        {
+            options = options.merge(&model_options.options);
+        }
+    }
+    options
+}
+
 pub fn effective_model_name(provider: &str, configured_model: &str) -> String {
     if configured_model != PROVIDER_DEFAULT_MODEL {
         return normalize_model_id_for_provider(provider, configured_model);
@@ -966,6 +1186,7 @@ pub fn complete_configured_model_request_with_account(
         model: model.to_string(),
         ..request.clone()
     };
+    let provider_options = provider_options_for_model(account, model);
     match provider {
         GitHubCopilotProvider::PROVIDER_ID => {
             let credentials_path =
@@ -996,15 +1217,19 @@ pub fn complete_configured_model_request_with_account(
             let provider = CodexCliProvider::new(CodexCliConfig {
                 model: model_or_default(model, CODEX_CLI_DEFAULT_MODEL.to_string()),
                 working_dir: working_dir.clone(),
+                reasoning_effort: provider_options.reasoning_effort,
                 ..CodexCliConfig::default()
             });
             provider.complete(&request)
         }
-        CODEX_PROVIDER_ID => codex_provider_for_model(model).complete(&request),
+        CODEX_PROVIDER_ID => {
+            codex_provider_for_model_with_options(model, provider_options).complete(&request)
+        }
         ClaudeCodeProvider::PROVIDER_ID => {
             let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
                 model: model_or_default(model, CLAUDE_CODE_DEFAULT_MODEL.to_string()),
                 working_dir,
+                reasoning_effort: provider_options.reasoning_effort,
                 ..ClaudeCodeConfig::default()
             });
             provider.complete(&request)
@@ -1023,6 +1248,7 @@ pub fn complete_configured_model_request_with_account(
                     .and_then(|account| account.api_key.as_ref())
                     .map(|_| None)
                     .unwrap_or(Some(credentials_path)),
+                options: provider_options.clone(),
             });
             provider.complete(&request)
         }
@@ -1039,6 +1265,7 @@ pub fn complete_configured_model_request_with_account(
                     .and_then(|account| account.api_key.as_ref())
                     .map(|_| None)
                     .unwrap_or(Some(credentials_path)),
+                options: provider_options.clone(),
             });
             provider.complete(&request)
         }
@@ -1107,6 +1334,56 @@ pub fn model_or_default(model: &str, default_model: String) -> String {
     }
 }
 
+pub(crate) fn apply_provider_vendor_options_to_payload(
+    payload: &mut serde_json::Value,
+    options: &LanguageModelProviderOptions,
+) {
+    for (key, value) in &options.vendor_options {
+        apply_provider_vendor_option_to_payload(payload, key, value);
+    }
+}
+
+fn apply_provider_vendor_option_to_payload(
+    payload: &mut serde_json::Value,
+    key: &str,
+    value: &str,
+) {
+    let path = key
+        .split('.')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some((last, parents)) = path.split_last() else {
+        return;
+    };
+    let value = provider_vendor_option_json_value(value);
+    let mut target = payload;
+    for parent in parents {
+        if !target.is_object() {
+            *target = serde_json::json!({});
+        }
+        let object = target.as_object_mut().expect("target was object");
+        target = object
+            .entry((*parent).to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    target
+        .as_object_mut()
+        .expect("target was object")
+        .insert((*last).to_string(), value);
+}
+
+fn provider_vendor_option_json_value(value: &str) -> serde_json::Value {
+    let value = value.trim();
+    if value.is_empty() {
+        return serde_json::Value::String(String::new());
+    }
+    serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_string()))
+}
+
 pub fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), LanguageModelError> {
     let data_dir =
         SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
@@ -1140,6 +1417,7 @@ pub fn anthropic_provider() -> Result<(AnthropicProvider, PathBuf), LanguageMode
         default_model: AnthropicConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
+        options: LanguageModelProviderOptions::default(),
     });
     Ok((provider, credentials_path))
 }
@@ -1152,6 +1430,7 @@ pub fn openai_provider() -> Result<(OpenAiProvider, PathBuf), LanguageModelError
         default_model: OpenAiConfig::default().default_model,
         api_key: None,
         credentials_path: Some(credentials_path.clone()),
+        options: LanguageModelProviderOptions::default(),
     });
     Ok((provider, credentials_path))
 }
@@ -1205,6 +1484,13 @@ pub fn codex_provider() -> Result<(CodexProvider, PathBuf), LanguageModelError> 
 }
 
 pub fn codex_provider_for_model(model: &str) -> CodexProvider {
+    codex_provider_for_model_with_options(model, LanguageModelProviderOptions::default())
+}
+
+pub fn codex_provider_for_model_with_options(
+    model: &str,
+    options: LanguageModelProviderOptions,
+) -> CodexProvider {
     let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
     let config_default = OpenAiResponsesCodexConfig::default();
     let client_config = OpenAiResponsesCodexConfig {
@@ -1218,6 +1504,7 @@ pub fn codex_provider_for_model(model: &str) -> CodexProvider {
     CodexProvider::new(
         CodexConfig {
             default_model,
+            options,
             ..CodexConfig::default()
         },
         OpenAiResponsesCodexClient::new(client_config),
@@ -1329,7 +1616,9 @@ pub fn save_provider_api_key_in_model_config(
         });
     }
     let account = normalize_provider_account_name(account);
-    let default_model = provider_account_config(config, &provider, Some(&account))
+    let existing = provider_account_config(config, &provider, Some(&account)).cloned();
+    let default_model = existing
+        .as_ref()
         .and_then(|existing| existing.default_model.clone())
         .unwrap_or_else(|| effective_model_name(&provider, PROVIDER_DEFAULT_MODEL));
     upsert_provider_account_config(
@@ -1338,10 +1627,19 @@ pub fn save_provider_api_key_in_model_config(
             provider: provider.clone(),
             account: account.clone(),
             default_model: Some(default_model),
-            api_base_url: provider_account_config(config, &provider, Some(&account))
+            api_base_url: existing
+                .as_ref()
                 .and_then(|existing| existing.api_base_url.clone()),
             api_key: Some(api_key.trim().to_string()),
             enabled: true,
+            options: existing
+                .as_ref()
+                .map(|existing| existing.options.clone())
+                .unwrap_or_default(),
+            model_options: existing
+                .as_ref()
+                .map(|existing| existing.model_options.clone())
+                .unwrap_or_default(),
         },
     )?;
     Ok(provider_accounts(config)
@@ -1846,6 +2144,163 @@ mod tests {
         assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn model_config_reads_old_account_schema_with_default_options() {
+        let config: ModelConfig = serde_json::from_str(
+            r#"{
+                "default_provider": "openai",
+                "accounts": [
+                    {
+                        "provider": "openai",
+                        "account": "default",
+                        "default_model": "gpt-5.5",
+                        "enabled": true
+                    }
+                ]
+            }"#,
+        )
+        .expect("old schema config");
+
+        let account =
+            provider_account_config(&config, "openai", Some("default")).expect("provider account");
+
+        assert!(account.options.is_default());
+        assert!(account.model_options.is_empty());
+    }
+
+    #[test]
+    fn model_config_serializes_xhigh_reasoning_effort_without_dash() {
+        let config = ModelConfig {
+            accounts: vec![ProviderAccountConfig {
+                provider: OpenAiProvider::PROVIDER_ID.to_string(),
+                account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+                default_model: None,
+                api_base_url: None,
+                api_key: None,
+                enabled: true,
+                options: LanguageModelProviderOptions {
+                    reasoning_effort: Some(ProviderReasoningEffort::XHigh),
+                    ..LanguageModelProviderOptions::default()
+                },
+                model_options: Vec::new(),
+            }],
+            ..ModelConfig::default()
+        };
+
+        let json = serde_json::to_string(&config).expect("json");
+        let parsed: ModelConfig = serde_json::from_str(&json).expect("round trip");
+
+        assert!(json.contains(r#""reasoning_effort":"xhigh""#));
+        assert_eq!(
+            parsed.accounts[0].options.reasoning_effort,
+            Some(ProviderReasoningEffort::XHigh)
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderReasoningEffort>(r#""x-high""#).expect("legacy alias"),
+            ProviderReasoningEffort::XHigh
+        );
+    }
+
+    #[test]
+    fn provider_options_for_model_merges_account_and_model_overrides() {
+        let mut account_options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::Low),
+            text_verbosity: Some(ProviderTextVerbosity::Medium),
+            ..LanguageModelProviderOptions::default()
+        };
+        account_options
+            .vendor_options
+            .insert("metadata.trace".to_string(), "false".to_string());
+        let mut model_options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::High),
+            ..LanguageModelProviderOptions::default()
+        };
+        model_options
+            .vendor_options
+            .insert("metadata.trace".to_string(), "true".to_string());
+        let account = ProviderAccountConfig {
+            provider: OpenAiProvider::PROVIDER_ID.to_string(),
+            account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            default_model: Some("gpt-5.5".to_string()),
+            api_base_url: None,
+            api_key: None,
+            enabled: true,
+            options: account_options,
+            model_options: vec![LanguageModelModelOptions {
+                model: "gpt-5.5".to_string(),
+                options: model_options,
+            }],
+        };
+
+        let options = provider_options_for_model(Some(&account), "gpt-5.5");
+
+        assert_eq!(
+            options.reasoning_effort,
+            Some(ProviderReasoningEffort::High)
+        );
+        assert_eq!(options.text_verbosity, Some(ProviderTextVerbosity::Medium));
+        assert_eq!(
+            options
+                .vendor_options
+                .get("metadata.trace")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn save_provider_api_key_preserves_provider_options() {
+        let mut config = ModelConfig::default();
+        let mut account_options = LanguageModelProviderOptions {
+            reasoning_effort: Some(ProviderReasoningEffort::XHigh),
+            ..LanguageModelProviderOptions::default()
+        };
+        account_options
+            .vendor_options
+            .insert("text.format.strict".to_string(), "true".to_string());
+        upsert_provider_account_config(
+            &mut config,
+            ProviderAccountConfig {
+                provider: OpenAiProvider::PROVIDER_ID.to_string(),
+                account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+                default_model: Some("gpt-5.5".to_string()),
+                api_base_url: Some("https://api.example.test/v1".to_string()),
+                api_key: None,
+                enabled: true,
+                options: account_options.clone(),
+                model_options: vec![LanguageModelModelOptions {
+                    model: "gpt-5.5".to_string(),
+                    options: LanguageModelProviderOptions {
+                        text_verbosity: Some(ProviderTextVerbosity::Low),
+                        ..LanguageModelProviderOptions::default()
+                    },
+                }],
+            },
+        )
+        .expect("upsert account");
+
+        save_provider_api_key_in_model_config(
+            &mut config,
+            OpenAiProvider::PROVIDER_ID,
+            Some(DEFAULT_PROVIDER_ACCOUNT),
+            "sk-test",
+        )
+        .expect("save key");
+
+        let account = provider_account_config(
+            &config,
+            OpenAiProvider::PROVIDER_ID,
+            Some(DEFAULT_PROVIDER_ACCOUNT),
+        )
+        .expect("provider account");
+        assert_eq!(account.options, account_options);
+        assert_eq!(account.model_options.len(), 1);
+        assert_eq!(
+            account.model_options[0].options.text_verbosity,
+            Some(ProviderTextVerbosity::Low)
+        );
     }
 
     #[test]

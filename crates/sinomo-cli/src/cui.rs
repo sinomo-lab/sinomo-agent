@@ -1,15 +1,22 @@
 use super::*;
+use crate::file_manager::{
+    FileManagerEntryKind, FileManagerPrompt, FileManagerState, format_file_size,
+};
+use crate::sifs_file_manager::SifsFileManagerBackend;
 #[cfg(feature = "native-models")]
 use candle_core::{DType, Device, Tensor};
 use crossterm::{
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Position, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -29,9 +36,8 @@ use tokenizers::Tokenizer;
 const RUST_MINICPM_V46_PROVIDER_ID: &str = "sinomo-models";
 #[cfg(feature = "native-models")]
 const DEFAULT_RUST_MINICPM_V46_CACHE_SUBDIR: &str = "openbmb--MiniCPM-V-4_6";
-const FILE_BROWSER_PREVIEW_MAX_BYTES: u64 = 64 * 1024;
-const FILE_BROWSER_PREVIEW_MAX_LINES: usize = 200;
 const TUI_SESSION_SCHEMA_VERSION: u32 = 1;
+const TUI_MOUSE_SCROLL_LINES: isize = 4;
 
 pub fn run_cui() -> Result<(), CliError> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -255,47 +261,29 @@ fn run_cui_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         }
         match event::read().map_err(CliError::stdio)? {
             CrosstermEvent::Key(key) => {
-                match state.apply_key_event(key) {
-                    TuiInputAction::None => {}
-                    TuiInputAction::Exit => {
-                        submit_tui_input(
-                            &mut runtime,
-                            &mut state,
-                            &mut terminal,
-                            &data_dir,
-                            &session_store,
-                            daemon.as_ref(),
-                            "/quit".to_string(),
-                        )?;
-                    }
-                    TuiInputAction::Submit(line) => {
-                        submit_tui_input(
-                            &mut runtime,
-                            &mut state,
-                            &mut terminal,
-                            &data_dir,
-                            &session_store,
-                            daemon.as_ref(),
-                            line,
-                        )?;
-                    }
-                    TuiInputAction::OpenSessions => {
-                        open_tui_session_list_view(&runtime, &mut state, &session_store)?;
-                    }
-                    TuiInputAction::Resume(session_id) => {
-                        for output in resume_tui_session(
-                            &mut runtime,
-                            &mut state,
-                            &session_store,
-                            &data_dir,
-                            daemon.as_ref(),
-                            session_id,
-                        )? {
-                            state.apply_output(output);
-                        }
-                        session_store.save_state(runtime.session(), &state)?;
-                    }
-                }
+                handle_tui_input_action(
+                    state.apply_key_event(key),
+                    &mut runtime,
+                    &mut state,
+                    &mut terminal,
+                    &data_dir,
+                    &session_store,
+                    daemon.as_ref(),
+                )?;
+                terminal.draw(&state)?;
+            }
+            CrosstermEvent::Mouse(mouse) => {
+                let area = terminal.viewport()?;
+                let action = state.apply_mouse_event(mouse, area);
+                handle_tui_input_action(
+                    action,
+                    &mut runtime,
+                    &mut state,
+                    &mut terminal,
+                    &data_dir,
+                    &session_store,
+                    daemon.as_ref(),
+                )?;
                 terminal.draw(&state)?;
             }
             CrosstermEvent::Paste(text) => {
@@ -307,6 +295,54 @@ fn run_cui_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         }
     }
 
+    Ok(())
+}
+
+fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
+    action: TuiInputAction,
+    runtime: &mut InteractionRuntime<JsonlEventStore, H>,
+    state: &mut CuiTuiState,
+    terminal: &mut TuiTerminalSession,
+    data_dir: &SinomoDataDir,
+    session_store: &TuiSessionStore,
+    daemon: Option<&DaemonStatus>,
+) -> Result<(), CliError> {
+    match action {
+        TuiInputAction::None => {}
+        TuiInputAction::Exit => {
+            submit_tui_input(
+                runtime,
+                state,
+                terminal,
+                data_dir,
+                session_store,
+                daemon,
+                "/quit".to_string(),
+            )?;
+        }
+        TuiInputAction::Submit(line) => {
+            submit_tui_input(
+                runtime,
+                state,
+                terminal,
+                data_dir,
+                session_store,
+                daemon,
+                line,
+            )?;
+        }
+        TuiInputAction::OpenSessions => {
+            open_tui_session_list_view(runtime, state, session_store)?;
+        }
+        TuiInputAction::Resume(session_id) => {
+            for output in
+                resume_tui_session(runtime, state, session_store, data_dir, daemon, session_id)?
+            {
+                state.apply_output(output);
+            }
+            session_store.save_state(runtime.session(), state)?;
+        }
+    }
     Ok(())
 }
 
@@ -391,7 +427,7 @@ impl TuiTerminalSession {
     fn enter() -> Result<Self, CliError> {
         enable_raw_mode().map_err(CliError::stdio)?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
             let _ = disable_raw_mode();
             return Err(CliError::stdio(error));
         }
@@ -400,7 +436,7 @@ impl TuiTerminalSession {
             Err(error) => {
                 let _ = disable_raw_mode();
                 let mut stdout = io::stdout();
-                let _ = execute!(stdout, LeaveAlternateScreen);
+                let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
                 return Err(CliError::stdio(error));
             }
         };
@@ -413,6 +449,11 @@ impl TuiTerminalSession {
             .map(|_| ())
             .map_err(CliError::stdio)
     }
+
+    fn viewport(&self) -> Result<Rect, CliError> {
+        let size = self.terminal.size().map_err(CliError::stdio)?;
+        Ok(Rect::new(0, 0, size.width, size.height))
+    }
 }
 
 impl Drop for TuiTerminalSession {
@@ -420,7 +461,7 @@ impl Drop for TuiTerminalSession {
         let _ = self.terminal.show_cursor();
         let _ = disable_raw_mode();
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -441,7 +482,7 @@ struct TuiCompletionState {
     items: Vec<SlashCompletionItem>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CuiTuiViewMode {
     Chat,
     Files,
@@ -652,264 +693,14 @@ impl TuiSessionStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum FileBrowserEntryKind {
-    Parent,
-    Directory,
-    File,
-    Symlink,
-    Other,
-}
-
-impl FileBrowserEntryKind {
-    fn sort_rank(&self) -> u8 {
-        match self {
-            Self::Parent => 0,
-            Self::Directory => 1,
-            Self::File => 2,
-            Self::Symlink => 3,
-            Self::Other => 4,
-        }
-    }
-
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Parent => "[up]",
-            Self::Directory => "[dir]",
-            Self::File => "[file]",
-            Self::Symlink => "[link]",
-            Self::Other => "[item]",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FileBrowserEntry {
-    name: String,
-    path: PathBuf,
-    kind: FileBrowserEntryKind,
-    size: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FileBrowserPreview {
-    title: String,
-    lines: Vec<String>,
-}
-
-impl FileBrowserPreview {
-    fn new(title: impl Into<String>, lines: Vec<String>) -> Self {
-        Self {
-            title: title.into(),
-            lines,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FileBrowserState {
-    current_dir: PathBuf,
-    entries: Vec<FileBrowserEntry>,
-    selected: usize,
-    preview: FileBrowserPreview,
-}
-
-impl FileBrowserState {
-    fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
-        let path = path.into();
-        let path = if path.as_os_str().is_empty() {
-            env::current_dir().map_err(|error| format!("cannot read current directory: {error}"))?
-        } else {
-            path
-        };
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-        let (current_dir, selected_path) = if metadata.is_dir() {
-            (path, None)
-        } else {
-            let parent = path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."));
-            (parent, Some(path))
-        };
-        let current_dir = current_dir.canonicalize().unwrap_or(current_dir);
-        let selected_path = selected_path.map(|path| path.canonicalize().unwrap_or(path));
-        let mut browser = Self {
-            current_dir,
-            entries: Vec::new(),
-            selected: 0,
-            preview: FileBrowserPreview::new("Preview", Vec::new()),
-        };
-        browser.refresh_select(selected_path.as_deref())?;
-        Ok(browser)
-    }
-
-    fn refresh(&mut self) -> Result<(), String> {
-        let selected_path = self.selected_entry().map(|entry| entry.path.clone());
-        self.refresh_select(selected_path.as_deref())
-    }
-
-    fn refresh_select(&mut self, selected_path: Option<&Path>) -> Result<(), String> {
-        self.entries = load_file_browser_entries(&self.current_dir)?;
-        if let Some(selected_path) = selected_path
-            && let Some(index) = self
-                .entries
-                .iter()
-                .position(|entry| entry.path == selected_path)
-        {
-            self.selected = index;
-        } else if self.entries.is_empty() {
-            self.selected = 0;
-        } else {
-            self.selected = self.selected.min(self.entries.len() - 1);
-        }
-        self.update_preview();
-        Ok(())
-    }
-
-    fn selected_entry(&self) -> Option<&FileBrowserEntry> {
-        self.entries.get(self.selected)
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let last = self.entries.len() - 1;
-        self.selected = if delta.is_negative() {
-            self.selected.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.selected.saturating_add(delta as usize).min(last)
-        };
-        self.update_preview();
-    }
-
-    fn open_selected(&mut self) -> Result<String, String> {
-        let Some(entry) = self.selected_entry().cloned() else {
-            return Ok("no file selected".to_string());
-        };
-        if entry.kind == FileBrowserEntryKind::Parent {
-            self.go_parent()?;
-            return Ok(format!("opened {}", self.current_dir.display()));
-        }
-        if entry.kind == FileBrowserEntryKind::Directory || entry.path.is_dir() {
-            self.current_dir = entry.path;
-            self.refresh_select(None)?;
-            return Ok(format!("opened {}", self.current_dir.display()));
-        }
-        self.update_preview();
-        Ok(format!("previewing {}", entry.name))
-    }
-
-    fn go_parent(&mut self) -> Result<String, String> {
-        let Some(parent) = self.current_dir.parent().map(Path::to_path_buf) else {
-            return Ok("already at filesystem root".to_string());
-        };
-        let previous = self.current_dir.clone();
-        self.current_dir = parent;
-        self.refresh_select(Some(&previous))?;
-        Ok(format!("opened {}", self.current_dir.display()))
-    }
-
-    fn create_file(&mut self, name: &str) -> Result<String, String> {
-        let path = file_browser_child_path(&self.current_dir, name)?;
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| format!("cannot create file {}: {error}", path.display()))?;
-        self.refresh_select(Some(&path))?;
-        Ok(format!("created file {}", file_browser_display_name(&path)))
-    }
-
-    fn create_dir(&mut self, name: &str) -> Result<String, String> {
-        let path = file_browser_child_path(&self.current_dir, name)?;
-        fs::create_dir(&path)
-            .map_err(|error| format!("cannot create directory {}: {error}", path.display()))?;
-        self.refresh_select(Some(&path))?;
-        Ok(format!(
-            "created directory {}",
-            file_browser_display_name(&path)
-        ))
-    }
-
-    fn rename_selected(&mut self, target_name: &str) -> Result<String, String> {
-        let Some(entry) = self.selected_entry().cloned() else {
-            return Err("no file selected".to_string());
-        };
-        if entry.kind == FileBrowserEntryKind::Parent {
-            return Err("cannot rename parent directory entry".to_string());
-        }
-        let target = file_browser_child_path(&self.current_dir, target_name)?;
-        fs::rename(&entry.path, &target).map_err(|error| {
-            format!(
-                "cannot rename {} to {}: {error}",
-                entry.path.display(),
-                target.display()
-            )
-        })?;
-        self.refresh_select(Some(&target))?;
-        Ok(format!(
-            "renamed {} to {}",
-            entry.name,
-            file_browser_display_name(&target)
-        ))
-    }
-
-    fn delete_selected(&mut self, confirmation: &str) -> Result<String, String> {
-        let Some(entry) = self.selected_entry().cloned() else {
-            return Err("no file selected".to_string());
-        };
-        if entry.kind == FileBrowserEntryKind::Parent {
-            return Err("cannot delete parent directory entry".to_string());
-        }
-        if confirmation.trim() != "DELETE" {
-            return Err(format!("type DELETE to remove {}", entry.name));
-        }
-        match entry.kind {
-            FileBrowserEntryKind::Directory => fs::remove_dir(&entry.path).map_err(|error| {
-                format!(
-                    "cannot delete directory {}: {error}; only empty directories can be deleted",
-                    entry.path.display()
-                )
-            })?,
-            _ => fs::remove_file(&entry.path)
-                .map_err(|error| format!("cannot delete file {}: {error}", entry.path.display()))?,
-        }
-        self.refresh()?;
-        Ok(format!("deleted {}", entry.name))
-    }
-
-    fn update_preview(&mut self) {
-        self.preview = match self.selected_entry() {
-            Some(entry) => file_browser_preview(entry),
-            None => FileBrowserPreview::new("Empty", vec!["directory has no entries".to_string()]),
-        };
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum FileBrowserPrompt {
-    NewFile,
-    NewDirectory,
-    Rename,
-    Delete,
-}
-
-impl FileBrowserPrompt {
-    fn title(&self) -> &'static str {
-        match self {
-            Self::NewFile => "New File",
-            Self::NewDirectory => "New Directory",
-            Self::Rename => "Rename To",
-            Self::Delete => "Confirm Delete",
-        }
-    }
+enum TuiFilesTarget {
+    Local(PathBuf),
+    Sifs(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiSlashCommand {
-    Files { target: PathBuf },
+    Files { target: TuiFilesTarget },
     Model(TuiModelCommand),
     Sessions,
     Resume { session_id: SessionId },
@@ -990,14 +781,12 @@ struct TuiMessage {
 #[derive(Clone, Debug)]
 struct CuiTuiState {
     session_id: String,
-    node_id: String,
-    daemon_label: String,
     daemon_connected: bool,
     cluster_label: Option<String>,
     runtime_info: TuiAgentRuntimeInfo,
     view_mode: CuiTuiViewMode,
-    file_browser: Option<FileBrowserState>,
-    file_prompt: Option<FileBrowserPrompt>,
+    file_browser: Option<FileManagerState>,
+    file_prompt: Option<FileManagerPrompt>,
     session_list: Option<TuiSessionListState>,
     input: String,
     input_cursor: usize,
@@ -1015,16 +804,11 @@ impl CuiTuiState {
         daemon: Option<&DaemonStatus>,
         runtime_info: TuiAgentRuntimeInfo,
     ) -> Self {
-        let daemon_label = daemon
-            .map(|status| format!("daemon pid={} address={}", status.pid, status.address))
-            .unwrap_or_else(|| "daemon not connected".to_string());
         let cluster_label = daemon
             .and_then(|status| status.cluster.as_ref())
             .map(|cluster| format!("cluster {}", cluster.cluster_id));
         let mut state = Self {
             session_id: session.session_id.to_string(),
-            node_id: session.node_id.to_string(),
-            daemon_label,
             daemon_connected: daemon.is_some(),
             cluster_label,
             runtime_info,
@@ -1054,6 +838,10 @@ impl CuiTuiState {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 TuiInputAction::Exit
             }
+            KeyCode::F(1) => {
+                self.open_chat_tab();
+                TuiInputAction::None
+            }
             KeyCode::F(2) => {
                 self.toggle_file_browser();
                 TuiInputAction::None
@@ -1070,7 +858,13 @@ impl CuiTuiState {
                 TuiInputAction::None
             }
             KeyCode::Esc => TuiInputAction::Exit,
-            KeyCode::Enter => self.take_submission(),
+            KeyCode::Enter => {
+                if self.accept_completion() {
+                    TuiInputAction::None
+                } else {
+                    self.take_submission()
+                }
+            }
             KeyCode::Tab => {
                 self.accept_completion();
                 TuiInputAction::None
@@ -1084,13 +878,13 @@ impl CuiTuiState {
                 TuiInputAction::None
             }
             KeyCode::Left => {
-                self.move_cursor_left();
+                if !self.step_slash_completion_back() {
+                    self.move_cursor_left();
+                }
                 TuiInputAction::None
             }
             KeyCode::Right => {
-                if self.completions.is_some() {
-                    self.accept_completion();
-                } else {
+                if !self.accept_completion() {
                     self.move_cursor_right();
                 }
                 TuiInputAction::None
@@ -1133,6 +927,187 @@ impl CuiTuiState {
                 TuiInputAction::None
             }
             _ => TuiInputAction::None,
+        }
+    }
+
+    fn apply_mouse_event(&mut self, mouse: MouseEvent, area: Rect) -> TuiInputAction {
+        let layout = tui_layout_areas(area, self);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.apply_mouse_left_click(&layout, mouse.column, mouse.row)
+            }
+            MouseEventKind::ScrollUp => {
+                self.apply_mouse_scroll(&layout, mouse.column, mouse.row, true);
+                TuiInputAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.apply_mouse_scroll(&layout, mouse.column, mouse.row, false);
+                TuiInputAction::None
+            }
+            _ => TuiInputAction::None,
+        }
+    }
+
+    fn apply_mouse_left_click(
+        &mut self,
+        layout: &TuiLayoutAreas,
+        column: u16,
+        row: u16,
+    ) -> TuiInputAction {
+        if let Some(tab) = tui_menu_tab_at(layout.menu, column, row) {
+            return match tab {
+                CuiTuiViewMode::Chat => {
+                    self.open_chat_tab();
+                    TuiInputAction::None
+                }
+                CuiTuiViewMode::Files => {
+                    if self.view_mode != CuiTuiViewMode::Files {
+                        self.open_file_browser_current_dir();
+                    }
+                    TuiInputAction::None
+                }
+                CuiTuiViewMode::Sessions => {
+                    if self.view_mode == CuiTuiViewMode::Sessions {
+                        TuiInputAction::None
+                    } else {
+                        TuiInputAction::OpenSessions
+                    }
+                }
+            };
+        }
+
+        match self.view_mode {
+            CuiTuiViewMode::Chat => {
+                if let Some(completions_area) = layout.completions {
+                    self.select_completion_at(completions_area, column, row);
+                }
+            }
+            CuiTuiViewMode::Files => {
+                let (entries_area, _) = tui_file_browser_areas(layout.main);
+                self.select_file_browser_entry_at(entries_area, column, row);
+            }
+            CuiTuiViewMode::Sessions => {
+                self.select_session_at(layout.main, column, row);
+            }
+        }
+        TuiInputAction::None
+    }
+
+    fn apply_mouse_scroll(&mut self, layout: &TuiLayoutAreas, column: u16, row: u16, up: bool) {
+        match self.view_mode {
+            CuiTuiViewMode::Chat => {
+                if let Some(completions_area) = layout.completions
+                    && rect_contains(completions_area, column, row)
+                {
+                    if up {
+                        self.select_previous_completion();
+                    } else {
+                        self.select_next_completion();
+                    }
+                    return;
+                }
+                if rect_contains(layout.main, column, row) {
+                    if up {
+                        self.scrollback = self
+                            .scrollback
+                            .saturating_add(TUI_MOUSE_SCROLL_LINES as u16);
+                    } else {
+                        self.scrollback = self
+                            .scrollback
+                            .saturating_sub(TUI_MOUSE_SCROLL_LINES as u16);
+                    }
+                }
+            }
+            CuiTuiViewMode::Files => {
+                let (entries_area, _) = tui_file_browser_areas(layout.main);
+                let entries_inner = tui_inner_rect(entries_area);
+                if rect_contains(entries_inner, column, row)
+                    && let Some(browser) = self.file_browser.as_mut()
+                {
+                    browser.move_selection(if up {
+                        -TUI_MOUSE_SCROLL_LINES
+                    } else {
+                        TUI_MOUSE_SCROLL_LINES
+                    });
+                }
+            }
+            CuiTuiViewMode::Sessions => {
+                let list_inner = tui_inner_rect(layout.main);
+                if rect_contains(list_inner, column, row)
+                    && let Some(list) = self.session_list.as_mut()
+                {
+                    list.move_selection(if up {
+                        -TUI_MOUSE_SCROLL_LINES
+                    } else {
+                        TUI_MOUSE_SCROLL_LINES
+                    });
+                }
+            }
+        }
+    }
+
+    fn select_completion_at(&mut self, area: Rect, column: u16, row: u16) {
+        let inner = tui_inner_rect(area);
+        if !rect_contains(inner, column, row) {
+            return;
+        }
+        let selected = {
+            let Some(completions) = self.completions.as_mut() else {
+                return;
+            };
+            let visible_height = usize::from(inner.height);
+            let (visible_start, visible_end) = completion_visible_range(
+                completions.items.len(),
+                completions.selected,
+                visible_height,
+            );
+            let index = visible_start + usize::from(row - inner.y);
+            if index >= visible_end {
+                return;
+            }
+            completions.selected = Some(index);
+            true
+        };
+        if selected {
+            self.apply_selected_completion_preview();
+        }
+    }
+
+    fn select_file_browser_entry_at(&mut self, area: Rect, column: u16, row: u16) {
+        let inner = tui_inner_rect(area);
+        if !rect_contains(inner, column, row) {
+            return;
+        }
+        let Some(browser) = self.file_browser.as_mut() else {
+            return;
+        };
+        let visible_height = usize::from(inner.height);
+        let (visible_start, visible_end) = completion_visible_range(
+            browser.entries.len(),
+            Some(browser.selected),
+            visible_height,
+        );
+        let index = visible_start + usize::from(row - inner.y);
+        if index < visible_end {
+            browser.selected = index;
+            browser.update_preview();
+        }
+    }
+
+    fn select_session_at(&mut self, area: Rect, column: u16, row: u16) {
+        let inner = tui_inner_rect(area);
+        if !rect_contains(inner, column, row) {
+            return;
+        }
+        let Some(list) = self.session_list.as_mut() else {
+            return;
+        };
+        let visible_height = usize::from(inner.height);
+        let (visible_start, visible_end) =
+            completion_visible_range(list.sessions.len(), Some(list.selected), visible_height);
+        let index = visible_start + usize::from(row - inner.y);
+        if index < visible_end {
+            list.selected = index;
         }
     }
 
@@ -1287,34 +1262,30 @@ impl CuiTuiState {
             }
             KeyCode::Home => {
                 if let Some(browser) = self.file_browser.as_mut() {
-                    browser.selected = 0;
-                    browser.update_preview();
+                    browser.select_first();
                 }
                 TuiInputAction::None
             }
             KeyCode::End => {
-                if let Some(browser) = self.file_browser.as_mut()
-                    && !browser.entries.is_empty()
-                {
-                    browser.selected = browser.entries.len() - 1;
-                    browser.update_preview();
+                if let Some(browser) = self.file_browser.as_mut() {
+                    browser.select_last();
                 }
                 TuiInputAction::None
             }
             KeyCode::Char('n') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_file_prompt(FileBrowserPrompt::NewFile);
+                self.start_file_prompt(FileManagerPrompt::NewFile);
                 TuiInputAction::None
             }
             KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_file_prompt(FileBrowserPrompt::NewDirectory);
+                self.start_file_prompt(FileManagerPrompt::NewDirectory);
                 TuiInputAction::None
             }
             KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_file_prompt(FileBrowserPrompt::Rename);
+                self.start_file_prompt(FileManagerPrompt::Rename);
                 TuiInputAction::None
             }
             KeyCode::Char('x') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.start_file_prompt(FileBrowserPrompt::Delete);
+                self.start_file_prompt(FileManagerPrompt::Delete);
                 TuiInputAction::None
             }
             _ => TuiInputAction::None,
@@ -1333,6 +1304,14 @@ impl CuiTuiState {
         self.runtime_info = runtime_info;
     }
 
+    fn open_chat_tab(&mut self) {
+        match self.view_mode {
+            CuiTuiViewMode::Chat => {}
+            CuiTuiViewMode::Files => self.close_file_browser(),
+            CuiTuiViewMode::Sessions => self.close_session_list(),
+        }
+    }
+
     fn open_file_browser_current_dir(&mut self) {
         let target = match env::current_dir() {
             Ok(path) => path,
@@ -1345,21 +1324,45 @@ impl CuiTuiState {
     }
 
     fn open_file_browser_at(&mut self, target: PathBuf) {
-        match FileBrowserState::open(target) {
+        match FileManagerState::open_local(target) {
             Ok(browser) => {
-                let current_dir = browser.current_dir.display().to_string();
-                self.view_mode = CuiTuiViewMode::Files;
-                self.file_browser = Some(browser);
-                self.file_prompt = None;
-                self.input.clear();
-                self.input_cursor = 0;
-                self.completions = None;
-                self.status = format!("browsing {current_dir}");
+                self.install_file_browser(browser);
             }
             Err(error) => {
                 self.status = format!("file browser error: {error}");
             }
         }
+    }
+
+    fn open_sifs_file_browser_at(&mut self, data_dir: &SinomoDataDir, target: &str) {
+        match SifsFileManagerBackend::open(data_dir)
+            .and_then(|backend| FileManagerState::open(Arc::new(backend), target))
+        {
+            Ok(browser) => self.install_file_browser(browser),
+            Err(error) => {
+                self.status = format!("file browser error: {error}");
+            }
+        }
+    }
+
+    fn open_files_target(&mut self, data_dir: &SinomoDataDir, target: TuiFilesTarget) {
+        match target {
+            TuiFilesTarget::Local(path) => self.open_file_browser_at(path),
+            TuiFilesTarget::Sifs(path) => self.open_sifs_file_browser_at(data_dir, &path),
+        }
+    }
+
+    fn install_file_browser(&mut self, browser: FileManagerState) {
+        let current_path = browser.current_path().to_string();
+        let source = browser.source_label().to_string();
+        self.view_mode = CuiTuiViewMode::Files;
+        self.file_browser = Some(browser);
+        self.file_prompt = None;
+        self.session_list = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.status = format!("browsing {source} {current_path}");
     }
 
     fn close_file_browser(&mut self) {
@@ -1404,7 +1407,6 @@ impl CuiTuiState {
             });
         }
         self.session_id = session.session_id.to_string();
-        self.node_id = session.node_id.to_string();
         self.runtime_info = runtime_info;
         self.view_mode = CuiTuiViewMode::Chat;
         self.file_browser = None;
@@ -1422,7 +1424,7 @@ impl CuiTuiState {
 
     fn with_file_browser(
         &mut self,
-        action: impl FnOnce(&mut FileBrowserState) -> Result<String, String>,
+        action: impl FnOnce(&mut FileManagerState) -> Result<String, String>,
     ) {
         let Some(browser) = self.file_browser.as_mut() else {
             self.status = "file browser is not open".to_string();
@@ -1434,20 +1436,20 @@ impl CuiTuiState {
         };
     }
 
-    fn start_file_prompt(&mut self, prompt: FileBrowserPrompt) {
+    fn start_file_prompt(&mut self, prompt: FileManagerPrompt) {
         if matches!(
             prompt,
-            FileBrowserPrompt::Rename | FileBrowserPrompt::Delete
+            FileManagerPrompt::Rename | FileManagerPrompt::Delete
         ) {
             let Some(entry) = self
                 .file_browser
                 .as_ref()
-                .and_then(FileBrowserState::selected_entry)
+                .and_then(FileManagerState::selected_entry)
             else {
                 self.status = "no file selected".to_string();
                 return;
             };
-            if entry.kind == FileBrowserEntryKind::Parent {
+            if entry.kind == FileManagerEntryKind::Parent {
                 self.status = "select a file or directory first".to_string();
                 return;
             }
@@ -1457,10 +1459,10 @@ impl CuiTuiState {
         self.input_cursor = 0;
         self.completions = None;
         self.status = match self.file_prompt {
-            Some(FileBrowserPrompt::NewFile) => "enter new file name".to_string(),
-            Some(FileBrowserPrompt::NewDirectory) => "enter new directory name".to_string(),
-            Some(FileBrowserPrompt::Rename) => "enter new name".to_string(),
-            Some(FileBrowserPrompt::Delete) => "type DELETE to remove selected item".to_string(),
+            Some(FileManagerPrompt::NewFile) => "enter new file name".to_string(),
+            Some(FileManagerPrompt::NewDirectory) => "enter new directory name".to_string(),
+            Some(FileManagerPrompt::Rename) => "enter new name".to_string(),
+            Some(FileManagerPrompt::Delete) => "type DELETE to remove selected item".to_string(),
             None => self.status.clone(),
         };
     }
@@ -1479,10 +1481,10 @@ impl CuiTuiState {
         let value = std::mem::take(&mut self.input);
         self.input_cursor = 0;
         self.with_file_browser(|browser| match prompt {
-            FileBrowserPrompt::NewFile => browser.create_file(&value),
-            FileBrowserPrompt::NewDirectory => browser.create_dir(&value),
-            FileBrowserPrompt::Rename => browser.rename_selected(&value),
-            FileBrowserPrompt::Delete => browser.delete_selected(&value),
+            FileManagerPrompt::NewFile => browser.create_file(&value),
+            FileManagerPrompt::NewDirectory => browser.create_dir(&value),
+            FileManagerPrompt::Rename => browser.rename_selected(&value),
+            FileManagerPrompt::Delete => browser.delete_selected(&value),
         });
     }
 
@@ -1491,7 +1493,7 @@ impl CuiTuiState {
             return self
                 .file_prompt
                 .as_ref()
-                .map(FileBrowserPrompt::title)
+                .map(FileManagerPrompt::title)
                 .unwrap_or("Files");
         }
         if self.view_mode == CuiTuiViewMode::Sessions {
@@ -1727,30 +1729,42 @@ impl CuiTuiState {
         self.apply_selected_completion_preview();
     }
 
-    fn accept_completion(&mut self) {
-        if self.completions.is_none() {
-            return;
+    fn accept_completion(&mut self) -> bool {
+        let Some(selected) = self.selected_fillable_completion() else {
+            return false;
+        };
+        if let Some(completions) = self.completions.as_mut() {
+            completions.selected = Some(selected);
         }
-        let needs_preview = self
-            .completions
-            .as_ref()
-            .and_then(|completions| completions.selected)
-            .is_none();
-        if needs_preview {
-            if let Some(completions) = self.completions.as_mut() {
-                completions.selected = Some(0);
-            }
-            self.apply_selected_completion_preview();
+        if !self.apply_selected_completion_preview() {
+            return false;
         }
         self.refresh_completions();
+        true
     }
 
-    fn apply_selected_completion_preview(&mut self) {
+    fn selected_fillable_completion(&self) -> Option<usize> {
+        let completions = self.completions.as_ref()?;
+        if let Some(selected) = completions.selected.filter(|selected| {
+            completions
+                .items
+                .get(*selected)
+                .is_some_and(|item| item.insert.is_some())
+        }) {
+            return Some(selected);
+        }
+        completions
+            .items
+            .iter()
+            .position(|item| item.insert.is_some())
+    }
+
+    fn apply_selected_completion_preview(&mut self) -> bool {
         let Some(completions) = self.completions.as_mut() else {
-            return;
+            return false;
         };
         let Some(selected) = completions.selected else {
-            return;
+            return false;
         };
         let Some(insert) = completions
             .items
@@ -1758,17 +1772,42 @@ impl CuiTuiState {
             .and_then(|item| item.insert.as_ref())
             .cloned()
         else {
-            return;
+            return false;
         };
         if completions.replace_start > completions.replace_end
             || completions.replace_end > self.input.len()
         {
-            return;
+            return false;
         }
         self.input
             .replace_range(completions.replace_start..completions.replace_end, &insert);
         completions.replace_end = completions.replace_start + insert.len();
         self.input_cursor = completions.replace_end;
+        true
+    }
+
+    fn step_slash_completion_back(&mut self) -> bool {
+        if self.view_mode != CuiTuiViewMode::Chat
+            || !self.input.starts_with('/')
+            || self.input_cursor != self.input.len()
+        {
+            return false;
+        }
+        let trimmed_end = self.input.trim_end_matches(char::is_whitespace).len();
+        if trimmed_end <= 1 {
+            return false;
+        }
+        let command = &self.input[..trimmed_end];
+        let previous_level_end = command
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, character)| index + character.len_utf8())
+            .unwrap_or(1);
+        self.input.truncate(previous_level_end.max(1));
+        self.input_cursor = self.input.len();
+        self.refresh_completions();
+        true
     }
 
     fn input_view(&self, width: u16) -> (String, u16) {
@@ -1789,18 +1828,36 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
     let Some(args) = parse_slash_command(line)? else {
         return Ok(None);
     };
+    if args.iter().any(|arg| arg == "--local") {
+        return Err(CliError::Parse {
+            detail: "`--local` is a process option; start the TUI with `sinomo --local` instead"
+                .to_string(),
+        });
+    }
     match args.as_slice() {
         [command] if command == "files" => {
             let target = env::current_dir().map_err(|error| CliError::Parse {
                 detail: format!("cannot read current directory: {error}"),
             })?;
-            Ok(Some(TuiSlashCommand::Files { target }))
+            Ok(Some(TuiSlashCommand::Files {
+                target: TuiFilesTarget::Local(target),
+            }))
+        }
+        [command, flag] if command == "files" && flag == "--sifs" => {
+            Ok(Some(TuiSlashCommand::Files {
+                target: TuiFilesTarget::Sifs("/".to_string()),
+            }))
+        }
+        [command, flag, path] if command == "files" && flag == "--sifs" => {
+            Ok(Some(TuiSlashCommand::Files {
+                target: TuiFilesTarget::Sifs(path.clone()),
+            }))
         }
         [command, path] if command == "files" => Ok(Some(TuiSlashCommand::Files {
-            target: PathBuf::from(path),
+            target: parse_tui_files_target(path),
         })),
         [command, ..] if command == "files" => Err(CliError::Parse {
-            detail: "usage: /files [path]".to_string(),
+            detail: "usage: /files [path|sifs:/path|--sifs [path]]".to_string(),
         }),
         [command, rest @ ..] if command == "model" => parse_tui_model_command(rest),
         [command] if command == "sessions" => Ok(Some(TuiSlashCommand::Sessions)),
@@ -1820,6 +1877,22 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
     }
 }
 
+fn parse_tui_files_target(value: &str) -> TuiFilesTarget {
+    let lower = value.to_ascii_lowercase();
+    if lower == "sifs" || lower == "sifs:" {
+        return TuiFilesTarget::Sifs("/".to_string());
+    }
+    if lower.starts_with("sifs:") {
+        let path = value
+            .split_once(':')
+            .map(|(_, path)| path)
+            .filter(|path| !path.is_empty())
+            .unwrap_or("/");
+        return TuiFilesTarget::Sifs(path.to_string());
+    }
+    TuiFilesTarget::Local(PathBuf::from(value))
+}
+
 fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
     runtime: &mut InteractionRuntime<JsonlEventStore, H>,
     state: &mut CuiTuiState,
@@ -1830,7 +1903,7 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
 ) -> Result<Vec<InteractionOutput>, CliError> {
     match command {
         TuiSlashCommand::Files { target } => {
-            state.open_file_browser_at(target);
+            state.open_files_target(data_dir, target);
             Ok(vec![InteractionOutput::Line(
                 "opened file browser".to_string(),
             )])
@@ -2090,214 +2163,6 @@ fn normalize_tui_model_provider(provider: &str) -> Result<String, CliError> {
     }
 }
 
-fn load_file_browser_entries(current_dir: &Path) -> Result<Vec<FileBrowserEntry>, String> {
-    let mut entries = Vec::new();
-    if let Some(parent) = current_dir.parent() {
-        entries.push(FileBrowserEntry {
-            name: "..".to_string(),
-            path: parent.to_path_buf(),
-            kind: FileBrowserEntryKind::Parent,
-            size: None,
-        });
-    }
-
-    let read_dir = fs::read_dir(current_dir)
-        .map_err(|error| format!("cannot list {}: {error}", current_dir.display()))?;
-    for entry in read_dir {
-        let entry = entry
-            .map_err(|error| format!("cannot read entry in {}: {error}", current_dir.display()))?;
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
-        let metadata = entry.metadata().ok();
-        let kind = if file_type.is_dir() {
-            FileBrowserEntryKind::Directory
-        } else if file_type.is_file() {
-            FileBrowserEntryKind::File
-        } else if file_type.is_symlink() {
-            FileBrowserEntryKind::Symlink
-        } else {
-            FileBrowserEntryKind::Other
-        };
-        let size = metadata
-            .as_ref()
-            .filter(|_| kind == FileBrowserEntryKind::File)
-            .map(|metadata| metadata.len());
-        entries.push(FileBrowserEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
-            path,
-            kind,
-            size,
-        });
-    }
-
-    entries.sort_by(|left, right| {
-        left.kind
-            .sort_rank()
-            .cmp(&right.kind.sort_rank())
-            .then_with(|| {
-                left.name
-                    .to_ascii_lowercase()
-                    .cmp(&right.name.to_ascii_lowercase())
-            })
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    Ok(entries)
-}
-
-fn file_browser_child_path(current_dir: &Path, input: &str) -> Result<PathBuf, String> {
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Err("name cannot be empty".to_string());
-    }
-    let path = Path::new(trimmed);
-    if path.is_absolute() {
-        return Err("use a relative name inside the current directory".to_string());
-    }
-
-    let mut has_name = false;
-    for component in path.components() {
-        match component {
-            std::path::Component::Normal(_) => has_name = true,
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir
-            | std::path::Component::RootDir
-            | std::path::Component::Prefix(_) => {
-                return Err("name cannot leave the current directory".to_string());
-            }
-        }
-    }
-    if !has_name {
-        return Err("name cannot be empty".to_string());
-    }
-    Ok(current_dir.join(path))
-}
-
-fn file_browser_display_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
-}
-
-fn file_browser_preview(entry: &FileBrowserEntry) -> FileBrowserPreview {
-    match entry.kind {
-        FileBrowserEntryKind::Parent => {
-            FileBrowserPreview::new("Parent", vec![format!("open {}", entry.path.display())])
-        }
-        FileBrowserEntryKind::Directory => file_browser_directory_preview(entry),
-        FileBrowserEntryKind::Symlink if entry.path.is_dir() => {
-            file_browser_directory_preview(entry)
-        }
-        _ => file_browser_file_preview(entry),
-    }
-}
-
-fn file_browser_directory_preview(entry: &FileBrowserEntry) -> FileBrowserPreview {
-    match fs::read_dir(&entry.path) {
-        Ok(read_dir) => {
-            let mut count = 0usize;
-            for item in read_dir {
-                if item.is_ok() {
-                    count = count.saturating_add(1);
-                }
-            }
-            FileBrowserPreview::new(
-                format!("Directory {}", entry.name),
-                vec![
-                    format!("path: {}", entry.path.display()),
-                    format!("entries: {count}"),
-                ],
-            )
-        }
-        Err(error) => FileBrowserPreview::new(
-            format!("Directory {}", entry.name),
-            vec![format!("cannot read directory: {error}")],
-        ),
-    }
-}
-
-fn file_browser_file_preview(entry: &FileBrowserEntry) -> FileBrowserPreview {
-    let file = match fs::File::open(&entry.path) {
-        Ok(file) => file,
-        Err(error) => {
-            return FileBrowserPreview::new(
-                format!("Preview {}", entry.name),
-                vec![format!("cannot open file: {error}")],
-            );
-        }
-    };
-    let mut bytes = Vec::new();
-    let mut reader = file.take(FILE_BROWSER_PREVIEW_MAX_BYTES + 1);
-    if let Err(error) = std::io::Read::read_to_end(&mut reader, &mut bytes) {
-        return FileBrowserPreview::new(
-            format!("Preview {}", entry.name),
-            vec![format!("cannot read file: {error}")],
-        );
-    }
-    let truncated_bytes = bytes.len() > FILE_BROWSER_PREVIEW_MAX_BYTES as usize;
-    if truncated_bytes {
-        bytes.truncate(FILE_BROWSER_PREVIEW_MAX_BYTES as usize);
-    }
-    if bytes.iter().any(|byte| *byte == 0) {
-        return FileBrowserPreview::new(
-            format!("Binary {}", entry.name),
-            vec![format!(
-                "binary file; preview disabled after {}",
-                format_file_size(bytes.len() as u64)
-            )],
-        );
-    }
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(error) => {
-            return FileBrowserPreview::new(
-                format!("Binary {}", entry.name),
-                vec![format!(
-                    "non UTF-8 file; preview disabled after {}",
-                    format_file_size(error.as_bytes().len() as u64)
-                )],
-            );
-        }
-    };
-
-    let mut lines = if text.is_empty() {
-        vec!["empty file".to_string()]
-    } else {
-        text.lines()
-            .take(FILE_BROWSER_PREVIEW_MAX_LINES)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-    };
-    if text.lines().count() > FILE_BROWSER_PREVIEW_MAX_LINES {
-        lines.push(format!(
-            "... truncated after {FILE_BROWSER_PREVIEW_MAX_LINES} lines"
-        ));
-    }
-    if truncated_bytes {
-        lines.push(format!(
-            "... truncated after {}",
-            format_file_size(FILE_BROWSER_PREVIEW_MAX_BYTES)
-        ));
-    }
-    FileBrowserPreview::new(format!("Preview {}", entry.name), lines)
-}
-
-fn format_file_size(size: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    if size >= GIB {
-        format!("{:.1} GiB", size as f64 / GIB as f64)
-    } else if size >= MIB {
-        format!("{:.1} MiB", size as f64 / MIB as f64)
-    } else if size >= KIB {
-        format!("{:.1} KiB", size as f64 / KIB as f64)
-    } else {
-        format!("{size} B")
-    }
-}
-
 fn tui_session_title(messages: &[TuiMessage]) -> String {
     messages
         .iter()
@@ -2398,50 +2263,43 @@ fn replace_tui_file(source: &Path, target: &Path) -> Result<(), CliError> {
     }
 }
 
-fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
-    let area = frame.area();
-    if state.view_mode == CuiTuiViewMode::Sessions {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TuiLayoutAreas {
+    menu: Rect,
+    main: Rect,
+    completions: Option<Rect>,
+    input: Rect,
+    status: Rect,
+}
+
+fn tui_layout_areas(area: Rect, state: &CuiTuiState) -> TuiLayoutAreas {
+    if matches!(
+        state.view_mode,
+        CuiTuiViewMode::Files | CuiTuiViewMode::Sessions
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
+                Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(3),
                 Constraint::Length(1),
             ])
             .split(area);
-        render_tui_header(frame, chunks[0], state);
-        render_tui_session_list(frame, chunks[1], state);
-        render_tui_input(frame, chunks[2], state);
-        render_tui_status(frame, chunks[3], state);
-        return;
-    }
-    if state.view_mode == CuiTuiViewMode::Files {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(5),
-                Constraint::Min(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
-            ])
-            .split(area);
-        render_tui_header(frame, chunks[0], state);
-        render_tui_file_browser(frame, chunks[1], state);
-        render_tui_input(frame, chunks[2], state);
-        render_tui_status(frame, chunks[3], state);
-        return;
+        return TuiLayoutAreas {
+            menu: chunks[0],
+            main: chunks[1],
+            completions: None,
+            input: chunks[2],
+            status: chunks[3],
+        };
     }
 
-    let completion_height = state
-        .completions
-        .as_ref()
-        .map(|completions| (completions.items.len() as u16 + 2).clamp(3, 8))
-        .unwrap_or(0);
+    let completion_height = tui_completion_height(state);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5),
+            Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(completion_height),
             Constraint::Length(3),
@@ -2449,55 +2307,164 @@ fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
         ])
         .split(area);
 
-    render_tui_header(frame, chunks[0], state);
-    render_tui_transcript(frame, chunks[1], state);
-    if completion_height > 0 {
-        render_tui_completions(frame, chunks[2], state);
+    TuiLayoutAreas {
+        menu: chunks[0],
+        main: chunks[1],
+        completions: (completion_height > 0).then_some(chunks[2]),
+        input: chunks[3],
+        status: chunks[4],
     }
-    render_tui_input(frame, chunks[3], state);
-    render_tui_status(frame, chunks[4], state);
 }
 
-fn render_tui_header(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
-    let mut runtime_line = vec![
-        Span::styled("session ", Style::default().fg(Color::DarkGray)),
-        Span::raw(state.session_id.clone()),
-        Span::raw("  "),
-        Span::styled("node ", Style::default().fg(Color::DarkGray)),
-        Span::raw(state.node_id.clone()),
-    ];
-    if let Some(cluster) = &state.cluster_label {
-        runtime_line.push(Span::raw("  "));
-        runtime_line.push(Span::styled(
-            "cluster ",
-            Style::default().fg(Color::DarkGray),
-        ));
-        runtime_line.push(Span::raw(
-            cluster
-                .strip_prefix("cluster ")
-                .unwrap_or(cluster)
-                .to_string(),
-        ));
+fn tui_completion_height(state: &CuiTuiState) -> u16 {
+    state
+        .completions
+        .as_ref()
+        .map(|completions| (completions.items.len() as u16 + 2).clamp(3, 8))
+        .unwrap_or(0)
+}
+
+fn tui_file_browser_areas(area: Rect) -> (Rect, Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn tui_inner_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    )
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    area.width > 0
+        && area.height > 0
+        && column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn render_cui_tui(frame: &mut Frame<'_>, state: &CuiTuiState) {
+    let areas = tui_layout_areas(frame.area(), state);
+    render_tui_menu_bar(frame, areas.menu, state);
+    match state.view_mode {
+        CuiTuiViewMode::Sessions => render_tui_session_list(frame, areas.main, state),
+        CuiTuiViewMode::Files => render_tui_file_browser(frame, areas.main, state),
+        CuiTuiViewMode::Chat => {
+            render_tui_transcript(frame, areas.main, state);
+            if let Some(completions) = areas.completions {
+                render_tui_completions(frame, completions, state);
+            }
+        }
     }
-    let text = Text::from(vec![
-        Line::from(runtime_line),
-        Line::from(vec![
-            Span::styled("runtime ", Style::default().fg(Color::DarkGray)),
-            Span::raw(state.daemon_label.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("agent ", Style::default().fg(Color::DarkGray)),
-            Span::raw(state.runtime_info.agent.clone()),
-            Span::raw("  "),
-            Span::styled("model ", Style::default().fg(Color::DarkGray)),
-            Span::raw(state.runtime_info.model_label()),
-        ]),
-    ]);
-    let block = Block::default()
-        .title("Sinomo")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    frame.render_widget(Paragraph::new(text).block(block), area);
+    render_tui_input(frame, areas.input, state);
+    render_tui_status(frame, areas.status, state);
+}
+
+fn render_tui_menu_bar(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
+    if area.is_empty() {
+        return;
+    }
+    let cluster_label = tui_cluster_status_label(state);
+    let cluster_width = cluster_label.chars().count().saturating_add(1) as u16;
+    let cluster_width = cluster_width.min(area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(cluster_width)])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(Line::from(tui_menu_spans(state))), chunks[0]);
+    let cluster_style = if state.cluster_label.is_some() {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(cluster_label)
+            .alignment(Alignment::Right)
+            .style(cluster_style),
+        chunks[1],
+    );
+}
+
+fn tui_menu_spans(state: &CuiTuiState) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, tab) in tui_menu_tabs(&state.view_mode).into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(tab.label, tui_menu_tab_style(tab.active)));
+    }
+    spans
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TuiMenuTab {
+    label: &'static str,
+    active: bool,
+}
+
+fn tui_menu_tabs(view_mode: &CuiTuiViewMode) -> [TuiMenuTab; 3] {
+    [
+        TuiMenuTab {
+            label: " Chat (F1) ",
+            active: *view_mode == CuiTuiViewMode::Chat,
+        },
+        TuiMenuTab {
+            label: " Files (F2) ",
+            active: *view_mode == CuiTuiViewMode::Files,
+        },
+        TuiMenuTab {
+            label: " Sessions (F3) ",
+            active: *view_mode == CuiTuiViewMode::Sessions,
+        },
+    ]
+}
+
+fn tui_menu_tab_at(area: Rect, column: u16, row: u16) -> Option<CuiTuiViewMode> {
+    if row != area.y || !rect_contains(area, column, row) {
+        return None;
+    }
+    let tabs = [
+        (CuiTuiViewMode::Chat, " Chat (F1) "),
+        (CuiTuiViewMode::Files, " Files (F2) "),
+        (CuiTuiViewMode::Sessions, " Sessions (F3) "),
+    ];
+    let mut x = area.x;
+    for (mode, label) in tabs {
+        let width = label.chars().count() as u16;
+        if column >= x && column < x.saturating_add(width) {
+            return Some(mode);
+        }
+        x = x.saturating_add(width).saturating_add(1);
+    }
+    None
+}
+
+fn tui_menu_tab_style(active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    }
+}
+
+fn tui_cluster_status_label(state: &CuiTuiState) -> String {
+    match &state.cluster_label {
+        Some(cluster) => cluster.clone(),
+        None => "cluster local".to_string(),
+    }
 }
 
 fn render_tui_transcript(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
@@ -2668,15 +2635,12 @@ fn render_tui_file_browser(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiStat
         );
         return;
     };
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
-        .split(area);
-    render_tui_file_entries(frame, chunks[0], browser);
-    render_tui_file_preview(frame, chunks[1], browser);
+    let (entries_area, preview_area) = tui_file_browser_areas(area);
+    render_tui_file_entries(frame, entries_area, browser);
+    render_tui_file_preview(frame, preview_area, browser);
 }
 
-fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileBrowserState) {
+fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileManagerState) {
     let visible_height = usize::from(area.height.saturating_sub(2));
     let (visible_start, visible_end) = completion_visible_range(
         browser.entries.len(),
@@ -2696,7 +2660,7 @@ fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileBrow
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
-            } else if entry.kind == FileBrowserEntryKind::Directory {
+            } else if entry.kind == FileManagerEntryKind::Directory {
                 Style::default().fg(Color::Cyan)
             } else {
                 Style::default().fg(Color::White)
@@ -2726,14 +2690,19 @@ fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileBrow
         .collect::<Vec<_>>();
     let title = if visible_start > 0 || visible_end < browser.entries.len() {
         format!(
-            "Files {}-{}/{}  {}",
+            "Files ({}) {}-{}/{}  {}",
+            browser.source_label(),
             visible_start + 1,
             visible_end,
             browser.entries.len(),
-            browser.current_dir.display()
+            browser.current_path()
         )
     } else {
-        format!("Files  {}", browser.current_dir.display())
+        format!(
+            "Files ({})  {}",
+            browser.source_label(),
+            browser.current_path()
+        )
     };
     let block = Block::default()
         .title(title)
@@ -2742,7 +2711,7 @@ fn render_tui_file_entries(frame: &mut Frame<'_>, area: Rect, browser: &FileBrow
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
-fn render_tui_file_preview(frame: &mut Frame<'_>, area: Rect, browser: &FileBrowserState) {
+fn render_tui_file_preview(frame: &mut Frame<'_>, area: Rect, browser: &FileManagerState) {
     let lines = browser
         .preview
         .lines
@@ -2823,7 +2792,7 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
             Span::raw(" parent   "),
             Span::styled("n/m/r/x", Style::default().fg(Color::DarkGray)),
             Span::raw(" new/mkdir/rename/delete   "),
-            Span::styled("F2/Esc", Style::default().fg(Color::DarkGray)),
+            Span::styled("F1/F2/Esc", Style::default().fg(Color::DarkGray)),
             Span::raw(" chat"),
         ]);
         frame.render_widget(Paragraph::new(line), area);
@@ -2840,7 +2809,7 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &CuiTuiState) {
             Span::raw(" move   "),
             Span::styled("Enter/r", Style::default().fg(Color::DarkGray)),
             Span::raw(" resume   "),
-            Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc/F1", Style::default().fg(Color::DarkGray)),
             Span::raw(" chat"),
         ]);
         frame.render_widget(Paragraph::new(line), area);
@@ -2931,6 +2900,15 @@ mod tui_tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     fn temp_file_browser_root(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2943,6 +2921,23 @@ mod tui_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp root");
         root
+    }
+
+    fn session_record(session_id: SessionId, title: &str) -> TuiSessionRecord {
+        TuiSessionRecord {
+            schema_version: TUI_SESSION_SCHEMA_VERSION,
+            session: InteractionSession::new(
+                session_id,
+                NodeId::from_legacy_named("node_mouse").expect("node"),
+                InteractionSurface::new("surface.mouse", InteractionSurfaceKind::CommandLine),
+            ),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+            title: title.to_string(),
+            message_count: 1,
+            ended: false,
+            runtime_info: TuiAgentRuntimeInfo::default(),
+        }
     }
 
     #[test]
@@ -3080,6 +3075,77 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_state_enter_confirms_completion_and_refreshes_suggestions() {
+        let mut state = fixture_tui_state();
+
+        state.insert_char('/');
+        while state.input != "/cluster " {
+            state.select_next_completion();
+        }
+        assert!(
+            state
+                .completions
+                .as_ref()
+                .expect("top completions")
+                .items
+                .iter()
+                .any(|item| item.label == "files")
+        );
+
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Enter)),
+            TuiInputAction::None
+        );
+        let labels = state
+            .completions
+            .as_ref()
+            .expect("cluster completions")
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"role"));
+        assert!(labels.contains(&"health"));
+        assert!(!labels.contains(&"files"));
+    }
+
+    #[test]
+    fn tui_state_left_arrow_steps_back_one_slash_completion_level() {
+        let mut state = fixture_tui_state();
+
+        state.insert_str("/cluster role ");
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Left)),
+            TuiInputAction::None
+        );
+        assert_eq!(state.input, "/cluster ");
+        assert!(
+            state
+                .completions
+                .as_ref()
+                .expect("cluster completions")
+                .items
+                .iter()
+                .any(|item| item.label == "role")
+        );
+
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Left)),
+            TuiInputAction::None
+        );
+        assert_eq!(state.input, "/");
+        assert!(
+            state
+                .completions
+                .as_ref()
+                .expect("top completions")
+                .items
+                .iter()
+                .any(|item| item.label == "cluster")
+        );
+    }
+
+    #[test]
     fn completion_visible_range_keeps_selection_in_view() {
         assert_eq!(completion_visible_range(20, None, 6), (0, 6));
         assert_eq!(completion_visible_range(20, Some(0), 6), (0, 6));
@@ -3089,16 +3155,224 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_menu_tabs_mark_current_view() {
+        let chat = tui_menu_tabs(&CuiTuiViewMode::Chat);
+        assert_eq!(chat[0].label, " Chat (F1) ");
+        assert!(chat[0].active);
+        assert!(!chat[1].active);
+        assert!(!chat[2].active);
+
+        let files = tui_menu_tabs(&CuiTuiViewMode::Files);
+        assert!(!files[0].active);
+        assert!(files[1].active);
+        assert!(!files[2].active);
+
+        let sessions = tui_menu_tabs(&CuiTuiViewMode::Sessions);
+        assert!(!sessions[0].active);
+        assert!(!sessions[1].active);
+        assert!(sessions[2].active);
+    }
+
+    #[test]
+    fn tui_state_f1_returns_to_chat_tab() {
+        let root = temp_file_browser_root("f1");
+        let mut state = fixture_tui_state();
+
+        state.open_file_browser_at(root.clone());
+        assert_eq!(state.view_mode, CuiTuiViewMode::Files);
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::F(1))),
+            TuiInputAction::None
+        );
+        assert_eq!(state.view_mode, CuiTuiViewMode::Chat);
+
+        state.open_session_list(Vec::new());
+        assert_eq!(state.view_mode, CuiTuiViewMode::Sessions);
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::F(1))),
+            TuiInputAction::None
+        );
+        assert_eq!(state.view_mode, CuiTuiViewMode::Chat);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_mouse_menu_clicks_switch_views() {
+        let root = temp_file_browser_root("mouse-menu");
+        let area = Rect::new(0, 0, 100, 24);
+        let mut state = fixture_tui_state();
+        let menu = tui_layout_areas(area, &state).menu;
+
+        assert_eq!(tui_menu_tab_at(menu, 1, 0), Some(CuiTuiViewMode::Chat));
+        assert_eq!(tui_menu_tab_at(menu, 13, 0), Some(CuiTuiViewMode::Files));
+        assert_eq!(tui_menu_tab_at(menu, 26, 0), Some(CuiTuiViewMode::Sessions));
+
+        assert_eq!(
+            state.apply_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 26, 0), area),
+            TuiInputAction::OpenSessions
+        );
+
+        state.open_file_browser_at(root.clone());
+        assert_eq!(state.view_mode, CuiTuiViewMode::Files);
+        assert_eq!(
+            state.apply_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0), area),
+            TuiInputAction::None
+        );
+        assert_eq!(state.view_mode, CuiTuiViewMode::Chat);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_mouse_selects_completion_file_and_session_rows() {
+        let root = temp_file_browser_root("mouse-select");
+        fs::write(root.join("a.txt"), "alpha").expect("file a");
+        fs::write(root.join("b.txt"), "beta").expect("file b");
+        let area = Rect::new(0, 0, 100, 24);
+        let mut state = fixture_tui_state();
+
+        state.insert_char('/');
+        let completions_area = tui_layout_areas(area, &state)
+            .completions
+            .expect("completions");
+        let completions_inner = tui_inner_rect(completions_area);
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    completions_inner.x,
+                    completions_inner.y,
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        assert_eq!(
+            state.completions.as_ref().and_then(|list| list.selected),
+            Some(0)
+        );
+
+        state.open_file_browser_at(root.clone());
+        let layout = tui_layout_areas(area, &state);
+        let (entries_area, _) = tui_file_browser_areas(layout.main);
+        let entries_inner = tui_inner_rect(entries_area);
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    entries_inner.x,
+                    entries_inner.y.saturating_add(1),
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        assert_eq!(state.file_browser.as_ref().expect("browser").selected, 1);
+
+        let session_a = SessionId::generate();
+        let session_b = SessionId::generate();
+        state.open_session_list(vec![
+            session_record(session_a, "first"),
+            session_record(session_b.clone(), "second"),
+        ]);
+        let sessions_inner = tui_inner_rect(tui_layout_areas(area, &state).main);
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    sessions_inner.x,
+                    sessions_inner.y.saturating_add(1),
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        assert_eq!(
+            state
+                .session_list
+                .as_ref()
+                .expect("sessions")
+                .selected_session_id(),
+            Some(session_b)
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_mouse_wheel_scrolls_active_panel() {
+        let root = temp_file_browser_root("mouse-scroll");
+        fs::write(root.join("a.txt"), "alpha").expect("file a");
+        fs::write(root.join("b.txt"), "beta").expect("file b");
+        let area = Rect::new(0, 0, 100, 24);
+        let mut state = fixture_tui_state();
+
+        for index in 0..30 {
+            state.push_message(TuiMessageKind::Agent, format!("line {index}"));
+        }
+        let transcript = tui_layout_areas(area, &state).main;
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::ScrollUp,
+                    transcript.x.saturating_add(1),
+                    transcript.y.saturating_add(1),
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        assert_eq!(state.scrollback, TUI_MOUSE_SCROLL_LINES as u16);
+        state.apply_mouse_event(
+            mouse(
+                MouseEventKind::ScrollDown,
+                transcript.x.saturating_add(1),
+                transcript.y.saturating_add(1),
+            ),
+            area,
+        );
+        assert_eq!(state.scrollback, 0);
+
+        state.open_file_browser_at(root.clone());
+        let (entries_area, _) = tui_file_browser_areas(tui_layout_areas(area, &state).main);
+        let entries_inner = tui_inner_rect(entries_area);
+        state.apply_mouse_event(
+            mouse(MouseEventKind::ScrollDown, entries_inner.x, entries_inner.y),
+            area,
+        );
+        assert_eq!(state.file_browser.as_ref().expect("browser").selected, 2);
+
+        state.open_session_list(vec![
+            session_record(SessionId::generate(), "first"),
+            session_record(SessionId::generate(), "second"),
+            session_record(SessionId::generate(), "third"),
+        ]);
+        let sessions_inner = tui_inner_rect(tui_layout_areas(area, &state).main);
+        state.apply_mouse_event(
+            mouse(
+                MouseEventKind::ScrollDown,
+                sessions_inner.x,
+                sessions_inner.y,
+            ),
+            area,
+        );
+        assert_eq!(state.session_list.as_ref().expect("sessions").selected, 2);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn file_browser_loads_directory_and_previews_text_file() {
         let root = temp_file_browser_root("preview");
         fs::create_dir(root.join("src")).expect("dir");
         fs::write(root.join("note.txt"), "hello\nworld\n").expect("file");
 
-        let mut browser = FileBrowserState::open(&root).expect("browser");
+        let mut browser = FileManagerState::open_local(&root).expect("browser");
         let parent_index = browser
             .entries
             .iter()
-            .position(|entry| entry.kind == FileBrowserEntryKind::Parent)
+            .position(|entry| entry.kind == FileManagerEntryKind::Parent)
             .expect("parent");
         let dir_index = browser
             .entries
@@ -3124,7 +3398,7 @@ mod tui_tests {
     #[test]
     fn file_browser_manages_files_with_guarded_delete() {
         let root = temp_file_browser_root("manage");
-        let mut browser = FileBrowserState::open(&root).expect("browser");
+        let mut browser = FileManagerState::open_local(&root).expect("browser");
 
         browser.create_file("alpha.txt").expect("create file");
         assert!(root.join("alpha.txt").is_file());
@@ -3156,7 +3430,7 @@ mod tui_tests {
             state.apply_key_event(press(KeyCode::Char('n'))),
             TuiInputAction::None
         );
-        assert_eq!(state.file_prompt, Some(FileBrowserPrompt::NewFile));
+        assert_eq!(state.file_prompt, Some(FileManagerPrompt::NewFile));
         state.insert_str("made.txt");
         assert_eq!(
             state.apply_key_event(press(KeyCode::Enter)),
@@ -3182,10 +3456,28 @@ mod tui_tests {
                 .expect("parse")
                 .expect("target"),
             TuiSlashCommand::Files {
-                target: PathBuf::from("two words")
+                target: TuiFilesTarget::Local(PathBuf::from("two words"))
+            }
+        );
+        assert_eq!(
+            parse_tui_slash_command("/files sifs:/services")
+                .expect("parse")
+                .expect("target"),
+            TuiSlashCommand::Files {
+                target: TuiFilesTarget::Sifs("/services".to_string())
+            }
+        );
+        assert_eq!(
+            parse_tui_slash_command("/files --sifs /users")
+                .expect("parse")
+                .expect("target"),
+            TuiSlashCommand::Files {
+                target: TuiFilesTarget::Sifs("/users".to_string())
             }
         );
         assert!(parse_tui_slash_command("/help").expect("parse").is_none());
+        assert!(parse_tui_slash_command("/--local files").is_err());
+        assert!(parse_tui_slash_command("/files --local").is_err());
     }
 
     #[test]
@@ -3588,6 +3880,7 @@ impl ThinkingControl {
 
 pub struct MainAgentInteractionHandler<M> {
     agent: MainAgentLoop<M>,
+    agent_definition: sinomo_agent::AgentDefinition,
     thinking: ThinkingControl,
     provider: String,
     model_name: String,
@@ -3657,8 +3950,15 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
     pub fn new(model: M, provider: impl Into<String>, model_name: impl Into<String>) -> Self {
         let provider = provider.into();
         let model_name = model_name.into();
+        let agent_definition = sinomo_agent::AgentDefinition::main();
         Self {
-            agent: MainAgentLoop::new(model, provider.clone(), model_name.clone()),
+            agent: MainAgentLoop::with_definition(
+                model,
+                provider.clone(),
+                model_name.clone(),
+                agent_definition.clone(),
+            ),
+            agent_definition,
             thinking: ThinkingControl::default(),
             provider,
             model_name,
@@ -3674,8 +3974,15 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
     ) -> Self {
         let provider = provider.into();
         let model_name = model_name.into();
+        let agent_definition = sinomo_agent::AgentDefinition::main();
         Self {
-            agent: MainAgentLoop::new(model, provider.clone(), model_name.clone()),
+            agent: MainAgentLoop::with_definition(
+                model,
+                provider.clone(),
+                model_name.clone(),
+                agent_definition.clone(),
+            ),
+            agent_definition,
             thinking,
             provider,
             model_name,
@@ -3683,9 +3990,15 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         }
     }
 
+    pub fn with_agent_definition(mut self, definition: sinomo_agent::AgentDefinition) -> Self {
+        self.agent = self.agent.with_agent_definition(definition.clone());
+        self.agent_definition = definition;
+        self
+    }
+
     fn runtime_info(&self) -> TuiAgentRuntimeInfo {
         TuiAgentRuntimeInfo {
-            agent: "main-agent".to_string(),
+            agent: self.agent_definition.name.clone(),
             provider: self.provider.clone(),
             model: self.model_name.clone(),
             account: self.account.clone(),
@@ -3699,7 +4012,12 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         model_name: String,
         account: Option<String>,
     ) -> TuiAgentRuntimeInfo {
-        self.agent = MainAgentLoop::new(model, provider.clone(), model_name.clone());
+        self.agent = MainAgentLoop::with_definition(
+            model,
+            provider.clone(),
+            model_name.clone(),
+            self.agent_definition.clone(),
+        );
         self.provider = provider;
         self.model_name = model_name;
         self.account = account;
@@ -3925,7 +4243,7 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
             context,
             async_update: None,
             context_attachments: Vec::new(),
-            tool_specs: sinomo_agent::default_main_agent_tools(),
+            tool_specs: Vec::new(),
         };
         let requested = interaction_event(
             session,
@@ -3960,7 +4278,7 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
                         "response_mode": decision.response_mode,
                         "text": decision.text,
                         "tool_calls": decision.tool_calls,
-                        "maid_handoff": decision.maid_handoff,
+                        "background_handoff": decision.background_handoff,
                         "next_state": decision.next_state
                     }),
                 )
@@ -4561,7 +4879,7 @@ pub(crate) fn minicpm_tool_call_to_agent_decision_json(content: &str) -> Option<
             "async": true,
             "summary": format!("MiniCPM requested `{tool}` through its tool-call format.")
         }],
-        "maid_handoff": null,
+        "background_handoff": null,
         "next_state": "delegating"
     }))
     .ok()

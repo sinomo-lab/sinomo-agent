@@ -376,6 +376,18 @@ pub(super) fn print_models_help() {
     println!("      List available or known models.");
     println!("  sinomo models default --provider <provider> --model <model>");
     println!("      Set the default model for CUI and model-backed commands.");
+    println!(
+        "  sinomo models options [show] [--provider <provider>] [--account <account>] [--model <model>]"
+    );
+    println!("      Show provider-specific account or model options.");
+    println!(
+        "  sinomo models options set --provider <provider> [--account <account>] [--model <model>] [--reasoning-effort none|minimal|low|medium|high|xhigh|max|clear] [--reasoning-budget-tokens <n|clear>] [--text-verbosity low|medium|high|clear] [--vendor-option <key=value>] [--clear-vendor-option <key>]"
+    );
+    println!("      Update provider-specific account or model options.");
+    println!(
+        "  sinomo models options clear --provider <provider> [--account <account>] [--model <model>]"
+    );
+    println!("      Clear provider-specific options for an account or one model override.");
     println!("  sinomo models runtime [show]");
     println!("      Show cluster-scoped native model runtime settings.");
     println!(

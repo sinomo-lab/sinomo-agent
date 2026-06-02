@@ -5912,7 +5912,7 @@ pub(crate) fn sandbox_create_with_daemon(options: SandboxCreateOptions) -> Resul
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sandbox"))]
 pub(crate) fn sandbox_run_with_store(
     options: SandboxRunOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -6167,6 +6167,7 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
     }
 }
 
+#[cfg(feature = "sandbox")]
 fn sandbox_cli_streaming_output_sink()
 -> std::sync::Arc<dyn sinomo_runtime::sandbox::SandboxOutputSink> {
     std::sync::Arc::new(

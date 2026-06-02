@@ -7,7 +7,8 @@ use super::{
     DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
     InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
     InteractionSurface, InteractionSurfaceKind, MainAgentInteractionHandler,
-    ModelBackedInteractionHandler, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
+    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
+    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
     ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
     RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
     RolloutProgressExpectation, RolloutTelemetryGateSetOptions, SandboxCliCommand,
@@ -21,9 +22,58 @@ use super::{
     cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
     cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
     compact_default_invite_introducers, cui_default_daemon_status,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_checkpoint,
-    daemon_handle_daemon_sandbox_create, daemon_handle_daemon_sandbox_destroy,
-    daemon_handle_daemon_sandbox_http_fetch, daemon_handle_daemon_sandbox_http_fetch_to_file,
+    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
+    daemon_package_version, daemon_remove_cluster_members, daemon_run_toolchain_request,
+    data_dir_storage_contract_findings, decode_cluster_join_invite, elect_cluster_raft_leader,
+    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
+    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
+    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
+    handle_daemon_cluster_raft_vote_request, handle_daemon_connection,
+    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
+    invite_channels_for_join_registration, invite_communication_channels,
+    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
+    load_cui_model_runtime_config, main_agent_handler_for_cui_with_data_dir, managed_source_status,
+    merge_benchmark_gate_requests, merge_module_replay_report_refs, model_config_uses_cluster,
+    models_default_with_data_dir, normalize_model_provider,
+    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
+    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
+    parse_dfs_command, parse_install_options, parse_model_default_options,
+    parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
+    parse_propose_options, parse_provider_command, parse_rollout_command, parse_sandbox_command,
+    parse_slash_command, parse_uninstall_options, parse_usage_options, push_unique_introducer,
+    quickjs_setup_script, read_cluster_kv_snapshot, read_cluster_members_from_kv,
+    read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
+    refresh_daemon_node_status_in_kv, require_cluster_runtime_quorum_with_paths_and_daemon,
+    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
+    rollout_endpoint_candidates, rollout_progress_bar, rollout_status_matches_expectation,
+    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
+    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
+    rollout_terminal_response, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
+    run_evolve_command, run_shadow_daemon_with_paths, sandbox_cat_with_store,
+    sandbox_checkpoint_with_store, sandbox_config_with_store, sandbox_create_with_store,
+    sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
+    sandbox_doctor_findings_with_stores_and_events,
+    sandbox_fetch_with_store_transport_and_event_store, sandbox_ls_with_store,
+    sandbox_policy_uses_cluster, sandbox_reboot_with_store, sandbox_resume_with_store,
+    sandbox_run_with_stores, sandbox_status_with_store, sandbox_toolchain_add_artifact_with_store,
+    sandbox_toolchain_add_command_with_store, sandbox_toolchain_bash_plan_text,
+    sandbox_toolchain_build_tools_plan_text, sandbox_toolchain_busybox_plan_text,
+    sandbox_toolchain_import_busybox_with_store, sandbox_toolchain_import_package_with_store,
+    sandbox_toolchain_python_plan_text, sandbox_toolchain_verify_package, sandbox_write_with_store,
+    sandbox_write_with_store_and_event_store, send_cluster_join_registration_over_iroh,
+    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, uninstall_with_layout, with_cli_force_local_mode,
+    write_daemon_status, write_model_runtime_config_for_node, write_rollout_status,
+    write_sandbox_policy_config_for_node,
+};
+#[cfg(feature = "sandbox")]
+use super::{
+    daemon_handle_daemon_sandbox_checkpoint, daemon_handle_daemon_sandbox_create,
+    daemon_handle_daemon_sandbox_destroy, daemon_handle_daemon_sandbox_http_fetch_to_file,
     daemon_handle_daemon_sandbox_import_busybox, daemon_handle_daemon_sandbox_list,
     daemon_handle_daemon_sandbox_read, daemon_handle_daemon_sandbox_reboot,
     daemon_handle_daemon_sandbox_resume, daemon_handle_daemon_sandbox_run_process_plan,
@@ -32,53 +82,8 @@ use super::{
     daemon_handle_daemon_sandbox_toolchain_add_artifact,
     daemon_handle_daemon_sandbox_toolchain_add_command,
     daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_update,
-    daemon_handle_daemon_sandbox_write, daemon_package_version, daemon_remove_cluster_members,
-    daemon_run_toolchain_request, data_dir_storage_contract_findings, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
-    format_rollout_progress_line, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
-    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
-    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
-    handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
-    install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    load_cui_model_runtime_config, main_agent_handler_for_cui_with_data_dir, managed_source_status,
-    merge_benchmark_gate_requests, merge_module_replay_report_refs, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
-    parse_models_list_options, parse_models_runtime_command, parse_propose_options,
-    parse_provider_command, parse_rollout_command, parse_sandbox_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, push_unique_introducer, quickjs_setup_script,
-    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
-    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
-    require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
-    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
-    rollout_progress_bar, rollout_status_matches_expectation, rollout_target_endpoint_for_main,
-    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_cui_with_handler_io,
-    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
-    sandbox_cat_with_store, sandbox_checkpoint_with_store, sandbox_config_with_store,
-    sandbox_create_with_store, sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
-    sandbox_doctor_findings_with_stores_and_events,
-    sandbox_fetch_with_store_transport_and_event_store, sandbox_logs_with_store,
-    sandbox_ls_with_store, sandbox_policy_uses_cluster, sandbox_process_plan_with_stores,
-    sandbox_reboot_with_store, sandbox_resume_with_store, sandbox_run_with_store,
-    sandbox_run_with_stores, sandbox_shell_with_stores, sandbox_status_with_store,
-    sandbox_toolchain_add_artifact_with_store, sandbox_toolchain_add_command_with_store,
-    sandbox_toolchain_bash_plan_text, sandbox_toolchain_build_tools_plan_text,
-    sandbox_toolchain_busybox_plan_text, sandbox_toolchain_import_busybox_with_store,
-    sandbox_toolchain_import_package_with_store, sandbox_toolchain_python_plan_text,
-    sandbox_toolchain_verify_package, sandbox_write_with_store,
-    sandbox_write_with_store_and_event_store, send_cluster_join_registration_over_iroh,
-    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, with_cli_force_local_mode,
-    write_daemon_status, write_model_runtime_config_for_node, write_rollout_status,
-    write_sandbox_policy_config_for_node,
+    daemon_handle_daemon_sandbox_write, sandbox_logs_with_store, sandbox_process_plan_with_stores,
+    sandbox_run_with_store, sandbox_shell_with_stores,
 };
 use base64::Engine;
 use sinomo_evolution::{
@@ -87,6 +92,7 @@ use sinomo_evolution::{
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, LanguageModelUsage,
+    ProviderReasoningEffort, ProviderTextVerbosity,
 };
 use sinomo_runtime::core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
@@ -119,7 +125,9 @@ use sinomo_runtime::rollout::{
     read_rollout_runtime_state, write_rollout_runtime_state,
 };
 use sinomo_runtime::sandbox::SandboxFileSystem;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(feature = "sandbox")]
+use std::collections::BTreeSet;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -4438,7 +4446,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
                 "async": false,
                 "summary": "Write the candidate module source."
             }],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "waiting"
         })
         .to_string(),
@@ -4446,7 +4454,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
             "response_mode": "answer",
             "text": "Produced the low-risk silence-policy candidate module source and left verification to the requested replay gate.",
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         })
         .to_string(),
@@ -16127,7 +16135,7 @@ impl InteractionModel for MainAgentFixtureModel {
                 "response_mode": "answer",
                 "text": "cluster-aware reply",
                 "tool_calls": [],
-                "maid_handoff": null,
+                "background_handoff": null,
                 "next_state": "listening"
             })
             .to_string(),
@@ -16170,7 +16178,7 @@ fn main_agent_fixture_response(
             "response_mode": "answer",
             "text": text,
             "tool_calls": [],
-            "maid_handoff": null,
+            "background_handoff": null,
             "next_state": "listening"
         })
         .to_string(),
@@ -16261,6 +16269,74 @@ fn model_default_parser_normalizes_nvidia_provider_qualified_model() {
 
     assert_eq!(options.provider, "nvidia");
     assert_eq!(options.model, "nvidia/nemotron-3-super-120b-a12b");
+}
+
+#[test]
+fn model_options_parser_accepts_reasoning_and_vendor_options() {
+    let command = parse_model_options_command(&[
+        "set".to_string(),
+        "--provider".to_string(),
+        "openai-api".to_string(),
+        "--account".to_string(),
+        "team-a".to_string(),
+        "--model".to_string(),
+        "gpt-5.5".to_string(),
+        "--reasoning-effort".to_string(),
+        "none".to_string(),
+        "--reasoning-budget-tokens".to_string(),
+        "4096".to_string(),
+        "--text-verbosity".to_string(),
+        "low".to_string(),
+        "--vendor-option".to_string(),
+        "reasoning.summary=auto".to_string(),
+    ])
+    .expect("model options");
+
+    assert_eq!(
+        command,
+        ModelOptionsCliCommand::Set(ModelOptionsSetOptions {
+            target: ModelOptionsTarget {
+                provider: Some("openai".to_string()),
+                account: "team-a".to_string(),
+                model: Some("gpt-5.5".to_string()),
+            },
+            reasoning_effort: Some(ModelOptionValueUpdate::Set(ProviderReasoningEffort::None)),
+            reasoning_budget_tokens: Some(ModelOptionValueUpdate::Set(4096)),
+            text_verbosity: Some(ModelOptionValueUpdate::Set(ProviderTextVerbosity::Low)),
+            vendor_options: vec![("reasoning.summary".to_string(), "auto".to_string())],
+            clear_vendor_options: Vec::new(),
+        })
+    );
+}
+
+#[test]
+fn model_options_parser_distinguishes_clear_from_none() {
+    let command = parse_model_options_command(&[
+        "set".to_string(),
+        "--provider".to_string(),
+        "anthropic".to_string(),
+        "--reasoning-effort".to_string(),
+        "clear".to_string(),
+        "--text-verbosity".to_string(),
+        "clear".to_string(),
+    ])
+    .expect("model options");
+
+    assert_eq!(
+        command,
+        ModelOptionsCliCommand::Set(ModelOptionsSetOptions {
+            target: ModelOptionsTarget {
+                provider: Some("anthropic".to_string()),
+                account: "default".to_string(),
+                model: None,
+            },
+            reasoning_effort: Some(ModelOptionValueUpdate::Clear),
+            reasoning_budget_tokens: None,
+            text_verbosity: Some(ModelOptionValueUpdate::Clear),
+            vendor_options: Vec::new(),
+            clear_vendor_options: Vec::new(),
+        })
+    );
 }
 
 #[test]

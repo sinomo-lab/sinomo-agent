@@ -82,8 +82,174 @@ pub enum AgentToolKind {
     WriteSifs,
     ListSifs,
     ClusterStatus,
-    HandoffToMaid,
+    HandoffToBackground,
     ObserveVision,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentOutputFormat {
+    JsonDecision,
+    Text,
+}
+
+impl Default for AgentOutputFormat {
+    fn default() -> Self {
+        Self::JsonDecision
+    }
+}
+
+impl AgentOutputFormat {
+    pub fn language_model_response_format(&self) -> LanguageModelResponseFormat {
+        match self {
+            Self::JsonDecision => LanguageModelResponseFormat::JsonObject,
+            Self::Text => LanguageModelResponseFormat::Text,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentDefinition {
+    pub name: String,
+    pub role: AgentRole,
+    pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<AgentToolSpec>,
+    #[serde(default)]
+    pub output_format: AgentOutputFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+}
+
+impl Default for AgentDefinition {
+    fn default() -> Self {
+        Self::main()
+    }
+}
+
+impl AgentDefinition {
+    pub fn built_ins() -> Vec<Self> {
+        vec![
+            Self::main(),
+            Self::background(),
+            Self::coding(),
+            Self::evolution(),
+        ]
+    }
+
+    pub fn built_in(name: &str) -> Option<Self> {
+        match name {
+            "main" | "main-agent" => Some(Self::main()),
+            "background" | "background-agent" => Some(Self::background()),
+            "coding" | "coding-agent" | "deliberation" | "deliberation-agent" => {
+                Some(Self::coding())
+            }
+            "evolution" | "evolution-agent" => Some(Self::evolution()),
+            _ => None,
+        }
+    }
+
+    pub fn custom(
+        name: impl Into<String>,
+        role: AgentRole,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            role,
+            system_prompt: system_prompt.into(),
+            tools: Vec::new(),
+            output_format: AgentOutputFormat::JsonDecision,
+            temperature: None,
+            max_output_tokens: None,
+        }
+    }
+
+    pub fn main() -> Self {
+        Self {
+            name: "main-agent".to_string(),
+            role: AgentRole::Main,
+            system_prompt: main_agent_base_prompt().to_string(),
+            tools: default_main_agent_tools(),
+            output_format: AgentOutputFormat::JsonDecision,
+            temperature: Some(0.2),
+            max_output_tokens: Some(900),
+        }
+    }
+
+    pub fn background() -> Self {
+        Self {
+            name: "background-agent".to_string(),
+            role: AgentRole::Background,
+            system_prompt: background_agent_base_prompt().to_string(),
+            tools: default_background_agent_tools(),
+            output_format: AgentOutputFormat::JsonDecision,
+            temperature: Some(0.2),
+            max_output_tokens: Some(700),
+        }
+    }
+
+    pub fn coding() -> Self {
+        Self {
+            name: "coding-agent".to_string(),
+            role: AgentRole::Deliberation,
+            system_prompt: coding_agent_base_prompt().to_string(),
+            tools: default_coding_agent_tools(),
+            output_format: AgentOutputFormat::JsonDecision,
+            temperature: Some(0.2),
+            max_output_tokens: None,
+        }
+    }
+
+    pub fn evolution() -> Self {
+        Self {
+            name: "evolution-agent".to_string(),
+            role: AgentRole::Evolution,
+            system_prompt: evolution_agent_base_prompt().to_string(),
+            tools: default_coding_agent_tools(),
+            output_format: AgentOutputFormat::JsonDecision,
+            temperature: Some(0.2),
+            max_output_tokens: None,
+        }
+    }
+
+    pub fn with_tools(mut self, tools: impl IntoIterator<Item = AgentToolSpec>) -> Self {
+        self.tools = tools.into_iter().collect();
+        self
+    }
+
+    pub fn with_tool(mut self, tool: AgentToolSpec) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn with_output_format(mut self, output_format: AgentOutputFormat) -> Self {
+        self.output_format = output_format;
+        self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    pub fn resolve_tool_specs<'a>(
+        &'a self,
+        turn_tools: &'a [AgentToolSpec],
+    ) -> &'a [AgentToolSpec] {
+        if turn_tools.is_empty() {
+            &self.tools
+        } else {
+            turn_tools
+        }
+    }
 }
 
 pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
@@ -113,6 +279,24 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
             true,
         ),
         AgentToolSpec::new(
+            AgentToolKind::HandoffToBackground,
+            "handoff_to_background",
+            "Delegate maintenance, cleanup, rollout, cluster-health, or filesystem work.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ObserveVision,
+            "observe_vision",
+            "Attach a current screen/camera observation for multimodal reasoning.",
+            false,
+        ),
+    ]
+}
+
+pub fn default_background_agent_tools() -> Vec<AgentToolSpec> {
+    let mut tools = default_main_agent_tools();
+    tools.extend([
+        AgentToolSpec::new(
             AgentToolKind::ReadSifs,
             "read_sifs",
             "Read a file from the cluster root filesystem.",
@@ -136,19 +320,8 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
             "Summarize local quorum, node placement, and degraded services.",
             false,
         ),
-        AgentToolSpec::new(
-            AgentToolKind::HandoffToMaid,
-            "handoff_to_maid",
-            "Delegate maintenance, cleanup, rollout, or cluster-health work.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ObserveVision,
-            "observe_vision",
-            "Attach a current screen/camera observation for multimodal reasoning.",
-            false,
-        ),
-    ]
+    ]);
+    tools
 }
 
 pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
@@ -210,44 +383,108 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
     ]
 }
 
-pub fn main_agent_system_prompt(tools: &[AgentToolSpec]) -> String {
-    let tools_json = serde_json::to_string_pretty(tools).expect("tool specs serialize");
-    format!(
-        r#"You are Sinomo, the user-facing main agent.
+fn main_agent_base_prompt() -> &'static str {
+    r#"You are Sinomo, the user-facing main agent.
 
 Operate as a real-time, event-driven agent. Keep live interaction responsive:
 - never block the conversation on slow work;
 - start async tasks for slow shell, research, coding, maintenance, or file work;
 - treat async progress and results as session events;
-- hand cluster maintenance, cleanup, rollout, and diagnostics to the maid agent by default;
+- hand cluster maintenance, cleanup, rollout, and diagnostics to the background agent by default;
 - use SIFS as the default filesystem root;
-- use the local Rust MiniCPM-V 4.6 runtime as the core live model when available, and use stronger models only for deliberate background work.
-
-Return only JSON shaped as:
-{{
-  "response_mode": "answer|acknowledge|clarify|defer|silent",
-  "text": "short user-facing response",
-  "tool_calls": [
-    {{
-      "tool": "tool name",
-      "input": {{}},
-      "async": true,
-      "summary": "why this tool is being used"
-    }}
-  ],
-  "maid_handoff": null,
-  "next_state": "speaking|listening|waiting|delegating|recovering|idle"
-}}
-
-Available tools:
-```json
-{tools_json}
-```"#
-    )
+- use the local Rust MiniCPM-V 4.6 runtime as the core live model when available, and use stronger models only for deliberate background work."#
 }
 
-pub fn maid_agent_system_prompt() -> String {
-    "You are Sinomo's maid agent. Stay silent unless escalation is needed. Coalesce maintenance events, inspect evidence through files and tools, prefer minimal operational fixes, and report concise findings back to the main agent.".to_string()
+fn background_agent_base_prompt() -> &'static str {
+    "You are Sinomo's background agent. Stay silent unless escalation is needed. Coalesce maintenance events, inspect evidence through files and tools, prefer minimal operational fixes, and report concise findings back to the main agent."
+}
+
+fn coding_agent_base_prompt() -> &'static str {
+    r#"You are Sinomo's deliberation agent model.
+
+You operate inside Sinomo's coding-agent loop. The agent owns tool execution,
+policy, event emission, and session state. Use tools when evidence or workspace
+changes are needed, then continue after tool_result messages arrive.
+
+When the next step is clear and no more tools are needed, return an empty
+tool_calls array. If a tool fails or is blocked, recover from the model-visible
+tool_result instead of repeating the same call blindly."#
+}
+
+fn evolution_agent_base_prompt() -> &'static str {
+    r#"You are Sinomo's evolution agent model.
+
+You operate inside Sinomo's supervised self-evolution loop. The runtime owns
+tool execution, policy, event emission, candidate evidence, and session state.
+Use tools when evidence or workspace changes are needed, then continue after
+tool_result messages arrive.
+
+Prefer small, auditable changes that satisfy the mutation packet and produce
+clear verification evidence. When the next step is clear and no more tools are
+needed, return an empty tool_calls array."#
+}
+
+pub fn main_agent_system_prompt(tools: &[AgentToolSpec]) -> String {
+    let definition = AgentDefinition::main().with_tools(tools.to_vec());
+    render_agent_system_prompt(&definition, tools)
+}
+
+pub fn background_agent_system_prompt() -> String {
+    background_agent_base_prompt().to_string()
+}
+
+pub fn render_agent_system_prompt(definition: &AgentDefinition, tools: &[AgentToolSpec]) -> String {
+    let tools_json = serde_json::to_string_pretty(tools).expect("tool specs serialize");
+    render_agent_system_prompt_with_tools_json(definition, "Available tools", &tools_json)
+}
+
+pub fn render_agent_system_prompt_with_descriptors(
+    definition: &AgentDefinition,
+    tools: &[AgentToolDescriptor],
+) -> String {
+    let tools_json = serde_json::to_string_pretty(tools).expect("tool descriptors serialize");
+    render_agent_system_prompt_with_tools_json(definition, "Available agent tools", &tools_json)
+}
+
+fn render_agent_system_prompt_with_tools_json(
+    definition: &AgentDefinition,
+    tool_label: &str,
+    tools_json: &str,
+) -> String {
+    let mut prompt = definition.system_prompt.trim().to_string();
+    match definition.output_format {
+        AgentOutputFormat::JsonDecision => {
+            prompt.push_str("\n\n");
+            prompt.push_str(agent_decision_output_contract());
+        }
+        AgentOutputFormat::Text => {
+            prompt.push_str("\n\nRespond directly in plain text.");
+        }
+    }
+    prompt.push_str("\n\n");
+    prompt.push_str(tool_label);
+    prompt.push_str(":\n```json\n");
+    prompt.push_str(tools_json);
+    prompt.push_str("\n```");
+    prompt
+}
+
+fn agent_decision_output_contract() -> &'static str {
+    r#"Return only JSON shaped as:
+{
+  "response_mode": "answer|acknowledge|clarify|defer|silent",
+  "text": "short user-facing response or a concise working note",
+  "tool_calls": [
+    {
+      "tool": "tool name",
+      "input": {},
+      "async": false,
+      "summary": "why this tool is being used"
+    }
+  ],
+  "background_handoff": null,
+  "next_state": "speaking|listening|waiting|delegating|recovering|idle"
+}"#
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -278,7 +515,7 @@ pub enum AsyncTaskNextAction {
     ContinueSilently,
     TellUser,
     AskUser,
-    HandoffToMaid,
+    HandoffToBackground,
     InspectResult,
 }
 
@@ -302,7 +539,7 @@ pub struct AgentLoopDecision {
     #[serde(default)]
     pub tool_calls: Vec<AgentToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maid_handoff: Option<MaidHandoffRequest>,
+    pub background_handoff: Option<BackgroundHandoffRequest>,
     pub next_state: AgentInteractionState,
 }
 
@@ -312,7 +549,7 @@ impl AgentLoopDecision {
             response_mode: AgentLoopResponseMode::Silent,
             text: String::new(),
             tool_calls: Vec::new(),
-            maid_handoff: None,
+            background_handoff: None,
             next_state: AgentInteractionState::Idle,
         }
     }
@@ -350,15 +587,15 @@ pub struct AgentToolCall {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct MaidHandoffRequest {
+pub struct BackgroundHandoffRequest {
     pub reason: String,
     pub evidence_ref: String,
-    pub priority: MaidHandoffPriority,
+    pub priority: BackgroundHandoffPriority,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-pub enum MaidHandoffPriority {
+pub enum BackgroundHandoffPriority {
     Routine,
     Important,
     Emergency,
@@ -368,22 +605,44 @@ pub struct MainAgentLoop<M> {
     model: M,
     provider: String,
     model_id: String,
-    tools: Vec<AgentToolSpec>,
+    definition: AgentDefinition,
 }
 
 impl<M: InteractionModel> MainAgentLoop<M> {
     pub fn new(model: M, provider: impl Into<String>, model_id: impl Into<String>) -> Self {
+        Self::with_definition(model, provider, model_id, AgentDefinition::main())
+    }
+
+    pub fn with_definition(
+        model: M,
+        provider: impl Into<String>,
+        model_id: impl Into<String>,
+        definition: AgentDefinition,
+    ) -> Self {
         Self {
             model,
             provider: provider.into(),
             model_id: model_id.into(),
-            tools: default_main_agent_tools(),
+            definition,
         }
     }
 
     pub fn with_tools(mut self, tools: Vec<AgentToolSpec>) -> Self {
-        self.tools = tools;
+        self.definition.tools = tools;
         self
+    }
+
+    pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
+        self.definition = definition;
+        self
+    }
+
+    pub fn definition(&self) -> &AgentDefinition {
+        &self.definition
+    }
+
+    pub fn tool_specs(&self) -> &[AgentToolSpec] {
+        &self.definition.tools
     }
 
     pub fn decide(&self, input: &AgentLoopInput) -> Result<AgentLoopDecision, AgentError> {
@@ -416,22 +675,18 @@ impl<M: InteractionModel> MainAgentLoop<M> {
         }
         let request = self.request(input)?;
         let response = complete(&self.model, &request)?;
-        parse_agent_loop_decision(&response.content)
+        parse_agent_loop_response(&self.definition.output_format, &response.content)
     }
 
     pub fn request(&self, input: &AgentLoopInput) -> Result<LanguageModelRequest, AgentError> {
-        let tools = if input.tool_specs.is_empty() {
-            self.tools.as_slice()
-        } else {
-            input.tool_specs.as_slice()
-        };
+        let tools = self.definition.resolve_tool_specs(&input.tool_specs);
         Ok(LanguageModelRequest {
             provider: self.provider.clone(),
             model: self.model_id.clone(),
             messages: vec![
                 LanguageModelMessage {
                     role: LanguageModelRole::System,
-                    content: main_agent_system_prompt(tools),
+                    content: render_agent_system_prompt(&self.definition, tools),
                 },
                 LanguageModelMessage {
                     role: LanguageModelRole::User,
@@ -446,15 +701,36 @@ impl<M: InteractionModel> MainAgentLoop<M> {
             tools: Vec::new(),
             tool_choice: None,
             parallel_tool_calls: None,
-            temperature: Some(0.2),
-            max_output_tokens: Some(900),
-            response_format: LanguageModelResponseFormat::JsonObject,
+            temperature: self.definition.temperature,
+            max_output_tokens: self.definition.max_output_tokens,
+            response_format: self
+                .definition
+                .output_format
+                .language_model_response_format(),
             metadata: serde_json::json!({
-                "loop": "main-agent",
+                "loop": self.definition.name,
+                "agent_name": self.definition.name,
+                "agent_role": self.definition.role,
                 "session_id": input.session.session_id,
                 "event_id": input.latest_event.event_id
             }),
         })
+    }
+}
+
+pub fn parse_agent_loop_response(
+    output_format: &AgentOutputFormat,
+    raw: &str,
+) -> Result<AgentLoopDecision, AgentError> {
+    match output_format {
+        AgentOutputFormat::JsonDecision => parse_agent_loop_decision(raw),
+        AgentOutputFormat::Text => Ok(AgentLoopDecision {
+            response_mode: AgentLoopResponseMode::Answer,
+            text: raw.trim().to_string(),
+            tool_calls: Vec::new(),
+            background_handoff: None,
+            next_state: AgentInteractionState::Listening,
+        }),
     }
 }
 
@@ -483,8 +759,8 @@ pub fn parse_agent_loop_decision(raw: &str) -> Result<AgentLoopDecision, AgentEr
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok())
                         .unwrap_or_default(),
-                    maid_handoff: value
-                        .get("maid_handoff")
+                    background_handoff: value
+                        .get("background_handoff")
                         .cloned()
                         .and_then(|value| serde_json::from_value(value).ok()),
                     next_state: value
@@ -503,7 +779,7 @@ pub fn parse_agent_loop_decision(raw: &str) -> Result<AgentLoopDecision, AgentEr
                     response_mode: AgentLoopResponseMode::Answer,
                     text: trimmed.to_string(),
                     tool_calls: Vec::new(),
-                    maid_handoff: None,
+                    background_handoff: None,
                     next_state: AgentInteractionState::Listening,
                 })
             }
@@ -1033,6 +1309,7 @@ mod tests {
     use sinomo_runtime::device::{DeviceId, DeviceState};
     use sinomo_runtime::events::{EventId, EventStore, InMemoryEventStore};
     use sinomo_runtime::node::NodeId;
+    use std::sync::{Arc, Mutex};
 
     struct FakeInteractionModel {
         response: &'static str,
@@ -1048,6 +1325,40 @@ mod tests {
                 LanguageModelResponseFormat::JsonObject
             );
             assert!(request.messages[0].content.contains("Available tools"));
+            Ok(LanguageModelResponse {
+                provider: "fake".to_string(),
+                model: "fake".to_string(),
+                content: self.response.to_string(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+    }
+
+    struct CapturingInteractionModel {
+        response: &'static str,
+        requests: Arc<Mutex<Vec<LanguageModelRequest>>>,
+    }
+
+    impl CapturingInteractionModel {
+        fn new(response: &'static str) -> Self {
+            Self {
+                response,
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl InteractionModel for CapturingInteractionModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
             Ok(LanguageModelResponse {
                 provider: "fake".to_string(),
                 model: "fake".to_string(),
@@ -1230,12 +1541,12 @@ mod tests {
                     "response_mode": "acknowledge",
                     "text": "I will check that in the background.",
                     "tool_calls": [{
-                        "tool": "handoff_to_maid",
+                        "tool": "handoff_to_background",
                         "input": {"reason": "cluster check"},
                         "async": true,
-                        "summary": "Ask maid to inspect cluster health."
+                        "summary": "Ask background to inspect cluster health."
                     }],
-                    "maid_handoff": {
+                    "background_handoff": {
                         "reason": "cluster health check",
                         "evidence_ref": "sifs:/services/tasks/task_1/input.json",
                         "priority": "routine"
@@ -1250,8 +1561,106 @@ mod tests {
         let decision = agent_loop.decide(&loop_input).expect("decision");
 
         assert_eq!(decision.response_mode, AgentLoopResponseMode::Acknowledge);
-        assert_eq!(decision.tool_calls[0].tool, "handoff_to_maid");
+        assert_eq!(decision.tool_calls[0].tool, "handoff_to_background");
         assert_eq!(decision.next_state, AgentInteractionState::Delegating);
+    }
+
+    #[test]
+    fn main_agent_default_tools_exclude_cluster_and_sifs_tools() {
+        let names: Vec<_> = default_main_agent_tools()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        for excluded in ["cluster_status", "read_sifs", "write_sifs", "list_sifs"] {
+            assert!(!names.iter().any(|name| name == excluded), "{excluded}");
+        }
+        assert!(names.iter().any(|name| name == "handoff_to_background"));
+    }
+
+    #[test]
+    fn background_agent_default_tools_include_cluster_and_sifs_tools() {
+        let definition = AgentDefinition::background();
+        let names: Vec<_> = definition.tools.into_iter().map(|tool| tool.name).collect();
+
+        for expected in ["cluster_status", "read_sifs", "write_sifs", "list_sifs"] {
+            assert!(names.iter().any(|name| name == expected), "{expected}");
+        }
+        assert!(names.iter().any(|name| name == "handoff_to_background"));
+    }
+
+    #[test]
+    fn custom_agent_definition_controls_lightweight_loop_request() {
+        let session = InteractionSession::new(
+            SessionId::from_legacy_named("sess_custom_loop").expect("session"),
+            NodeId::from_legacy_named("node_custom_loop").expect("node"),
+            InteractionSurface::new("surface.custom", InteractionSurfaceKind::CommandLine),
+        );
+        let latest_event = user_interaction_input_event(&session, "status");
+        let context = BoundedContext {
+            session_id: session.session_id.clone(),
+            events: Vec::new(),
+            packet: ContextPacket::default(),
+        };
+        let loop_input = AgentLoopInput {
+            session,
+            latest_event,
+            context,
+            async_update: None,
+            context_attachments: Vec::new(),
+            tool_specs: Vec::new(),
+        };
+        let definition = AgentDefinition::custom(
+            "operator-agent",
+            AgentRole::Background,
+            "Use the operator playbook.",
+        )
+        .with_output_format(AgentOutputFormat::Text)
+        .with_temperature(Some(0.1))
+        .with_max_output_tokens(Some(123))
+        .with_tool(AgentToolSpec::new(
+            AgentToolKind::ClusterStatus,
+            "custom_status",
+            "Read custom operator status.",
+            false,
+        ));
+        let model = CapturingInteractionModel::new("plain operator answer");
+        let requests = model.requests.clone();
+        let agent_loop = MainAgentLoop::with_definition(model, "fake", "fake", definition);
+
+        let decision = agent_loop.decide(&loop_input).expect("decision");
+        let request = requests.lock().expect("requests")[0].clone();
+
+        assert_eq!(decision.response_mode, AgentLoopResponseMode::Answer);
+        assert_eq!(decision.text, "plain operator answer");
+        assert_eq!(request.response_format, LanguageModelResponseFormat::Text);
+        assert_eq!(request.temperature, Some(0.1));
+        assert_eq!(request.max_output_tokens, Some(123));
+        assert!(
+            request.messages[0]
+                .content
+                .contains("Use the operator playbook.")
+        );
+        assert!(request.messages[0].content.contains("custom_status"));
+        assert!(
+            request.messages[0]
+                .content
+                .contains("Respond directly in plain text")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("agent_name")
+                .and_then(serde_json::Value::as_str),
+            Some("operator-agent")
+        );
+        assert_eq!(
+            request
+                .metadata
+                .get("agent_role")
+                .and_then(serde_json::Value::as_str),
+            Some("background")
+        );
     }
 
     #[test]
@@ -1273,7 +1682,7 @@ mod tests {
         assert_eq!(decision.response_mode, AgentLoopResponseMode::Answer);
         assert_eq!(decision.text, "Hello from Sinomo.");
         assert!(decision.tool_calls.is_empty());
-        assert_eq!(decision.maid_handoff, None);
+        assert_eq!(decision.background_handoff, None);
         assert_eq!(decision.next_state, AgentInteractionState::Listening);
     }
 
