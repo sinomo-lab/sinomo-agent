@@ -4189,8 +4189,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         committed_object.changed_at_unix_nanos = write_time;
         committed_object.current_locations = vec![self.node_id.clone()];
         committed_object.last_modified_by_event_id = Some(EventId::generate());
-        self.put_visible_object_in_metadata_backend(&committed_object)?;
-        self.put_object_version_size_in_metadata_backend(
+        self.put_visible_object_and_version_in_metadata_backend(
             &committed_object,
             Some(manifest.size_bytes),
         )?;
@@ -4364,8 +4363,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             committed_object.changed_at_unix_nanos = write_time;
             committed_object.current_locations = vec![self.node_id.clone()];
             committed_object.last_modified_by_event_id = Some(EventId::generate());
-            self.put_visible_object_in_metadata_backend(&committed_object)?;
-            self.put_object_version_size_in_metadata_backend(
+            self.put_visible_object_and_version_in_metadata_backend(
                 &committed_object,
                 Some(manifest.size_bytes),
             )?;
@@ -4850,8 +4848,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             committed_object.changed_at_unix_nanos = write_time;
             committed_object.current_locations = vec![self.node_id.clone()];
             committed_object.last_modified_by_event_id = Some(EventId::generate());
-            self.put_visible_object_in_metadata_backend(&committed_object)?;
-            self.put_object_version_size_in_metadata_backend(
+            self.put_visible_object_and_version_in_metadata_backend(
                 &committed_object,
                 Some(manifest.size_bytes),
             )?;
@@ -11422,6 +11419,55 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             backend.as_mut(),
             object_version_record(&object, size_bytes),
         )?;
+        Ok(())
+    }
+
+    fn put_visible_object_and_version_in_metadata_backend(
+        &mut self,
+        object: &DfsObjectMetadata,
+        size_bytes: Option<u64>,
+    ) -> Result<(), DfsError> {
+        let mut object = object.clone();
+        normalize_current_locations(&mut object.current_locations);
+        let size_bytes = match size_bytes {
+            Some(size_bytes) => Some(size_bytes),
+            None => self.object_content_size_hint(&object)?,
+        };
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(());
+        };
+        if backend.get_file_system(&object.file_system_id)?.is_none() {
+            backend.put_file_system(&DfsFileSystem {
+                file_system_id: object.file_system_id.clone(),
+                display_name: object.file_system_id.to_string(),
+                owner_node_id: object.owner_node_id.clone(),
+                subtree_policies: Vec::new(),
+            })?;
+        }
+
+        let object_changed = backend.get_object(&object.object_id)?.as_ref() != Some(&object);
+
+        let mut version = object_version_record(&object, size_bytes);
+        let version_changed =
+            if let Some(existing) = backend.get_version(&version.object_id, &version.version)? {
+                version.created_at = existing.created_at;
+                existing != version
+            } else {
+                true
+            };
+
+        match (object_changed, version_changed) {
+            (true, true) => {
+                backend.put_object_and_version(&object, &version)?;
+            }
+            (true, false) => {
+                backend.put_object(&object)?;
+            }
+            (false, true) => {
+                backend.put_version(&version)?;
+            }
+            (false, false) => {}
+        }
         Ok(())
     }
 

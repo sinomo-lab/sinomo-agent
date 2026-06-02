@@ -1272,6 +1272,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         }
     }
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry>;
+    fn put_object_and_version(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let object_entry = self.put_object(object)?;
+        let version_entry = self.put_version(version)?;
+        Ok(vec![object_entry, version_entry])
+    }
     fn get_version(
         &self,
         object_id: &DfsObjectId,
@@ -3649,6 +3658,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
         let shard_id = self.require_shard_id_for_object(&version.object_id)?;
         self.shard_backend_mut(&shard_id)?.put_version(version)
+    }
+
+    fn put_object_and_version(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let object = normalized_object_metadata(object);
+        let target_shard_id =
+            self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        let source_shard_id = self.shard_id_for_object(&object.object_id)?;
+        let entries = self
+            .shard_backend_mut(&target_shard_id)?
+            .put_object_and_version(&object, version)?;
+        self.write_object_shard_index(&object, &target_shard_id)?;
+        if let Some(source_shard_id) = source_shard_id {
+            self.put_cross_shard_tombstone(&object, &source_shard_id, &target_shard_id)?;
+        }
+        Ok(entries)
     }
 
     fn get_version(
@@ -6273,6 +6301,67 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         }
         self.checkpoint_local_materialization_cursor_if_due(entry.sequence)?;
         Ok(entry)
+    }
+
+    fn put_object_and_version(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let object = normalized_object_metadata(object);
+        let version = normalized_version_record(version);
+        let metadata_matches = object.file_system_id == version.file_system_id
+            && object.object_id == version.object_id;
+        if !metadata_matches {
+            return Err(MetadataBackendError::Serde(format!(
+                "object {} {} does not match version {} {}",
+                object.file_system_id, object.object_id, version.file_system_id, version.object_id
+            )));
+        }
+        if self.get_file_system(&object.file_system_id)?.is_none() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: object.file_system_id.clone(),
+            });
+        }
+        let previous = self.get_object(&object.object_id)?;
+        let entries = self.write_journal_entries_unlocked(vec![
+            DfsMetadataMutation::PutObject {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                path: object.path.clone(),
+                object: Some(object.clone()),
+            },
+            DfsMetadataMutation::PutVersion {
+                file_system_id: version.file_system_id.clone(),
+                object_id: version.object_id.clone(),
+                version: version.version.clone(),
+                version_record: Some(version.clone()),
+            },
+        ])?;
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        if let Err(error) = self.plan_object_index_table_ops_with_previous(
+            &object,
+            previous.as_ref(),
+            &mut table_ops,
+            &mut rollback,
+        ) {
+            rollback.rollback(&mut self.tables);
+            return Err(error);
+        }
+        self.plan_preapplied_table_op(
+            DfsMetadataTableOp::PutVersion { version },
+            &mut table_ops,
+            &mut rollback,
+        );
+        let last_sequence = entries
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or_else(|| self.next_sequence.saturating_sub(1));
+        self.append_preapplied_table_ops(last_sequence, table_ops, rollback)?;
+        self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
+        Ok(entries)
     }
 
     fn get_version(
@@ -13973,6 +14062,75 @@ mod tests {
             reopened.journal_since(0).expect("journal").len(),
             journal_len,
             "opening a healthy backend must not append duplicate namespace transaction journal entries"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_put_object_and_version_uses_one_table_batch_without_namespace_transaction() {
+        let root = temp_root("local_backend_object_version_grouped_table_batch");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut object = object(version("version_2"));
+        object.path = "/services/web/grouped.bin".to_string();
+        object.content_hash = Some("blake3:grouped-object-version".to_string());
+        object.content_size_bytes = Some(4096);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let table_batches_before = metadata_table_batch_count(&root);
+
+        let entries = backend
+            .put_object_and_version(&object, &version_record)
+            .expect("grouped object version");
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            entries[0].mutation,
+            DfsMetadataMutation::PutObject { .. }
+        ));
+        assert!(matches!(
+            entries[1].mutation,
+            DfsMetadataMutation::PutVersion { .. }
+        ));
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            table_batches_before + 1,
+            "object and visible version should materialize in one table batch"
+        );
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            Some(object.clone())
+        );
+        assert_eq!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .expect("version lookup"),
+            Some(normalized_version_record(&version_record))
+        );
+        assert!(backend.tables.namespace_transactions.is_empty());
+        let journal_len = backend.journal_since(0).expect("journal").len();
+        drop(backend);
+
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopened backend");
+        assert_eq!(
+            reopened.journal_since(0).expect("journal").len(),
+            journal_len,
+            "grouped object/version write must not create a recoverable namespace transaction"
         );
         cleanup(&root);
     }

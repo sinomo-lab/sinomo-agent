@@ -10666,6 +10666,93 @@ fn posix_write_file_from_reader_streams_content() {
 }
 
 #[test]
+fn posix_self_only_create_publishes_object_and_version_without_namespace_transaction() {
+    let owner = NodeId::from_legacy_named("node_posix_create_grouped_owner").expect("node");
+    let root = temp_root("posix_create_grouped_metadata");
+    let network = InProcessNetwork::new();
+    let backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
+
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services/web").expect("mkdir service");
+    let before_sequence = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .journal_since(0)
+        .expect("initial journal")
+        .last()
+        .map(|entry| entry.sequence)
+        .unwrap_or(0);
+
+    let bytes = 4096;
+    let stat = dfs
+        .posix_write_file_from_reader(
+            "/services/web/grouped.bin",
+            PatternReader::new(bytes),
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("streaming POSIX write");
+
+    let write_entries = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .journal_since(before_sequence)
+        .expect("write journal");
+    let file_publish_entries = write_entries
+        .iter()
+        .filter(|entry| match &entry.mutation {
+            DfsMetadataMutation::PutObject { path, .. } => path == "/services/web/grouped.bin",
+            DfsMetadataMutation::PutVersion {
+                version_record: Some(version),
+                ..
+            } => version.content_hash == stat.content_hash,
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } => {
+                transaction
+                    .objects
+                    .iter()
+                    .any(|object| object.path == "/services/web/grouped.bin")
+                    || transaction
+                        .versions
+                        .iter()
+                        .any(|version| version.content_hash == stat.content_hash)
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        file_publish_entries.len(),
+        2,
+        "self-only create should publish file object and version without extra file metadata journal entries"
+    );
+    assert!(matches!(
+        file_publish_entries[0].mutation,
+        DfsMetadataMutation::PutObject { .. }
+    ));
+    assert!(matches!(
+        file_publish_entries[1].mutation,
+        DfsMetadataMutation::PutVersion { .. }
+    ));
+    assert!(!write_entries.iter().any(|entry| {
+        matches!(
+            entry.mutation,
+            DfsMetadataMutation::ApplyNamespaceTransaction { .. }
+        )
+    }));
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_rejected_stage_blob_does_not_create_replica_metadata() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let attacker = NodeId::from_legacy_named("node_attacker").expect("node");
