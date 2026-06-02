@@ -229,7 +229,7 @@ use sinomo_runtime::daemon::{
 use sinomo_runtime::dfs::{
     DfsConflictRecord, DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId,
     DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView,
-    LocalJsonMetadataBackend, LocalShardedMetadataBackend,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend,
 };
 use sinomo_runtime::dfs::{
     DfsExposeAddRequest, DfsPinAddRequest, DfsPinMode, add_dfs_expose_entry, add_local_dfs_pin,

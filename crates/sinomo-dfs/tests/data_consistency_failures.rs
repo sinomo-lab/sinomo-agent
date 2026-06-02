@@ -7,7 +7,7 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
     DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalJsonMetadataBackend, NetworkedDfsReadOutcome, NetworkedDfsService,
+    LocalSobjMetadataBackend, NetworkedDfsReadOutcome, NetworkedDfsService,
     NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
 };
 use sinomo_network::{InProcessNetwork, InProcessTransport};
@@ -185,7 +185,7 @@ fn restart_hydration_restores_backend_visible_version_without_fake_receipts() {
     let content_root = root.join("content");
 
     let network = InProcessNetwork::new();
-    let backend = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+    let backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
         .expect("backend");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -224,7 +224,7 @@ fn restart_hydration_restores_backend_visible_version_without_fake_receipts() {
         sinomo_dfs::LocalContentStore::new(&content_root).expect("recovered content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
             .expect("recovered backend"),
     )
     .expect("hydrate");
@@ -274,7 +274,7 @@ fn metadata_backend_pending_intent_blocks_second_write() {
         sinomo_dfs::LocalContentStore::new(root.join("content")).expect("content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
             .expect("backend"),
     )
     .expect("metadata backend");

@@ -1335,7 +1335,7 @@ mod tests {
     use crate::{
         DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
         DfsObjectKind, DfsObjectMetadata, DfsReplicaReceiptRecord, DfsReplicationPolicy,
-        DfsWriteIntentRecord, LocalJsonMetadataBackend,
+        DfsWriteIntentRecord, LocalSobjMetadataBackend,
     };
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
     use sinomo_events::EventId;
@@ -1345,7 +1345,7 @@ mod tests {
     fn operator_inspector_reports_status_object_conflicts_and_repairs() {
         let root = temp_root("operator_inspector_reports_status_object_conflicts_and_repairs");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -1471,7 +1471,7 @@ mod tests {
     fn operator_inspector_counts_staging_intents_as_pending_writes() {
         let root = temp_root("operator_inspector_counts_staging_intents_as_pending_writes");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -1541,7 +1541,7 @@ mod tests {
     fn operator_inspector_ignores_superseded_version_repairs() {
         let root = temp_root("operator_inspector_ignores_superseded_version_repairs");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -1665,7 +1665,7 @@ mod tests {
     fn operator_inspection_scans_conflicts_repairs_and_agent_summary_in_pages() {
         let root = temp_root("operator_inspection_scans_conflicts_repairs_in_pages");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend
             .put_file_system(&DfsFileSystem {
@@ -1872,7 +1872,7 @@ mod tests {
     fn operator_repair_pages_preserve_order_without_full_object_materialization() {
         let root = temp_root("operator_repair_pages_preserve_order");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -2071,7 +2071,7 @@ mod tests {
     fn operator_status_aggregates_counts_across_multiple_objects() {
         let root = temp_root("operator_status_aggregates_counts_across_multiple_objects");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend
             .put_file_system(&DfsFileSystem {

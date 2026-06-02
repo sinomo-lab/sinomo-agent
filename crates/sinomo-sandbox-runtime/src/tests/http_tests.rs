@@ -575,7 +575,7 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record_in_sifs() {
     let replica = NodeId::from_legacy_named("node_sifs_http_fetch_replica").expect("replica");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -585,7 +585,7 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record_in_sifs() {
     .expect("owner metadata backend");
     owner_dfs.bootstrap_distributed_sifs().expect("bootstrap");
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("replica metadata");
     let mut replica_dfs = NetworkedDfsService::new(
         network.add_node(replica.clone()),
@@ -645,7 +645,7 @@ fn sandbox_http_fetch_to_file_stores_response_body_and_audit_record_in_sifs() {
         .process_incoming()
         .expect("replica receives fetched body and audit record");
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");
     let replica_dfs = NetworkedDfsService::new(
         network.add_node(replica),

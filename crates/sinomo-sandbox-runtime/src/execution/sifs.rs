@@ -1037,7 +1037,7 @@ pub(super) fn sandbox_command_record_status_for_execution_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_dfs::{DfsMetadataShardId, LocalContentStore, LocalJsonMetadataBackend};
+    use sinomo_dfs::{DfsMetadataShardId, LocalContentStore, LocalSobjMetadataBackend};
     use sinomo_network::InProcessNetwork;
 
     fn unique_test_dir(name: &str) -> PathBuf {
@@ -1055,7 +1055,7 @@ mod tests {
         let reader = NodeId::from_legacy_named("node_sifs_snapshot_reader").expect("reader");
         let metadata_root = runtime_root.join("metadata");
         let owner_backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
                 .expect("owner metadata");
         let mut owner_dfs = NetworkedDfsService::new(
             network.add_node(owner.clone()),
@@ -1094,7 +1094,7 @@ mod tests {
         let owner_dfs = Arc::new(Mutex::new(owner_fs.into_inner()));
 
         let reader_backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
                 .expect("reader metadata");
         let reader_dfs = NetworkedDfsService::new(
             network.add_node(reader),

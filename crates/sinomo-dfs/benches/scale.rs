@@ -3,7 +3,7 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsNamespaceJobStatus, DfsObjectId,
     DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult, DfsReplicationPolicy,
-    DfsVersion, DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend,
+    DfsVersion, DfsWriteOptions, LocalContentStore, LocalSobjMetadataBackend,
     NetworkedDfsRangeReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
 };
 use sinomo_network::{InProcessNetwork, NetworkTransport};
@@ -399,7 +399,7 @@ fn run_namespace(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         &metadata_root,
     )?)?;
@@ -503,7 +503,7 @@ fn run_namespace(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         &metadata_root,
     )?)?;
@@ -538,7 +538,7 @@ fn run_posix_create(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         &metadata_root,
     )?)?;
@@ -617,7 +617,7 @@ fn run_posix_create(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         &metadata_root,
     )?)?;
@@ -652,7 +652,7 @@ fn run_posix_read(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         &metadata_root,
     )?)?;
@@ -763,7 +763,7 @@ fn run_posix_write_at(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         &metadata_root,
     )?)?;
@@ -859,7 +859,7 @@ fn run_metadata_replication(args: &Args) -> BenchResult<()> {
         network.add_node(owner.clone()),
         LocalContentStore::new(root.join("owner-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("owner-metadata"),
     )?)?;
@@ -867,7 +867,7 @@ fn run_metadata_replication(args: &Args) -> BenchResult<()> {
         network.add_node(replica.clone()),
         LocalContentStore::new(root.join("replica-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("replica-metadata"),
     )?)?;
@@ -948,7 +948,7 @@ fn run_directory_jobs(args: &Args) -> BenchResult<()> {
         network.add_node(node.clone()),
         LocalContentStore::new(root.join("content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("metadata"),
     )?)?;
@@ -1212,7 +1212,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         network.add_node(owner.clone()),
         LocalContentStore::new(root.join("owner-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("owner-metadata"),
     )?)?;
@@ -1220,7 +1220,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         network.add_node(replica.clone()),
         LocalContentStore::new(root.join("replica-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("replica-metadata"),
     )?)?;
@@ -1353,7 +1353,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         network.add_node(reader.clone()),
         LocalContentStore::new(root.join("reader-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("reader-metadata"),
     )?)?;
@@ -1461,7 +1461,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         network.add_node(range_reader.clone()),
         LocalContentStore::new(root.join("range-reader-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("root"),
         root.join("range-reader-metadata"),
     )?)?;
@@ -1622,7 +1622,7 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
         network.add_node(owner.clone()),
         LocalContentStore::new(root.join("owner-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("owner"),
         root.join("owner-metadata"),
     )?)?;
@@ -1630,7 +1630,7 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
         network.add_node(replica.clone()),
         LocalContentStore::new(root.join("replica-content"))?,
     )
-    .with_metadata_backend(LocalJsonMetadataBackend::new(
+    .with_metadata_backend(LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("replica"),
         root.join("replica-metadata"),
     )?)?;

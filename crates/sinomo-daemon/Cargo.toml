@@ -32,6 +32,7 @@ sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
+sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }

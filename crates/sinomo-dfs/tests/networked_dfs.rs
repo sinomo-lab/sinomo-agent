@@ -11,7 +11,7 @@ use sinomo_dfs::{
     DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
     DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsStageBlobChunkCommand, DfsStageBlobCommand,
     DfsStageBlobResponse, DfsVersion, DfsWriteIntentState, DfsWriteIntentStatus,
-    LocalJsonMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
+    LocalSobjMetadataBackend, NetworkedDfsReadFreshness, NetworkedDfsReadOutcome,
     NetworkedDfsService, NetworkedDfsServiceEvent, NetworkedDfsWriteOutcome,
     SharedDfsControlPlaneKvClient, file_system_config_key, sifs_node_files_path,
 };
@@ -1634,7 +1634,7 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
 
     {
         let owner_backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
                 .expect("owner metadata");
         let mut owner_dfs = NetworkedDfsService::new(
             network.add_node(owner.clone()),
@@ -1669,7 +1669,7 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
     }
 
     let recovered_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
             .expect("recovered metadata");
     let mut recovered_owner = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -1686,7 +1686,7 @@ fn networked_dfs_recovers_committed_repair_jobs_from_metadata_backend() {
         version_2
     );
 
-    let replica_backend = LocalJsonMetadataBackend::new(
+    let replica_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("replica"),
         root.join("replica-meta"),
     )
@@ -1773,7 +1773,7 @@ fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
 
     {
         let owner_backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
                 .expect("owner metadata");
         let mut owner_dfs = NetworkedDfsService::new(
             network.add_node(owner.clone()),
@@ -1837,7 +1837,7 @@ fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
 
     fs::remove_dir_all(&owner_content).expect("remove owner content");
     let recovered_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &owner_meta)
             .expect("recovered metadata");
     let mut recovered_owner = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -2515,7 +2515,7 @@ fn distributed_sifs_bootstrap_exposes_cluster_root_users_and_services_in_metadat
             .expect("control-plane kv cluster"),
     );
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
             .expect("metadata backend");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -2589,9 +2589,9 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
     let root = temp_root("networked_metadata_journal_batches");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
-    let replica_backend = LocalJsonMetadataBackend::new(
+    let replica_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("replica"),
         root.join("replica-meta"),
     )
@@ -2718,9 +2718,9 @@ fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
     let root = temp_root("networked_metadata_incremental");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
-    let replica_backend = LocalJsonMetadataBackend::new(
+    let replica_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("replica"),
         root.join("replica-meta"),
     )
@@ -2845,7 +2845,7 @@ fn networked_dfs_sends_metadata_journal_in_bounded_batches() {
     let root = temp_root("networked_metadata_bounded_batches");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -2960,7 +2960,7 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
             })
             .expect("metadata shard");
     });
-    let primary_backend = LocalJsonMetadataBackend::new(
+    let primary_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("services"),
         root.join("primary-meta"),
     )
@@ -3111,7 +3111,7 @@ fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
             })
             .expect("metadata shard");
     });
-    let primary_backend = LocalJsonMetadataBackend::new(
+    let primary_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("services"),
         root.join("primary-meta"),
     )
@@ -3311,10 +3311,10 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
             .expect("metadata shard");
     });
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
             .expect("owner metadata");
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
             .expect("replica metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -3454,7 +3454,7 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
 
     drop(owner_dfs);
     let restarted_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
             .expect("restarted owner metadata");
     let mut restarted_owner = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -3507,10 +3507,10 @@ fn networked_dfs_replicates_configured_metadata_shard_to_replicas() {
     });
 
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("owner-meta"))
             .expect("owner metadata");
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("replica-meta"))
             .expect("replica metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -3640,7 +3640,7 @@ fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
     let root = temp_root("posix_service_workflow");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -3648,7 +3648,7 @@ fn posix_facade_supports_service_file_workflow_and_repairs_offline_replica() {
     )
     .with_metadata_backend(owner_backend)
     .expect("owner metadata backend");
-    let replica_backend = LocalJsonMetadataBackend::new(
+    let replica_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("replica"),
         root.join("replica-meta"),
     )
@@ -3752,7 +3752,7 @@ fn posix_rename_directory_over_empty_directory_moves_subtree_atomically() {
     let root = temp_root("posix_rename_directory_over_empty_directory");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -3819,7 +3819,7 @@ fn posix_rename_directory_over_empty_directory_moves_subtree_atomically() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -3850,7 +3850,7 @@ fn posix_paths_treat_backslash_as_filename_character() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata"),
     )
     .expect("owner metadata backend");
@@ -3898,7 +3898,7 @@ fn posix_paths_treat_backslash_as_filename_character() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -3931,7 +3931,7 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata"),
     )
     .expect("owner metadata backend");
@@ -3974,7 +3974,7 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -4001,7 +4001,7 @@ fn posix_paths_reject_nul_bytes_before_metadata_mutation() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata"),
     )
     .expect("owner metadata backend");
@@ -4040,7 +4040,7 @@ fn posix_paths_reject_nul_bytes_before_metadata_mutation() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -4064,7 +4064,7 @@ fn posix_symlink_rejects_invalid_targets_before_metadata_mutation() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata"),
     )
     .expect("owner metadata backend");
@@ -4098,7 +4098,7 @@ fn posix_symlink_rejects_invalid_targets_before_metadata_mutation() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -4125,7 +4125,7 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata"),
     )
     .expect("owner metadata backend");
@@ -4254,7 +4254,7 @@ fn posix_stat_read_and_write_follow_symlink_targets() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -4303,7 +4303,7 @@ fn posix_operations_follow_intermediate_parent_symlinks() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata"),
     )
     .expect("owner metadata backend");
@@ -4401,7 +4401,7 @@ fn posix_operations_follow_intermediate_parent_symlinks() {
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("reload metadata"),
     )
     .expect("reload metadata backend");
@@ -4430,7 +4430,7 @@ fn networked_dfs_persists_committed_metadata_through_backend() {
     let root = temp_root("networked_metadata_backend_commit");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -5095,7 +5095,7 @@ fn networked_dfs_second_writer_conflicts_with_existing_pending_write() {
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend"),
     )
     .expect("metadata backend");
@@ -5216,7 +5216,7 @@ fn networked_dfs_three_nodes_two_replicas_supports_multiple_readers_and_writers(
         sinomo_dfs::LocalContentStore::new(root.join("b")).expect("node b store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("node-b-shard"), root.join("b-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("node-b-shard"), root.join("b-meta"))
             .expect("node b metadata backend"),
     )
     .expect("node b metadata backend");
@@ -5225,7 +5225,7 @@ fn networked_dfs_three_nodes_two_replicas_supports_multiple_readers_and_writers(
         sinomo_dfs::LocalContentStore::new(root.join("c")).expect("node c store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("node-c-shard"), root.join("c-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("node-c-shard"), root.join("c-meta"))
             .expect("node c metadata backend"),
     )
     .expect("node c metadata backend");
@@ -6243,7 +6243,7 @@ fn networked_dfs_ignores_stale_remote_read_responses_after_backend_metadata_adva
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     );
-    let reader_backend = LocalJsonMetadataBackend::new(
+    let reader_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -6310,7 +6310,7 @@ fn networked_dfs_ignores_stale_remote_read_responses_after_backend_metadata_adva
     reader_metadata.content_hash = Some(content_hash(b"new backend bytes"));
     reader_metadata.content_size_bytes = Some(b"new backend bytes".len() as u64);
     reader_metadata.current_locations = vec![owner.clone()];
-    LocalJsonMetadataBackend::new(
+    LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -6366,7 +6366,7 @@ fn networked_dfs_remote_read_planning_uses_backend_current_locations() {
     let mut old_owner_transport = network.add_node(old_owner.clone());
     let mut new_owner_transport = network.add_node(new_owner.clone());
     let reader_backend_path = root.join("reader-meta");
-    let reader_backend = LocalJsonMetadataBackend::new(
+    let reader_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -6418,7 +6418,7 @@ fn networked_dfs_remote_read_planning_uses_backend_current_locations() {
     backend_object.content_size_bytes = Some(b"new bytes".len() as u64);
     backend_object.owner_node_id = new_owner.clone();
     backend_object.current_locations = vec![new_owner.clone()];
-    LocalJsonMetadataBackend::new(
+    LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -6614,7 +6614,7 @@ fn networked_dfs_write_uses_backend_current_metadata_over_transient_memory() {
         sinomo_dfs::LocalContentStore::new(root.join("writer")).expect("writer store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("writer-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("writer-shard"), root.join("meta"))
             .expect("metadata backend"),
     )
     .expect("metadata backend");
@@ -6705,7 +6705,7 @@ fn networked_dfs_rejects_stale_commit_after_backend_metadata_advances() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
             .expect("metadata backend"),
     )
     .expect("metadata backend");
@@ -6824,7 +6824,7 @@ fn networked_dfs_rejects_stale_stage_after_backend_metadata_advances() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
             .expect("metadata backend"),
     )
     .expect("metadata backend");
@@ -6939,7 +6939,7 @@ fn networked_dfs_rejects_stage_from_stale_owner_after_backend_handoff() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
             .expect("metadata backend"),
     )
     .expect("metadata backend");
@@ -7063,7 +7063,7 @@ fn networked_dfs_rejects_stale_repair_after_backend_metadata_advances() {
         sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("replica-shard"), root.join("meta"))
             .expect("metadata backend"),
     )
     .expect("metadata backend");
@@ -7178,7 +7178,7 @@ fn networked_dfs_remote_read_accepts_backend_current_despite_stale_memory() {
         sinomo_dfs::LocalContentStore::new(root.join("new-owner")).expect("new owner store"),
     );
     let reader_backend_path = root.join("reader-meta");
-    let reader_backend = LocalJsonMetadataBackend::new(
+    let reader_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -7236,7 +7236,7 @@ fn networked_dfs_remote_read_accepts_backend_current_despite_stale_memory() {
     new_owner_dfs
         .put_local_object_version(backend_object.clone(), b"new backend bytes")
         .expect("seed new owner");
-    LocalJsonMetadataBackend::new(
+    LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -7290,7 +7290,7 @@ fn networked_dfs_remote_read_serves_backend_only_current_metadata() {
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     )
     .with_metadata_backend(
-        LocalJsonMetadataBackend::new(
+        LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("owner-shard"),
             root.join("owner-meta"),
         )
@@ -7401,7 +7401,7 @@ fn networked_dfs_remote_read_stores_backend_only_current_metadata() {
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     );
     let reader_backend_path = root.join("reader-meta");
-    let reader_backend = LocalJsonMetadataBackend::new(
+    let reader_backend = LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -7454,7 +7454,7 @@ fn networked_dfs_remote_read_stores_backend_only_current_metadata() {
         .object(&object_id)
         .expect("owner metadata")
         .clone();
-    LocalJsonMetadataBackend::new(
+    LocalSobjMetadataBackend::new(
         DfsMetadataShardId::new("reader-shard"),
         &reader_backend_path,
     )
@@ -7508,7 +7508,7 @@ fn networked_remote_read_cache_records_size_without_rewriting_object_metadata() 
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     );
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("reader"), root.join("reader-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("reader"), root.join("reader-meta"))
             .expect("reader backend");
     let mut reader_dfs = NetworkedDfsService::new(
         network.add_node(reader.clone()),
@@ -8132,7 +8132,7 @@ fn networked_dfs_rejects_read_chunks_after_content_size_metadata_advances() {
     );
     let reader_backend_path = root.join("reader-meta");
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("reader"), &reader_backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("reader"), &reader_backend_path)
             .expect("reader backend");
     let mut reader_dfs = NetworkedDfsService::new(
         network.add_node(reader.clone()),
@@ -8196,7 +8196,7 @@ fn networked_dfs_rejects_read_chunks_after_content_size_metadata_advances() {
         vec![owner.clone()]
     );
     reader_object.content_size_bytes = Some(large_bytes.len() as u64 + 1);
-    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("reader"), &reader_backend_path)
+    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("reader"), &reader_backend_path)
         .expect("external reader backend")
         .put_object(&reader_object)
         .expect("advance reader size metadata");
@@ -9550,7 +9550,7 @@ fn networked_dfs_remote_read_miss_persists_stale_location_prune() {
         sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
     );
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("reader"), root.join("reader-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("reader"), root.join("reader-meta"))
             .expect("reader backend");
     let mut reader_dfs = NetworkedDfsService::new(
         network.add_node(reader.clone()),
@@ -10695,7 +10695,7 @@ fn posix_write_file_does_not_expose_new_file_until_content_commits() {
     let root = temp_root("posix_new_file_pending_hidden");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -10738,7 +10738,7 @@ fn posix_write_file_from_reader_streams_content() {
     let root = temp_root("posix_write_file_from_reader");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -10786,7 +10786,7 @@ fn posix_open_file_stream_reads_file_and_range_incrementally() {
     let root = temp_root("posix_open_file_stream_reader");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -10856,7 +10856,7 @@ fn posix_self_only_create_publishes_object_and_version_without_namespace_transac
     let root = temp_root("posix_create_grouped_metadata");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
             .expect("owner metadata");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -11033,7 +11033,7 @@ fn networked_dfs_replicated_confirmed_commits_after_all_receipts_and_reads_confi
     let root = temp_root("networked_confirmed_commit");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -11174,7 +11174,7 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
         .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
         .expect("content");
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("reader-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("reader-shard"), &backend_path)
             .expect("metadata backend");
     let mut reader_dfs = NetworkedDfsService::new(network.add_node(reader.clone()), content)
         .with_metadata_backend(backend)
@@ -11238,7 +11238,7 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
         last_modified_by_event_id: None,
     };
     let mut backend_writer =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("reader-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("reader-shard"), &backend_path)
             .expect("metadata backend writer");
     backend_writer
         .put_object(&current_backend)
@@ -11299,7 +11299,7 @@ fn networked_dfs_replicated_confirmed_timeout_can_abort_pending_intent() {
     let root = temp_root("networked_confirmed_abort");
     let network = InProcessNetwork::new();
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend");
     let mut replica_transport = network.add_node(replica.clone());
     let mut owner_dfs = NetworkedDfsService::new(
@@ -11594,7 +11594,7 @@ fn networked_dfs_stale_replicated_eventual_write_creates_conflict_read_view() {
     let root = temp_root("networked_conflict_write");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -11701,7 +11701,7 @@ fn networked_dfs_reconnect_reconciliation_refreshes_receipt_and_records_conflict
     let root = temp_root("networked_reconnect_reconcile");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node.clone()),
@@ -11814,7 +11814,7 @@ fn networked_dfs_reconnect_reconciliation_ignores_historical_manifests() {
     let root = temp_root("networked_reconnect_historical_manifest");
     let network = InProcessNetwork::new();
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner-shard"), root.join("meta"))
             .expect("metadata backend");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node.clone()),
@@ -11900,7 +11900,7 @@ fn networked_dfs_reconnect_reconciliation_uses_backend_current_metadata() {
     let network = InProcessNetwork::new();
     let backend_path = root.join("meta");
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("node-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("node-shard"), &backend_path)
             .expect("metadata backend");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node.clone()),
@@ -11943,7 +11943,7 @@ fn networked_dfs_reconnect_reconciliation_uses_backend_current_metadata() {
     .expect("stale memory metadata");
 
     let mut backend_writer =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("node-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("node-shard"), &backend_path)
             .expect("metadata backend writer");
     backend_writer
         .put_object(&DfsObjectMetadata {
@@ -12196,7 +12196,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
     });
     let backend_path = root.join("candidate-meta");
     let backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("candidate-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("candidate-shard"), &backend_path)
             .expect("candidate metadata backend");
     let mut candidate_dfs = NetworkedDfsService::new(
         network.add_node(candidate.clone()),
@@ -12243,7 +12243,7 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
         .expect("candidate latest content");
 
     let mut backend_writer =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("candidate-shard"), &backend_path)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("candidate-shard"), &backend_path)
             .expect("backend writer");
     backend_writer
         .put_object(&DfsObjectMetadata {

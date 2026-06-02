@@ -52,8 +52,8 @@ pub use metadata_backend::{
     DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
     DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
     DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
-    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
-    LocalShardedMetadataBackend, MetadataBackendError,
+    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
 };
 use namespace::metadata_path;
 pub use namespace::{
@@ -286,8 +286,8 @@ pub fn remove_local_dfs_pin(
 
 pub fn open_root_local_metadata_backend(
     root: impl Into<PathBuf>,
-) -> Result<LocalJsonMetadataBackend, MetadataBackendError> {
-    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
+) -> Result<LocalSobjMetadataBackend, MetadataBackendError> {
+    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
 }
 
 pub fn open_local_sharded_metadata_backend(

@@ -17,7 +17,7 @@ use sinomo_dfs::{
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
     DfsMetadataSnapshotInstallResult, DfsOperatorInspector, DfsOperatorStatus,
-    LocalJsonMetadataBackend, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    LocalSobjMetadataBackend, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
     open_root_local_metadata_backend, sifs_file_system_id,
 };
@@ -345,7 +345,7 @@ fn dfs_metadata_journal_batch(
     if let Some(rejection) = validate_journal_batch_source(data_dir, &command)? {
         return Ok(rejection);
     }
-    let mut backend = LocalJsonMetadataBackend::new(
+    let mut backend = LocalSobjMetadataBackend::new(
         command.batch.shard_id.clone(),
         data_dir
             .dfs_dir()
@@ -419,7 +419,7 @@ fn dfs_metadata_snapshot_install(
         )));
     }
 
-    let mut backend = LocalJsonMetadataBackend::new(
+    let mut backend = LocalSobjMetadataBackend::new(
         command.shard_id.clone(),
         data_dir
             .dfs_dir()

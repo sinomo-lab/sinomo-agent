@@ -291,7 +291,7 @@ fn sifs_sandbox_instance_checkpoint_fetches_remote_manifest_file_and_symlink() {
     let reader = NodeId::from_legacy_named("node_sifs_checkpoint_remote_reader").expect("reader");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -330,7 +330,7 @@ fn sifs_sandbox_instance_checkpoint_fetches_remote_manifest_file_and_symlink() {
     let owner_dfs = Arc::new(Mutex::new(owner_fs.into_inner()));
 
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("reader metadata");
     let reader_dfs = NetworkedDfsService::new(
         network.add_node(reader),
@@ -407,7 +407,7 @@ fn sifs_sandbox_instance_checkpoint_preserves_hardlinks() {
         NodeId::from_legacy_named("node_sifs_instance_checkpoint_hardlink").expect("node");
     let metadata_root = runtime_root.join("metadata");
     let metadata_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("metadata");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node_id),
@@ -442,7 +442,7 @@ fn sifs_sandbox_instance_checkpoint_preserves_hardlinks() {
     };
 
     let reload_metadata_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("reload metadata");
     let reload_node = NodeId::from_legacy_named("node_sifs_instance_checkpoint_hardlink_reload")
         .expect("node reload");
@@ -2360,7 +2360,7 @@ fn sifs_sandbox_workspace_can_resume_and_read_from_replica_node() {
     let replica = NodeId::from_legacy_named("node_sifs_resume_replica").expect("replica");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -2372,7 +2372,7 @@ fn sifs_sandbox_workspace_can_resume_and_read_from_replica_node() {
         .bootstrap_distributed_sifs()
         .expect("owner bootstrap");
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("replica metadata");
     let mut replica_dfs = NetworkedDfsService::new(
         network.add_node(replica.clone()),
@@ -2401,7 +2401,7 @@ fn sifs_sandbox_workspace_can_resume_and_read_from_replica_node() {
         .expect("replica receives staged content");
 
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");
     let replica_dfs = NetworkedDfsService::new(
         network.add_node(replica),
@@ -2431,7 +2431,7 @@ fn sifs_sandbox_read_file_requests_and_completes_remote_content_fetch() {
     let reader = NodeId::from_legacy_named("node_sifs_remote_read_reader").expect("reader");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -2466,7 +2466,7 @@ fn sifs_sandbox_read_file_requests_and_completes_remote_content_fetch() {
     let owner_dfs = Arc::new(Mutex::new(owner_fs.into_inner()));
 
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("reader metadata");
     let reader_dfs = NetworkedDfsService::new(
         network.add_node(reader),
