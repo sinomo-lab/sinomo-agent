@@ -19,6 +19,7 @@ type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 #[derive(Clone, Debug)]
 struct Args {
     scenario: Scenario,
+    preset: Preset,
     root: PathBuf,
     explicit_root: bool,
     files: usize,
@@ -41,6 +42,24 @@ enum Scenario {
     NetworkBlob,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Preset {
+    Smoke,
+    Scale,
+    Production,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BenchDefaults {
+    files: usize,
+    dirs: usize,
+    file_bytes: usize,
+    blob_bytes: u64,
+    blob_range_bytes: usize,
+    network_blob_bytes: u64,
+    list_page_size: usize,
+}
+
 impl Scenario {
     fn parse(value: &str) -> BenchResult<Self> {
         match value {
@@ -56,10 +75,73 @@ impl Scenario {
             .into()),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Namespace => "namespace",
+            Self::PosixCreate => "posix-create",
+            Self::MetadataReplication => "metadata-replication",
+            Self::Blob => "blob",
+            Self::NetworkBlob => "network-blob",
+        }
+    }
+}
+
+impl Preset {
+    fn parse(value: &str) -> BenchResult<Self> {
+        match value {
+            "smoke" => Ok(Self::Smoke),
+            "scale" => Ok(Self::Scale),
+            "production" => Ok(Self::Production),
+            _ => Err(format!("unknown preset `{value}`; use smoke, scale, or production").into()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Smoke => "smoke",
+            Self::Scale => "scale",
+            Self::Production => "production",
+        }
+    }
+
+    fn defaults(self) -> BenchDefaults {
+        match self {
+            Self::Smoke => BenchDefaults {
+                files: 10_000,
+                dirs: 128,
+                file_bytes: 32,
+                blob_bytes: 64 * 1024 * 1024,
+                blob_range_bytes: 1024 * 1024,
+                network_blob_bytes: 8 * 1024 * 1024,
+                list_page_size: 1024,
+            },
+            Self::Scale => BenchDefaults {
+                files: 100_000,
+                dirs: 1024,
+                file_bytes: 32,
+                blob_bytes: 1024 * 1024 * 1024,
+                blob_range_bytes: 8 * 1024 * 1024,
+                network_blob_bytes: 512 * 1024 * 1024,
+                list_page_size: 4096,
+            },
+            Self::Production => BenchDefaults {
+                files: 1_000_000,
+                dirs: 4096,
+                file_bytes: 32,
+                blob_bytes: 4 * 1024 * 1024 * 1024,
+                blob_range_bytes: 16 * 1024 * 1024,
+                network_blob_bytes: 4 * 1024 * 1024 * 1024,
+                list_page_size: 4096,
+            },
+        }
+    }
 }
 
 fn main() -> BenchResult<()> {
     let args = Args::parse()?;
+    args.emit_config();
     match args.scenario {
         Scenario::All => {
             run_namespace(&args)?;
@@ -84,27 +166,58 @@ impl Args {
     fn parse() -> BenchResult<Self> {
         let mut args = env::args().skip(1);
         let mut scenario = Scenario::All;
+        let mut preset = match env::var("SINOMO_DFS_BENCH_PRESET") {
+            Ok(value) => Preset::parse(&value)?,
+            Err(env::VarError::NotPresent) => Preset::Smoke,
+            Err(error) => {
+                return Err(format!("could not read SINOMO_DFS_BENCH_PRESET: {error}").into());
+            }
+        };
+        let defaults = preset.defaults();
         let mut root = None::<PathBuf>;
-        let mut files = env_usize("SINOMO_DFS_BENCH_FILES", 10_000)?;
-        let mut dirs = env_usize("SINOMO_DFS_BENCH_DIRS", 128)?;
-        let mut file_bytes = env_usize("SINOMO_DFS_BENCH_FILE_BYTES", 32)?;
-        let mut blob_bytes = env_u64("SINOMO_DFS_BENCH_BLOB_BYTES", 64 * 1024 * 1024)?;
-        let mut blob_range_bytes = env_usize("SINOMO_DFS_BENCH_BLOB_RANGE_BYTES", 1024 * 1024)?;
-        let mut network_blob_bytes =
-            env_u64("SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES", 8 * 1024 * 1024)?;
-        let mut list_page_size = env_usize("SINOMO_DFS_BENCH_LIST_PAGE_SIZE", 1024)?;
+        let mut files = env_usize("SINOMO_DFS_BENCH_FILES", defaults.files)?;
+        let mut dirs = env_usize("SINOMO_DFS_BENCH_DIRS", defaults.dirs)?;
+        let mut file_bytes = env_usize("SINOMO_DFS_BENCH_FILE_BYTES", defaults.file_bytes)?;
+        let mut blob_bytes = env_bytes("SINOMO_DFS_BENCH_BLOB_BYTES", defaults.blob_bytes)?;
+        let mut blob_range_bytes = byte_count_to_usize(
+            "SINOMO_DFS_BENCH_BLOB_RANGE_BYTES",
+            env_bytes(
+                "SINOMO_DFS_BENCH_BLOB_RANGE_BYTES",
+                defaults.blob_range_bytes as u64,
+            )?,
+        )?;
+        let mut network_blob_bytes = env_bytes(
+            "SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES",
+            defaults.network_blob_bytes,
+        )?;
+        let mut list_page_size =
+            env_usize("SINOMO_DFS_BENCH_LIST_PAGE_SIZE", defaults.list_page_size)?;
         let mut keep = false;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--scenario" => scenario = Scenario::parse(&required_value(&arg, args.next())?)?,
+                "--preset" => {
+                    preset = Preset::parse(&required_value(&arg, args.next())?)?;
+                    let defaults = preset.defaults();
+                    files = defaults.files;
+                    dirs = defaults.dirs;
+                    file_bytes = defaults.file_bytes;
+                    blob_bytes = defaults.blob_bytes;
+                    blob_range_bytes = defaults.blob_range_bytes;
+                    network_blob_bytes = defaults.network_blob_bytes;
+                    list_page_size = defaults.list_page_size;
+                }
                 "--root" => root = Some(PathBuf::from(required_value(&arg, args.next())?)),
                 "--files" => files = parse_usize(&arg, args.next())?,
                 "--dirs" => dirs = parse_usize(&arg, args.next())?,
                 "--file-bytes" => file_bytes = parse_usize(&arg, args.next())?,
-                "--blob-bytes" => blob_bytes = parse_u64(&arg, args.next())?,
-                "--blob-range-bytes" => blob_range_bytes = parse_usize(&arg, args.next())?,
-                "--network-blob-bytes" => network_blob_bytes = parse_u64(&arg, args.next())?,
+                "--blob-bytes" => blob_bytes = parse_byte_count(&arg, args.next())?,
+                "--blob-range-bytes" => {
+                    blob_range_bytes =
+                        byte_count_to_usize(&arg, parse_byte_count(&arg, args.next())?)?
+                }
+                "--network-blob-bytes" => network_blob_bytes = parse_byte_count(&arg, args.next())?,
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
                 "--keep" => keep = true,
                 "--bench" => {}
@@ -130,6 +243,7 @@ impl Args {
 
         Ok(Self {
             scenario,
+            preset,
             root,
             explicit_root,
             files,
@@ -145,6 +259,27 @@ impl Args {
 
     fn scenario_root(&self, name: &str) -> PathBuf {
         self.root.join(name)
+    }
+
+    fn emit_config(&self) {
+        emit(
+            "bench_config",
+            std::time::Duration::ZERO,
+            json!({
+                "preset": self.preset.as_str(),
+                "selected_scenario": self.scenario.as_str(),
+                "root": self.root,
+                "explicit_root": self.explicit_root,
+                "files": self.files,
+                "dirs": self.dirs,
+                "file_bytes": self.file_bytes,
+                "blob_bytes": self.blob_bytes,
+                "blob_range_bytes": self.blob_range_bytes,
+                "network_blob_bytes": self.network_blob_bytes,
+                "list_page_size": self.list_page_size,
+                "keep": self.keep,
+            }),
+        );
     }
 }
 
@@ -777,11 +912,9 @@ fn env_usize(name: &str, default: usize) -> BenchResult<usize> {
     }
 }
 
-fn env_u64(name: &str, default: u64) -> BenchResult<u64> {
+fn env_bytes(name: &str, default: u64) -> BenchResult<u64> {
     match env::var(name) {
-        Ok(value) => value
-            .parse::<u64>()
-            .map_err(|error| format!("{name}={value:?} is not a u64: {error}").into()),
+        Ok(value) => parse_byte_count_value(name, &value),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(format!("could not read {name}: {error}").into()),
     }
@@ -794,11 +927,51 @@ fn parse_usize(flag: &str, value: Option<String>) -> BenchResult<usize> {
         .map_err(|error| format!("{flag} value {value:?} is not a usize: {error}").into())
 }
 
-fn parse_u64(flag: &str, value: Option<String>) -> BenchResult<u64> {
+fn parse_byte_count(flag: &str, value: Option<String>) -> BenchResult<u64> {
     let value = required_value(flag, value)?;
+    parse_byte_count_value(flag, &value)
+}
+
+fn byte_count_to_usize(label: &str, value: u64) -> BenchResult<usize> {
     value
+        .try_into()
+        .map_err(|_| format!("{label} value is too large for this platform").into())
+}
+
+fn parse_byte_count_value(label: &str, value: &str) -> BenchResult<u64> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(format!("{label} value must not be empty").into());
+    }
+    let split_at = normalized
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(normalized.len());
+    let (digits, suffix) = normalized.split_at(split_at);
+    if digits.is_empty() {
+        return Err(format!("{label} value {value:?} must start with digits").into());
+    }
+    let base = digits
         .parse::<u64>()
-        .map_err(|error| format!("{flag} value {value:?} is not a u64: {error}").into())
+        .map_err(|error| format!("{label} value {value:?} is not a byte count: {error}"))?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "t" | "tb" => 1_000_000_000_000,
+        "kib" => 1024,
+        "mib" => 1024 * 1024,
+        "gib" => 1024 * 1024 * 1024,
+        "tib" => 1024_u64.pow(4),
+        _ => {
+            return Err(format!(
+                "{label} value {value:?} has unsupported suffix; use B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB"
+            )
+            .into())
+        }
+    };
+    base.checked_mul(multiplier)
+        .ok_or_else(|| format!("{label} value {value:?} overflows u64").into())
 }
 
 fn required_value(flag: &str, value: Option<String>) -> BenchResult<String> {
@@ -811,6 +984,7 @@ fn print_help() {
          \n\
          Options:\n\
            --scenario all|namespace|posix-create|metadata-replication|blob|network-blob\n\
+           --preset smoke|scale|production\n\
            --root PATH\n\
            --files COUNT\n\
            --dirs COUNT\n\
@@ -822,11 +996,19 @@ fn print_help() {
            --keep\n\
          \n\
          Environment defaults:\n\
+           SINOMO_DFS_BENCH_PRESET,\n\
            SINOMO_DFS_BENCH_FILES, SINOMO_DFS_BENCH_DIRS,\n\
            SINOMO_DFS_BENCH_FILE_BYTES, SINOMO_DFS_BENCH_BLOB_BYTES,\n\
            SINOMO_DFS_BENCH_BLOB_RANGE_BYTES,\n\
            SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES,\n\
-           SINOMO_DFS_BENCH_LIST_PAGE_SIZE"
+           SINOMO_DFS_BENCH_LIST_PAGE_SIZE\n\
+         \n\
+         Presets:\n\
+           smoke: 10k files, 64 MiB local blob, 8 MiB network blob\n\
+           scale: 100k files, 1 GiB local blob, 512 MiB network blob\n\
+           production: 1M files, 4 GiB local blob, 4 GiB network blob\n\
+         \n\
+         Byte flags accept B, KB, MB, GB, TB, KiB, MiB, GiB, and TiB suffixes."
     );
 }
 

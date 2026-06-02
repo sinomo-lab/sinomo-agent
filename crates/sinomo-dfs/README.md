@@ -75,6 +75,26 @@ Legacy per-record `.sobj` metadata layouts are loaded into the compact table sna
 
 Operator status includes per-shard journal positions, inbound replay cursors, and configured replica cursor lag so cluster checks can distinguish object-level repair work from metadata replication backlog.
 
+### Scale Benchmarks
+
+The crate includes a JSONL scale benchmark for DFS namespace, metadata replication, local content, and network content paths:
+
+```sh
+cargo bench -p sinomo-dfs --bench scale -- --scenario all --preset smoke
+```
+
+The default `smoke` preset keeps local validation cheap. Use the production preset for the baseline targets that matter before DFS scaling changes: 1M namespace objects, full and paginated directory listing, create throughput, reopen hydration, metadata replication catch-up, and multi-GB local/network blob streaming.
+
+```sh
+cargo bench -p sinomo-dfs --bench scale -- \
+  --scenario all \
+  --preset production \
+  --root /path/to/fast/sinomo-dfs-scale-baseline \
+  --keep
+```
+
+The benchmark prints one JSON object per measured step. Byte-sized flags such as `--blob-bytes`, `--blob-range-bytes`, and `--network-blob-bytes` accept suffixes like `MiB` and `GiB`, so expensive one-off runs can be narrowed without changing source code.
+
 ### Networked DFS Service
 
 `NetworkedDfsService<T>` is the distributed object service over a `sinomo-network` transport. It combines:
