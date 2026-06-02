@@ -4523,16 +4523,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
-        let manifest = match self.content.put_object_version_patch(
+        let patch_info = match self.content.put_object_version_patch_with_info(
             request.object_id.as_str(),
             expected_base_version.as_str(),
             request.target_version.as_str(),
             offset,
             bytes,
         ) {
-            Ok(manifest) => manifest,
+            Ok(patch_info) => patch_info,
             Err(_) => return Ok(None),
         };
+        let manifest = patch_info.manifest;
+        let Some(patch_hash) = patch_info.patch_hash.clone() else {
+            return Ok(None);
+        };
+        let patch_size_bytes = patch_info.patch_size_bytes;
         let intent = match self.coordinator.create_intent_at_epoch(
             request.file_system_id.clone(),
             request.object_id.clone(),
@@ -4548,12 +4553,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
                     && distributed_error_creates_conflict(&error) =>
             {
+                let conflict_content_hash = manifest.content_hash.clone();
                 let conflict = self.create_write_conflict(
                     &object,
                     Some(expected_base_version),
                     request.target_version.clone(),
                     request.requesting_node_id.clone(),
-                    Some(manifest.content_hash),
+                    Some(conflict_content_hash),
                     error.to_string(),
                     None,
                 )?;
@@ -4562,7 +4568,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Err(error) => return Err(error.into()),
         };
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
-        let patch_hash = content_hash(bytes);
         self.pending_writes.insert(
             intent.intent_id.clone(),
             pending_networked_write_with_patch(
@@ -4574,7 +4579,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     base_version: expected_base_version.clone(),
                     offset,
                     patch_hash: patch_hash.clone(),
-                    bytes: bytes.to_vec(),
+                    patch_size_bytes,
                     full_stage_fallback_nodes: BTreeSet::new(),
                 }),
             ),
@@ -4620,7 +4625,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     &manifest.content_hash,
                     offset,
                     &patch_hash,
-                    bytes,
+                    patch_size_bytes,
                     0,
                     DFS_STAGE_CHUNK_WINDOW_SIZE,
                     Some(object.clone()),
@@ -11513,7 +11518,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             &pending.content_hash,
             patch.offset,
             &patch.patch_hash,
-            &patch.bytes,
+            patch.patch_size_bytes,
             start_chunk_index,
             DFS_STAGE_CHUNK_WINDOW_SIZE,
             object_metadata,
@@ -13445,12 +13450,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         content_hash: &str,
         offset: u64,
         patch_hash: &str,
-        bytes: &[u8],
+        patch_size_bytes: u64,
         start_chunk_index: u32,
         max_chunks: u32,
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<StageBlobSendOutcome, DfsError> {
-        if bytes.len() <= DFS_BLOB_INLINE_LIMIT_BYTES {
+        if patch_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            let bytes = self.read_patch_blob_range(patch_hash, 0, patch_size_bytes)?;
             let sent = self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::StagePatch(DfsStagePatchCommand {
@@ -13463,7 +13469,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     content_hash: content_hash.to_string(),
                     offset,
                     patch_hash: patch_hash.to_string(),
-                    bytes: bytes.to_vec(),
+                    bytes,
                     object_metadata,
                 }),
             )?;
@@ -13474,8 +13480,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
 
-        let total_size_bytes = bytes.len() as u64;
-        let total_chunks = blob_chunk_count(bytes)?;
+        let total_size_bytes = patch_size_bytes;
+        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
         if start_chunk_index >= total_chunks {
             return Ok(StageBlobSendOutcome {
                 sent: true,
@@ -13487,13 +13493,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .saturating_add(max_chunks.max(1))
             .min(total_chunks);
         for chunk_index in start_chunk_index..end_chunk_index {
-            let start =
-                usize::try_from(u64::from(chunk_index).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64))
-                    .map_err(|_| DfsError::Distributed {
-                        message: format!("DFS patch chunk index is too large: {chunk_index}"),
-                    })?;
-            let end = start.saturating_add(DFS_BLOB_CHUNK_BYTES).min(bytes.len());
-            let chunk = &bytes[start..end];
+            let chunk_offset = u64::from(chunk_index).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64);
+            let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
+            let chunk = self.read_patch_blob_range(patch_hash, chunk_offset, chunk_len as u64)?;
             let sent = self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::StagePatchChunk(DfsStagePatchChunkCommand {
@@ -13509,8 +13511,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     total_size_bytes,
                     chunk_index,
                     total_chunks,
-                    chunk_hash: Some(chunk_hash(chunk)),
-                    bytes: chunk.to_vec(),
+                    chunk_hash: Some(chunk_hash(&chunk)),
+                    bytes: chunk,
                     object_metadata: object_metadata.clone(),
                 }),
             )?;
@@ -13527,6 +13529,34 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             complete: end_chunk_index >= total_chunks,
             next_chunk_index: end_chunk_index,
         })
+    }
+
+    fn read_patch_blob_range(
+        &self,
+        patch_hash: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, DfsError> {
+        let len = usize::try_from(len).map_err(|_| DfsError::Distributed {
+            message: format!("DFS patch range is too large to fit in memory: {len} bytes"),
+        })?;
+        let mut reader = self
+            .content
+            .open_blob_range_stream(patch_hash, offset, len)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!(
+                    "failed to open DFS patch blob {patch_hash} at {offset}+{len}: {source}"
+                ),
+            })?;
+        let mut bytes = vec![0_u8; len];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!(
+                    "failed to read DFS patch blob {patch_hash} at {offset}+{len}: {source}"
+                ),
+            })?;
+        Ok(bytes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13878,7 +13908,7 @@ fn pending_stage_transfer_size_bytes(
         .patch
         .as_ref()
         .filter(|patch| !patch.full_stage_fallback_nodes.contains(replica_node_id))
-        .map(|patch| patch.bytes.len() as u64)
+        .map(|patch| patch.patch_size_bytes)
         .unwrap_or(pending.size_bytes)
 }
 

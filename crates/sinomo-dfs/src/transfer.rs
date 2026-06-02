@@ -31,7 +31,7 @@ pub(crate) struct PendingNetworkedWritePatch {
     pub(crate) base_version: DfsVersion,
     pub(crate) offset: u64,
     pub(crate) patch_hash: String,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) patch_size_bytes: u64,
     pub(crate) full_stage_fallback_nodes: BTreeSet<NodeId>,
 }
 

@@ -10770,6 +10770,7 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
     for (index, byte) in patch.iter_mut().enumerate() {
         *byte = (index % 239) as u8;
     }
+    let patch_hash = content_hash(&patch);
     owner_dfs
         .posix_write_file_at(
             path,
@@ -10782,6 +10783,21 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
             },
         )
         .expect("large patch write");
+    let pending = owner_dfs
+        .pending_writes
+        .values()
+        .next()
+        .expect("pending large patch write");
+    let pending_patch = pending.patch.as_ref().expect("pending patch metadata");
+    assert_eq!(pending_patch.patch_hash, patch_hash);
+    assert_eq!(pending_patch.patch_size_bytes, patch.len() as u64);
+    assert!(
+        owner_dfs
+            .content()
+            .has_blob(&pending_patch.patch_hash)
+            .expect("pending patch blob exists"),
+        "pending patch retry should stream from the content-addressed patch blob"
+    );
 
     let first_messages = drain_dfs_messages(&mut replica_mailbox);
     assert!(

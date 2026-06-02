@@ -78,6 +78,13 @@ pub struct ContentManifest {
     pub extents: Vec<ContentExtent>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentPatchManifest {
+    pub manifest: ContentManifest,
+    pub patch_hash: Option<String>,
+    pub patch_size_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentExtent {
     pub logical_offset: u64,
@@ -825,13 +832,15 @@ impl LocalContentStore {
                 actual_hash,
             });
         }
-        let manifest = self.put_object_version_patch_from_file(
-            &assembler.object_id,
-            base_version,
-            &assembler.version,
-            offset,
-            &assembler.path,
-        )?;
+        let manifest = self
+            .put_object_version_patch_from_file(
+                &assembler.object_id,
+                base_version,
+                &assembler.version,
+                offset,
+                &assembler.path,
+            )?
+            .manifest;
         remove_file_if_exists(&assembler.path)?;
         assembler.cleanup_on_drop = false;
         Ok(manifest)
@@ -1352,6 +1361,25 @@ impl LocalContentStore {
         offset: u64,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        Ok(self
+            .put_object_version_patch_with_info(
+                object_id,
+                base_version,
+                target_version,
+                offset,
+                bytes,
+            )?
+            .manifest)
+    }
+
+    pub fn put_object_version_patch_with_info(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<ContentPatchManifest> {
         self.validate_object_version_patch_source(
             object_id,
             base_version,
@@ -1374,14 +1402,50 @@ impl LocalContentStore {
         )
     }
 
+    pub fn put_object_version_patch_from_reader_with_info<R: Read>(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        reader: R,
+    ) -> Result<ContentPatchManifest> {
+        self.put_object_version_patch_from_reader_impl(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            reader,
+        )
+    }
+
     pub fn put_object_version_patch_from_reader<R: Read>(
         &self,
         object_id: &str,
         base_version: &str,
         target_version: &str,
         offset: u64,
-        mut reader: R,
+        reader: R,
     ) -> Result<ContentManifest> {
+        Ok(self
+            .put_object_version_patch_from_reader_impl(
+                object_id,
+                base_version,
+                target_version,
+                offset,
+                reader,
+            )?
+            .manifest)
+    }
+
+    fn put_object_version_patch_from_reader_impl<R: Read>(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        mut reader: R,
+    ) -> Result<ContentPatchManifest> {
         let staging_anchor = self
             .root
             .join("staging")
@@ -1413,7 +1477,7 @@ impl LocalContentStore {
         target_version: &str,
         offset: u64,
         source_path: &Path,
-    ) -> Result<ContentManifest> {
+    ) -> Result<ContentPatchManifest> {
         let (patch_hash, patch_size) = file_content_hash_and_size(source_path)?;
         self.validate_object_version_patch_source(object_id, base_version, offset, patch_size)?;
         if patch_size == 0 {
@@ -1480,7 +1544,7 @@ impl LocalContentStore {
         offset: u64,
         patch_hash: Option<String>,
         patch_size: u64,
-    ) -> Result<ContentManifest> {
+    ) -> Result<ContentPatchManifest> {
         let base_manifest = self.read_manifest(object_id, base_version)?;
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
@@ -1532,13 +1596,13 @@ impl LocalContentStore {
             }
         }
 
-        if let Some(patch_hash) = patch_hash {
+        if let Some(patch_hash) = patch_hash.as_ref() {
             push_extent_coalescing(
                 &mut target_extents,
                 ContentExtent {
                     logical_offset: offset,
                     size_bytes: patch_size,
-                    content_hash: patch_hash,
+                    content_hash: patch_hash.clone(),
                     blob_offset: 0,
                 },
             )?;
@@ -1558,7 +1622,12 @@ impl LocalContentStore {
             size_bytes: target_size,
             extents: target_extents,
         };
-        self.write_manifest_create_new_or_existing(manifest)
+        let manifest = self.write_manifest_create_new_or_existing(manifest)?;
+        Ok(ContentPatchManifest {
+            manifest,
+            patch_hash,
+            patch_size_bytes: patch_size,
+        })
     }
 
     fn write_object_version(
@@ -3118,13 +3187,26 @@ mod tests {
             .put_object_version("object-patch", "v1", &base)
             .expect("put base object");
         let patch = b"extent-patch";
+        let patch_hash = content_hash(patch);
         let patch_offset = 96 * 1024 + 7;
         let mut expected = base.clone();
         expected[patch_offset..patch_offset + patch.len()].copy_from_slice(patch);
 
-        let patched = store
-            .put_object_version_patch("object-patch", "v1", "v2", patch_offset as u64, patch)
+        let patched_info = store
+            .put_object_version_patch_with_info(
+                "object-patch",
+                "v1",
+                "v2",
+                patch_offset as u64,
+                patch,
+            )
             .expect("put patched object");
+        assert_eq!(
+            patched_info.patch_hash.as_deref(),
+            Some(patch_hash.as_str())
+        );
+        assert_eq!(patched_info.patch_size_bytes, patch.len() as u64);
+        let patched = patched_info.manifest;
 
         assert_eq!(patched.size_bytes, expected.len() as u64);
         assert_eq!(patched.content_hash, content_hash(&expected));
@@ -3139,7 +3221,7 @@ mod tests {
             patched
                 .extents
                 .iter()
-                .any(|extent| extent.content_hash == content_hash(patch)),
+                .any(|extent| extent.content_hash == patch_hash),
             "patched manifest should reference only the changed bytes as a patch blob"
         );
         assert!(
@@ -3840,8 +3922,8 @@ mod tests {
         expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
         let reads = std::rc::Rc::new(std::cell::Cell::new(0));
 
-        let patched = store
-            .put_object_version_patch_from_reader(
+        let patched_info = store
+            .put_object_version_patch_from_reader_with_info(
                 "object-stream-patch",
                 "v1",
                 "v2",
@@ -3854,6 +3936,12 @@ mod tests {
                 },
             )
             .expect("put streamed patch object");
+        assert_eq!(
+            patched_info.patch_hash.as_deref(),
+            Some(patch_hash.as_str())
+        );
+        assert_eq!(patched_info.patch_size_bytes, patch.len() as u64);
+        let patched = patched_info.manifest;
 
         assert!(
             reads.get() > 1,
