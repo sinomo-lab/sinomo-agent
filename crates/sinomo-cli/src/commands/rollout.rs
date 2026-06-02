@@ -1411,6 +1411,7 @@ fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutT
 }
 
 const ROLLOUT_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const ROLLOUT_TERMINAL_STATUS_GRACE: Duration = Duration::from_secs(45);
 const ROLLOUT_PROGRESS_BAR_WIDTH: usize = 24;
 
 pub(crate) fn rollout_progress_bar(status: Option<&ClusterNodeRolloutStatus>) -> String {
@@ -1547,43 +1548,61 @@ where
     let started = Instant::now();
     let mut last_len = 0usize;
     let mut drew_progress = false;
+    let mut pending_error: Option<CliError> = None;
+    let mut pending_error_started_at: Option<Instant> = None;
     loop {
-        match result_rx.recv_timeout(ROLLOUT_PROGRESS_POLL_INTERVAL) {
-            Ok(result) => {
-                if drew_progress {
-                    println!();
-                }
-                return result;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                let rollout_status = read_rollout_target_status(&target_for_poll)
-                    .ok()
-                    .and_then(|status| status.rollout)
-                    .filter(|status| rollout_status_matches_expectation(status, &expectation));
-                let line = format_rollout_progress_line(
-                    target.label(),
-                    operation,
-                    rollout_status.as_ref(),
-                    started.elapsed(),
-                );
-                write_rollout_progress_line(&line, &mut last_len)?;
-                drew_progress = true;
-                if let Some(response) = rollout_status
-                    .as_ref()
-                    .and_then(|status| rollout_terminal_response(status, &expectation))
-                {
-                    println!();
+        if pending_error.is_none() {
+            match result_rx.recv_timeout(ROLLOUT_PROGRESS_POLL_INTERVAL) {
+                Ok(Ok(response)) => {
+                    if drew_progress {
+                        println!();
+                    }
                     return Ok(response);
                 }
+                Ok(Err(error)) => {
+                    pending_error = Some(error);
+                    pending_error_started_at = Some(Instant::now());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    pending_error = Some(CliError::Network {
+                        address: target.label().to_string(),
+                        detail: format!("{operation} worker stopped before returning a result"),
+                    });
+                    pending_error_started_at = Some(Instant::now());
+                }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+        } else {
+            thread::sleep(ROLLOUT_PROGRESS_POLL_INTERVAL);
+        }
+
+        let rollout_status = read_rollout_target_status(&target_for_poll)
+            .ok()
+            .and_then(|status| status.rollout)
+            .filter(|status| rollout_status_matches_expectation(status, &expectation));
+        let line = format_rollout_progress_line(
+            target.label(),
+            operation,
+            rollout_status.as_ref(),
+            started.elapsed(),
+        );
+        write_rollout_progress_line(&line, &mut last_len)?;
+        drew_progress = true;
+        if let Some(response) = rollout_status
+            .as_ref()
+            .and_then(|status| rollout_terminal_response(status, &expectation))
+        {
+            println!();
+            return Ok(response);
+        }
+        if pending_error_started_at
+            .is_some_and(|started_at| started_at.elapsed() >= ROLLOUT_TERMINAL_STATUS_GRACE)
+        {
+            if let Some(error) = pending_error {
                 if drew_progress {
                     println!();
                 }
-                return Err(CliError::Network {
-                    address: target.label().to_string(),
-                    detail: format!("{operation} worker stopped before returning a result"),
-                });
+                return Err(error);
             }
         }
     }
