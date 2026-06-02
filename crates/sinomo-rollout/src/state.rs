@@ -287,6 +287,21 @@ pub fn append_rollout_status_diagnostic(
             if let Some(detail) = status.detail {
                 output.push_str(&format!("detail: {detail}\n"));
             }
+            if let Some(phase) = status.phase {
+                output.push_str(&format!("phase: {phase}\n"));
+            }
+            match (status.progress_current, status.progress_total) {
+                (Some(current), Some(total)) => {
+                    output.push_str(&format!("progress: {current}/{total}\n"));
+                }
+                (Some(current), None) => {
+                    output.push_str(&format!("progress: {current}\n"));
+                }
+                _ => {}
+            }
+            if let Some(message) = status.progress_message {
+                output.push_str(&format!("progress_message: {message}\n"));
+            }
             if let Some(source) = status.source {
                 output.push_str(&format!("source: {source}\n"));
             }
@@ -412,6 +427,10 @@ pub fn record_main_activation_staged(
             status: "main-staged".to_string(),
             mode: Some(activation.mode.clone()),
             detail: None,
+            phase: Some("main-staged".to_string()),
+            progress_current: Some(5),
+            progress_total: Some(5),
+            progress_message: Some("candidate main staged".to_string()),
             source: Some(activation.source.clone()),
             requested_at: Some(activation.requested_at.clone()),
             staged_at: Some(format_now()),
@@ -439,6 +458,10 @@ pub fn record_activation_failure(
             status: "failed".to_string(),
             mode: Some(activation.mode.clone()),
             detail: Some(detail.to_string()),
+            phase: Some("activation-failed".to_string()),
+            progress_current: Some(5),
+            progress_total: Some(5),
+            progress_message: Some(detail.to_string()),
             source: Some(activation.source.clone()),
             requested_at: Some(activation.requested_at.clone()),
             staged_at: None,
@@ -485,6 +508,10 @@ pub fn record_main_rollout_failure_with_diagnostics(
             status: "failed".to_string(),
             mode: Some(activation.mode.clone()),
             detail: Some(detail.to_string()),
+            phase: Some("activation-failed".to_string()),
+            progress_current: Some(5),
+            progress_total: Some(5),
+            progress_message: Some(detail.to_string()),
             source: Some(activation.source.clone()),
             requested_at: Some(activation.requested_at.clone()),
             staged_at: None,
@@ -515,6 +542,10 @@ pub fn record_shadow_rollout_finalized(
             status: status.to_string(),
             mode: Some(finalize.mode.clone()),
             detail: Some(detail.to_string()),
+            phase: Some("shadow-finalized".to_string()),
+            progress_current: Some(5),
+            progress_total: Some(5),
+            progress_message: Some(detail.to_string()),
             source: Some(finalize.source.clone()),
             requested_at: Some(finalize.requested_at.clone()),
             staged_at: None,
@@ -839,6 +870,10 @@ mod tests {
                 status: "main-staged".to_string(),
                 mode: Some("cluster-remote-build".to_string()),
                 detail: Some("ready".to_string()),
+                phase: None,
+                progress_current: None,
+                progress_total: None,
+                progress_message: None,
                 source: Some("source-head".to_string()),
                 requested_at: Some("2026-05-08T00:00:00Z".to_string()),
                 staged_at: None,
@@ -877,6 +912,10 @@ mod tests {
             status: "accepted".to_string(),
             mode: Some("cluster-remote-build".to_string()),
             detail: Some("recovered".to_string()),
+            phase: None,
+            progress_current: None,
+            progress_total: None,
+            progress_message: None,
             source: None,
             requested_at: None,
             staged_at: None,

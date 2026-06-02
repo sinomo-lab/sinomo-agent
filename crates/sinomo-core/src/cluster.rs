@@ -205,6 +205,14 @@ pub struct ClusterNodeRolloutStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_current: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_total: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_at: Option<String>,

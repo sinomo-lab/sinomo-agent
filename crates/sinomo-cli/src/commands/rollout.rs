@@ -1367,6 +1367,122 @@ fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutT
     }
 }
 
+const ROLLOUT_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const ROLLOUT_PROGRESS_BAR_WIDTH: usize = 24;
+
+pub(crate) fn rollout_progress_bar(status: Option<&ClusterNodeRolloutStatus>) -> String {
+    let Some(status) = status else {
+        return format!("[{}]   -", ".".repeat(ROLLOUT_PROGRESS_BAR_WIDTH));
+    };
+    let Some(total) = status.progress_total.filter(|total| *total > 0) else {
+        return format!("[{}]   -", ".".repeat(ROLLOUT_PROGRESS_BAR_WIDTH));
+    };
+    let current = status.progress_current.unwrap_or_default().min(total);
+    let filled = ((current as usize * ROLLOUT_PROGRESS_BAR_WIDTH) / total as usize)
+        .min(ROLLOUT_PROGRESS_BAR_WIDTH);
+    let empty = ROLLOUT_PROGRESS_BAR_WIDTH.saturating_sub(filled);
+    let percent = ((current * 100) / total).min(100);
+    format!(
+        "[{}{}] {:>3}%",
+        "=".repeat(filled),
+        ".".repeat(empty),
+        percent
+    )
+}
+
+pub(crate) fn format_rollout_progress_line(
+    label: &str,
+    operation: &str,
+    status: Option<&ClusterNodeRolloutStatus>,
+    elapsed: Duration,
+) -> String {
+    let elapsed_secs = elapsed.as_secs();
+    let Some(status) = status else {
+        return format!(
+            "{label}: {} {operation} - waiting for status ({elapsed_secs}s)",
+            rollout_progress_bar(None)
+        );
+    };
+    let phase = status
+        .phase
+        .as_deref()
+        .filter(|phase| !phase.is_empty())
+        .unwrap_or(status.status.as_str());
+    let message = status
+        .progress_message
+        .as_deref()
+        .or(status.detail.as_deref())
+        .filter(|message| !message.is_empty())
+        .unwrap_or(operation);
+    format!(
+        "{label}: {} {phase} - {message} ({elapsed_secs}s)",
+        rollout_progress_bar(Some(status))
+    )
+}
+
+fn write_rollout_progress_line(line: &str, last_len: &mut usize) -> Result<(), CliError> {
+    let padding = last_len.saturating_sub(line.len());
+    let mut output = format!("\r{line}");
+    if padding > 0 {
+        output.push_str(&" ".repeat(padding));
+    }
+    write_cli_stdout_bytes(output.as_bytes()).map_err(CliError::stdio)?;
+    *last_len = line.len();
+    Ok(())
+}
+
+fn send_rollout_request_with_progress<F>(
+    target: &RolloutTarget,
+    operation: &'static str,
+    send: F,
+) -> Result<ClusterRolloutBinaryResponse, CliError>
+where
+    F: FnOnce(RolloutTarget) -> Result<ClusterRolloutBinaryResponse, CliError> + Send + 'static,
+{
+    let target_for_send = target.clone();
+    let target_for_poll = target.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = result_tx.send(send(target_for_send));
+    });
+
+    let started = Instant::now();
+    let mut last_len = 0usize;
+    let mut drew_progress = false;
+    loop {
+        match result_rx.recv_timeout(ROLLOUT_PROGRESS_POLL_INTERVAL) {
+            Ok(result) => {
+                if drew_progress {
+                    println!();
+                }
+                return result;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let rollout_status = read_rollout_target_status(&target_for_poll)
+                    .ok()
+                    .and_then(|status| status.rollout);
+                let line = format_rollout_progress_line(
+                    target.label(),
+                    operation,
+                    rollout_status.as_ref(),
+                    started.elapsed(),
+                );
+                write_rollout_progress_line(&line, &mut last_len)?;
+                drew_progress = true;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if drew_progress {
+                    println!();
+                }
+                return Err(CliError::Network {
+                    address: target.label().to_string(),
+                    detail: format!("{operation} worker stopped before returning a result"),
+                });
+            }
+        }
+    }
+}
+
 pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<DaemonStatus, CliError> {
     if let Some(endpoint) = &target.endpoint {
         sinomo_runtime::daemon::fetch_daemon_status_from_endpoint(endpoint, DAEMON_JOIN_TIMEOUT)
@@ -1392,6 +1508,16 @@ pub(crate) fn send_daemon_rollout_binary(
     target: &RolloutTarget,
     request: &ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    let request = request.clone();
+    send_rollout_request_with_progress(target, "binary rollout", move |target| {
+        send_daemon_rollout_binary_direct(&target, &request)
+    })
+}
+
+fn send_daemon_rollout_binary_direct(
+    target: &RolloutTarget,
+    request: &ClusterRolloutBinaryRequest,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
     if let Some(endpoint) = &target.endpoint {
         daemon_send_daemon_rollout_binary_to_endpoint(endpoint, request, DAEMON_ROLLOUT_TIMEOUT)
             .map_err(Into::into)
@@ -1402,6 +1528,16 @@ pub(crate) fn send_daemon_rollout_binary(
 }
 
 pub(crate) fn send_daemon_rollout_build(
+    target: &RolloutTarget,
+    request: &ClusterRolloutBuildRequest,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    let request = request.clone();
+    send_rollout_request_with_progress(target, "remote build", move |target| {
+        send_daemon_rollout_build_direct(&target, &request)
+    })
+}
+
+fn send_daemon_rollout_build_direct(
     target: &RolloutTarget,
     request: &ClusterRolloutBuildRequest,
 ) -> Result<ClusterRolloutBinaryResponse, CliError> {

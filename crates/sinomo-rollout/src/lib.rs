@@ -74,7 +74,11 @@ pub fn register_storage_paths(
         ObjectSchema::new("ClusterNodeRolloutStatus", STORAGE_CONTRACT_OBJECT_VERSION)
             .field("status", "String")
             .field("mode", "Option<String>")
-            .field("detail", "Option<String>"),
+            .field("detail", "Option<String>")
+            .field("phase", "Option<String>")
+            .field("progress_current", "Option<u32>")
+            .field("progress_total", "Option<u32>")
+            .field("progress_message", "Option<String>"),
     )?;
     layout.register_sinomo_object(
         "sinomo-rollout",

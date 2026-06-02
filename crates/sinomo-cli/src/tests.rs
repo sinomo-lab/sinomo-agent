@@ -36,13 +36,13 @@ use super::{
     daemon_run_toolchain_request, data_dir_storage_contract_findings, decode_cluster_join_invite,
     elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
     expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
-    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
-    handle_daemon_cluster_raft_vote_request, handle_daemon_connection,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
+    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
+    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
+    handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
+    install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
     load_cui_model_runtime_config, main_agent_handler_for_cui_with_data_dir, managed_source_status,
     merge_benchmark_gate_requests, merge_module_replay_report_refs, model_config_uses_cluster,
@@ -57,12 +57,13 @@ use super::{
     read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
     rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
-    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
-    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
-    run_cui_with_handler_io, run_cui_with_handler_io_and_daemon, run_evolve_command,
-    run_shadow_daemon_with_paths, sandbox_cat_with_store, sandbox_checkpoint_with_store,
-    sandbox_config_with_store, sandbox_create_with_store, sandbox_destroy_with_store,
-    sandbox_doctor_findings_with_stores, sandbox_doctor_findings_with_stores_and_events,
+    rollout_progress_bar, rollout_target_endpoint_for_main,
+    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
+    rollout_telemetry_gates_set_with_data_dir, run_cui_with_handler_io,
+    run_cui_with_handler_io_and_daemon, run_evolve_command, run_shadow_daemon_with_paths,
+    sandbox_cat_with_store, sandbox_checkpoint_with_store, sandbox_config_with_store,
+    sandbox_create_with_store, sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
+    sandbox_doctor_findings_with_stores_and_events,
     sandbox_fetch_with_store_transport_and_event_store, sandbox_logs_with_store,
     sandbox_ls_with_store, sandbox_policy_uses_cluster, sandbox_process_plan_with_stores,
     sandbox_reboot_with_store, sandbox_resume_with_store, sandbox_run_with_store,
@@ -12450,6 +12451,10 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
             status: "accepted".to_string(),
             mode: Some("cluster-remote-build".to_string()),
             detail: None,
+            phase: None,
+            progress_current: None,
+            progress_total: None,
+            progress_message: None,
             source: None,
             requested_at: None,
             staged_at: None,
@@ -12931,6 +12936,66 @@ fn local_rollout_wait_timeout_covers_shadow_candidate_handoff() {
 #[test]
 fn daemon_rollout_timeout_covers_windows_shadow_handoff() {
     assert!(super::DAEMON_ROLLOUT_TIMEOUT >= Duration::from_secs(30));
+}
+
+#[test]
+fn rollout_progress_bar_formats_known_and_unknown_progress() {
+    assert_eq!(rollout_progress_bar(None), "[........................]   -");
+    let status = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "in-progress".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: None,
+        phase: Some("building".to_string()),
+        progress_current: Some(2),
+        progress_total: Some(5),
+        progress_message: Some("cargo build running".to_string()),
+        source: None,
+        requested_at: None,
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    assert_eq!(
+        rollout_progress_bar(Some(&status)),
+        "[=========...............]  40%"
+    );
+}
+
+#[test]
+fn rollout_progress_line_includes_phase_message_and_elapsed_time() {
+    let status = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "in-progress".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: None,
+        phase: Some("building".to_string()),
+        progress_current: Some(2),
+        progress_total: Some(5),
+        progress_message: Some("cargo build running".to_string()),
+        source: None,
+        requested_at: None,
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    assert_eq!(
+        format_rollout_progress_line(
+            "node-a",
+            "remote build",
+            Some(&status),
+            Duration::from_secs(12),
+        ),
+        "node-a: [=========...............]  40% building - cargo build running (12s)"
+    );
 }
 
 #[test]

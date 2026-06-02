@@ -47,6 +47,97 @@ const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
+const CLUSTER_ROLLOUT_PROGRESS_TOTAL: u32 = 5;
+const CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+fn rollout_timestamp_now() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_cluster_rollout_progress(
+    daemon_paths: &DaemonPaths,
+    rollout_paths: &SelfRolloutPaths,
+    status: &str,
+    mode: &str,
+    detail: Option<String>,
+    source: &str,
+    requested_at: &str,
+    phase: &str,
+    progress_current: u32,
+    progress_message: impl Into<String>,
+) -> Result<(), DaemonError> {
+    let now = rollout_timestamp_now();
+    let is_terminal_failure = matches!(status, "failed" | "rejected");
+    write_rollout_status(
+        rollout_paths,
+        &ClusterNodeRolloutStatus {
+            status: status.to_string(),
+            mode: Some(mode.to_string()),
+            detail,
+            phase: Some(phase.to_string()),
+            progress_current: Some(progress_current.min(CLUSTER_ROLLOUT_PROGRESS_TOTAL)),
+            progress_total: Some(CLUSTER_ROLLOUT_PROGRESS_TOTAL),
+            progress_message: Some(progress_message.into()),
+            source: Some(source.to_string()),
+            requested_at: Some(requested_at.to_string()),
+            staged_at: (status == "main-staged").then_some(now.clone()),
+            updated_at: Some(now.clone()),
+            failed_at: is_terminal_failure.then_some(now),
+            diagnostics: None,
+            stdout_log: None,
+            stderr_log: None,
+            stdout_tail: None,
+            stderr_tail: None,
+        },
+    )?;
+    publish_rollout_progress_to_cluster(daemon_paths);
+    Ok(())
+}
+
+fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
+    if let Err(error) = crate::refresh_daemon_node_status_in_kv(daemon_paths) {
+        eprintln!("sinomo daemon rollout progress publish failed: {error}");
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_cluster_rollout_build_heartbeat(
+    daemon_paths: DaemonPaths,
+    rollout_paths: SelfRolloutPaths,
+    mode: &'static str,
+    source: String,
+    requested_at: String,
+    phase: &'static str,
+    progress_current: u32,
+) -> (std::sync::mpsc::Sender<()>, thread::JoinHandle<()>) {
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        loop {
+            match stop_rx.recv_timeout(CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            let elapsed = started.elapsed().as_secs();
+            let _ = write_cluster_rollout_progress(
+                &daemon_paths,
+                &rollout_paths,
+                "in-progress",
+                mode,
+                Some(format!("building for {elapsed}s")),
+                &source,
+                &requested_at,
+                phase,
+                progress_current,
+                format!("cargo build running for {elapsed}s"),
+            );
+        }
+    });
+    (stop_tx, handle)
+}
 
 #[derive(Clone, Debug)]
 pub struct ShadowMainRolloutMonitor {
@@ -760,38 +851,89 @@ pub fn handle_daemon_rollout_binary_request(
     request: ClusterRolloutBinaryRequest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    ensure_rollout_layout(&rollout_paths)?;
+    let source = request.source.clone();
+    let requested_at = request.requested_at.clone();
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-binary-push",
+        Some("rollout request received".to_string()),
+        &source,
+        &requested_at,
+        "received",
+        1,
+        "rollout request received",
+    )?;
     if (!request.target_os.is_empty() && request.target_os != env::consts::OS)
         || (!request.target_arch.is_empty() && request.target_arch != env::consts::ARCH)
     {
+        let detail = format!(
+            "artifact platform {}/{} does not match target platform {}/{}",
+            request.target_os,
+            request.target_arch,
+            env::consts::OS,
+            env::consts::ARCH
+        );
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "rejected",
+            "cluster-binary-push",
+            Some(detail.clone()),
+            &source,
+            &requested_at,
+            "rejected",
+            CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+            "platform rejected",
+        )?;
         return Ok(ClusterRolloutBinaryResponse {
             status: "rejected".to_string(),
-            detail: format!(
-                "artifact platform {}/{} does not match target platform {}/{}",
-                request.target_os,
-                request.target_arch,
-                env::consts::OS,
-                env::consts::ARCH
-            ),
+            detail,
             main_binary: PathBuf::new(),
             shadow_binary: PathBuf::new(),
             source_head: None,
         });
     }
 
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
-    ensure_rollout_layout(&rollout_paths)?;
     let binary = request.binary;
     let main_binary = rollout_paths.main_binary.clone();
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-binary-push",
+        Some("staging candidate binaries".to_string()),
+        &source,
+        &requested_at,
+        "staging-binaries",
+        2,
+        "staging candidate binaries",
+    )?;
     stage_rollout_bytes(&binary, &staged_main_binary)?;
     stage_rollout_bytes(&binary, &staged_shadow_binary)?;
 
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-binary-push",
+        Some("preparing activation".to_string()),
+        &source,
+        &requested_at,
+        "preparing-activation",
+        4,
+        "preparing activation",
+    )?;
     let plan = prepare_cluster_rollout_main_activation(
         paths,
         data_dir,
-        request.source,
+        source,
         main_binary.clone(),
         shadow_binary.clone(),
         Some(staged_main_binary),
@@ -799,11 +941,12 @@ pub fn handle_daemon_rollout_binary_request(
         request.host,
         request.port,
         request.shadow_port,
-        request.requested_at,
+        requested_at,
         "cluster-binary-push",
     )?;
     let activation_strategy =
         stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    publish_rollout_progress_to_cluster(paths);
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
         detail: rollout_staged_detail(
@@ -1492,7 +1635,33 @@ pub fn handle_daemon_rollout_build_request(
     let data_dir = daemon_data_dir(paths)?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
+    let source = request.source.clone();
+    let requested_at = request.requested_at.clone();
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-remote-build",
+        Some("remote build request received".to_string()),
+        &source,
+        &requested_at,
+        "received",
+        1,
+        "remote build request received",
+    )?;
     let repo = if let Some(bundle_bytes) = request.source_bundle.as_deref() {
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "in-progress",
+            "cluster-remote-build",
+            Some("importing source bundle".to_string()),
+            &source,
+            &requested_at,
+            "importing-source",
+            1,
+            "importing source bundle",
+        )?;
         let bundle_path = rollout_paths
             .root
             .join("staged")
@@ -1511,12 +1680,25 @@ pub fn handle_daemon_rollout_build_request(
         if let Some(expected_head) = request.source_head.as_deref() {
             let status = managed_source_status(&rollout_paths)?;
             if !source_heads_match(status.head.as_deref(), expected_head) {
+                let detail = format!(
+                    "source bundle imported but managed source head is {}, expected {expected_head}",
+                    status.head.unwrap_or_else(|| "unknown".to_string())
+                );
+                write_cluster_rollout_progress(
+                    paths,
+                    &rollout_paths,
+                    "rejected",
+                    "cluster-remote-build",
+                    Some(detail.clone()),
+                    &source,
+                    &requested_at,
+                    "source-rejected",
+                    CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+                    "source head mismatch",
+                )?;
                 return Ok(ClusterRolloutBinaryResponse {
                     status: "rejected".to_string(),
-                    detail: format!(
-                        "source bundle imported but managed source head is {}, expected {expected_head}",
-                        status.head.unwrap_or_else(|| "unknown".to_string())
-                    ),
+                    detail,
                     main_binary: PathBuf::new(),
                     shadow_binary: PathBuf::new(),
                     source_head: None,
@@ -1525,27 +1707,92 @@ pub fn handle_daemon_rollout_build_request(
         }
         rollout_paths.source_repo.clone()
     } else {
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "in-progress",
+            "cluster-remote-build",
+            Some("using target source repository".to_string()),
+            &source,
+            &requested_at,
+            "preparing-source",
+            1,
+            "using target source repository",
+        )?;
         rollout_remote_repo_path(&rollout_paths, request.remote_repo.as_deref())
     };
     if !repo.join("Cargo.toml").exists() {
+        let detail = format!(
+            "remote source repo is not initialized at {}; run `sinomo rollout init-source --repo <path>` on this node or pass --remote-repo <path>",
+            repo.display()
+        );
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "rejected",
+            "cluster-remote-build",
+            Some(detail.clone()),
+            &source,
+            &requested_at,
+            "source-rejected",
+            CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+            "source repository missing",
+        )?;
         return Ok(ClusterRolloutBinaryResponse {
             status: "rejected".to_string(),
-            detail: format!(
-                "remote source repo is not initialized at {}; run `sinomo rollout init-source --repo <path>` on this node or pass --remote-repo <path>",
-                repo.display()
-            ),
+            detail,
             main_binary: PathBuf::new(),
             shadow_binary: PathBuf::new(),
             source_head: None,
         });
     }
 
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-remote-build",
+        Some("building target binary".to_string()),
+        &source,
+        &requested_at,
+        "building",
+        2,
+        "cargo build running",
+    )?;
+    let (heartbeat_stop, heartbeat) = start_cluster_rollout_build_heartbeat(
+        paths.clone(),
+        rollout_paths.clone(),
+        "cluster-remote-build",
+        source.clone(),
+        requested_at.clone(),
+        "building",
+        2,
+    );
     let built_binary = match rollout_build_dev_binary(&repo, &rollout_paths.build_log) {
-        Ok(binary) => binary,
+        Ok(binary) => {
+            let _ = heartbeat_stop.send(());
+            let _ = heartbeat.join();
+            binary
+        }
         Err(error) => {
+            let _ = heartbeat_stop.send(());
+            let _ = heartbeat.join();
+            let detail = format!("remote build failed: {error}");
+            let _ = write_cluster_rollout_progress(
+                paths,
+                &rollout_paths,
+                "rejected",
+                "cluster-remote-build",
+                Some(detail.clone()),
+                &source,
+                &requested_at,
+                "build-failed",
+                CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+                "build failed",
+            );
             return Ok(ClusterRolloutBinaryResponse {
                 status: "rejected".to_string(),
-                detail: format!("remote build failed: {error}"),
+                detail,
                 main_binary: PathBuf::new(),
                 shadow_binary: PathBuf::new(),
                 source_head: None,
@@ -1556,11 +1803,33 @@ pub fn handle_daemon_rollout_build_request(
     let shadow_binary = rollout_paths.shadow_binary.clone();
     let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-remote-build",
+        Some("staging built binaries".to_string()),
+        &source,
+        &requested_at,
+        "staging-binaries",
+        3,
+        "staging built binaries",
+    )?;
     stage_rollout_file(&built_binary, &staged_main_binary)?;
     stage_rollout_file(&built_binary, &staged_shadow_binary)?;
 
-    let source = request.source.clone();
-    let requested_at = request.requested_at.clone();
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-remote-build",
+        Some("preparing activation".to_string()),
+        &source,
+        &requested_at,
+        "preparing-activation",
+        4,
+        "preparing activation",
+    )?;
     let plan = prepare_cluster_rollout_main_activation(
         paths,
         data_dir,
@@ -1578,28 +1847,7 @@ pub fn handle_daemon_rollout_build_request(
     let activation_strategy =
         stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
     let _ = (repo, built_binary);
-    write_rollout_status(
-        &rollout_paths,
-        &ClusterNodeRolloutStatus {
-            status: "main-staged".to_string(),
-            mode: Some("cluster-remote-build".to_string()),
-            detail: None,
-            source: Some(source),
-            requested_at: Some(requested_at),
-            staged_at: Some(
-                OffsetDateTime::now_utc()
-                    .format(&Rfc3339)
-                    .unwrap_or_else(|_| "unknown".to_string()),
-            ),
-            updated_at: None,
-            failed_at: None,
-            diagnostics: None,
-            stdout_log: None,
-            stderr_log: None,
-            stdout_tail: None,
-            stderr_tail: None,
-        },
-    )?;
+    publish_rollout_progress_to_cluster(paths);
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
         detail: rollout_staged_detail(

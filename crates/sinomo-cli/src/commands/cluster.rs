@@ -936,10 +936,19 @@ pub(crate) fn format_node_availability(availability: &ClusterNodeAvailability) -
 }
 
 pub(crate) fn format_rollout_status(status: &ClusterNodeRolloutStatus) -> String {
-    match status.mode.as_deref() {
+    let mut label = match status.mode.as_deref() {
         Some(mode) if !mode.is_empty() => format!("{} ({mode})", status.status),
         _ => status.status.clone(),
+    };
+    if status.progress_total.is_some_and(|total| total > 0) {
+        let phase = status
+            .phase
+            .as_deref()
+            .filter(|phase| !phase.is_empty())
+            .unwrap_or(status.status.as_str());
+        label.push_str(&format!(" {} {phase}", rollout_progress_bar(Some(status))));
     }
+    label
 }
 
 pub(crate) fn cluster_doctor() -> Result<(), CliError> {

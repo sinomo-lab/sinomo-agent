@@ -112,6 +112,11 @@ pub fn send_daemon_rpc_to_endpoint(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
     let command = daemon_rpc_command(&request.route);
+    if let Some(response) =
+        route_endpoint_request_via_local_daemon(endpoint, request, &signed, &command, timeout)
+    {
+        return response;
+    }
     // If we have no healthy direct edge to this endpoint but DO have a healthy relay route
     // (e.g. a cross-segment voter reachable only through a bridge), skip the direct dial -- it
     // would otherwise burn the entire timeout on a connect that cannot succeed, often past the
@@ -149,6 +154,66 @@ pub fn send_daemon_rpc_to_endpoint(
             ),
         }),
     }
+}
+
+fn route_endpoint_request_via_local_daemon(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    request_auth: &[u8],
+    request_command: &str,
+    timeout: Duration,
+) -> Option<Result<sinomo_network::ObjectRpcResponse, DaemonError>> {
+    if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
+        return None;
+    }
+    let status = match crate::default_main_daemon_status(timeout) {
+        Ok(Some(status)) => status,
+        Ok(None) | Err(_) => return None,
+    };
+    if !local_daemon_can_gateway_endpoint(
+        status.pid,
+        status.cluster.as_ref(),
+        endpoint,
+        std::process::id(),
+    ) {
+        return None;
+    }
+
+    let cluster = status.cluster.as_ref()?;
+    let inner = DaemonControlRequest::authenticated_rpc(
+        request_command.to_string(),
+        request.clone(),
+        request_auth.to_vec(),
+    );
+    let outer = match sinomo_network::RelayEnvelope::new(
+        cluster.cluster_id.clone(),
+        endpoint.node_id.clone(),
+        inner,
+    )
+    .into_request()
+    {
+        Ok(outer) => outer,
+        Err(error) => return Some(Err(DaemonError::from(error))),
+    };
+    match send_daemon_rpc(&status.address, &outer, timeout) {
+        Ok(response) if is_relay_routing_error(&response) => None,
+        Ok(response) => Some(Ok(response)),
+        Err(_) => None,
+    }
+}
+
+fn local_daemon_can_gateway_endpoint(
+    daemon_pid: u32,
+    daemon_cluster: Option<&crate::DaemonClusterStatus>,
+    endpoint: &ClusterEndpointRecord,
+    current_pid: u32,
+) -> bool {
+    daemon_pid != current_pid
+        && daemon_cluster.is_some_and(|cluster| cluster.node_id != endpoint.node_id)
+}
+
+fn is_relay_routing_error(response: &sinomo_network::ObjectRpcResponse) -> bool {
+    response.route == sinomo_network::CLUSTER_RELAY_ROUTE && response.error_detail().is_err()
 }
 
 pub fn fetch_daemon_status_from_endpoint(
@@ -626,7 +691,44 @@ pub fn send_daemon_rollout_diagnostics(
 
 #[cfg(test)]
 mod tests {
-    use super::{DaemonRpcAddressTransport, daemon_rpc_address_transport};
+    use super::{
+        DaemonRpcAddressTransport, daemon_rpc_address_transport, is_relay_routing_error,
+        local_daemon_can_gateway_endpoint,
+    };
+    use crate::DaemonClusterStatus;
+    use sinomo_core::{
+        ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterMemberRole,
+        ClusterMemberState, ClusterTransportKind,
+    };
+    use sinomo_network::{ClusterId, ObjectRpcResponse};
+    use sinomo_node::NodeId;
+
+    fn node_id(name: &str) -> NodeId {
+        NodeId::from_legacy_named(name).expect("node id")
+    }
+
+    fn endpoint(node_id: NodeId) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_core::Id::generate(),
+            node_id,
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.2:21353".to_string(),
+            source: ClusterEndpointSource::KvMembership,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn cluster_status(node_id: NodeId) -> DaemonClusterStatus {
+        DaemonClusterStatus {
+            cluster_id: ClusterId::from_legacy_named("cluster_gateway_test").expect("cluster id"),
+            node_id,
+            process: "daemon-main".to_string(),
+            member_role: ClusterMemberRole::Voter,
+            member_state: ClusterMemberState::Voter,
+        }
+    }
 
     #[test]
     fn daemon_rpc_address_transport_detects_iroh_urls() {
@@ -642,5 +744,49 @@ mod tests {
             daemon_rpc_address_transport("127.0.0.1:21353"),
             DaemonRpcAddressTransport::Tcp
         );
+    }
+
+    #[test]
+    fn local_daemon_gateway_only_handles_remote_endpoints_from_client_processes() {
+        let local = node_id("node_gateway_local");
+        let remote = node_id("node_gateway_remote");
+        let cluster = cluster_status(local.clone());
+        assert!(local_daemon_can_gateway_endpoint(
+            42,
+            Some(&cluster),
+            &endpoint(remote),
+            7
+        ));
+        assert!(!local_daemon_can_gateway_endpoint(
+            42,
+            Some(&cluster),
+            &endpoint(local),
+            7
+        ));
+        assert!(!local_daemon_can_gateway_endpoint(
+            42,
+            Some(&cluster),
+            &endpoint(node_id("node_gateway_other")),
+            42
+        ));
+        assert!(!local_daemon_can_gateway_endpoint(
+            42,
+            None,
+            &endpoint(node_id("node_gateway_other")),
+            7
+        ));
+    }
+
+    #[test]
+    fn relay_routing_errors_are_gateway_fallbacks() {
+        let relay_error =
+            ObjectRpcResponse::encode_error(sinomo_network::CLUSTER_RELAY_ROUTE, "no route")
+                .expect("relay error");
+        assert!(is_relay_routing_error(&relay_error));
+
+        let target_error =
+            ObjectRpcResponse::encode_error(sinomo_network::ROLLOUT_BUILD_ROUTE, "build failed")
+                .expect("target error");
+        assert!(!is_relay_routing_error(&target_error));
     }
 }
