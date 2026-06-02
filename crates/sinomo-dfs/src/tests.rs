@@ -3536,6 +3536,134 @@ fn stale_pending_remote_read_can_be_retried() {
 }
 
 #[test]
+fn chunked_remote_read_retry_resumes_from_received_prefix() {
+    let root = temp_root("chunked-remote-read-retry-resumes-prefix");
+    let owner = NodeId::from_legacy_named("node_read_resume_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_read_resume_reader").expect("node");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner")).expect("owner content"),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        LocalContentStore::new(root.join("reader")).expect("reader content"),
+    );
+    let file_system = file_system(owner.clone());
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    reader_dfs
+        .add_file_system(file_system)
+        .expect("reader filesystem");
+
+    let mut object = file_metadata(owner.clone());
+    object.object_id = DfsObjectId::from_legacy_named("obj_read_resume_prefix").expect("object");
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+    let object_id = object.object_id.clone();
+    let total_chunks = DFS_READ_CHUNK_WINDOW_SIZE + 1;
+    let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
+    let bytes = (0..bytes_len)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    owner_dfs
+        .put_local_object_version(object, &bytes)
+        .expect("seed owner object");
+    reader_dfs
+        .add_object_metadata(
+            owner_dfs
+                .metadata()
+                .object(&object_id)
+                .expect("owner metadata")
+                .clone(),
+        )
+        .expect("replicate metadata");
+
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_read(&object_id)
+            .expect("initial read request"),
+        vec![owner.clone()]
+    );
+    owner_dfs
+        .process_incoming()
+        .expect("owner sends first read window");
+    let mut first_window = drain_dfs_messages(&mut reader_dfs.transport)
+        .into_iter()
+        .filter_map(|message| match message {
+            DfsNetworkMessage::ReadResponseChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_window.len(), DFS_READ_CHUNK_WINDOW_SIZE as usize);
+    let first_chunk = first_window.remove(0);
+    assert_eq!(first_chunk.chunk_index, 0);
+    let request_id = first_chunk.request_id.clone();
+    assert!(
+        reader_dfs
+            .handle_networked_read_response_chunk(owner.clone(), first_chunk)
+            .expect("reader accepts first chunk")
+            .is_none()
+    );
+    assert_eq!(
+        reader_dfs
+            .pending_reads
+            .get(&request_id)
+            .expect("pending read")
+            .next_chunk_index,
+        1
+    );
+
+    reader_dfs
+        .pending_reads
+        .get_mut(&request_id)
+        .expect("pending read")
+        .next_retry_at = Instant::now() - Duration::from_millis(1);
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_read(&object_id)
+            .expect("retry read request"),
+        vec![owner.clone()]
+    );
+    let retry_request = drain_dfs_messages(&mut owner_dfs.transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::ReadRequest(request) => Some(request),
+            _ => None,
+        })
+        .expect("retry read request");
+    assert_eq!(retry_request.request_id, request_id);
+    assert_eq!(retry_request.start_chunk_index, 1);
+    assert_eq!(retry_request.max_chunks, DFS_READ_CHUNK_WINDOW_SIZE);
+
+    owner_dfs
+        .handle_networked_read_request(reader.clone(), retry_request)
+        .expect("owner sends resumed read chunks");
+    let completed = reader_dfs
+        .process_incoming()
+        .expect("reader completes resumed read");
+    assert!(completed.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result: DfsReadResult::Found(DfsReadData { bytes, .. }),
+                ..
+            } if completed_object_id == &object_id && bytes.is_empty()
+        )
+    }));
+    assert!(matches!(
+        reader_dfs
+            .read_local_object_with_state(&object_id, false)
+            .expect("resumed read cached"),
+        NetworkedDfsReadOutcome::Found { data, .. } if data.bytes == bytes
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn process_incoming_prunes_expired_pending_remote_reads() {
     let root = temp_root("remote-read-process-prunes-expired");
     let owner = NodeId::from_legacy_named("node_read_prune_owner").expect("node");

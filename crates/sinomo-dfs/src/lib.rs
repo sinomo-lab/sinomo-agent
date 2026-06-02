@@ -3122,6 +3122,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     requested.push(node_id.clone());
                     break;
                 }
+                if self.pending_remote_read_has_resume_state(&request_id, &pending)
+                    && self.retry_remote_read_request_to(&request_id, &pending, node_id, now)?
+                {
+                    requested.push(node_id.clone());
+                    break;
+                }
                 self.pending_reads.remove(&request_id);
                 self.incoming_read_transfers.remove(&request_id);
                 expired_candidates.push(node_id.clone());
@@ -3186,6 +3192,46 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     next_retry_at: now + DFS_REMOTE_READ_RETRY_DELAY,
                 },
             );
+        }
+        Ok(sent)
+    }
+
+    fn pending_remote_read_has_resume_state(
+        &self,
+        request_id: &str,
+        pending: &PendingNetworkedRead,
+    ) -> bool {
+        pending.range_offset.is_none()
+            && pending.range_max_bytes.is_none()
+            && (pending.next_chunk_index > 0
+                || self.incoming_read_transfers.contains_key(request_id))
+    }
+
+    fn retry_remote_read_request_to(
+        &mut self,
+        request_id: &str,
+        pending: &PendingNetworkedRead,
+        target_node_id: &NodeId,
+        now: Instant,
+    ) -> Result<bool, DfsError> {
+        let start_chunk_index = pending.next_chunk_index;
+        let max_chunks = DFS_READ_CHUNK_WINDOW_SIZE;
+        let sent = self.send_dfs_message_if_routable(
+            target_node_id,
+            DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: request_id.to_string(),
+                object_id: pending.object_id.clone(),
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index,
+                max_chunks,
+            }),
+        )?;
+        if sent && let Some(pending) = self.pending_reads.get_mut(request_id) {
+            pending.target_node_id = target_node_id.clone();
+            pending.next_retry_at = now + DFS_REMOTE_READ_RETRY_DELAY;
+            pending.window_end_chunk_index =
+                Self::read_window_end_chunk_index(start_chunk_index, max_chunks);
         }
         Ok(sent)
     }
