@@ -10275,6 +10275,79 @@ fn sifs_posix_write_at_self_only_uses_extent_patch_manifest() {
 }
 
 #[test]
+fn sifs_posix_write_at_from_reader_uses_extent_patch_manifest() {
+    let root = temp_root("sifs-posix-write-at-reader-extent-patch");
+    let node_id = NodeId::from_legacy_named("node_sifs_write_at_reader_extent").expect("node");
+    let work = "/services/sandbox/instances/sandbox_write_at_reader_extent/work";
+    let file = "/services/sandbox/instances/sandbox_write_at_reader_extent/work/file.bin";
+
+    let mut initial = vec![0_u8; 320 * 1024 + 29];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let initial_hash = content_hash(&initial);
+    let patch = (0..80 * 1024 + 23)
+        .map(|index| (index % 241) as u8)
+        .collect::<Vec<_>>();
+    let patch_hash = content_hash(&patch);
+    let patch_offset = 160 * 1024 + 7;
+    let mut expected = initial.clone();
+    expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+    let expected_hash = content_hash(&expected);
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    dfs.posix_write_file(
+        file,
+        &initial,
+        DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+    )
+    .expect("write initial");
+
+    let stat = dfs
+        .posix_write_file_at_from_reader(
+            file,
+            patch_offset as u64,
+            std::io::Cursor::new(patch.clone()),
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("streaming write_at extent patch");
+
+    assert_eq!(stat.size_bytes, Some(expected.len() as u64));
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    let manifest = dfs
+        .content()
+        .read_manifest(stat.object_id.as_str(), stat.version.as_str())
+        .expect("patched manifest");
+    assert_eq!(manifest.content_hash, expected_hash);
+    assert!(
+        manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == initial_hash)
+    );
+    assert!(
+        manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == patch_hash)
+    );
+    assert!(
+        !dfs.content()
+            .has_blob(&manifest.content_hash)
+            .expect("logical blob check"),
+        "streamed write_at should not materialize a full replacement blob"
+    );
+    assert_eq!(
+        dfs.posix_read_file_range(file, patch_offset as u64 - 8, patch.len() + 16)
+            .expect("read patched range"),
+        expected[patch_offset - 8..patch_offset + patch.len() + 8]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
     let root = temp_root("sifs-posix-write-at-replicated-extent-patch");
     let owner = NodeId::from_legacy_named("node_sifs_write_at_patch_owner").expect("owner");

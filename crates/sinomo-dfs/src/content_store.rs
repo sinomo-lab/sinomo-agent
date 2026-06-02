@@ -1304,6 +1304,135 @@ impl LocalContentStore {
         offset: u64,
         bytes: &[u8],
     ) -> Result<ContentManifest> {
+        self.validate_object_version_patch_source(
+            object_id,
+            base_version,
+            offset,
+            bytes.len() as u64,
+        )?;
+        let (patch_hash, patch_size) = if bytes.is_empty() {
+            (None, 0)
+        } else {
+            let (hash, size) = self.write_bytes_as_blob(bytes)?;
+            (Some(hash), size)
+        };
+        self.put_object_version_patch_from_blob(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            patch_hash,
+            patch_size,
+        )
+    }
+
+    pub fn put_object_version_patch_from_reader<R: Read>(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        mut reader: R,
+    ) -> Result<ContentManifest> {
+        let staging_anchor = self
+            .root
+            .join("staging")
+            .join("streamed-object-version-patch");
+        let tmp_path = temporary_path_for(&staging_anchor);
+        if let Err(error) = write_reader_to_file(&tmp_path, &mut reader) {
+            remove_file_if_exists(&tmp_path).ok();
+            return Err(error);
+        }
+        if let Err(error) = self.ensure_quota_delta(ContentStoreQuotaDelta::default()) {
+            remove_file_if_exists(&tmp_path).ok();
+            return Err(error);
+        }
+        let result = self.put_object_version_patch_from_file(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            &tmp_path,
+        );
+        remove_file_if_exists(&tmp_path).ok();
+        result
+    }
+
+    fn put_object_version_patch_from_file(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        source_path: &Path,
+    ) -> Result<ContentManifest> {
+        let (patch_hash, patch_size) = file_content_hash_and_size(source_path)?;
+        self.validate_object_version_patch_source(object_id, base_version, offset, patch_size)?;
+        if patch_size == 0 {
+            return self.put_object_version_patch_from_blob(
+                object_id,
+                base_version,
+                target_version,
+                offset,
+                None,
+                0,
+            );
+        }
+        let blob_path = self.blob_path(&patch_hash)?;
+        if !self.has_blob(&patch_hash)? {
+            self.ensure_quota_delta(ContentStoreQuotaDelta {
+                blob_bytes: projected_file_growth(&blob_path, patch_size)?,
+                ..ContentStoreQuotaDelta::default()
+            })?;
+            publish_file_as_blob(source_path, &blob_path, &patch_hash)?;
+        }
+        self.put_object_version_patch_from_blob(
+            object_id,
+            base_version,
+            target_version,
+            offset,
+            Some(patch_hash),
+            patch_size,
+        )
+    }
+
+    fn validate_object_version_patch_source(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        offset: u64,
+        patch_size: u64,
+    ) -> Result<()> {
+        let base_manifest = self.read_manifest(object_id, base_version)?;
+        let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
+        self.ensure_extents_readable(&base_extents)?;
+        if offset > base_manifest.size_bytes {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "patch offset leaves sparse gap: object={object_id}, base={base_version}, offset={offset}, size={}",
+                    base_manifest.size_bytes
+                ),
+            });
+        }
+        offset
+            .checked_add(patch_size)
+            .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "patch range overflows object size: object={object_id}, offset={offset}, bytes={patch_size}"
+                ),
+            })?;
+        Ok(())
+    }
+
+    fn put_object_version_patch_from_blob(
+        &self,
+        object_id: &str,
+        base_version: &str,
+        target_version: &str,
+        offset: u64,
+        patch_hash: Option<String>,
+        patch_size: u64,
+    ) -> Result<ContentManifest> {
         let base_manifest = self.read_manifest(object_id, base_version)?;
         let base_extents = self.logical_extents_for_manifest(&base_manifest)?;
         self.ensure_extents_readable(&base_extents)?;
@@ -1316,7 +1445,6 @@ impl LocalContentStore {
             });
         }
 
-        let patch_size = bytes.len() as u64;
         let patch_end =
             offset
                 .checked_add(patch_size)
@@ -1356,8 +1484,7 @@ impl LocalContentStore {
             }
         }
 
-        if !bytes.is_empty() {
-            let (patch_hash, patch_size) = self.write_bytes_as_blob(bytes)?;
+        if let Some(patch_hash) = patch_hash {
             push_extent_coalescing(
                 &mut target_extents,
                 ContentExtent {
@@ -3618,6 +3745,108 @@ mod tests {
             assembler.insert_chunk(0, &duplicate),
             Err(ContentStoreError::ConflictingChunk { chunk_index: 0, .. })
         ));
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn put_object_version_patch_from_reader_streams_patch_blob() {
+        struct ChunkedReader {
+            bytes: Vec<u8>,
+            offset: usize,
+            max_chunk: usize,
+            reads: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+
+        impl Read for ChunkedReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads.set(self.reads.get().saturating_add(1));
+                if self.offset >= self.bytes.len() || buffer.is_empty() {
+                    return Ok(0);
+                }
+                let len = buffer
+                    .len()
+                    .min(self.max_chunk)
+                    .min(self.bytes.len() - self.offset);
+                buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+                self.offset += len;
+                Ok(len)
+            }
+        }
+
+        let root = temp_root("put_object_version_patch_from_reader_streams_patch_blob");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let mut base = vec![0_u8; 320 * 1024 + 29];
+        for (index, byte) in base.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let base_manifest = store
+            .put_object_version("object-stream-patch", "v1", &base)
+            .expect("put base object");
+        let patch = (0..96 * 1024 + 31)
+            .map(|index| (index % 239) as u8)
+            .collect::<Vec<_>>();
+        let patch_hash = content_hash(&patch);
+        let patch_offset = 144 * 1024 + 17;
+        let mut expected = base.clone();
+        expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0));
+
+        let patched = store
+            .put_object_version_patch_from_reader(
+                "object-stream-patch",
+                "v1",
+                "v2",
+                patch_offset as u64,
+                ChunkedReader {
+                    bytes: patch.clone(),
+                    offset: 0,
+                    max_chunk: 4093,
+                    reads: reads.clone(),
+                },
+            )
+            .expect("put streamed patch object");
+
+        assert!(
+            reads.get() > 1,
+            "streamed patch reader should be consumed incrementally"
+        );
+        assert_eq!(patched.size_bytes, expected.len() as u64);
+        assert_eq!(patched.content_hash, content_hash(&expected));
+        assert!(
+            patched
+                .extents
+                .iter()
+                .any(|extent| extent.content_hash == base_manifest.content_hash)
+        );
+        assert!(
+            patched
+                .extents
+                .iter()
+                .any(|extent| extent.content_hash == patch_hash)
+        );
+        assert!(
+            !store
+                .has_blob(&patched.content_hash)
+                .expect("logical blob check"),
+            "streamed patch should not materialize the full logical blob"
+        );
+        let stats = store.stats().expect("content stats");
+        assert_eq!(stats.staging_file_count, 0);
+        assert_eq!(stats.blob_count, 2);
+        assert!(stats.extent_count >= 3);
+        let (_, range) = store
+            .read_object_version_range(
+                "object-stream-patch",
+                "v2",
+                patch_offset as u64 - 11,
+                patch.len() + 22,
+            )
+            .expect("read streamed patch range");
+        assert_eq!(
+            range,
+            expected[patch_offset - 11..patch_offset + patch.len() + 11]
+        );
 
         cleanup(&root);
     }

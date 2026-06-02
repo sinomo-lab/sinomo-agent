@@ -4695,6 +4695,92 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Ok(manifest) => manifest,
             Err(_) => return Ok(None),
         };
+        self.commit_self_only_eventual_patch_manifest(request, object, manifest)
+    }
+
+    pub(crate) fn write_self_only_eventual_patch_from_reader_with_base<R: Read>(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: DfsVersion,
+        offset: u64,
+        reader: &mut R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        let object = self.current_object_for_write(&request.object_id)?;
+        if object.policy != DfsObjectPolicy::ReplicatedEventual {
+            return Ok(None);
+        }
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
+            let desired_replicas = desired_replica_nodes.len();
+            DfsReplicationPolicy::new(
+                policy.min_commit_replicas.min(desired_replicas),
+                desired_replicas,
+            )?
+        } else {
+            policy
+        };
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        if policy.min_commit_replicas != 1
+            || desired_replica_nodes.len() != 1
+            || desired_replica_nodes[0] != self.node_id
+            || object.owner_node_id != self.node_id
+        {
+            return Ok(None);
+        }
+        if self
+            .select_metadata_shard_for_object(&object)?
+            .is_some_and(|shard| shard.primary_node_id != self.node_id)
+        {
+            return Ok(None);
+        }
+        if expected_base_version != object.version {
+            return Ok(None);
+        }
+        if self
+            .ensure_no_backend_pending_write_intent(
+                &request.object_id,
+                &request.target_version,
+                None,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if self
+            .coordinator
+            .validate_new_intent(
+                &request.file_system_id,
+                &request.object_id,
+                Some(&expected_base_version),
+                &request.target_version,
+                &desired_replica_nodes,
+                &policy,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        let manifest = self.content.put_object_version_patch_from_reader(
+            request.object_id.as_str(),
+            expected_base_version.as_str(),
+            request.target_version.as_str(),
+            offset,
+            reader,
+        )?;
+        self.commit_self_only_eventual_patch_manifest(request, object, manifest)
+    }
+
+    fn commit_self_only_eventual_patch_manifest(
+        &mut self,
+        request: DfsWriteRequest,
+        object: DfsObjectMetadata,
+        manifest: ContentManifest,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
         let mut committed_object = object.clone();
         let write_time = dfs_now_unix_nanos();
         committed_object.version = request.target_version.clone();

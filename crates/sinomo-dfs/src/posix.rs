@@ -423,6 +423,119 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
+    pub fn posix_write_file_at_from_reader<R: Read>(
+        &mut self,
+        path: &str,
+        offset: u64,
+        mut reader: R,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
+        let mut first_byte = [0_u8; 1];
+        let first_len = reader
+            .read(&mut first_byte)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!("failed to read POSIX write_at stream for {path}: {source}"),
+            })?;
+        if first_len == 0 {
+            return self.posix_write_file_at(path, offset, &[], options);
+        }
+        let mut reader = Cursor::new(first_byte[..first_len].to_vec()).chain(reader);
+        let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
+        let path = self.resolve_posix_path_distributed(&path, true)?;
+        if requires_directory {
+            return match self.ensure_resolved_path_is_directory(&path) {
+                Ok(()) => Err(DfsPosixError::IsDirectory { path }),
+                Err(DfsPosixError::NotDirectory { path }) => {
+                    Err(DfsPosixError::NotDirectory { path })
+                }
+                Err(DfsPosixError::NotFound { path }) => Err(DfsPosixError::NotDirectory { path }),
+                Err(error) => Err(error),
+            };
+        }
+        let object = self
+            .lookup_sifs_path(&path)?
+            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        let object = self.resolve_hardlink_target(&object)?;
+        if object.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory { path });
+        }
+        let base_version = object.version.clone();
+        let target_version = next_version(&object.version);
+        let mut candidates = options.replica_candidates.clone();
+        if !candidates.contains(&self.node_id) {
+            candidates.insert(0, self.node_id.clone());
+        }
+        let request = DfsWriteRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            target_version,
+            requesting_node_id: self.node_id.clone(),
+        };
+        let plan =
+            self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
+        if object
+            .content_size_bytes
+            .is_some_and(|current_size| offset <= current_size)
+            && let Some(outcome) = self.write_self_only_eventual_patch_from_reader_with_base(
+                request,
+                base_version,
+                offset,
+                &mut reader,
+                plan.desired_replica_nodes,
+                options.policy.clone(),
+            )?
+        {
+            let outcome = if options.wait_for_commit {
+                self.settle_ready_write_outcome(outcome)?
+            } else {
+                outcome
+            };
+            return match outcome {
+                NetworkedDfsWriteOutcome::Committed { .. } => {
+                    let object = self.stat_target_for_path(&path)?;
+                    self.stat_object_for_path(&object, &path)
+                }
+                NetworkedDfsWriteOutcome::Pending {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                } if !options.wait_for_commit => {
+                    let object = self.stat_target_for_path(&path)?;
+                    let mut stat = self.stat_object_for_path(&object, &path)?;
+                    stat.size_bytes = object.content_size_bytes;
+                    let _ = intent_id;
+                    let _ = durable_receipts;
+                    let _ = required_receipts;
+                    Ok(stat)
+                }
+                NetworkedDfsWriteOutcome::Pending {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                } => Err(DfsPosixError::PendingWrite {
+                    intent_id,
+                    durable_receipts,
+                    required_receipts,
+                }),
+                NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
+                    path,
+                    reason: conflict.reason,
+                }),
+            };
+        }
+
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!("failed to buffer POSIX write_at fallback for {path}: {source}"),
+            })?;
+        self.posix_write_file_at(&path, offset, &bytes, options)
+    }
+
     pub fn posix_write_file_at(
         &mut self,
         path: &str,
