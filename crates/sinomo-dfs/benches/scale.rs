@@ -42,6 +42,7 @@ enum Scenario {
     All,
     Namespace,
     PosixCreate,
+    PosixRead,
     PosixWriteAt,
     MetadataReplication,
     Blob,
@@ -77,13 +78,14 @@ impl Scenario {
             "all" => Ok(Self::All),
             "namespace" => Ok(Self::Namespace),
             "posix-create" => Ok(Self::PosixCreate),
+            "posix-read" => Ok(Self::PosixRead),
             "posix-write-at" => Ok(Self::PosixWriteAt),
             "metadata-replication" => Ok(Self::MetadataReplication),
             "blob" => Ok(Self::Blob),
             "network-blob" => Ok(Self::NetworkBlob),
             "network-write-at" => Ok(Self::NetworkWriteAt),
             _ => Err(format!(
-                "unknown scenario `{value}`; use all, namespace, posix-create, posix-write-at, metadata-replication, blob, network-blob, or network-write-at"
+                "unknown scenario `{value}`; use all, namespace, posix-create, posix-read, posix-write-at, metadata-replication, blob, network-blob, or network-write-at"
             )
             .into()),
         }
@@ -94,6 +96,7 @@ impl Scenario {
             Self::All => "all",
             Self::Namespace => "namespace",
             Self::PosixCreate => "posix-create",
+            Self::PosixRead => "posix-read",
             Self::PosixWriteAt => "posix-write-at",
             Self::MetadataReplication => "metadata-replication",
             Self::Blob => "blob",
@@ -173,6 +176,7 @@ fn main() -> BenchResult<()> {
         Scenario::All => {
             run_namespace(&args)?;
             run_posix_create(&args)?;
+            run_posix_read(&args)?;
             run_posix_write_at(&args)?;
             run_metadata_replication(&args)?;
             run_blob(&args)?;
@@ -181,6 +185,7 @@ fn main() -> BenchResult<()> {
         }
         Scenario::Namespace => run_namespace(&args)?,
         Scenario::PosixCreate => run_posix_create(&args)?,
+        Scenario::PosixRead => run_posix_read(&args)?,
         Scenario::PosixWriteAt => run_posix_write_at(&args)?,
         Scenario::MetadataReplication => run_metadata_replication(&args)?,
         Scenario::Blob => run_blob(&args)?,
@@ -608,6 +613,117 @@ fn run_posix_create(args: &Args) -> BenchResult<()> {
             "dirs": args.dirs,
             "objects_loaded": reopened_objects,
             "objects_per_second": rate(reopened_objects as u64, reopen_elapsed),
+        }),
+    );
+
+    Ok(())
+}
+
+fn run_posix_read(args: &Args) -> BenchResult<()> {
+    let root = args.scenario_root("posix-read");
+    remove_dir_all_if_exists(&root)?;
+    fs::create_dir_all(&root)?;
+
+    let node = node("node_dfs_bench_posix_read");
+    let network = InProcessNetwork::new();
+    let metadata_root = root.join("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(root.join("content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        &metadata_root,
+    )?)?;
+
+    let setup_start = Instant::now();
+    dfs.bootstrap_distributed_sifs()?;
+    dfs.posix_mkdir_all("/services/dfs-scale")?;
+    emit(
+        "posix_read_setup",
+        setup_start.elapsed(),
+        json!({ "root": root }),
+    );
+
+    let options = DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+    let path = "/services/dfs-scale/stream-read.bin";
+    let write_start = Instant::now();
+    let stat =
+        dfs.posix_write_file_from_reader(path, RepeatingReader::new(args.blob_bytes), options)?;
+    let write_elapsed = write_start.elapsed();
+    emit(
+        "posix_read_stream_write",
+        write_elapsed,
+        json!({
+            "bytes": args.blob_bytes,
+            "object_id": stat.object_id,
+            "version": stat.version,
+            "content_hash": stat.content_hash,
+            "mib_per_second": mib_per_second(args.blob_bytes, write_elapsed),
+        }),
+    );
+
+    let read_start = Instant::now();
+    let mut stream = dfs.posix_open_file_stream(path)?;
+    let mut buffer = [0u8; 1024 * 1024];
+    let mut read_bytes = 0u64;
+    loop {
+        let read = stream.reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        read_bytes = read_bytes.saturating_add(read as u64);
+    }
+    let read_elapsed = read_start.elapsed();
+    if read_bytes != args.blob_bytes {
+        return Err(format!(
+            "POSIX stream read returned {read_bytes} bytes, expected {}",
+            args.blob_bytes
+        )
+        .into());
+    }
+    emit(
+        "posix_stream_read",
+        read_elapsed,
+        json!({
+            "bytes": read_bytes,
+            "reported_size_bytes": stream.size_bytes,
+            "content_hash": stream.content_hash,
+            "mib_per_second": mib_per_second(read_bytes, read_elapsed),
+        }),
+    );
+
+    let range_offset = args.blob_bytes.saturating_sub(args.blob_range_bytes as u64) / 2;
+    let range_start = Instant::now();
+    let mut range_stream =
+        dfs.posix_open_file_range_stream(path, range_offset, args.blob_range_bytes)?;
+    let mut range_stream_bytes = 0u64;
+    loop {
+        let read = range_stream.reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        range_stream_bytes = range_stream_bytes.saturating_add(read as u64);
+    }
+    let range_elapsed = range_start.elapsed();
+    if range_stream_bytes != range_stream.range_size_bytes {
+        return Err(format!(
+            "POSIX range stream read returned {range_stream_bytes} bytes, expected {}",
+            range_stream.range_size_bytes
+        )
+        .into());
+    }
+    emit(
+        "posix_range_stream_read",
+        range_elapsed,
+        json!({
+            "offset": range_stream.offset,
+            "bytes": range_stream_bytes,
+            "requested_bytes": args.blob_range_bytes,
+            "range_size_bytes": range_stream.range_size_bytes,
+            "total_size_bytes": range_stream.total_size_bytes,
+            "content_hash": range_stream.content_hash,
+            "mib_per_second": mib_per_second(range_stream_bytes, range_elapsed),
         }),
     );
 
@@ -1722,7 +1838,7 @@ fn print_help() {
         "Usage: cargo bench -p sinomo-dfs --bench scale -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --scenario all|namespace|posix-create|posix-write-at|metadata-replication|blob|network-blob|network-write-at\n\
+           --scenario all|namespace|posix-create|posix-read|posix-write-at|metadata-replication|blob|network-blob|network-write-at\n\
            --preset smoke|scale|production\n\
            --root PATH\n\
            --files COUNT\n\
