@@ -741,6 +741,118 @@ fn metadata_replication_cursor_advances_only_after_replica_ack() {
 }
 
 #[test]
+fn metadata_journal_intent_conflict_applies_incrementally_without_full_hydrate() {
+    let root = temp_root("metadata-journal-intent-conflict-incremental");
+    let owner = NodeId::from_legacy_named("node_meta_conflict_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_meta_conflict_replica").expect("replica");
+    let object_id = DfsObjectId::from_legacy_named("obj_meta_conflict").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let version_3 = DfsVersion::from_legacy_named("version_3").expect("version");
+    let file_system = file_system(owner.clone());
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/metadata/conflict.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone()];
+
+    let mut backend = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    backend.put_file_system(&file_system).expect("filesystem");
+    backend.put_object(&object).expect("object");
+    backend
+        .put_intent(&DfsWriteIntentRecord {
+            intent_id: "dfs_intent_meta_conflict_first".to_string(),
+            file_system_id: file_system.file_system_id.clone(),
+            object_id: object_id.clone(),
+            base_version: Some(version_1.clone()),
+            target_version: version_2.clone(),
+            coordinator_node_id: owner.clone(),
+            owner_epoch: 0,
+            desired_replica_node_ids: vec![owner.clone(), replica.clone()],
+            policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: None,
+            object_metadata: Some(object.clone()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+        })
+        .expect("first intent");
+
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(backend)
+        .expect("dfs");
+    dfs.pending_reads.insert(
+        "sentinel-read".to_string(),
+        PendingNetworkedRead {
+            object_id: object_id.clone(),
+            version: version_1.clone(),
+            content_hash: None,
+            content_size_bytes: None,
+            range_offset: None,
+            range_max_bytes: None,
+            next_chunk_index: 0,
+            window_end_chunk_index: None,
+            target_node_id: replica.clone(),
+            next_retry_at: std::time::Instant::now(),
+        },
+    );
+
+    let second_intent = DfsWriteIntentRecord {
+        intent_id: "dfs_intent_meta_conflict_second".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        object_id: object_id.clone(),
+        base_version: Some(version_1.clone()),
+        target_version: version_3.clone(),
+        coordinator_node_id: replica.clone(),
+        owner_epoch: 0,
+        desired_replica_node_ids: vec![owner.clone(), replica.clone()],
+        policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
+        status: DfsWriteIntentStatus::ReceiptsPending,
+        content_hash: None,
+        object_metadata: Some(object.clone()),
+        created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1),
+        updated_at: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+    };
+    let entry = dfs
+        .metadata_backend
+        .as_mut()
+        .expect("backend")
+        .put_intent(&second_intent)
+        .expect("second intent");
+    let batch = DfsMetadataJournalBatch {
+        shard_id: entry.shard_id.clone(),
+        next_after_sequence: entry.sequence,
+        entries: vec![entry],
+    };
+
+    dfs.apply_metadata_journal_batch_to_service_state(&batch)
+        .expect("incremental apply");
+
+    assert!(
+        dfs.pending_reads.contains_key("sentinel-read"),
+        "metadata journal conflict handling must not clear active read state with a full hydrate"
+    );
+    let stored_intent = dfs
+        .metadata_backend()
+        .expect("backend")
+        .get_intent(&object_id, &second_intent.intent_id)
+        .expect("stored intent")
+        .expect("second intent remains");
+    assert_eq!(stored_intent.status, DfsWriteIntentStatus::Conflict);
+    assert!(
+        !dfs.conflicts_for_object(&object_id)
+            .expect("conflicts")
+            .is_empty()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn distributed_write_uses_path_selected_metadata_shard_epoch() {
     let root = temp_root("distributed-write-path-shard-epoch");
     let owner = NodeId::from_legacy_named("node_path_shard_owner").expect("owner");

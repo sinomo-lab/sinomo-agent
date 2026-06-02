@@ -2529,41 +2529,35 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &mut self,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
-        let mut needs_full_hydration = false;
         for entry in &batch.entries {
-            if self.apply_metadata_journal_entry_to_service_state(entry)? {
-                needs_full_hydration = true;
-                break;
-            }
-        }
-        if needs_full_hydration {
-            self.hydrate_from_metadata_backend()?;
+            self.apply_metadata_journal_entry_to_service_state(entry)?;
         }
         Ok(())
     }
 
-    /// Returns `true` when the entry cannot be applied from replay payloads alone
-    /// and the caller should fall back to a full backend hydration.
     fn apply_metadata_journal_entry_to_service_state(
         &mut self,
         entry: &DfsMetadataJournalEntry,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<(), DfsError> {
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem { file_system, .. } => {
                 let Some(file_system) = file_system.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.metadata.add_file_system(file_system.clone());
             }
             DfsMetadataMutation::PutObject { object, .. } => {
                 let Some(object) = object.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.apply_metadata_object_to_service_state(object.clone())?;
             }
             DfsMetadataMutation::PutVersion { version_record, .. } => {
                 let Some(version_record) = version_record.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.apply_metadata_version_to_service_state(version_record);
             }
@@ -2575,41 +2569,48 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ..
             } => {
                 if receipt.is_none() {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 }
                 self.apply_metadata_receipt_to_service_state(object_id, version, replica_node_id)?;
             }
             DfsMetadataMutation::PutIntent { intent, .. } => {
                 let Some(intent) = intent.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
-                if self.apply_metadata_intent_to_service_state(intent)? {
-                    return Ok(true);
-                }
+                self.apply_metadata_intent_to_service_state(intent)?;
             }
             DfsMetadataMutation::CommitVisibleVersion {
                 committed_object,
                 visible_version,
+                object_id,
+                committed_version,
                 ..
             } => {
                 let Some(committed_object) = committed_object.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 let Some(visible_version) = visible_version.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.apply_metadata_object_to_service_state(committed_object.clone())?;
                 self.apply_metadata_version_to_service_state(visible_version);
+                self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
             }
             DfsMetadataMutation::PutConflict { conflict, .. } => {
                 let Some(conflict) = conflict.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.metadata.add_conflict(conflict.clone());
             }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
                 let Some(transaction) = transaction.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 let mut objects = transaction.objects.clone();
                 objects.sort_by(|left, right| {
@@ -2628,7 +2629,219 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
             }
         }
-        Ok(false)
+        Ok(())
+    }
+
+    fn apply_missing_payload_metadata_journal_entry_to_service_state(
+        &mut self,
+        entry: &DfsMetadataJournalEntry,
+    ) -> Result<(), DfsError> {
+        match &entry.mutation {
+            DfsMetadataMutation::PutFileSystem { file_system_id, .. } => {
+                let file_system = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_file_system(file_system_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(file_system) = file_system {
+                    self.metadata.add_file_system(file_system);
+                }
+            }
+            DfsMetadataMutation::PutObject { object_id, .. } => {
+                self.apply_backend_object_to_service_state(object_id)?;
+            }
+            DfsMetadataMutation::PutVersion {
+                object_id, version, ..
+            } => {
+                let version_record = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_version(object_id, version))
+                    .transpose()?
+                    .flatten();
+                if let Some(version_record) = version_record {
+                    self.apply_metadata_version_to_service_state(&version_record);
+                }
+            }
+            DfsMetadataMutation::PutReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if self
+                    .backend_receipt_for_replica(object_id, version, replica_node_id)?
+                    .is_some()
+                {
+                    self.apply_metadata_receipt_to_service_state(
+                        object_id,
+                        version,
+                        replica_node_id,
+                    )?;
+                }
+            }
+            DfsMetadataMutation::PutIntent {
+                object_id,
+                intent_id,
+                ..
+            } => {
+                let intent = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_intent(object_id, intent_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(intent) = intent {
+                    self.apply_metadata_intent_to_service_state(&intent)?;
+                }
+            }
+            DfsMetadataMutation::CommitVisibleVersion {
+                object_id,
+                committed_version,
+                ..
+            } => {
+                self.apply_backend_object_to_service_state(object_id)?;
+                let version_record = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_version(object_id, committed_version))
+                    .transpose()?
+                    .flatten();
+                if let Some(version_record) = version_record {
+                    self.apply_metadata_version_to_service_state(&version_record);
+                }
+                self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
+            }
+            DfsMetadataMutation::PutConflict {
+                object_id,
+                conflict_id,
+                ..
+            } => {
+                let conflict = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_conflict(object_id, conflict_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(conflict) = conflict {
+                    self.metadata.add_conflict(conflict);
+                }
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. } => {
+                self.apply_backend_file_system_objects_to_service_state(file_system_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_backend_object_to_service_state(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<(), DfsError> {
+        let object = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_object(object_id))
+            .transpose()?
+            .flatten();
+        if let Some(object) = object {
+            self.apply_metadata_object_to_service_state(object)?;
+        }
+        Ok(())
+    }
+
+    fn apply_backend_file_system_objects_to_service_state(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<(), DfsError> {
+        if self.metadata_backend.is_none() {
+            return Ok(());
+        }
+        let mut cursor = None;
+        loop {
+            let page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .objects_for_file_system_page(
+                    file_system_id,
+                    cursor.as_ref(),
+                    DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
+                )?;
+            for object in page.objects {
+                self.apply_metadata_object_to_service_state(object)?;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(())
+    }
+
+    fn backend_receipt_for_replica(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let mut cursor = None;
+        loop {
+            let page = backend.receipts_for_version_page(
+                object_id,
+                version,
+                cursor.as_ref(),
+                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+            )?;
+            for receipt in page.receipts {
+                if receipt.replica_node_id == *replica_node_id {
+                    return Ok(Some(receipt));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    fn restore_backend_receipts_for_visible_version(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<(), DfsError> {
+        if self.metadata_backend.is_none() {
+            return Ok(());
+        }
+        let mut cursor = None;
+        loop {
+            let page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .receipts_for_version_page(
+                    object_id,
+                    version,
+                    cursor.as_ref(),
+                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+                )?;
+            for receipt in page.receipts {
+                self.apply_metadata_receipt_to_service_state(
+                    object_id,
+                    version,
+                    &receipt.replica_node_id,
+                )?;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(())
     }
 
     fn apply_metadata_object_to_service_state(
@@ -2688,15 +2901,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     fn apply_metadata_intent_to_service_state(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<(), DfsError> {
         let intent = distributed_intent_from_record(intent_record);
         match self.coordinator.restore_intent(intent) {
             Ok(()) => {}
             Err(error @ DfsDistributedError::PendingIntentConflict { .. }) => {
-                eprintln!(
-                    "warning: falling back to full DFS metadata hydration after journal intent conflict: {error}"
-                );
-                return Ok(true);
+                self.mark_replayed_intent_as_conflict(intent_record, error.to_string(), true)?;
+                return Ok(());
             }
             Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
                 if self
@@ -2705,11 +2916,22 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     .is_some_and(|intent| distributed_intent_matches_record(intent, intent_record))
                 {
                     // Same intent replayed after local state had already advanced.
+                } else if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                    && self
+                        .current_read_object_metadata(&intent_record.object_id)
+                        .is_ok_and(|object| {
+                            object.version == intent_record.target_version
+                                && intent_record.content_hash.as_deref().is_none_or(
+                                    |content_hash| {
+                                        object.content_hash.as_deref() == Some(content_hash)
+                                    },
+                                )
+                        })
+                {
+                    self.restore_visible_committed_object_location_receipts(intent_record)?;
                 } else {
-                    eprintln!(
-                        "warning: falling back to full DFS metadata hydration after duplicate journal intent: {error}"
-                    );
-                    return Ok(true);
+                    self.mark_replayed_intent_as_conflict(intent_record, error.to_string(), false)?;
+                    return Ok(());
                 }
             }
             Err(error) => return Err(error.into()),
@@ -2740,7 +2962,44 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ),
             );
         }
-        Ok(false)
+        Ok(())
+    }
+
+    fn mark_replayed_intent_as_conflict(
+        &mut self,
+        intent_record: &DfsWriteIntentRecord,
+        reason: String,
+        restore_conflict_intent: bool,
+    ) -> Result<(), DfsError> {
+        let object = match self.current_read_object_metadata(&intent_record.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => {
+                self.apply_backend_object_to_service_state(&intent_record.object_id)?;
+                self.current_read_object_metadata(&intent_record.object_id)?
+            }
+            Err(error) => return Err(error),
+        };
+        self.create_write_conflict(
+            &object,
+            intent_record.base_version.clone(),
+            intent_record.target_version.clone(),
+            intent_record.coordinator_node_id.clone(),
+            intent_record.content_hash.clone(),
+            reason,
+            Some(intent_record.intent_id.clone()),
+        )?;
+        let mut conflict_record = intent_record.clone();
+        conflict_record.status = DfsWriteIntentStatus::Conflict;
+        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.put_intent(&conflict_record)?;
+        }
+        self.remove_pending_write_state(&conflict_record.intent_id);
+        if restore_conflict_intent {
+            self.coordinator
+                .restore_intent(distributed_intent_from_record(&conflict_record))?;
+        }
+        Ok(())
     }
 
     fn apply_metadata_receipt_to_service_state(
