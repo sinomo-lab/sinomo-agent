@@ -2848,6 +2848,7 @@ fn committed_pending_write_cleanup_drops_stale_stage_inflight_state() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -2931,6 +2932,7 @@ fn apply_committed_intent_tolerates_missing_local_repair_blob() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -2993,6 +2995,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
         fetch_inflight_request_ids: BTreeMap::new(),
         fetch_inflight_started_ticks: BTreeMap::new(),
         fetch_next_chunk_indexes: BTreeMap::new(),
+        fetch_window_end_chunk_indexes: BTreeMap::new(),
         fetch_failed_from: BTreeSet::new(),
     };
     let job = DistributedRepairJob {
@@ -3056,6 +3059,7 @@ fn write_outcome_uses_backend_current_metadata_after_pending_state_is_removed() 
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -4655,6 +4659,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             )]),
             fetch_inflight_started_ticks: BTreeMap::from([(replica.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::from([(replica.clone(), 1)]),
+            fetch_window_end_chunk_indexes: BTreeMap::from([(replica.clone(), 64)]),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -4720,6 +4725,11 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
     assert!(!pending.fetch_inflight_request_ids.contains_key(&replica));
     assert!(!pending.fetch_inflight_started_ticks.contains_key(&replica));
     assert!(!pending.fetch_next_chunk_indexes.contains_key(&replica));
+    assert!(
+        !pending
+            .fetch_window_end_chunk_indexes
+            .contains_key(&replica)
+    );
     assert!(pending.fetch_failed_from.contains(&replica));
     assert_eq!(
         pending
@@ -4880,6 +4890,7 @@ fn stale_fetch_request_expiry_wakes_stage_and_repair_retries() {
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -4976,6 +4987,7 @@ fn fetch_rejection_wakes_stage_and_repair_retries() {
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5087,6 +5099,7 @@ fn fetch_store_failure_wakes_stage_and_repair_retries() {
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5208,6 +5221,7 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5303,6 +5317,7 @@ fn chunked_fetch_store_failure_is_rejected_without_hard_error() {
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5417,6 +5432,7 @@ fn chunked_fetch_response_reuses_existing_local_blob_without_rehashing_payload()
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5528,6 +5544,7 @@ fn chunked_fetch_response_teaches_unknown_pending_write_size() {
             fetch_inflight_request_ids: BTreeMap::from([(source.clone(), request_id.clone())]),
             fetch_inflight_started_ticks: BTreeMap::from([(source.clone(), 0)]),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5628,6 +5645,7 @@ fn repair_retry_schedule_does_not_double_count_completed_inflight_attempt() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -5699,6 +5717,7 @@ fn repair_response_conflicting_receipt_preserves_retry_state() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -6102,6 +6121,7 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -6694,6 +6714,7 @@ fn chunked_fetch_response_to_unroutable_requester_stops_after_first_unsent_chunk
             version,
             content_hash: content_hash(&bytes),
             start_chunk_index: 0,
+            max_chunks: 0,
         },
         &bytes,
     )
@@ -6717,7 +6738,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let base_version = DfsVersion::from_legacy_named("version_1").expect("version");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
-    let total_chunks = DFS_STAGE_CHUNK_WINDOW_SIZE + 2;
+    let total_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE + 1;
     let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
     let bytes = (0..bytes_len)
         .map(|index| (index % 251) as u8)
@@ -6770,6 +6791,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -6805,6 +6827,7 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
         })
         .expect("fetch command");
     assert_eq!(first_request.start_chunk_index, 0);
+    assert_eq!(first_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), first_request.clone())
@@ -6894,11 +6917,12 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
         "fetch retry should preserve the request id so the partial assembler can continue"
     );
     assert_eq!(retry_request.start_chunk_index, 1);
+    assert_eq!(retry_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
 
     source_dfs
         .handle_fetch_blob(owner.clone(), retry_request)
         .expect("source sends resumed chunks");
-    for chunk in owner_dfs
+    let resumed_chunks = owner_dfs
         .transport
         .drain_incoming()
         .expect("owner resumed fetch chunks")
@@ -6912,11 +6936,24 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
                 _ => None,
             }
         })
-    {
-        owner_dfs
+        .collect::<Vec<_>>();
+    assert_eq!(resumed_chunks.len(), (total_chunks - 1) as usize);
+    let mut fetched = false;
+    for chunk in resumed_chunks {
+        if let Some(event) = owner_dfs
             .handle_fetch_blob_response_chunk(source.clone(), chunk)
-            .expect("owner accepts resumed fetch chunk");
+            .expect("owner accepts resumed fetch chunk")
+        {
+            match event {
+                NetworkedDfsServiceEvent::BlobFetched { .. } => fetched = true,
+                NetworkedDfsServiceEvent::BlobFetchRejected { reason, .. } => {
+                    panic!("resumed fetch was rejected: {reason}");
+                }
+                _ => {}
+            }
+        }
     }
+    assert!(fetched, "resumed fetch should complete the object");
 
     assert_eq!(
         owner_dfs
@@ -6934,6 +6971,182 @@ fn chunked_fetch_retry_resumes_from_received_prefix() {
             .fetch_next_chunk_indexes
             .is_empty(),
         "completed fetch should clear resume state"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn chunked_fetch_response_windows_and_continues() {
+    let root = temp_root("chunked-fetch-response-windows");
+    let owner = NodeId::from_legacy_named("node_fetch_window_owner").expect("node");
+    let source = NodeId::from_legacy_named("node_fetch_window_source").expect("node");
+    let replica = NodeId::from_legacy_named("node_fetch_window_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_fetch_window").expect("object");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let base_version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version = DfsVersion::from_legacy_named("version_2").expect("version");
+    let total_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE + 2;
+    let bytes_len = DFS_BLOB_CHUNK_BYTES * (total_chunks as usize - 1) + 17;
+    let bytes = (0..bytes_len)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    );
+    let mut source_dfs = NetworkedDfsService::new(
+        network.add_node(source.clone()),
+        LocalContentStore::new(root.join("source-content")).expect("source content"),
+    );
+    let manifest = source_dfs
+        .content
+        .put_object_version(object_id.as_str(), version.as_str(), &bytes)
+        .expect("source content");
+    let intent = owner_dfs
+        .coordinator
+        .create_intent(
+            file_system_id,
+            object_id.clone(),
+            Some(base_version),
+            version.clone(),
+            owner.clone(),
+            vec![owner.clone(), source.clone(), replica.clone()],
+            DfsReplicationPolicy::new(3, 3).expect("policy"),
+        )
+        .expect("intent");
+    owner_dfs
+        .coordinator
+        .record_durable_receipt(&intent.intent_id, source.clone())
+        .expect("source receipt");
+    owner_dfs.pending_writes.insert(
+        intent.intent_id.clone(),
+        PendingNetworkedWrite {
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: manifest.content_hash.clone(),
+            size_bytes: manifest.size_bytes,
+            patch: None,
+            stage_retries: BTreeMap::new(),
+            repair_retries: BTreeMap::new(),
+            stage_inflight_request_ids: BTreeMap::new(),
+            stage_next_chunk_indexes: BTreeMap::new(),
+            repair_inflight_request_ids: BTreeMap::new(),
+            repair_next_chunk_indexes: BTreeMap::new(),
+            fetch_inflight_from: BTreeSet::new(),
+            fetch_inflight_request_ids: BTreeMap::new(),
+            fetch_inflight_started_ticks: BTreeMap::new(),
+            fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
+            fetch_failed_from: BTreeSet::new(),
+        },
+    );
+
+    let intent_snapshot = owner_dfs
+        .coordinator
+        .intent(&intent.intent_id)
+        .cloned()
+        .expect("intent");
+    let pending_snapshot = owner_dfs
+        .pending_writes
+        .get(&intent.intent_id)
+        .cloned()
+        .expect("pending write");
+    assert!(
+        owner_dfs
+            .request_stage_blob_from_alternate(&intent_snapshot, &pending_snapshot)
+            .expect("initial fetch request")
+    );
+    let first_request = drain_dfs_messages(&mut source_dfs.transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::FetchBlob(command) => Some(command),
+            _ => None,
+        })
+        .expect("first fetch request");
+    assert_eq!(first_request.start_chunk_index, 0);
+    assert_eq!(first_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
+
+    source_dfs
+        .handle_fetch_blob(owner.clone(), first_request)
+        .expect("source sends first fetch window");
+    let first_window = drain_dfs_messages(&mut owner_dfs.transport)
+        .into_iter()
+        .filter_map(|message| match message {
+            DfsNetworkMessage::FetchBlobResponseChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(first_window.len(), DFS_FETCH_CHUNK_WINDOW_SIZE as usize);
+    assert_eq!(first_window.first().expect("first chunk").chunk_index, 0);
+    assert_eq!(
+        first_window
+            .last()
+            .expect("last first-window chunk")
+            .chunk_index,
+        DFS_FETCH_CHUNK_WINDOW_SIZE - 1
+    );
+    for chunk in first_window {
+        owner_dfs
+            .handle_fetch_blob_response_chunk(source.clone(), chunk)
+            .expect("owner accepts first fetch window");
+    }
+    assert!(
+        owner_dfs
+            .content
+            .read_object_version(object_id.as_str(), version.as_str())
+            .is_err(),
+        "first window alone must not commit an incomplete object"
+    );
+
+    let next_request = drain_dfs_messages(&mut source_dfs.transport)
+        .into_iter()
+        .find_map(|message| match message {
+            DfsNetworkMessage::FetchBlob(command) => Some(command),
+            _ => None,
+        })
+        .expect("continuation fetch request");
+    assert_eq!(next_request.start_chunk_index, DFS_FETCH_CHUNK_WINDOW_SIZE);
+    assert_eq!(next_request.max_chunks, DFS_FETCH_CHUNK_WINDOW_SIZE);
+    source_dfs
+        .handle_fetch_blob(owner.clone(), next_request)
+        .expect("source sends second fetch window");
+    let second_window = drain_dfs_messages(&mut owner_dfs.transport)
+        .into_iter()
+        .filter_map(|message| match message {
+            DfsNetworkMessage::FetchBlobResponseChunk(chunk) => Some(chunk),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(second_window.len(), 2);
+    assert_eq!(
+        second_window
+            .first()
+            .expect("first resumed chunk")
+            .chunk_index,
+        DFS_FETCH_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        second_window
+            .last()
+            .expect("last resumed chunk")
+            .chunk_index,
+        total_chunks - 1
+    );
+    for chunk in second_window {
+        owner_dfs
+            .handle_fetch_blob_response_chunk(source.clone(), chunk)
+            .expect("owner accepts second fetch window");
+    }
+
+    assert_eq!(
+        owner_dfs
+            .content
+            .read_object_version(object_id.as_str(), version.as_str())
+            .expect("fetched object")
+            .1,
+        bytes
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -8035,6 +8248,7 @@ fn duplicate_committed_intent_application_does_not_recommit_visible_version() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );
@@ -8137,6 +8351,7 @@ fn committed_intent_repairs_already_current_stale_locations() {
             fetch_inflight_request_ids: BTreeMap::new(),
             fetch_inflight_started_ticks: BTreeMap::new(),
             fetch_next_chunk_indexes: BTreeMap::new(),
+            fetch_window_end_chunk_indexes: BTreeMap::new(),
             fetch_failed_from: BTreeSet::new(),
         },
     );

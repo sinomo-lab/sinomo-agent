@@ -273,6 +273,8 @@ pub struct DfsFetchBlobCommand {
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub start_chunk_index: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_chunks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
