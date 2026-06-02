@@ -915,6 +915,59 @@ fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
 }
 
 #[test]
+fn metadata_journal_missing_namespace_transaction_record_fails_without_full_scan() {
+    let root = temp_root("metadata-journal-namespace-transaction-missing-record");
+    let owner = NodeId::from_legacy_named("node_namespace_tx_missing_owner").expect("owner");
+    let file_system = file_system(owner.clone());
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+
+    let mut unrelated = file_metadata(owner.clone());
+    unrelated.object_id =
+        DfsObjectId::from_legacy_named("obj_namespace_tx_missing_unrelated").expect("object");
+    unrelated.path = "/services/namespace-tx-missing/unrelated.txt".to_string();
+    backend.put_object(&unrelated).expect("unrelated object");
+
+    let entry = DfsMetadataJournalEntry {
+        shard_id: DfsMetadataShardId::new("root"),
+        sequence: 99,
+        created_at: OffsetDateTime::UNIX_EPOCH,
+        mutation: DfsMetadataMutation::ApplyNamespaceTransaction {
+            file_system_id: file_system.file_system_id.clone(),
+            transaction_id: "namespace_tx_missing_record".to_string(),
+            object_count: 1,
+            transaction: None,
+        },
+    };
+
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
+    dfs.metadata.add_file_system(file_system);
+    dfs.metadata_backend = Some(Box::new(backend));
+
+    let error = dfs
+        .apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
+            shard_id: entry.shard_id.clone(),
+            next_after_sequence: entry.sequence,
+            entries: vec![entry],
+        })
+        .expect_err("missing namespace transaction record should fail replay");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot apply namespace transaction namespace_tx_missing_record without its transaction payload")
+    );
+    assert!(
+        dfs.metadata.object(&unrelated.object_id).is_none(),
+        "unrecoverable sparse namespace transaction replay must not import the whole file system"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn distributed_write_uses_path_selected_metadata_shard_epoch() {
     let root = temp_root("distributed-write-path-shard-epoch");
     let owner = NodeId::from_legacy_named("node_path_shard_owner").expect("owner");

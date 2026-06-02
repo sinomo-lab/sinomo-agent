@@ -2898,11 +2898,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     self.metadata.add_conflict(conflict);
                 }
             }
-            DfsMetadataMutation::ApplyNamespaceTransaction {
-                file_system_id,
-                transaction_id,
-                ..
-            } => {
+            DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
                 let transaction = self
                     .metadata_backend
                     .as_ref()
@@ -2912,7 +2908,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 if let Some(transaction) = transaction {
                     self.apply_metadata_namespace_transaction_to_service_state(&transaction)?;
                 } else {
-                    self.apply_backend_file_system_objects_to_service_state(file_system_id)?;
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "metadata journal entry {}:{} cannot apply namespace transaction {} without its transaction payload",
+                            entry.shard_id.0, entry.sequence, transaction_id
+                        ),
+                    });
                 }
             }
         }
@@ -2953,35 +2954,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .flatten();
         if let Some(object) = object {
             self.apply_metadata_object_to_service_state(object)?;
-        }
-        Ok(())
-    }
-
-    fn apply_backend_file_system_objects_to_service_state(
-        &mut self,
-        file_system_id: &DfsFileSystemId,
-    ) -> Result<(), DfsError> {
-        if self.metadata_backend.is_none() {
-            return Ok(());
-        }
-        let mut cursor = None;
-        loop {
-            let page = self
-                .metadata_backend
-                .as_ref()
-                .expect("metadata backend checked above")
-                .objects_for_file_system_page(
-                    file_system_id,
-                    cursor.as_ref(),
-                    DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
-                )?;
-            for object in page.objects {
-                self.apply_metadata_object_to_service_state(object)?;
-            }
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
         }
         Ok(())
     }

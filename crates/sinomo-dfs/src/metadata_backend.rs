@@ -5580,6 +5580,40 @@ impl LocalSobjMetadataBackend {
             } if conflict.is_none() => {
                 *conflict = self.get_conflict(object_id, conflict_id)?;
             }
+            DfsMetadataMutation::CommitVisibleVersion {
+                object_id,
+                committed_version,
+                committed_object,
+                visible_version,
+                ..
+            } if committed_object.is_none() || visible_version.is_none() => {
+                let commit_key = (object_id.clone(), committed_version.clone());
+                if let Some(commit) = self.tables.visible_commits.get(&commit_key) {
+                    if committed_object.is_none() {
+                        *committed_object = Some(commit.committed_object.clone());
+                    }
+                    if visible_version.is_none() {
+                        *visible_version = Some(commit.visible_version.clone());
+                    }
+                } else {
+                    if committed_object.is_none()
+                        && let Some(object) = self.get_object(object_id)?
+                        && object.version == *committed_version
+                    {
+                        *committed_object = Some(object);
+                    }
+                    if visible_version.is_none() {
+                        *visible_version = self.get_version(object_id, committed_version)?;
+                    }
+                }
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction_id,
+                transaction,
+                ..
+            } if transaction.is_none() => {
+                *transaction = self.get_namespace_transaction(transaction_id)?;
+            }
             _ => {}
         }
         Ok(entry)
@@ -12650,6 +12684,44 @@ mod tests {
                 visible: true,
             })
             .expect("version");
+        let mut committed_object = object(version("version_2"));
+        committed_object.content_hash = Some("blake3:new".to_string());
+        committed_object.content_size_bytes = Some(128);
+        let visible_version = DfsObjectVersionRecord {
+            file_system_id: file_system_id(),
+            object_id: object_id(),
+            version: version("version_2"),
+            content_hash: committed_object.content_hash.clone(),
+            size_bytes: committed_object.content_size_bytes,
+            locations: vec![node("node_owner")],
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        backend
+            .commit_visible_version(
+                &version("version_1"),
+                &committed_object,
+                &visible_version,
+                &[],
+            )
+            .expect("commit visible version");
+        let mut transaction_object = object(version("version_namespace_tx"));
+        transaction_object.object_id =
+            DfsObjectId::from_legacy_named("obj_hydrated_namespace_tx").expect("object");
+        transaction_object.path = "docs/transaction.md".to_string();
+        transaction_object.content_hash = None;
+        transaction_object.content_size_bytes = None;
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "namespace_tx_hydrate_legacy".to_string(),
+            file_system_id: file_system_id(),
+            objects: vec![transaction_object],
+            versions: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend
+            .apply_namespace_transaction(&transaction)
+            .expect("namespace transaction");
 
         let legacy_entries = backend
             .journal_since(0)
@@ -12665,6 +12737,17 @@ mod tests {
                     }
                     DfsMetadataMutation::PutVersion { version_record, .. } => {
                         *version_record = None;
+                    }
+                    DfsMetadataMutation::CommitVisibleVersion {
+                        committed_object,
+                        visible_version,
+                        ..
+                    } => {
+                        *committed_object = None;
+                        *visible_version = None;
+                    }
+                    DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
+                        *transaction = None;
                     }
                     _ => {}
                 }
@@ -12696,6 +12779,22 @@ mod tests {
                 ..
             }
         ));
+        assert!(hydrated.iter().any(|entry| matches!(
+            &entry.mutation,
+            DfsMetadataMutation::CommitVisibleVersion {
+                committed_object: Some(object),
+                visible_version: Some(version_record),
+                ..
+            } if object.version == version("version_2")
+                && version_record.version == version("version_2")
+        )));
+        assert!(hydrated.iter().any(|entry| matches!(
+            &entry.mutation,
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } if transaction.transaction_id == "namespace_tx_hydrate_legacy"
+        )));
 
         cleanup(&root);
     }
