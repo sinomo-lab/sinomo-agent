@@ -479,7 +479,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if object
             .content_size_bytes
             .is_some_and(|current_size| offset <= current_size)
-            && let Some(outcome) = self.write_self_only_eventual_patch_from_reader_with_base(
+            && let Some(outcome) = self.write_distributed_eventual_patch_from_reader_with_base(
                 request,
                 base_version,
                 offset,

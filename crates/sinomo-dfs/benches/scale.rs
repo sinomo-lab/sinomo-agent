@@ -1375,14 +1375,13 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
     let mut last_patch = Vec::new();
     for index in 0..args.write_at_ops {
         let offset = write_at_offset(index, args.blob_bytes, args.write_at_bytes);
-        let patch = patch_bytes(index, args.write_at_bytes);
         let previous_version = bench_object_metadata(&owner_dfs, &object_id)?
             .version
             .clone();
-        owner_dfs.posix_write_file_at(
+        owner_dfs.posix_write_file_at_from_reader(
             path,
             offset,
-            &patch,
+            RepeatingReader::with_seed(args.write_at_bytes as u64, index as u64),
             DfsWriteOptions {
                 policy: policy.clone(),
                 replica_candidates: vec![owner.clone(), replica.clone()],
@@ -1417,9 +1416,9 @@ fn run_network_write_at(args: &Args) -> BenchResult<()> {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
-        patched_bytes = patched_bytes.saturating_add(patch.len() as u64);
+        patched_bytes = patched_bytes.saturating_add(args.write_at_bytes as u64);
         last_offset = offset;
-        last_patch = patch;
+        last_patch = patch_bytes(index, args.write_at_bytes);
     }
     let patch_elapsed = patch_start.elapsed();
     let owner_object = bench_object_metadata(&owner_dfs, &object_id)?;

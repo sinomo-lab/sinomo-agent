@@ -10771,11 +10771,47 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
         *byte = (index % 239) as u8;
     }
     let patch_hash = content_hash(&patch);
+    struct StreamingPatchReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        bulk_reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl std::io::Read for StreamingPatchReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == 0 {
+                if buffer.len() != 1 {
+                    return Err(std::io::Error::other(format!(
+                        "expected initial POSIX peek buffer, got {}",
+                        buffer.len()
+                    )));
+                }
+            } else if buffer.len() != 64 * 1024 {
+                return Err(std::io::Error::other(format!(
+                    "expected content-store streaming buffer, got {}",
+                    buffer.len()
+                )));
+            } else {
+                self.bulk_reads.set(self.bulk_reads.get() + 1);
+            }
+            if self.offset >= self.bytes.len() {
+                return Ok(0);
+            }
+            let len = buffer.len().min(self.bytes.len() - self.offset);
+            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
+        }
+    }
+    let bulk_reads = std::rc::Rc::new(std::cell::Cell::new(0));
     owner_dfs
-        .posix_write_file_at(
+        .posix_write_file_at_from_reader(
             path,
             96 * 1024 + 5,
-            &patch,
+            StreamingPatchReader {
+                bytes: patch.clone(),
+                offset: 0,
+                bulk_reads: bulk_reads.clone(),
+            },
             DfsWriteOptions {
                 policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
                 replica_candidates: vec![owner.clone(), replica.clone()],
@@ -10783,6 +10819,10 @@ fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
             },
         )
         .expect("large patch write");
+    assert!(
+        bulk_reads.get() > 1,
+        "replicated write_at reader should stream the patch through the content store"
+    );
     let pending = owner_dfs
         .pending_writes
         .values()

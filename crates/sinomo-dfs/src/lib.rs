@@ -4648,6 +4648,221 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(Some(outcome))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_patch_from_reader_with_base<R: Read>(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: DfsVersion,
+        offset: u64,
+        reader: &mut R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if let Some(outcome) = self.write_self_only_eventual_patch_from_reader_with_base(
+            request.clone(),
+            expected_base_version.clone(),
+            offset,
+            reader,
+            desired_replica_nodes.clone(),
+            policy.clone(),
+        )? {
+            return Ok(Some(outcome));
+        }
+
+        let object = self.current_object_for_write(&request.object_id)?;
+        if !matches!(
+            object.policy,
+            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
+        ) {
+            return Ok(None);
+        }
+        if expected_base_version != object.version {
+            return Ok(None);
+        }
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
+            let desired_replicas = desired_replica_nodes.len();
+            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
+                desired_replicas
+            } else {
+                policy.min_commit_replicas.min(desired_replicas)
+            };
+            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+        } else {
+            policy
+        };
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+        let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
+            Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
+            Some(shard) => shard.epoch,
+            None => 0,
+        };
+
+        if self
+            .ensure_no_backend_pending_write_intent(
+                &request.object_id,
+                &request.target_version,
+                None,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if self
+            .coordinator
+            .validate_new_intent(
+                &request.file_system_id,
+                &request.object_id,
+                Some(&expected_base_version),
+                &request.target_version,
+                &desired_replica_nodes,
+                &policy,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        let patch_info = self
+            .content
+            .put_object_version_patch_from_reader_with_info(
+                request.object_id.as_str(),
+                expected_base_version.as_str(),
+                request.target_version.as_str(),
+                offset,
+                reader,
+            )?;
+        let manifest = patch_info.manifest;
+        let Some(patch_hash) = patch_info.patch_hash.clone() else {
+            return Ok(None);
+        };
+        let patch_size_bytes = patch_info.patch_size_bytes;
+        let intent = match self.coordinator.create_intent_at_epoch(
+            request.file_system_id.clone(),
+            request.object_id.clone(),
+            Some(expected_base_version.clone()),
+            request.target_version.clone(),
+            request.requesting_node_id.clone(),
+            owner_epoch,
+            desired_replica_nodes.clone(),
+            policy,
+        ) {
+            Ok(intent) => intent,
+            Err(error)
+                if object.policy == DfsObjectPolicy::ReplicatedEventual
+                    && distributed_error_creates_conflict(&error) =>
+            {
+                let conflict_content_hash = manifest.content_hash.clone();
+                let conflict = self.create_write_conflict(
+                    &object,
+                    Some(expected_base_version),
+                    request.target_version.clone(),
+                    request.requesting_node_id.clone(),
+                    Some(conflict_content_hash),
+                    error.to_string(),
+                    None,
+                )?;
+                return Ok(Some(NetworkedDfsWriteOutcome::Conflict { conflict }));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
+        self.pending_writes.insert(
+            intent.intent_id.clone(),
+            pending_networked_write_with_patch(
+                request.object_id.clone(),
+                request.target_version.clone(),
+                manifest.content_hash.clone(),
+                manifest.size_bytes,
+                Some(PendingNetworkedWritePatch {
+                    base_version: expected_base_version.clone(),
+                    offset,
+                    patch_hash: patch_hash.clone(),
+                    patch_size_bytes,
+                    full_stage_fallback_nodes: BTreeSet::new(),
+                }),
+            ),
+        );
+
+        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
+            let local_node_id = self.node_id.clone();
+            self.put_metadata_receipt(
+                &request.file_system_id,
+                &request.object_id,
+                &request.target_version,
+                &local_node_id,
+                &manifest.content_hash,
+            )?;
+            self.coordinator
+                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
+        } else {
+            intent
+        };
+
+        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+        if !matches!(
+            self.coordinator
+                .intent(&updated_intent.intent_id)
+                .map(|intent| &intent.state),
+            Some(DfsWriteIntentState::Committed)
+        ) {
+            let stage_targets = desired_replica_nodes
+                .iter()
+                .filter(|node_id| *node_id != &self.node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for replica_node_id in stage_targets {
+                let request_id = self.next_request_id();
+                let outcome = self.send_stage_patch_window_if_routable(
+                    &replica_node_id,
+                    request_id.clone(),
+                    &updated_intent.intent_id,
+                    &request.file_system_id,
+                    &request.object_id,
+                    &expected_base_version,
+                    &request.target_version,
+                    &manifest.content_hash,
+                    offset,
+                    &patch_hash,
+                    patch_size_bytes,
+                    0,
+                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    Some(object.clone()),
+                )?;
+                if outcome.sent {
+                    self.record_stage_window_progress(
+                        &updated_intent.intent_id,
+                        &replica_node_id,
+                        request_id,
+                        outcome,
+                    );
+                } else {
+                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
+                }
+            }
+        }
+
+        let outcome = self.write_outcome(&updated_intent.intent_id)?;
+        self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
+        Ok(Some(outcome))
+    }
+
     pub(crate) fn write_self_only_eventual_patch_with_base(
         &mut self,
         request: DfsWriteRequest,
