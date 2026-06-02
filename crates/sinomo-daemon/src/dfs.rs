@@ -42,6 +42,8 @@ const DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
 const DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET: usize = 3;
 const DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+const DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
+const DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
 #[cfg(not(test))]
 const DFS_PROTOCOL_METADATA_PUBLISH_RETRY_ROUNDS: usize = 3;
 #[cfg(not(test))]
@@ -301,15 +303,37 @@ pub fn handle_daemon_dfs_inspection(
         DaemonDfsInspectionRequest::Conflicts {
             file_system_id,
             object_id,
-        } => DaemonDfsInspectionResponse::Conflicts {
-            conflicts: inspector.conflicts(file_system_id.as_ref(), object_id.as_ref())?,
-        },
+            limit,
+            cursor,
+        } => {
+            let page = inspector.conflicts_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Conflicts {
+                conflicts: page.conflicts,
+                next_cursor: page.next_cursor,
+            }
+        }
         DaemonDfsInspectionRequest::Repair {
             file_system_id,
             object_id,
-        } => DaemonDfsInspectionResponse::Repair {
-            repairs: inspector.repairs(file_system_id.as_ref(), object_id.as_ref())?,
-        },
+            limit,
+            cursor,
+        } => {
+            let page = inspector.repairs_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Repair {
+                repairs: page.repairs,
+                next_cursor: page.next_cursor,
+            }
+        }
     };
     Ok(response)
 }
@@ -748,6 +772,11 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
         &cluster_paths,
     )
     .with_boxed_metadata_backend(metadata)?;
+    let namespace_jobs = service.posix_resume_namespace_jobs_bounded(
+        DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
+        DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
+    )?;
+    log_dfs_namespace_job_maintenance_report(&namespace_jobs);
     let scheduled_repairs = service.retry_pending_repairs()?;
     if !scheduled_repairs.is_empty() {
         service.process_incoming()?;
@@ -766,6 +795,26 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     }
     log_dfs_metadata_replication_report(report);
     Ok(())
+}
+
+fn log_dfs_namespace_job_maintenance_report(report: &sinomo_dfs::DfsNamespaceJobMaintenanceReport) {
+    if report.resumed_job_count == 0 && report.failed_job_count == 0 {
+        return;
+    }
+    eprintln!(
+        "sinomo daemon DFS namespace jobs: scanned={}, resumed={}, completed={}, failed={}, remaining={}",
+        report.scanned_job_count,
+        report.resumed_job_count,
+        report.completed_job_count,
+        report.failed_job_count,
+        report.remaining_running_job_count
+    );
+    for failure in &report.failures {
+        eprintln!(
+            "sinomo daemon DFS namespace job {} ({:?}) failed: {}",
+            failure.job_id, failure.kind, failure.reason
+        );
+    }
 }
 
 pub fn log_dfs_metadata_replication_report(report: DaemonDfsMetadataReplicationReport) {
@@ -2124,9 +2173,9 @@ mod tests {
         DfsObjectPolicy,
     };
     use sinomo_dfs::{
-        DfsBlobTransferResult, DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
-        DfsProtocolFrameCommand, DfsReplicationPolicy, DfsStageBlobCommand, DfsVersion,
-        DfsWriteOptions,
+        DfsBlobTransferResult, DfsNamespaceJobStatus, DfsNetworkMessage, DfsObjectId,
+        DfsObjectKind, DfsObjectMetadata, DfsProtocolFrameCommand, DfsReplicationPolicy,
+        DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
     };
     use sinomo_network::{
         MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
@@ -2482,6 +2531,99 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_maintenance_tick_resumes_namespace_jobs() {
+        let root = temp_root("daemon_dfs_maintenance_namespace_jobs");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_namespace_jobs")
+            .expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_dfs_namespace_jobs").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon dfs namespace jobs",
+            node_id.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let old_dir = "/services/sandbox/instances/daemon_namespace_job/work/old";
+        let new_dir = "/services/sandbox/instances/daemon_namespace_job/work/new";
+        let old_file = format!("{old_dir}/nested/file.txt");
+        let new_file = format!("{new_dir}/nested/file.txt");
+        let job_id = {
+            let content =
+                LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+            let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("metadata backend");
+            let mut service = NetworkedDfsService::new(
+                DaemonDfsEndpointTransport::new(node_id.clone(), Vec::new()),
+                content,
+            )
+            .with_boxed_metadata_backend(metadata)
+            .expect("service backend");
+            service
+                .bootstrap_distributed_sifs()
+                .expect("bootstrap sifs");
+            service
+                .posix_mkdir_all(&format!("{old_dir}/nested"))
+                .expect("mkdir old tree");
+            service
+                .posix_write_file(
+                    &old_file,
+                    b"daemon namespace job",
+                    DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+                )
+                .expect("write file");
+            let job = service
+                .posix_rename_directory_bounded(old_dir, new_dir, 1)
+                .expect("start bounded rename");
+            assert_eq!(job.status, DfsNamespaceJobStatus::Running);
+            job.job_id
+        };
+
+        let status = handle_daemon_dfs_status(&paths).expect("status before maintenance");
+        assert_eq!(status.pending_namespace_job_count, 1);
+
+        run_daemon_dfs_maintenance_tick(&paths).expect("maintenance tick");
+
+        let status = handle_daemon_dfs_status(&paths).expect("status after maintenance");
+        assert_eq!(status.pending_namespace_job_count, 0);
+        assert_eq!(status.failed_namespace_job_count, 0);
+        let backend =
+            open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata backend");
+        let job = backend
+            .get_namespace_job(&job_id)
+            .expect("get namespace job")
+            .expect("namespace job");
+        assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+        assert!(job.completed_at.is_some());
+
+        let content =
+            LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+        let service = NetworkedDfsService::new(
+            DaemonDfsEndpointTransport::new(node_id, Vec::new()),
+            content,
+        )
+        .with_boxed_metadata_backend(backend)
+        .expect("service backend");
+        assert_eq!(
+            service.posix_read_file(&new_file).expect("read moved file"),
+            b"daemon namespace job"
+        );
+        assert!(service.posix_read_file(&old_file).is_err());
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         let root = temp_root("daemon_dfs_status_sharded");
         let data_root = root.join("data");
@@ -2603,6 +2745,21 @@ mod tests {
                 lag_entries: 2,
             }
         );
+        let DaemonDfsInspectionResponse::FileSystem {
+            file_system: Some(file_system_view),
+        } = handle_daemon_dfs_inspection(
+            &paths,
+            DaemonDfsInspectionRequest::FileSystem {
+                file_system_id: file_system.file_system_id.clone(),
+            },
+        )
+        .expect("filesystem inspection")
+        else {
+            panic!("expected filesystem inspection response")
+        };
+        assert_eq!(file_system_view.object_count, 1);
+        assert_eq!(file_system_view.open_conflict_count, 0);
+        assert_eq!(file_system_view.pending_repair_count, 0);
 
         cleanup(&root);
     }

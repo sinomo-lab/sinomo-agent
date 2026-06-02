@@ -18,10 +18,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::ops::Bound::{Included, Unbounded};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Duration;
 #[cfg(windows)]
 use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 use thiserror::Error;
@@ -34,6 +35,7 @@ const DEFAULT_METADATA_TABLE_COMPACT_AFTER_BYTES: u64 = 64 * 1024 * 1024;
 const JOURNAL_SEGMENT_ENTRY_LIMIT: u64 = 8192;
 const DIRFRAG_BUCKET_COUNT: u64 = 256;
 const LOCAL_MATERIALIZATION_CURSOR_FLUSH_INTERVAL: u64 = 512;
+const SHARD_MIGRATION_PAGE_SIZE: usize = 1024;
 const LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 1;
 const METADATA_TABLE_SNAPSHOT_FORMAT_VERSION: u16 = 2;
 static METADATA_WRITE_PATH_LOCKS: OnceLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> = OnceLock::new();
@@ -410,6 +412,534 @@ pub struct DfsNamespaceTransaction {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectPageCursor {
+    pub path: String,
+    pub object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<DfsMetadataShardId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectPage {
+    pub objects: Vec<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsObjectPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsConflictPageCursor {
+    pub conflict_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsConflictPage {
+    pub conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsConflictPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsDirectoryPageCursor {
+    pub path: String,
+    pub object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dentry: Option<DfsDentryPageCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_id: Option<DfsMetadataShardId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsDentryPageCursor {
+    pub dirfrag_id: DfsDirFragmentId,
+    pub name_hash: u64,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsDirectoryPage {
+    pub objects: Vec<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsDirectoryPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsTombstoneCompactionOptions {
+    pub dry_run: bool,
+    pub min_tombstone_age_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_compactions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_unix_nanos: Option<u64>,
+}
+
+impl DfsTombstoneCompactionOptions {
+    pub fn dry_run(min_tombstone_age: Duration) -> Self {
+        Self {
+            dry_run: true,
+            min_tombstone_age_nanos: duration_nanos_saturating(min_tombstone_age),
+            max_compactions: None,
+            now_unix_nanos: None,
+        }
+    }
+
+    pub fn compact_eligible(min_tombstone_age: Duration) -> Self {
+        Self {
+            dry_run: false,
+            min_tombstone_age_nanos: duration_nanos_saturating(min_tombstone_age),
+            max_compactions: None,
+            now_unix_nanos: None,
+        }
+    }
+
+    pub fn with_max_compactions(mut self, max_compactions: u64) -> Self {
+        self.max_compactions = Some(max_compactions);
+        self
+    }
+
+    pub fn with_now_unix_nanos(mut self, now_unix_nanos: u64) -> Self {
+        self.now_unix_nanos = Some(now_unix_nanos);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsTombstoneCompactionReport {
+    pub dry_run: bool,
+    pub min_tombstone_age_nanos: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_compactions: Option<u64>,
+    pub scanned_tombstone_count: u64,
+    pub eligible_tombstone_count: u64,
+    pub compacted_tombstone_count: u64,
+    pub retained_young_tombstone_count: u64,
+    pub retained_referenced_tombstone_count: u64,
+    pub retained_limit_tombstone_count: u64,
+    pub removed_object_record_count: u64,
+    pub removed_inode_record_count: u64,
+    pub removed_file_system_object_record_count: u64,
+    pub preserved_path_marker_count: u64,
+    pub compacted_marker_count: u64,
+    pub max_compactions_reached: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataSummary {
+    pub file_system_count: usize,
+    pub object_count: usize,
+    pub version_count: usize,
+    pub receipt_count: usize,
+    pub intent_count: usize,
+    pub pending_write_count: usize,
+    pub open_conflict_count: usize,
+    pub pending_repair_count: usize,
+    pub pending_namespace_job_count: usize,
+    pub failed_namespace_job_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceJobRecord {
+    pub job_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub kind: DfsNamespaceJobKind,
+    pub status: DfsNamespaceJobStatus,
+    pub root_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_frames: Vec<DfsNamespaceJobFrame>,
+    pub processed_object_count: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub completed_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespaceJobKind {
+    ClearDirectoryRecursive,
+    RenameDirectory,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespaceJobStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DfsNamespaceJobFrame {
+    ScanDirectory {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<DfsDirectoryPageCursor>,
+    },
+    CompleteDirectory {
+        path: String,
+    },
+    RenameDirectoryStart {
+        source_object_id: DfsObjectId,
+    },
+    RenameDirectoryScan {
+        source_object_id: DfsObjectId,
+        source_path: String,
+        target_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<DfsDirectoryPageCursor>,
+    },
+    RenameDirectoryComplete {
+        source_object_id: DfsObjectId,
+        source_path: String,
+        target_path: String,
+    },
+}
+
+impl DfsTombstoneCompactionReport {
+    fn for_options(options: &DfsTombstoneCompactionOptions) -> Self {
+        Self {
+            dry_run: options.dry_run,
+            min_tombstone_age_nanos: options.min_tombstone_age_nanos,
+            max_compactions: options.max_compactions,
+            ..Self::default()
+        }
+    }
+
+    fn merge(&mut self, other: DfsTombstoneCompactionReport) {
+        self.scanned_tombstone_count = self
+            .scanned_tombstone_count
+            .saturating_add(other.scanned_tombstone_count);
+        self.eligible_tombstone_count = self
+            .eligible_tombstone_count
+            .saturating_add(other.eligible_tombstone_count);
+        self.compacted_tombstone_count = self
+            .compacted_tombstone_count
+            .saturating_add(other.compacted_tombstone_count);
+        self.retained_young_tombstone_count = self
+            .retained_young_tombstone_count
+            .saturating_add(other.retained_young_tombstone_count);
+        self.retained_referenced_tombstone_count = self
+            .retained_referenced_tombstone_count
+            .saturating_add(other.retained_referenced_tombstone_count);
+        self.retained_limit_tombstone_count = self
+            .retained_limit_tombstone_count
+            .saturating_add(other.retained_limit_tombstone_count);
+        self.removed_object_record_count = self
+            .removed_object_record_count
+            .saturating_add(other.removed_object_record_count);
+        self.removed_inode_record_count = self
+            .removed_inode_record_count
+            .saturating_add(other.removed_inode_record_count);
+        self.removed_file_system_object_record_count = self
+            .removed_file_system_object_record_count
+            .saturating_add(other.removed_file_system_object_record_count);
+        self.preserved_path_marker_count = self
+            .preserved_path_marker_count
+            .saturating_add(other.preserved_path_marker_count);
+        self.compacted_marker_count = self
+            .compacted_marker_count
+            .saturating_add(other.compacted_marker_count);
+        self.max_compactions_reached |= other.max_compactions_reached;
+    }
+}
+
+fn metadata_summary_from_records(
+    file_system_count: usize,
+    objects: &[DfsObjectMetadata],
+    versions: &[DfsObjectVersionRecord],
+    receipts: &[DfsReplicaReceiptRecord],
+    intents: &[DfsWriteIntentRecord],
+    conflicts: &[DfsConflictRecord],
+    namespace_jobs: &[DfsNamespaceJobRecord],
+) -> DfsMetadataSummary {
+    let mut receipts_by_object_version =
+        BTreeMap::<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>::new();
+    for receipt in receipts {
+        receipts_by_object_version
+            .entry((
+                receipt.receipt.object_id.clone(),
+                receipt.receipt.committed_version.clone(),
+            ))
+            .or_default()
+            .push(receipt.clone());
+    }
+    let mut intents_by_object = BTreeMap::<DfsObjectId, Vec<DfsWriteIntentRecord>>::new();
+    for intent in intents {
+        intents_by_object
+            .entry(intent.object_id.clone())
+            .or_default()
+            .push(intent.clone());
+    }
+    let pending_repair_count = objects
+        .iter()
+        .map(|object| {
+            let Some(object_intents) = intents_by_object.get(&object.object_id) else {
+                return 0;
+            };
+            let mut receipts_by_version =
+                BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
+            for intent in object_intents
+                .iter()
+                .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
+            {
+                receipts_by_version
+                    .entry(intent.target_version.clone())
+                    .or_insert_with(|| {
+                        receipts_by_object_version
+                            .get(&(object.object_id.clone(), intent.target_version.clone()))
+                            .cloned()
+                            .unwrap_or_default()
+                    });
+            }
+            count_pending_repairs_for_object(object, object_intents, &receipts_by_version)
+        })
+        .sum();
+    DfsMetadataSummary {
+        file_system_count,
+        object_count: objects.len(),
+        version_count: versions.len(),
+        receipt_count: receipts.len(),
+        intent_count: intents.len(),
+        pending_write_count: intents
+            .iter()
+            .filter(|intent| write_intent_status_is_active(&intent.status))
+            .count(),
+        open_conflict_count: conflicts
+            .iter()
+            .filter(|conflict| conflict.status == DfsConflictStatus::Open)
+            .count(),
+        pending_repair_count,
+        pending_namespace_job_count: namespace_jobs
+            .iter()
+            .filter(|job| job.status == DfsNamespaceJobStatus::Running)
+            .count(),
+        failed_namespace_job_count: namespace_jobs
+            .iter()
+            .filter(|job| job.status == DfsNamespaceJobStatus::Failed)
+            .count(),
+    }
+}
+
+fn metadata_summary_from_tables<F>(
+    tables: &DfsMetadataTables,
+    mut object_is_countable: F,
+) -> Result<DfsMetadataSummary>
+where
+    F: FnMut(&DfsObjectMetadata) -> Result<bool>,
+{
+    metadata_summary_from_tables_scoped(tables, None, &mut object_is_countable)
+}
+
+fn metadata_summary_for_file_system_from_tables<F>(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    mut object_is_countable: F,
+) -> Result<Option<DfsMetadataSummary>>
+where
+    F: FnMut(&DfsObjectMetadata) -> Result<bool>,
+{
+    if !tables.file_systems.contains_key(file_system_id) {
+        return Ok(None);
+    }
+    metadata_summary_from_tables_scoped(tables, Some(file_system_id), &mut object_is_countable)
+        .map(Some)
+}
+
+fn metadata_summary_from_tables_scoped<F>(
+    tables: &DfsMetadataTables,
+    file_system_scope: Option<&DfsFileSystemId>,
+    object_is_countable: &mut F,
+) -> Result<DfsMetadataSummary>
+where
+    F: FnMut(&DfsObjectMetadata) -> Result<bool>,
+{
+    let file_system_in_scope = |file_system_id: &DfsFileSystemId| {
+        file_system_scope.is_none_or(|scope| file_system_id == scope)
+    };
+    let mut object_count = 0usize;
+    for ((file_system_id, _), path_record) in &tables.file_system_objects {
+        if !file_system_in_scope(file_system_id)
+            || !tables.file_systems.contains_key(file_system_id)
+            || path_record.file_system_id != *file_system_id
+        {
+            continue;
+        }
+        let Some(object) = tables.objects.get(&path_record.object_id) else {
+            continue;
+        };
+        if object.file_system_id == *file_system_id
+            && normalize_path(&object.path) == path_record.path
+            && object_is_countable(object)?
+        {
+            object_count = object_count.saturating_add(1);
+        }
+    }
+
+    let mut pending_repair_count = 0usize;
+    for intent in tables.intents.values() {
+        if intent.status != DfsWriteIntentStatus::Committed {
+            continue;
+        }
+        if !file_system_in_scope(&intent.file_system_id) {
+            continue;
+        }
+        let Some(object) = tables.objects.get(&intent.object_id) else {
+            continue;
+        };
+        let Some(path_record) = tables
+            .file_system_objects
+            .get(&(object.file_system_id.clone(), object.object_id.clone()))
+        else {
+            continue;
+        };
+        if !file_system_in_scope(&object.file_system_id)
+            || !tables.file_systems.contains_key(&object.file_system_id)
+            || path_record.file_system_id != object.file_system_id
+            || path_record.path != normalize_path(&object.path)
+            || object.version != intent.target_version
+            || !object_is_countable(object)?
+        {
+            continue;
+        }
+        let receipts = receipts_for_object_version_from_tables(
+            tables,
+            &object.object_id,
+            &intent.target_version,
+        );
+        let mut receipts_by_version = BTreeMap::new();
+        receipts_by_version.insert(intent.target_version.clone(), receipts);
+        pending_repair_count =
+            pending_repair_count.saturating_add(count_pending_repairs_for_object(
+                object,
+                std::slice::from_ref(intent),
+                &receipts_by_version,
+            ));
+    }
+
+    Ok(DfsMetadataSummary {
+        file_system_count: match file_system_scope {
+            Some(file_system_id) if tables.file_systems.contains_key(file_system_id) => 1,
+            Some(_) => 0,
+            None => tables.file_systems.len(),
+        },
+        object_count,
+        version_count: tables
+            .versions
+            .values()
+            .filter(|version| file_system_in_scope(&version.file_system_id))
+            .count(),
+        receipt_count: tables
+            .receipts
+            .values()
+            .filter(|receipt| file_system_in_scope(&receipt.receipt.file_system_id))
+            .count(),
+        intent_count: tables
+            .intents
+            .values()
+            .filter(|intent| file_system_in_scope(&intent.file_system_id))
+            .count(),
+        pending_write_count: tables
+            .intents
+            .values()
+            .filter(|intent| {
+                file_system_in_scope(&intent.file_system_id)
+                    && write_intent_status_is_active(&intent.status)
+            })
+            .count(),
+        open_conflict_count: tables
+            .conflicts
+            .values()
+            .filter(|conflict| {
+                file_system_in_scope(&conflict.file_system_id)
+                    && conflict.status == DfsConflictStatus::Open
+            })
+            .count(),
+        pending_repair_count,
+        pending_namespace_job_count: tables
+            .namespace_jobs
+            .values()
+            .filter(|job| {
+                file_system_in_scope(&job.file_system_id)
+                    && job.status == DfsNamespaceJobStatus::Running
+            })
+            .count(),
+        failed_namespace_job_count: tables
+            .namespace_jobs
+            .values()
+            .filter(|job| {
+                file_system_in_scope(&job.file_system_id)
+                    && job.status == DfsNamespaceJobStatus::Failed
+            })
+            .count(),
+    })
+}
+
+fn receipts_for_object_version_from_tables(
+    tables: &DfsMetadataTables,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+) -> Vec<DfsReplicaReceiptRecord> {
+    tables
+        .receipts
+        .range((
+            Included((object_id.clone(), version.clone(), id_lower_bound())),
+            Unbounded,
+        ))
+        .take_while(|((record_object_id, record_version, _), _)| {
+            record_object_id == object_id && record_version == version
+        })
+        .map(|(_, receipt)| receipt.clone())
+        .collect()
+}
+
+fn count_pending_repairs_for_object(
+    object: &DfsObjectMetadata,
+    intents: &[DfsWriteIntentRecord],
+    receipts_by_version: &BTreeMap<DfsVersion, Vec<DfsReplicaReceiptRecord>>,
+) -> usize {
+    let mut count = 0usize;
+    for intent in intents {
+        if intent.status != DfsWriteIntentStatus::Committed
+            || intent.target_version != object.version
+        {
+            continue;
+        }
+        let receipt_nodes = receipts_by_version
+            .get(&intent.target_version)
+            .into_iter()
+            .flatten()
+            .filter(|receipt| {
+                intent
+                    .content_hash
+                    .as_ref()
+                    .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
+            })
+            .map(|receipt| receipt.replica_node_id.clone())
+            .collect::<BTreeSet<_>>();
+        for node_id in &intent.desired_replica_node_ids {
+            if !receipt_nodes.contains(node_id) {
+                count = count.saturating_add(1);
+            }
+        }
+    }
+    count
+}
+
+fn write_intent_status_is_active(status: &DfsWriteIntentStatus) -> bool {
+    matches!(
+        status,
+        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsVisibleVersionCommitRecord {
     expected_version: DfsVersion,
     committed_object: DfsObjectMetadata,
@@ -434,6 +964,44 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>>;
+    fn objects_for_file_system_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut objects = self.objects_for_file_system(file_system_id)?;
+        if let Some(after) = after {
+            objects.retain(|object| object_page_key(object) > (&after.path, &after.object_id));
+        }
+        let has_more = objects.len() > max_entries;
+        objects.truncate(max_entries);
+        let next_cursor = if has_more {
+            objects.last().map(object_page_cursor)
+        } else {
+            None
+        };
+        Ok(DfsObjectPage {
+            objects,
+            next_cursor,
+        })
+    }
+    fn object_page_cursor_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsObjectPageCursor> {
+        Ok(DfsObjectPageCursor {
+            path: object.path.clone(),
+            object_id: object.object_id.clone(),
+            shard_id: None,
+        })
+    }
     fn child_objects_for_directory(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -466,6 +1034,35 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         });
         Ok(children)
     }
+    fn child_objects_for_directory_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsDirectoryPage> {
+        if max_entries == 0 {
+            return Ok(DfsDirectoryPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut objects = self.child_objects_for_directory(file_system_id, directory_path)?;
+        if let Some(after) = after {
+            objects.retain(|object| directory_page_key(object) > (&after.path, &after.object_id));
+        }
+        let has_more = objects.len() > max_entries;
+        objects.truncate(max_entries);
+        let next_cursor = if has_more {
+            objects.last().map(directory_page_cursor)
+        } else {
+            None
+        };
+        Ok(DfsDirectoryPage {
+            objects,
+            next_cursor,
+        })
+    }
     fn hardlinks_to_object(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -485,6 +1082,93 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 .then_with(|| left.object_id.cmp(&right.object_id))
         });
         Ok(hardlinks)
+    }
+    fn hardlinks_to_object_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut hardlinks = self.hardlinks_to_object(file_system_id, target_object_id)?;
+        if let Some(after) = after {
+            hardlinks.retain(|object| object_page_key(object) > (&after.path, &after.object_id));
+        }
+        let has_more = hardlinks.len() > max_entries;
+        hardlinks.truncate(max_entries);
+        let next_cursor = if has_more {
+            hardlinks.last().map(object_page_cursor)
+        } else {
+            None
+        };
+        Ok(DfsObjectPage {
+            objects: hardlinks,
+            next_cursor,
+        })
+    }
+    fn hardlink_count_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<usize> {
+        let mut count = 0usize;
+        let mut cursor = None;
+        loop {
+            let page = self.hardlinks_to_object_page(
+                file_system_id,
+                target_object_id,
+                cursor.as_ref(),
+                1024,
+            )?;
+            count = count.saturating_add(page.objects.len());
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(count);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+    fn first_hardlink_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        Ok(self
+            .hardlinks_to_object_page(file_system_id, target_object_id, None, 1)?
+            .objects
+            .into_iter()
+            .next())
+    }
+    fn first_hardlink_to_object_outside_prefix(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        prefix: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let prefix = normalize_posix_path(prefix);
+        let mut cursor = None;
+        loop {
+            let page = self.hardlinks_to_object_page(
+                file_system_id,
+                target_object_id,
+                cursor.as_ref(),
+                1024,
+            )?;
+            for object in page.objects {
+                if !posix_path_is_at_or_under_prefix(&object.path, &prefix) {
+                    return Ok(Some(object));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next_cursor);
+        }
     }
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry>;
     fn get_version(
@@ -568,6 +1252,70 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         }
         Ok(conflicts)
     }
+    fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
+        let filesystems = self.list_file_systems()?;
+        let mut objects = Vec::new();
+        for file_system in &filesystems {
+            objects.extend(self.objects_for_file_system(&file_system.file_system_id)?);
+        }
+        let versions = self.all_versions()?;
+        let receipts = self.all_receipts()?;
+        let intents = self.all_intents()?;
+        let conflicts = self.all_conflicts()?;
+        let namespace_jobs = self.list_namespace_jobs()?;
+        Ok(metadata_summary_from_records(
+            filesystems.len(),
+            &objects,
+            &versions,
+            &receipts,
+            &intents,
+            &conflicts,
+            &namespace_jobs,
+        ))
+    }
+    fn metadata_summary_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsMetadataSummary>> {
+        let Some(_) = self.get_file_system(file_system_id)? else {
+            return Ok(None);
+        };
+        let objects = self.objects_for_file_system(file_system_id)?;
+        let versions = self
+            .all_versions()?
+            .into_iter()
+            .filter(|version| version.file_system_id == *file_system_id)
+            .collect::<Vec<_>>();
+        let receipts = self
+            .all_receipts()?
+            .into_iter()
+            .filter(|receipt| receipt.receipt.file_system_id == *file_system_id)
+            .collect::<Vec<_>>();
+        let intents = self
+            .all_intents()?
+            .into_iter()
+            .filter(|intent| intent.file_system_id == *file_system_id)
+            .collect::<Vec<_>>();
+        let conflicts = self
+            .all_conflicts()?
+            .into_iter()
+            .filter(|conflict| conflict.file_system_id == *file_system_id)
+            .collect::<Vec<_>>();
+        let namespace_jobs = self
+            .list_namespace_jobs()?
+            .into_iter()
+            .filter(|job| job.file_system_id == *file_system_id)
+            .collect::<Vec<_>>();
+        Ok(Some(metadata_summary_from_records(
+            1,
+            &objects,
+            &versions,
+            &receipts,
+            &intents,
+            &conflicts,
+            &namespace_jobs,
+        )))
+    }
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -579,6 +1327,24 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry>;
+    fn compact_tombstones(
+        &mut self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        let _ = options;
+        Ok(DfsTombstoneCompactionReport::default())
+    }
+    fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
+        let _ = job;
+        Ok(())
+    }
+    fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
+        let _ = job_id;
+        Ok(None)
+    }
+    fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
+        Ok(Vec::new())
+    }
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry>;
     fn get_conflict(
         &self,
@@ -586,6 +1352,35 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         conflict_id: &str,
     ) -> Result<Option<DfsConflictRecord>>;
     fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>>;
+    fn conflicts_for_object_page(
+        &self,
+        object_id: &DfsObjectId,
+        after: Option<&DfsConflictPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictPage> {
+        if max_entries == 0 {
+            return Ok(DfsConflictPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut conflicts = self.conflicts_for_object(object_id)?;
+        conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
+        if let Some(after) = after {
+            conflicts.retain(|conflict| conflict.conflict_id > after.conflict_id);
+        }
+        let has_more = conflicts.len() > max_entries;
+        conflicts.truncate(max_entries);
+        let next_cursor = if has_more {
+            conflicts.last().map(conflict_page_cursor)
+        } else {
+            None
+        };
+        Ok(DfsConflictPage {
+            conflicts,
+            next_cursor,
+        })
+    }
     fn update_conflict_status(
         &mut self,
         object_id: &DfsObjectId,
@@ -677,12 +1472,16 @@ struct DfsMetadataTables {
     dirfrags: BTreeMap<(DfsInodeId, DfsDirFragmentId), DfsDirFragmentRecord>,
     dentries: BTreeMap<(DfsInodeId, DfsDirFragmentId, u64, String), DfsPathRecord>,
     hardlinks: BTreeMap<(DfsObjectId, DfsObjectId), DfsPathRecord>,
+    hardlink_paths: BTreeMap<(DfsObjectId, String, DfsObjectId), DfsPathRecord>,
+    compacted_tombstones: BTreeMap<DfsObjectId, DfsObjectMetadata>,
+    compacted_tombstone_paths: BTreeMap<(DfsFileSystemId, String), DfsObjectId>,
     versions: BTreeMap<(DfsObjectId, DfsVersion), DfsObjectVersionRecord>,
     receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptRecord>,
     intents: BTreeMap<(DfsObjectId, String), DfsWriteIntentRecord>,
     conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
+    namespace_jobs: BTreeMap<String, DfsNamespaceJobRecord>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -720,6 +1519,8 @@ pub struct DfsMetadataTableSnapshotTables {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hardlinks: Vec<DfsHardlinkIndexSnapshotRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    compacted_tombstones: Vec<DfsObjectMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     versions: Vec<DfsObjectVersionRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     receipts: Vec<DfsReplicaReceiptRecord>,
@@ -731,6 +1532,8 @@ pub struct DfsMetadataTableSnapshotTables {
     visible_commits: Vec<DfsVisibleCommitSnapshotRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     namespace_transactions: Vec<DfsNamespaceTransaction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    namespace_jobs: Vec<DfsNamespaceJobRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -756,6 +1559,8 @@ impl DfsMetadataTables {
             || !self.intents.is_empty()
             || !self.conflicts.is_empty()
             || !self.namespace_transactions.is_empty()
+            || !self.namespace_jobs.is_empty()
+            || !self.compacted_tombstones.is_empty()
             || !self.visible_commits.is_empty()
     }
 
@@ -767,6 +1572,9 @@ impl DfsMetadataTables {
             }
             DfsMetadataTableOp::PutObject { object } => {
                 self.objects.insert(object.object_id.clone(), object);
+            }
+            DfsMetadataTableOp::RemoveObject { object_id } => {
+                self.objects.remove(&object_id);
             }
             DfsMetadataTableOp::PutFileSystemObject { path_record } => {
                 self.file_system_objects.insert(
@@ -799,6 +1607,9 @@ impl DfsMetadataTables {
             DfsMetadataTableOp::PutInode { inode } => {
                 self.inodes.insert(inode.inode_id.clone(), inode);
             }
+            DfsMetadataTableOp::RemoveInode { inode_id } => {
+                self.inodes.remove(&inode_id);
+            }
             DfsMetadataTableOp::PutDirFragment { dirfrag } => {
                 self.dirfrags.insert(
                     (dirfrag.dir_inode_id.clone(), dirfrag.dirfrag_id.clone()),
@@ -822,15 +1633,22 @@ impl DfsMetadataTables {
                 hardlink_object_id,
                 path_record,
             } => {
-                self.hardlinks
-                    .insert((target_object_id, hardlink_object_id), path_record);
+                self.put_hardlink_index(target_object_id, hardlink_object_id, path_record);
             }
             DfsMetadataTableOp::RemoveHardlink {
                 target_object_id,
                 hardlink_object_id,
             } => {
-                self.hardlinks
-                    .remove(&(target_object_id, hardlink_object_id));
+                self.remove_hardlink_index(&target_object_id, &hardlink_object_id);
+            }
+            DfsMetadataTableOp::PutCompactedTombstone { object } => {
+                self.put_compacted_tombstone(object);
+            }
+            DfsMetadataTableOp::RemoveCompactedTombstonePath {
+                file_system_id,
+                path,
+            } => {
+                self.remove_compacted_tombstone_path(&file_system_id, &path);
             }
             DfsMetadataTableOp::PutVersion { version } => {
                 self.versions.insert(
@@ -869,6 +1687,9 @@ impl DfsMetadataTables {
                 self.namespace_transactions
                     .insert(transaction.transaction_id.clone(), transaction);
             }
+            DfsMetadataTableOp::PutNamespaceJob { job } => {
+                self.namespace_jobs.insert(job.job_id.clone(), job);
+            }
         }
     }
 
@@ -879,6 +1700,108 @@ impl DfsMetadataTables {
     ) {
         rollback.record(self, &op);
         self.apply(op);
+    }
+
+    fn put_compacted_tombstone(&mut self, object: DfsObjectMetadata) {
+        let object = normalized_object_metadata(&object);
+        let path_key = (object.file_system_id.clone(), normalize_path(&object.path));
+        if let Some(previous_object_id) = self
+            .compacted_tombstone_paths
+            .insert(path_key, object.object_id.clone())
+            && previous_object_id != object.object_id
+        {
+            self.compacted_tombstones.remove(&previous_object_id);
+        }
+        self.compacted_tombstones
+            .insert(object.object_id.clone(), object);
+    }
+
+    fn remove_compacted_tombstone_path(&mut self, file_system_id: &DfsFileSystemId, path: &str) {
+        let path_key = (file_system_id.clone(), normalize_path(path));
+        if let Some(object_id) = self.compacted_tombstone_paths.remove(&path_key) {
+            self.compacted_tombstones.remove(&object_id);
+        }
+    }
+
+    fn compacted_tombstone_by_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Option<DfsObjectMetadata> {
+        let path_key = (file_system_id.clone(), normalize_path(path));
+        self.compacted_tombstone_paths
+            .get(&path_key)
+            .and_then(|object_id| self.compacted_tombstones.get(object_id))
+            .filter(|object| {
+                object.kind == DfsObjectKind::Tombstone
+                    && object.file_system_id == *file_system_id
+                    && normalize_path(&object.path) == path_key.1
+            })
+            .cloned()
+    }
+
+    fn compacted_tombstone_matches(&self, object: &DfsObjectMetadata) -> bool {
+        if object.kind != DfsObjectKind::Tombstone {
+            return false;
+        }
+        self.compacted_tombstones
+            .get(&object.object_id)
+            .is_some_and(|stored| {
+                normalized_object_metadata(stored) == normalized_object_metadata(object)
+            })
+    }
+
+    fn put_hardlink_index(
+        &mut self,
+        target_object_id: DfsObjectId,
+        hardlink_object_id: DfsObjectId,
+        path_record: DfsPathRecord,
+    ) {
+        self.remove_hardlink_index(&target_object_id, &hardlink_object_id);
+        self.hardlink_paths.insert(
+            (
+                target_object_id.clone(),
+                path_record.path.clone(),
+                hardlink_object_id.clone(),
+            ),
+            path_record.clone(),
+        );
+        self.hardlinks
+            .insert((target_object_id, hardlink_object_id), path_record);
+    }
+
+    fn remove_hardlink_index(
+        &mut self,
+        target_object_id: &DfsObjectId,
+        hardlink_object_id: &DfsObjectId,
+    ) {
+        if let Some(path_record) = self
+            .hardlinks
+            .remove(&(target_object_id.clone(), hardlink_object_id.clone()))
+        {
+            self.hardlink_paths.remove(&(
+                target_object_id.clone(),
+                path_record.path,
+                hardlink_object_id.clone(),
+            ));
+        }
+    }
+
+    fn rebuild_hardlink_path_index(&mut self) {
+        self.hardlink_paths = self
+            .hardlinks
+            .iter()
+            .map(|((target_object_id, hardlink_object_id), path_record)| {
+                (
+                    (
+                        target_object_id.clone(),
+                        path_record.path.clone(),
+                        hardlink_object_id.clone(),
+                    ),
+                    path_record.clone(),
+                )
+            })
+            .collect();
     }
 }
 
@@ -892,12 +1815,15 @@ struct DfsMetadataTableRollback {
     dirfrags: BTreeMap<(DfsInodeId, DfsDirFragmentId), Option<DfsDirFragmentRecord>>,
     dentries: BTreeMap<(DfsInodeId, DfsDirFragmentId, u64, String), Option<DfsPathRecord>>,
     hardlinks: BTreeMap<(DfsObjectId, DfsObjectId), Option<DfsPathRecord>>,
+    compacted_tombstones: BTreeMap<DfsObjectId, Option<DfsObjectMetadata>>,
+    compacted_tombstone_paths: BTreeMap<(DfsFileSystemId, String), Option<DfsObjectId>>,
     versions: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsObjectVersionRecord>>,
     receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), Option<DfsReplicaReceiptRecord>>,
     intents: BTreeMap<(DfsObjectId, String), Option<DfsWriteIntentRecord>>,
     conflicts: BTreeMap<(DfsObjectId, String), Option<DfsConflictRecord>>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), Option<DfsVisibleVersionCommitRecord>>,
     namespace_transactions: BTreeMap<String, Option<DfsNamespaceTransaction>>,
+    namespace_jobs: BTreeMap<String, Option<DfsNamespaceJobRecord>>,
 }
 
 impl DfsMetadataTableRollback {
@@ -910,6 +1836,9 @@ impl DfsMetadataTableRollback {
             ),
             DfsMetadataTableOp::PutObject { object } => {
                 record_rollback_value(&mut self.objects, &tables.objects, object.object_id.clone())
+            }
+            DfsMetadataTableOp::RemoveObject { object_id } => {
+                record_rollback_value(&mut self.objects, &tables.objects, object_id.clone())
             }
             DfsMetadataTableOp::PutFileSystemObject { path_record } => record_rollback_value(
                 &mut self.file_system_objects,
@@ -942,6 +1871,9 @@ impl DfsMetadataTableRollback {
             ),
             DfsMetadataTableOp::PutInode { inode } => {
                 record_rollback_value(&mut self.inodes, &tables.inodes, inode.inode_id.clone())
+            }
+            DfsMetadataTableOp::RemoveInode { inode_id } => {
+                record_rollback_value(&mut self.inodes, &tables.inodes, inode_id.clone())
             }
             DfsMetadataTableOp::PutDirFragment { dirfrag } => record_rollback_value(
                 &mut self.dirfrags,
@@ -985,6 +1917,15 @@ impl DfsMetadataTableRollback {
                 &tables.hardlinks,
                 (target_object_id.clone(), hardlink_object_id.clone()),
             ),
+            DfsMetadataTableOp::PutCompactedTombstone { object } => {
+                record_compacted_tombstone_rollback(self, tables, object);
+            }
+            DfsMetadataTableOp::RemoveCompactedTombstonePath {
+                file_system_id,
+                path,
+            } => {
+                record_compacted_tombstone_path_rollback(self, tables, file_system_id, path);
+            }
             DfsMetadataTableOp::PutVersion { version } => record_rollback_value(
                 &mut self.versions,
                 &tables.versions,
@@ -1021,6 +1962,11 @@ impl DfsMetadataTableRollback {
                 &tables.namespace_transactions,
                 transaction.transaction_id.clone(),
             ),
+            DfsMetadataTableOp::PutNamespaceJob { job } => record_rollback_value(
+                &mut self.namespace_jobs,
+                &tables.namespace_jobs,
+                job.job_id.clone(),
+            ),
         }
     }
 
@@ -1033,6 +1979,12 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.dirfrags, self.dirfrags);
         rollback_map(&mut tables.dentries, self.dentries);
         rollback_map(&mut tables.hardlinks, self.hardlinks);
+        tables.rebuild_hardlink_path_index();
+        rollback_map(&mut tables.compacted_tombstones, self.compacted_tombstones);
+        rollback_map(
+            &mut tables.compacted_tombstone_paths,
+            self.compacted_tombstone_paths,
+        );
         rollback_map(&mut tables.versions, self.versions);
         rollback_map(&mut tables.receipts, self.receipts);
         rollback_map(&mut tables.intents, self.intents);
@@ -1042,6 +1994,7 @@ impl DfsMetadataTableRollback {
             &mut tables.namespace_transactions,
             self.namespace_transactions,
         );
+        rollback_map(&mut tables.namespace_jobs, self.namespace_jobs);
     }
 }
 
@@ -1055,6 +2008,53 @@ fn record_rollback_value<K, V>(
 {
     if !rollback.contains_key(&key) {
         rollback.insert(key.clone(), table.get(&key).cloned());
+    }
+}
+
+fn record_compacted_tombstone_rollback(
+    rollback: &mut DfsMetadataTableRollback,
+    tables: &DfsMetadataTables,
+    object: &DfsObjectMetadata,
+) {
+    let object_id = object.object_id.clone();
+    let path_key = (object.file_system_id.clone(), normalize_path(&object.path));
+    record_rollback_value(
+        &mut rollback.compacted_tombstones,
+        &tables.compacted_tombstones,
+        object_id,
+    );
+    record_rollback_value(
+        &mut rollback.compacted_tombstone_paths,
+        &tables.compacted_tombstone_paths,
+        path_key.clone(),
+    );
+    if let Some(previous_object_id) = tables.compacted_tombstone_paths.get(&path_key) {
+        record_rollback_value(
+            &mut rollback.compacted_tombstones,
+            &tables.compacted_tombstones,
+            previous_object_id.clone(),
+        );
+    }
+}
+
+fn record_compacted_tombstone_path_rollback(
+    rollback: &mut DfsMetadataTableRollback,
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    path: &str,
+) {
+    let path_key = (file_system_id.clone(), normalize_path(path));
+    record_rollback_value(
+        &mut rollback.compacted_tombstone_paths,
+        &tables.compacted_tombstone_paths,
+        path_key.clone(),
+    );
+    if let Some(object_id) = tables.compacted_tombstone_paths.get(&path_key) {
+        record_rollback_value(
+            &mut rollback.compacted_tombstones,
+            &tables.compacted_tombstones,
+            object_id.clone(),
+        );
     }
 }
 
@@ -1086,6 +2086,9 @@ enum DfsMetadataTableOp {
     PutObject {
         object: DfsObjectMetadata,
     },
+    RemoveObject {
+        object_id: DfsObjectId,
+    },
     PutFileSystemObject {
         path_record: DfsPathRecord,
     },
@@ -1102,6 +2105,9 @@ enum DfsMetadataTableOp {
     },
     PutInode {
         inode: DfsInodeRecord,
+    },
+    RemoveInode {
+        inode_id: DfsInodeId,
     },
     PutDirFragment {
         dirfrag: DfsDirFragmentRecord,
@@ -1124,6 +2130,13 @@ enum DfsMetadataTableOp {
         target_object_id: DfsObjectId,
         hardlink_object_id: DfsObjectId,
     },
+    PutCompactedTombstone {
+        object: DfsObjectMetadata,
+    },
+    RemoveCompactedTombstonePath {
+        file_system_id: DfsFileSystemId,
+        path: String,
+    },
     PutVersion {
         version: DfsObjectVersionRecord,
     },
@@ -1144,6 +2157,9 @@ enum DfsMetadataTableOp {
     PutNamespaceTransaction {
         transaction: DfsNamespaceTransaction,
     },
+    PutNamespaceJob {
+        job: DfsNamespaceJobRecord,
+    },
 }
 
 #[derive(Debug)]
@@ -1160,6 +2176,12 @@ struct DfsObjectShardMigrationBundle {
     receipts: Vec<DfsReplicaReceiptRecord>,
     intents: Vec<DfsWriteIntentRecord>,
     conflicts: Vec<DfsConflictRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct DfsDirectoryPageEntries {
+    entries: Vec<(DfsObjectMetadata, DfsDirectoryPageCursor)>,
+    next_cursor: Option<DfsDirectoryPageCursor>,
 }
 
 impl LocalShardedMetadataBackend {
@@ -1229,6 +2251,10 @@ impl LocalShardedMetadataBackend {
                 shard_id: shard_id.clone(),
             },
         )
+    }
+
+    fn remove_object_shard_index(&self, object_id: &DfsObjectId) -> Result<()> {
+        remove_file_if_exists(&self.object_shard_index_path(object_id))
     }
 
     fn shard_backend(&self, shard_id: &DfsMetadataShardId) -> Result<&LocalJsonMetadataBackend> {
@@ -1305,6 +2331,20 @@ impl LocalShardedMetadataBackend {
         Ok(index.shard_id == *shard_id)
     }
 
+    fn object_is_listable_from_shard(
+        &self,
+        object: &DfsObjectMetadata,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        if let Some(index) = self.read_object_shard_index(&object.object_id)?
+            && self.shards.contains_key(&index.shard_id)
+            && index.shard_id != *shard_id
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn require_shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<DfsMetadataShardId> {
         self.shard_id_for_object(object_id)?
             .ok_or_else(|| MetadataBackendError::UnknownObject {
@@ -1332,6 +2372,46 @@ impl LocalShardedMetadataBackend {
             });
         }
         self.select_shard_id_for_path(file_system_id, &object.path)
+    }
+
+    fn first_hardlink_to_object_matching<P>(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        mut matches: P,
+    ) -> Result<Option<DfsObjectMetadata>>
+    where
+        P: FnMut(&DfsObjectMetadata) -> bool,
+    {
+        let mut best = None::<DfsObjectMetadata>;
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = None;
+            loop {
+                let page = backend.hardlinks_to_object_page(
+                    file_system_id,
+                    target_object_id,
+                    cursor.as_ref(),
+                    4096,
+                )?;
+                for object in page.objects {
+                    if !self.object_is_listable_from_shard(&object, shard_id)? || !matches(&object)
+                    {
+                        continue;
+                    }
+                    if best
+                        .as_ref()
+                        .is_none_or(|current| object_page_key(&object) < object_page_key(current))
+                    {
+                        best = Some(object);
+                    }
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        Ok(best)
     }
 
     pub fn ensure_file_system_on_all_shards(
@@ -1378,51 +2458,71 @@ impl LocalShardedMetadataBackend {
             skipped_stale_sources: 0,
             reached_limit: false,
         };
-        let mut candidates = Vec::<(DfsMetadataShardId, DfsObjectMetadata)>::new();
-        for (source_shard_id, backend) in &self.shards {
-            for object in backend.objects_for_file_system(file_system_id)? {
-                report.scanned_objects = report.scanned_objects.saturating_add(1);
-                candidates.push((source_shard_id.clone(), object));
-            }
-        }
-        candidates.sort_by(|(left_shard, left), (right_shard, right)| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.object_id.cmp(&right.object_id))
-                .then_with(|| left_shard.cmp(right_shard))
-        });
-
-        for (source_shard_id, object) in candidates {
-            if let Some(index) = self.read_object_shard_index(&object.object_id)?
-                && index.shard_id != source_shard_id
-            {
-                report.skipped_stale_sources = report.skipped_stale_sources.saturating_add(1);
-                continue;
-            }
-            let target_shard_id =
-                self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
-            if source_shard_id == target_shard_id {
-                let expected_path = normalize_path(&object.path);
-                let needs_index =
-                    self.read_object_shard_index(&object.object_id)?
-                        .is_none_or(|index| {
-                            index.shard_id != target_shard_id || index.path != expected_path
-                        });
-                if needs_index {
-                    self.write_object_shard_index(&object, &target_shard_id)?;
-                    report.indexed_objects = report.indexed_objects.saturating_add(1);
+        let shard_ids = self.shard_ids();
+        let mut visited_object_ids = BTreeSet::<DfsObjectId>::new();
+        for source_shard_id in shard_ids {
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .shard_backend(&source_shard_id)?
+                    .objects_for_file_system_page(
+                        file_system_id,
+                        cursor.as_ref(),
+                        SHARD_MIGRATION_PAGE_SIZE,
+                    )?;
+                let next_cursor = page.next_cursor;
+                for object in page.objects {
+                    if visited_object_ids.contains(&object.object_id) {
+                        continue;
+                    }
+                    if report.migrated_objects >= max_migrations {
+                        report.reached_limit = true;
+                        return Ok(report);
+                    }
+                    report.scanned_objects = report.scanned_objects.saturating_add(1);
+                    if let Some(index) = self.read_object_shard_index(&object.object_id)?
+                        && index.shard_id != source_shard_id
+                    {
+                        report.skipped_stale_sources =
+                            report.skipped_stale_sources.saturating_add(1);
+                        continue;
+                    }
+                    visited_object_ids.insert(object.object_id.clone());
+                    let target_shard_id =
+                        self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+                    if source_shard_id == target_shard_id {
+                        let expected_path = normalize_path(&object.path);
+                        let needs_index = self
+                            .read_object_shard_index(&object.object_id)?
+                            .is_none_or(|index| {
+                                index.shard_id != target_shard_id || index.path != expected_path
+                            });
+                        if needs_index {
+                            self.write_object_shard_index(&object, &target_shard_id)?;
+                            report.indexed_objects = report.indexed_objects.saturating_add(1);
+                        }
+                        continue;
+                    }
+                    let bundle =
+                        self.object_shard_migration_bundle(&source_shard_id, &object.object_id)?;
+                    self.install_object_shard_migration_bundle(
+                        &file_system,
+                        &bundle,
+                        &target_shard_id,
+                    )?;
+                    self.write_object_shard_index(&bundle.object, &target_shard_id)?;
+                    self.put_cross_shard_tombstone(
+                        &bundle.object,
+                        &source_shard_id,
+                        &target_shard_id,
+                    )?;
+                    report.migrated_objects = report.migrated_objects.saturating_add(1);
                 }
-                continue;
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
             }
-            if report.migrated_objects >= max_migrations {
-                report.reached_limit = true;
-                break;
-            }
-            let bundle = self.object_shard_migration_bundle(&source_shard_id, &object.object_id)?;
-            self.install_object_shard_migration_bundle(&file_system, &bundle, &target_shard_id)?;
-            self.write_object_shard_index(&bundle.object, &target_shard_id)?;
-            self.put_cross_shard_tombstone(&bundle.object, &source_shard_id, &target_shard_id)?;
-            report.migrated_objects = report.migrated_objects.saturating_add(1);
         }
         Ok(report)
     }
@@ -1716,6 +2816,295 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         Ok(objects)
     }
 
+    fn objects_for_file_system_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
+        let mut entries = Vec::<(DfsObjectMetadata, DfsObjectPageCursor)>::new();
+        'shards: for (shard_id, backend) in &self.shards {
+            if let Some(resume_shard_id) = resume_shard_id
+                && shard_id < resume_shard_id
+            {
+                continue;
+            }
+            let mut local_after = match resume_shard_id {
+                Some(resume_shard_id) if resume_shard_id == shard_id => {
+                    after.map(local_object_page_cursor)
+                }
+                Some(_) => None,
+                None => after.map(local_object_page_cursor),
+            };
+            loop {
+                let page = backend.objects_for_file_system_page(
+                    file_system_id,
+                    local_after.as_ref(),
+                    max_entries.saturating_add(1),
+                )?;
+                let next_local_cursor = page.next_cursor;
+                for object in page.objects {
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    let cursor = object_page_cursor_with_shard(&object, shard_id);
+                    entries.push((object, cursor));
+                    if entries.len() > max_entries {
+                        break 'shards;
+                    }
+                }
+                let Some(next_local_cursor) = next_local_cursor else {
+                    break;
+                };
+                local_after = Some(next_local_cursor);
+            }
+        }
+        let has_more = entries.len() > max_entries;
+        if has_more {
+            entries.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        Ok(DfsObjectPage {
+            objects: entries.into_iter().map(|(object, _)| object).collect(),
+            next_cursor,
+        })
+    }
+
+    fn object_page_cursor_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<DfsObjectPageCursor> {
+        Ok(DfsObjectPageCursor {
+            path: object.path.clone(),
+            object_id: object.object_id.clone(),
+            shard_id: self.shard_id_for_object(&object.object_id)?,
+        })
+    }
+
+    fn child_objects_for_directory_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsDirectoryPage> {
+        if max_entries == 0 {
+            return Ok(DfsDirectoryPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
+        let mut entries = Vec::<(DfsObjectMetadata, DfsDirectoryPageCursor)>::new();
+        'shards: for (shard_id, backend) in &self.shards {
+            if let Some(resume_shard_id) = resume_shard_id
+                && shard_id < resume_shard_id
+            {
+                continue;
+            }
+            let mut local_after = match resume_shard_id {
+                Some(resume_shard_id) if resume_shard_id == shard_id => {
+                    after.map(local_directory_page_cursor)
+                }
+                Some(_) => None,
+                None => after.map(local_directory_page_cursor),
+            };
+            loop {
+                let page = backend.child_objects_for_directory_page_entries(
+                    file_system_id,
+                    directory_path,
+                    local_after.as_ref(),
+                    max_entries.saturating_add(1),
+                )?;
+                let next_local_cursor = page.next_cursor;
+                for (object, local_cursor) in page.entries {
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    entries.push((
+                        object,
+                        directory_page_cursor_with_shard(local_cursor, shard_id),
+                    ));
+                    if entries.len() > max_entries {
+                        break 'shards;
+                    }
+                }
+                let Some(next_local_cursor) = next_local_cursor else {
+                    break;
+                };
+                local_after = Some(next_local_cursor);
+            }
+        }
+        let has_more = entries.len() > max_entries;
+        if has_more {
+            entries.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        Ok(DfsDirectoryPage {
+            objects: entries.into_iter().map(|(object, _)| object).collect(),
+            next_cursor,
+        })
+    }
+
+    fn hardlinks_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut hardlinks = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.hardlinks_to_object_page(
+                file_system_id,
+                target_object_id,
+                cursor.as_ref(),
+                4096,
+            )?;
+            hardlinks.extend(page.objects);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        hardlinks.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        Ok(hardlinks)
+    }
+
+    fn hardlinks_to_object_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
+        let mut entries = Vec::<(DfsObjectMetadata, DfsObjectPageCursor)>::new();
+        'shards: for (shard_id, backend) in &self.shards {
+            if let Some(resume_shard_id) = resume_shard_id
+                && shard_id < resume_shard_id
+            {
+                continue;
+            }
+            let mut local_after = match resume_shard_id {
+                Some(resume_shard_id) if resume_shard_id == shard_id => {
+                    after.map(local_object_page_cursor)
+                }
+                Some(_) => None,
+                None => after.map(local_object_page_cursor),
+            };
+            loop {
+                let page = backend.hardlinks_to_object_page(
+                    file_system_id,
+                    target_object_id,
+                    local_after.as_ref(),
+                    max_entries.saturating_add(1),
+                )?;
+                let next_local_cursor = page.next_cursor;
+                for object in page.objects {
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    let cursor = object_page_cursor_with_shard(&object, shard_id);
+                    entries.push((object, cursor));
+                    if entries.len() > max_entries {
+                        break 'shards;
+                    }
+                }
+                let Some(next_local_cursor) = next_local_cursor else {
+                    break;
+                };
+                local_after = Some(next_local_cursor);
+            }
+        }
+        let has_more = entries.len() > max_entries;
+        if has_more {
+            entries.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        Ok(DfsObjectPage {
+            objects: entries.into_iter().map(|(object, _)| object).collect(),
+            next_cursor,
+        })
+    }
+
+    fn hardlink_count_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<usize> {
+        let mut object_ids = BTreeSet::<DfsObjectId>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = None;
+            loop {
+                let page = backend.hardlinks_to_object_page(
+                    file_system_id,
+                    target_object_id,
+                    cursor.as_ref(),
+                    4096,
+                )?;
+                for object in page.objects {
+                    if self.object_is_listable_from_shard(&object, shard_id)? {
+                        object_ids.insert(object.object_id);
+                    }
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        Ok(object_ids.len())
+    }
+
+    fn first_hardlink_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        self.first_hardlink_to_object_matching(file_system_id, target_object_id, |_| true)
+    }
+
+    fn first_hardlink_to_object_outside_prefix(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        prefix: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let prefix = normalize_posix_path(prefix);
+        self.first_hardlink_to_object_matching(file_system_id, target_object_id, |object| {
+            !posix_path_is_at_or_under_prefix(&object.path, &prefix)
+        })
+    }
+
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
         let shard_id = self.require_shard_id_for_object(&version.object_id)?;
         self.shard_backend_mut(&shard_id)?.put_version(version)
@@ -1919,6 +3308,153 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn compact_tombstones(
+        &mut self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        let mut report = DfsTombstoneCompactionReport::for_options(&options);
+        let shard_ids = self.shard_ids();
+        let mut compacted_object_ids = Vec::new();
+        for shard_id in shard_ids {
+            let mut shard_options = options.clone();
+            if !options.dry_run
+                && let Some(max_compactions) = options.max_compactions
+            {
+                let remaining = max_compactions.saturating_sub(report.compacted_tombstone_count);
+                if remaining == 0 {
+                    report.max_compactions_reached = true;
+                    break;
+                }
+                shard_options.max_compactions = Some(remaining);
+            }
+            let (shard_report, shard_compacted_object_ids) = self
+                .shard_backend_mut(&shard_id)?
+                .compact_tombstones_with_ids(shard_options)?;
+            report.merge(shard_report);
+            compacted_object_ids.extend(shard_compacted_object_ids);
+        }
+        for object_id in compacted_object_ids {
+            self.remove_object_shard_index(&object_id)?;
+        }
+        Ok(report)
+    }
+
+    fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
+        let shard_id = self.select_shard_id_for_path(&job.file_system_id, &job.root_path)?;
+        self.shard_backend_mut(&shard_id)?.put_namespace_job(job)
+    }
+
+    fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
+        for backend in self.shards.values() {
+            if let Some(job) = backend.get_namespace_job(job_id)? {
+                return Ok(Some(job));
+            }
+        }
+        Ok(None)
+    }
+
+    fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
+        let mut jobs = BTreeMap::<String, DfsNamespaceJobRecord>::new();
+        for backend in self.shards.values() {
+            for job in backend.list_namespace_jobs()? {
+                jobs.insert(job.job_id.clone(), job);
+            }
+        }
+        Ok(jobs.into_values().collect())
+    }
+
+    fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
+        let mut summary = DfsMetadataSummary {
+            file_system_count: self.list_file_systems()?.len(),
+            ..DfsMetadataSummary::default()
+        };
+        for (shard_id, backend) in &self.shards {
+            let tables = backend.current_tables_snapshot()?;
+            let shard_summary = metadata_summary_from_tables(&tables, |object| {
+                self.object_is_listable_from_shard(object, shard_id)
+            })?;
+            summary.object_count = summary
+                .object_count
+                .saturating_add(shard_summary.object_count);
+            summary.version_count = summary
+                .version_count
+                .saturating_add(shard_summary.version_count);
+            summary.receipt_count = summary
+                .receipt_count
+                .saturating_add(shard_summary.receipt_count);
+            summary.intent_count = summary
+                .intent_count
+                .saturating_add(shard_summary.intent_count);
+            summary.pending_write_count = summary
+                .pending_write_count
+                .saturating_add(shard_summary.pending_write_count);
+            summary.open_conflict_count = summary
+                .open_conflict_count
+                .saturating_add(shard_summary.open_conflict_count);
+            summary.pending_repair_count = summary
+                .pending_repair_count
+                .saturating_add(shard_summary.pending_repair_count);
+            summary.pending_namespace_job_count = summary
+                .pending_namespace_job_count
+                .saturating_add(shard_summary.pending_namespace_job_count);
+            summary.failed_namespace_job_count = summary
+                .failed_namespace_job_count
+                .saturating_add(shard_summary.failed_namespace_job_count);
+        }
+        Ok(summary)
+    }
+
+    fn metadata_summary_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsMetadataSummary>> {
+        let Some(_) = self.get_file_system(file_system_id)? else {
+            return Ok(None);
+        };
+        let mut summary = DfsMetadataSummary {
+            file_system_count: 1,
+            ..DfsMetadataSummary::default()
+        };
+        for (shard_id, backend) in &self.shards {
+            let tables = backend.current_tables_snapshot()?;
+            let Some(shard_summary) =
+                metadata_summary_for_file_system_from_tables(&tables, file_system_id, |object| {
+                    self.object_is_listable_from_shard(object, shard_id)
+                })?
+            else {
+                continue;
+            };
+            summary.object_count = summary
+                .object_count
+                .saturating_add(shard_summary.object_count);
+            summary.version_count = summary
+                .version_count
+                .saturating_add(shard_summary.version_count);
+            summary.receipt_count = summary
+                .receipt_count
+                .saturating_add(shard_summary.receipt_count);
+            summary.intent_count = summary
+                .intent_count
+                .saturating_add(shard_summary.intent_count);
+            summary.pending_write_count = summary
+                .pending_write_count
+                .saturating_add(shard_summary.pending_write_count);
+            summary.open_conflict_count = summary
+                .open_conflict_count
+                .saturating_add(shard_summary.open_conflict_count);
+            summary.pending_repair_count = summary
+                .pending_repair_count
+                .saturating_add(shard_summary.pending_repair_count);
+            summary.pending_namespace_job_count = summary
+                .pending_namespace_job_count
+                .saturating_add(shard_summary.pending_namespace_job_count);
+            summary.failed_namespace_job_count = summary
+                .failed_namespace_job_count
+                .saturating_add(shard_summary.failed_namespace_job_count);
+        }
+        Ok(Some(summary))
+    }
+
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
         let shard_id = self.require_shard_id_for_object(&conflict.object_id)?;
         self.shard_backend_mut(&shard_id)?.put_conflict(conflict)
@@ -1942,6 +3478,22 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         };
         self.shard_backend(&shard_id)?
             .conflicts_for_object(object_id)
+    }
+
+    fn conflicts_for_object_page(
+        &self,
+        object_id: &DfsObjectId,
+        after: Option<&DfsConflictPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictPage> {
+        let Some(shard_id) = self.shard_id_for_object(object_id)? else {
+            return Ok(DfsConflictPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        };
+        self.shard_backend(&shard_id)?
+            .conflicts_for_object_page(object_id, after, max_entries)
     }
 
     fn update_conflict_status(
@@ -2096,6 +3648,7 @@ impl LocalJsonMetadataBackend {
         let mut local_cursor_advanced = false;
         let mut replay_cursors = BTreeMap::<DfsMetadataShardId, DfsMetadataReplayCursor>::new();
         let mut advanced_cursors = BTreeSet::<DfsMetadataShardId>::new();
+        let mut replay_entries = Vec::new();
         for entry in &batch.entries {
             if !replay_cursors.contains_key(&entry.shard_id) {
                 let replay_cursor_path = self.replay_cursor_path(&entry.shard_id);
@@ -2112,10 +3665,7 @@ impl LocalJsonMetadataBackend {
             if entry.sequence <= cursor.last_sequence {
                 continue;
             }
-            self.persist_replayed_journal_entry_unlocked(entry)?;
-            if self.materialize_replayed_journal_entry_unlocked(entry)? {
-                applied = applied.saturating_add(1);
-            }
+            replay_entries.push(entry);
             if entry.sequence > local_cursor.last_sequence {
                 local_cursor.last_sequence = entry.sequence;
                 local_cursor_advanced = true;
@@ -2123,6 +3673,29 @@ impl LocalJsonMetadataBackend {
             cursor.last_sequence = entry.sequence;
             advanced_cursors.insert(entry.shard_id.clone());
         }
+        self.persist_replayed_journal_entries_unlocked(&replay_entries)?;
+
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let mut table_sequence = 0u64;
+        let replay_result = (|| -> Result<()> {
+            for entry in replay_entries {
+                if self.materialize_replayed_journal_entry_into_batch(
+                    entry,
+                    &mut table_ops,
+                    &mut rollback,
+                )? {
+                    applied = applied.saturating_add(1);
+                    table_sequence = entry.sequence;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = replay_result {
+            rollback.rollback(&mut self.tables);
+            return Err(error);
+        }
+        self.append_preapplied_table_ops(table_sequence, table_ops, rollback)?;
         if local_cursor_advanced {
             self.write_local_materialization_cursor(&local_cursor)?;
         }
@@ -2214,6 +3787,55 @@ impl LocalJsonMetadataBackend {
         self.advance_journal_head_after_replayed_entry(entry.sequence)
     }
 
+    fn persist_replayed_journal_entries_unlocked(
+        &mut self,
+        entries: &[&DfsMetadataJournalEntry],
+    ) -> Result<()> {
+        let mut entries_by_segment = BTreeMap::<u64, Vec<&DfsMetadataJournalEntry>>::new();
+        let mut max_sequence = 0u64;
+        for entry in entries {
+            entries_by_segment
+                .entry(journal_segment_id(entry.sequence))
+                .or_default()
+                .push(*entry);
+            max_sequence = max_sequence.max(entry.sequence);
+        }
+        for (segment_id, entries) in entries_by_segment.iter_mut() {
+            entries.sort_by_key(|entry| entry.sequence);
+            let path = self
+                .root
+                .join("journal")
+                .join("segments")
+                .join(format!("{segment_id:020}.slog"));
+            let existing = if path.exists() {
+                read_segmented_journal_file_since_limited(&path, 0, usize::MAX)?
+                    .into_iter()
+                    .map(|entry| (entry.sequence, entry))
+                    .collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
+            };
+            let mut missing = Vec::new();
+            for entry in entries.iter().copied() {
+                if let Some(existing) = existing.get(&entry.sequence) {
+                    if existing == entry {
+                        continue;
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal sequence {} already exists with a different entry while replaying shard {}",
+                        entry.sequence, entry.shard_id.0
+                    )));
+                }
+                missing.push(entry);
+            }
+            append_segmented_journal_entries(&self.root, &missing)?;
+        }
+        if max_sequence > 0 {
+            self.advance_journal_head_after_replayed_entry(max_sequence)?;
+        }
+        Ok(())
+    }
+
     fn advance_journal_head_after_replayed_entry(&mut self, sequence: u64) -> Result<()> {
         let next_sequence = sequence.saturating_add(1).max(1).max(self.next_sequence);
         if next_sequence == self.next_sequence {
@@ -2249,7 +3871,10 @@ impl LocalJsonMetadataBackend {
                 object_id, object, ..
             } => {
                 let object = required_replay_payload(entry, "put-object", object.as_ref())?;
-                if self.get_object(object_id)? == Some(normalized_object_metadata(object)) {
+                let object = normalized_object_metadata(object);
+                if self.get_object(object_id)? == Some(object.clone())
+                    || self.tables.compacted_tombstone_matches(&object)
+                {
                     return Ok(false);
                 }
                 self.materialize_local_journal_entry(entry)?;
@@ -2404,19 +4029,266 @@ impl LocalJsonMetadataBackend {
                     transaction.as_ref(),
                 )?;
                 let normalized = normalized_namespace_transaction(transaction);
-                if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized)
-                    && normalized.objects.iter().all(|object| {
-                        self.get_object(&object.object_id)
-                            .is_ok_and(|stored| stored == Some(normalized_object_metadata(object)))
-                    })
-                    && normalized.versions.iter().all(|version| {
+                if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
+                    let mut objects_materialized = true;
+                    for object in &normalized.objects {
+                        if !self.object_is_materialized_or_compacted(object)? {
+                            objects_materialized = false;
+                            break;
+                        }
+                    }
+                    let versions_materialized = normalized.versions.iter().all(|version| {
                         self.get_version(&version.object_id, &version.version)
                             .is_ok_and(|stored| stored == Some(normalized_version_record(version)))
-                    })
+                    });
+                    if objects_materialized && versions_materialized {
+                        return Ok(false);
+                    }
+                }
+                self.materialize_local_journal_entry(entry)?;
+                Ok(true)
+            }
+        }
+    }
+
+    fn materialize_replayed_journal_entry_into_batch(
+        &mut self,
+        entry: &DfsMetadataJournalEntry,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<bool> {
+        match &entry.mutation {
+            DfsMetadataMutation::PutFileSystem {
+                file_system_id,
+                file_system,
+            } => {
+                let file_system =
+                    required_replay_payload(entry, "put-file-system", file_system.as_ref())?;
+                if self.get_file_system(file_system_id)?.as_ref() == Some(file_system) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutFileSystem {
+                        file_system: file_system.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutObject {
+                object_id, object, ..
+            } => {
+                let object = required_replay_payload(entry, "put-object", object.as_ref())?;
+                let object = normalized_object_metadata(object);
+                if self.get_object(object_id)? == Some(object.clone())
+                    || self.tables.compacted_tombstone_matches(&object)
                 {
                     return Ok(false);
                 }
-                self.materialize_local_journal_entry(entry)?;
+                if self.get_file_system(&object.file_system_id)?.is_none() {
+                    return Err(MetadataBackendError::UnknownFileSystem {
+                        file_system_id: object.file_system_id.clone(),
+                    });
+                }
+                let previous = self.get_object(object_id)?;
+                self.plan_object_index_table_ops_with_previous(
+                    &object,
+                    previous.as_ref(),
+                    table_ops,
+                    rollback,
+                )?;
+                Ok(true)
+            }
+            DfsMetadataMutation::PutVersion {
+                object_id,
+                version,
+                version_record,
+                ..
+            } => {
+                let version_record =
+                    required_replay_payload(entry, "put-version", version_record.as_ref())?;
+                let version_record = normalized_version_record(version_record);
+                if self.get_version(object_id, version)? == Some(version_record.clone()) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutVersion {
+                        version: version_record,
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                receipt,
+                ..
+            } => {
+                let receipt = required_replay_payload(entry, "put-receipt", receipt.as_ref())?;
+                for existing in self.receipts_for_version(object_id, version)? {
+                    if &existing.replica_node_id != replica_node_id {
+                        continue;
+                    }
+                    if &existing == receipt {
+                        return Ok(false);
+                    }
+                    if existing.receipt.file_system_id == receipt.receipt.file_system_id
+                        && existing.receipt.object_id == receipt.receipt.object_id
+                        && existing.receipt.committed_version == receipt.receipt.committed_version
+                        && existing.replica_node_id == receipt.replica_node_id
+                        && existing.content_hash == receipt.content_hash
+                    {
+                        return Ok(false);
+                    }
+                    return Err(MetadataBackendError::Serde(format!(
+                        "metadata journal entry {}:{} conflicts with an existing receipt for replica {}",
+                        entry.shard_id.0, entry.sequence, replica_node_id
+                    )));
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutReceipt {
+                        receipt: receipt.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::PutIntent {
+                object_id,
+                intent_id,
+                intent,
+                ..
+            } => {
+                let intent = required_replay_payload(entry, "put-intent", intent.as_ref())?;
+                if self.get_intent(object_id, intent_id)?.as_ref() == Some(intent) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutIntent {
+                        intent: intent.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::CommitVisibleVersion {
+                object_id,
+                previous_version,
+                committed_version,
+                committed_object,
+                visible_version,
+                required_replica_node_ids,
+                ..
+            } => {
+                let committed_object = required_replay_payload(
+                    entry,
+                    "commit-visible-version committed object",
+                    committed_object.as_ref(),
+                )?;
+                let visible_version = required_replay_payload(
+                    entry,
+                    "commit-visible-version visible version",
+                    visible_version.as_ref(),
+                )?;
+                if self
+                    .get_object(object_id)?
+                    .as_ref()
+                    .is_some_and(|object| &object.version == committed_version)
+                    && self.get_version(object_id, committed_version)?.as_ref()
+                        == Some(&normalized_version_record(visible_version))
+                {
+                    return Ok(false);
+                }
+                let current = self.get_object(object_id)?.ok_or_else(|| {
+                    MetadataBackendError::UnknownObject {
+                        object_id: object_id.clone(),
+                    }
+                })?;
+                if &current.version != previous_version {
+                    return Err(MetadataBackendError::Conflict {
+                        object_id: object_id.clone(),
+                        expected: previous_version.clone(),
+                        current: current.version,
+                    });
+                }
+                for node_id in required_replica_node_ids {
+                    if !self.tables.receipts.contains_key(&(
+                        object_id.clone(),
+                        committed_version.clone(),
+                        node_id.clone(),
+                    )) {
+                        return Err(MetadataBackendError::Conflict {
+                            object_id: object_id.clone(),
+                            expected: previous_version.clone(),
+                            current: current.version.clone(),
+                        });
+                    }
+                }
+                let commit_record = DfsVisibleVersionCommitRecord {
+                    expected_version: previous_version.clone(),
+                    committed_object: normalized_object_metadata(committed_object),
+                    visible_version: normalized_version_record(visible_version),
+                    required_replica_node_ids: normalized_node_location_list(
+                        required_replica_node_ids,
+                    ),
+                    created_at: entry.created_at,
+                };
+                self.plan_visible_version_commit_table_ops(&commit_record, table_ops, rollback)?;
+                Ok(true)
+            }
+            DfsMetadataMutation::PutConflict {
+                object_id,
+                conflict_id,
+                conflict,
+                ..
+            } => {
+                let conflict = required_replay_payload(entry, "put-conflict", conflict.as_ref())?;
+                if self.get_conflict(object_id, conflict_id)?.as_ref() == Some(conflict) {
+                    return Ok(false);
+                }
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::PutConflict {
+                        conflict: conflict.clone(),
+                    },
+                    table_ops,
+                    rollback,
+                );
+                Ok(true)
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction_id,
+                transaction,
+                ..
+            } => {
+                let transaction = required_replay_payload(
+                    entry,
+                    "apply-namespace-transaction",
+                    transaction.as_ref(),
+                )?;
+                let normalized = normalized_namespace_transaction(transaction);
+                if self.tables.namespace_transactions.get(transaction_id) == Some(&normalized) {
+                    let mut objects_materialized = true;
+                    for object in &normalized.objects {
+                        if !self.object_is_materialized_or_compacted(object)? {
+                            objects_materialized = false;
+                            break;
+                        }
+                    }
+                    let versions_materialized = normalized.versions.iter().all(|version| {
+                        self.get_version(&version.object_id, &version.version)
+                            .is_ok_and(|stored| stored == Some(normalized_version_record(version)))
+                    });
+                    if objects_materialized && versions_materialized {
+                        return Ok(false);
+                    }
+                }
+                self.plan_namespace_transaction_table_ops(&normalized, table_ops, rollback)?;
                 Ok(true)
             }
         }
@@ -2676,6 +4548,9 @@ impl LocalJsonMetadataBackend {
                 let Some(object) = object.as_ref() else {
                     return Ok(());
                 };
+                if self.tables.compacted_tombstone_matches(object) {
+                    return Ok(());
+                }
                 if self.get_file_system(&object.file_system_id)?.is_none() {
                     return Err(MetadataBackendError::UnknownFileSystem {
                         file_system_id: object.file_system_id.clone(),
@@ -2929,6 +4804,82 @@ impl LocalJsonMetadataBackend {
         replay_metadata_table_batches_from(&path, self.table_log_offset, &mut tables)?;
         Ok(Cow::Owned(tables))
     }
+
+    fn child_objects_for_directory_page_entries(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsDirectoryPageEntries> {
+        if max_entries == 0 {
+            return Ok(DfsDirectoryPageEntries {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let directory_path = normalize_posix_path(directory_path);
+        let parent_inode_id = directory_inode_id(file_system_id, &directory_path);
+        let tables = self.current_tables_snapshot()?;
+        let start = match after.and_then(|cursor| cursor.dentry.as_ref()) {
+            Some(dentry) => Excluded((
+                parent_inode_id.clone(),
+                dentry.dirfrag_id.clone(),
+                dentry.name_hash,
+                dentry.name.clone(),
+            )),
+            None => Included((
+                parent_inode_id.clone(),
+                DfsDirFragmentId::new(""),
+                0,
+                String::new(),
+            )),
+        };
+        let mut entries = Vec::<(DfsObjectMetadata, DfsDirectoryPageCursor)>::new();
+        let mut next_cursor = None;
+        for ((record_parent_inode_id, dirfrag_id, name_hash, name), path_record) in
+            tables.dentries.range((start, Unbounded)).take_while(
+                |((record_parent_inode_id, _, _, _), _)| record_parent_inode_id == &parent_inode_id,
+            )
+        {
+            if path_record.file_system_id != *file_system_id
+                || record_parent_inode_id != &parent_inode_id
+                || path_record.parent_inode_id != parent_inode_id
+            {
+                continue;
+            }
+            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
+                continue;
+            };
+            if object.kind == DfsObjectKind::Tombstone
+                || object.file_system_id != *file_system_id
+                || normalize_path(&object.path) != path_record.path
+            {
+                continue;
+            }
+            if after.and_then(|cursor| cursor.dentry.as_ref()).is_none()
+                && let Some(after) = after
+                && directory_page_key(&object) <= (&after.path, &after.object_id)
+            {
+                continue;
+            }
+            let cursor = directory_page_cursor_with_dentry(
+                &object,
+                dirfrag_id.clone(),
+                *name_hash,
+                name.clone(),
+            );
+            if entries.len() >= max_entries {
+                next_cursor = entries.last().map(|(_, cursor)| cursor.clone());
+                break;
+            }
+            entries.push((object, cursor));
+        }
+        Ok(DfsDirectoryPageEntries {
+            entries,
+            next_cursor,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -3047,7 +4998,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             .get(&(file_system_id.clone(), normalized_path.clone()))
             .cloned()
         else {
-            return Ok(None);
+            return Ok(tables.compacted_tombstone_by_path(file_system_id, &normalized_path));
         };
         if path_record.file_system_id != *file_system_id {
             return Ok(None);
@@ -3055,16 +5006,13 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         if normalize_path(&path_record.path) != normalized_path {
             return Ok(None);
         }
-        let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
-            return Ok(None);
-        };
-        if object.file_system_id != *file_system_id {
-            return Ok(None);
+        if let Some(object) = tables.objects.get(&path_record.object_id).cloned()
+            && object.file_system_id == *file_system_id
+            && normalize_path(&object.path) == normalize_path(path)
+        {
+            return Ok(Some(object));
         }
-        if normalize_path(&object.path) != normalize_path(path) {
-            return Ok(None);
-        }
-        Ok(Some(object))
+        Ok(tables.compacted_tombstone_by_path(file_system_id, &normalized_path))
     }
 
     fn objects_for_file_system(
@@ -3101,6 +5049,62 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
                 .then_with(|| left.object_id.cmp(&right.object_id))
         });
         Ok(objects)
+    }
+
+    fn objects_for_file_system_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = match after {
+            Some(after) => Excluded((file_system_id.clone(), after.path.clone())),
+            None => Included((file_system_id.clone(), String::new())),
+        };
+        let mut objects = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_file_system_id, _), path_record) in tables
+            .paths
+            .range((start, Unbounded))
+            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
+        {
+            if record_file_system_id != file_system_id
+                || path_record.file_system_id != *file_system_id
+            {
+                continue;
+            }
+            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
+                continue;
+            };
+            if object.file_system_id != *file_system_id
+                || normalize_path(&object.path) != path_record.path
+            {
+                continue;
+            }
+            if let Some(after) = after
+                && object_page_key(&object) <= (&after.path, &after.object_id)
+            {
+                continue;
+            }
+            if objects.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(object_page_cursor(&object));
+            objects.push(object);
+        }
+        Ok(DfsObjectPage {
+            objects,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn child_objects_for_directory(
@@ -3152,44 +5156,179 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         Ok(objects)
     }
 
+    fn child_objects_for_directory_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        directory_path: &str,
+        after: Option<&DfsDirectoryPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsDirectoryPage> {
+        let page = self.child_objects_for_directory_page_entries(
+            file_system_id,
+            directory_path,
+            after,
+            max_entries,
+        )?;
+        Ok(DfsDirectoryPage {
+            objects: page.entries.into_iter().map(|(object, _)| object).collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+
     fn hardlinks_to_object(
         &self,
         file_system_id: &DfsFileSystemId,
         target_object_id: &DfsObjectId,
     ) -> Result<Vec<DfsObjectMetadata>> {
-        let tables = self.current_tables_snapshot()?;
         let mut hardlinks = Vec::new();
-        for ((target_id, _), path_record) in tables
-            .hardlinks
-            .range((
-                Included((target_object_id.clone(), id_lower_bound())),
-                Unbounded,
-            ))
-            .take_while(|((target_id, _), _)| target_id == target_object_id)
+        let mut cursor = None;
+        loop {
+            let page = self.hardlinks_to_object_page(
+                file_system_id,
+                target_object_id,
+                cursor.as_ref(),
+                4096,
+            )?;
+            hardlinks.extend(page.objects);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(hardlinks)
+    }
+
+    fn hardlinks_to_object_page(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        after: Option<&DfsObjectPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectPage {
+                objects: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = match after {
+            Some(after) => Excluded((
+                target_object_id.clone(),
+                normalize_path(&after.path),
+                after.object_id.clone(),
+            )),
+            None => Included((target_object_id.clone(), String::new(), id_lower_bound())),
+        };
+        let mut objects = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_target_object_id, _, _), path_record) in
+            tables.hardlink_paths.range((start, Unbounded)).take_while(
+                |((record_target_object_id, _, _), _)| record_target_object_id == target_object_id,
+            )
         {
-            if target_id != target_object_id {
+            if record_target_object_id != target_object_id {
                 continue;
             }
-            if path_record.file_system_id != *file_system_id {
-                continue;
-            }
-            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
+            let Some(object) = hardlink_object_from_path_record(
+                &tables,
+                file_system_id,
+                target_object_id,
+                path_record,
+            ) else {
                 continue;
             };
-            if object.kind == DfsObjectKind::Hardlink
-                && object.file_system_id == *file_system_id
-                && object.link_target_object_id.as_ref() == Some(target_object_id)
-                && normalize_path(&object.path) == path_record.path
+            if objects.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(object_page_cursor(&object));
+            objects.push(object);
+        }
+        Ok(DfsObjectPage {
+            objects,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
+    }
+
+    fn hardlink_count_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<usize> {
+        let tables = self.current_tables_snapshot()?;
+        let mut count = 0usize;
+        for ((record_target_object_id, _, _), path_record) in tables
+            .hardlink_paths
+            .range((
+                Included((target_object_id.clone(), String::new(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((record_target_object_id, _, _), _)| {
+                record_target_object_id == target_object_id
+            })
+        {
+            if record_target_object_id == target_object_id
+                && hardlink_object_from_path_record(
+                    &tables,
+                    file_system_id,
+                    target_object_id,
+                    path_record,
+                )
+                .is_some()
             {
-                hardlinks.push(object);
+                count = count.saturating_add(1);
             }
         }
-        hardlinks.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.object_id.cmp(&right.object_id))
-        });
-        Ok(hardlinks)
+        Ok(count)
+    }
+
+    fn first_hardlink_to_object(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        Ok(self
+            .hardlinks_to_object_page(file_system_id, target_object_id, None, 1)?
+            .objects
+            .into_iter()
+            .next())
+    }
+
+    fn first_hardlink_to_object_outside_prefix(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        target_object_id: &DfsObjectId,
+        prefix: &str,
+    ) -> Result<Option<DfsObjectMetadata>> {
+        let prefix = normalize_posix_path(prefix);
+        let tables = self.current_tables_snapshot()?;
+        for ((record_target_object_id, _, _), path_record) in tables
+            .hardlink_paths
+            .range((
+                Included((target_object_id.clone(), String::new(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((record_target_object_id, _, _), _)| {
+                record_target_object_id == target_object_id
+            })
+        {
+            if record_target_object_id != target_object_id
+                || posix_path_is_at_or_under_prefix(&path_record.path, &prefix)
+            {
+                continue;
+            }
+            if let Some(object) = hardlink_object_from_path_record(
+                &tables,
+                file_system_id,
+                target_object_id,
+                path_record,
+            ) {
+                return Ok(Some(object));
+            }
+        }
+        Ok(None)
     }
 
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry> {
@@ -3261,6 +5400,19 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.conflicts.values().cloned().collect())
+    }
+
+    fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
+        let tables = self.current_tables_snapshot()?;
+        metadata_summary_from_tables(&tables, |_| Ok(true))
+    }
+
+    fn metadata_summary_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsMetadataSummary>> {
+        let tables = self.current_tables_snapshot()?;
+        metadata_summary_for_file_system_from_tables(&tables, file_system_id, |_| Ok(true))
     }
 
     fn put_receipt(
@@ -3449,6 +5601,32 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         Ok(entry)
     }
 
+    fn compact_tombstones(
+        &mut self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<DfsTombstoneCompactionReport> {
+        self.compact_tombstones_with_ids(options)
+            .map(|(report, _)| report)
+    }
+
+    fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
+        let _lock = self.begin_metadata_write()?;
+        self.append_and_apply_table_ops(
+            self.next_sequence.saturating_sub(1).max(1),
+            vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }],
+        )
+    }
+
+    fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_jobs.get(job_id).cloned())
+    }
+
+    fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_jobs.values().cloned().collect())
+    }
+
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutConflict {
@@ -3489,6 +5667,47 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             .filter(|conflict| conflict.object_id == *object_id)
             .cloned()
             .collect())
+    }
+
+    fn conflicts_for_object_page(
+        &self,
+        object_id: &DfsObjectId,
+        after: Option<&DfsConflictPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictPage> {
+        if max_entries == 0 {
+            return Ok(DfsConflictPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = match after {
+            Some(after) => Excluded((object_id.clone(), after.conflict_id.clone())),
+            None => Included((object_id.clone(), String::new())),
+        };
+        let mut conflicts = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, _), conflict) in tables
+            .conflicts
+            .range((start, Unbounded))
+            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+        {
+            if record_object_id != object_id || conflict.object_id != *object_id {
+                continue;
+            }
+            if conflicts.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(conflict_page_cursor(conflict));
+            conflicts.push(conflict.clone());
+        }
+        Ok(DfsConflictPage {
+            conflicts,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn update_conflict_status(
@@ -3646,44 +5865,58 @@ impl LocalJsonMetadataBackend {
     ) -> Result<()> {
         let mut table_ops = Vec::new();
         let mut rollback = DfsMetadataTableRollback::default();
-        let planning_result = (|| -> Result<()> {
-            self.plan_namespace_transaction_table_op(
-                DfsMetadataTableOp::PutNamespaceTransaction {
-                    transaction: transaction.clone(),
-                },
-                &mut table_ops,
-                &mut rollback,
-            );
-            for object in transaction
-                .objects
-                .iter()
-                .filter(|object| object.kind == DfsObjectKind::Tombstone)
-            {
-                self.plan_object_index_table_ops(object, &mut table_ops, &mut rollback)?;
-            }
-            for object in transaction
-                .objects
-                .iter()
-                .filter(|object| object.kind != DfsObjectKind::Tombstone)
-            {
-                self.plan_object_index_table_ops(object, &mut table_ops, &mut rollback)?;
-            }
-            for version in &transaction.versions {
-                self.plan_namespace_transaction_table_op(
-                    DfsMetadataTableOp::PutVersion {
-                        version: normalized_version_record(version),
-                    },
-                    &mut table_ops,
-                    &mut rollback,
-                );
-            }
-            Ok(())
-        })();
+        let planning_result =
+            self.plan_namespace_transaction_table_ops(transaction, &mut table_ops, &mut rollback);
         if let Err(error) = planning_result {
             rollback.rollback(&mut self.tables);
             return Err(error);
         }
         self.append_preapplied_table_ops(sequence, table_ops, rollback)
+    }
+
+    fn plan_namespace_transaction_table_ops(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<()> {
+        self.plan_preapplied_table_op(
+            DfsMetadataTableOp::PutNamespaceTransaction {
+                transaction: transaction.clone(),
+            },
+            table_ops,
+            rollback,
+        );
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind == DfsObjectKind::Tombstone)
+        {
+            if self.tables.compacted_tombstone_matches(object) {
+                continue;
+            }
+            self.plan_object_index_table_ops(object, table_ops, rollback)?;
+        }
+        for object in transaction
+            .objects
+            .iter()
+            .filter(|object| object.kind != DfsObjectKind::Tombstone)
+        {
+            if self.tables.compacted_tombstone_matches(object) {
+                continue;
+            }
+            self.plan_object_index_table_ops(object, table_ops, rollback)?;
+        }
+        for version in &transaction.versions {
+            self.plan_preapplied_table_op(
+                DfsMetadataTableOp::PutVersion {
+                    version: normalized_version_record(version),
+                },
+                table_ops,
+                rollback,
+            );
+        }
+        Ok(())
     }
 
     fn materialize_namespace_transaction_for_recovery(
@@ -3724,6 +5957,9 @@ impl LocalJsonMetadataBackend {
         object: &DfsObjectMetadata,
         sequence: u64,
     ) -> Result<bool> {
+        if self.tables.compacted_tombstone_matches(object) {
+            return Ok(false);
+        }
         if let Some(current) = self.get_object(&object.object_id)? {
             if self.object_indexes_are_materialized(&current)? {
                 return Ok(false);
@@ -3739,6 +5975,9 @@ impl LocalJsonMetadataBackend {
     }
 
     fn object_indexes_are_materialized(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        if self.tables.compacted_tombstone_matches(object) {
+            return Ok(true);
+        }
         let path_record = path_record_for_object(object);
         if self.tables.objects.get(&object.object_id).cloned()
             != Some(normalized_object_metadata(object))
@@ -3780,6 +6019,183 @@ impl LocalJsonMetadataBackend {
             }))
     }
 
+    fn object_is_materialized_or_compacted(&self, object: &DfsObjectMetadata) -> Result<bool> {
+        if self.tables.compacted_tombstone_matches(object) {
+            return Ok(true);
+        }
+        self.get_object(&object.object_id)
+            .map(|stored| stored == Some(normalized_object_metadata(object)))
+    }
+
+    fn tombstone_has_live_references(&self, object_id: &DfsObjectId) -> bool {
+        self.tables
+            .versions
+            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
+            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+            .next()
+            .is_some()
+            || self
+                .tables
+                .receipts
+                .range((
+                    Included((object_id.clone(), id_lower_bound(), id_lower_bound())),
+                    Unbounded,
+                ))
+                .take_while(|((record_object_id, _, _), _)| record_object_id == object_id)
+                .next()
+                .is_some()
+            || self
+                .tables
+                .intents
+                .range((Included((object_id.clone(), String::new())), Unbounded))
+                .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+                .next()
+                .is_some()
+            || self
+                .tables
+                .conflicts
+                .range((Included((object_id.clone(), String::new())), Unbounded))
+                .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+                .next()
+                .is_some()
+            || self
+                .tables
+                .visible_commits
+                .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
+                .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+                .next()
+                .is_some()
+            || self.tables.hardlinks.iter().any(
+                |((target_object_id, hardlink_object_id), path_record)| {
+                    target_object_id == object_id
+                        || hardlink_object_id == object_id
+                        || &path_record.object_id == object_id
+                },
+            )
+    }
+
+    fn compact_tombstones_with_ids(
+        &mut self,
+        options: DfsTombstoneCompactionOptions,
+    ) -> Result<(DfsTombstoneCompactionReport, Vec<DfsObjectId>)> {
+        let _lock = self.begin_metadata_write()?;
+        let now = options
+            .now_unix_nanos
+            .unwrap_or_else(metadata_now_unix_nanos);
+        let mut report = DfsTombstoneCompactionReport::for_options(&options);
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        let mut compacted_object_ids = Vec::new();
+        let candidates = self
+            .tables
+            .objects
+            .values()
+            .filter(|object| object.kind == DfsObjectKind::Tombstone)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for object in candidates {
+            report.scanned_tombstone_count = report.scanned_tombstone_count.saturating_add(1);
+            let age_nanos = now.saturating_sub(object_timestamp_for_retention(&object));
+            if age_nanos < options.min_tombstone_age_nanos {
+                report.retained_young_tombstone_count =
+                    report.retained_young_tombstone_count.saturating_add(1);
+                continue;
+            }
+            if self.tombstone_has_live_references(&object.object_id) {
+                report.retained_referenced_tombstone_count =
+                    report.retained_referenced_tombstone_count.saturating_add(1);
+                continue;
+            }
+
+            report.eligible_tombstone_count = report.eligible_tombstone_count.saturating_add(1);
+            if !options.dry_run
+                && options.max_compactions.is_some_and(|max_compactions| {
+                    report.compacted_tombstone_count >= max_compactions
+                })
+            {
+                report.max_compactions_reached = true;
+                report.retained_limit_tombstone_count =
+                    report.retained_limit_tombstone_count.saturating_add(1);
+                continue;
+            }
+            if options.dry_run {
+                continue;
+            }
+
+            let path_record = path_record_for_object(&object);
+            let mut dentry_ops = Vec::new();
+            self.remove_dentry_index(&path_record, &mut dentry_ops)?;
+            for op in dentry_ops {
+                self.plan_preapplied_table_op(op, &mut table_ops, &mut rollback);
+            }
+            if self
+                .tables
+                .file_system_objects
+                .contains_key(&(object.file_system_id.clone(), object.object_id.clone()))
+            {
+                report.removed_file_system_object_record_count = report
+                    .removed_file_system_object_record_count
+                    .saturating_add(1);
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveFileSystemObject {
+                        file_system_id: object.file_system_id.clone(),
+                        object_id: object.object_id.clone(),
+                    },
+                    &mut table_ops,
+                    &mut rollback,
+                );
+            }
+            if self.tables.objects.contains_key(&object.object_id) {
+                report.removed_object_record_count =
+                    report.removed_object_record_count.saturating_add(1);
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveObject {
+                        object_id: object.object_id.clone(),
+                    },
+                    &mut table_ops,
+                    &mut rollback,
+                );
+            }
+            let inode_id = object_inode_id(&object.object_id);
+            if self.tables.inodes.contains_key(&inode_id) {
+                report.removed_inode_record_count =
+                    report.removed_inode_record_count.saturating_add(1);
+                self.plan_preapplied_table_op(
+                    DfsMetadataTableOp::RemoveInode { inode_id },
+                    &mut table_ops,
+                    &mut rollback,
+                );
+            }
+            if self
+                .tables
+                .paths
+                .contains_key(&(object.file_system_id.clone(), normalize_path(&object.path)))
+            {
+                report.preserved_path_marker_count =
+                    report.preserved_path_marker_count.saturating_add(1);
+            }
+            self.plan_preapplied_table_op(
+                DfsMetadataTableOp::PutCompactedTombstone {
+                    object: object.clone(),
+                },
+                &mut table_ops,
+                &mut rollback,
+            );
+            report.compacted_marker_count = report.compacted_marker_count.saturating_add(1);
+            report.compacted_tombstone_count = report.compacted_tombstone_count.saturating_add(1);
+            compacted_object_ids.push(object.object_id);
+        }
+
+        if options.dry_run || table_ops.is_empty() {
+            return Ok((report, compacted_object_ids));
+        }
+        let sequence = self.next_sequence.saturating_sub(1).max(1);
+        self.append_preapplied_table_ops(sequence, table_ops, rollback)?;
+        self.compact_metadata_table_log_if_needed(0)?;
+        Ok((report, compacted_object_ids))
+    }
+
     fn materialize_object_indexes(
         &mut self,
         object: &DfsObjectMetadata,
@@ -3808,14 +6224,24 @@ impl LocalJsonMetadataBackend {
         table_ops: &mut Vec<DfsMetadataTableOp>,
         rollback: &mut DfsMetadataTableRollback,
     ) -> Result<()> {
-        let object_ops = self.object_index_table_ops_with_previous(object, None)?;
+        self.plan_object_index_table_ops_with_previous(object, None, table_ops, rollback)
+    }
+
+    fn plan_object_index_table_ops_with_previous(
+        &mut self,
+        object: &DfsObjectMetadata,
+        previous: Option<&DfsObjectMetadata>,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<()> {
+        let object_ops = self.object_index_table_ops_with_previous(object, previous)?;
         for op in object_ops {
-            self.plan_namespace_transaction_table_op(op, table_ops, rollback);
+            self.plan_preapplied_table_op(op, table_ops, rollback);
         }
         Ok(())
     }
 
-    fn plan_namespace_transaction_table_op(
+    fn plan_preapplied_table_op(
         &mut self,
         op: DfsMetadataTableOp,
         table_ops: &mut Vec<DfsMetadataTableOp>,
@@ -3823,6 +6249,37 @@ impl LocalJsonMetadataBackend {
     ) {
         self.tables.apply_with_rollback(op.clone(), rollback);
         table_ops.push(op);
+    }
+
+    fn plan_visible_version_commit_table_ops(
+        &mut self,
+        commit: &DfsVisibleVersionCommitRecord,
+        table_ops: &mut Vec<DfsMetadataTableOp>,
+        rollback: &mut DfsMetadataTableRollback,
+    ) -> Result<()> {
+        self.plan_preapplied_table_op(
+            DfsMetadataTableOp::PutVisibleCommit {
+                object_id: commit.committed_object.object_id.clone(),
+                version: commit.committed_object.version.clone(),
+                commit: commit.clone(),
+            },
+            table_ops,
+            rollback,
+        );
+        self.plan_object_index_table_ops_with_previous(
+            &commit.committed_object,
+            None,
+            table_ops,
+            rollback,
+        )?;
+        self.plan_preapplied_table_op(
+            DfsMetadataTableOp::PutVersion {
+                version: normalized_version_record(&commit.visible_version),
+            },
+            table_ops,
+            rollback,
+        );
+        Ok(())
     }
 
     fn object_index_table_ops_with_previous(
@@ -3893,6 +6350,16 @@ impl LocalJsonMetadataBackend {
                 removed_dentry = Some(previous_path_record.clone());
                 self.remove_dentry_index(&previous_path_record, &mut table_ops)?;
             }
+        }
+        if self
+            .tables
+            .compacted_tombstone_paths
+            .contains_key(&(path_record.file_system_id.clone(), path_record.path.clone()))
+        {
+            table_ops.push(DfsMetadataTableOp::RemoveCompactedTombstonePath {
+                file_system_id: path_record.file_system_id.clone(),
+                path: path_record.path.clone(),
+            });
         }
         table_ops.push(DfsMetadataTableOp::PutFileSystemObject {
             path_record: path_record.clone(),
@@ -4244,6 +6711,112 @@ fn normalized_namespace_transaction(
     transaction
 }
 
+fn object_page_key(object: &DfsObjectMetadata) -> (&String, &DfsObjectId) {
+    (&object.path, &object.object_id)
+}
+
+fn conflict_page_cursor(conflict: &DfsConflictRecord) -> DfsConflictPageCursor {
+    DfsConflictPageCursor {
+        conflict_id: conflict.conflict_id.clone(),
+    }
+}
+
+fn hardlink_object_from_path_record(
+    tables: &DfsMetadataTables,
+    file_system_id: &DfsFileSystemId,
+    target_object_id: &DfsObjectId,
+    path_record: &DfsPathRecord,
+) -> Option<DfsObjectMetadata> {
+    if path_record.file_system_id != *file_system_id {
+        return None;
+    }
+    let object = tables.objects.get(&path_record.object_id)?.clone();
+    if object.kind == DfsObjectKind::Hardlink
+        && object.file_system_id == *file_system_id
+        && object.link_target_object_id.as_ref() == Some(target_object_id)
+        && normalize_path(&object.path) == path_record.path
+    {
+        Some(object)
+    } else {
+        None
+    }
+}
+
+fn object_page_cursor(object: &DfsObjectMetadata) -> DfsObjectPageCursor {
+    DfsObjectPageCursor {
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        shard_id: None,
+    }
+}
+
+fn object_page_cursor_with_shard(
+    object: &DfsObjectMetadata,
+    shard_id: &DfsMetadataShardId,
+) -> DfsObjectPageCursor {
+    DfsObjectPageCursor {
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        shard_id: Some(shard_id.clone()),
+    }
+}
+
+fn local_object_page_cursor(cursor: &DfsObjectPageCursor) -> DfsObjectPageCursor {
+    DfsObjectPageCursor {
+        path: cursor.path.clone(),
+        object_id: cursor.object_id.clone(),
+        shard_id: None,
+    }
+}
+
+fn directory_page_key(object: &DfsObjectMetadata) -> (&String, &DfsObjectId) {
+    (&object.path, &object.object_id)
+}
+
+fn directory_page_cursor(object: &DfsObjectMetadata) -> DfsDirectoryPageCursor {
+    DfsDirectoryPageCursor {
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        dentry: None,
+        shard_id: None,
+    }
+}
+
+fn directory_page_cursor_with_dentry(
+    object: &DfsObjectMetadata,
+    dirfrag_id: DfsDirFragmentId,
+    name_hash: u64,
+    name: String,
+) -> DfsDirectoryPageCursor {
+    DfsDirectoryPageCursor {
+        path: object.path.clone(),
+        object_id: object.object_id.clone(),
+        dentry: Some(DfsDentryPageCursor {
+            dirfrag_id,
+            name_hash,
+            name,
+        }),
+        shard_id: None,
+    }
+}
+
+fn directory_page_cursor_with_shard(
+    mut cursor: DfsDirectoryPageCursor,
+    shard_id: &DfsMetadataShardId,
+) -> DfsDirectoryPageCursor {
+    cursor.shard_id = Some(shard_id.clone());
+    cursor
+}
+
+fn local_directory_page_cursor(cursor: &DfsDirectoryPageCursor) -> DfsDirectoryPageCursor {
+    DfsDirectoryPageCursor {
+        path: cursor.path.clone(),
+        object_id: cursor.object_id.clone(),
+        dentry: cursor.dentry.clone(),
+        shard_id: None,
+    }
+}
+
 fn required_replay_payload<'a, T>(
     entry: &DfsMetadataJournalEntry,
     mutation: &str,
@@ -4325,6 +6898,16 @@ fn normalize_posix_path(path: &str) -> String {
     } else {
         format!("/{normalized}")
     }
+}
+
+fn posix_path_is_at_or_under_prefix(path: &str, prefix: &str) -> bool {
+    let path = normalize_posix_path(path);
+    let prefix = normalize_posix_path(prefix);
+    prefix == "/"
+        || path == prefix
+        || path
+            .strip_prefix(&prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn path_hash(path: &str) -> String {
@@ -4593,6 +7176,7 @@ fn metadata_tables_snapshot(tables: &DfsMetadataTables) -> DfsMetadataTableSnaps
                 }
             })
             .collect(),
+        compacted_tombstones: tables.compacted_tombstones.values().cloned().collect(),
         versions: tables.versions.values().cloned().collect(),
         receipts: tables.receipts.values().cloned().collect(),
         intents: tables.intents.values().cloned().collect(),
@@ -4609,6 +7193,7 @@ fn metadata_tables_snapshot(tables: &DfsMetadataTables) -> DfsMetadataTableSnaps
             )
             .collect(),
         namespace_transactions: tables.namespace_transactions.values().cloned().collect(),
+        namespace_jobs: tables.namespace_jobs.values().cloned().collect(),
     }
 }
 
@@ -4642,6 +7227,9 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
             path_record: hardlink.path_record,
         });
     }
+    for object in snapshot.compacted_tombstones {
+        tables.apply(DfsMetadataTableOp::PutCompactedTombstone { object });
+    }
     for version in snapshot.versions {
         tables.apply(DfsMetadataTableOp::PutVersion { version });
     }
@@ -4663,6 +7251,9 @@ fn metadata_tables_from_snapshot(snapshot: DfsMetadataTableSnapshotTables) -> Df
     }
     for transaction in snapshot.namespace_transactions {
         tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
+    }
+    for job in snapshot.namespace_jobs {
+        tables.apply(DfsMetadataTableOp::PutNamespaceJob { job });
     }
     tables
 }
@@ -4773,6 +7364,13 @@ fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<DfsMetadataTab
     ));
     ops.extend(
         tables
+            .compacted_tombstones
+            .values()
+            .cloned()
+            .map(|object| DfsMetadataTableOp::PutCompactedTombstone { object }),
+    );
+    ops.extend(
+        tables
             .versions
             .values()
             .cloned()
@@ -4817,6 +7415,13 @@ fn metadata_table_snapshot_ops(tables: &DfsMetadataTables) -> Vec<DfsMetadataTab
             .values()
             .cloned()
             .map(|transaction| DfsMetadataTableOp::PutNamespaceTransaction { transaction }),
+    );
+    ops.extend(
+        tables
+            .namespace_jobs
+            .values()
+            .cloned()
+            .map(|job| DfsMetadataTableOp::PutNamespaceJob { job }),
     );
     ops
 }
@@ -5048,6 +7653,63 @@ fn append_segmented_journal_entry(root: &Path, entry: &DfsMetadataJournalEntry) 
             source,
         })?;
     file.write_all(&record)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    drop(file);
+    if !existed && let Some(parent) = path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+fn append_segmented_journal_entries(
+    root: &Path,
+    entries: &[&DfsMetadataJournalEntry],
+) -> Result<()> {
+    let Some(first) = entries.first() else {
+        return Ok(());
+    };
+    let segment_id = journal_segment_id(first.sequence);
+    let path = root
+        .join("journal")
+        .join("segments")
+        .join(format!("{segment_id:020}.slog"));
+    let existed = path.exists();
+    if let Some(parent) = path.parent() {
+        create_dir_all(parent.to_owned())?;
+    }
+    let mut records = Vec::new();
+    for entry in entries {
+        if journal_segment_id(entry.sequence) != segment_id {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata journal batch tried to append entry {} to segment {segment_id}",
+                entry.sequence
+            )));
+        }
+        let bytes = sinomo_object_serde::to_bytes(entry, 1, LengthMode::U32)
+            .map_err(|source| MetadataBackendError::Serde(source.to_string()))?;
+        let length = u32::try_from(bytes.len()).map_err(|_| {
+            MetadataBackendError::Serde(format!(
+                "metadata journal entry {} is too large: {} bytes",
+                entry.sequence,
+                bytes.len()
+            ))
+        })?;
+        records.extend_from_slice(&length.to_le_bytes());
+        records.extend_from_slice(&bytes);
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    file.write_all(&records)
         .and_then(|()| file.sync_all())
         .map_err(|source| MetadataBackendError::Io {
             path: path.clone(),
@@ -5341,6 +8003,29 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
+fn duration_nanos_saturating(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn metadata_now_unix_nanos() -> u64 {
+    OffsetDateTime::now_utc()
+        .unix_timestamp_nanos()
+        .try_into()
+        .unwrap_or(0)
+}
+
+fn object_timestamp_for_retention(object: &DfsObjectMetadata) -> u64 {
+    [
+        object.changed_at_unix_nanos,
+        object.modified_at_unix_nanos,
+        object.created_at_unix_nanos,
+        object.accessed_at_unix_nanos,
+    ]
+    .into_iter()
+    .find(|value| *value > 0)
+    .unwrap_or(0)
+}
+
 fn read_dir(path: &Path) -> Result<Vec<fs::DirEntry>> {
     let mut entries = Vec::new();
     let reader = fs::read_dir(path).map_err(|source| MetadataBackendError::Io {
@@ -5519,7 +8204,7 @@ mod tests {
     use super::*;
     use crate::DfsMetadataShardAssignment;
     use sinomo_core::DfsObjectPolicy;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -5923,6 +8608,235 @@ mod tests {
     }
 
     #[test]
+    fn sharded_backend_pages_objects_and_directory_children_with_shard_cursors() {
+        let root = temp_root("sharded_backend_pages_with_shard_cursors");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let mut root_file = object(version("version_1"));
+        root_file.object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_page_root_file").expect("root file");
+        root_file.path = "/root.txt".to_string();
+
+        let mut users_dir = object(version("version_1"));
+        users_dir.object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_page_users").expect("users dir");
+        users_dir.path = "/users".to_string();
+        users_dir.kind = DfsObjectKind::Directory;
+        users_dir.content_hash = None;
+        users_dir.content_size_bytes = None;
+
+        let mut services_dir = object(version("version_1"));
+        services_dir.object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_page_services").expect("services dir");
+        services_dir.path = "/services".to_string();
+        services_dir.kind = DfsObjectKind::Directory;
+        services_dir.content_hash = None;
+        services_dir.content_size_bytes = None;
+
+        let mut service_file = object(version("version_1"));
+        service_file.object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_page_service_file").expect("service file");
+        service_file.path = "/services/app.txt".to_string();
+
+        for object in [&root_file, &users_dir, &services_dir, &service_file] {
+            backend.put_object(object).expect("object");
+        }
+
+        let mut object_cursor = None;
+        let mut paged_object_ids = BTreeSet::new();
+        let mut saw_object_shard_cursor = false;
+        loop {
+            let page = backend
+                .objects_for_file_system_page(
+                    &file_system.file_system_id,
+                    object_cursor.as_ref(),
+                    2,
+                )
+                .expect("object page");
+            paged_object_ids.extend(page.objects.into_iter().map(|object| object.object_id));
+            if page
+                .next_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.shard_id.is_some())
+            {
+                saw_object_shard_cursor = true;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            object_cursor = Some(next_cursor);
+        }
+        let full_object_ids = backend
+            .objects_for_file_system(&file_system.file_system_id)
+            .expect("full objects")
+            .into_iter()
+            .map(|object| object.object_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(paged_object_ids, full_object_ids);
+        assert!(
+            saw_object_shard_cursor,
+            "sharded object pages should carry shard cursors for bounded continuation"
+        );
+
+        let mut dir_cursor = None;
+        let mut root_child_names = Vec::new();
+        let mut saw_directory_shard_cursor = false;
+        loop {
+            let page = backend
+                .child_objects_for_directory_page(
+                    &file_system.file_system_id,
+                    "/",
+                    dir_cursor.as_ref(),
+                    1,
+                )
+                .expect("directory page");
+            root_child_names.extend(page.objects.into_iter().map(|object| {
+                object
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .expect("child name")
+                    .to_string()
+            }));
+            if page
+                .next_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.shard_id.is_some())
+            {
+                saw_directory_shard_cursor = true;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            dir_cursor = Some(next_cursor);
+        }
+        root_child_names.sort();
+        assert_eq!(root_child_names, vec!["root.txt", "services", "users"]);
+        assert!(
+            saw_directory_shard_cursor,
+            "sharded directory pages should carry shard cursors for bounded continuation"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_pages_and_counts_hardlinks_across_shards() {
+        let root = temp_root("sharded_backend_pages_hardlinks");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let target = object(version("version_1"));
+        let mut root_alias = object(version("version_1"));
+        root_alias.object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_root_alias").expect("root alias");
+        root_alias.path = "/z-root.alias".to_string();
+        root_alias.kind = DfsObjectKind::Hardlink;
+        root_alias.content_hash = None;
+        root_alias.link_target_object_id = Some(target.object_id.clone());
+        let mut service_alias = root_alias.clone();
+        service_alias.object_id =
+            DfsObjectId::from_legacy_named("obj_sharded_service_alias").expect("service alias");
+        service_alias.path = "/services/a-service.alias".to_string();
+
+        for object in [&target, &root_alias, &service_alias] {
+            backend.put_object(object).expect("object");
+        }
+
+        assert_eq!(
+            backend
+                .hardlink_count_to_object(&file_system.file_system_id, &target.object_id)
+                .expect("hardlink count"),
+            2
+        );
+        assert_eq!(
+            backend
+                .first_hardlink_to_object(&file_system.file_system_id, &target.object_id)
+                .expect("first hardlink")
+                .expect("first hardlink")
+                .path,
+            "/services/a-service.alias"
+        );
+        assert_eq!(
+            backend
+                .first_hardlink_to_object_outside_prefix(
+                    &file_system.file_system_id,
+                    &target.object_id,
+                    "/services",
+                )
+                .expect("outside prefix")
+                .expect("outside prefix")
+                .path,
+            "/z-root.alias"
+        );
+
+        let mut cursor = None;
+        let mut paged_ids = BTreeSet::new();
+        let mut saw_hardlink_shard_cursor = false;
+        loop {
+            let page = backend
+                .hardlinks_to_object_page(
+                    &file_system.file_system_id,
+                    &target.object_id,
+                    cursor.as_ref(),
+                    1,
+                )
+                .expect("hardlink page");
+            paged_ids.extend(page.objects.into_iter().map(|object| object.object_id));
+            if page
+                .next_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.shard_id.is_some())
+            {
+                saw_hardlink_shard_cursor = true;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            paged_ids,
+            [root_alias.object_id, service_alias.object_id]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert!(
+            saw_hardlink_shard_cursor,
+            "sharded hardlink pages should carry shard cursors for bounded continuation"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn sharded_backend_keeps_source_object_when_cross_shard_target_write_fails() {
         let root = temp_root("sharded_backend_cross_shard_target_failure");
         let mut backend = LocalShardedMetadataBackend::new(
@@ -6304,6 +9218,10 @@ mod tests {
             .migrate_objects_to_configured_shards(&file_system.file_system_id, 1)
             .expect("bounded migration");
 
+        assert_eq!(
+            report.scanned_objects, 1,
+            "bounded migration should not scan the rest of the shard after reaching the migration limit"
+        );
         assert_eq!(report.migrated_objects, 1);
         assert!(report.reached_limit);
         assert_eq!(
@@ -7426,6 +10344,80 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_pages_filesystem_objects_and_directory_children() {
+        let root = temp_root("local_backend_pages_objects_and_children");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let mut dir = object(version("version_1"));
+        dir.object_id = DfsObjectId::from_legacy_named("obj_page_dir").expect("dir object");
+        dir.path = "/paged".to_string();
+        dir.kind = DfsObjectKind::Directory;
+        dir.content_hash = None;
+        dir.content_size_bytes = None;
+        backend.put_object(&dir).expect("dir");
+
+        for index in 0..5 {
+            let mut file = object(version("version_1"));
+            file.object_id =
+                DfsObjectId::from_legacy_named(format!("obj_page_file_{index}")).expect("object");
+            file.path = format!("/paged/file-{index}.txt");
+            file.kind = DfsObjectKind::File;
+            backend.put_object(&file).expect("file");
+        }
+
+        let first_object_page = backend
+            .objects_for_file_system_page(&file_system_id(), None, 3)
+            .expect("first object page");
+        assert_eq!(first_object_page.objects.len(), 3);
+        assert!(first_object_page.next_cursor.is_some());
+        let second_object_page = backend
+            .objects_for_file_system_page(
+                &file_system_id(),
+                first_object_page.next_cursor.as_ref(),
+                3,
+            )
+            .expect("second object page");
+        assert_eq!(second_object_page.objects.len(), 3);
+        assert!(second_object_page.next_cursor.is_none());
+
+        let mut cursor = None;
+        let mut child_names = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let page = backend
+                .child_objects_for_directory_page(&file_system_id(), "/paged", cursor.as_ref(), 2)
+                .expect("child page");
+            assert!(page.objects.len() <= 2);
+            child_names.extend(
+                page.objects
+                    .iter()
+                    .map(|object| object.path.rsplit('/').next().unwrap().to_string()),
+            );
+            pages = pages.saturating_add(1);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        child_names.sort();
+        assert_eq!(
+            child_names,
+            vec![
+                "file-0.txt",
+                "file-1.txt",
+                "file-2.txt",
+                "file-3.txt",
+                "file-4.txt"
+            ]
+        );
+        assert_eq!(pages, 3);
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_content_update_does_not_rewrite_stable_namespace_indexes() {
         let root = temp_root("local_backend_content_update_skips_stable_indexes");
         let mut backend =
@@ -7608,6 +10600,280 @@ mod tests {
             )
             .entry_count,
             0
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_compacts_retention_eligible_tombstones_to_path_markers() {
+        let root = temp_root("local_backend_compacts_tombstones_to_markers");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let mut tombstone = object(version("version_2"));
+        tombstone.path = "/docs/deleted.md".to_string();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.content_hash = None;
+        tombstone.content_size_bytes = None;
+        tombstone.changed_at_unix_nanos = 10;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&tombstone).expect("tombstone");
+
+        let dry_run = backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::dry_run(Duration::from_nanos(50))
+                    .with_now_unix_nanos(100),
+            )
+            .expect("dry run");
+        assert_eq!(dry_run.scanned_tombstone_count, 1);
+        assert_eq!(dry_run.eligible_tombstone_count, 1);
+        assert_eq!(dry_run.compacted_tombstone_count, 0);
+        assert_eq!(
+            backend
+                .get_object(&tombstone.object_id)
+                .expect("dry-run object"),
+            Some(tombstone.clone())
+        );
+
+        let report = backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::from_nanos(50))
+                    .with_now_unix_nanos(100),
+            )
+            .expect("compact");
+        assert_eq!(report.scanned_tombstone_count, 1);
+        assert_eq!(report.eligible_tombstone_count, 1);
+        assert_eq!(report.compacted_tombstone_count, 1);
+        assert_eq!(report.removed_object_record_count, 1);
+        assert_eq!(report.removed_inode_record_count, 1);
+        assert_eq!(report.removed_file_system_object_record_count, 1);
+        assert_eq!(report.preserved_path_marker_count, 1);
+        assert!(table_path_exists(
+            &backend,
+            &file_system.file_system_id,
+            "/docs/deleted.md"
+        ));
+        assert_eq!(
+            backend
+                .get_object(&tombstone.object_id)
+                .expect("compacted object"),
+            None
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, "/docs/deleted.md")
+                .expect("path lookup")
+                .expect("compacted marker")
+                .kind,
+            DfsObjectKind::Tombstone
+        );
+        assert!(
+            backend
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("objects")
+                .is_empty(),
+            "compacted tombstones should not hydrate through object scans"
+        );
+
+        drop(backend);
+        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopen");
+        assert_eq!(
+            reopened
+                .get_object(&tombstone.object_id)
+                .expect("reopened object"),
+            None
+        );
+        assert_eq!(
+            reopened
+                .get_object_by_path(&file_system.file_system_id, "/docs/deleted.md")
+                .expect("reopened path")
+                .expect("compacted marker")
+                .kind,
+            DfsObjectKind::Tombstone
+        );
+        assert!(
+            reopened
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("reopened objects")
+                .is_empty()
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_tombstone_compaction_retains_young_and_referenced_tombstones() {
+        let root = temp_root("local_backend_tombstone_compaction_retains");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+
+        let mut young = object(version("version_2"));
+        young.path = "/docs/young.md".to_string();
+        young.kind = DfsObjectKind::Tombstone;
+        young.content_hash = None;
+        young.changed_at_unix_nanos = 90;
+        backend.put_object(&young).expect("young tombstone");
+
+        let mut referenced = object(version("version_3"));
+        referenced.object_id =
+            DfsObjectId::from_legacy_named("obj_referenced_tombstone").expect("object id");
+        referenced.path = "/docs/referenced.md".to_string();
+        referenced.kind = DfsObjectKind::Tombstone;
+        referenced.content_hash = None;
+        referenced.changed_at_unix_nanos = 1;
+        backend
+            .put_object(&referenced)
+            .expect("referenced tombstone");
+        backend
+            .put_version(&DfsObjectVersionRecord {
+                file_system_id: referenced.file_system_id.clone(),
+                object_id: referenced.object_id.clone(),
+                version: referenced.version.clone(),
+                content_hash: None,
+                size_bytes: None,
+                locations: Vec::new(),
+                created_by_event_id: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                visible: false,
+            })
+            .expect("version ref");
+
+        let report = backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::from_nanos(50))
+                    .with_now_unix_nanos(100),
+            )
+            .expect("compact");
+        assert_eq!(report.scanned_tombstone_count, 2);
+        assert_eq!(report.eligible_tombstone_count, 0);
+        assert_eq!(report.retained_young_tombstone_count, 1);
+        assert_eq!(report.retained_referenced_tombstone_count, 1);
+        assert_eq!(report.compacted_tombstone_count, 0);
+        assert_eq!(
+            backend.get_object(&young.object_id).expect("young object"),
+            Some(young)
+        );
+        assert_eq!(
+            backend
+                .get_object(&referenced.object_id)
+                .expect("referenced object"),
+            Some(referenced)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_recreating_compacted_tombstone_path_removes_marker() {
+        let root = temp_root("local_backend_recreate_compacted_tombstone_path");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        let mut tombstone = object(version("version_2"));
+        tombstone.path = "/docs/recreate.md".to_string();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.content_hash = None;
+        tombstone.changed_at_unix_nanos = 1;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&tombstone).expect("tombstone");
+        backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::from_nanos(0))
+                    .with_now_unix_nanos(100),
+            )
+            .expect("compact");
+
+        let mut replacement = object(version("version_1"));
+        replacement.object_id =
+            DfsObjectId::from_legacy_named("obj_recreated_path").expect("object id");
+        replacement.path = tombstone.path.clone();
+        replacement.kind = DfsObjectKind::File;
+        replacement.content_hash = Some("blake3:new".to_string());
+        backend.put_object(&replacement).expect("replacement");
+
+        assert!(backend.tables.compacted_tombstones.is_empty());
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, &replacement.path)
+                .expect("path lookup"),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            backend
+                .objects_for_file_system(&file_system.file_system_id)
+                .expect("objects")
+                .into_iter()
+                .map(|object| object.object_id)
+                .collect::<Vec<_>>(),
+            vec![replacement.object_id]
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_compacts_tombstone_and_removes_object_index() {
+        let root = temp_root("sharded_backend_compacts_tombstone");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        let mut tombstone = object(version("version_2"));
+        tombstone.path = "/services/deleted.md".to_string();
+        tombstone.kind = DfsObjectKind::Tombstone;
+        tombstone.content_hash = None;
+        tombstone.changed_at_unix_nanos = 1;
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&tombstone).expect("tombstone");
+        assert!(
+            backend
+                .object_shard_index_path(&tombstone.object_id)
+                .is_file()
+        );
+
+        let report = backend
+            .compact_tombstones(
+                DfsTombstoneCompactionOptions::compact_eligible(Duration::from_nanos(0))
+                    .with_now_unix_nanos(100),
+            )
+            .expect("compact");
+        assert_eq!(report.compacted_tombstone_count, 1);
+        assert!(
+            !backend
+                .object_shard_index_path(&tombstone.object_id)
+                .exists(),
+            "compaction should remove stale object shard routing indexes"
+        );
+        assert_eq!(
+            backend
+                .get_object(&tombstone.object_id)
+                .expect("object lookup"),
+            None
+        );
+        assert_eq!(
+            backend
+                .get_object_by_path(&file_system.file_system_id, "/services/deleted.md")
+                .expect("path lookup")
+                .expect("compacted marker")
+                .kind,
+            DfsObjectKind::Tombstone
         );
 
         cleanup(&root);
@@ -7866,11 +11132,14 @@ mod tests {
         let mut alias_b = alias_a.clone();
         alias_b.object_id = DfsObjectId::from_legacy_named("obj_alias_b").expect("object");
         alias_b.path = "/docs/readme.alias-b".to_string();
+        let mut alias_c = alias_a.clone();
+        alias_c.object_id = DfsObjectId::from_legacy_named("obj_alias_c").expect("object");
+        alias_c.path = "/archive/readme.alias-c".to_string();
         let mut unrelated = object(version("version_1"));
         unrelated.object_id = DfsObjectId::from_legacy_named("obj_unrelated").expect("object");
         unrelated.path = "/docs/unrelated".to_string();
 
-        for object in [&target, &alias_b, &unrelated, &alias_a] {
+        for object in [&target, &alias_b, &unrelated, &alias_a, &alias_c] {
             backend.put_object(object).expect("object");
         }
         let mut stale_alias = alias_b.clone();
@@ -7885,6 +11154,60 @@ mod tests {
             .expect("hardlinks");
         assert_eq!(
             hardlinks
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/archive/readme.alias-c", "/docs/readme.alias-a"]
+        );
+        assert_eq!(
+            backend
+                .hardlink_count_to_object(&file_system_id(), &target.object_id)
+                .expect("hardlink count"),
+            2
+        );
+        assert_eq!(
+            backend
+                .first_hardlink_to_object(&file_system_id(), &target.object_id)
+                .expect("first hardlink")
+                .expect("first hardlink")
+                .path,
+            "/archive/readme.alias-c"
+        );
+        assert_eq!(
+            backend
+                .first_hardlink_to_object_outside_prefix(
+                    &file_system_id(),
+                    &target.object_id,
+                    "/archive",
+                )
+                .expect("outside prefix")
+                .expect("outside prefix")
+                .path,
+            "/docs/readme.alias-a"
+        );
+
+        let first_page = backend
+            .hardlinks_to_object_page(&file_system_id(), &target.object_id, None, 1)
+            .expect("first page");
+        assert_eq!(
+            first_page
+                .objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/archive/readme.alias-c"]
+        );
+        let second_page = backend
+            .hardlinks_to_object_page(
+                &file_system_id(),
+                &target.object_id,
+                first_page.next_cursor.as_ref(),
+                1,
+            )
+            .expect("second page");
+        assert_eq!(
+            second_page
+                .objects
                 .iter()
                 .map(|object| object.path.as_str())
                 .collect::<Vec<_>>(),
@@ -9011,8 +12334,11 @@ mod tests {
             status: DfsConflictStatus::Open,
             detected_at: OffsetDateTime::UNIX_EPOCH,
         };
+        let mut conflict_b = conflict.clone();
+        conflict_b.conflict_id = "conflict_b".to_string();
 
         let entry = backend.put_conflict(&conflict).expect("put conflict");
+        backend.put_conflict(&conflict_b).expect("put conflict b");
         assert!(matches!(
             entry.mutation,
             DfsMetadataMutation::PutConflict {
@@ -9030,7 +12356,23 @@ mod tests {
             backend
                 .conflicts_for_object(&conflict.object_id)
                 .expect("list conflicts"),
-            vec![conflict.clone()]
+            vec![conflict.clone(), conflict_b.clone()]
+        );
+        let first_page = backend
+            .conflicts_for_object_page(&conflict.object_id, None, 1)
+            .expect("first conflict page");
+        assert_eq!(first_page.conflicts, vec![conflict.clone()]);
+        let second_page = backend
+            .conflicts_for_object_page(&conflict.object_id, first_page.next_cursor.as_ref(), 1)
+            .expect("second conflict page");
+        assert_eq!(second_page.conflicts, vec![conflict_b.clone()]);
+        assert!(second_page.next_cursor.is_none());
+        assert!(
+            backend
+                .conflicts_for_object_page(&conflict.object_id, None, 0)
+                .expect("empty conflict page")
+                .conflicts
+                .is_empty()
         );
 
         let resolved = backend

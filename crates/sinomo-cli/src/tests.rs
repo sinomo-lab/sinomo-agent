@@ -7700,6 +7700,8 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             "01hxy6qa9k0t9vr4g9n8d3q5d0".to_string(),
             "--object".to_string(),
             "01hxy6qa9k0t9vr4g9n8d3q5d1".to_string(),
+            "--limit".to_string(),
+            "128".to_string(),
         ])
         .expect("dfs conflicts"),
         DfsCliCommand::Conflicts(DfsFilterOptions {
@@ -7712,6 +7714,8 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
                 sinomo_runtime::dfs::DfsObjectId::new("01hxy6qa9k0t9vr4g9n8d3q5d1")
                     .expect("object")
             ),
+            limit: Some(128),
+            cursor: None,
         })
     );
     assert!(matches!(

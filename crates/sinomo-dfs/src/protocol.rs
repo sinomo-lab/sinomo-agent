@@ -17,9 +17,24 @@ pub struct DfsReadData {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReadRangeData {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    pub offset: u64,
+    pub total_size_bytes: u64,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsReadRequest {
     pub request_id: String,
     pub object_id: DfsObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_max_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -39,6 +54,8 @@ pub struct DfsReadResponseChunk {
     pub total_size_bytes: u64,
     pub chunk_index: u32,
     pub total_chunks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_hash: Option<String>,
     pub bytes: Vec<u8>,
 }
 
@@ -46,6 +63,7 @@ pub struct DfsReadResponseChunk {
 #[serde(rename_all = "kebab-case")]
 pub enum DfsReadResult {
     Found(DfsReadData),
+    RangeFound(DfsReadRangeData),
     NotFound,
     Rejected { reason: String },
 }
@@ -144,6 +162,8 @@ pub struct DfsStageBlobChunkCommand {
     pub total_size_bytes: u64,
     pub chunk_index: u32,
     pub total_chunks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_hash: Option<String>,
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -213,6 +233,8 @@ pub struct DfsRepairReplicaChunkCommand {
     pub total_size_bytes: u64,
     pub chunk_index: u32,
     pub total_chunks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_hash: Option<String>,
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object_metadata: Option<DfsObjectMetadata>,
@@ -248,6 +270,8 @@ pub struct DfsFetchBlobResponseChunk {
     pub total_size_bytes: u64,
     pub chunk_index: u32,
     pub total_chunks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_hash: Option<String>,
     pub bytes: Vec<u8>,
 }
 

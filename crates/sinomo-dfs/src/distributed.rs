@@ -513,6 +513,18 @@ impl DistributedEventualCoordinator {
         &self.repair_jobs
     }
 
+    pub fn intent_count(&self) -> usize {
+        self.intents.len()
+    }
+
+    pub fn receipt_count(&self) -> usize {
+        self.receipts.len()
+    }
+
+    pub fn committed_version_count(&self) -> usize {
+        self.committed_versions.len()
+    }
+
     pub fn abort_intent(
         &mut self,
         intent_id: &str,

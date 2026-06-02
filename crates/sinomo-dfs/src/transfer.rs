@@ -27,6 +27,8 @@ pub(crate) struct PendingNetworkedRead {
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: Option<String>,
     pub(crate) content_size_bytes: Option<u64>,
+    pub(crate) range_offset: Option<u64>,
+    pub(crate) range_max_bytes: Option<usize>,
     pub(crate) target_node_id: NodeId,
     pub(crate) next_retry_at: Instant,
 }
@@ -38,39 +40,37 @@ pub(crate) struct RepairRetryState {
     pub(crate) inflight: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct InProgressReadTransfer {
     pub(crate) object_id: DfsObjectId,
     pub(crate) version: DfsVersion,
-    pub(crate) content_hash: Option<String>,
+    pub(crate) content_hash: String,
     pub(crate) total_size_bytes: u64,
     pub(crate) last_updated_at: Instant,
-    pub(crate) chunks: Vec<Option<Vec<u8>>>,
+    pub(crate) assembler: ChunkedBlobAssembler,
 }
 
 impl InProgressReadTransfer {
     pub(crate) fn new(
         object_id: DfsObjectId,
         version: DfsVersion,
-        content_hash: Option<String>,
+        content_hash: String,
         total_size_bytes: u64,
         total_chunks: u32,
+        assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        let total_chunks_len = validate_chunked_transfer_shape(
+        validate_chunked_transfer_shape(
             "chunked DFS read response",
             total_size_bytes,
             total_chunks,
         )?;
-        usize::try_from(total_size_bytes).map_err(|_| DfsError::Distributed {
-            message: format!("chunked DFS read response is too large: {total_size_bytes} bytes"),
-        })?;
         Ok(Self {
             object_id,
             version,
             content_hash,
             total_size_bytes,
             last_updated_at: Instant::now(),
-            chunks: vec![None; total_chunks_len],
+            assembler,
         })
     }
 
@@ -79,16 +79,18 @@ impl InProgressReadTransfer {
         chunk_index: u32,
         total_chunks: u32,
         bytes: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>, DfsError> {
-        insert_chunk_into(
+    ) -> Result<bool, DfsError> {
+        validate_chunk_bytes(
             "chunked DFS read response",
             self.total_size_bytes,
-            &mut self.last_updated_at,
-            &mut self.chunks,
             chunk_index,
             total_chunks,
-            bytes,
-        )
+            &bytes,
+        )?;
+        self.last_updated_at = Instant::now();
+        self.assembler
+            .insert_chunk(chunk_index, &bytes)
+            .map_err(DfsError::from)
     }
 }
 
@@ -288,6 +290,29 @@ pub(crate) fn validate_chunk_bytes(
     Ok(())
 }
 
+pub(crate) fn validate_chunk_hash(
+    label: &str,
+    chunk_index: u32,
+    bytes: &[u8],
+    expected_hash: Option<&str>,
+) -> Result<(), DfsError> {
+    let Some(expected_hash) = expected_hash else {
+        return Ok(());
+    };
+    let actual_hash = chunk_hash(bytes);
+    if actual_hash != expected_hash {
+        return Err(DfsError::ContentHashMismatch {
+            expected: format!("{label} chunk {chunk_index} hash {expected_hash}"),
+            actual: actual_hash,
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn chunk_hash(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
 pub(crate) fn blob_transfer_key(
     kind: &str,
     source_node_id: &NodeId,
@@ -297,60 +322,30 @@ pub(crate) fn blob_transfer_key(
     format!("{kind}:{source_node_id}:{intent_id}:{request_id}")
 }
 
-fn insert_chunk_into(
-    label: &str,
-    total_size_bytes: u64,
-    last_updated_at: &mut Instant,
-    chunks: &mut [Option<Vec<u8>>],
-    chunk_index: u32,
-    total_chunks: u32,
-    bytes: Vec<u8>,
-) -> Result<Option<Vec<u8>>, DfsError> {
-    validate_chunk_bytes(label, total_size_bytes, chunk_index, total_chunks, &bytes)?;
-    if total_chunks as usize != chunks.len() {
-        return Err(DfsError::Distributed {
-            message: format!(
-                "{label} chunk count changed: expected {}, actual {}",
-                chunks.len(),
-                total_chunks
-            ),
-        });
-    }
-    let Some(slot) = chunks.get_mut(chunk_index as usize) else {
-        return Err(DfsError::Distributed {
-            message: format!("{label} index out of range: {chunk_index}/{total_chunks}"),
-        });
-    };
-    if let Some(existing) = slot.as_ref() {
-        if existing == &bytes {
-            return Ok(None);
-        }
-        return Err(DfsError::Distributed {
-            message: format!("conflicting duplicate {label} index: {chunk_index}"),
-        });
-    }
-    *slot = Some(bytes);
-    *last_updated_at = Instant::now();
-    if chunks.iter().any(Option::is_none) {
-        return Ok(None);
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut assembled = Vec::with_capacity(usize::try_from(total_size_bytes).map_err(|_| {
-        DfsError::Distributed {
-            message: format!("{label} is too large: {total_size_bytes} bytes"),
-        }
-    })?);
-    for chunk in chunks {
-        assembled.extend_from_slice(chunk.as_ref().expect("all chunks present"));
+    #[test]
+    fn validate_chunk_hash_accepts_absent_or_matching_hash_and_rejects_mismatch() {
+        let bytes = b"checksummed DFS transfer chunk";
+        validate_chunk_hash("chunked DFS blob transfer", 0, bytes, None)
+            .expect("legacy chunk without hash remains compatible");
+        validate_chunk_hash(
+            "chunked DFS blob transfer",
+            0,
+            bytes,
+            Some(chunk_hash(bytes).as_str()),
+        )
+        .expect("matching chunk hash");
+
+        let error = validate_chunk_hash(
+            "chunked DFS blob transfer",
+            0,
+            bytes,
+            Some(chunk_hash(b"different chunk").as_str()),
+        )
+        .expect_err("mismatched chunk hash");
+        assert!(matches!(error, DfsError::ContentHashMismatch { .. }));
     }
-    if assembled.len() as u64 != total_size_bytes {
-        return Err(DfsError::Distributed {
-            message: format!(
-                "{label} size mismatch: expected {}, actual {}",
-                total_size_bytes,
-                assembled.len()
-            ),
-        });
-    }
-    Ok(Some(assembled))
 }
