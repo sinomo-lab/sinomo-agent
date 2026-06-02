@@ -29,6 +29,8 @@ struct Args {
     blob_bytes: u64,
     blob_range_bytes: usize,
     network_blob_bytes: u64,
+    write_at_ops: usize,
+    write_at_bytes: usize,
     list_page_size: usize,
     metadata_batch_size: usize,
     network_timeout_secs: u64,
@@ -40,6 +42,7 @@ enum Scenario {
     All,
     Namespace,
     PosixCreate,
+    PosixWriteAt,
     MetadataReplication,
     Blob,
     NetworkBlob,
@@ -60,6 +63,8 @@ struct BenchDefaults {
     blob_bytes: u64,
     blob_range_bytes: usize,
     network_blob_bytes: u64,
+    write_at_ops: usize,
+    write_at_bytes: usize,
     list_page_size: usize,
     metadata_batch_size: usize,
     network_timeout_secs: u64,
@@ -71,11 +76,12 @@ impl Scenario {
             "all" => Ok(Self::All),
             "namespace" => Ok(Self::Namespace),
             "posix-create" => Ok(Self::PosixCreate),
+            "posix-write-at" => Ok(Self::PosixWriteAt),
             "metadata-replication" => Ok(Self::MetadataReplication),
             "blob" => Ok(Self::Blob),
             "network-blob" => Ok(Self::NetworkBlob),
             _ => Err(format!(
-                "unknown scenario `{value}`; use all, namespace, posix-create, metadata-replication, blob, or network-blob"
+                "unknown scenario `{value}`; use all, namespace, posix-create, posix-write-at, metadata-replication, blob, or network-blob"
             )
             .into()),
         }
@@ -86,6 +92,7 @@ impl Scenario {
             Self::All => "all",
             Self::Namespace => "namespace",
             Self::PosixCreate => "posix-create",
+            Self::PosixWriteAt => "posix-write-at",
             Self::MetadataReplication => "metadata-replication",
             Self::Blob => "blob",
             Self::NetworkBlob => "network-blob",
@@ -120,6 +127,8 @@ impl Preset {
                 blob_bytes: 64 * 1024 * 1024,
                 blob_range_bytes: 1024 * 1024,
                 network_blob_bytes: 8 * 1024 * 1024,
+                write_at_ops: 64,
+                write_at_bytes: 4 * 1024,
                 list_page_size: 1024,
                 metadata_batch_size: 1024,
                 network_timeout_secs: 60,
@@ -131,6 +140,8 @@ impl Preset {
                 blob_bytes: 1024 * 1024 * 1024,
                 blob_range_bytes: 8 * 1024 * 1024,
                 network_blob_bytes: 512 * 1024 * 1024,
+                write_at_ops: 1024,
+                write_at_bytes: 16 * 1024,
                 list_page_size: 4096,
                 metadata_batch_size: 4096,
                 network_timeout_secs: 300,
@@ -142,6 +153,8 @@ impl Preset {
                 blob_bytes: 4 * 1024 * 1024 * 1024,
                 blob_range_bytes: 16 * 1024 * 1024,
                 network_blob_bytes: 4 * 1024 * 1024 * 1024,
+                write_at_ops: 8192,
+                write_at_bytes: 64 * 1024,
                 list_page_size: 4096,
                 metadata_batch_size: 4096,
                 network_timeout_secs: 1800,
@@ -157,12 +170,14 @@ fn main() -> BenchResult<()> {
         Scenario::All => {
             run_namespace(&args)?;
             run_posix_create(&args)?;
+            run_posix_write_at(&args)?;
             run_metadata_replication(&args)?;
             run_blob(&args)?;
             run_network_blob(&args)?;
         }
         Scenario::Namespace => run_namespace(&args)?,
         Scenario::PosixCreate => run_posix_create(&args)?,
+        Scenario::PosixWriteAt => run_posix_write_at(&args)?,
         Scenario::MetadataReplication => run_metadata_replication(&args)?,
         Scenario::Blob => run_blob(&args)?,
         Scenario::NetworkBlob => run_network_blob(&args)?,
@@ -201,6 +216,14 @@ impl Args {
             "SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES",
             defaults.network_blob_bytes,
         )?;
+        let mut write_at_ops = env_usize("SINOMO_DFS_BENCH_WRITE_AT_OPS", defaults.write_at_ops)?;
+        let mut write_at_bytes = byte_count_to_usize(
+            "SINOMO_DFS_BENCH_WRITE_AT_BYTES",
+            env_bytes(
+                "SINOMO_DFS_BENCH_WRITE_AT_BYTES",
+                defaults.write_at_bytes as u64,
+            )?,
+        )?;
         let mut list_page_size =
             env_usize("SINOMO_DFS_BENCH_LIST_PAGE_SIZE", defaults.list_page_size)?;
         let mut metadata_batch_size = env_usize(
@@ -225,6 +248,8 @@ impl Args {
                     blob_bytes = defaults.blob_bytes;
                     blob_range_bytes = defaults.blob_range_bytes;
                     network_blob_bytes = defaults.network_blob_bytes;
+                    write_at_ops = defaults.write_at_ops;
+                    write_at_bytes = defaults.write_at_bytes;
                     list_page_size = defaults.list_page_size;
                     metadata_batch_size = defaults.metadata_batch_size;
                     network_timeout_secs = defaults.network_timeout_secs;
@@ -239,6 +264,11 @@ impl Args {
                         byte_count_to_usize(&arg, parse_byte_count(&arg, args.next())?)?
                 }
                 "--network-blob-bytes" => network_blob_bytes = parse_byte_count(&arg, args.next())?,
+                "--write-at-ops" => write_at_ops = parse_usize(&arg, args.next())?,
+                "--write-at-bytes" => {
+                    write_at_bytes =
+                        byte_count_to_usize(&arg, parse_byte_count(&arg, args.next())?)?
+                }
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
                 "--metadata-batch-size" => metadata_batch_size = parse_usize(&arg, args.next())?,
                 "--network-timeout-secs" => network_timeout_secs = parse_u64(&arg, args.next())?,
@@ -264,6 +294,12 @@ impl Args {
         if network_timeout_secs == 0 {
             return Err("--network-timeout-secs must be greater than zero".into());
         }
+        if write_at_ops == 0 {
+            return Err("--write-at-ops must be greater than zero".into());
+        }
+        if write_at_bytes == 0 {
+            return Err("--write-at-bytes must be greater than zero".into());
+        }
 
         let (root, explicit_root) = match root {
             Some(root) => (root, true),
@@ -281,6 +317,8 @@ impl Args {
             blob_bytes,
             blob_range_bytes,
             network_blob_bytes,
+            write_at_ops,
+            write_at_bytes,
             list_page_size,
             metadata_batch_size,
             network_timeout_secs,
@@ -307,6 +345,8 @@ impl Args {
                 "blob_bytes": self.blob_bytes,
                 "blob_range_bytes": self.blob_range_bytes,
                 "network_blob_bytes": self.network_blob_bytes,
+                "write_at_ops": self.write_at_ops,
+                "write_at_bytes": self.write_at_bytes,
                 "list_page_size": self.list_page_size,
                 "metadata_batch_size": self.metadata_batch_size,
                 "network_timeout_secs": self.network_timeout_secs,
@@ -563,6 +603,102 @@ fn run_posix_create(args: &Args) -> BenchResult<()> {
             "dirs": args.dirs,
             "objects_loaded": reopened_objects,
             "objects_per_second": rate(reopened_objects as u64, reopen_elapsed),
+        }),
+    );
+
+    Ok(())
+}
+
+fn run_posix_write_at(args: &Args) -> BenchResult<()> {
+    let root = args.scenario_root("posix-write-at");
+    remove_dir_all_if_exists(&root)?;
+    fs::create_dir_all(&root)?;
+
+    let node = node("node_dfs_bench_posix_write_at");
+    let network = InProcessNetwork::new();
+    let metadata_root = root.join("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(root.join("content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        &metadata_root,
+    )?)?;
+
+    let setup_start = Instant::now();
+    dfs.bootstrap_distributed_sifs()?;
+    dfs.posix_mkdir_all("/services/dfs-scale")?;
+    emit(
+        "posix_write_at_setup",
+        setup_start.elapsed(),
+        json!({ "root": root }),
+    );
+
+    let options = DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+    let path = "/services/dfs-scale/random-write.bin";
+    let base_start = Instant::now();
+    dfs.posix_write_file_from_reader(path, RepeatingReader::new(args.blob_bytes), options.clone())?;
+    let base_elapsed = base_start.elapsed();
+    emit(
+        "posix_write_at_base_stream_write",
+        base_elapsed,
+        json!({
+            "bytes": args.blob_bytes,
+            "mib_per_second": mib_per_second(args.blob_bytes, base_elapsed),
+        }),
+    );
+
+    let patch_start = Instant::now();
+    let mut patched_bytes = 0u64;
+    let mut last_offset = 0u64;
+    for index in 0..args.write_at_ops {
+        let offset = write_at_offset(index, args.blob_bytes, args.write_at_bytes);
+        last_offset = offset;
+        dfs.posix_write_file_at_from_reader(
+            path,
+            offset,
+            RepeatingReader::with_seed(args.write_at_bytes as u64, index as u64),
+            options.clone(),
+        )?;
+        patched_bytes = patched_bytes.saturating_add(args.write_at_bytes as u64);
+    }
+    let patch_elapsed = patch_start.elapsed();
+    let stat = dfs.posix_stat(path)?;
+    let manifest = dfs
+        .content()
+        .read_manifest(stat.object_id.as_str(), stat.version.as_str())?;
+    let logical_blob_materialized = dfs.content().has_blob(&manifest.content_hash)?;
+    let content_stats = dfs.content().stats()?;
+    emit(
+        "posix_write_at_stream_patches",
+        patch_elapsed,
+        json!({
+            "base_bytes": args.blob_bytes,
+            "ops": args.write_at_ops,
+            "patch_bytes": args.write_at_bytes,
+            "patched_bytes": patched_bytes,
+            "ops_per_second": rate(args.write_at_ops as u64, patch_elapsed),
+            "mib_per_second": mib_per_second(patched_bytes, patch_elapsed),
+            "result_size_bytes": manifest.size_bytes,
+            "extent_count": manifest.extents.len(),
+            "logical_blob_materialized": logical_blob_materialized,
+            "content_stats": content_stats,
+        }),
+    );
+
+    let verify_len = args.write_at_bytes.min(args.blob_range_bytes);
+    let verify_start = Instant::now();
+    let verify = dfs.posix_read_file_range(path, last_offset, verify_len)?;
+    let verify_elapsed = verify_start.elapsed();
+    emit(
+        "posix_write_at_verify_range_read",
+        verify_elapsed,
+        json!({
+            "offset": last_offset,
+            "bytes": verify.len(),
+            "requested_bytes": verify_len,
+            "mib_per_second": mib_per_second(verify.len() as u64, verify_elapsed),
         }),
     );
 
@@ -1213,6 +1349,23 @@ fn valid_fake_hash(index: usize) -> String {
     format!("blake3:{index:064x}")
 }
 
+fn write_at_offset(index: usize, object_size_bytes: u64, patch_bytes: usize) -> u64 {
+    let patch_bytes = patch_bytes as u64;
+    let max_start = object_size_bytes.saturating_sub(patch_bytes);
+    if max_start == 0 {
+        return 0;
+    }
+    let mut value = (index as u64)
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value % (max_start + 1)
+}
+
 fn emit(name: &str, elapsed: std::time::Duration, fields: serde_json::Value) {
     let mut value = json!({
         "scenario": name,
@@ -1352,7 +1505,7 @@ fn print_help() {
         "Usage: cargo bench -p sinomo-dfs --bench scale -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --scenario all|namespace|posix-create|metadata-replication|blob|network-blob\n\
+           --scenario all|namespace|posix-create|posix-write-at|metadata-replication|blob|network-blob\n\
            --preset smoke|scale|production\n\
            --root PATH\n\
            --files COUNT\n\
@@ -1361,6 +1514,8 @@ fn print_help() {
            --blob-bytes BYTES\n\
            --blob-range-bytes BYTES\n\
            --network-blob-bytes BYTES\n\
+           --write-at-ops COUNT\n\
+           --write-at-bytes BYTES\n\
            --list-page-size COUNT\n\
            --metadata-batch-size COUNT\n\
            --network-timeout-secs SECONDS\n\
@@ -1372,14 +1527,15 @@ fn print_help() {
            SINOMO_DFS_BENCH_FILE_BYTES, SINOMO_DFS_BENCH_BLOB_BYTES,\n\
            SINOMO_DFS_BENCH_BLOB_RANGE_BYTES,\n\
            SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES,\n\
+           SINOMO_DFS_BENCH_WRITE_AT_OPS, SINOMO_DFS_BENCH_WRITE_AT_BYTES,\n\
            SINOMO_DFS_BENCH_LIST_PAGE_SIZE,\n\
            SINOMO_DFS_BENCH_METADATA_BATCH_SIZE,\n\
            SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS\n\
          \n\
          Presets:\n\
            smoke: 10k files, 64 MiB local blob, 8 MiB network blob, 60s network timeout\n\
-           scale: 100k files, 1 GiB local blob, 512 MiB network blob, 300s network timeout\n\
-           production: 1M files, 4 GiB local blob, 4 GiB network blob, 1800s network timeout\n\
+           scale: 100k files, 1 GiB local blob, 512 MiB network blob, 1k write_at ops, 300s network timeout\n\
+           production: 1M files, 4 GiB local blob, 4 GiB network blob, 8k write_at ops, 1800s network timeout\n\
          \n\
          Byte flags accept B, KB, MB, GB, TB, KiB, MiB, GiB, and TiB suffixes."
     );
@@ -1392,9 +1548,13 @@ struct RepeatingReader {
 
 impl RepeatingReader {
     fn new(bytes: u64) -> Self {
+        Self::with_seed(bytes, 0)
+    }
+
+    fn with_seed(bytes: u64, seed: u64) -> Self {
         Self {
             remaining: bytes,
-            state: 0x9e37_79b9_7f4a_7c15,
+            state: 0x9e37_79b9_7f4a_7c15 ^ seed.wrapping_mul(0xbf58_476d_1ce4_e5b9),
         }
     }
 }
