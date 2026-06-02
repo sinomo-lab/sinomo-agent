@@ -1053,20 +1053,59 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 next_cursor: None,
             });
         }
-        let mut objects = self.child_objects_for_directory(file_system_id, directory_path)?;
-        if let Some(after) = after {
-            objects.retain(|object| directory_page_key(object) > (&after.path, &after.object_id));
-        }
-        let has_more = objects.len() > max_entries;
-        objects.truncate(max_entries);
-        let next_cursor = if has_more {
-            objects.last().map(directory_page_cursor)
+        let directory_path = normalize_posix_path(directory_path);
+        let prefix = if directory_path == "/" {
+            "/".to_string()
         } else {
-            None
+            format!("{}/", directory_path.trim_end_matches('/'))
         };
+        let mut object_cursor = after.map(|cursor| DfsObjectPageCursor {
+            path: cursor.path.clone(),
+            object_id: cursor.object_id.clone(),
+            shard_id: cursor.shard_id.clone(),
+        });
+        let mut objects = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        'pages: loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                object_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for object in page.objects {
+                let object_path = normalize_posix_path(&object.path);
+                if object.kind == DfsObjectKind::Tombstone
+                    || object_path == directory_path
+                    || !object_path.starts_with(&prefix)
+                {
+                    continue;
+                }
+                let rest = object_path.trim_start_matches(&prefix);
+                if rest.is_empty() || rest.contains('/') {
+                    continue;
+                }
+                if objects.len() >= max_entries {
+                    has_more = true;
+                    break 'pages;
+                }
+                let object_cursor = self.object_page_cursor_for_object(&object)?;
+                last_cursor = Some(DfsDirectoryPageCursor {
+                    path: object_cursor.path,
+                    object_id: object_cursor.object_id,
+                    dentry: None,
+                    shard_id: object_cursor.shard_id,
+                });
+                objects.push(object);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            object_cursor = Some(next_cursor);
+        }
         Ok(DfsDirectoryPage {
             objects,
-            next_cursor,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
         })
     }
     fn hardlinks_to_object(
@@ -1114,20 +1153,37 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 next_cursor: None,
             });
         }
-        let mut hardlinks = self.hardlinks_to_object(file_system_id, target_object_id)?;
-        if let Some(after) = after {
-            hardlinks.retain(|object| object_page_key(object) > (&after.path, &after.object_id));
+        let mut object_cursor = after.cloned();
+        let mut hardlinks = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        'pages: loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                object_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for object in page.objects {
+                if object.kind != DfsObjectKind::Hardlink
+                    || object.link_target_object_id.as_ref() != Some(target_object_id)
+                {
+                    continue;
+                }
+                if hardlinks.len() >= max_entries {
+                    has_more = true;
+                    break 'pages;
+                }
+                last_cursor = Some(self.object_page_cursor_for_object(&object)?);
+                hardlinks.push(object);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            object_cursor = Some(next_cursor);
         }
-        let has_more = hardlinks.len() > max_entries;
-        hardlinks.truncate(max_entries);
-        let next_cursor = if has_more {
-            hardlinks.last().map(object_page_cursor)
-        } else {
-            None
-        };
         Ok(DfsObjectPage {
             objects: hardlinks,
-            next_cursor,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
         })
     }
     fn hardlink_count_to_object(
@@ -7694,15 +7750,6 @@ fn local_object_page_cursor(cursor: &DfsObjectPageCursor) -> DfsObjectPageCursor
 
 fn directory_page_key(object: &DfsObjectMetadata) -> (&String, &DfsObjectId) {
     (&object.path, &object.object_id)
-}
-
-fn directory_page_cursor(object: &DfsObjectMetadata) -> DfsDirectoryPageCursor {
-    DfsDirectoryPageCursor {
-        path: object.path.clone(),
-        object_id: object.object_id.clone(),
-        dentry: None,
-        shard_id: None,
-    }
 }
 
 fn directory_page_cursor_with_dentry(
