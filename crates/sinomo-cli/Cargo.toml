@@ -12,8 +12,10 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "application"
 
 [features]
+default = ["sandbox"]
 native-models = ["dep:candle-core", "dep:sinomo-models", "dep:tokenizers"]
-# Enable the build-heavy wasm sandbox runtime (off by default).
+# Enable sandbox execution through the native-module host loader. This does not
+# link the build-heavy WASIX module; it loads an active dylib from the data dir.
 sandbox = ["sinomo-runtime/sandbox"]
 
 [dependencies]
@@ -35,5 +37,5 @@ crossterm = "0.28"
 libc = "0.2"
 
 [dev-dependencies]
-sinomo-sandbox-runtime = { path = "../sinomo-sandbox-runtime" }
+sinomo-sandbox-wasix-module = { path = "../../modules/sandbox/wasix" }
 wat = "1.248.0"

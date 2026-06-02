@@ -241,26 +241,64 @@ pub struct ModuleManifest {
 }
 
 impl ModuleManifest {
-    pub fn r3_wasm(module_id: Id, version: impl Into<String>, owner: impl Into<String>) -> Self {
+    pub fn new(
+        module_id: Id,
+        kind: ModuleKind,
+        version: impl Into<String>,
+        api_version: impl Into<String>,
+        owner: impl Into<String>,
+        target_ring: TrustRing,
+    ) -> Self {
         Self {
             module_id,
-            kind: ModuleKind::WasmComponent,
+            kind,
             version: version.into(),
-            api_version: "sinomo-module-v1".to_string(),
+            api_version: api_version.into(),
             owner: owner.into(),
-            target_ring: TrustRing::R3SandboxedModule,
+            target_ring,
             capabilities: ModuleCapabilities::default(),
             limits: ModuleResourceLimits::default(),
             rollout: RolloutPolicy::default(),
         }
+    }
+
+    pub fn r3_wasm(module_id: Id, version: impl Into<String>, owner: impl Into<String>) -> Self {
+        Self::new(
+            module_id,
+            ModuleKind::WasmComponent,
+            version,
+            "sinomo-module-v1",
+            owner,
+            TrustRing::R3SandboxedModule,
+        )
+    }
+
+    pub fn native_dylib(
+        module_id: Id,
+        version: impl Into<String>,
+        owner: impl Into<String>,
+        api_version: impl Into<String>,
+        target_ring: TrustRing,
+    ) -> Self {
+        Self::new(
+            module_id,
+            ModuleKind::NativeDylib,
+            version,
+            api_version,
+            owner,
+            target_ring,
+        )
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModuleKind {
+    NativeRust,
+    NativeDylib,
     WasmComponent,
     ProcessSandbox,
+    Declarative,
     Prompt,
     Config,
     Policy,
@@ -618,6 +656,26 @@ mod tests {
         let round_tripped: ModuleManifest =
             serde_json::from_value(json).expect("deserialize manifest");
         assert_eq!(round_tripped.target_ring, TrustRing::R3SandboxedModule);
+    }
+
+    #[test]
+    fn native_dylib_module_manifest_is_backend_neutral() {
+        let manifest = ModuleManifest::native_dylib(
+            Id::from_legacy_named("module.sandbox.wasix").expect("module id"),
+            "0.1.0",
+            "sinomo-sandbox",
+            "sinomo.sandbox.wasix.v1",
+            TrustRing::R1TrustedRuntime,
+        );
+
+        let json = serde_json::to_value(&manifest).expect("serialize manifest");
+        assert_eq!(json["kind"], "native-dylib");
+        assert_eq!(json["api_version"], "sinomo.sandbox.wasix.v1");
+        assert_eq!(json["target_ring"], "r1-trusted-runtime");
+
+        let round_tripped: ModuleManifest =
+            serde_json::from_value(json).expect("deserialize manifest");
+        assert_eq!(round_tripped.kind, ModuleKind::NativeDylib);
     }
 
     #[test]

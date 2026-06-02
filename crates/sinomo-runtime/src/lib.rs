@@ -32,19 +32,19 @@ pub mod r1 {
     pub use sinomo_kv as kv;
     pub use sinomo_local as local;
     pub use sinomo_module as module;
+    pub use sinomo_module_api as module_api;
+    pub use sinomo_module_host as module_host;
     pub use sinomo_network as network;
     pub use sinomo_node as node;
     pub use sinomo_policy as policy;
     pub use sinomo_registry as registry;
     pub use sinomo_rollout as rollout;
-    // The `sandbox` facade resolves to the lightweight contracts crate by
-    // default, and to the build-heavy `sinomo-sandbox-runtime` backend (which
-    // re-exports all the contracts plus the wasmtime/WASIX runners) when the
-    // `sandbox` feature is enabled.
-    #[cfg(not(feature = "sandbox"))]
+    // The `sandbox` facade is always the lightweight contracts crate. Runtime
+    // execution is provided by `sandbox_wasix_host`, which loads an active
+    // native-dylib module from content-addressed module cache.
     pub use sinomo_sandbox as sandbox;
-    #[cfg(feature = "sandbox")]
-    pub use sinomo_sandbox_runtime as sandbox;
+    pub use sinomo_sandbox_wasix_api as sandbox_wasix_api;
+    pub use sinomo_sandbox_wasix_host as sandbox_wasix_host;
     pub use sinomo_service as service;
     pub use sinomo_supervision as supervision;
     pub use sinomo_sync as sync;
@@ -95,8 +95,9 @@ pub mod r1 {
 
 pub use r0::core;
 pub use r1::{
-    api, daemon, device, dfs, eval, events, kv, local, module, network, node, policy, registry,
-    rollout, sandbox, service, storage, supervision, sync,
+    api, daemon, device, dfs, eval, events, kv, local, module, module_api, module_host, network,
+    node, policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host, service,
+    storage, supervision, sync,
 };
 
 #[cfg(test)]

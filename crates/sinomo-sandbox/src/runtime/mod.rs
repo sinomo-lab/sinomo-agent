@@ -1,5 +1,5 @@
 //! Sandbox runtime *contracts*: the WASI ABI selector and capability descriptors.
-//! The wasmtime/wasmer execution backends live in the `sinomo-sandbox-runtime`
+//! The wasmtime/wasmer execution backends live in the native WASIX module
 //! crate, behind the `sandbox` feature.
 
 mod abi;

@@ -1190,6 +1190,13 @@ fn slash_command_registry() -> CommandSpec {
                 vec![],
             ),
             cmd(
+                "module",
+                "manage local module activation",
+                module_children(),
+                vec![],
+                vec![],
+            ),
+            cmd(
                 "sandbox",
                 "manage local sandbox instances and toolchains",
                 sandbox_children(),
@@ -2008,6 +2015,44 @@ fn evolve_children() -> Vec<CommandSpec> {
     ]
 }
 
+fn module_children() -> Vec<CommandSpec> {
+    vec![
+        cmd(
+            "native-dylib",
+            "manage trusted native-dylib modules",
+            vec![cmd(
+                "activate",
+                "install and activate a trusted native module",
+                vec![],
+                opts(&[
+                    "--module",
+                    "--artifact",
+                    "--interface",
+                    "--cache-key",
+                    "--library-name",
+                    "--source",
+                ]),
+                vec![value("library", "native dynamic library path", &[])],
+            )],
+            vec![],
+            vec![],
+        ),
+        cmd(
+            "wasix",
+            "manage the WASIX sandbox runtime module",
+            vec![cmd(
+                "activate",
+                "activate module.sandbox.wasix from a native library",
+                vec![],
+                opts(&["--artifact", "--library-name", "--source"]),
+                vec![value("library", "WASIX native dynamic library path", &[])],
+            )],
+            vec![],
+            vec![],
+        ),
+    ]
+}
+
 fn cmd(
     word: &'static str,
     detail: &'static str,
@@ -2137,6 +2182,10 @@ fn option_placeholder(name: &str) -> &'static str {
         "--filesystem" => "file-system-id",
         "--object" => "object-id",
         "--dfs-path" => "dfs-path",
+        "--module" | "--module-id" => "module-id",
+        "--interface" | "--interface-version" => "version",
+        "--cache-key" => "path-key",
+        "--library-name" => "file-name",
         "--id" => "id",
         "--toolchain" => "toolchain-id",
         "--mount" => "sifs-path:mount-path[:ro|rw]",
@@ -2176,6 +2225,12 @@ fn option_detail(name: &str) -> &'static str {
         "--port" => "port number",
         "--repo" => "repository path",
         "--path" => "filesystem path",
+        "--module" | "--module-id" => "module id",
+        "--artifact" | "--artifact-id" => "module artifact id",
+        "--interface" | "--interface-version" => "module interface version",
+        "--cache-key" => "content-addressed cache path key",
+        "--library-name" => "native library file name",
+        "--source" => "source label",
         "--target" => "target host:port",
         "--daemon" => "use daemon-backed storage",
         "--mode" => "mode value",
@@ -2340,6 +2395,33 @@ mod tests {
                 .any(|item| item.label == "raft-role")
         );
         assert!(!completions.items.iter().any(|item| item.label == "health"));
+    }
+
+    #[test]
+    fn slash_completion_lists_module_activation_commands() {
+        let completions = slash_completions("/module ", "/module ".len()).expect("module");
+
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == "native-dylib")
+        );
+        assert!(completions.items.iter().any(|item| item.label == "wasix"));
+
+        let options = slash_completions(
+            "/module wasix activate --",
+            "/module wasix activate --".len(),
+        )
+        .expect("wasix activate options");
+
+        assert!(options.items.iter().any(|item| item.label == "--artifact"));
+        assert!(
+            options
+                .items
+                .iter()
+                .any(|item| item.label == "--library-name")
+        );
     }
 
     #[test]

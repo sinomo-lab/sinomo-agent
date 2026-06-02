@@ -4988,9 +4988,11 @@ fn write_self_evolution_module_replay_report(
             source_event: None,
         }],
     };
-    let report =
-        sinomo_sandbox_runtime::run_sandbox_wasm_module_replay_fixture(data_dir_root, &fixture)
-            .expect("sandbox module replay");
+    let report = sinomo_sandbox_wasix_module::run_sandbox_wasm_module_replay_fixture(
+        data_dir_root,
+        &fixture,
+    )
+    .expect("sandbox module replay");
     assert_eq!(report.missing_route_count, 0);
     assert_eq!(report.primary_error_count, 0);
     assert_eq!(report.shadow_error_count, 0);
@@ -14147,7 +14149,7 @@ fn invoke_bad_candidate_for_self_evolution_flow(
     event_store: &mut JsonlEventStore,
 ) -> ModuleInvocationOutcome {
     let runner =
-        sinomo_sandbox_runtime::SandboxWasmModuleArtifactRunner::from_data_dir(data_dir_root)
+        sinomo_sandbox_wasix_module::SandboxWasmModuleArtifactRunner::from_data_dir(data_dir_root)
             .expect("sandbox wasm module runner");
     execute_routed_module_invocation_with_event_store(
         data_dir_root,

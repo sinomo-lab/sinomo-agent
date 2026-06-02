@@ -1649,7 +1649,7 @@ pub fn handle_daemon_sandbox_run_process_plan(
 }
 
 /// Error returned by sandbox-execution RPC handlers when the daemon was built
-/// without the `sandbox` feature, so the build-heavy `sinomo-sandbox-runtime`
+/// without the `sandbox` feature, so the build-heavy native WASIX module
 /// backend is not linked in.
 #[cfg(not(feature = "sandbox"))]
 fn sandbox_runtime_not_compiled_error() -> DaemonError {
@@ -1705,11 +1705,12 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink(
         dfs = store.into_inner();
         manifest.command_history
     };
-    let runner = sinomo_sandbox_runtime::SifsStagedSandboxCommandRunner::new()
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })?
-        .with_replica_candidates(replica_candidates);
+    let runner =
+        sinomo_sandbox_wasix_host::SandboxWasixSifsCommandRunner::from_active_module(&data_dir)
+            .map_err(|source| DaemonError::Parse {
+                detail: source.to_string(),
+            })?
+            .with_replica_candidates(replica_candidates);
     let outcome = match runner.run_toolchain_process_plan_with_policy_and_output_sink(
         dfs,
         &local_store,
@@ -1907,11 +1908,12 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink(
     let local_store = sinomo_sandbox::LocalSandboxInstanceStore::new(
         data_dir.join("sandbox").join("tmp").join("daemon-staging"),
     );
-    let runner = sinomo_sandbox_runtime::SifsStagedSandboxCommandRunner::new()
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })?
-        .with_replica_candidates(replica_candidates);
+    let runner =
+        sinomo_sandbox_wasix_host::SandboxWasixSifsCommandRunner::from_active_module(&data_dir)
+            .map_err(|source| DaemonError::Parse {
+                detail: source.to_string(),
+            })?
+            .with_replica_candidates(replica_candidates);
     let outcome = match runner.run_toolchain_command_with_stdin_policy_and_output_sink(
         dfs,
         &local_store,

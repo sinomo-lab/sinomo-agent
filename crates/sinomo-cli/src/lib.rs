@@ -813,6 +813,7 @@ pub(crate) enum CliCommand {
     Evolve(EvolveCliCommand),
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
+    Module(ModuleCliCommand),
     Dfs(DfsCliCommand),
     Sandbox(SandboxCliCommand),
     Models(ModelsCliCommand),
@@ -863,6 +864,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         }
         Some((command, rest)) if command == "rollout" => {
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
+        }
+        Some((command, rest)) if command == "module" => {
+            Ok(CliCommand::Module(parse_module_command(rest)?))
         }
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
         Some((command, rest)) if command == "sandbox" => {
@@ -1320,6 +1324,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
+        CliCommand::Module(command) => run_module_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Sandbox(command) => run_sandbox_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),

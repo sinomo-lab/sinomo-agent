@@ -117,6 +117,21 @@ pub struct ModuleLoaderRuntimeState {
     pub applied_at: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeDylibModuleLoaderState {
+    pub module_id: ModuleId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<ArtifactId>,
+    pub content_hash: String,
+    pub cache_key: String,
+    pub library_name: String,
+    pub platform_triple: String,
+    pub native_abi_version: u32,
+    pub interface_version: String,
+    pub activated_at: String,
+    pub source: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct ModuleLocalCommandRegistry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -784,6 +799,112 @@ pub trait ModuleArtifactRunner {
     fn invoke(&self, invocation: &ModuleArtifactInvocation) -> Result<String, String>;
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleRegistration {
+    pub manifest: sinomo_core::ModuleManifest,
+    pub backend: ModuleBackendRegistration,
+}
+
+impl ModuleRegistration {
+    pub fn module_id(&self) -> &ModuleId {
+        &self.manifest.module_id
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "backend", rename_all = "kebab-case")]
+pub enum ModuleBackendRegistration {
+    NativeRust {
+        registration_key: String,
+    },
+    NativeDylib {
+        artifact_id: ArtifactId,
+        content_hash: String,
+        library_name: String,
+        platform_triple: String,
+        interface_version: String,
+    },
+    Declarative {
+        payload_ref: String,
+    },
+    SandboxProcess {
+        artifact_id: ArtifactId,
+        command: String,
+    },
+    WasmComponent {
+        artifact_id: ArtifactId,
+        interface_version: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ModuleRegistry {
+    registrations: BTreeMap<ModuleId, ModuleRegistration>,
+    registration_order: Vec<ModuleId>,
+}
+
+impl ModuleRegistry {
+    pub fn builder() -> ModuleRegistryBuilder {
+        ModuleRegistryBuilder::default()
+    }
+
+    pub fn get(&self, module_id: &ModuleId) -> Option<&ModuleRegistration> {
+        self.registrations.get(module_id)
+    }
+
+    pub fn contains(&self, module_id: &ModuleId) -> bool {
+        self.registrations.contains_key(module_id)
+    }
+
+    pub fn registrations(&self) -> impl Iterator<Item = &ModuleRegistration> {
+        self.registration_order
+            .iter()
+            .filter_map(|module_id| self.registrations.get(module_id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.registrations.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModuleRegistryBuilder {
+    registrations: BTreeMap<ModuleId, ModuleRegistration>,
+    registration_order: Vec<ModuleId>,
+}
+
+impl ModuleRegistryBuilder {
+    pub fn register(
+        mut self,
+        registration: ModuleRegistration,
+    ) -> Result<Self, ModuleRegistryError> {
+        let module_id = registration.module_id().clone();
+        if self.registrations.contains_key(&module_id) {
+            return Err(ModuleRegistryError::DuplicateModuleId { module_id });
+        }
+        self.registration_order.push(module_id.clone());
+        self.registrations.insert(module_id, registration);
+        Ok(self)
+    }
+
+    pub fn build(self) -> ModuleRegistry {
+        ModuleRegistry {
+            registrations: self.registrations,
+            registration_order: self.registration_order,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ModuleRegistryError {
+    #[error("duplicate module registration for {module_id}")]
+    DuplicateModuleId { module_id: ModuleId },
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalCommandModuleArtifactRunner {
     registry: ModuleLocalCommandRegistry,
@@ -896,6 +1017,17 @@ pub fn module_loader_state_path(data_dir_root: &Path, module_id: &ModuleId) -> P
     module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
 }
 
+pub fn native_dylib_module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join("native-dylib")
+}
+
+pub fn native_dylib_module_loader_state_path(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> PathBuf {
+    native_dylib_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
+}
+
 pub fn module_local_command_registry_path(data_dir_root: &Path) -> PathBuf {
     data_dir_root
         .join("module")
@@ -918,6 +1050,26 @@ pub fn write_module_loader_runtime_state(
     state: &ModuleLoaderRuntimeState,
 ) -> Result<PathBuf, ModuleLoaderStoreError> {
     let path = module_loader_state_path(data_dir_root, &state.module_id);
+    write_object(&path, state)?;
+    Ok(path)
+}
+
+pub fn read_native_dylib_module_loader_state(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> Result<Option<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
+    let path = native_dylib_module_loader_state_path(data_dir_root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_object(&path).map(Some)
+}
+
+pub fn write_native_dylib_module_loader_state(
+    data_dir_root: &Path,
+    state: &NativeDylibModuleLoaderState,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let path = native_dylib_module_loader_state_path(data_dir_root, &state.module_id);
     write_object(&path, state)?;
     Ok(path)
 }
@@ -1896,6 +2048,37 @@ pub fn register_storage_paths(
         .field("reason", "String")
         .field("applied_at", "String"),
     )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/loader-state/native-dylib",
+        "node-local native-dylib module activation records keyed by module id",
+    )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/cache/native-dylib",
+        "content-addressed native dynamic-library module cache",
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/loader-state/native-dylib/example.sobj",
+        sinomo_storage::ObjectSchema::new(
+            "NativeDylibModuleLoaderState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("module_id", "ModuleId")
+        .field("artifact_id", "Option<ArtifactId>")
+        .field("content_hash", "String")
+        .field("cache_key", "String")
+        .field("library_name", "String")
+        .field("platform_triple", "String")
+        .field("native_abi_version", "u32")
+        .field("interface_version", "String")
+        .field("activated_at", "String")
+        .field("source", "String"),
+    )?;
     layout.register_sinomo_object(
         "sinomo-module",
         StorageRing::R1,
@@ -1920,6 +2103,92 @@ mod tests {
     use std::collections::BTreeMap;
 
     type PolicyDecisionId = Id;
+
+    #[test]
+    fn module_registry_preserves_registration_order_and_rejects_duplicates() {
+        let first_module_id =
+            ModuleId::from_legacy_named("module.agent.prompt_pack").expect("module");
+        let second_module_id = ModuleId::from_legacy_named("module.sandbox.wasix").expect("module");
+        let first = ModuleRegistration {
+            manifest: ModuleManifest::r3_wasm(first_module_id.clone(), "0.1.0", "agent"),
+            backend: ModuleBackendRegistration::Declarative {
+                payload_ref: "config://modules/module/agent/prompt_pack/payload".to_string(),
+            },
+        };
+        let second = ModuleRegistration {
+            manifest: ModuleManifest::native_dylib(
+                second_module_id.clone(),
+                "0.1.0",
+                "sandbox",
+                "sinomo.sandbox.wasix.v1",
+                TrustRing::R1TrustedRuntime,
+            ),
+            backend: ModuleBackendRegistration::NativeDylib {
+                artifact_id: ArtifactId::from_legacy_named("artifact_wasix_dylib")
+                    .expect("artifact"),
+                content_hash: "blake3:abc".to_string(),
+                library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
+                platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+                interface_version: "sinomo.sandbox.wasix.v1".to_string(),
+            },
+        };
+
+        let duplicate = ModuleRegistry::builder()
+            .register(first.clone())
+            .expect("first")
+            .register(first.clone())
+            .expect_err("duplicate module id");
+        assert!(matches!(
+            duplicate,
+            ModuleRegistryError::DuplicateModuleId { module_id } if module_id == first_module_id
+        ));
+
+        let registry = ModuleRegistry::builder()
+            .register(first)
+            .expect("first")
+            .register(second)
+            .expect("second")
+            .build();
+
+        let ordered_ids = registry
+            .registrations()
+            .map(|registration| registration.module_id().clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered_ids, vec![first_module_id, second_module_id]);
+        assert!(registry.contains(&ordered_ids[0]));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn native_dylib_loader_state_roundtrips_from_data_dir() {
+        let root = unique_temp("native-dylib-loader-state");
+        let module_id = ModuleId::from_legacy_named("module.sandbox.wasix").expect("module");
+        let state = NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: Some(
+                ArtifactId::from_legacy_named("artifact_wasix_dylib").expect("artifact"),
+            ),
+            content_hash: "blake3:abc".to_string(),
+            cache_key: "module/sandbox/wasix".to_string(),
+            library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo.sandbox.wasix.v1".to_string(),
+            activated_at: module_loader_applied_at_now(),
+            source: "local".to_string(),
+        };
+
+        let path = write_native_dylib_module_loader_state(&root, &state).expect("write state");
+        assert_eq!(
+            path,
+            native_dylib_module_loader_state_path(&root, &module_id)
+        );
+        let read_back = read_native_dylib_module_loader_state(&root, &module_id)
+            .expect("read state")
+            .expect("state");
+        assert_eq!(read_back, state);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn r3_allowed_artifact_loads_in_shadow() {

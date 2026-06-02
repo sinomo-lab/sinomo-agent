@@ -352,7 +352,7 @@ Initial crate ownership:
 | Group | Crates |
 |---|---|
 | R0 | `sinomo-core` |
-| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync` |
+| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-module-api`, `sinomo-module-host`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync` |
 | R0/R1 boundary | `sinomo-runtime` |
 | R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-trigger`, `sinomo-video`, `sinomo-voice` |
 | Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli` |
@@ -568,7 +568,9 @@ sinomo-agent/
     sinomo-dfs/           # Local-first distributed workspace filesystem
     sinomo-policy/        # Trusted policy decision contracts and verifier
     sinomo-registry/      # Module artifact registry and provenance metadata
-    sinomo-module/        # Module manifests, interfaces, and node-local loader state
+    sinomo-module/        # Module lifecycle, registry, routing, and node-local loader state
+    sinomo-module-api/    # Stable native dynamic-library module ABI
+    sinomo-module-host/   # Trusted native dynamic-library loading backend
     sinomo-sandbox/       # Sandboxed candidate execution and test jobs
     sinomo-eval/          # Evaluation definitions, replay suites, and scorecards
     sinomo-evolution/     # Evolution job orchestration
@@ -736,6 +738,30 @@ Responsibilities:
 - Verify manifests and artifact compatibility before load.
 - Support activation, drain, quiesce, hot-swap, and rollback state transitions.
 - Emit module load, unload, shadow decision, crash, timeout, and policy-blocked events.
+
+### `sinomo-module-api`
+
+Stable native dynamic-library module ABI.
+
+Responsibilities:
+
+- Define C-compatible byte buffer, status, descriptor, host callback, and
+  invocation entrypoint types.
+- Define generic SOBJ request and response envelopes for native module
+  invocation.
+- Stay independent of dynamic loading, sandbox execution, Wasm runtimes, and
+  high-level services.
+
+### `sinomo-module-host`
+
+Trusted native dynamic-library loader.
+
+Responsibilities:
+
+- Verify content hashes before loading native module artifacts.
+- Check ABI, interface, module identity, and platform descriptors.
+- Invoke modules through the generic `sinomo-module-api` C/SOBJ boundary.
+- Keep dynamic loading separate from typed module-specific host wrappers.
 
 ### `sinomo-sandbox`
 

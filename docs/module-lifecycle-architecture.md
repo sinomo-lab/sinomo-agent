@@ -9,17 +9,21 @@ architecture for that purpose.
 
 The goal is not to make WebAssembly the default extension format. The goal is
 to make behavior independently buildable, inspectable, testable, routable, and
-reversible. Native Rust modules, declarative capsules, sandboxed processes, and
-future Wasm components should all fit behind the same lifecycle model when that
-model is useful.
+reversible. Static native Rust modules, native dynamic libraries, declarative
+capsules, sandboxed processes, and future Wasm components should all fit behind
+the same lifecycle model when that model is useful.
 
 ## Design Goals
 
 - Separate module lifecycle from module execution backend.
 - Support independently versioned and rolled-out behavior units.
+- Reduce rebuild cost by allowing modules to become independently buildable
+  artifacts when the module boundary is stable enough.
 - Make self-evolution targets smaller than the whole Sinomo source tree when
   the target naturally fits a module boundary.
 - Preserve Rust-native implementation paths for first-party behavior.
+- Support trusted native dynamic-library modules on platforms where dynamic
+  loading is a practical deployment mechanism.
 - Support declarative modules for prompts, configs, tool descriptors, eval
   suites, routing rules, and policy-adjacent data.
 - Keep Wasm/components optional for third-party, generated, or cross-language
@@ -31,6 +35,8 @@ model is useful.
 
 - Do not require Wasm for every module.
 - Do not make modules a substitute for sandboxing.
+- Do not treat native dynamic libraries as security isolation. They share the
+  host process address space and are suitable only for trusted code.
 - Do not assume a general policy engine can understand every tool's domain
   semantics.
 - Do not introduce runtime extensibility for R0/R1 continuity code before the
@@ -60,6 +66,7 @@ The same lifecycle can apply to multiple backend kinds:
 | Backend | Use Case | Runtime Loading |
 |---|---|---|
 | `native-rust` | First-party trusted behavior compiled into Sinomo | Registered by Rust code at process startup. |
+| `native-dylib` | Trusted first-party behavior built separately for desktop/server platforms | Loaded from signed, content-addressed shared-library artifacts through the stable `sinomo-module-api` C/SOBJ ABI. |
 | `declarative` | Prompts, configs, tool descriptors, eval fixtures, routing tables | Loaded as structured data from registry/DFS/local config. |
 | `sandbox-process` | CLI tools, adapters, benchmark runners, generated tool wrappers | Executed by `sinomo-sandbox` or a constrained command runner. |
 | `wasm-component` | Third-party or generated procedural extensions needing stronger ABI isolation | Optional future runner, not a hard dependency. |
@@ -107,7 +114,7 @@ backend neutral:
 ```text
 module_id: module.trigger.silence_policy
 version: 0.3.0
-backend: native-rust | declarative | sandbox-process | wasm-component
+backend: native-rust | native-dylib | declarative | sandbox-process | wasm-component
 interface: tool | evaluator | trigger | planner | adapter | prompt-pack | policy-data
 artifact_ref: registry://artifact/...
 payload_ref: dfs://...
@@ -117,6 +124,8 @@ compatibility:
   min_host: ...
   max_host: ...
   interface_version: ...
+  module_abi_version: ...
+  platform_triple: ...
 declared_capabilities:
   - dfs.read:/workspace/repo
   - network.public-vulnerability-db
@@ -156,7 +165,7 @@ single canonical escaping function rather than ad hoc path construction.
 
 ## Execution Backends
 
-### Native Rust
+### Static Native Rust
 
 Native Rust modules are compiled into the Sinomo binary and registered at
 startup.
@@ -195,6 +204,97 @@ magic. A build step can scan crate metadata and module declaration files, reject
 duplicate module IDs, verify interface/backend compatibility, and generate a
 stable table that the binary includes at compile time.
 
+### Native Dynamic Libraries
+
+Native dynamic-library modules are trusted native artifacts built separately
+from the main `sinomo` binary and loaded at runtime as `.so`, `.dylib`, or
+`.dll` files on platforms where this is supported.
+
+This backend is useful when:
+
+- a first-party module is large enough to materially affect build time,
+- the module boundary is stable enough to build and test independently,
+- the code should stay native Rust without introducing a Wasm runtime,
+- the module can be rolled out as an artifact without replacing the whole host
+  binary,
+- the operator accepts that this is build and deployment isolation, not a
+  security sandbox.
+
+Native dynamic libraries run in the host process. A faulty module can corrupt
+memory, leak resources, deadlock, or crash the daemon. They should therefore be
+limited to trusted code and gated like other host-process code. Untrusted,
+third-party, or generated procedural behavior should start as `sandbox-process`
+or, when justified, `wasm-component`.
+
+The dynamic boundary should not expose Rust trait objects, generic types,
+`serde_json::Value`, futures, host-owned allocations, or unstable Rust ABI
+details. The boundary should be a small C ABI that exchanges Sinomo object bytes
+and versioned host function tables:
+
+```text
+sinomo_module_api_version() -> u32
+sinomo_module_descriptor(out: *mut ByteBuffer) -> Status
+sinomo_module_init(host: HostApiV1) -> Status
+sinomo_module_invoke(request_sobj: ByteSlice, response_sobj: *mut ByteBuffer) -> Status
+sinomo_module_shutdown() -> Status
+sinomo_module_free_buffer(buffer: ByteBuffer)
+```
+
+The request and response envelopes should be SOBJ-encoded typed module
+invocation records. The descriptor should include module ID, version, backend,
+interface, ABI version, platform triple, required host capabilities, declared
+resource expectations, and content hash.
+
+The host side should:
+
+- load only signed artifacts whose content hash matches the capsule,
+- verify host version, module ABI version, interface version, and platform
+  triple before loading,
+- load artifacts from content-addressed paths so an active library file is never
+  overwritten in place,
+- catch unwinds at the FFI boundary where possible and convert them into module
+  telemetry,
+- treat unloading as best-effort and not as a correctness requirement,
+- rely on shadow/main process restart to reclaim old libraries after version
+  replacement,
+- run replay and health checks in shadow before canary traffic reaches a loaded
+  native dynamic module.
+
+This backend implies a separate build artifact flow. A module crate can produce
+a `cdylib` plus a manifest/capsule, while the main binary depends only on the
+stable module API and host loader. The workspace should avoid compiling every
+dynamic module during normal host builds; dynamic modules can be outside default
+workspace members or built by an explicit command such as:
+
+```text
+sinomo module build <module-id>
+sinomo module register <module-artifact>
+```
+
+The initial implementation should support native dynamic libraries only on
+desktop/server platforms where dynamic loading and operator debugging are
+straightforward. Other platforms can reject `native-dylib` modules during
+compatibility checks and continue using static native, declarative,
+sandbox-process, or optional Wasm backends.
+
+Native dynamic module crates live under the top-level `modules/` tree rather
+than under `crates/`. The main Cargo workspace may include them as members so
+they can share dependency and lint configuration, but they must stay outside
+`default-members`. A normal `cargo build`, `cargo check`, or `cargo build -p
+sinomo` should build the host, generic module API, and host loader only. A
+specific native module is built explicitly by package name or module tooling.
+
+The first native dynamic module is the WASIX sandbox execution engine at:
+
+```text
+modules/sandbox/wasix/
+```
+
+The main binary keeps `sinomo-sandbox` contracts, policy, stores, command
+records, SIFS/local filesystem logic, and loader state. The module owns the
+build-heavy Wasmtime/Wasmer/WASIX execution machinery and exports the generic
+native module ABI with a WASIX-specific SOBJ payload interface.
+
 ### Declarative
 
 Declarative modules have no executable code. They are structured data consumed
@@ -230,13 +330,18 @@ $SINOMO_DATA_DIR/config/modules/catalog.toml
 $SINOMO_DATA_DIR/config/modules/<module-path-key>/module.toml
 $SINOMO_DATA_DIR/config/modules/<module-path-key>/payload/
 $SINOMO_DATA_DIR/module/loader-state/<module-id>.sobj
+$SINOMO_DATA_DIR/module/loader-state/native-dylib/<module-id>.sobj
 $SINOMO_DATA_DIR/module/cache/cluster-modules/<module-path-key>/
+$SINOMO_DATA_DIR/module/cache/native-dylib/<module-path-key>/<content-hash>/
 ```
 
 The `config/modules` tree is human-editable local configuration. The
-`module/loader-state` tree is node-local applied runtime state. The cache path
-is optional and should only mirror cluster-owned module content; it must not
-become authoritative when the node is clustered.
+`module/loader-state` tree is node-local applied runtime state. Native-dylib
+loader records point at content-addressed cache entries and carry the artifact
+hash, module cache key, library filename, platform metadata, native ABI version,
+and interface version. The cache path is optional and should only mirror
+cluster-owned module content; it must not become authoritative when the node is
+clustered.
 
 ### Sandbox Process
 
@@ -273,12 +378,43 @@ earns its cost:
 - cross-language extension authorship,
 - stronger crash and resource isolation than native Rust,
 - ABI stability across host upgrades,
-- dynamic loading without rebuilding the main binary.
+- portable dynamic loading without rebuilding the main binary.
 
 Wasm should not be the universal module format. It should be behind an optional
 runner and should use specific typed interfaces when introduced. A generic
 `run(input_json) -> output_json` boundary is useful for early experiments, but
 stable tools and evaluators should eventually use narrower interface contracts.
+
+## Runtime Assembly
+
+The runtime module registry should be assembled from multiple sources in a
+deterministic order:
+
+```text
+generated static native registry
+  + local declarative module config
+  + cluster desired module state
+  + trusted native dynamic-library artifacts
+  + sandbox-process module packages
+  + optional Wasm component artifacts
+  -> ModuleRegistry
+```
+
+The generated static registry gives the host a known baseline. Local
+declarative config supports development and pre-cluster operation. When the node
+is clustered, cluster desired state is authoritative for shared modules and can
+select dynamic, sandbox-process, or Wasm artifacts by content hash.
+
+Runtime assembly should never search arbitrary directories for executable
+modules. All executable artifacts should be selected by manifest, content hash,
+signature, backend compatibility, and rollout/loader state. This prevents module
+loading from becoming ambient plugin discovery.
+
+Static native modules are available immediately at process startup. Dynamic
+native modules and sandbox/Wasm artifacts are materialized lazily or during
+loader reconciliation from local cache, registry, or cluster-owned storage. The
+loader records the applied version and lane locally so routing remains stable
+between reconciliation passes.
 
 ## Lifecycle
 
@@ -378,12 +514,18 @@ Common gates:
 
 Backend-specific gates can be added when needed:
 
-- native Rust: crate tests, feature compatibility, binary rollout readiness,
+- static native Rust: crate tests, feature compatibility, binary rollout
+  readiness,
+- native dynamic library: ABI compatibility, platform compatibility, symbol
+  validation, signature verification, host-process crash telemetry, shadow
+  daemon health checks, and unload/restart behavior,
 - declarative: schema validation, semantic linting, dry-run replay,
 - sandbox process: sandbox policy validation, command determinism, network and
   filesystem access checks,
 - Wasm component: component validation, interface compatibility, fuel/memory
-  limits.
+  limits. For WASIX-backed Sinomo module artifacts, component validation is a
+  `ValidateComponent` request handled by the active `module.sandbox.wasix`
+  native-dylib module, not by the shipped CLI binary.
 
 Evaluation outputs should feed `sinomo-eval` scorecards and `module.*`
 telemetry events.
@@ -395,6 +537,7 @@ Policy is layered, but not omniscient.
 Host-level policy can decide coarse authority:
 
 - which module backend is allowed,
+- whether `native-dylib` is allowed on this node and platform,
 - which filesystem roots are visible,
 - which network class is available,
 - which secrets or devices are available,
@@ -435,9 +578,16 @@ source or declarative payload
   -> node-local loader state
 ```
 
-Native Rust modules may share the Sinomo binary artifact. In that case, the
-module capsule points to the binary artifact plus a module registration record
-inside that build.
+Static native Rust modules may share the Sinomo binary artifact. In that case,
+the module capsule points to the binary artifact plus a module registration
+record inside that build.
+
+Native dynamic-library modules point to signed shared-library artifacts plus a
+module descriptor record. The artifact record must include content hash,
+platform triple, module ABI version, interface version, build profile, source
+revision, and signer provenance. The loader should copy or materialize the
+artifact under a content-addressed path before loading it, rather than loading
+directly from mutable staging paths.
 
 Declarative modules point to signed/configured structured data.
 
@@ -458,7 +608,11 @@ Self-evolution should target the narrowest natural unit:
 
 - source patch when the change affects trusted Rust infrastructure,
 - declarative capsule when the change is prompt/config/eval/tool metadata,
-- native module when the change is first-party modular behavior,
+- static native module when the change is first-party modular behavior that
+  should remain compiled into the host,
+- native dynamic-library module when the change is trusted first-party behavior
+  whose build and rollout boundary is stable enough to justify a separate
+  native artifact,
 - sandbox-process module when the change is an external or generated tool,
 - Wasm component only when dynamic procedural extension isolation is worth the
   runtime cost.
@@ -471,8 +625,14 @@ For generated tools, the expected progression is:
 1. generated declarative tool descriptor,
 2. sandbox-process prototype,
 3. replay and private regression evidence,
-4. optional Wasm component packaging if the tool needs long-lived dynamic
-   loading or third-party distribution.
+4. optional native dynamic-library packaging only after the code is trusted and
+   first-party enough to share the host process,
+5. optional Wasm component packaging if the tool needs long-lived dynamic
+   loading, third-party distribution, or stronger ABI/resource isolation.
+
+The planner should treat native dynamic libraries as a way to reduce build and
+deployment blast radius for trusted native code. It should not use them as the
+default containment answer for generated code.
 
 ## Crate Responsibilities
 
@@ -499,6 +659,41 @@ must not depend on `sinomo-module`.
 It should expose a `ModuleRegistry`/`ModuleRegistryBuilder` shape similar to
 `ServiceRegistry`, rejecting duplicate module IDs and preserving deterministic
 registration order.
+
+### `sinomo-module-api`
+
+Owns the minimal stable ABI shared between native dynamic-library modules and
+the host:
+
+- ABI version constants,
+- C-compatible byte buffer and status types,
+- SOBJ request and response envelope schemas,
+- module descriptor schema,
+- host function table versions.
+
+This crate must remain small and conservative. It should not depend on the
+dynamic loader, Wasm runtime, sandbox runtime, or high-level services.
+
+The generic native ABI uses a small C surface with SOBJ request/response
+envelopes. Backend-specific protocols, such as `sinomo.sandbox.wasix.v1`, ride
+inside the generic invocation payload instead of defining their own dynamic
+library ABI.
+
+### `sinomo-module-host`
+
+Owns native dynamic-library loading as an optional host backend:
+
+- content-addressed library materialization,
+- platform and ABI compatibility checks,
+- symbol lookup,
+- host function table construction,
+- invocation through the stable C/SOBJ boundary,
+- crash/error telemetry conversion,
+- best-effort shutdown and restart-oriented replacement semantics.
+
+If this remains inside `sinomo-module` initially, it should still be feature
+gated and structured as a separable backend so non-desktop builds and minimal
+deployments do not inherit dynamic-loading requirements.
 
 ### `sinomo-registry`
 
@@ -568,17 +763,43 @@ The concept should be refactored in place toward backend neutrality:
 
 1. Introduce backend-neutral module manifest types in `sinomo-core`.
 2. Add generated native module registration tables.
-3. Define declarative module loading from local config plus cluster DFS state,
+3. Define a minimal `sinomo-module-api` ABI for native dynamic libraries.
+4. Add an optional native dynamic-library host backend that loads signed
+   content-addressed artifacts through that ABI.
+5. Define declarative module loading from local config plus cluster DFS state,
    with cluster state taking precedence when present.
-4. Rename or generalize Wasm-specific constants so they do not define the main
+6. Rename or generalize Wasm-specific constants so they do not define the main
    module concept.
-5. Keep `ModuleArtifactRunner` as the backend runner abstraction.
-6. Move Wasm-specific execution behind `sinomo-sandbox` or an optional backend
-   crate/feature.
-7. Add native and declarative backend records before expanding Wasm.
-8. Update self-evolution docs so R3 modules are not described as Wasm-first.
-9. Keep current replay, routing, and telemetry tests as lifecycle regression
+7. Keep `ModuleArtifactRunner` as the backend runner abstraction.
+8. Move Wasm-specific execution behind `sinomo-sandbox` or an optional backend
+   crate/feature. WASIX execution is the first implementation and lives in
+   `modules/sandbox/wasix`.
+9. Add static native, native dynamic-library, and declarative backend records
+   before expanding Wasm.
+10. Update self-evolution docs so R3 modules are not described as Wasm-first.
+11. Keep current replay, routing, and telemetry tests as lifecycle regression
    coverage.
+
+Current WASIX split:
+
+- `sinomo-sandbox` keeps contracts, policy, stores, file-system sync helpers,
+  command records, and output/event types.
+- `sinomo-sandbox-wasix-host` owns host-side loading plus local/SIFS staging and
+  reconcile. It loads `module.sandbox.wasix` from
+  `$SINOMO_DATA_DIR/module/cache/native-dylib/module/sandbox/wasix/<hash>/...`
+  using the node-local native-dylib loader-state record.
+- `modules/sandbox/wasix` owns the WASIX/Wasmtime/Wasmer execution engine and
+  exposes only the C ABI plus SOBJ envelopes.
+- Local activation is explicit:
+  `sinomo module wasix activate <libsinomo_sandbox_wasix_module.so>`. The
+  generic path is
+  `sinomo module native-dylib activate [--module <module-id>] [--interface <version>] <library>`.
+  Both commands validate the dylib descriptor, copy the library into the
+  content-addressed native-dylib cache, and write
+  `$SINOMO_DATA_DIR/module/loader-state/native-dylib/<module-id>.sobj`.
+- The shipped `sinomo` binary does not depend on `sinomo-sandbox-wasix-module`,
+  Wasmtime, or Wasmer; sandbox execution returns a normal runtime-unavailable
+  error when no active WASIX native module is installed.
 
 ## Open Questions
 

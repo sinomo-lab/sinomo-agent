@@ -3,6 +3,54 @@ resolver = "3"
 
 members = [
     "crates/*",
+    "modules/*/*",
+]
+
+default-members = [
+    "crates/sinomo",
+    "crates/sinomo-actions",
+    "crates/sinomo-agent",
+    "crates/sinomo-api",
+    "crates/sinomo-app",
+    "crates/sinomo-audio",
+    "crates/sinomo-benchmarks",
+    "crates/sinomo-cli",
+    "crates/sinomo-core",
+    "crates/sinomo-daemon",
+    "crates/sinomo-deliberation",
+    "crates/sinomo-device",
+    "crates/sinomo-dfs",
+    "crates/sinomo-eval",
+    "crates/sinomo-events",
+    "crates/sinomo-evolution",
+    "crates/sinomo-fusion",
+    "crates/sinomo-gateway",
+    "crates/sinomo-kv",
+    "crates/sinomo-lm",
+    "crates/sinomo-local",
+    "crates/sinomo-memory",
+    "crates/sinomo-models",
+    "crates/sinomo-module",
+    "crates/sinomo-module-api",
+    "crates/sinomo-module-host",
+    "crates/sinomo-network",
+    "crates/sinomo-node",
+    "crates/sinomo-object",
+    "crates/sinomo-policy",
+    "crates/sinomo-pytorch",
+    "crates/sinomo-registry",
+    "crates/sinomo-rollout",
+    "crates/sinomo-runtime",
+    "crates/sinomo-sandbox",
+    "crates/sinomo-sandbox-wasix-api",
+    "crates/sinomo-sandbox-wasix-host",
+    "crates/sinomo-service",
+    "crates/sinomo-storage",
+    "crates/sinomo-supervision",
+    "crates/sinomo-sync",
+    "crates/sinomo-trigger",
+    "crates/sinomo-video",
+    "crates/sinomo-voice",
 ]
 
 [workspace.package]
@@ -23,10 +71,10 @@ incremental = false
 opt-level = 2
 
 [patch.crates-io]
-virtual-fs = { path = "crates/sinomo-sandbox-runtime/vendor/virtual-fs" }
-wasmer-compiler = { path = "crates/sinomo-sandbox-runtime/vendor/wasmer-compiler" }
-wasmer-vm = { path = "crates/sinomo-sandbox-runtime/vendor/wasmer-vm" }
-wasmer-wasix = { path = "crates/sinomo-sandbox-runtime/vendor/wasmer-wasix" }
+virtual-fs = { path = "modules/sandbox/wasix/vendor/virtual-fs" }
+wasmer-compiler = { path = "modules/sandbox/wasix/vendor/wasmer-compiler" }
+wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
+wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
 blake3 = "1.5"

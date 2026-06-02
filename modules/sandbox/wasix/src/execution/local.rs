@@ -507,7 +507,7 @@ impl LocalStagedSandboxCommandRunner {
         Ok(outcome)
     }
 
-    pub(super) fn run_module_for_abi(
+    pub(crate) fn run_module_for_abi(
         &self,
         target_abi: SandboxWasiAbi,
         wasm: &[u8],

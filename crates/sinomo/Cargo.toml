@@ -10,8 +10,8 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "application"
 [features]
-# Enable the build-heavy wasm sandbox runtime. OFF by default so `cargo build -p
-# sinomo` skips wasmtime/wasmer; build with `--features sandbox` for the full runtime.
+# Enable sandbox execution through the native-module host loader. The heavy
+# WASIX engine is built and activated as a separate native-dylib module.
 sandbox = ["sinomo-cli/sandbox"]
 
 [dependencies]

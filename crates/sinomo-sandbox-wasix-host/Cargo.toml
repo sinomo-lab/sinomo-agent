@@ -1,0 +1,27 @@
+[package]
+name = "sinomo-sandbox-wasix-host"
+version.workspace = true
+description = "Lightweight host loader for trusted native-dylib WASIX sandbox modules"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-module = { path = "../sinomo-module" }
+sinomo-module-api = { path = "../sinomo-module-api" }
+sinomo-module-host = { path = "../sinomo-module-host" }
+sinomo-network = { path = "../sinomo-network" }
+sinomo-node = { path = "../sinomo-node" }
+sinomo-sandbox = { path = "../sinomo-sandbox" }
+sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+wat = "1.248.0"

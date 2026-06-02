@@ -1,7 +1,7 @@
 [package]
-name = "sinomo-sandbox-runtime"
+name = "sinomo-sandbox-wasix-module"
 version.workspace = true
-description = "Sinomo agent sandbox wasm runtime (wasmtime/WASIX execution backend for sinomo-sandbox)"
+description = "Trusted native-dylib WASIX execution module for sinomo-sandbox"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,9 @@ include = ["**/*.rs", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "r1"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["wasix-runtime"]
@@ -27,7 +30,7 @@ wasix-runtime = [
 ]
 
 [dependencies]
-sinomo-sandbox = { path = "../sinomo-sandbox" }
+sinomo-sandbox = { path = "../../../crates/sinomo-sandbox" }
 blake3.workspace = true
 getrandom = "0.2"
 serde.workspace = true
@@ -35,15 +38,16 @@ serde_json.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 time.workspace = true
-sinomo-core = { path = "../sinomo-core" }
-sinomo-dfs = { path = "../sinomo-dfs" }
-sinomo-events = { path = "../sinomo-events" }
-sinomo-kv = { path = "../sinomo-kv" }
-sinomo-module = { path = "../sinomo-module" }
-sinomo-network = { path = "../sinomo-network" }
-sinomo-node = { path = "../sinomo-node" }
-sinomo-object = { path = "../sinomo-object", features = ["serde"] }
-sinomo-storage = { path = "../sinomo-storage" }
+sinomo-core = { path = "../../../crates/sinomo-core" }
+sinomo-dfs = { path = "../../../crates/sinomo-dfs" }
+sinomo-events = { path = "../../../crates/sinomo-events" }
+sinomo-kv = { path = "../../../crates/sinomo-kv" }
+sinomo-module = { path = "../../../crates/sinomo-module" }
+sinomo-network = { path = "../../../crates/sinomo-network" }
+sinomo-node = { path = "../../../crates/sinomo-node" }
+sinomo-object = { path = "../../../crates/sinomo-object", features = ["serde"] }
+sinomo-sandbox-wasix-api = { path = "../../../crates/sinomo-sandbox-wasix-api" }
+sinomo-storage = { path = "../../../crates/sinomo-storage" }
 wasmtime = { version = "41.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"] }
 wasmtime-wasi = { version = "41.0.4", default-features = false, features = ["p1"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "time"], optional = true }

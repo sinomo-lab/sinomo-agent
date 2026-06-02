@@ -8,6 +8,7 @@
 
 mod backend;
 mod execution;
+mod ffi;
 mod internal;
 mod module_runner;
 mod runtime;

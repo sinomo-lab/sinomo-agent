@@ -12,9 +12,10 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [features]
-# Compile the build-heavy wasm sandbox runtime. OFF by default: without it the
-# daemon's sandbox-execution RPCs report that the runtime is not compiled in.
-sandbox = ["dep:sinomo-sandbox-runtime"]
+default = ["sandbox"]
+# Enable sandbox execution through the native-module host loader. The heavy
+# WASIX engine is loaded from an active native-dylib module, not linked here.
+sandbox = ["dep:sinomo-sandbox-wasix-host"]
 
 [dependencies]
 base64 = "0.22"
@@ -35,7 +36,7 @@ sinomo-node = { path = "../sinomo-node" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
-sinomo-sandbox-runtime = { path = "../sinomo-sandbox-runtime", optional = true }
+sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
 sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true

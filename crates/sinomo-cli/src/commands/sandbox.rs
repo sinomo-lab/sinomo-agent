@@ -3628,14 +3628,25 @@ pub(crate) fn sandbox_toolchain_verify_busybox(
 }
 
 /// Error surfaced by local sandbox-execution CLI commands when the binary was
-/// built without the `sandbox` feature, so the wasmtime/WASIX backend in
-/// `sinomo-sandbox-runtime` is not linked in.
+/// built without the `sandbox` feature, so the native WASIX module is not
+/// linked in.
 #[cfg(not(feature = "sandbox"))]
 fn sandbox_runtime_not_compiled_error() -> CliError {
     CliError::Parse {
-        detail: "sandbox runtime not compiled in; rebuild with `--features sandbox` or use a daemon-backed run (`--daemon`)"
+        detail: "sandbox execution support is disabled in this build; use a build with the sandbox host loader or a daemon-backed run (`--daemon`)"
             .to_string(),
     }
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_wasix_runner_from_data_dir()
+-> Result<sinomo_runtime::sandbox_wasix_host::SandboxWasixModuleCommandRunner, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    sinomo_runtime::sandbox_wasix_host::SandboxWasixModuleCommandRunner::from_active_module(
+        data_dir.root(),
+    )
+    .map_err(CliError::from)
 }
 
 #[cfg(not(feature = "sandbox"))]
@@ -3653,7 +3664,7 @@ pub(crate) fn sandbox_toolchain_verify_busybox_with_stores(
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
     toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
-    let runner = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?;
+    let runner = sandbox_wasix_runner_from_data_dir()?;
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
@@ -3837,7 +3848,7 @@ fn sandbox_toolchain_verify_coding_workflow_with_stores(
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
     toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
-    let runner = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?;
+    let runner = sandbox_wasix_runner_from_data_dir()?;
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
@@ -4325,7 +4336,7 @@ fn sandbox_toolchain_verify_command_cases_with_stores(
     cases: &[sinomo_runtime::sandbox::SandboxCommandFidelityCase],
     failure_detail: &str,
 ) -> Result<(), CliError> {
-    let runner = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?;
+    let runner = sandbox_wasix_runner_from_data_dir()?;
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
@@ -4598,7 +4609,7 @@ pub(crate) fn sandbox_toolchain_verify_quickjs_with_stores(
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
     toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
-    let runner = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?;
+    let runner = sandbox_wasix_runner_from_data_dir()?;
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
@@ -5041,11 +5052,9 @@ fn sandbox_module_artifact_relative_path(
 
 #[cfg(feature = "sandbox")]
 fn validate_sandbox_component_artifact_bytes(bytes: &[u8]) -> Result<(), CliError> {
-    sinomo_runtime::sandbox::validate_sinomo_module_v1_component_contract(bytes).map_err(|source| {
-        CliError::Parse {
-            detail: format!("invalid sinomo-module-v1 component artifact: {source}"),
-        }
-    })
+    sandbox_wasix_runner_from_data_dir()?
+        .validate_sinomo_module_v1_component_contract(bytes)
+        .map_err(CliError::from)
 }
 
 #[cfg(not(feature = "sandbox"))]
@@ -5083,8 +5092,8 @@ pub(crate) fn sandbox_module_replay_run_with_data_dir(
             path: options.fixture_path.display().to_string(),
             detail: source.to_string(),
         })?;
-    let report =
-        sinomo_runtime::sandbox::run_sandbox_wasm_module_replay_fixture(data_dir_root, &fixture)
+    let report = sinomo_runtime::sandbox_wasix_host::
+        run_sandbox_wasm_module_replay_fixture_with_active_module(data_dir_root, &fixture)
             .map_err(|source| CliError::Parse {
                 detail: format!("sandbox module replay failed: {source}"),
             })?;
@@ -5955,7 +5964,7 @@ pub(crate) fn sandbox_process_plan_with_stores(
         })?;
     let mut policy = sinomo_runtime::sandbox::SandboxPolicy::default();
     policy.allow_unsigned_toolchains = true;
-    let outcome = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?
+    let outcome = sandbox_wasix_runner_from_data_dir()?
         .run_toolchain_process_plan_with_policy_and_output_sink(
             store,
             toolchain_store,
@@ -6123,7 +6132,7 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
             } else {
                 options.timeout_ms
             };
-            let outcome = sinomo_runtime::sandbox::LocalStagedSandboxCommandRunner::new()?
+            let outcome = sandbox_wasix_runner_from_data_dir()?
                 .run_module_with_stdin_limits_preopens_output_sink_and_toolchain(
                     store,
                     toolchain_store,
@@ -6153,14 +6162,18 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
                 stdin,
                 timeout_ms: options.timeout_ms,
             };
-            let outcome =
-                sinomo_runtime::sandbox::RuntimeSandboxBackend::run_toolchain_command_streaming(
+            let outcome = sandbox_wasix_runner_from_data_dir()?
+                .run_toolchain_command_with_stdin_policy_and_output_sink(
                     store,
                     toolchain_store,
-                    request,
+                    &request.sandbox_id,
+                    &request.command_name,
+                    request.argv,
+                    request.stdin,
+                    request.timeout_ms,
                     &execution_node_id,
                     &policy,
-                    sandbox_cli_streaming_output_sink(),
+                    Some(sandbox_cli_streaming_output_sink()),
                 )?;
             print_sandbox_command_outcome(&outcome, false)
         }

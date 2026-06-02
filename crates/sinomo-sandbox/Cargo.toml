@@ -12,10 +12,10 @@ include = ["**/*.rs", "Cargo.toml", "toolchains/**"]
 ring = "r1"
 
 [features]
-# Mirrored from sinomo-sandbox-runtime: its `wasix-runtime` feature enables this
-# one so the capability/policy checks in this crate (which gate WASIX command
-# support) reflect whether the WASIX backend is actually linked. This marker adds
-# no dependencies of its own — the contracts crate carries no wasm code.
+# Mirrored by the native WASIX execution module: its `wasix-runtime` feature
+# enables this one so capability/policy checks in this crate reflect whether the
+# WASIX backend is actually linked. This marker adds no dependencies of its own;
+# the contracts crate carries no wasm code.
 wasix-runtime = []
 
 [dependencies]

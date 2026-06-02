@@ -108,20 +108,44 @@ fn runtime_boundary_crate_exports_only_r0_r1_dependencies() {
     }
 }
 
+#[test]
+fn wasix_native_module_is_not_a_default_workspace_build_member() {
+    let default_members = read_workspace_default_members();
+
+    assert!(
+        !default_members.is_empty(),
+        "workspace should declare default-members so heavy native modules stay opt-in"
+    );
+    assert!(
+        default_members.contains(&"crates/sinomo-sandbox-wasix-api".to_string()),
+        "the stable WASIX ABI crate should remain in default builds"
+    );
+    assert!(
+        default_members.contains(&"crates/sinomo-module-api".to_string()),
+        "the generic native module ABI crate should remain in default builds"
+    );
+    assert!(
+        default_members.contains(&"crates/sinomo-module-host".to_string()),
+        "the generic native module host loader should remain in default builds"
+    );
+    assert!(
+        default_members.contains(&"crates/sinomo-sandbox-wasix-host".to_string()),
+        "the lightweight WASIX host loader should remain in default builds"
+    );
+    assert!(
+        !default_members.contains(&"modules/sandbox/wasix".to_string()),
+        "the heavy WASIX native-dylib module must be built explicitly, not by default"
+    );
+}
+
 fn read_workspace_packages() -> BTreeMap<String, PackageManifest> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("workspace root");
-    let crates_dir = workspace_root.join("crates");
 
     let mut packages = BTreeMap::new();
-    for entry in fs::read_dir(&crates_dir).expect("read crates dir") {
-        let entry = entry.expect("crate dir entry");
-        let manifest_path = entry.path().join("Cargo.toml");
-        if !manifest_path.exists() {
-            continue;
-        }
+    for manifest_path in workspace_manifest_paths(workspace_root) {
         let manifest_text = fs::read_to_string(&manifest_path).expect("read manifest");
         let name = parse_package_name(&manifest_text)
             .unwrap_or_else(|| panic!("missing package name in {}", manifest_path.display()));
@@ -139,6 +163,66 @@ fn read_workspace_packages() -> BTreeMap<String, PackageManifest> {
     }
 
     packages
+}
+
+fn workspace_manifest_paths(workspace_root: &Path) -> Vec<PathBuf> {
+    let mut manifests = Vec::new();
+    for entry in fs::read_dir(workspace_root.join("crates")).expect("read crates dir") {
+        let entry = entry.expect("crate dir entry");
+        let manifest_path = entry.path().join("Cargo.toml");
+        if manifest_path.exists() {
+            manifests.push(manifest_path);
+        }
+    }
+    let modules_dir = workspace_root.join("modules");
+    if modules_dir.exists() {
+        for family in fs::read_dir(&modules_dir).expect("read modules dir") {
+            let family = family.expect("module family dir entry");
+            if !family.path().is_dir() {
+                continue;
+            }
+            for module in fs::read_dir(family.path()).expect("read module family dir") {
+                let module = module.expect("module dir entry");
+                let manifest_path = module.path().join("Cargo.toml");
+                if manifest_path.exists() {
+                    manifests.push(manifest_path);
+                }
+            }
+        }
+    }
+    manifests.sort();
+    manifests
+}
+
+fn read_workspace_default_members() -> Vec<String> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let manifest_text =
+        fs::read_to_string(workspace_root.join("Cargo.toml")).expect("read workspace manifest");
+
+    let mut in_default_members = false;
+    let mut default_members = Vec::new();
+
+    for line in manifest_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "default-members = [" {
+            in_default_members = true;
+            continue;
+        }
+        if in_default_members && trimmed == "]" {
+            break;
+        }
+        if !in_default_members || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        default_members.push(trimmed.trim_end_matches(',').trim_matches('"').to_string());
+    }
+
+    default_members.sort();
+    default_members.dedup();
+    default_members
 }
 
 fn parse_package_name(manifest_text: &str) -> Option<String> {

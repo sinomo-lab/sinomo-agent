@@ -9,6 +9,7 @@ pub fn print_usage() {
     println!("  sinomo uninstall");
     println!("  sinomo daemon");
     println!("  sinomo rollout");
+    println!("  sinomo module");
     println!("  sinomo dfs");
     println!("  sinomo sandbox");
     println!("  sinomo models");
@@ -164,6 +165,24 @@ pub(super) fn print_rollout_help() {
     );
     println!("  sinomo rollout status");
     println!("      Show source, binary, and rollout state paths.");
+}
+
+pub(super) fn print_module_help() {
+    println!("Module:");
+    println!("  sinomo module");
+    println!("      Show module commands.");
+    println!("  sinomo module help");
+    println!("      Show module commands.");
+    println!(
+        "  sinomo module native-dylib activate [--module <module-id>] [--artifact <artifact-id>] [--interface <version>] [--cache-key <path-key>] [--library-name <file-name>] [--source <text>] <library>"
+    );
+    println!(
+        "      Install a trusted native module into the content-addressed local cache and activate it from descriptor metadata."
+    );
+    println!(
+        "  sinomo module wasix activate [--artifact <artifact-id>] [--library-name <file-name>] [--source <text>] <library>"
+    );
+    println!("      Activate the trusted WASIX sandbox runtime module as module.sandbox.wasix.");
 }
 
 pub(super) fn print_dfs_help() {

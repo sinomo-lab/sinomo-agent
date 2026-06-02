@@ -5910,7 +5910,7 @@ dependencies = [
  "sinomo-models",
  "sinomo-pytorch",
  "sinomo-runtime",
- "sinomo-sandbox-runtime",
+ "sinomo-sandbox-wasix-module",
  "time",
  "tokenizers",
  "wat",
@@ -5950,7 +5950,7 @@ dependencies = [
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
- "sinomo-sandbox-runtime",
+ "sinomo-sandbox-wasix-host",
  "sinomo-service",
  "sinomo-storage",
  "thiserror 2.0.18",
@@ -6145,6 +6145,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-module-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-object",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sinomo-module-host"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libloading 0.8.9",
+ "sinomo-module-api",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sinomo-network"
 version = "0.1.0"
 dependencies = [
@@ -6261,13 +6280,16 @@ dependencies = [
  "sinomo-kv",
  "sinomo-local",
  "sinomo-module",
+ "sinomo-module-api",
+ "sinomo-module-host",
  "sinomo-network",
  "sinomo-node",
  "sinomo-policy",
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
- "sinomo-sandbox-runtime",
+ "sinomo-sandbox-wasix-api",
+ "sinomo-sandbox-wasix-host",
  "sinomo-service",
  "sinomo-storage",
  "sinomo-supervision",
@@ -6297,7 +6319,36 @@ dependencies = [
 ]
 
 [[package]]
-name = "sinomo-sandbox-runtime"
+name = "sinomo-sandbox-wasix-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-module",
+ "sinomo-module-api",
+ "sinomo-object",
+ "sinomo-sandbox",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sinomo-sandbox-wasix-host"
+version = "0.1.0"
+dependencies = [
+ "sinomo-dfs",
+ "sinomo-module",
+ "sinomo-module-api",
+ "sinomo-module-host",
+ "sinomo-network",
+ "sinomo-node",
+ "sinomo-sandbox",
+ "sinomo-sandbox-wasix-api",
+ "thiserror 2.0.18",
+ "time",
+ "wat",
+]
+
+[[package]]
+name = "sinomo-sandbox-wasix-module"
 version = "0.1.0"
 dependencies = [
  "blake3",
@@ -6313,6 +6364,7 @@ dependencies = [
  "sinomo-node",
  "sinomo-object",
  "sinomo-sandbox",
+ "sinomo-sandbox-wasix-api",
  "sinomo-storage",
  "tar",
  "thiserror 2.0.18",
