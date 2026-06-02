@@ -1785,6 +1785,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry>;
+    fn get_namespace_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransaction>> {
+        let _ = transaction_id;
+        Ok(None)
+    }
     fn compact_tombstones(
         &mut self,
         options: DfsTombstoneCompactionOptions,
@@ -4133,6 +4140,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         let shard_id = self.select_shard_id_for_path(&job.file_system_id, &job.root_path)?;
         self.shard_backend_mut(&shard_id)?.put_namespace_job(job)
+    }
+
+    fn get_namespace_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransaction>> {
+        for backend in self.shards.values() {
+            if let Some(transaction) = backend.get_namespace_transaction(transaction_id)? {
+                return Ok(Some(transaction));
+            }
+        }
+        Ok(None)
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
@@ -6810,6 +6829,14 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             self.next_sequence.saturating_sub(1).max(1),
             vec![DfsMetadataTableOp::PutNamespaceJob { job: job.clone() }],
         )
+    }
+
+    fn get_namespace_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransaction>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_transactions.get(transaction_id).cloned())
     }
 
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
@@ -10217,6 +10244,56 @@ mod tests {
                 .expect("job")
                 .root_path,
             "/services/jobs/5"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_gets_namespace_transaction_by_shard_transaction_id() {
+        let root = temp_root("sharded_backend_get_namespace_transaction");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut object = object(version("version_1"));
+        object.path = "/services/namespace-transaction.txt".to_string();
+
+        let entry = backend
+            .apply_namespace_transaction(&DfsNamespaceTransaction {
+                transaction_id: "move-to-services".to_string(),
+                file_system_id: file_system.file_system_id.clone(),
+                objects: vec![object.clone()],
+                versions: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("namespace transaction");
+        let transaction_id = match &entry.mutation {
+            DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
+                transaction_id.clone()
+            }
+            other => panic!("expected namespace transaction journal entry, got {other:?}"),
+        };
+
+        let recovered = backend
+            .get_namespace_transaction(&transaction_id)
+            .expect("lookup transaction")
+            .expect("transaction");
+        assert_eq!(recovered.transaction_id, transaction_id);
+        assert_eq!(
+            recovered.objects.first().map(|object| &object.object_id),
+            Some(&object.object_id)
         );
 
         cleanup(&root);

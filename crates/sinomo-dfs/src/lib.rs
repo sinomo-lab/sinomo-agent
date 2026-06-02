@@ -2795,21 +2795,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
                     return Ok(());
                 };
-                let mut objects = transaction.objects.clone();
-                objects.sort_by(|left, right| {
-                    let left_is_tombstone = left.kind == DfsObjectKind::Tombstone;
-                    let right_is_tombstone = right.kind == DfsObjectKind::Tombstone;
-                    right_is_tombstone
-                        .cmp(&left_is_tombstone)
-                        .then_with(|| left.path.cmp(&right.path))
-                        .then_with(|| left.object_id.cmp(&right.object_id))
-                });
-                for object in objects {
-                    self.apply_metadata_object_to_service_state(object)?;
-                }
-                for version in &transaction.versions {
-                    self.apply_metadata_version_to_service_state(version);
-                }
+                self.apply_metadata_namespace_transaction_to_service_state(transaction)?;
             }
         }
         Ok(())
@@ -2911,9 +2897,45 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     self.metadata.add_conflict(conflict);
                 }
             }
-            DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. } => {
-                self.apply_backend_file_system_objects_to_service_state(file_system_id)?;
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                file_system_id,
+                transaction_id,
+                ..
+            } => {
+                let transaction = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_namespace_transaction(transaction_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(transaction) = transaction {
+                    self.apply_metadata_namespace_transaction_to_service_state(&transaction)?;
+                } else {
+                    self.apply_backend_file_system_objects_to_service_state(file_system_id)?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    fn apply_metadata_namespace_transaction_to_service_state(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<(), DfsError> {
+        let mut objects = transaction.objects.clone();
+        objects.sort_by(|left, right| {
+            let left_is_tombstone = left.kind == DfsObjectKind::Tombstone;
+            let right_is_tombstone = right.kind == DfsObjectKind::Tombstone;
+            right_is_tombstone
+                .cmp(&left_is_tombstone)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        for object in objects {
+            self.apply_metadata_object_to_service_state(object)?;
+        }
+        for version in &transaction.versions {
+            self.apply_metadata_version_to_service_state(version);
         }
         Ok(())
     }

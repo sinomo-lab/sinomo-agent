@@ -853,6 +853,68 @@ fn metadata_journal_intent_conflict_applies_incrementally_without_full_hydrate()
 }
 
 #[test]
+fn metadata_journal_missing_namespace_transaction_payload_uses_keyed_replay() {
+    let root = temp_root("metadata-journal-namespace-transaction-keyed-replay");
+    let owner = NodeId::from_legacy_named("node_namespace_tx_owner").expect("owner");
+    let file_system = file_system(owner.clone());
+    let mut backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+
+    let mut unrelated = file_metadata(owner.clone());
+    unrelated.object_id =
+        DfsObjectId::from_legacy_named("obj_namespace_tx_unrelated").expect("object");
+    unrelated.path = "/services/namespace-tx/unrelated.txt".to_string();
+    backend.put_object(&unrelated).expect("unrelated object");
+
+    let mut touched = file_metadata(owner.clone());
+    touched.object_id = DfsObjectId::from_legacy_named("obj_namespace_tx_touched").expect("object");
+    touched.path = "/services/namespace-tx/touched.txt".to_string();
+    touched.version =
+        DfsVersion::from_legacy_named("version_namespace_tx_touched").expect("touched version");
+    let transaction = DfsNamespaceTransaction {
+        transaction_id: "namespace_tx_keyed_replay".to_string(),
+        file_system_id: file_system.file_system_id.clone(),
+        objects: vec![touched.clone()],
+        versions: Vec::new(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    };
+    let mut entry = backend
+        .apply_namespace_transaction(&transaction)
+        .expect("transaction");
+    if let DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } = &mut entry.mutation
+    {
+        *transaction = None;
+    } else {
+        panic!("expected namespace transaction journal entry");
+    }
+
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner), content);
+    dfs.metadata.add_file_system(file_system);
+    dfs.metadata_backend = Some(Box::new(backend));
+
+    dfs.apply_metadata_journal_batch_to_service_state(&DfsMetadataJournalBatch {
+        shard_id: entry.shard_id.clone(),
+        next_after_sequence: entry.sequence,
+        entries: vec![entry],
+    })
+    .expect("incremental namespace transaction replay");
+
+    assert!(
+        dfs.metadata.object(&touched.object_id).is_some(),
+        "missing-payload namespace transaction replay should restore touched objects"
+    );
+    assert!(
+        dfs.metadata.object(&unrelated.object_id).is_none(),
+        "missing-payload namespace transaction replay should not scan and import the whole file system"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn distributed_write_uses_path_selected_metadata_shard_epoch() {
     let root = temp_root("distributed-write-path-shard-epoch");
     let owner = NodeId::from_legacy_named("node_path_shard_owner").expect("owner");
