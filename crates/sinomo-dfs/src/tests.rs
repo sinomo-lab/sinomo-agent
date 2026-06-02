@@ -270,6 +270,126 @@ fn put_local_object_version_from_reader_streams_to_content_store() {
 }
 
 #[test]
+fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
+    let root = temp_root("lifecycle-maintenance-runs-collectors");
+    let node_id = NodeId::from_legacy_named("node_lifecycle_maintenance").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_lifecycle_tombstone").expect("object");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let version_1 = dfs
+        .content
+        .put_object_version("object-lifecycle", "version_1", b"history bytes v1")
+        .expect("put version 1");
+    let version_2 = dfs
+        .content
+        .put_object_version("object-lifecycle", "version_2", b"history bytes v2")
+        .expect("put version 2");
+
+    let mut tombstone = file_metadata(node_id);
+    tombstone.object_id = object_id.clone();
+    tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.path = "/services/lifecycle/deleted.txt".to_string();
+    tombstone.content_hash = None;
+    tombstone.content_size_bytes = None;
+    tombstone.changed_at_unix_nanos = 10;
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_object(&tombstone)
+        .expect("tombstone metadata");
+
+    let report = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            scrub_content: true,
+            version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
+                std::time::Duration::from_nanos(0),
+                1,
+            )),
+            orphan_gc: Some(ContentStoreGcOptions::delete_eligible(
+                std::time::Duration::from_nanos(0),
+            )),
+            tombstone_compaction: Some(
+                DfsTombstoneCompactionOptions::compact_eligible(std::time::Duration::from_nanos(
+                    50,
+                ))
+                .with_now_unix_nanos(100),
+            ),
+        })
+        .expect("lifecycle maintenance");
+
+    assert!(
+        report
+            .content_scrub
+            .as_ref()
+            .expect("content scrub")
+            .is_healthy()
+    );
+    let version_gc = report.version_gc.expect("version gc");
+    assert_eq!(version_gc.deleted_version_count, 1);
+    assert_eq!(version_gc.retained_latest_version_count, 1);
+    let orphan_gc = report.orphan_gc.expect("orphan gc");
+    assert_eq!(orphan_gc.deleted_orphan_count, 1);
+    assert!(
+        !dfs.content
+            .has_blob(&version_1.content_hash)
+            .expect("v1 reclaimed")
+    );
+    assert!(
+        dfs.content
+            .has_blob(&version_2.content_hash)
+            .expect("v2 retained")
+    );
+
+    assert!(report.metadata_backend_configured);
+    assert!(report.tombstone_compaction_requested);
+    let tombstone_report = report.tombstone_compaction.expect("tombstone compaction");
+    assert_eq!(tombstone_report.compacted_tombstone_count, 1);
+    let backend = dfs.metadata_backend().expect("metadata backend");
+    assert_eq!(
+        backend.get_object(&object_id).expect("compacted object"),
+        None
+    );
+    assert_eq!(
+        backend
+            .get_object_by_path(&sifs_file_system_id(), "/services/lifecycle/deleted.txt")
+            .expect("path marker")
+            .expect("compacted tombstone marker")
+            .kind,
+        DfsObjectKind::Tombstone
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn lifecycle_maintenance_reports_skipped_tombstones_without_backend() {
+    let root = temp_root("lifecycle-maintenance-no-backend");
+    let node_id = NodeId::from_legacy_named("node_lifecycle_no_backend").expect("node");
+    let network = InProcessNetwork::new();
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node_id),
+        LocalContentStore::new(root.join("content")).expect("content"),
+    );
+
+    let report = dfs
+        .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            tombstone_compaction: Some(DfsTombstoneCompactionOptions::compact_eligible(
+                std::time::Duration::from_nanos(0),
+            )),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })
+        .expect("lifecycle maintenance without backend");
+
+    assert!(!report.metadata_backend_configured);
+    assert!(report.tombstone_compaction_requested);
+    assert!(report.tombstone_compaction.is_none());
+    assert!(report.content_scrub.is_none());
+    assert!(report.version_gc.is_none());
+    assert!(report.orphan_gc.is_none());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn add_object_metadata_batch_persists_visible_versions_in_one_transaction() {
     let root = temp_root("add-object-metadata-batch-visible-versions");
     let owner = NodeId::from_legacy_named("node_batch_visible_owner").expect("node");

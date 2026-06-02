@@ -793,6 +793,32 @@ pub struct DfsOperationalMetrics {
     pub content: ContentStoreStats,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsLifecycleMaintenanceOptions {
+    #[serde(default)]
+    pub scrub_content: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_gc: Option<ContentStoreVersionGcOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_gc: Option<ContentStoreGcOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_compaction: Option<DfsTombstoneCompactionOptions>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsLifecycleMaintenanceReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_scrub: Option<ContentStoreScrubReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_gc: Option<ContentStoreVersionGcReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orphan_gc: Option<ContentStoreGcReport>,
+    pub metadata_backend_configured: bool,
+    pub tombstone_compaction_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_compaction: Option<DfsTombstoneCompactionReport>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LocalOwnedDfsService<T> {
     node_id: NodeId,
@@ -1718,6 +1744,41 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending_remote_write_response_count: self.pending_remote_write_responses.len(),
             metadata_backend_configured: self.metadata_backend.is_some(),
             content: self.content.stats()?,
+        })
+    }
+
+    pub fn run_lifecycle_maintenance(
+        &mut self,
+        options: DfsLifecycleMaintenanceOptions,
+    ) -> Result<DfsLifecycleMaintenanceReport, DfsError> {
+        let content_scrub = if options.scrub_content {
+            Some(self.content.scrub()?)
+        } else {
+            None
+        };
+        let version_gc = options
+            .version_gc
+            .map(|options| self.content.collect_versions(options))
+            .transpose()?;
+        let orphan_gc = options
+            .orphan_gc
+            .map(|options| self.content.collect_garbage(options))
+            .transpose()?;
+        let tombstone_compaction_requested = options.tombstone_compaction.is_some();
+        let metadata_backend_configured = self.metadata_backend.is_some();
+        let tombstone_compaction =
+            match (options.tombstone_compaction, self.metadata_backend.as_mut()) {
+                (Some(options), Some(backend)) => Some(backend.compact_tombstones(options)?),
+                (Some(_), None) | (None, _) => None,
+            };
+
+        Ok(DfsLifecycleMaintenanceReport {
+            content_scrub,
+            version_gc,
+            orphan_gc,
+            metadata_backend_configured,
+            tombstone_compaction_requested,
+            tombstone_compaction,
         })
     }
 
