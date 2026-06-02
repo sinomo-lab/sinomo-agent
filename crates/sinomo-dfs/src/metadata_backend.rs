@@ -693,83 +693,6 @@ impl DfsTombstoneCompactionReport {
     }
 }
 
-fn metadata_summary_from_records(
-    file_system_count: usize,
-    objects: &[DfsObjectMetadata],
-    versions: &[DfsObjectVersionRecord],
-    receipts: &[DfsReplicaReceiptRecord],
-    intents: &[DfsWriteIntentRecord],
-    conflicts: &[DfsConflictRecord],
-    namespace_jobs: &[DfsNamespaceJobRecord],
-) -> DfsMetadataSummary {
-    let mut receipts_by_object_version =
-        BTreeMap::<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>::new();
-    for receipt in receipts {
-        receipts_by_object_version
-            .entry((
-                receipt.receipt.object_id.clone(),
-                receipt.receipt.committed_version.clone(),
-            ))
-            .or_default()
-            .push(receipt.clone());
-    }
-    let mut intents_by_object = BTreeMap::<DfsObjectId, Vec<DfsWriteIntentRecord>>::new();
-    for intent in intents {
-        intents_by_object
-            .entry(intent.object_id.clone())
-            .or_default()
-            .push(intent.clone());
-    }
-    let pending_repair_count = objects
-        .iter()
-        .map(|object| {
-            let Some(object_intents) = intents_by_object.get(&object.object_id) else {
-                return 0;
-            };
-            let mut receipts_by_version =
-                BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
-            for intent in object_intents
-                .iter()
-                .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
-            {
-                receipts_by_version
-                    .entry(intent.target_version.clone())
-                    .or_insert_with(|| {
-                        receipts_by_object_version
-                            .get(&(object.object_id.clone(), intent.target_version.clone()))
-                            .cloned()
-                            .unwrap_or_default()
-                    });
-            }
-            count_pending_repairs_for_object(object, object_intents, &receipts_by_version)
-        })
-        .sum();
-    DfsMetadataSummary {
-        file_system_count,
-        object_count: objects.len(),
-        version_count: versions.len(),
-        receipt_count: receipts.len(),
-        intent_count: intents.len(),
-        pending_write_count: intents
-            .iter()
-            .filter(|intent| write_intent_status_is_active(&intent.status))
-            .count(),
-        open_conflict_count: conflicts
-            .iter()
-            .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-            .count(),
-        pending_repair_count,
-        pending_namespace_job_count: namespace_jobs
-            .iter()
-            .filter(|job| job.status == DfsNamespaceJobStatus::Running)
-            .count(),
-        failed_namespace_job_count: namespace_jobs
-            .iter()
-            .filter(|job| job.status == DfsNamespaceJobStatus::Failed)
-            .count(),
-    }
-}
-
 fn metadata_summary_from_tables<F>(
     tables: &DfsMetadataTables,
     mut object_is_countable: F,
@@ -1530,51 +1453,121 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         }
         Ok(conflicts)
     }
-    fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
-        let filesystems = self.list_file_systems()?;
-        let mut objects = Vec::new();
-        for file_system in &filesystems {
-            let mut cursor = None;
-            loop {
-                let page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                objects.extend(page.objects);
-                let Some(next_cursor) = page.next_cursor else {
-                    break;
-                };
-                cursor = Some(next_cursor);
-            }
-        }
-        let versions = self.all_versions()?;
-        let receipts = self.all_receipts()?;
-        let intents = self.all_intents()?;
-        let conflicts = self.all_conflicts()?;
-        let namespace_jobs = self.list_namespace_jobs()?;
-        Ok(metadata_summary_from_records(
-            filesystems.len(),
-            &objects,
-            &versions,
-            &receipts,
-            &intents,
-            &conflicts,
-            &namespace_jobs,
-        ))
-    }
-    fn metadata_summary_for_file_system(
+    fn accumulate_metadata_summary_for_object(
         &self,
+        summary: &mut DfsMetadataSummary,
+        object: &DfsObjectMetadata,
+    ) -> Result<()> {
+        summary.object_count = summary.object_count.saturating_add(1);
+
+        let mut object_intents = Vec::new();
+        let mut intent_cursor = None;
+        loop {
+            let intent_page = self.intents_for_object_page(
+                &object.object_id,
+                intent_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            summary.intent_count = summary
+                .intent_count
+                .saturating_add(intent_page.intents.len());
+            summary.pending_write_count = summary.pending_write_count.saturating_add(
+                intent_page
+                    .intents
+                    .iter()
+                    .filter(|intent| write_intent_status_is_active(&intent.status))
+                    .count(),
+            );
+            object_intents.extend(intent_page.intents);
+            let Some(next_cursor) = intent_page.next_cursor else {
+                break;
+            };
+            intent_cursor = Some(next_cursor);
+        }
+
+        let committed_targets = object_intents
+            .iter()
+            .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
+            .map(|intent| intent.target_version.clone())
+            .collect::<BTreeSet<_>>();
+        let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
+        let mut version_cursor = None;
+        loop {
+            let version_page = self.versions_for_object_page(
+                &object.object_id,
+                version_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            summary.version_count = summary
+                .version_count
+                .saturating_add(version_page.versions.len());
+            for version in version_page.versions {
+                let collect_for_repair = committed_targets.contains(&version.version);
+                let mut receipt_cursor = None;
+                loop {
+                    let receipt_page = self.receipts_for_version_page(
+                        &object.object_id,
+                        &version.version,
+                        receipt_cursor.as_ref(),
+                        OBJECT_LOCAL_METADATA_PAGE_SIZE,
+                    )?;
+                    summary.receipt_count = summary
+                        .receipt_count
+                        .saturating_add(receipt_page.receipts.len());
+                    if collect_for_repair {
+                        receipts_by_version
+                            .entry(version.version.clone())
+                            .or_default()
+                            .extend(receipt_page.receipts);
+                    }
+                    let Some(next_cursor) = receipt_page.next_cursor else {
+                        break;
+                    };
+                    receipt_cursor = Some(next_cursor);
+                }
+            }
+            let Some(next_cursor) = version_page.next_cursor else {
+                break;
+            };
+            version_cursor = Some(next_cursor);
+        }
+
+        let mut conflict_cursor = None;
+        loop {
+            let conflict_page = self.conflicts_for_object_page(
+                &object.object_id,
+                conflict_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            summary.open_conflict_count = summary.open_conflict_count.saturating_add(
+                conflict_page
+                    .conflicts
+                    .iter()
+                    .filter(|conflict| conflict.status == DfsConflictStatus::Open)
+                    .count(),
+            );
+            let Some(next_cursor) = conflict_page.next_cursor else {
+                break;
+            };
+            conflict_cursor = Some(next_cursor);
+        }
+
+        summary.pending_repair_count =
+            summary
+                .pending_repair_count
+                .saturating_add(count_pending_repairs_for_object(
+                    object,
+                    &object_intents,
+                    &receipts_by_version,
+                ));
+        Ok(())
+    }
+
+    fn accumulate_metadata_summary_for_file_system(
+        &self,
+        summary: &mut DfsMetadataSummary,
         file_system_id: &DfsFileSystemId,
-    ) -> Result<Option<DfsMetadataSummary>> {
-        let Some(_) = self.get_file_system(file_system_id)? else {
-            return Ok(None);
-        };
-        let mut objects = Vec::new();
-        let mut versions = Vec::new();
-        let mut receipts = Vec::new();
-        let mut intents = Vec::new();
-        let mut conflicts = Vec::new();
+    ) -> Result<()> {
         let mut object_cursor = None;
         loop {
             let page = self.objects_for_file_system_page(
@@ -1583,85 +1576,71 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 OBJECT_LOCAL_METADATA_PAGE_SIZE,
             )?;
             for object in page.objects {
-                let mut version_cursor = None;
-                loop {
-                    let version_page = self.versions_for_object_page(
-                        &object.object_id,
-                        version_cursor.as_ref(),
-                        OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                    )?;
-                    for version in version_page.versions {
-                        let mut receipt_cursor = None;
-                        loop {
-                            let receipt_page = self.receipts_for_version_page(
-                                &object.object_id,
-                                &version.version,
-                                receipt_cursor.as_ref(),
-                                OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                            )?;
-                            receipts.extend(receipt_page.receipts);
-                            let Some(next_cursor) = receipt_page.next_cursor else {
-                                break;
-                            };
-                            receipt_cursor = Some(next_cursor);
-                        }
-                        versions.push(version);
-                    }
-                    let Some(next_cursor) = version_page.next_cursor else {
-                        break;
-                    };
-                    version_cursor = Some(next_cursor);
-                }
-
-                let mut intent_cursor = None;
-                loop {
-                    let intent_page = self.intents_for_object_page(
-                        &object.object_id,
-                        intent_cursor.as_ref(),
-                        OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                    )?;
-                    intents.extend(intent_page.intents);
-                    let Some(next_cursor) = intent_page.next_cursor else {
-                        break;
-                    };
-                    intent_cursor = Some(next_cursor);
-                }
-
-                let mut conflict_cursor = None;
-                loop {
-                    let conflict_page = self.conflicts_for_object_page(
-                        &object.object_id,
-                        conflict_cursor.as_ref(),
-                        OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                    )?;
-                    conflicts.extend(conflict_page.conflicts);
-                    let Some(next_cursor) = conflict_page.next_cursor else {
-                        break;
-                    };
-                    conflict_cursor = Some(next_cursor);
-                }
-
-                objects.push(object);
+                self.accumulate_metadata_summary_for_object(summary, &object)?;
             }
             let Some(next_cursor) = page.next_cursor else {
                 break;
             };
             object_cursor = Some(next_cursor);
         }
-        let namespace_jobs = self
-            .list_namespace_jobs()?
-            .into_iter()
-            .filter(|job| job.file_system_id == *file_system_id)
-            .collect::<Vec<_>>();
-        Ok(Some(metadata_summary_from_records(
-            1,
-            &objects,
-            &versions,
-            &receipts,
-            &intents,
-            &conflicts,
-            &namespace_jobs,
-        )))
+        Ok(())
+    }
+
+    fn accumulate_namespace_job_summary(
+        &self,
+        summary: &mut DfsMetadataSummary,
+        file_system_scope: Option<&DfsFileSystemId>,
+    ) -> Result<()> {
+        for job in self.list_namespace_jobs()? {
+            if file_system_scope.is_some_and(|file_system_id| job.file_system_id != *file_system_id)
+            {
+                continue;
+            }
+            match job.status {
+                DfsNamespaceJobStatus::Running => {
+                    summary.pending_namespace_job_count =
+                        summary.pending_namespace_job_count.saturating_add(1);
+                }
+                DfsNamespaceJobStatus::Failed => {
+                    summary.failed_namespace_job_count =
+                        summary.failed_namespace_job_count.saturating_add(1);
+                }
+                DfsNamespaceJobStatus::Completed => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
+        let filesystems = self.list_file_systems()?;
+        let mut summary = DfsMetadataSummary {
+            file_system_count: filesystems.len(),
+            ..DfsMetadataSummary::default()
+        };
+        for file_system in &filesystems {
+            self.accumulate_metadata_summary_for_file_system(
+                &mut summary,
+                &file_system.file_system_id,
+            )?;
+        }
+        self.accumulate_namespace_job_summary(&mut summary, None)?;
+        Ok(summary)
+    }
+
+    fn metadata_summary_for_file_system(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsMetadataSummary>> {
+        let Some(_) = self.get_file_system(file_system_id)? else {
+            return Ok(None);
+        };
+        let mut summary = DfsMetadataSummary {
+            file_system_count: 1,
+            ..DfsMetadataSummary::default()
+        };
+        self.accumulate_metadata_summary_for_file_system(&mut summary, file_system_id)?;
+        self.accumulate_namespace_job_summary(&mut summary, Some(file_system_id))?;
+        Ok(Some(summary))
     }
     fn commit_visible_version(
         &mut self,
