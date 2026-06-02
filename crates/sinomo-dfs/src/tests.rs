@@ -2239,11 +2239,122 @@ fn operational_metrics_report_repair_backlog_and_content_footprint() {
     assert_eq!(metrics.repair_inflight_count, 0);
     assert_eq!(metrics.fetch_inflight_count, 0);
     assert_eq!(metrics.fetch_failed_source_count, 0);
+    assert_eq!(metrics.stage_window_resume_count, 0);
+    assert_eq!(metrics.stage_window_resume_bytes, 0);
+    assert_eq!(metrics.repair_window_resume_count, 0);
+    assert_eq!(metrics.repair_window_resume_bytes, 0);
+    assert_eq!(metrics.fetch_window_resume_count, 0);
+    assert_eq!(metrics.fetch_window_resume_bytes, 0);
+    assert_eq!(metrics.pending_read_window_resume_count, 0);
+    assert_eq!(metrics.pending_read_window_resume_bytes, 0);
     assert_eq!(metrics.incoming_transfer_bytes, 0);
+    assert_eq!(metrics.incoming_blob_transfer_received_bytes, 0);
+    assert_eq!(metrics.incoming_fetch_transfer_received_bytes, 0);
+    assert_eq!(metrics.incoming_read_transfer_received_bytes, 0);
     assert_eq!(metrics.content.blob_count, 1);
     assert_eq!(metrics.content.manifest_count, 1);
     assert_eq!(metrics.content.logical_object_bytes, bytes.len() as u64);
     assert_eq!(metrics.content.staging_file_count, 0);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn operational_metrics_report_transfer_window_progress() {
+    let root = temp_root("operational-metrics-transfer-window-progress");
+    let owner = NodeId::from_legacy_named("node_metrics_window_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metrics_window_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_metrics_window").expect("object");
+    let target_version = DfsVersion::from_legacy_named("version_metrics_window").expect("version");
+    let network = InProcessNetwork::new();
+    let owner_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("owner"),
+        root.join("owner-metadata"),
+    )
+    .expect("owner backend");
+    let replica_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("replica"),
+        root.join("replica-metadata"),
+    )
+    .expect("replica backend");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
+    let file_system = file_system(owner.clone());
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner fs");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica fs");
+    owner_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("owner object");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
+
+    let total_chunks = DFS_STAGE_CHUNK_WINDOW_SIZE + 2;
+    let bytes = vec![0x5a; total_chunks as usize * DFS_BLOB_CHUNK_BYTES];
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version,
+                requesting_node_id: owner.clone(),
+            },
+            std::io::Cursor::new(bytes),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("windowed write");
+    assert!(matches!(
+        write,
+        NetworkedDfsWriteOutcome::Pending {
+            durable_receipts: 1,
+            required_receipts: 2,
+            ..
+        }
+    ));
+
+    let first_window_bytes = u64::from(DFS_STAGE_CHUNK_WINDOW_SIZE) * DFS_BLOB_CHUNK_BYTES as u64;
+    let owner_metrics = owner_dfs.operational_metrics().expect("owner metrics");
+    assert_eq!(owner_metrics.stage_window_resume_count, 1);
+    assert_eq!(owner_metrics.stage_window_resume_bytes, first_window_bytes);
+    assert_eq!(owner_metrics.repair_window_resume_count, 0);
+    assert_eq!(owner_metrics.fetch_window_resume_count, 0);
+    assert_eq!(owner_metrics.pending_read_window_resume_count, 0);
+
+    let replica_events = replica_dfs.process_incoming().expect("replica process");
+    assert!(
+        replica_events.is_empty(),
+        "first stage window should not complete the blob"
+    );
+    let replica_metrics = replica_dfs.operational_metrics().expect("replica metrics");
+    assert_eq!(replica_metrics.incoming_blob_transfer_count, 1);
+    assert_eq!(
+        replica_metrics.incoming_transfer_bytes,
+        total_chunks as u64 * DFS_BLOB_CHUNK_BYTES as u64
+    );
+    assert_eq!(
+        replica_metrics.incoming_blob_transfer_received_bytes,
+        first_window_bytes
+    );
+    assert_eq!(replica_metrics.incoming_fetch_transfer_received_bytes, 0);
+    assert_eq!(replica_metrics.incoming_read_transfer_received_bytes, 0);
 
     std::fs::remove_dir_all(root).ok();
 }

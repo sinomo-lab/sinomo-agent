@@ -237,6 +237,10 @@ impl InProgressBlobTransfer {
             .insert_chunk(chunk_index, &bytes)
             .map_err(DfsError::from)
     }
+
+    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+        self.assembler.contiguous_received_chunk_count()
+    }
 }
 
 pub(crate) fn blob_chunk_count(bytes: &[u8]) -> Result<u32, DfsError> {

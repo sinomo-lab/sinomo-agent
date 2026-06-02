@@ -2,9 +2,9 @@ use serde_json::json;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsReadResult, DfsReplicationPolicy, DfsVersion, DfsWriteOptions,
-    LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsRangeReadOutcome, NetworkedDfsService,
-    NetworkedDfsServiceEvent,
+    DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult, DfsReplicationPolicy, DfsVersion,
+    DfsWriteOptions, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsRangeReadOutcome,
+    NetworkedDfsService, NetworkedDfsServiceEvent,
 };
 use sinomo_network::InProcessNetwork;
 use sinomo_node::NodeId;
@@ -808,6 +808,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        report.metrics = Some(replica_dfs.operational_metrics()?);
         Ok(report)
     });
 
@@ -823,6 +824,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         vec![owner.clone(), replica.clone()],
         DfsReplicationPolicy::new(2, 2)?,
     )?;
+    let initial_owner_metrics = owner_dfs.operational_metrics()?;
 
     let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
     let mut owner_event_count = 0usize;
@@ -845,6 +847,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     let replica_report = replica_worker
         .join()
         .map_err(|_| "replica network blob worker panicked")??;
+    let final_owner_metrics = owner_dfs.operational_metrics()?;
 
     emit(
         "network_blob_replicated_write",
@@ -859,6 +862,9 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             "replica_staged": replica_report.staged,
             "owner_committed": owner_committed,
             "replica_committed": replica_report.committed,
+            "initial_owner_metrics": initial_owner_metrics,
+            "final_owner_metrics": final_owner_metrics,
+            "replica_metrics": replica_report.metrics,
         }),
     );
 
@@ -953,6 +959,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
                 .into());
             }
         };
+    let reader_metrics = reader_dfs.operational_metrics()?;
     emit(
         "network_blob_remote_read",
         read_elapsed,
@@ -964,6 +971,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             "reader_events": reader_read_events,
             "reader_process_loops": read_process_loops,
             "verification_range_bytes": cached_range,
+            "reader_metrics": reader_metrics,
         }),
     );
 
@@ -976,6 +984,7 @@ struct ReplicaWorkerReport {
     process_loops: usize,
     staged: bool,
     committed: bool,
+    metrics: Option<DfsOperationalMetrics>,
 }
 
 fn file_metadata(

@@ -784,10 +784,21 @@ pub struct DfsOperationalMetrics {
     pub repair_inflight_count: usize,
     pub fetch_inflight_count: usize,
     pub fetch_failed_source_count: usize,
+    pub stage_window_resume_count: usize,
+    pub stage_window_resume_bytes: u64,
+    pub repair_window_resume_count: usize,
+    pub repair_window_resume_bytes: u64,
+    pub fetch_window_resume_count: usize,
+    pub fetch_window_resume_bytes: u64,
+    pub pending_read_window_resume_count: usize,
+    pub pending_read_window_resume_bytes: u64,
     pub incoming_blob_transfer_count: usize,
     pub incoming_fetch_transfer_count: usize,
     pub incoming_read_transfer_count: usize,
     pub incoming_transfer_bytes: u64,
+    pub incoming_blob_transfer_received_bytes: u64,
+    pub incoming_fetch_transfer_received_bytes: u64,
+    pub incoming_read_transfer_received_bytes: u64,
     pub active_replica_stage_count: usize,
     pub metadata_replication_cursor_count: usize,
     pub pending_metadata_replication_count: usize,
@@ -1762,6 +1773,78 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .values()
             .map(|pending| pending.fetch_failed_from.len())
             .sum();
+        let stage_window_resume_count = self
+            .pending_writes
+            .values()
+            .map(|pending| pending.stage_next_chunk_indexes.len())
+            .sum();
+        let stage_window_resume_bytes = self
+            .pending_writes
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .stage_next_chunk_indexes
+                    .values()
+                    .map(|next_chunk_index| {
+                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
+                    })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let repair_window_resume_count = self
+            .pending_writes
+            .values()
+            .map(|pending| pending.repair_next_chunk_indexes.len())
+            .sum();
+        let repair_window_resume_bytes = self
+            .pending_writes
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .repair_next_chunk_indexes
+                    .values()
+                    .map(|next_chunk_index| {
+                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
+                    })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let fetch_window_resume_count = self
+            .pending_writes
+            .values()
+            .map(|pending| {
+                pending
+                    .fetch_next_chunk_indexes
+                    .values()
+                    .filter(|next_chunk_index| **next_chunk_index > 0)
+                    .count()
+            })
+            .sum();
+        let fetch_window_resume_bytes = self
+            .pending_writes
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .fetch_next_chunk_indexes
+                    .values()
+                    .filter(|next_chunk_index| **next_chunk_index > 0)
+                    .map(|next_chunk_index| {
+                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
+                    })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let pending_read_window_resume_count = self
+            .pending_reads
+            .values()
+            .filter(|pending| pending.next_chunk_index > 0)
+            .count();
+        let pending_read_window_resume_bytes = self
+            .pending_reads
+            .values()
+            .filter_map(|pending| {
+                pending
+                    .content_size_bytes
+                    .map(|size_bytes| chunk_prefix_bytes(size_bytes, pending.next_chunk_index))
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
         let incoming_transfer_bytes = self
             .incoming_blob_transfers
             .values()
@@ -1777,6 +1860,36 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     .map(|transfer| transfer.total_size_bytes),
             )
             .fold(0_u64, |total, size| total.saturating_add(size));
+        let incoming_blob_transfer_received_bytes = self
+            .incoming_blob_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let incoming_fetch_transfer_received_bytes = self
+            .incoming_fetch_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let incoming_read_transfer_received_bytes = self
+            .incoming_read_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
 
         Ok(DfsOperationalMetrics {
             node_id: self.node_id.clone(),
@@ -1795,10 +1908,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             repair_inflight_count,
             fetch_inflight_count,
             fetch_failed_source_count,
+            stage_window_resume_count,
+            stage_window_resume_bytes,
+            repair_window_resume_count,
+            repair_window_resume_bytes,
+            fetch_window_resume_count,
+            fetch_window_resume_bytes,
+            pending_read_window_resume_count,
+            pending_read_window_resume_bytes,
             incoming_blob_transfer_count: self.incoming_blob_transfers.len(),
             incoming_fetch_transfer_count: self.incoming_fetch_transfers.len(),
             incoming_read_transfer_count: self.incoming_read_transfers.len(),
             incoming_transfer_bytes,
+            incoming_blob_transfer_received_bytes,
+            incoming_fetch_transfer_received_bytes,
+            incoming_read_transfer_received_bytes,
             active_replica_stage_count: self.active_replica_stages.len(),
             metadata_replication_cursor_count: self.metadata_replication_cursors.len(),
             pending_metadata_replication_count: self.pending_metadata_replications.len(),
@@ -12788,6 +12912,10 @@ fn blob_chunk_len(total_size_bytes: u64, chunk_index: u32) -> Result<usize, DfsE
     usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
         message: format!("DFS blob chunk is too large to fit in memory: {chunk_len} bytes"),
     })
+}
+
+fn chunk_prefix_bytes(total_size_bytes: u64, chunk_count: u32) -> u64 {
+    total_size_bytes.min(u64::from(chunk_count).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64))
 }
 
 fn fetch_response_window_end(start_chunk_index: u32, total_chunks: u32, max_chunks: u32) -> u32 {
