@@ -1723,22 +1723,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         summary: &mut DfsMetadataSummary,
         file_system_scope: Option<&DfsFileSystemId>,
     ) -> Result<()> {
-        for job in self.list_namespace_jobs()? {
-            if file_system_scope.is_some_and(|file_system_id| job.file_system_id != *file_system_id)
-            {
-                continue;
-            }
-            match job.status {
-                DfsNamespaceJobStatus::Running => {
-                    summary.pending_namespace_job_count =
-                        summary.pending_namespace_job_count.saturating_add(1);
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            for job in page.jobs {
+                if file_system_scope
+                    .is_some_and(|file_system_id| job.file_system_id != *file_system_id)
+                {
+                    continue;
                 }
-                DfsNamespaceJobStatus::Failed => {
-                    summary.failed_namespace_job_count =
-                        summary.failed_namespace_job_count.saturating_add(1);
+                match job.status {
+                    DfsNamespaceJobStatus::Running => {
+                        summary.pending_namespace_job_count =
+                            summary.pending_namespace_job_count.saturating_add(1);
+                    }
+                    DfsNamespaceJobStatus::Failed => {
+                        summary.failed_namespace_job_count =
+                            summary.failed_namespace_job_count.saturating_add(1);
+                    }
+                    DfsNamespaceJobStatus::Completed => {}
                 }
-                DfsNamespaceJobStatus::Completed => {}
             }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(())
     }
@@ -1839,36 +1849,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         conflict_id: &str,
     ) -> Result<Option<DfsConflictRecord>>;
-    fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>>;
+    fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
+        let mut conflicts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.conflicts_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(conflicts)
+    }
+
     fn conflicts_for_object_page(
         &self,
         object_id: &DfsObjectId,
         after: Option<&DfsConflictPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsConflictPage> {
-        if max_entries == 0 {
-            return Ok(DfsConflictPage {
-                conflicts: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut conflicts = self.conflicts_for_object(object_id)?;
-        conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
-        if let Some(after) = after {
-            conflicts.retain(|conflict| conflict.conflict_id > after.conflict_id);
-        }
-        let has_more = conflicts.len() > max_entries;
-        conflicts.truncate(max_entries);
-        let next_cursor = if has_more {
-            conflicts.last().map(conflict_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsConflictPage {
-            conflicts,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsConflictPage>;
     fn update_conflict_status(
         &mut self,
         object_id: &DfsObjectId,
@@ -3092,7 +3096,20 @@ impl LocalShardedMetadataBackend {
             };
             intent_cursor = Some(next_cursor);
         }
-        let conflicts = source.conflicts_for_object(object_id)?;
+        let mut conflicts = Vec::new();
+        let mut conflict_cursor = None;
+        loop {
+            let page = source.conflicts_for_object_page(
+                object_id,
+                conflict_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            conflict_cursor = Some(next_cursor);
+        }
         Ok(DfsObjectShardMigrationBundle {
             object,
             versions,
@@ -4165,10 +4182,17 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
         let mut jobs = BTreeMap::<String, DfsNamespaceJobRecord>::new();
-        for backend in self.shards.values() {
-            for job in backend.list_namespace_jobs()? {
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            for job in page.jobs {
                 jobs.insert(job.job_id.clone(), job);
             }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(jobs.into_values().collect())
     }
@@ -4321,8 +4345,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let Some(shard_id) = self.shard_id_for_object(object_id)? else {
             return Ok(Vec::new());
         };
-        self.shard_backend(&shard_id)?
-            .conflicts_for_object(object_id)
+        let mut conflicts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.shard_backend(&shard_id)?.conflicts_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(conflicts)
     }
 
     fn conflicts_for_object_page(

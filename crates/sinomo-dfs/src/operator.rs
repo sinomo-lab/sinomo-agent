@@ -257,7 +257,7 @@ impl<'a> DfsOperatorInspector<'a> {
             receipts.extend(version_receipts);
         }
         let intents = intents_for_object_from_backend(self.backend, object_id)?;
-        let conflicts = self.backend.conflicts_for_object(object_id)?;
+        let conflicts = conflicts_for_object_from_backend(self.backend, object_id)?;
         let repairs = repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version);
         let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
         Ok(Some(DfsOperatorObjectView {
@@ -290,7 +290,10 @@ impl<'a> DfsOperatorInspector<'a> {
         let backend = self.backend;
         let mut conflicts = Vec::new();
         self.for_filtered_objects(file_system_id, object_id, |object| {
-            conflicts.extend(backend.conflicts_for_object(&object.object_id)?);
+            conflicts.extend(conflicts_for_object_from_backend(
+                backend,
+                &object.object_id,
+            )?);
             Ok(())
         })?;
         conflicts.sort_by(|left, right| {
@@ -932,6 +935,27 @@ fn intents_for_object_from_backend(
         cursor = Some(next_cursor);
     }
     Ok(intents)
+}
+
+fn conflicts_for_object_from_backend(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
+    let mut conflicts = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = backend.conflicts_for_object_page(
+            object_id,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        conflicts.extend(page.conflicts);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(conflicts)
 }
 
 fn repairs_for_object_from_backend(
