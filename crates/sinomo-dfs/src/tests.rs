@@ -6892,7 +6892,7 @@ fn reconcile_local_manifests_requires_current_blob_bytes() {
 }
 
 #[test]
-fn commit_version_rejects_manifest_without_blob_bytes() {
+fn commit_version_rejects_manifest_without_content_bytes() {
     let root = temp_root("commit-rejects-manifest-without-blob");
     let owner = NodeId::from_legacy_named("node_commit_missing_blob_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_commit_missing_blob_replica").expect("node");
@@ -6950,7 +6950,7 @@ fn commit_version_rejects_manifest_without_blob_bytes() {
             object_id: rejected_object_id,
             reason,
             ..
-        } if rejected_object_id == object_id && reason.contains("committed blob bytes are missing")
+        } if rejected_object_id == object_id && reason.contains("committed content bytes are missing")
     ));
     assert!(matches!(
         replica_dfs.read_local_object_with_state(&object_id, false),
@@ -9318,6 +9318,162 @@ fn sifs_posix_write_at_self_only_uses_extent_patch_manifest() {
         dfs.posix_read_file_range(file, patch_offset as u64 - 8, patch.len() + 16)
             .expect("read patched range"),
         expected[patch_offset - 8..patch_offset + patch.len() + 8]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
+    let root = temp_root("sifs-posix-write-at-replicated-extent-patch");
+    let owner = NodeId::from_legacy_named("node_sifs_write_at_patch_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_sifs_write_at_patch_replica").expect("replica");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_sifs_write_at_patch_replicated").expect("object");
+    let base_version =
+        DfsVersion::from_legacy_named("version_sifs_write_at_patch_base").expect("base");
+    let path = "/services/replicated-write-at-patch.bin";
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("replica"),
+            root.join("replica-meta"),
+        )
+        .expect("replica metadata"),
+    )
+    .expect("replica backend");
+    owner_dfs.bootstrap_distributed_sifs().expect("owner sifs");
+    replica_dfs
+        .bootstrap_distributed_sifs()
+        .expect("replica sifs");
+
+    let mut initial = vec![0_u8; 384 * 1024 + 37];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 239) as u8;
+    }
+    let owner_base = owner_dfs
+        .content()
+        .put_object_version(object_id.as_str(), base_version.as_str(), &initial)
+        .expect("owner base content");
+    let replica_base = replica_dfs
+        .content()
+        .put_object_version(object_id.as_str(), base_version.as_str(), &initial)
+        .expect("replica base content");
+    assert_eq!(owner_base.content_hash, replica_base.content_hash);
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.path = path.to_string();
+    object.version = base_version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone(), replica.clone()];
+    object.content_hash = Some(owner_base.content_hash.clone());
+    object.content_size_bytes = Some(owner_base.size_bytes);
+    owner_dfs
+        .add_object_metadata(object.clone())
+        .expect("owner object metadata");
+    replica_dfs
+        .add_object_metadata(object)
+        .expect("replica object metadata");
+
+    let patch = b"remote extent patch";
+    let patch_offset = 192 * 1024 + 13;
+    let mut expected = initial.clone();
+    expected[patch_offset..patch_offset + patch.len()].copy_from_slice(patch);
+    let expected_hash = content_hash(&expected);
+    let pending_stat = owner_dfs
+        .posix_write_file_at(
+            path,
+            patch_offset as u64,
+            patch,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: false,
+            },
+        )
+        .expect("owner patch write");
+    assert_eq!(pending_stat.size_bytes, Some(expected.len() as u64));
+
+    let mut committed = false;
+    for _ in 0..16 {
+        replica_dfs.process_incoming().expect("replica incoming");
+        owner_dfs.process_incoming().expect("owner incoming");
+        replica_dfs
+            .process_incoming()
+            .expect("replica commit incoming");
+        let owner_object = owner_dfs
+            .current_read_object_metadata(&object_id)
+            .expect("owner object");
+        let replica_object = replica_dfs
+            .current_read_object_metadata(&object_id)
+            .expect("replica object");
+        if owner_object.content_hash.as_deref() == Some(expected_hash.as_str())
+            && replica_object.content_hash.as_deref() == Some(expected_hash.as_str())
+        {
+            committed = true;
+            break;
+        }
+    }
+    assert!(committed, "replicated patch write did not commit");
+
+    let committed_owner = owner_dfs
+        .current_read_object_metadata(&object_id)
+        .expect("committed owner metadata");
+    assert_eq!(
+        committed_owner.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(
+        owner_dfs.posix_read_file(path).expect("owner read"),
+        expected
+    );
+    assert_eq!(
+        replica_dfs
+            .current_read_object_metadata(&object_id)
+            .expect("replica metadata")
+            .current_locations,
+        vec![owner.clone(), replica.clone()]
+    );
+    let replica_manifest = replica_dfs
+        .content()
+        .read_manifest(object_id.as_str(), committed_owner.version.as_str())
+        .expect("replica patched manifest");
+    assert_eq!(replica_manifest.content_hash, expected_hash);
+    assert!(
+        !replica_manifest.extents.is_empty(),
+        "remote patch stage should preserve unchanged bytes as extents"
+    );
+    assert!(
+        replica_manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == owner_base.content_hash)
+    );
+    assert!(
+        replica_manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == content_hash(patch))
+    );
+    assert!(
+        !replica_dfs
+            .content()
+            .has_blob(&replica_manifest.content_hash)
+            .expect("logical blob check"),
+        "replicated patch write should not materialize a full replacement blob on the replica"
     );
 
     std::fs::remove_dir_all(root).ok();

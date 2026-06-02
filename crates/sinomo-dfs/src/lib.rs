@@ -81,7 +81,7 @@ pub use protocol::{
     DfsProtocolFrameResponse, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
     DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand,
     DfsRepairReplicaResponse, DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse,
-    DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
 
 pub type DfsFileSystemId = sinomo_core::Id;
@@ -1077,6 +1077,7 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                 }
                 DfsNetworkMessage::StageBlob(_)
                 | DfsNetworkMessage::StageBlobChunk(_)
+                | DfsNetworkMessage::StagePatch(_)
                 | DfsNetworkMessage::StageBlobResponse(_)
                 | DfsNetworkMessage::CommitVersion(_)
                 | DfsNetworkMessage::CommitVersionResponse(_)
@@ -3743,6 +3744,210 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_patch_with_base(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: DfsVersion,
+        offset: u64,
+        bytes: &[u8],
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if let Some(outcome) = self.write_self_only_eventual_patch_with_base(
+            request.clone(),
+            expected_base_version.clone(),
+            offset,
+            bytes,
+            desired_replica_nodes.clone(),
+            policy.clone(),
+        )? {
+            return Ok(Some(outcome));
+        }
+        if bytes.is_empty() || bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES {
+            return Ok(None);
+        }
+
+        let object = self.current_object_for_write(&request.object_id)?;
+        if !matches!(
+            object.policy,
+            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
+        ) {
+            return Ok(None);
+        }
+        if expected_base_version != object.version {
+            return Ok(None);
+        }
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
+            let desired_replicas = desired_replica_nodes.len();
+            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
+                desired_replicas
+            } else {
+                policy.min_commit_replicas.min(desired_replicas)
+            };
+            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+        } else {
+            policy
+        };
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+        let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
+            Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
+            Some(shard) => shard.epoch,
+            None => 0,
+        };
+
+        if self
+            .ensure_no_backend_pending_write_intent(
+                &request.object_id,
+                &request.target_version,
+                None,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if self
+            .coordinator
+            .validate_new_intent(
+                &request.file_system_id,
+                &request.object_id,
+                Some(&expected_base_version),
+                &request.target_version,
+                &desired_replica_nodes,
+                &policy,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        let manifest = match self.content.put_object_version_patch(
+            request.object_id.as_str(),
+            expected_base_version.as_str(),
+            request.target_version.as_str(),
+            offset,
+            bytes,
+        ) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(None),
+        };
+        let intent = match self.coordinator.create_intent_at_epoch(
+            request.file_system_id.clone(),
+            request.object_id.clone(),
+            Some(expected_base_version.clone()),
+            request.target_version.clone(),
+            request.requesting_node_id.clone(),
+            owner_epoch,
+            desired_replica_nodes.clone(),
+            policy,
+        ) {
+            Ok(intent) => intent,
+            Err(error)
+                if object.policy == DfsObjectPolicy::ReplicatedEventual
+                    && distributed_error_creates_conflict(&error) =>
+            {
+                let conflict = self.create_write_conflict(
+                    &object,
+                    Some(expected_base_version),
+                    request.target_version.clone(),
+                    request.requesting_node_id.clone(),
+                    Some(manifest.content_hash),
+                    error.to_string(),
+                    None,
+                )?;
+                return Ok(Some(NetworkedDfsWriteOutcome::Conflict { conflict }));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
+        self.pending_writes.insert(
+            intent.intent_id.clone(),
+            pending_networked_write(
+                request.object_id.clone(),
+                request.target_version.clone(),
+                manifest.content_hash.clone(),
+                manifest.size_bytes,
+            ),
+        );
+
+        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
+            let local_node_id = self.node_id.clone();
+            self.put_metadata_receipt(
+                &request.file_system_id,
+                &request.object_id,
+                &request.target_version,
+                &local_node_id,
+                &manifest.content_hash,
+            )?;
+            self.coordinator
+                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
+        } else {
+            intent
+        };
+
+        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+        if !matches!(
+            self.coordinator
+                .intent(&updated_intent.intent_id)
+                .map(|intent| &intent.state),
+            Some(DfsWriteIntentState::Committed)
+        ) {
+            let stage_targets = desired_replica_nodes
+                .iter()
+                .filter(|node_id| *node_id != &self.node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let patch_hash = content_hash(bytes);
+            for replica_node_id in stage_targets {
+                let request_id = self.next_request_id();
+                let sent = self.send_stage_patch_if_routable(
+                    &replica_node_id,
+                    request_id.clone(),
+                    &updated_intent.intent_id,
+                    &request.file_system_id,
+                    &request.object_id,
+                    &expected_base_version,
+                    &request.target_version,
+                    &manifest.content_hash,
+                    offset,
+                    &patch_hash,
+                    bytes,
+                    Some(object.clone()),
+                )?;
+                if sent {
+                    self.record_stage_inflight(
+                        &updated_intent.intent_id,
+                        &replica_node_id,
+                        request_id,
+                    );
+                } else {
+                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
+                }
+            }
+        }
+
+        let outcome = self.write_outcome(&updated_intent.intent_id)?;
+        self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
+        Ok(Some(outcome))
+    }
+
     pub(crate) fn write_self_only_eventual_patch_with_base(
         &mut self,
         request: DfsWriteRequest,
@@ -4764,6 +4969,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     if let Some(event) = self.handle_stage_blob_chunk(source_node_id, command)? {
                         events.push(event);
                     }
+                }
+                DfsNetworkMessage::StagePatch(command) => {
+                    events.push(self.handle_stage_patch(source_node_id, command)?);
                 }
                 DfsNetworkMessage::StageBlobResponse(response) => {
                     if let Some(event) =
@@ -6143,6 +6351,117 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         })
     }
 
+    fn handle_stage_patch(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStagePatchCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let result = match self
+            .ensure_replica_command_authorized_with_metadata(
+                &requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                command.object_metadata.as_ref(),
+            )
+            .and_then(|()| self.ensure_replica_object_metadata(command.object_metadata.as_ref()))
+            .and_then(|()| {
+                self.ensure_no_conflicting_pending_replica_write(
+                    "stage-patch",
+                    &requester_node_id,
+                    &command.intent_id,
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.ensure_command_base_matches_current(
+                    "stage-patch",
+                    &command.object_id,
+                    Some(&command.base_version),
+                    &command.version,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                let local_node_id = self.node_id.clone();
+                self.ensure_metadata_receipt_accepts(
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                )
+            })
+            .and_then(|()| {
+                self.store_command_patch(
+                    &command.object_id,
+                    &command.base_version,
+                    &command.version,
+                    &command.content_hash,
+                    command.offset,
+                    &command.patch_hash,
+                    &command.bytes,
+                )
+            }) {
+            Ok(()) => {
+                let local_node_id = self.node_id.clone();
+                self.put_replica_receipt_if_authoritative(
+                    &command.file_system_id,
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                    command.object_metadata.as_ref(),
+                )?;
+                self.record_active_replica_stage(
+                    &command.object_id,
+                    &command.intent_id,
+                    &command.version,
+                    &command.content_hash,
+                    &requester_node_id,
+                );
+                DfsBlobTransferResult::Durable {
+                    content_hash: command.content_hash.clone(),
+                }
+            }
+            Err(error) => DfsBlobTransferResult::Rejected {
+                reason: error.to_string(),
+            },
+        };
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                request_id: command.request_id.clone(),
+                intent_id: command.intent_id.clone(),
+                file_system_id: command.file_system_id,
+                object_id: command.object_id.clone(),
+                version: command.version.clone(),
+                replica_node_id: self.node_id.clone(),
+                result: result.clone(),
+            }),
+        )?;
+        Ok(match result {
+            DfsBlobTransferResult::Durable { content_hash }
+            | DfsBlobTransferResult::Committed { content_hash } => {
+                NetworkedDfsServiceEvent::BlobStaged {
+                    intent_id: command.intent_id,
+                    object_id: command.object_id,
+                    version: command.version,
+                    replica_node_id: self.node_id.clone(),
+                    content_hash,
+                }
+            }
+            DfsBlobTransferResult::Rejected { reason } => {
+                NetworkedDfsServiceEvent::BlobStageRejected {
+                    intent_id: command.intent_id,
+                    object_id: command.object_id,
+                    replica_node_id: self.node_id.clone(),
+                    reason,
+                }
+            }
+        })
+    }
+
     fn handle_stage_blob_chunk(
         &mut self,
         requester_node_id: NodeId,
@@ -6593,10 +6912,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         actual: manifest.content_hash,
                     });
                 }
-                if !self.content.has_blob(&command.content_hash)? {
+                if !self.content.manifest_content_available(&manifest)? {
                     return Err(DfsError::ContentStore {
                         message: format!(
-                            "committed blob bytes are missing for {} {}",
+                            "committed content bytes are missing for {} {}",
                             command.object_id, command.version
                         ),
                     });
@@ -10664,6 +10983,39 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn store_command_patch(
+        &self,
+        object_id: &DfsObjectId,
+        base_version: &DfsVersion,
+        target_version: &DfsVersion,
+        expected_hash: &str,
+        offset: u64,
+        expected_patch_hash: &str,
+        bytes: &[u8],
+    ) -> Result<(), DfsError> {
+        let actual_patch_hash = content_hash(bytes);
+        if actual_patch_hash != expected_patch_hash {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_patch_hash.to_string(),
+                actual: actual_patch_hash,
+            });
+        }
+        let manifest = self.content.put_object_version_patch(
+            object_id.as_str(),
+            base_version.as_str(),
+            target_version.as_str(),
+            offset,
+            bytes,
+        )?;
+        if manifest.content_hash != expected_hash {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash.to_string(),
+                actual: manifest.content_hash,
+            });
+        }
+        Ok(())
+    }
+
     fn local_object_version_manifest_matches(
         &self,
         object_id: &DfsObjectId,
@@ -11145,6 +11497,43 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         }
         Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_stage_patch_if_routable(
+        &mut self,
+        target_node_id: &NodeId,
+        request_id: String,
+        intent_id: &str,
+        file_system_id: &DfsFileSystemId,
+        object_id: &DfsObjectId,
+        base_version: &DfsVersion,
+        version: &DfsVersion,
+        content_hash: &str,
+        offset: u64,
+        patch_hash: &str,
+        bytes: &[u8],
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<bool, DfsError> {
+        if bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES {
+            return Ok(false);
+        }
+        self.send_best_effort_message_if_routable(
+            target_node_id,
+            DfsNetworkMessage::StagePatch(DfsStagePatchCommand {
+                request_id,
+                intent_id: intent_id.to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                base_version: base_version.clone(),
+                version: version.clone(),
+                content_hash: content_hash.to_string(),
+                offset,
+                patch_hash: patch_hash.to_string(),
+                bytes: bytes.to_vec(),
+                object_metadata,
+            }),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
