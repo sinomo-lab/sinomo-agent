@@ -719,6 +719,32 @@ fn run_blob(args: &Args) -> BenchResult<()> {
         }),
     );
 
+    let range_stream_start = Instant::now();
+    let mut range_reader = store.open_blob_range_stream(
+        &manifest.content_hash,
+        range_offset,
+        args.blob_range_bytes,
+    )?;
+    let mut range_stream_bytes = 0u64;
+    loop {
+        let read = range_reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        range_stream_bytes = range_stream_bytes.saturating_add(read as u64);
+    }
+    let range_stream_elapsed = range_stream_start.elapsed();
+    emit(
+        "blob_range_stream_read",
+        range_stream_elapsed,
+        json!({
+            "offset": range_offset,
+            "bytes": range_stream_bytes,
+            "requested_bytes": args.blob_range_bytes,
+            "mib_per_second": mib_per_second(range_stream_bytes, range_stream_elapsed),
+        }),
+    );
+
     Ok(())
 }
 
