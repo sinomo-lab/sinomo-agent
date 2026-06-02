@@ -1,4 +1,5 @@
 use super::*;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -45,6 +46,22 @@ pub(crate) struct DfsFilterOptions {
     pub(crate) common: DfsCommonOptions,
     pub(crate) file_system_id: Option<DfsFileSystemId>,
     pub(crate) object_id: Option<DfsObjectId>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) cursor: Option<DfsOperatorInspectionCursor>,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsConflictCliPage {
+    conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DfsRepairCliPage {
+    repairs: Vec<DfsOperatorRepairView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
 }
 
 pub(crate) enum DfsInspectionMetadata {
@@ -250,6 +267,22 @@ pub(crate) fn parse_dfs_filter_options(args: &[String]) -> Result<DfsFilterOptio
                     return Err(CliError::Usage);
                 };
                 options.object_id = Some(parse_dfs_object_id(object_id)?);
+            }
+            "--limit" => {
+                index += 1;
+                let Some(limit) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.limit = Some(limit.parse::<usize>().map_err(|source| CliError::Parse {
+                    detail: format!("invalid DFS inspection limit {limit}: {source}"),
+                })?);
+            }
+            "--cursor" => {
+                index += 1;
+                let Some(cursor) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                options.cursor = Some(decode_dfs_inspection_cursor(cursor)?);
             }
             "--json" => options.common.json = true,
             _ => return Err(CliError::Usage),
@@ -617,15 +650,37 @@ fn run_dfs_inspection_against_metadata_root(
         DaemonDfsInspectionRequest::Conflicts {
             file_system_id,
             object_id,
-        } => DaemonDfsInspectionResponse::Conflicts {
-            conflicts: inspector.conflicts(file_system_id.as_ref(), object_id.as_ref())?,
-        },
+            limit,
+            cursor,
+        } => {
+            let page = inspector.conflicts_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Conflicts {
+                conflicts: page.conflicts,
+                next_cursor: page.next_cursor,
+            }
+        }
         DaemonDfsInspectionRequest::Repair {
             file_system_id,
             object_id,
-        } => DaemonDfsInspectionResponse::Repair {
-            repairs: inspector.repairs(file_system_id.as_ref(), object_id.as_ref())?,
-        },
+            limit,
+            cursor,
+        } => {
+            let page = inspector.repairs_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Repair {
+                repairs: page.repairs,
+                next_cursor: page.next_cursor,
+            }
+        }
     })
 }
 
@@ -664,6 +719,14 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                 println!("  intents: {}", status.intent_count);
                 println!("  pending writes: {}", status.pending_write_count);
                 println!("  pending repairs: {}", status.pending_repair_count);
+                println!(
+                    "  pending namespace jobs: {}",
+                    status.pending_namespace_job_count
+                );
+                println!(
+                    "  failed namespace jobs: {}",
+                    status.failed_namespace_job_count
+                );
                 println!("  open conflicts: {}", status.open_conflict_count);
             }
             Ok(())
@@ -753,18 +816,33 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             Ok(())
         }
         DfsCliCommand::Conflicts(options) => {
-            let DaemonDfsInspectionResponse::Conflicts { conflicts } = run_dfs_inspection(
+            let DaemonDfsInspectionResponse::Conflicts {
+                conflicts,
+                next_cursor,
+            } = run_dfs_inspection(
                 &options.common,
                 DaemonDfsInspectionRequest::Conflicts {
                     file_system_id: options.file_system_id.clone(),
                     object_id: options.object_id.clone(),
+                    limit: options.limit,
+                    cursor: options.cursor.clone(),
                 },
             )?
             else {
                 return Err(CliError::Usage);
             };
+            let next_cursor = next_cursor
+                .as_ref()
+                .map(encode_dfs_inspection_cursor)
+                .transpose()?;
             if options.common.json {
-                print_json("<dfs-conflicts>", &conflicts)?;
+                print_json(
+                    "<dfs-conflicts>",
+                    &DfsConflictCliPage {
+                        conflicts,
+                        next_cursor,
+                    },
+                )?;
             } else if conflicts.is_empty() {
                 println!("No DFS conflicts.");
             } else {
@@ -779,22 +857,40 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                         conflict.reason
                     );
                 }
+                if let Some(next_cursor) = next_cursor {
+                    println!("next cursor: {next_cursor}");
+                }
             }
             Ok(())
         }
         DfsCliCommand::Repair(options) => {
-            let DaemonDfsInspectionResponse::Repair { repairs } = run_dfs_inspection(
+            let DaemonDfsInspectionResponse::Repair {
+                repairs,
+                next_cursor,
+            } = run_dfs_inspection(
                 &options.common,
                 DaemonDfsInspectionRequest::Repair {
                     file_system_id: options.file_system_id.clone(),
                     object_id: options.object_id.clone(),
+                    limit: options.limit,
+                    cursor: options.cursor.clone(),
                 },
             )?
             else {
                 return Err(CliError::Usage);
             };
+            let next_cursor = next_cursor
+                .as_ref()
+                .map(encode_dfs_inspection_cursor)
+                .transpose()?;
             if options.common.json {
-                print_json("<dfs-repair>", &repairs)?;
+                print_json(
+                    "<dfs-repair>",
+                    &DfsRepairCliPage {
+                        repairs,
+                        next_cursor,
+                    },
+                )?;
             } else if repairs.is_empty() {
                 println!("No DFS repairs are pending.");
             } else {
@@ -807,6 +903,9 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                         repair.missing_replica_node_id,
                         option_label(&repair.content_hash)
                     );
+                }
+                if let Some(next_cursor) = next_cursor {
+                    println!("next cursor: {next_cursor}");
                 }
             }
             Ok(())
@@ -1027,6 +1126,14 @@ fn print_dfs_cluster_status(report: &DfsClusterStatusReport) {
             println!("    versions: {}", status.version_count);
             println!("    pending writes: {}", status.pending_write_count);
             println!("    pending repairs: {}", status.pending_repair_count);
+            println!(
+                "    pending namespace jobs: {}",
+                status.pending_namespace_job_count
+            );
+            println!(
+                "    failed namespace jobs: {}",
+                status.failed_namespace_job_count
+            );
             println!("    open conflicts: {}", status.open_conflict_count);
             if !status.metadata_shards.is_empty() {
                 println!("    metadata shards: {}", status.metadata_shards.len());
@@ -1378,6 +1485,26 @@ pub(crate) fn print_json<T: Serialize>(label: &str, value: &T) -> Result<(), Cli
         })?
     );
     Ok(())
+}
+
+fn encode_dfs_inspection_cursor(cursor: &DfsOperatorInspectionCursor) -> Result<String, CliError> {
+    let bytes = serde_json::to_vec(cursor).map_err(|source| CliError::Json {
+        path: "<dfs-inspection-cursor>".to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn decode_dfs_inspection_cursor(cursor: &str) -> Result<DfsOperatorInspectionCursor, CliError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid DFS inspection cursor: {source}"),
+        })?;
+    serde_json::from_slice(&bytes).map_err(|source| CliError::Json {
+        path: "<dfs-inspection-cursor>".to_string(),
+        detail: source.to_string(),
+    })
 }
 
 pub(crate) fn option_label(value: &Option<String>) -> String {

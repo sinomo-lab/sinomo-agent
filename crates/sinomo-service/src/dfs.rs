@@ -206,19 +206,41 @@ fn dfs_inspection(
         DaemonDfsInspectionRequest::Conflicts {
             file_system_id,
             object_id,
-        } => DaemonDfsInspectionResponse::Conflicts {
-            conflicts: inspector
-                .conflicts(file_system_id.as_ref(), object_id.as_ref())
-                .map_err(service_error)?,
-        },
+            limit,
+            cursor,
+        } => {
+            let page = inspector
+                .conflicts_page(
+                    file_system_id.as_ref(),
+                    object_id.as_ref(),
+                    limit,
+                    cursor.as_ref(),
+                )
+                .map_err(service_error)?;
+            DaemonDfsInspectionResponse::Conflicts {
+                conflicts: page.conflicts,
+                next_cursor: page.next_cursor,
+            }
+        }
         DaemonDfsInspectionRequest::Repair {
             file_system_id,
             object_id,
-        } => DaemonDfsInspectionResponse::Repair {
-            repairs: inspector
-                .repairs(file_system_id.as_ref(), object_id.as_ref())
-                .map_err(service_error)?,
-        },
+            limit,
+            cursor,
+        } => {
+            let page = inspector
+                .repairs_page(
+                    file_system_id.as_ref(),
+                    object_id.as_ref(),
+                    limit,
+                    cursor.as_ref(),
+                )
+                .map_err(service_error)?;
+            DaemonDfsInspectionResponse::Repair {
+                repairs: page.repairs,
+                next_cursor: page.next_cursor,
+            }
+        }
     };
     Ok(response)
 }

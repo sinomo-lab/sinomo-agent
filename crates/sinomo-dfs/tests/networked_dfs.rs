@@ -835,7 +835,9 @@ fn networked_dfs_retries_lost_inflight_stage_after_retry_delay() {
         .add_object_metadata(metadata)
         .expect("replica object");
 
-    let bytes = b"lost stage retry bytes".to_vec();
+    let bytes = (0..90_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -858,7 +860,7 @@ fn networked_dfs_retries_lost_inflight_stage_after_retry_delay() {
             .drain_incoming()
             .expect("drop original stage")
             .len(),
-        1
+        2
     );
 
     owner_dfs
@@ -1777,6 +1779,7 @@ fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
             total_size_bytes: alternate_repair_bytes.len() as u64,
             chunk_index: 0,
             total_chunks: 1,
+            chunk_hash: None,
             bytes: alternate_repair_bytes.clone(),
         }),
     );
@@ -2502,6 +2505,138 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
             } if source_node_id == &owner
         )
     }));
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
+    let owner = NodeId::from_legacy_named("node_metadata_incremental_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metadata_incremental_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let replicated_object_id =
+        DfsObjectId::from_legacy_named("obj_metadata_incremental_replicated").expect("object");
+    let transient_object_id =
+        DfsObjectId::from_legacy_named("obj_metadata_incremental_transient").expect("object");
+    let version = DfsVersion::from_legacy_named("version_metadata_incremental").expect("version");
+    let root = temp_root("networked_metadata_incremental");
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let replica_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("replica"),
+        root.join("replica-meta"),
+    )
+    .expect("replica metadata");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("owner metadata backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(replica_backend)
+    .expect("replica metadata backend");
+
+    owner_dfs
+        .add_file_system(DfsFileSystem {
+            file_system_id: file_system_id.clone(),
+            display_name: "repo".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        })
+        .expect("owner filesystem");
+
+    let transient_metadata = DfsObjectMetadata {
+        object_id: transient_object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/transient-only-on-replica.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: replica.clone(),
+        current_locations: vec![replica.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    replica_dfs
+        .add_transient_object_metadata(transient_metadata.clone())
+        .expect("replica transient metadata");
+    assert!(
+        replica_dfs
+            .metadata_backend()
+            .expect("replica backend")
+            .get_object(&transient_object_id)
+            .expect("transient backend lookup")
+            .is_none(),
+        "transient object is deliberately absent from the replica backend"
+    );
+
+    let replicated_metadata = DfsObjectMetadata {
+        object_id: replicated_object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/replicated-incremental.txt".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: Some("blake3:metadata-incremental".to_string()),
+        content_size_bytes: Some(12),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    owner_dfs
+        .add_object_metadata(replicated_metadata.clone())
+        .expect("owner metadata");
+
+    owner_dfs
+        .send_metadata_journal_since(&replica, 0)
+        .expect("send journal")
+        .expect("nonempty batch");
+    let events = replica_dfs.process_incoming().expect("replica incoming");
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
+                source_node_id,
+                applied_entries,
+                ..
+            } if source_node_id == &owner && *applied_entries > 0
+        )
+    }));
+
+    assert_eq!(
+        replica_dfs.metadata().object(&replicated_object_id),
+        Some(&replicated_metadata)
+    );
+    assert_eq!(
+        replica_dfs.metadata().object(&transient_object_id),
+        Some(&transient_metadata),
+        "incremental metadata replay must not clear unrelated in-memory service state"
+    );
 
     cleanup(&root);
 }
@@ -7171,7 +7306,7 @@ fn networked_dfs_large_remote_read_uses_chunked_response() {
                 object_id: served_object_id,
                 result: DfsReadResult::Found(DfsReadData { bytes, .. }),
                 ..
-            } if served_object_id == &object_id && bytes == &large_bytes
+            } if served_object_id == &object_id && bytes.is_empty()
         )
     }));
     let completed = reader_dfs
@@ -7184,7 +7319,7 @@ fn networked_dfs_large_remote_read_uses_chunked_response() {
                 object_id: completed_object_id,
                 result: DfsReadResult::Found(DfsReadData { bytes, .. }),
                 ..
-            } if completed_object_id == &object_id && bytes == &large_bytes
+            } if completed_object_id == &object_id && bytes.is_empty()
         )
     }));
     assert!(matches!(
@@ -7193,6 +7328,137 @@ fn networked_dfs_large_remote_read_uses_chunked_response() {
             .expect("large read cached"),
         NetworkedDfsReadOutcome::Found { data, .. } if data.bytes == large_bytes
     ));
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_remote_range_read_returns_slice_without_full_cache() {
+    let owner = NodeId::from_legacy_named("node_range_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_range_reader").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_range_artifact").expect("object");
+    let version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let root = temp_root("networked_read_range_slice");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id,
+        path: "range.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version.clone(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    let bytes = (0..200_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let offset = 70_003_u64;
+    let max_bytes = 4096_usize;
+    let expected = bytes[offset as usize..offset as usize + max_bytes].to_vec();
+
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    reader_dfs
+        .add_file_system(file_system)
+        .expect("reader filesystem");
+    owner_dfs
+        .put_local_object_version(metadata, &bytes)
+        .expect("seed owner");
+    let owner_metadata = owner_dfs
+        .metadata()
+        .object(&object_id)
+        .expect("owner metadata")
+        .clone();
+    reader_dfs
+        .add_object_metadata(owner_metadata.clone())
+        .expect("replicate metadata");
+
+    let too_large = reader_dfs
+        .request_remote_object_range_read(&object_id, 0, 65_537)
+        .expect_err("oversized range window should be rejected");
+    assert!(
+        too_large.to_string().contains("exceeds inline limit"),
+        "{too_large}"
+    );
+
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_range_read(&object_id, offset, max_bytes)
+            .expect("request range read"),
+        vec![owner.clone()]
+    );
+    let served = owner_dfs.process_incoming().expect("owner serves range");
+    assert!(served.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadServed {
+                object_id: served_object_id,
+                result: DfsReadResult::RangeFound(data),
+                ..
+            } if served_object_id == &object_id
+                && data.object_id == object_id
+                && data.version == version
+                && data.content_hash == owner_metadata.content_hash
+                && data.offset == offset
+                && data.total_size_bytes == bytes.len() as u64
+                && data.bytes == expected
+        )
+    }));
+
+    let completed = reader_dfs
+        .process_incoming()
+        .expect("reader receives range");
+    assert!(completed.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result: DfsReadResult::RangeFound(data),
+                ..
+            } if completed_object_id == &object_id
+                && data.object_id == object_id
+                && data.version == version
+                && data.content_hash == owner_metadata.content_hash
+                && data.offset == offset
+                && data.total_size_bytes == bytes.len() as u64
+                && data.bytes == expected
+        )
+    }));
+    assert!(
+        reader_dfs
+            .read_local_object(&object_id)
+            .expect("range read should not cache full object")
+            .is_none()
+    );
 
     cleanup(&root);
 }
@@ -7394,6 +7660,7 @@ fn networked_dfs_rejects_read_chunk_size_that_disagrees_with_metadata() {
         total_size_bytes: large_bytes.len() as u64 + 1,
         chunk_index: 0,
         total_chunks: 1,
+        chunk_hash: None,
         bytes: large_bytes,
     });
     let protocol_message =
@@ -7514,6 +7781,7 @@ fn networked_dfs_rejects_read_chunk_count_that_disagrees_with_declared_size() {
         total_size_bytes: 1,
         chunk_index: 0,
         total_chunks: u32::MAX,
+        chunk_hash: None,
         bytes: vec![7],
     });
     let protocol_message =
@@ -7560,6 +7828,100 @@ fn networked_dfs_rejects_read_chunk_count_that_disagrees_with_declared_size() {
 }
 
 #[test]
+fn networked_dfs_rejects_read_chunk_hash_mismatch() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let reader = NodeId::from_legacy_named("node_reader").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_bad_read_chunk_hash").expect("object");
+    let version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let root = temp_root("networked_read_bad_chunk_hash");
+    let network = InProcessNetwork::new();
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("reader")).expect("reader store"),
+    );
+    let mut owner_transport = network.add_node(owner.clone());
+    let bytes = b"read bytes with a corrupt chunk checksum".to_vec();
+    let expected_content_hash = content_hash(&bytes);
+    reader_dfs
+        .add_file_system(DfsFileSystem {
+            file_system_id: file_system_id.clone(),
+            display_name: "repo".to_string(),
+            owner_node_id: owner.clone(),
+            subtree_policies: Vec::new(),
+        })
+        .expect("reader filesystem");
+    reader_dfs
+        .add_object_metadata(DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id,
+            path: "bad-read-chunk-hash.bin".to_string(),
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: owner.clone(),
+            current_locations: vec![owner.clone()],
+            content_hash: Some(expected_content_hash.clone()),
+            content_size_bytes: Some(bytes.len() as u64),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        })
+        .expect("reader metadata");
+    reader_dfs
+        .request_remote_object_read(&object_id)
+        .expect("request read");
+    assert_eq!(
+        owner_transport
+            .drain_incoming()
+            .expect("drain original read request")
+            .len(),
+        1
+    );
+    let bad_chunk = DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
+        request_id: "dfs_net_req_1".to_string(),
+        object_id: object_id.clone(),
+        version,
+        content_hash: Some(expected_content_hash),
+        total_size_bytes: bytes.len() as u64,
+        chunk_index: 0,
+        total_chunks: 1,
+        chunk_hash: Some(content_hash(b"different read chunk")),
+        bytes,
+    });
+    send_dfs_test_message(&mut owner_transport, &owner, &reader, bad_chunk);
+    let events = reader_dfs
+        .process_incoming()
+        .expect("bad read chunk checksum is isolated");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result: DfsReadResult::Rejected { reason },
+                ..
+            } if completed_object_id == &object_id && reason.contains("content hash mismatch")
+        )),
+        "expected rejected read checksum event, got {events:?}"
+    );
+    assert_eq!(
+        reader_dfs
+            .request_remote_object_read(&object_id)
+            .expect("bad checksum source should not be retried"),
+        Vec::<NodeId>::new()
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_rejects_stage_chunk_count_that_disagrees_with_declared_size() {
     let owner = NodeId::from_legacy_named("node_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_replica").expect("node");
@@ -7584,6 +7946,7 @@ fn networked_dfs_rejects_stage_chunk_count_that_disagrees_with_declared_size() {
         total_size_bytes: 1,
         chunk_index: 0,
         total_chunks: u32::MAX,
+        chunk_hash: None,
         bytes: vec![9],
         object_metadata: None,
     });
@@ -7602,6 +7965,62 @@ fn networked_dfs_rejects_stage_chunk_count_that_disagrees_with_declared_size() {
                 && reason.contains("chunked DFS blob transfer chunk count does not match size")
         )),
         "expected rejected stage event, got {events:?}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_rejects_stage_chunk_hash_mismatch() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_bad_stage_chunk_hash").expect("object");
+    let version = DfsVersion::from_legacy_named("version_1").expect("version");
+    let root = temp_root("networked_stage_bad_chunk_hash");
+    let network = InProcessNetwork::new();
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
+    );
+    let mut owner_transport = network.add_node(owner.clone());
+    let bytes = b"stage bytes with a corrupt chunk checksum".to_vec();
+    let bad_chunk = DfsNetworkMessage::StageBlobChunk(DfsStageBlobChunkCommand {
+        request_id: "dfs_net_req_bad_stage_chunk_hash".to_string(),
+        intent_id: "intent_bad_stage_chunk_hash".to_string(),
+        file_system_id,
+        object_id: object_id.clone(),
+        expected_base_version: None,
+        version: version.clone(),
+        content_hash: content_hash(&bytes),
+        total_size_bytes: bytes.len() as u64,
+        chunk_index: 0,
+        total_chunks: 1,
+        chunk_hash: Some(content_hash(b"different stage chunk")),
+        bytes,
+        object_metadata: None,
+    });
+    send_dfs_test_message(&mut owner_transport, &owner, &replica, bad_chunk);
+    let events = replica_dfs
+        .process_incoming()
+        .expect("bad stage chunk checksum is isolated");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobStageRejected {
+                object_id: rejected_object_id,
+                reason,
+                ..
+            } if rejected_object_id == &object_id && reason.contains("content hash mismatch")
+        )),
+        "expected rejected stage checksum event, got {events:?}"
+    );
+    assert!(
+        replica_dfs
+            .content()
+            .read_manifest(object_id.as_str(), version.as_str())
+            .is_err(),
+        "bad checksum chunks must not leave a committed manifest"
     );
 
     cleanup(&root);
@@ -7632,6 +8051,7 @@ fn networked_dfs_rejects_repair_chunk_count_that_disagrees_with_declared_size() 
         total_size_bytes: 1,
         chunk_index: 0,
         total_chunks: u32::MAX,
+        chunk_hash: None,
         bytes: vec![11],
         object_metadata: None,
     });
@@ -7703,6 +8123,7 @@ fn networked_dfs_chunked_repair_auth_failure_notifies_sender() {
         total_size_bytes: b"repair auth bytes".len() as u64,
         chunk_index: 0,
         total_chunks: 1,
+        chunk_hash: None,
         bytes: b"repair auth bytes".to_vec(),
         object_metadata: Some(object_metadata),
     };
@@ -7798,6 +8219,7 @@ fn networked_dfs_chunked_stage_accepts_out_of_order_chunks() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 1,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: bytes[chunk_size..].to_vec(),
         object_metadata: Some(metadata.clone()),
     };
@@ -7894,6 +8316,7 @@ fn networked_dfs_chunked_repair_accepts_out_of_order_chunks() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 1,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: bytes[chunk_size..].to_vec(),
         object_metadata: Some(metadata.clone()),
     };
@@ -7999,6 +8422,7 @@ fn networked_dfs_chunked_stage_retry_uses_latest_request_id() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 0,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata.clone()),
     };
@@ -8026,6 +8450,7 @@ fn networked_dfs_chunked_stage_retry_uses_latest_request_id() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 0,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata.clone()),
     };
@@ -8121,6 +8546,7 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 0,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata.clone()),
     };
@@ -8148,6 +8574,7 @@ fn networked_dfs_chunked_repair_retry_uses_latest_request_id() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 0,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: bytes[..chunk_size].to_vec(),
         object_metadata: Some(metadata),
     };
@@ -8246,6 +8673,7 @@ fn networked_dfs_stage_chunk_duplicate_is_idempotent() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 0,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: first_chunk.clone(),
         object_metadata: Some(metadata),
     };
@@ -8284,6 +8712,7 @@ fn networked_dfs_stage_chunk_duplicate_is_idempotent() {
         total_size_bytes: bytes.len() as u64,
         chunk_index: 1,
         total_chunks: 2,
+        chunk_hash: None,
         bytes: second_chunk,
         object_metadata: None,
     };
@@ -9532,6 +9961,9 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
         .add_object_metadata(metadata.clone())
         .expect("owner object");
 
+    let bytes = (0..90_000)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
     let write = owner_dfs
         .write_distributed_eventual(
             DfsWriteRequest {
@@ -9540,7 +9972,7 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
                 target_version: version_2.clone(),
                 requesting_node_id: owner.clone(),
             },
-            b"retry repair bytes".to_vec(),
+            bytes.clone(),
             vec![owner.clone(), replica.clone()],
             DfsReplicationPolicy::new(1, 2).expect("policy"),
         )
@@ -9590,7 +10022,7 @@ fn networked_dfs_retries_offline_repair_when_replica_appears() {
             .expect("read")
             .expect("data")
             .bytes,
-        b"retry repair bytes"
+        bytes
     );
 
     cleanup(&root);

@@ -1,9 +1,9 @@
 //! Operator and agent-facing DFS inspection surfaces.
 
 use crate::{
-    DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
-    DfsMetadataShardStatus, DfsObjectMetadata, DfsObjectVersionRecord, DfsReplicaReceiptRecord,
-    DfsWriteIntentRecord, DfsWriteIntentStatus, MetadataBackendError,
+    DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus, DfsFileSystem, DfsMetadataBackend,
+    DfsMetadataShardStatus, DfsObjectMetadata, DfsObjectPageCursor, DfsObjectVersionRecord,
+    DfsReplicaReceiptRecord, DfsWriteIntentRecord, DfsWriteIntentStatus, MetadataBackendError,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -15,6 +15,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
+
+const OPERATOR_OBJECT_SCAN_PAGE_SIZE: usize = 1024;
+const DEFAULT_OPERATOR_INSPECTION_LIMIT: usize = 1024;
+const MAX_OPERATOR_INSPECTION_LIMIT: usize = 10_000;
 
 /// A DFS operator inspection request (status / filesystem / path / object / conflicts /
 /// repair). Host-agnostic contract: the same request drives in-process and daemon paths.
@@ -35,10 +39,18 @@ pub enum DaemonDfsInspectionRequest {
     Conflicts {
         file_system_id: Option<DfsFileSystemId>,
         object_id: Option<DfsObjectId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<DfsOperatorInspectionCursor>,
     },
     Repair {
         file_system_id: Option<DfsFileSystemId>,
         object_id: Option<DfsObjectId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<DfsOperatorInspectionCursor>,
     },
 }
 
@@ -60,9 +72,13 @@ pub enum DaemonDfsInspectionResponse {
     },
     Conflicts {
         conflicts: Vec<DfsConflictRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<DfsOperatorInspectionCursor>,
     },
     Repair {
         repairs: Vec<DfsOperatorRepairView>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<DfsOperatorInspectionCursor>,
     },
 }
 
@@ -76,6 +92,10 @@ pub struct DfsOperatorStatus {
     pub pending_write_count: usize,
     pub open_conflict_count: usize,
     pub pending_repair_count: usize,
+    #[serde(default)]
+    pub pending_namespace_job_count: usize,
+    #[serde(default)]
+    pub failed_namespace_job_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_shards: Vec<DfsMetadataShardStatus>,
 }
@@ -107,6 +127,44 @@ pub struct DfsOperatorRepairView {
     pub version: DfsVersion,
     pub content_hash: Option<String>,
     pub missing_replica_node_id: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorConflictPage {
+    pub conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsOperatorInspectionCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorRepairPage {
+    pub repairs: Vec<DfsOperatorRepairView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsOperatorInspectionCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsOperatorInspectionCursor {
+    pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_cursor: Option<DfsObjectPageCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_id: Option<DfsObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_key: Option<DfsOperatorInspectionItemCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum DfsOperatorInspectionItemCursor {
+    Conflict {
+        conflict_id: String,
+    },
+    Repair {
+        intent_id: String,
+        version: DfsVersion,
+        missing_replica_node_id: NodeId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -146,87 +204,18 @@ impl<'a> DfsOperatorInspector<'a> {
     }
 
     pub fn status(&self) -> Result<DfsOperatorStatus, MetadataBackendError> {
-        let filesystems = self.backend.list_file_systems()?;
-        let mut objects = Vec::new();
-        for file_system in &filesystems {
-            objects.extend(
-                self.backend
-                    .objects_for_file_system(&file_system.file_system_id)?,
-            );
-        }
-
-        // Fetch each record kind in one bulk call instead of querying per object
-        // (and per version for receipts), then aggregate in memory.
-        let versions = self.backend.all_versions()?;
-        let receipts = self.backend.all_receipts()?;
-        let intents = self.backend.all_intents()?;
-        let conflicts = self.backend.all_conflicts()?;
-
-        let version_count = versions.len();
-        let receipt_count = receipts.len();
-        let intent_count = intents.len();
-        let pending_write_count = intents
-            .iter()
-            .filter(|intent| write_intent_is_active(&intent.status))
-            .count();
-        let open_conflict_count = conflicts
-            .iter()
-            .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-            .count();
-
-        let mut intents_by_object = BTreeMap::<DfsObjectId, Vec<DfsWriteIntentRecord>>::new();
-        for intent in intents {
-            intents_by_object
-                .entry(intent.object_id.clone())
-                .or_default()
-                .push(intent);
-        }
-        let mut receipts_by_object_version =
-            BTreeMap::<(DfsObjectId, DfsVersion), Vec<DfsReplicaReceiptRecord>>::new();
-        for receipt in receipts {
-            receipts_by_object_version
-                .entry((
-                    receipt.receipt.object_id.clone(),
-                    receipt.receipt.committed_version.clone(),
-                ))
-                .or_default()
-                .push(receipt);
-        }
-
-        let mut pending_repair_count = 0;
-        for object in &objects {
-            let Some(object_intents) = intents_by_object.get(&object.object_id) else {
-                continue;
-            };
-            let mut receipts_by_version =
-                BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
-            for intent in object_intents
-                .iter()
-                .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
-            {
-                receipts_by_version
-                    .entry(intent.target_version.clone())
-                    .or_insert_with(|| {
-                        receipts_by_object_version
-                            .get(&(object.object_id.clone(), intent.target_version.clone()))
-                            .cloned()
-                            .unwrap_or_default()
-                    });
-            }
-            pending_repair_count +=
-                repairs_from_intents_and_receipts(object, object_intents, &receipts_by_version)
-                    .len();
-        }
-
+        let summary = self.backend.metadata_summary()?;
         Ok(DfsOperatorStatus {
-            file_system_count: filesystems.len(),
-            object_count: objects.len(),
-            version_count,
-            receipt_count,
-            intent_count,
-            pending_write_count,
-            open_conflict_count,
-            pending_repair_count,
+            file_system_count: summary.file_system_count,
+            object_count: summary.object_count,
+            version_count: summary.version_count,
+            receipt_count: summary.receipt_count,
+            intent_count: summary.intent_count,
+            pending_write_count: summary.pending_write_count,
+            open_conflict_count: summary.open_conflict_count,
+            pending_repair_count: summary.pending_repair_count,
+            pending_namespace_job_count: summary.pending_namespace_job_count,
+            failed_namespace_job_count: summary.failed_namespace_job_count,
             metadata_shards: self.backend.metadata_shard_statuses()?,
         })
     }
@@ -238,24 +227,15 @@ impl<'a> DfsOperatorInspector<'a> {
         let Some(file_system) = self.backend.get_file_system(file_system_id)? else {
             return Ok(None);
         };
-        let objects = self.backend.objects_for_file_system(file_system_id)?;
-        let mut open_conflict_count = 0;
-        let mut pending_repair_count = 0;
-        for object in &objects {
-            let intents = self.backend.intents_for_object(&object.object_id)?;
-            open_conflict_count += self
-                .backend
-                .conflicts_for_object(&object.object_id)?
-                .into_iter()
-                .filter(|conflict| conflict.status == DfsConflictStatus::Open)
-                .count();
-            pending_repair_count += self.repairs_for_object(&object, &intents)?.len();
-        }
+        let summary = self
+            .backend
+            .metadata_summary_for_file_system(file_system_id)?
+            .unwrap_or_default();
         Ok(Some(DfsOperatorFileSystemView {
             file_system,
-            object_count: objects.len(),
-            open_conflict_count,
-            pending_repair_count,
+            object_count: summary.object_count,
+            open_conflict_count: summary.open_conflict_count,
+            pending_repair_count: summary.pending_repair_count,
         }))
     }
 
@@ -307,11 +287,12 @@ impl<'a> DfsOperatorInspector<'a> {
         file_system_id: Option<&DfsFileSystemId>,
         object_id: Option<&DfsObjectId>,
     ) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
-        let objects = self.filtered_objects(file_system_id, object_id)?;
+        let backend = self.backend;
         let mut conflicts = Vec::new();
-        for object in objects {
-            conflicts.extend(self.backend.conflicts_for_object(&object.object_id)?);
-        }
+        self.for_filtered_objects(file_system_id, object_id, |object| {
+            conflicts.extend(backend.conflicts_for_object(&object.object_id)?);
+            Ok(())
+        })?;
         conflicts.sort_by(|left, right| {
             left.object_id
                 .cmp(&right.object_id)
@@ -320,17 +301,123 @@ impl<'a> DfsOperatorInspector<'a> {
         Ok(conflicts)
     }
 
+    pub fn conflicts_page(
+        &self,
+        file_system_id: Option<&DfsFileSystemId>,
+        object_id: Option<&DfsObjectId>,
+        limit: Option<usize>,
+        cursor: Option<&DfsOperatorInspectionCursor>,
+    ) -> Result<DfsOperatorConflictPage, MetadataBackendError> {
+        let limit = normalize_operator_inspection_limit(limit);
+        let mut conflicts = Vec::new();
+        if let Some(object_id) = object_id {
+            if let Some(object) = self.backend.get_object(object_id)? {
+                let resume = cursor
+                    .filter(|cursor| cursor.object_id.as_ref() == Some(object_id))
+                    .and_then(|cursor| cursor.item_key.as_ref());
+                let has_remaining =
+                    self.extend_conflicts_for_object(&object, resume, limit, &mut conflicts)?;
+                let next_cursor = next_operator_inspection_cursor(
+                    self.backend,
+                    &object,
+                    has_remaining,
+                    false,
+                    conflicts.last().map(conflict_inspection_cursor),
+                )?;
+                return Ok(DfsOperatorConflictPage {
+                    conflicts,
+                    next_cursor,
+                });
+            }
+            return Ok(DfsOperatorConflictPage {
+                conflicts,
+                next_cursor: None,
+            });
+        }
+
+        let file_systems = self.inspection_file_systems(file_system_id)?;
+        for (file_system_index, file_system) in file_systems.iter().enumerate() {
+            let page_cursor = match self.resume_cursor_for_file_system(
+                file_system,
+                cursor,
+                &mut conflicts,
+                limit,
+                |inspector, object, item_cursor, item_limit, output| {
+                    inspector.extend_conflicts_for_object(object, item_cursor, item_limit, output)
+                },
+                conflict_inspection_cursor,
+            )? {
+                OperatorResumeState::SkipFileSystem => continue,
+                OperatorResumeState::Filled(next_cursor) => {
+                    return Ok(DfsOperatorConflictPage {
+                        next_cursor,
+                        conflicts,
+                    });
+                }
+                OperatorResumeState::Continue(cursor) => cursor,
+            };
+
+            let mut object_page_cursor = page_cursor.and_then(|cursor| cursor.object_cursor);
+            loop {
+                let page = self.backend.objects_for_file_system_page(
+                    &file_system.file_system_id,
+                    object_page_cursor.as_ref(),
+                    OPERATOR_OBJECT_SCAN_PAGE_SIZE,
+                )?;
+                let page_next_cursor = page.next_cursor.clone();
+                let objects = page.objects;
+                if objects.is_empty() {
+                    break;
+                }
+                let object_count = objects.len();
+                for (object_index, object) in objects.iter().enumerate() {
+                    let item_limit = limit.saturating_sub(conflicts.len());
+                    if item_limit == 0 {
+                        break;
+                    }
+                    let has_remaining =
+                        self.extend_conflicts_for_object(object, None, item_limit, &mut conflicts)?;
+                    if conflicts.len() >= limit {
+                        let has_more_after_object = object_index + 1 < object_count
+                            || page_next_cursor.is_some()
+                            || file_system_index + 1 < file_systems.len();
+                        return Ok(DfsOperatorConflictPage {
+                            next_cursor: next_operator_inspection_cursor(
+                                self.backend,
+                                object,
+                                has_remaining,
+                                has_more_after_object,
+                                conflicts.last().map(conflict_inspection_cursor),
+                            )?,
+                            conflicts,
+                        });
+                    }
+                }
+                let Some(next_cursor) = page_next_cursor else {
+                    break;
+                };
+                object_page_cursor = Some(next_cursor);
+            }
+        }
+
+        Ok(DfsOperatorConflictPage {
+            conflicts,
+            next_cursor: None,
+        })
+    }
+
     pub fn repairs(
         &self,
         file_system_id: Option<&DfsFileSystemId>,
         object_id: Option<&DfsObjectId>,
     ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
-        let objects = self.filtered_objects(file_system_id, object_id)?;
+        let backend = self.backend;
         let mut repairs = Vec::new();
-        for object in objects {
-            let intents = self.backend.intents_for_object(&object.object_id)?;
-            repairs.extend(self.repairs_for_object(&object, &intents)?);
-        }
+        self.for_filtered_objects(file_system_id, object_id, |object| {
+            let intents = backend.intents_for_object(&object.object_id)?;
+            repairs.extend(repairs_for_object_from_backend(backend, &object, &intents)?);
+            Ok(())
+        })?;
         repairs.sort_by(|left, right| {
             left.object_id
                 .cmp(&right.object_id)
@@ -343,6 +430,111 @@ impl<'a> DfsOperatorInspector<'a> {
         Ok(repairs)
     }
 
+    pub fn repairs_page(
+        &self,
+        file_system_id: Option<&DfsFileSystemId>,
+        object_id: Option<&DfsObjectId>,
+        limit: Option<usize>,
+        cursor: Option<&DfsOperatorInspectionCursor>,
+    ) -> Result<DfsOperatorRepairPage, MetadataBackendError> {
+        let limit = normalize_operator_inspection_limit(limit);
+        let mut repairs = Vec::new();
+        if let Some(object_id) = object_id {
+            if let Some(object) = self.backend.get_object(object_id)? {
+                let resume = cursor
+                    .filter(|cursor| cursor.object_id.as_ref() == Some(object_id))
+                    .and_then(|cursor| cursor.item_key.as_ref());
+                let has_remaining =
+                    self.extend_repairs_for_object(&object, resume, limit, &mut repairs)?;
+                let next_cursor = next_operator_inspection_cursor(
+                    self.backend,
+                    &object,
+                    has_remaining,
+                    false,
+                    repairs.last().map(repair_inspection_cursor),
+                )?;
+                return Ok(DfsOperatorRepairPage {
+                    repairs,
+                    next_cursor,
+                });
+            }
+            return Ok(DfsOperatorRepairPage {
+                repairs,
+                next_cursor: None,
+            });
+        }
+
+        let file_systems = self.inspection_file_systems(file_system_id)?;
+        for (file_system_index, file_system) in file_systems.iter().enumerate() {
+            let page_cursor = match self.resume_cursor_for_file_system(
+                file_system,
+                cursor,
+                &mut repairs,
+                limit,
+                |inspector, object, item_cursor, item_limit, output| {
+                    inspector.extend_repairs_for_object(object, item_cursor, item_limit, output)
+                },
+                repair_inspection_cursor,
+            )? {
+                OperatorResumeState::SkipFileSystem => continue,
+                OperatorResumeState::Filled(next_cursor) => {
+                    return Ok(DfsOperatorRepairPage {
+                        next_cursor,
+                        repairs,
+                    });
+                }
+                OperatorResumeState::Continue(cursor) => cursor,
+            };
+
+            let mut object_page_cursor = page_cursor.and_then(|cursor| cursor.object_cursor);
+            loop {
+                let page = self.backend.objects_for_file_system_page(
+                    &file_system.file_system_id,
+                    object_page_cursor.as_ref(),
+                    OPERATOR_OBJECT_SCAN_PAGE_SIZE,
+                )?;
+                let page_next_cursor = page.next_cursor.clone();
+                let objects = page.objects;
+                if objects.is_empty() {
+                    break;
+                }
+                let object_count = objects.len();
+                for (object_index, object) in objects.iter().enumerate() {
+                    let item_limit = limit.saturating_sub(repairs.len());
+                    if item_limit == 0 {
+                        break;
+                    }
+                    let has_remaining =
+                        self.extend_repairs_for_object(object, None, item_limit, &mut repairs)?;
+                    if repairs.len() >= limit {
+                        let has_more_after_object = object_index + 1 < object_count
+                            || page_next_cursor.is_some()
+                            || file_system_index + 1 < file_systems.len();
+                        return Ok(DfsOperatorRepairPage {
+                            next_cursor: next_operator_inspection_cursor(
+                                self.backend,
+                                object,
+                                has_remaining,
+                                has_more_after_object,
+                                repairs.last().map(repair_inspection_cursor),
+                            )?,
+                            repairs,
+                        });
+                    }
+                }
+                let Some(next_cursor) = page_next_cursor else {
+                    break;
+                };
+                object_page_cursor = Some(next_cursor);
+            }
+        }
+
+        Ok(DfsOperatorRepairPage {
+            repairs,
+            next_cursor: None,
+        })
+    }
+
     pub fn agent_file_system_summary(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -350,11 +542,12 @@ impl<'a> DfsOperatorInspector<'a> {
         let Some(file_system) = self.backend.get_file_system(file_system_id)? else {
             return Ok(None);
         };
+        let backend = self.backend;
         let mut objects = Vec::new();
-        for object in self.backend.objects_for_file_system(file_system_id)? {
-            let intents = self.backend.intents_for_object(&object.object_id)?;
-            let conflicts = self.backend.conflicts_for_object(&object.object_id)?;
-            let repairs = self.repairs_for_object(&object, &intents)?;
+        self.for_filtered_objects(Some(file_system_id), None, |object| {
+            let intents = backend.intents_for_object(&object.object_id)?;
+            let conflicts = backend.conflicts_for_object(&object.object_id)?;
+            let repairs = repairs_for_object_from_backend(backend, &object, &intents)?;
             objects.push(DfsAgentObjectSummary {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
@@ -362,7 +555,8 @@ impl<'a> DfsOperatorInspector<'a> {
                 content_hash: object.content_hash.clone(),
                 state: agent_state_for(&object, &intents, &conflicts, &repairs),
             });
-        }
+            Ok(())
+        })?;
         Ok(Some(DfsAgentFileSystemSummary {
             file_system_id: file_system.file_system_id,
             display_name: file_system.display_name,
@@ -370,13 +564,20 @@ impl<'a> DfsOperatorInspector<'a> {
         }))
     }
 
-    fn filtered_objects(
+    fn for_filtered_objects<F>(
         &self,
         file_system_id: Option<&DfsFileSystemId>,
         object_id: Option<&DfsObjectId>,
-    ) -> Result<Vec<DfsObjectMetadata>, MetadataBackendError> {
+        mut visit: F,
+    ) -> Result<(), MetadataBackendError>
+    where
+        F: FnMut(DfsObjectMetadata) -> Result<(), MetadataBackendError>,
+    {
         if let Some(object_id) = object_id {
-            return Ok(self.backend.get_object(object_id)?.into_iter().collect());
+            if let Some(object) = self.backend.get_object(object_id)? {
+                visit(object)?;
+            }
+            return Ok(());
         }
 
         let filesystems = match file_system_id {
@@ -387,40 +588,274 @@ impl<'a> DfsOperatorInspector<'a> {
                 .collect::<Vec<_>>(),
             None => self.backend.list_file_systems()?,
         };
-        let mut objects = Vec::new();
         for file_system in filesystems {
-            objects.extend(
-                self.backend
-                    .objects_for_file_system(&file_system.file_system_id)?,
-            );
-        }
-        Ok(objects)
-    }
-
-    fn repairs_for_object(
-        &self,
-        object: &DfsObjectMetadata,
-        intents: &[DfsWriteIntentRecord],
-    ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
-        let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
-        for intent in intents
-            .iter()
-            .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
-        {
-            if !receipts_by_version.contains_key(&intent.target_version) {
-                receipts_by_version.insert(
-                    intent.target_version.clone(),
-                    self.backend
-                        .receipts_for_version(&intent.object_id, &intent.target_version)?,
-                );
+            let mut cursor = None;
+            loop {
+                let page = self.backend.objects_for_file_system_page(
+                    &file_system.file_system_id,
+                    cursor.as_ref(),
+                    OPERATOR_OBJECT_SCAN_PAGE_SIZE,
+                )?;
+                for object in page.objects {
+                    visit(object)?;
+                }
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
             }
         }
-        Ok(repairs_from_intents_and_receipts(
-            object,
-            intents,
-            &receipts_by_version,
-        ))
+        Ok(())
     }
+
+    fn inspection_file_systems(
+        &self,
+        file_system_id: Option<&DfsFileSystemId>,
+    ) -> Result<Vec<DfsFileSystem>, MetadataBackendError> {
+        match file_system_id {
+            Some(file_system_id) => Ok(self
+                .backend
+                .get_file_system(file_system_id)?
+                .into_iter()
+                .collect()),
+            None => self.backend.list_file_systems(),
+        }
+    }
+
+    fn resume_cursor_for_file_system<T, Extend, Key>(
+        &self,
+        file_system: &DfsFileSystem,
+        cursor: Option<&DfsOperatorInspectionCursor>,
+        output: &mut Vec<T>,
+        limit: usize,
+        mut extend: Extend,
+        key_for_item: Key,
+    ) -> Result<OperatorResumeState, MetadataBackendError>
+    where
+        Extend: FnMut(
+            &Self,
+            &DfsObjectMetadata,
+            Option<&DfsOperatorInspectionItemCursor>,
+            usize,
+            &mut Vec<T>,
+        ) -> Result<bool, MetadataBackendError>,
+        Key: Fn(&T) -> DfsOperatorInspectionItemCursor,
+    {
+        let Some(cursor) = cursor else {
+            return Ok(OperatorResumeState::Continue(Some(
+                DfsOperatorInspectionCursor {
+                    file_system_id: file_system.file_system_id.clone(),
+                    object_cursor: None,
+                    object_id: None,
+                    item_key: None,
+                },
+            )));
+        };
+        if file_system.file_system_id < cursor.file_system_id {
+            return Ok(OperatorResumeState::SkipFileSystem);
+        }
+        if file_system.file_system_id > cursor.file_system_id {
+            return Ok(OperatorResumeState::Continue(Some(
+                DfsOperatorInspectionCursor {
+                    file_system_id: file_system.file_system_id.clone(),
+                    object_cursor: None,
+                    object_id: None,
+                    item_key: None,
+                },
+            )));
+        }
+
+        if let Some(object_id) = cursor.object_id.as_ref() {
+            if let Some(object) = self.backend.get_object(object_id)? {
+                let item_limit = limit.saturating_sub(output.len());
+                if item_limit > 0 {
+                    let has_remaining =
+                        extend(self, &object, cursor.item_key.as_ref(), item_limit, output)?;
+                    if output.len() >= limit {
+                        return Ok(OperatorResumeState::Filled(
+                            next_operator_inspection_cursor(
+                                self.backend,
+                                &object,
+                                has_remaining,
+                                cursor.object_cursor.is_some(),
+                                output.last().map(key_for_item),
+                            )?,
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(OperatorResumeState::Continue(Some(
+            DfsOperatorInspectionCursor {
+                file_system_id: file_system.file_system_id.clone(),
+                object_cursor: cursor.object_cursor.clone(),
+                object_id: None,
+                item_key: None,
+            },
+        )))
+    }
+
+    fn extend_conflicts_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+        cursor: Option<&DfsOperatorInspectionItemCursor>,
+        limit: usize,
+        output: &mut Vec<DfsConflictRecord>,
+    ) -> Result<bool, MetadataBackendError> {
+        if limit == 0 {
+            return Ok(true);
+        }
+        let after = conflict_page_cursor_from_operator(cursor);
+        let page =
+            self.backend
+                .conflicts_for_object_page(&object.object_id, after.as_ref(), limit)?;
+        let has_remaining = page.next_cursor.is_some();
+        output.extend(page.conflicts);
+        Ok(has_remaining)
+    }
+
+    fn extend_repairs_for_object(
+        &self,
+        object: &DfsObjectMetadata,
+        cursor: Option<&DfsOperatorInspectionItemCursor>,
+        limit: usize,
+        output: &mut Vec<DfsOperatorRepairView>,
+    ) -> Result<bool, MetadataBackendError> {
+        let intents = self.backend.intents_for_object(&object.object_id)?;
+        let mut repairs = repairs_for_object_from_backend(self.backend, object, &intents)?;
+        repairs.sort_by(repair_view_order);
+        let mut emitted = 0usize;
+        for repair in repairs {
+            if !repair_is_after_cursor(&repair, cursor) {
+                continue;
+            }
+            if emitted >= limit {
+                return Ok(true);
+            }
+            output.push(repair);
+            emitted = emitted.saturating_add(1);
+        }
+        Ok(false)
+    }
+}
+
+enum OperatorResumeState {
+    SkipFileSystem,
+    Continue(Option<DfsOperatorInspectionCursor>),
+    Filled(Option<DfsOperatorInspectionCursor>),
+}
+
+fn normalize_operator_inspection_limit(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(DEFAULT_OPERATOR_INSPECTION_LIMIT)
+        .clamp(1, MAX_OPERATOR_INSPECTION_LIMIT)
+}
+
+fn next_operator_inspection_cursor(
+    backend: &dyn DfsMetadataBackend,
+    object: &DfsObjectMetadata,
+    has_remaining_in_object: bool,
+    has_more_after_object: bool,
+    item_key: Option<DfsOperatorInspectionItemCursor>,
+) -> Result<Option<DfsOperatorInspectionCursor>, MetadataBackendError> {
+    if !has_remaining_in_object && !has_more_after_object {
+        return Ok(None);
+    }
+    Ok(Some(DfsOperatorInspectionCursor {
+        file_system_id: object.file_system_id.clone(),
+        object_cursor: if has_more_after_object {
+            Some(backend.object_page_cursor_for_object(object)?)
+        } else {
+            None
+        },
+        object_id: has_remaining_in_object.then(|| object.object_id.clone()),
+        item_key: has_remaining_in_object.then_some(item_key).flatten(),
+    }))
+}
+
+fn conflict_inspection_cursor(conflict: &DfsConflictRecord) -> DfsOperatorInspectionItemCursor {
+    DfsOperatorInspectionItemCursor::Conflict {
+        conflict_id: conflict.conflict_id.clone(),
+    }
+}
+
+fn conflict_page_cursor_from_operator(
+    cursor: Option<&DfsOperatorInspectionItemCursor>,
+) -> Option<DfsConflictPageCursor> {
+    match cursor {
+        Some(DfsOperatorInspectionItemCursor::Conflict { conflict_id }) => {
+            Some(DfsConflictPageCursor {
+                conflict_id: conflict_id.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn repair_inspection_cursor(repair: &DfsOperatorRepairView) -> DfsOperatorInspectionItemCursor {
+    DfsOperatorInspectionItemCursor::Repair {
+        intent_id: repair.intent_id.clone(),
+        version: repair.version.clone(),
+        missing_replica_node_id: repair.missing_replica_node_id.clone(),
+    }
+}
+
+fn repair_view_order(
+    left: &DfsOperatorRepairView,
+    right: &DfsOperatorRepairView,
+) -> std::cmp::Ordering {
+    left.version
+        .cmp(&right.version)
+        .then_with(|| {
+            left.missing_replica_node_id
+                .cmp(&right.missing_replica_node_id)
+        })
+        .then_with(|| left.intent_id.cmp(&right.intent_id))
+}
+
+fn repair_is_after_cursor(
+    repair: &DfsOperatorRepairView,
+    cursor: Option<&DfsOperatorInspectionItemCursor>,
+) -> bool {
+    match cursor {
+        Some(DfsOperatorInspectionItemCursor::Repair {
+            intent_id,
+            version,
+            missing_replica_node_id,
+        }) => {
+            (
+                &repair.version,
+                &repair.missing_replica_node_id,
+                &repair.intent_id,
+            ) > (version, missing_replica_node_id, intent_id)
+        }
+        _ => true,
+    }
+}
+
+fn repairs_for_object_from_backend(
+    backend: &dyn DfsMetadataBackend,
+    object: &DfsObjectMetadata,
+    intents: &[DfsWriteIntentRecord],
+) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
+    let mut receipts_by_version = BTreeMap::<DfsVersion, Vec<DfsReplicaReceiptRecord>>::new();
+    for intent in intents
+        .iter()
+        .filter(|intent| intent.status == DfsWriteIntentStatus::Committed)
+    {
+        if !receipts_by_version.contains_key(&intent.target_version) {
+            receipts_by_version.insert(
+                intent.target_version.clone(),
+                backend.receipts_for_version(&intent.object_id, &intent.target_version)?,
+            );
+        }
+    }
+    Ok(repairs_from_intents_and_receipts(
+        object,
+        intents,
+        &receipts_by_version,
+    ))
 }
 
 fn repairs_from_intents_and_receipts(
@@ -693,6 +1128,7 @@ fn key_segment(value: &impl ToString) -> String {
 mod tests {
     use super::*;
     use crate::{
+        DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
         DfsObjectKind, DfsObjectMetadata, DfsReplicaReceiptRecord, DfsReplicationPolicy,
         DfsWriteIntentRecord, LocalJsonMetadataBackend,
     };
@@ -1021,6 +1457,213 @@ mod tests {
     }
 
     #[test]
+    fn operator_inspection_scans_conflicts_repairs_and_agent_summary_in_pages() {
+        let root = temp_root("operator_inspection_scans_conflicts_repairs_in_pages");
+        let mut backend =
+            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        backend
+            .put_file_system(&DfsFileSystem {
+                file_system_id: file_system_id(),
+                display_name: "repo".to_string(),
+                owner_node_id: node("node_owner"),
+                subtree_policies: Vec::new(),
+            })
+            .expect("filesystem");
+
+        let make_object = |object_id: DfsObjectId, path: String| DfsObjectMetadata {
+            object_id,
+            file_system_id: file_system_id(),
+            path,
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: node("node_owner"),
+            current_locations: vec![node("node_owner")],
+            content_hash: Some("blake3:new".to_string()),
+            content_size_bytes: Some(3),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version("version_2"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+
+        for index in 0..OPERATOR_OBJECT_SCAN_PAGE_SIZE {
+            backend
+                .put_object(&make_object(
+                    DfsObjectId::from_legacy_named(format!("obj_operator_page_filler_{index}"))
+                        .expect("filler object"),
+                    format!("a/{index:05}.bin"),
+                ))
+                .expect("filler object");
+        }
+
+        let target_object_id =
+            DfsObjectId::from_legacy_named("obj_operator_page_target").expect("target object");
+        backend
+            .put_object(&make_object(
+                target_object_id.clone(),
+                "z/target.bin".to_string(),
+            ))
+            .expect("target object");
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file_system_id(),
+                    object_id: target_object_id.clone(),
+                    committed_version: version("version_2"),
+                    owner_node_id: node("node_owner"),
+                    event_id: EventId::from_legacy_named("evt_page_target").expect("event"),
+                },
+                replica_node_id: node("node_owner"),
+                content_hash: Some("blake3:new".to_string()),
+                received_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("target receipt");
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: "dfs_intent_page_target".to_string(),
+                file_system_id: file_system_id(),
+                object_id: target_object_id.clone(),
+                base_version: Some(version("version_1")),
+                target_version: version("version_2"),
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![
+                    node("node_owner"),
+                    node("node_replica_a"),
+                    node("node_replica_b"),
+                ],
+                policy: DfsReplicationPolicy::new(1, 3).expect("policy"),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: Some("blake3:new".to_string()),
+                object_metadata: None,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            })
+            .expect("target intent");
+        for conflict_id in ["conflict_page_target_a", "conflict_page_target_b"] {
+            backend
+                .put_conflict(&DfsConflictRecord {
+                    conflict_id: conflict_id.to_string(),
+                    file_system_id: file_system_id(),
+                    object_id: target_object_id.clone(),
+                    path: "z/target.bin".to_string(),
+                    base_version: Some(version("version_1")),
+                    local_version: version("version_2_local"),
+                    remote_version: version("version_2"),
+                    detected_by_node_id: node("node_laptop"),
+                    reason: "offline edit".to_string(),
+                    local_content_hash: Some("blake3:local".to_string()),
+                    remote_content_hash: Some("blake3:new".to_string()),
+                    created_by_intent_id: None,
+                    strategy: None,
+                    status: DfsConflictStatus::Open,
+                    detected_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("target conflict");
+        }
+
+        let inspector = DfsOperatorInspector::new(&backend);
+        let conflicts = inspector
+            .conflicts(Some(&file_system_id()), None)
+            .expect("conflicts");
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(&conflicts[0].object_id, &target_object_id);
+        let first_conflict_page = inspector
+            .conflicts_page(Some(&file_system_id()), None, Some(1), None)
+            .expect("first conflict page");
+        assert_eq!(first_conflict_page.conflicts.len(), 1);
+        assert_eq!(
+            first_conflict_page.conflicts[0].conflict_id,
+            "conflict_page_target_a"
+        );
+        assert_eq!(
+            first_conflict_page
+                .next_cursor
+                .as_ref()
+                .and_then(|cursor| cursor.object_id.as_ref()),
+            Some(&target_object_id)
+        );
+        assert_eq!(
+            first_conflict_page
+                .next_cursor
+                .as_ref()
+                .and_then(|cursor| cursor.item_key.as_ref()),
+            Some(&DfsOperatorInspectionItemCursor::Conflict {
+                conflict_id: "conflict_page_target_a".to_string()
+            })
+        );
+        let second_conflict_page = inspector
+            .conflicts_page(
+                Some(&file_system_id()),
+                None,
+                Some(1),
+                first_conflict_page.next_cursor.as_ref(),
+            )
+            .expect("second conflict page");
+        assert_eq!(second_conflict_page.conflicts.len(), 1);
+        assert_eq!(
+            second_conflict_page.conflicts[0].conflict_id,
+            "conflict_page_target_b"
+        );
+        assert!(second_conflict_page.next_cursor.is_none());
+
+        let repairs = inspector
+            .repairs(Some(&file_system_id()), None)
+            .expect("repairs");
+        assert_eq!(repairs.len(), 2);
+        assert_eq!(&repairs[0].object_id, &target_object_id);
+        let first_repair_page = inspector
+            .repairs_page(Some(&file_system_id()), None, Some(1), None)
+            .expect("first repair page");
+        assert_eq!(first_repair_page.repairs.len(), 1);
+        let second_repair_page = inspector
+            .repairs_page(
+                Some(&file_system_id()),
+                None,
+                Some(1),
+                first_repair_page.next_cursor.as_ref(),
+            )
+            .expect("second repair page");
+        assert_eq!(second_repair_page.repairs.len(), 1);
+        let paged_missing_replicas = BTreeSet::from([
+            first_repair_page.repairs[0].missing_replica_node_id.clone(),
+            second_repair_page.repairs[0]
+                .missing_replica_node_id
+                .clone(),
+        ]);
+        assert_eq!(
+            paged_missing_replicas,
+            BTreeSet::from([node("node_replica_a"), node("node_replica_b")])
+        );
+        assert!(second_repair_page.next_cursor.is_none());
+
+        let agent_summary = inspector
+            .agent_file_system_summary(&file_system_id())
+            .expect("agent summary")
+            .expect("filesystem");
+        assert_eq!(
+            agent_summary.objects.len(),
+            OPERATOR_OBJECT_SCAN_PAGE_SIZE + 1
+        );
+        let target_summary = agent_summary
+            .objects
+            .iter()
+            .find(|object| object.object_id == target_object_id)
+            .expect("target summary");
+        assert_eq!(target_summary.state, DfsAgentObjectState::Conflicted);
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn local_pin_store_adds_lists_and_removes_records() {
         let root = temp_root("local_pin_store_adds_lists_and_removes_records");
         let store = LocalDfsPinStore::new(&root);
@@ -1255,10 +1898,74 @@ mod tests {
         assert_eq!(backend.all_receipts().expect("receipts").len(), 2);
         assert_eq!(backend.all_intents().expect("intents").len(), 2);
         assert_eq!(backend.all_conflicts().expect("conflicts").len(), 1);
+        backend
+            .put_namespace_job(&DfsNamespaceJobRecord {
+                job_id: "namespace-job-running".to_string(),
+                file_system_id: file_system_id(),
+                kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
+                status: DfsNamespaceJobStatus::Running,
+                root_path: "/alpha".to_string(),
+                target_path: None,
+                pending_frames: vec![DfsNamespaceJobFrame::ScanDirectory {
+                    path: "/alpha".to_string(),
+                    cursor: None,
+                }],
+                processed_object_count: 0,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                completed_at: None,
+                failure_reason: None,
+            })
+            .expect("running namespace job");
+        backend
+            .put_namespace_job(&DfsNamespaceJobRecord {
+                job_id: "namespace-job-failed".to_string(),
+                file_system_id: file_system_id(),
+                kind: DfsNamespaceJobKind::RenameDirectory,
+                status: DfsNamespaceJobStatus::Failed,
+                root_path: "/beta".to_string(),
+                target_path: Some("/gamma".to_string()),
+                pending_frames: Vec::new(),
+                processed_object_count: 0,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: OffsetDateTime::UNIX_EPOCH,
+                completed_at: None,
+                failure_reason: Some("invalid destination".to_string()),
+            })
+            .expect("failed namespace job");
 
-        let status = DfsOperatorInspector::new(&backend)
-            .status()
-            .expect("status");
+        let summary = backend.metadata_summary().expect("summary");
+        assert_eq!(summary.file_system_count, 1);
+        assert_eq!(summary.object_count, 2);
+        assert_eq!(summary.version_count, 3);
+        assert_eq!(summary.receipt_count, 2);
+        assert_eq!(summary.intent_count, 2);
+        assert_eq!(summary.pending_write_count, 1);
+        assert_eq!(summary.open_conflict_count, 1);
+        assert_eq!(summary.pending_repair_count, 1);
+        assert_eq!(summary.pending_namespace_job_count, 1);
+        assert_eq!(summary.failed_namespace_job_count, 1);
+        let scoped_summary = backend
+            .metadata_summary_for_file_system(&file_system_id())
+            .expect("scoped summary")
+            .expect("filesystem summary");
+        assert_eq!(scoped_summary.file_system_count, 1);
+        assert_eq!(scoped_summary.object_count, 2);
+        assert_eq!(scoped_summary.version_count, 3);
+        assert_eq!(scoped_summary.open_conflict_count, 1);
+        assert_eq!(scoped_summary.pending_repair_count, 1);
+        assert!(
+            backend
+                .metadata_summary_for_file_system(
+                    &DfsFileSystemId::from_legacy_named("missing_filesystem")
+                        .expect("missing filesystem id")
+                )
+                .expect("missing scoped summary")
+                .is_none()
+        );
+
+        let inspector = DfsOperatorInspector::new(&backend);
+        let status = inspector.status().expect("status");
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 2);
         assert_eq!(status.version_count, 3);
@@ -1270,6 +1977,15 @@ mod tests {
             status.pending_repair_count, 1,
             "object_a committed intent is missing node_replica"
         );
+        assert_eq!(status.pending_namespace_job_count, 1);
+        assert_eq!(status.failed_namespace_job_count, 1);
+        let file_system = inspector
+            .file_system(&file_system_id())
+            .expect("filesystem view")
+            .expect("filesystem");
+        assert_eq!(file_system.object_count, 2);
+        assert_eq!(file_system.open_conflict_count, 1);
+        assert_eq!(file_system.pending_repair_count, 1);
 
         fs::remove_dir_all(&root).expect("cleanup");
     }

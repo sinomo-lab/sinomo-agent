@@ -1072,6 +1072,114 @@ fn hydrate_from_metadata_backend_clears_partial_blob_transfers() {
 }
 
 #[test]
+fn hydrate_from_metadata_backend_walks_multiple_object_pages() {
+    let root = temp_root("hydrate-multiple-object-pages");
+    let node_id = NodeId::from_legacy_named("node_hydrate_pages").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let tail_index = DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE;
+    let mut tail_object_id = None;
+    for index in 0..=tail_index {
+        let mut object = file_metadata(node_id.clone());
+        object.object_id =
+            DfsObjectId::from_legacy_named(format!("obj_hydrate_page_{index}")).expect("object");
+        object.path = format!("/users/hydrate/page-{index:05}.txt");
+        object.version = DfsVersion::from_legacy_named(format!("version_hydrate_page_{index}"))
+            .expect("version");
+        if index == tail_index {
+            tail_object_id = Some(object.object_id.clone());
+        }
+        dfs.add_object_metadata(object).expect("metadata object");
+    }
+
+    let mut tombstone = file_metadata(node_id);
+    tombstone.object_id =
+        DfsObjectId::from_legacy_named("obj_hydrate_page_tombstone").expect("tombstone");
+    tombstone.kind = DfsObjectKind::Tombstone;
+    tombstone.path = "/users/hydrate/deleted.txt".to_string();
+    dfs.add_object_metadata(tombstone.clone())
+        .expect("tombstone metadata");
+
+    dfs.metadata = DfsMetadataStore::new();
+    dfs.tombstones_by_metadata_path.clear();
+    dfs.hydrate_from_metadata_backend().expect("hydrate pages");
+
+    let tail_object = dfs
+        .current_read_object_metadata(&tail_object_id.expect("tail object"))
+        .expect("tail object loaded");
+    assert_eq!(
+        tail_object.path,
+        format!("/users/hydrate/page-{tail_index:05}.txt")
+    );
+    assert!(
+        dfs.tombstones_by_metadata_path
+            .contains_key(&(sifs_file_system_id(), metadata_path(&tombstone.path))),
+        "paged hydration must restore tombstone tracking"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn hydrate_from_metadata_backend_walks_multiple_conflict_pages() {
+    let root = temp_root("hydrate-multiple-conflict-pages");
+    let node_id = NodeId::from_legacy_named("node_hydrate_conflict_pages").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let object_id = DfsObjectId::from_legacy_named("obj_hydrate_conflict_pages").expect("object");
+    let mut object = file_metadata(node_id.clone());
+    object.object_id = object_id.clone();
+    object.path = "/users/hydrate/conflicted.txt".to_string();
+    object.version =
+        DfsVersion::from_legacy_named("version_hydrate_conflict_remote").expect("remote version");
+    dfs.add_object_metadata(object.clone())
+        .expect("metadata object");
+
+    let conflict_count = DFS_CONFLICT_SCAN_PAGE_SIZE + 1;
+    for index in 0..conflict_count {
+        let conflict = DfsConflictRecord {
+            conflict_id: format!("conflict_hydrate_page_{index:04}"),
+            file_system_id: object.file_system_id.clone(),
+            object_id: object_id.clone(),
+            path: object.path.clone(),
+            base_version: Some(
+                DfsVersion::from_legacy_named("version_hydrate_conflict_base")
+                    .expect("base version"),
+            ),
+            local_version: DfsVersion::from_legacy_named(format!(
+                "version_hydrate_conflict_local_{index}"
+            ))
+            .expect("local version"),
+            remote_version: object.version.clone(),
+            detected_by_node_id: node_id.clone(),
+            reason: "restart hydration must page conflict records".to_string(),
+            local_content_hash: Some(format!("blake3:local-hydrate-conflict-{index}")),
+            remote_content_hash: object.content_hash.clone(),
+            created_by_intent_id: None,
+            strategy: Some("branch".to_string()),
+            status: DfsConflictStatus::Open,
+            detected_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        dfs.put_conflict_record(&conflict).expect("conflict record");
+    }
+
+    dfs.metadata = DfsMetadataStore::new();
+    dfs.hydrate_from_metadata_backend()
+        .expect("hydrate conflict pages");
+
+    let loaded_conflicts = dfs
+        .conflicts_for_object(&object_id)
+        .expect("loaded conflicts");
+    assert_eq!(
+        loaded_conflicts.len(),
+        conflict_count,
+        "hydration must walk every conflict page for an object"
+    );
+    assert_eq!(
+        loaded_conflicts.last().expect("tail conflict").conflict_id,
+        format!("conflict_hydrate_page_{:04}", conflict_count - 1)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn hydrate_from_metadata_backend_does_not_resurrect_aborted_pending_write() {
     let root = temp_root("hydrate-skips-aborted-pending-write");
     let owner = NodeId::from_legacy_named("node_hydrate_abort_owner").expect("node");
@@ -1533,6 +1641,83 @@ fn hydrate_from_metadata_backend_restores_committed_pending_write_for_missing_re
         "committed intents with missing replicas must keep pending state for repair"
     );
     assert_eq!(recovered_owner.coordinator().repair_jobs().len(), 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn operational_metrics_report_repair_backlog_and_content_footprint() {
+    let root = temp_root("operational-metrics-repair-backlog");
+    let owner = NodeId::from_legacy_named("node_metrics_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_metrics_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_metrics_repair").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let bytes = b"metrics should expose repair backlog and content footprint";
+    let network = InProcessNetwork::new();
+    let owner_backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("metadata"))
+            .expect("owner backend");
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(owner_backend)
+    .expect("metadata backend");
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1;
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    owner_dfs
+        .add_file_system(file_system(owner.clone()))
+        .expect("owner fs");
+    owner_dfs
+        .add_object_metadata(metadata)
+        .expect("owner object");
+
+    let write = owner_dfs
+        .write_distributed_eventual(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2,
+                requesting_node_id: owner.clone(),
+            },
+            bytes.to_vec(),
+            vec![owner.clone(), replica],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("committed write with missing repair");
+    assert!(matches!(
+        write,
+        NetworkedDfsWriteOutcome::Committed {
+            repair_jobs,
+            ..
+        } if repair_jobs.len() == 1
+    ));
+
+    let metrics = owner_dfs.operational_metrics().expect("metrics");
+    assert_eq!(metrics.node_id, owner);
+    assert!(metrics.metadata_backend_configured);
+    assert_eq!(metrics.file_system_count, 1);
+    assert_eq!(metrics.object_count, 1);
+    assert_eq!(metrics.coordinator_intent_count, 1);
+    assert_eq!(metrics.coordinator_receipt_count, 1);
+    assert_eq!(metrics.coordinator_committed_version_count, 1);
+    assert_eq!(metrics.repair_job_count, 1);
+    assert_eq!(metrics.pending_write_count, 1);
+    assert_eq!(metrics.pending_read_count, 0);
+    assert_eq!(metrics.stage_retry_count, 0);
+    assert_eq!(metrics.repair_retry_count, 1);
+    assert_eq!(metrics.stage_inflight_count, 0);
+    assert_eq!(metrics.repair_inflight_count, 0);
+    assert_eq!(metrics.fetch_inflight_count, 0);
+    assert_eq!(metrics.fetch_failed_source_count, 0);
+    assert_eq!(metrics.incoming_transfer_bytes, 0);
+    assert_eq!(metrics.content.blob_count, 1);
+    assert_eq!(metrics.content.manifest_count, 1);
+    assert_eq!(metrics.content.logical_object_bytes, bytes.len() as u64);
+    assert_eq!(metrics.content.staging_file_count, 0);
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -2616,6 +2801,8 @@ fn malformed_dfs_protocol_frame_does_not_block_following_valid_frame() {
                             &DfsNetworkMessage::ReadRequest(DfsReadRequest {
                                 request_id: "dfs_net_req_after_bad_frame".to_string(),
                                 object_id: object_id.clone(),
+                                range_offset: None,
+                                range_max_bytes: None,
                             }),
                         )
                         .expect("valid read request"),
@@ -2787,30 +2974,45 @@ fn chunk_assemblers_ignore_identical_duplicate_chunks() {
         bytes
     );
 
+    let (read_store, read_assembler) = test_chunked_assembler(
+        &root,
+        "duplicate-read-transfer",
+        &object_id,
+        &version,
+        &hash,
+        bytes.len() as u64,
+        2,
+    );
     let mut read_transfer = InProgressReadTransfer::new(
         object_id.clone(),
         version.clone(),
-        Some(hash.clone()),
+        hash.clone(),
         bytes.len() as u64,
         2,
+        read_assembler,
     )
     .expect("read transfer");
     assert!(
-        read_transfer
+        !read_transfer
             .insert_chunk(0, 2, first_chunk.clone())
             .expect("first read chunk")
-            .is_none()
+    );
+    assert!(
+        !read_transfer
+            .insert_chunk(0, 2, first_chunk.clone())
+            .expect("duplicate read chunk")
     );
     assert!(
         read_transfer
-            .insert_chunk(0, 2, first_chunk.clone())
-            .expect("duplicate read chunk")
-            .is_none()
-    );
-    assert_eq!(
-        read_transfer
             .insert_chunk(1, 2, second_chunk.clone())
             .expect("second read chunk")
+    );
+    let manifest = read_store
+        .commit_chunked_object_version(read_transfer.assembler)
+        .expect("commit assembled read");
+    assert_eq!(
+        read_store
+            .read_blob(&manifest.content_hash)
             .expect("assembled read"),
         bytes
     );
@@ -2862,6 +3064,7 @@ fn chunk_assemblers_ignore_identical_duplicate_chunks() {
 
 #[test]
 fn chunk_assemblers_reject_conflicting_duplicate_chunks() {
+    let root = temp_root("conflicting-duplicate-read-chunk");
     let object_id =
         DfsObjectId::from_legacy_named("obj_conflicting_duplicate_chunk").expect("object");
     let version = DfsVersion::from_legacy_named("version_2").expect("version");
@@ -2873,9 +3076,24 @@ fn chunk_assemblers_reject_conflicting_duplicate_chunks() {
     conflicting_chunk[0] ^= 0xff;
     let hash = content_hash(&bytes);
 
-    let mut read_transfer =
-        InProgressReadTransfer::new(object_id, version, Some(hash), bytes.len() as u64, 2)
-            .expect("read transfer");
+    let (_, read_assembler) = test_chunked_assembler(
+        &root,
+        "conflicting-read-transfer",
+        &object_id,
+        &version,
+        &hash,
+        bytes.len() as u64,
+        2,
+    );
+    let mut read_transfer = InProgressReadTransfer::new(
+        object_id,
+        version,
+        hash,
+        bytes.len() as u64,
+        2,
+        read_assembler,
+    )
+    .expect("read transfer");
     read_transfer
         .insert_chunk(0, 2, std::mem::take(&mut first_chunk))
         .expect("first read chunk");
@@ -2885,9 +3103,10 @@ fn chunk_assemblers_reject_conflicting_duplicate_chunks() {
     assert!(
         error
             .to_string()
-            .contains("conflicting duplicate chunked DFS read response index"),
+            .contains("conflicting duplicate content chunk"),
         "{error}"
     );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -2982,23 +3201,33 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             version: version.clone(),
             content_hash: Some(hash.clone()),
             content_size_bytes: Some(70_000),
+            range_offset: None,
+            range_max_bytes: None,
             target_node_id: owner,
             next_retry_at: Instant::now()
                 - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
                 - Duration::from_millis(1),
         },
     );
-    dfs.incoming_read_transfers.insert(
-        request_id.clone(),
+    dfs.incoming_read_transfers.insert(request_id.clone(), {
+        let (_, assembler) = test_chunked_assembler(
+            &root,
+            "expired-read-transfer",
+            &object_id,
+            &version,
+            &hash,
+            70_000,
+            2,
+        );
         InProgressReadTransfer {
             object_id,
             version,
-            content_hash: Some(hash),
+            content_hash: hash,
             total_size_bytes: 70_000,
             last_updated_at: Instant::now(),
-            chunks: vec![None; 2],
-        },
-    );
+            assembler,
+        }
+    });
 
     assert!(
         dfs.process_incoming()
@@ -3057,6 +3286,8 @@ fn process_incoming_accepts_queued_remote_read_response_before_expiry_prune() {
             version: version.clone(),
             content_hash: Some(hash.clone()),
             content_size_bytes: Some(bytes.len() as u64),
+            range_offset: None,
+            range_max_bytes: None,
             target_node_id: owner.clone(),
             next_retry_at: Instant::now()
                 - DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
@@ -3258,17 +3489,29 @@ fn pending_remote_read_to_removed_location_does_not_block_fallback() {
             (pending.target_node_id == source_a).then(|| request_id.clone())
         })
         .expect("source a pending request");
-    reader_dfs.incoming_read_transfers.insert(
-        source_a_request_id.clone(),
-        InProgressReadTransfer {
-            object_id: object_id.clone(),
-            version: object.version.clone(),
-            content_hash: object.content_hash.clone(),
-            total_size_bytes: object.content_size_bytes.expect("size"),
-            last_updated_at: Instant::now(),
-            chunks: vec![Some(b"partial".to_vec())],
-        },
-    );
+    let transfer_hash = object.content_hash.clone().expect("content hash");
+    let transfer_size = object.content_size_bytes.expect("size");
+    reader_dfs
+        .incoming_read_transfers
+        .insert(source_a_request_id.clone(), {
+            let (_, assembler) = test_chunked_assembler(
+                &root,
+                "removed-location-read-transfer",
+                &object_id,
+                &object.version,
+                &transfer_hash,
+                transfer_size,
+                1,
+            );
+            InProgressReadTransfer {
+                object_id: object_id.clone(),
+                version: object.version.clone(),
+                content_hash: transfer_hash,
+                total_size_bytes: transfer_size,
+                last_updated_at: Instant::now(),
+                assembler,
+            }
+        });
     object.current_locations = vec![source_b.clone()];
     reader_dfs
         .add_object_metadata(object)
@@ -3867,6 +4110,8 @@ fn remote_read_content_mismatch_prunes_stale_location() {
             version: version.clone(),
             content_hash: Some(expected_hash.clone()),
             content_size_bytes: Some(b"expected remote bytes".len() as u64),
+            range_offset: None,
+            range_max_bytes: None,
             target_node_id: source.clone(),
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
         },
@@ -3998,21 +4243,32 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             version: version.clone(),
             content_hash: Some(content_hash.clone()),
             content_size_bytes: Some(70_000),
+            range_offset: None,
+            range_max_bytes: None,
             target_node_id: replica.clone(),
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
         },
     );
-    dfs.incoming_read_transfers.insert(
-        read_request_id.clone(),
-        InProgressReadTransfer {
-            object_id: object_id.clone(),
-            version: version.clone(),
-            content_hash: Some(content_hash.clone()),
-            total_size_bytes: 70_000,
-            last_updated_at: stale_at,
-            chunks: vec![None; 2],
-        },
-    );
+    dfs.incoming_read_transfers
+        .insert(read_request_id.clone(), {
+            let (_, assembler) = test_chunked_assembler(
+                &root,
+                "idle-prune-read",
+                &object_id,
+                &version,
+                &content_hash,
+                70_000,
+                2,
+            );
+            InProgressReadTransfer {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: content_hash.clone(),
+                total_size_bytes: 70_000,
+                last_updated_at: stale_at,
+                assembler,
+            }
+        });
 
     let fetch_request_id = "dfs_net_req_prune_fetch".to_string();
     let intent_id = "dfs_intent_prune".to_string();
@@ -4187,21 +4443,31 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
             version: version.clone(),
             content_hash: Some(content_hash.clone()),
             content_size_bytes: Some(70_000),
+            range_offset: None,
+            range_max_bytes: None,
             target_node_id: reader,
             next_retry_at: Instant::now() + DFS_REMOTE_READ_RETRY_DELAY,
         },
     );
-    dfs.incoming_read_transfers.insert(
-        request_id.clone(),
+    dfs.incoming_read_transfers.insert(request_id.clone(), {
+        let (_, assembler) = test_chunked_assembler(
+            &root,
+            "retry-prune-read",
+            &object_id,
+            &version,
+            &content_hash,
+            70_000,
+            2,
+        );
         InProgressReadTransfer {
             object_id,
             version,
-            content_hash: Some(content_hash),
+            content_hash,
             total_size_bytes: 70_000,
             last_updated_at: stale_at,
-            chunks: vec![None; 2],
-        },
-    );
+            assembler,
+        }
+    });
 
     let scheduled = dfs.retry_pending_repairs().expect("retry prune");
 
@@ -4679,6 +4945,7 @@ fn chunked_fetch_store_failure_is_rejected_without_hard_error() {
                     total_size_bytes: corrupt_bytes.len() as u64,
                     chunk_index: chunk_index as u32,
                     total_chunks,
+                    chunk_hash: None,
                     bytes: chunk_bytes.to_vec(),
                 },
             )
@@ -4791,6 +5058,7 @@ fn chunked_fetch_response_reuses_existing_local_blob_without_rehashing_payload()
                 total_size_bytes: stale_payload.len() as u64,
                 chunk_index: 0,
                 total_chunks,
+                chunk_hash: None,
                 bytes: first_chunk.to_vec(),
             },
         )
@@ -4893,6 +5161,7 @@ fn chunked_fetch_response_teaches_unknown_pending_write_size() {
                     total_size_bytes: bytes.len() as u64,
                     chunk_index: chunk_index as u32,
                     total_chunks: blob_chunk_count(&bytes).expect("chunk count"),
+                    chunk_hash: None,
                     bytes: chunk_bytes.to_vec(),
                 },
             )
@@ -5367,6 +5636,7 @@ fn stage_chunk_existing_manifest_conflicting_receipt_returns_rejection() {
                 total_size_bytes: bytes.len() as u64,
                 chunk_index: 0,
                 total_chunks: 1,
+                chunk_hash: None,
                 bytes: bytes.to_vec(),
                 object_metadata: None,
             },
@@ -5923,6 +6193,8 @@ fn chunked_read_response_to_unroutable_requester_stops_after_first_unsent_chunk(
         &DfsReadRequest {
             request_id: "dfs_net_req_read_response_unroutable".to_string(),
             object_id: object_id.clone(),
+            range_offset: None,
+            range_max_bytes: None,
         },
         &DfsReadData {
             object_id,
@@ -5981,6 +6253,60 @@ fn read_current_object_uses_hash_addressed_blob_without_manifest_scan() {
             panic!("expected current object bytes from hash-addressed blob, got {other:?}")
         }
     }
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn read_current_object_range_uses_bounded_hash_addressed_blob_slice() {
+    let root = temp_root("read-current-object-range-hash-addressed");
+    let node_id = NodeId::from_legacy_named("node_hash_range").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_hash_range").expect("object");
+    let version = DfsVersion::from_legacy_named("version_range").expect("version");
+    let bytes = b"range-readable content-addressed bytes";
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    let seed_manifest = dfs
+        .content
+        .put_object_version("obj_other_range_owner", "version_1", bytes)
+        .expect("seed blob");
+    let mut metadata = file_metadata(node_id.clone());
+    metadata.object_id = object_id.clone();
+    metadata.path = "/services/hash-range.txt".to_string();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    metadata.version = version.clone();
+    metadata.content_hash = Some(seed_manifest.content_hash.clone());
+    metadata.content_size_bytes = Some(bytes.len() as u64);
+    dfs.add_object_metadata(metadata).expect("metadata");
+
+    let outcome = dfs
+        .read_local_object_range_with_state(&object_id, 6, 8, false)
+        .expect("range read");
+    match outcome {
+        NetworkedDfsRangeReadOutcome::Found { data, freshness } => {
+            assert_eq!(freshness, NetworkedDfsReadFreshness::Current);
+            assert_eq!(data.object_id, object_id);
+            assert_eq!(data.version, version);
+            assert_eq!(
+                data.content_hash.as_deref(),
+                Some(seed_manifest.content_hash.as_str())
+            );
+            assert_eq!(data.offset, 6);
+            assert_eq!(data.total_size_bytes, bytes.len() as u64);
+            assert_eq!(data.bytes, &bytes[6..14]);
+        }
+        other => panic!("expected current range bytes, got {other:?}"),
+    }
+
+    assert_eq!(
+        dfs.posix_read_file_range("/services/hash-range.txt", 15, 7)
+            .expect("posix range"),
+        &bytes[15..22]
+    );
+    assert_eq!(
+        dfs.posix_read_file_range("/services/hash-range.txt", bytes.len() as u64 + 1, 16)
+            .expect("posix eof range"),
+        Vec::<u8>::new()
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -6444,6 +6770,148 @@ fn sifs_recursive_clear_survives_metadata_backend_reopen() {
             b"fresh"
         );
     }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_recursive_clear_bounded_job_resumes_after_reopen() {
+    let root = temp_root("sifs-recursive-clear-bounded-job");
+    let node_id = NodeId::from_legacy_named("node_sifs_clear_job").expect("node");
+    let clear_root = "/services/sandbox/instances/sandbox_clear_job/tmp/0";
+    let nested_dir = format!("{clear_root}/nested/deeper");
+    let files = [
+        format!("{clear_root}/root-cache.txt"),
+        format!("{clear_root}/nested/cache-a.txt"),
+        format!("{nested_dir}/cache-b.txt"),
+        format!("{nested_dir}/cache-c.txt"),
+    ];
+    let job_id = {
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(&nested_dir).expect("mkdir nested");
+        for path in &files {
+            dfs.posix_write_file(
+                path,
+                path.as_bytes(),
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write file");
+        }
+
+        let job = dfs
+            .posix_clear_dir_recursive_bounded(clear_root, 1)
+            .expect("first bounded clear batch");
+        assert_eq!(job.status, DfsNamespaceJobStatus::Running);
+        assert!(
+            !job.pending_frames.is_empty(),
+            "a one-step batch should persist remaining directory work"
+        );
+        assert!(
+            dfs.metadata_backend
+                .as_ref()
+                .expect("backend")
+                .get_namespace_job(&job.job_id)
+                .expect("get persisted job")
+                .is_some(),
+            "bounded recursive clear progress should be durable"
+        );
+        job.job_id
+    };
+
+    {
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let mut job = dfs
+            .posix_resume_namespace_job_bounded(&job_id, 2)
+            .expect("resume bounded clear after reopen");
+        while job.status != DfsNamespaceJobStatus::Completed {
+            job = dfs
+                .posix_resume_namespace_job_bounded(&job_id, 2)
+                .expect("resume next batch");
+        }
+        assert!(job.processed_object_count >= files.len() as u64);
+        for path in &files {
+            assert!(matches!(
+                dfs.posix_read_file(path),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
+        assert!(
+            dfs.posix_list_dir(clear_root)
+                .expect("cleared root list")
+                .is_empty()
+        );
+    }
+
+    {
+        let dfs = networked_sifs_with_backend(&root, node_id);
+        let job = dfs
+            .metadata_backend
+            .as_ref()
+            .expect("backend")
+            .get_namespace_job(&job_id)
+            .expect("get completed job")
+            .expect("job");
+        assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+        assert!(job.completed_at.is_some());
+        for path in &files {
+            assert!(matches!(
+                dfs.posix_read_file(path),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_namespace_job_maintenance_marks_invalid_job_failed() {
+    let root = temp_root("sifs-namespace-job-maintenance-failed");
+    let node_id = NodeId::from_legacy_named("node_sifs_namespace_job_maintenance").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    let now = time::OffsetDateTime::now_utc();
+    let job = DfsNamespaceJobRecord {
+        job_id: "invalid-clear-job".to_string(),
+        file_system_id: sifs_file_system_id(),
+        kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
+        status: DfsNamespaceJobStatus::Running,
+        root_path: "/services/sandbox/instances/invalid-clear/work".to_string(),
+        target_path: None,
+        pending_frames: vec![DfsNamespaceJobFrame::RenameDirectoryStart {
+            source_object_id: DfsObjectId::generate(),
+        }],
+        processed_object_count: 0,
+        created_at: now,
+        updated_at: now,
+        completed_at: None,
+        failure_reason: None,
+    };
+    dfs.metadata_backend
+        .as_mut()
+        .expect("backend")
+        .put_namespace_job(&job)
+        .expect("put invalid job");
+
+    let report = dfs
+        .posix_resume_namespace_jobs_bounded(4, 4)
+        .expect("namespace job maintenance");
+
+    assert_eq!(report.scanned_job_count, 1);
+    assert_eq!(report.resumed_job_count, 1);
+    assert_eq!(report.failed_job_count, 1);
+    assert_eq!(report.failures.len(), 1);
+    assert_eq!(report.failures[0].job_id, job.job_id);
+    let failed = dfs
+        .metadata_backend
+        .as_ref()
+        .expect("backend")
+        .get_namespace_job(&job.job_id)
+        .expect("get failed job")
+        .expect("failed job");
+    assert_eq!(failed.status, DfsNamespaceJobStatus::Failed);
+    assert!(failed.failure_reason.as_deref().is_some_and(|reason| {
+        reason.contains("invalid DFS path") || reason.contains("invalid-clear-job")
+    }));
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -7220,6 +7688,33 @@ fn sifs_posix_rmdir_reports_directory_not_empty() {
 }
 
 #[test]
+fn sifs_posix_empty_directory_checks_are_bounded_for_large_directories() {
+    let root = temp_root("sifs-posix-bounded-empty-dir-check");
+    let node_id = NodeId::from_legacy_named("node_sifs_bounded_empty_dir").expect("node");
+    let source = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/source";
+    let nonempty = "/services/sandbox/instances/sandbox_bounded_empty_dir/work/nonempty";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id);
+    dfs.posix_mkdir_all(source).expect("mkdir source");
+    for index in 0..160 {
+        dfs.posix_mkdir_all(&format!("{nonempty}/child-{index:04}"))
+            .expect("mkdir child");
+    }
+
+    assert!(matches!(
+        dfs.posix_rmdir(nonempty),
+        Err(DfsPosixError::DirectoryNotEmpty { .. })
+    ));
+    assert!(matches!(
+        dfs.posix_rename(source, nonempty),
+        Err(DfsPosixError::DirectoryNotEmpty { .. })
+    ));
+    assert!(dfs.posix_stat(source).is_ok());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_stat_reports_directory_link_counts() {
     let root = temp_root("sifs-posix-link-count");
     let node_id = NodeId::from_legacy_named("node_sifs_link_count").expect("node");
@@ -7432,6 +7927,105 @@ fn sifs_posix_rename_records_old_path_tombstone() {
             .expect("reloaded read new"),
         b"content"
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_rename_directory_bounded_job_resumes_after_reopen() {
+    let root = temp_root("sifs-posix-rename-dir-bounded-job");
+    let node_id = NodeId::from_legacy_named("node_sifs_rename_dir_job").expect("node");
+    let old_dir = "/services/sandbox/instances/sandbox_rename_job/work/old";
+    let new_dir = "/services/sandbox/instances/sandbox_rename_job/work/new";
+    let old_nested = format!("{old_dir}/nested/deeper");
+    let old_files = [
+        format!("{old_dir}/root.txt"),
+        format!("{old_dir}/nested/a.txt"),
+        format!("{old_nested}/b.txt"),
+        format!("{old_nested}/c.txt"),
+    ];
+    let new_files = [
+        format!("{new_dir}/root.txt"),
+        format!("{new_dir}/nested/a.txt"),
+        format!("{new_dir}/nested/deeper/b.txt"),
+        format!("{new_dir}/nested/deeper/c.txt"),
+    ];
+    let job_id = {
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        dfs.posix_mkdir_all(&old_nested).expect("mkdir old tree");
+        for path in &old_files {
+            dfs.posix_write_file(
+                path,
+                path.as_bytes(),
+                DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+            )
+            .expect("write old file");
+        }
+
+        let job = dfs
+            .posix_rename_directory_bounded(old_dir, new_dir, 1)
+            .expect("first bounded rename batch");
+        assert_eq!(job.status, DfsNamespaceJobStatus::Running);
+        assert!(
+            !job.pending_frames.is_empty(),
+            "a one-step directory rename should persist remaining subtree work"
+        );
+        assert!(matches!(
+            dfs.posix_stat(old_dir),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert_eq!(
+            dfs.posix_stat(new_dir)
+                .expect("new root after first batch")
+                .kind,
+            DfsObjectKind::Directory
+        );
+        job.job_id
+    };
+
+    {
+        let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+        let mut job = dfs
+            .posix_resume_namespace_job_bounded(&job_id, 2)
+            .expect("resume bounded rename after reopen");
+        while job.status != DfsNamespaceJobStatus::Completed {
+            job = dfs
+                .posix_resume_namespace_job_bounded(&job_id, 2)
+                .expect("resume next rename batch");
+        }
+        assert!(job.processed_object_count >= old_files.len() as u64);
+        for path in &old_files {
+            assert!(matches!(
+                dfs.posix_read_file(path),
+                Err(DfsPosixError::NotFound { .. })
+            ));
+        }
+        for (old_path, new_path) in old_files.iter().zip(new_files.iter()) {
+            assert_eq!(
+                dfs.posix_read_file(new_path).expect("new file content"),
+                old_path.as_bytes()
+            );
+        }
+    }
+
+    {
+        let dfs = networked_sifs_with_backend(&root, node_id);
+        let job = dfs
+            .metadata_backend
+            .as_ref()
+            .expect("backend")
+            .get_namespace_job(&job_id)
+            .expect("get completed rename job")
+            .expect("job");
+        assert_eq!(job.status, DfsNamespaceJobStatus::Completed);
+        assert!(job.completed_at.is_some());
+        for new_path in &new_files {
+            assert_eq!(
+                dfs.posix_stat(new_path).expect("reloaded moved file").kind,
+                DfsObjectKind::File
+            );
+        }
+    }
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -8175,6 +8769,75 @@ fn sifs_posix_write_at_merges_bytes_and_preserves_hardlink_identity() {
 }
 
 #[test]
+fn sifs_posix_write_at_self_only_uses_extent_patch_manifest() {
+    let root = temp_root("sifs-posix-write-at-extent-patch");
+    let node_id = NodeId::from_legacy_named("node_sifs_write_at_extent").expect("node");
+    let work = "/services/sandbox/instances/sandbox_write_at_extent/work";
+    let file = "/services/sandbox/instances/sandbox_write_at_extent/work/file.bin";
+
+    let mut initial = vec![0_u8; 256 * 1024 + 19];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    let initial_hash = content_hash(&initial);
+    let patch = b"small-random-write";
+    let patch_offset = 128 * 1024 + 11;
+    let mut expected = initial.clone();
+    expected[patch_offset..patch_offset + patch.len()].copy_from_slice(patch);
+    let expected_hash = content_hash(&expected);
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    dfs.posix_write_file(
+        file,
+        &initial,
+        DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+    )
+    .expect("write initial");
+
+    let stat = dfs
+        .posix_write_file_at(
+            file,
+            patch_offset as u64,
+            patch,
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("write extent patch");
+
+    assert_eq!(stat.size_bytes, Some(expected.len() as u64));
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    let manifest = dfs
+        .content()
+        .read_manifest(stat.object_id.as_str(), stat.version.as_str())
+        .expect("patched manifest");
+    assert_eq!(manifest.content_hash, expected_hash);
+    assert!(
+        !manifest.extents.is_empty(),
+        "local self-only write_at should preserve unchanged bytes as extents"
+    );
+    assert!(
+        manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == initial_hash)
+    );
+    assert!(
+        !dfs.content()
+            .has_blob(&manifest.content_hash)
+            .expect("logical blob check"),
+        "patched write_at should not materialize a full replacement blob"
+    );
+    assert_eq!(dfs.posix_read_file(file).expect("read patched"), expected);
+    assert_eq!(
+        dfs.posix_read_file_range(file, patch_offset as u64 - 8, patch.len() + 16)
+            .expect("read patched range"),
+        expected[patch_offset - 8..patch_offset + patch.len() + 8]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_truncate_preserves_hardlink_identity() {
     let root = temp_root("sifs-posix-truncate-hardlink");
     let node_id = NodeId::from_legacy_named("node_sifs_truncate").expect("node");
@@ -8504,6 +9167,71 @@ fn sifs_posix_list_updates_directory_atime_without_changing_mtime() {
     let stat = dfs.posix_stat(dir_path).expect("stat");
     assert!(stat.accessed_at_unix_nanos > 12_345);
     assert_eq!(stat.modified_at_unix_nanos, 67_890);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_list_dir_page_walks_large_directory_incrementally() {
+    let root = temp_root("sifs-posix-list-page");
+    let node_id = NodeId::from_legacy_named("node_sifs_list_page").expect("node");
+    let dir_path = "/services/sandbox/instances/sandbox_list_page/work";
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(dir_path).expect("mkdir");
+    for index in 0..5 {
+        dfs.posix_write_file(
+            &format!("{dir_path}/file-{index}.txt"),
+            b"content",
+            DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+        )
+        .expect("write");
+    }
+
+    let mut cursor = None;
+    let mut names = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let page = dfs
+            .posix_list_dir_page(dir_path, cursor.as_ref(), 2)
+            .expect("list page");
+        assert!(page.entries.len() <= 2);
+        names.extend(page.entries.into_iter().map(|entry| entry.name));
+        pages = pages.saturating_add(1);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "file-0.txt",
+            "file-1.txt",
+            "file-2.txt",
+            "file-3.txt",
+            "file-4.txt"
+        ]
+    );
+    assert_eq!(pages, 3);
+
+    let full_names = dfs
+        .posix_list_dir(dir_path)
+        .expect("full list")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        full_names,
+        vec![
+            "file-0.txt",
+            "file-1.txt",
+            "file-2.txt",
+            "file-3.txt",
+            "file-4.txt"
+        ]
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
