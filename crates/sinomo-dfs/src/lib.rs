@@ -111,9 +111,9 @@ use time::OffsetDateTime;
 use transfer::RepairRetryState;
 use transfer::{
     InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressReadTransfer,
-    PendingNetworkedRead, PendingNetworkedWrite, blob_chunk_count, blob_chunk_count_for_size,
-    blob_transfer_key, chunk_hash, validate_chunk_bytes, validate_chunk_hash,
-    validate_chunked_transfer_shape,
+    PendingNetworkedRead, PendingNetworkedWrite, PendingNetworkedWritePatch, blob_chunk_count,
+    blob_chunk_count_for_size, blob_transfer_key, chunk_hash, validate_chunk_bytes,
+    validate_chunk_hash, validate_chunked_transfer_shape,
 };
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
@@ -3877,13 +3877,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Err(error) => return Err(error.into()),
         };
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
+        let patch_hash = content_hash(bytes);
         self.pending_writes.insert(
             intent.intent_id.clone(),
-            pending_networked_write(
+            pending_networked_write_with_patch(
                 request.object_id.clone(),
                 request.target_version.clone(),
                 manifest.content_hash.clone(),
                 manifest.size_bytes,
+                Some(PendingNetworkedWritePatch {
+                    base_version: expected_base_version.clone(),
+                    offset,
+                    patch_hash: patch_hash.clone(),
+                    bytes: bytes.to_vec(),
+                    full_stage_fallback_nodes: BTreeSet::new(),
+                }),
             ),
         );
 
@@ -3914,7 +3922,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .filter(|node_id| *node_id != &self.node_id)
                 .cloned()
                 .collect::<Vec<_>>();
-            let patch_hash = content_hash(bytes);
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
                 let sent = self.send_stage_patch_if_routable(
@@ -6848,6 +6855,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             DfsBlobTransferResult::Rejected { ref reason } => {
                 match self.ensure_stage_response_request_matches_pending(&response) {
                     Ok(()) => {
+                        self.record_stage_patch_fallback(
+                            &response.intent_id,
+                            &response.replica_node_id,
+                        );
                         self.record_stage_retry_scheduled(
                             &response.intent_id,
                             &response.replica_node_id,
@@ -9716,22 +9727,43 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             if stage_targets.is_empty() {
                 continue;
             }
-            if self.open_pending_write_blob_stream(&pending).is_err() {
-                let fetch_requested = self.request_stage_blob_from_alternate(&intent, &pending)?;
-                if !fetch_requested {
-                    for replica_node_id in stage_targets {
-                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
-                    }
-                }
-                continue;
-            }
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
+            let mut full_stage_targets = Vec::new();
             for replica_node_id in stage_targets {
                 let request_id = pending
                     .stage_inflight_request_ids
                     .get(&replica_node_id)
                     .cloned()
                     .unwrap_or_else(|| self.next_request_id());
+                match self.send_pending_stage_patch_if_routable(
+                    &replica_node_id,
+                    request_id.clone(),
+                    &intent,
+                    &pending,
+                    object_metadata.clone(),
+                )? {
+                    Some(true) => {
+                        self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
+                    }
+                    Some(false) => {
+                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                    }
+                    None => full_stage_targets.push((replica_node_id, request_id)),
+                }
+            }
+            if full_stage_targets.is_empty() {
+                continue;
+            }
+            if self.open_pending_write_blob_stream(&pending).is_err() {
+                let fetch_requested = self.request_stage_blob_from_alternate(&intent, &pending)?;
+                if !fetch_requested {
+                    for (replica_node_id, _) in full_stage_targets {
+                        self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
+                    }
+                }
+                continue;
+            }
+            for (replica_node_id, request_id) in full_stage_targets {
                 let start_chunk_index = pending
                     .stage_next_chunk_indexes
                     .get(&replica_node_id)
@@ -9764,6 +9796,43 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         }
         Ok(())
+    }
+
+    fn send_pending_stage_patch_if_routable(
+        &mut self,
+        replica_node_id: &NodeId,
+        request_id: String,
+        intent: &DistributedWriteIntent,
+        pending: &PendingNetworkedWrite,
+        object_metadata: Option<DfsObjectMetadata>,
+    ) -> Result<Option<bool>, DfsError> {
+        let Some(patch) = pending.patch.as_ref() else {
+            return Ok(None);
+        };
+        if patch.full_stage_fallback_nodes.contains(replica_node_id) {
+            return Ok(None);
+        }
+        let Some(base_version) = intent.base_version.as_ref() else {
+            return Ok(None);
+        };
+        if base_version != &patch.base_version {
+            return Ok(None);
+        }
+        let sent = self.send_stage_patch_if_routable(
+            replica_node_id,
+            request_id,
+            &intent.intent_id,
+            &intent.file_system_id,
+            &intent.object_id,
+            base_version,
+            &intent.target_version,
+            &pending.content_hash,
+            patch.offset,
+            &patch.patch_hash,
+            &patch.bytes,
+            object_metadata,
+        )?;
+        Ok(Some(sent))
     }
 
     fn open_pending_write_blob_stream(
@@ -9982,6 +10051,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             state.next_retry_tick = tick.saturating_add(repair_retry_delay_ticks(state.attempts));
             pending.stage_inflight_request_ids.remove(replica_node_id);
             pending.stage_next_chunk_indexes.remove(replica_node_id);
+        }
+    }
+
+    fn record_stage_patch_fallback(&mut self, intent_id: &str, replica_node_id: &NodeId) {
+        if let Some(pending) = self.pending_writes.get_mut(intent_id)
+            && let Some(patch) = pending.patch.as_mut()
+        {
+            patch
+                .full_stage_fallback_nodes
+                .insert(replica_node_id.clone());
         }
     }
 
@@ -12002,11 +12081,22 @@ fn pending_networked_write(
     content_hash: String,
     size_bytes: u64,
 ) -> PendingNetworkedWrite {
+    pending_networked_write_with_patch(object_id, version, content_hash, size_bytes, None)
+}
+
+fn pending_networked_write_with_patch(
+    object_id: DfsObjectId,
+    version: DfsVersion,
+    content_hash: String,
+    size_bytes: u64,
+    patch: Option<PendingNetworkedWritePatch>,
+) -> PendingNetworkedWrite {
     PendingNetworkedWrite {
         object_id,
         version,
         content_hash,
         size_bytes,
+        patch,
         stage_retries: BTreeMap::new(),
         repair_retries: BTreeMap::new(),
         stage_inflight_request_ids: BTreeMap::new(),

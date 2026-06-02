@@ -11,6 +11,7 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
     pub(crate) size_bytes: u64,
+    pub(crate) patch: Option<PendingNetworkedWritePatch>,
     pub(crate) stage_retries: BTreeMap<NodeId, RepairRetryState>,
     pub(crate) repair_retries: BTreeMap<NodeId, RepairRetryState>,
     pub(crate) stage_inflight_request_ids: BTreeMap<NodeId, String>,
@@ -21,6 +22,15 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) fetch_inflight_request_ids: BTreeMap<NodeId, String>,
     pub(crate) fetch_inflight_started_ticks: BTreeMap<NodeId, u64>,
     pub(crate) fetch_failed_from: BTreeSet<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PendingNetworkedWritePatch {
+    pub(crate) base_version: DfsVersion,
+    pub(crate) offset: u64,
+    pub(crate) patch_hash: String,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) full_stage_fallback_nodes: BTreeSet<NodeId>,
 }
 
 #[derive(Clone, Debug)]

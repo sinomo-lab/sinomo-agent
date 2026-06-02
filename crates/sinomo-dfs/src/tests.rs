@@ -211,6 +211,22 @@ fn networked_sifs_with_backend(
     dfs
 }
 
+fn drain_dfs_messages(
+    transport: &mut sinomo_network::InProcessTransport,
+) -> Vec<DfsNetworkMessage> {
+    transport
+        .drain_incoming()
+        .expect("drain DFS frames")
+        .into_iter()
+        .filter_map(|frame| {
+            let MeshMessageBody::Protocol(protocol) = frame.frame.message.body else {
+                return None;
+            };
+            Some(protocol.decode::<DfsNetworkMessage>().expect("decode DFS"))
+        })
+        .collect()
+}
+
 fn test_chunked_assembler(
     root: &Path,
     name: &str,
@@ -2818,6 +2834,7 @@ fn committed_pending_write_cleanup_drops_stale_stage_inflight_state() {
             version: version_2,
             content_hash,
             size_bytes: b"cleanup bytes".len() as u64,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::from([(
@@ -2902,6 +2919,7 @@ fn apply_committed_intent_tolerates_missing_local_repair_blob() {
             version: version_2.clone(),
             content_hash: manifest.content_hash.clone(),
             size_bytes: manifest.size_bytes,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -2962,6 +2980,7 @@ fn repair_blob_sources_use_backend_current_locations_over_stale_memory() {
         version: version.clone(),
         content_hash: hash,
         size_bytes: bytes.len() as u64,
+        patch: None,
         stage_retries: BTreeMap::new(),
         repair_retries: BTreeMap::new(),
         stage_inflight_request_ids: BTreeMap::new(),
@@ -3023,6 +3042,7 @@ fn write_outcome_uses_backend_current_metadata_after_pending_state_is_removed() 
             version: version_2.clone(),
             content_hash: hash.clone(),
             size_bytes: bytes.len() as u64,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -4603,6 +4623,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             version: version.clone(),
             content_hash: content_hash.clone(),
             size_bytes: 70_000,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 replica.clone(),
                 RepairRetryState {
@@ -4828,6 +4849,7 @@ fn stale_fetch_request_expiry_wakes_stage_and_repair_retries() {
             version,
             content_hash,
             size_bytes: 0,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -4918,6 +4940,7 @@ fn fetch_rejection_wakes_stage_and_repair_retries() {
             version: version.clone(),
             content_hash: content_hash.clone(),
             size_bytes: b"fetch reject bytes".len() as u64,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -5027,6 +5050,7 @@ fn fetch_store_failure_wakes_stage_and_repair_retries() {
             version: version.clone(),
             content_hash: content_hash.clone(),
             size_bytes: expected_bytes.len() as u64,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -5153,6 +5177,7 @@ fn fetch_response_reuses_existing_local_blob_without_rehashing_payload() {
             version: version.clone(),
             content_hash: manifest.content_hash.clone(),
             size_bytes: bytes.len() as u64,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -5246,6 +5271,7 @@ fn chunked_fetch_store_failure_is_rejected_without_hard_error() {
             version: version.clone(),
             content_hash: content_hash.clone(),
             size_bytes: expected_bytes.len() as u64,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -5358,6 +5384,7 @@ fn chunked_fetch_response_reuses_existing_local_blob_without_rehashing_payload()
             version: version.clone(),
             content_hash: manifest.content_hash.clone(),
             size_bytes: bytes.len() as u64,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -5467,6 +5494,7 @@ fn chunked_fetch_response_teaches_unknown_pending_write_size() {
             version: version.clone(),
             content_hash: content_hash.clone(),
             size_bytes: 0,
+            patch: None,
             stage_retries: BTreeMap::from([(
                 target.clone(),
                 RepairRetryState {
@@ -5572,6 +5600,7 @@ fn repair_retry_schedule_does_not_double_count_completed_inflight_attempt() {
             version: DfsVersion::from_legacy_named("version_2").expect("version"),
             content_hash: "blake3:retry".to_string(),
             size_bytes: 5,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -5641,6 +5670,7 @@ fn repair_response_conflicting_receipt_preserves_retry_state() {
             version: version_2.clone(),
             content_hash: content_hash.clone(),
             size_bytes: bytes.len() as u64,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -6042,6 +6072,7 @@ fn committed_intent_applies_when_commit_notification_target_is_unroutable() {
             version: version_2.clone(),
             content_hash: manifest.content_hash.clone(),
             size_bytes: manifest.size_bytes,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -7740,6 +7771,7 @@ fn duplicate_committed_intent_application_does_not_recommit_visible_version() {
             version: version_2,
             content_hash: manifest.content_hash.clone(),
             size_bytes: manifest.size_bytes,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -7840,6 +7872,7 @@ fn committed_intent_repairs_already_current_stale_locations() {
             version: version_2,
             content_hash: manifest.content_hash.clone(),
             size_bytes: manifest.size_bytes,
+            patch: None,
             stage_retries: BTreeMap::new(),
             repair_retries: BTreeMap::new(),
             stage_inflight_request_ids: BTreeMap::new(),
@@ -9474,6 +9507,89 @@ fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
             .has_blob(&replica_manifest.content_hash)
             .expect("logical blob check"),
         "replicated patch write should not materialize a full replacement blob on the replica"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
+    let root = temp_root("sifs-posix-write-at-patch-retry");
+    let owner = NodeId::from_legacy_named("node_sifs_write_at_patch_retry_owner").expect("owner");
+    let replica =
+        NodeId::from_legacy_named("node_sifs_write_at_patch_retry_replica").expect("replica");
+    let path = "/services/retry-write-at-patch.bin";
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner backend");
+    let mut replica_mailbox = network.add_node(replica.clone());
+    owner_dfs.bootstrap_distributed_sifs().expect("owner sifs");
+
+    let mut initial = vec![0_u8; 256 * 1024 + 31];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    owner_dfs
+        .posix_write_file(
+            path,
+            &initial,
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("initial self write");
+
+    let patch = b"lost patch stage should retry as patch";
+    let patch_offset = 96 * 1024 + 5;
+    owner_dfs
+        .posix_write_file_at(
+            path,
+            patch_offset as u64,
+            patch,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: false,
+            },
+        )
+        .expect("patch write");
+
+    let first_messages = drain_dfs_messages(&mut replica_mailbox);
+    assert!(
+        first_messages
+            .iter()
+            .any(|message| matches!(message, DfsNetworkMessage::StagePatch(_))),
+        "first stage should send a patch"
+    );
+    assert!(
+        first_messages
+            .iter()
+            .all(|message| !matches!(message, DfsNetworkMessage::StageBlobChunk(_))),
+        "patch stage should not send full-object chunks"
+    );
+
+    owner_dfs.repair_retry_tick = 16;
+    owner_dfs
+        .retry_pending_repairs()
+        .expect("retry pending patch stage");
+
+    let retry_messages = drain_dfs_messages(&mut replica_mailbox);
+    assert!(
+        retry_messages
+            .iter()
+            .any(|message| matches!(message, DfsNetworkMessage::StagePatch(_))),
+        "lost patch stage should be retried as a patch"
+    );
+    assert!(
+        retry_messages
+            .iter()
+            .all(|message| !matches!(message, DfsNetworkMessage::StageBlobChunk(_))),
+        "patch retry should not fall back to full-object chunks before an explicit patch rejection"
     );
 
     std::fs::remove_dir_all(root).ok();
