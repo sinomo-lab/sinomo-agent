@@ -327,7 +327,10 @@ mod tests {
             a.clone(),
             inner_request(),
         );
-        assert_eq!(relay_decision(&envelope, &a, &g), RelayDecision::DeliverLocal);
+        assert_eq!(
+            relay_decision(&envelope, &a, &g),
+            RelayDecision::DeliverLocal
+        );
     }
 
     #[test]

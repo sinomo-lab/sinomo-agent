@@ -502,10 +502,7 @@ impl ClusterConnectivityGraph {
                 self.records.values().find(|record| {
                     record.source_node_id == self.source_node_id
                         && record.target_node_id == endpoint.node_id
-                        && cluster_endpoint_addresses_equivalent(
-                            &record.address,
-                            &endpoint.address,
-                        )
+                        && cluster_endpoint_addresses_equivalent(&record.address, &endpoint.address)
                 })
             })
     }

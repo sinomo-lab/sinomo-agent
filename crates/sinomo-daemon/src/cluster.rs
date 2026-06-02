@@ -1,19 +1,18 @@
 use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    DaemonClusterRegistration, DaemonClusterStatus, DaemonError,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST,
-    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    authenticated_signer_matches_cluster_node, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options, daemon_cluster_options_from_status,
-    daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
-    daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
-    default_main_daemon_status, ensure_daemon_cluster_members, ensure_default_distributed_dfs,
-    fetch_cluster_kv_snapshot_from_endpoint, fetch_daemon_status_from_endpoint,
-    handle_daemon_rollout_build_request, invite_introducers_from_daemon_status,
-    probe_daemon_status, read_daemon_status, send_cluster_join_registration_to_channel,
-    send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_member_publish,
-    send_cluster_raft_append, send_cluster_raft_vote, unknown_cluster_node_status,
-    write_daemon_status,
+    DaemonClusterRegistration, DaemonClusterStatus, DaemonError, DaemonPaths, DaemonProbeStatus,
+    DaemonRunOptions, IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
+    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, authenticated_signer_matches_cluster_node,
+    cluster_node_status_from_daemon_status, current_shadow_daemon_options,
+    daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_cluster_status,
+    daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
+    daemon_paths_are_shadow, default_main_daemon_status, ensure_daemon_cluster_members,
+    ensure_default_distributed_dfs, fetch_cluster_kv_snapshot_from_endpoint,
+    fetch_daemon_status_from_endpoint, handle_daemon_rollout_build_request,
+    invite_introducers_from_daemon_status, probe_daemon_status, read_daemon_status,
+    send_cluster_join_registration_to_channel, send_cluster_kv_txn, send_cluster_kv_watch_events,
+    send_cluster_member_publish, send_cluster_raft_append, send_cluster_raft_vote,
+    unknown_cluster_node_status, write_daemon_status,
 };
 use serde::Serialize;
 use sinomo_core::{
@@ -865,9 +864,10 @@ fn forward_cluster_join_registration_to_voter(
         match crate::send_daemon_rpc_to_endpoint(&voter, &rpc_request, DAEMON_CLUSTER_RELAY_TIMEOUT)
         {
             Ok(response) => return response.decode_body().map_err(DaemonError::from),
-            Err(error) => {
-                failures.push(format!("{} ({:?}): {error}", voter.address, voter.transport))
-            }
+            Err(error) => failures.push(format!(
+                "{} ({:?}): {error}",
+                voter.address, voter.transport
+            )),
         }
     }
     Err(DaemonError::ClusterReadOnly {
@@ -908,9 +908,10 @@ pub fn forward_cluster_invite_challenge_to_voter(
         match crate::send_daemon_rpc_to_endpoint(&voter, &rpc_request, DAEMON_CLUSTER_RELAY_TIMEOUT)
         {
             Ok(response) => return response.decode_body().map_err(DaemonError::from),
-            Err(error) => {
-                failures.push(format!("{} ({:?}): {error}", voter.address, voter.transport))
-            }
+            Err(error) => failures.push(format!(
+                "{} ({:?}): {error}",
+                voter.address, voter.transport
+            )),
         }
     }
     Err(DaemonError::ClusterReadOnly {
@@ -1623,11 +1624,10 @@ impl ClusterNetworkMaintenance {
                                         None
                                     }
                                 });
-                                let previously_healthy =
-                                    previous.as_ref().is_some_and(|record| {
-                                        record.state
-                                            == sinomo_network::ClusterConnectivityState::Healthy
-                                    });
+                                let previously_healthy = previous.as_ref().is_some_and(|record| {
+                                    record.state
+                                        == sinomo_network::ClusterConnectivityState::Healthy
+                                });
                                 let state_label = if previously_healthy && observed_failures == 1 {
                                     // Single-failure grace: a confirmed-healthy link survives one
                                     // transient probe failure as Healthy (stays routable through a
@@ -3322,8 +3322,11 @@ pub(crate) fn relay_request_to_endpoint(
         request.clone(),
         request_auth.to_vec(),
     );
-    let mut envelope =
-        sinomo_network::RelayEnvelope::new(state.cluster_id.clone(), endpoint.node_id.clone(), inner);
+    let mut envelope = sinomo_network::RelayEnvelope::new(
+        state.cluster_id.clone(),
+        endpoint.node_id.clone(),
+        inner,
+    );
     // Put the origin on the visited path so a downstream best-effort hop never bounces back.
     envelope.visited.push(state.local_node_id.clone());
     let outer = match envelope.into_request() {
