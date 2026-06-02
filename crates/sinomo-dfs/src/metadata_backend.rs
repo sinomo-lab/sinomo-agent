@@ -1387,32 +1387,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         after: Option<&DfsWriteIntentScanCursor>,
         max_entries: usize,
-    ) -> Result<DfsWriteIntentScanPage> {
-        if max_entries == 0 {
-            return Ok(DfsWriteIntentScanPage {
-                intents: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut intents = self.all_intents()?;
-        intents.sort_by(write_intent_scan_order);
-        if let Some(after) = after {
-            intents.retain(|intent| {
-                write_intent_scan_key(intent) > write_intent_scan_cursor_key(after)
-            });
-        }
-        let has_more = intents.len() > max_entries;
-        intents.truncate(max_entries);
-        let next_cursor = if has_more {
-            intents.last().map(write_intent_scan_cursor)
-        } else {
-            None
-        };
-        Ok(DfsWriteIntentScanPage {
-            intents,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsWriteIntentScanPage>;
     /// Returns every version record in the backend. The default aggregates per
     /// object so any backend stays correct; backends with a materialized table
     /// should override this with a single scan to avoid per-object queries.
@@ -6468,8 +6443,17 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        Ok(tables.intents.values().cloned().collect())
+        let mut intents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.write_intents_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(intents)
     }
 
     fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
@@ -6855,8 +6839,18 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        Ok(tables.namespace_jobs.values().cloned().collect())
+        let mut jobs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            jobs.extend(page.jobs);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(jobs)
     }
 
     fn list_namespace_jobs_page(
