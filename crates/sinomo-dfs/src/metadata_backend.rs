@@ -1475,37 +1475,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         }
         Ok(receipts)
     }
-    /// Returns every write intent in the backend. See [`Self::all_versions`].
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
         let mut intents = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut intent_cursor = None;
-                    loop {
-                        let intent_page = self.intents_for_object_page(
-                            &object.object_id,
-                            intent_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        intents.extend(intent_page.intents);
-                        let Some(next_cursor) = intent_page.next_cursor else {
-                            break;
-                        };
-                        intent_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page = self.write_intents_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(intents)
     }
@@ -2797,6 +2778,30 @@ impl LocalShardedMetadataBackend {
         Ok(true)
     }
 
+    fn intent_is_listable_from_shard(
+        &self,
+        intent: &DfsWriteIntentRecord,
+        backend: &LocalJsonMetadataBackend,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        if let Some(object) = backend.get_object(&intent.object_id)? {
+            return self.object_is_listable_from_shard(&object, shard_id);
+        }
+        if let Some(object) = intent.object_metadata.as_ref()
+            && object.object_id == intent.object_id
+            && object.file_system_id == intent.file_system_id
+        {
+            return self.object_is_listable_from_shard(object, shard_id);
+        }
+        if let Some(index) = self.read_object_shard_index(&intent.object_id)?
+            && self.shards.contains_key(&index.shard_id)
+            && index.shard_id != *shard_id
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     fn require_shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<DfsMetadataShardId> {
         self.shard_id_for_object(object_id)?
             .ok_or_else(|| MetadataBackendError::UnknownObject {
@@ -3949,14 +3954,34 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 next_cursor: None,
             });
         }
+        let per_shard_limit = max_entries.saturating_add(1);
         let mut intents = Vec::new();
         let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
-        for backend in self.shards.values() {
-            let page = backend.write_intents_page(after, max_entries.saturating_add(1))?;
-            for intent in page.intents {
-                if seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {
-                    intents.push(intent);
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_intents = 0usize;
+            loop {
+                let page = backend.write_intents_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for intent in page.intents {
+                    if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+                        continue;
+                    }
+                    if seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {
+                        intents.push(intent);
+                        shard_intents = shard_intents.saturating_add(1);
+                    }
+                    if shard_intents > max_entries {
+                        break;
+                    }
                 }
+                if shard_intents > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
             }
         }
         intents.sort_by(write_intent_scan_order);
@@ -10794,6 +10819,93 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(scanned_intent_ids, vec!["intent-0", "intent-1", "intent-2"]);
 
+        let mut transient_object = file.clone();
+        transient_object.object_id = DfsObjectId::from_legacy_named("obj_sharded_transient_intent")
+            .expect("transient object id");
+        transient_object.path = "/services/transient-create.txt".to_string();
+        transient_object.version = version("version_transient_1");
+        let transient_intent = DfsWriteIntentRecord {
+            intent_id: "intent-transient-create".to_string(),
+            file_system_id: transient_object.file_system_id.clone(),
+            object_id: transient_object.object_id.clone(),
+            base_version: None,
+            target_version: version("version_transient_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Staging,
+            content_hash: Some("blake3:transient".to_string()),
+            object_metadata: Some(transient_object.clone()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: None,
+        };
+        backend
+            .put_intent_for_object(Some(&transient_object), &transient_intent)
+            .expect("transient intent");
+
+        let mut moved_object = object(version("version_1"));
+        moved_object.object_id = DfsObjectId::from_legacy_named("obj_sharded_stale_intent_source")
+            .expect("stale intent object id");
+        moved_object.path = "/stale-intent-source.txt".to_string();
+        backend.put_object(&moved_object).expect("root object");
+        let stale_source_intent = DfsWriteIntentRecord {
+            intent_id: "intent-stale-source".to_string(),
+            file_system_id: moved_object.file_system_id.clone(),
+            object_id: moved_object.object_id.clone(),
+            base_version: Some(moved_object.version.clone()),
+            target_version: version("version_stale_source_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some("blake3:stale-source".to_string()),
+            object_metadata: Some(moved_object.clone()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: None,
+        };
+        backend
+            .put_intent(&stale_source_intent)
+            .expect("source shard intent");
+        let mut moved_target_object = moved_object.clone();
+        moved_target_object.path = "/services/stale-intent-source.txt".to_string();
+        moved_target_object.version = version("version_stale_source_3");
+        backend
+            .put_object(&moved_target_object)
+            .expect("move object to services");
+
+        let mut scan_cursor = None;
+        let mut visible_scan_ids = BTreeSet::new();
+        loop {
+            let page = backend
+                .write_intents_page(scan_cursor.as_ref(), 2)
+                .expect("visible intent scan page");
+            assert!(page.intents.len() <= 2);
+            visible_scan_ids.extend(page.intents.into_iter().map(|intent| intent.intent_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            scan_cursor = Some(next_cursor);
+        }
+        assert!(
+            visible_scan_ids.contains("intent-transient-create"),
+            "transient create intents should remain visible in global scans"
+        );
+        assert!(
+            !visible_scan_ids.contains("intent-stale-source"),
+            "global scans should hide source-shard intents after the object index moves"
+        );
+        assert_eq!(
+            backend
+                .all_intents()
+                .expect("all intents")
+                .into_iter()
+                .map(|intent| intent.intent_id)
+                .collect::<BTreeSet<_>>(),
+            visible_scan_ids
+        );
+
         for index in 0..3 {
             let conflict = DfsConflictRecord {
                 conflict_id: format!("conflict-{index}"),
@@ -12757,6 +12869,15 @@ mod tests {
             (0..5)
                 .map(|index| format!("intent-{index}"))
                 .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            backend
+                .all_intents()
+                .expect("all intents")
+                .into_iter()
+                .map(|intent| intent.intent_id)
+                .collect::<Vec<_>>(),
+            scanned_intents
         );
 
         cleanup(&root);
