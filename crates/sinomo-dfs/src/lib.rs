@@ -128,6 +128,8 @@ const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
 const DFS_METADATA_OBJECT_VERSION_PAGE_SIZE: usize = 1024;
 const DFS_METADATA_OBJECT_INTENT_PAGE_SIZE: usize = 1024;
 const DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE: usize = 1024;
+const DFS_ANTI_ENTROPY_DEFAULT_OBJECT_PAGE_SIZE: usize = 1024;
+const DFS_ANTI_ENTROPY_DEFAULT_ISSUE_LIMIT: usize = 1024;
 #[cfg(not(test))]
 const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
 #[cfg(test)]
@@ -793,10 +795,63 @@ pub struct DfsOperationalMetrics {
     pub content: ContentStoreStats,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsAntiEntropyOptions {
+    pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<DfsObjectPageCursor>,
+    pub max_objects: usize,
+    pub max_issues: usize,
+    #[serde(default)]
+    pub repair_metadata: bool,
+}
+
+impl DfsAntiEntropyOptions {
+    pub fn new(file_system_id: DfsFileSystemId) -> Self {
+        Self {
+            file_system_id,
+            after: None,
+            max_objects: DFS_ANTI_ENTROPY_DEFAULT_OBJECT_PAGE_SIZE,
+            max_issues: DFS_ANTI_ENTROPY_DEFAULT_ISSUE_LIMIT,
+            repair_metadata: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsAntiEntropyReport {
+    pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<DfsObjectPageCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsObjectPageCursor>,
+    pub metadata_backend_configured: bool,
+    pub scanned_object_count: u64,
+    pub checked_local_location_count: u64,
+    pub stale_local_location_count: u64,
+    pub repaired_location_count: u64,
+    pub issue_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<DfsAntiEntropyIssue>,
+    pub max_issues_reached: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsAntiEntropyIssue {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub path: String,
+    pub content_hash: String,
+    pub reason: String,
+    pub repaired: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsLifecycleMaintenanceOptions {
     #[serde(default)]
     pub scrub_content: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anti_entropy: Option<DfsAntiEntropyOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_gc: Option<ContentStoreVersionGcOptions>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -809,6 +864,8 @@ pub struct DfsLifecycleMaintenanceOptions {
 pub struct DfsLifecycleMaintenanceReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_scrub: Option<ContentStoreScrubReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anti_entropy: Option<DfsAntiEntropyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_gc: Option<ContentStoreVersionGcReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1747,6 +1804,81 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         })
     }
 
+    pub fn run_local_content_anti_entropy(
+        &mut self,
+        options: DfsAntiEntropyOptions,
+    ) -> Result<DfsAntiEntropyReport, DfsError> {
+        let mut report = DfsAntiEntropyReport {
+            file_system_id: options.file_system_id.clone(),
+            after: options.after.clone(),
+            next_cursor: None,
+            metadata_backend_configured: self.metadata_backend.is_some(),
+            scanned_object_count: 0,
+            checked_local_location_count: 0,
+            stale_local_location_count: 0,
+            repaired_location_count: 0,
+            issue_count: 0,
+            issues: Vec::new(),
+            max_issues_reached: false,
+        };
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(report);
+        };
+        let page = backend.objects_for_file_system_page(
+            &options.file_system_id,
+            options.after.as_ref(),
+            options.max_objects.max(1),
+        )?;
+        report.next_cursor = page.next_cursor;
+        let local_node_id = self.node_id.clone();
+
+        for object in page.objects {
+            report.scanned_object_count = report.scanned_object_count.saturating_add(1);
+            if !matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Symlink) {
+                continue;
+            }
+            if !object.current_locations.contains(&local_node_id) {
+                continue;
+            }
+            let Some(content_hash) = object.content_hash.clone() else {
+                continue;
+            };
+            report.checked_local_location_count =
+                report.checked_local_location_count.saturating_add(1);
+            let Some(reason) = self.local_content_anti_entropy_issue_reason(&object, &content_hash)
+            else {
+                continue;
+            };
+            report.stale_local_location_count = report.stale_local_location_count.saturating_add(1);
+            let repaired = if options.repair_metadata {
+                self.mark_remote_read_location_missing(
+                    &object.object_id,
+                    &object.version,
+                    &object.content_hash,
+                    &local_node_id,
+                )?;
+                report.repaired_location_count = report.repaired_location_count.saturating_add(1);
+                true
+            } else {
+                false
+            };
+            record_anti_entropy_issue(
+                &mut report,
+                options.max_issues,
+                DfsAntiEntropyIssue {
+                    object_id: object.object_id,
+                    version: object.version,
+                    path: object.path,
+                    content_hash,
+                    reason,
+                    repaired,
+                },
+            );
+        }
+
+        Ok(report)
+    }
+
     pub fn run_lifecycle_maintenance(
         &mut self,
         options: DfsLifecycleMaintenanceOptions,
@@ -1756,6 +1888,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         } else {
             None
         };
+        let anti_entropy = options
+            .anti_entropy
+            .map(|options| self.run_local_content_anti_entropy(options))
+            .transpose()?;
         let version_gc = options
             .version_gc
             .map(|options| self.content.collect_versions(options))
@@ -1774,12 +1910,54 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
         Ok(DfsLifecycleMaintenanceReport {
             content_scrub,
+            anti_entropy,
             version_gc,
             orphan_gc,
             metadata_backend_configured,
             tombstone_compaction_requested,
             tombstone_compaction,
         })
+    }
+
+    fn local_content_anti_entropy_issue_reason(
+        &self,
+        object: &DfsObjectMetadata,
+        expected_content_hash: &str,
+    ) -> Option<String> {
+        let manifest = match self
+            .content
+            .read_manifest(object.object_id.as_str(), object.version.as_str())
+        {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return Some(format!(
+                    "local object-version manifest is missing or unreadable: {error}"
+                ));
+            }
+        };
+        if manifest.content_hash != expected_content_hash {
+            return Some(format!(
+                "local object-version manifest hash mismatch: expected {expected_content_hash}, actual {}",
+                manifest.content_hash
+            ));
+        }
+        if let Some(expected_size) = object.content_size_bytes
+            && manifest.size_bytes != expected_size
+        {
+            return Some(format!(
+                "local object-version manifest size mismatch: expected {expected_size}, actual {}",
+                manifest.size_bytes
+            ));
+        }
+        match self.content.manifest_content_available(&manifest) {
+            Ok(true) => None,
+            Ok(false) => Some(
+                "local object-version manifest references missing or corrupt content".to_string(),
+            ),
+            Err(error) => Some(format!(
+                "local object-version manifest content is unreadable: {error}"
+            )),
+        }
     }
 
     pub fn send_metadata_journal_since(
@@ -11304,6 +11482,19 @@ fn blob_chunk_len(total_size_bytes: u64, chunk_index: u32) -> Result<usize, DfsE
     usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
         message: format!("DFS blob chunk is too large to fit in memory: {chunk_len} bytes"),
     })
+}
+
+fn record_anti_entropy_issue(
+    report: &mut DfsAntiEntropyReport,
+    max_issues: usize,
+    issue: DfsAntiEntropyIssue,
+) {
+    report.issue_count = report.issue_count.saturating_add(1);
+    if report.issues.len() < max_issues {
+        report.issues.push(issue);
+    } else {
+        report.max_issues_reached = true;
+    }
 }
 
 fn read_small_blob_from_reader(

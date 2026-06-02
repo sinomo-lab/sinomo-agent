@@ -300,6 +300,7 @@ fn lifecycle_maintenance_runs_version_blob_and_tombstone_collection() {
     let report = dfs
         .run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
             scrub_content: true,
+            anti_entropy: None,
             version_gc: Some(ContentStoreVersionGcOptions::delete_eligible(
                 std::time::Duration::from_nanos(0),
                 1,
@@ -385,6 +386,133 @@ fn lifecycle_maintenance_reports_skipped_tombstones_without_backend() {
     assert!(report.content_scrub.is_none());
     assert!(report.version_gc.is_none());
     assert!(report.orphan_gc.is_none());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_content_anti_entropy_pages_and_repairs_stale_locations() {
+    let root = temp_root("local-content-anti-entropy");
+    let node_id = NodeId::from_legacy_named("node_anti_entropy").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("fs_anti_entropy").expect("fs");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(node_id.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "anti entropy".to_string(),
+        owner_node_id: node_id.clone(),
+        subtree_policies: Vec::new(),
+    };
+    dfs.metadata_backend
+        .as_mut()
+        .expect("metadata backend")
+        .put_file_system(&file_system)
+        .expect("filesystem");
+
+    let mut stale_a = file_metadata(node_id.clone());
+    stale_a.file_system_id = file_system_id.clone();
+    stale_a.object_id = DfsObjectId::from_legacy_named("obj_anti_entropy_stale_a").expect("object");
+    stale_a.version = DfsVersion::from_legacy_named("version_anti_entropy_stale_a").expect("ver");
+    stale_a.path = "/anti/000-stale-a.bin".to_string();
+    stale_a.current_locations = vec![node_id.clone()];
+    stale_a.content_hash = Some(content_hash(b"missing local bytes a"));
+    stale_a.content_size_bytes = Some(21);
+
+    let mut stale_b = file_metadata(node_id.clone());
+    stale_b.file_system_id = file_system_id.clone();
+    stale_b.object_id = DfsObjectId::from_legacy_named("obj_anti_entropy_stale_b").expect("object");
+    stale_b.version = DfsVersion::from_legacy_named("version_anti_entropy_stale_b").expect("ver");
+    stale_b.path = "/anti/001-stale-b.bin".to_string();
+    stale_b.current_locations = vec![node_id.clone()];
+    stale_b.content_hash = Some(content_hash(b"missing local bytes b"));
+    stale_b.content_size_bytes = Some(21);
+
+    let mut healthy = file_metadata(node_id.clone());
+    healthy.file_system_id = file_system_id.clone();
+    healthy.object_id = DfsObjectId::from_legacy_named("obj_anti_entropy_healthy").expect("object");
+    healthy.version = DfsVersion::from_legacy_named("version_anti_entropy_healthy").expect("ver");
+    healthy.path = "/anti/002-healthy.bin".to_string();
+    let healthy_manifest = dfs
+        .content
+        .put_object_version(
+            healthy.object_id.as_str(),
+            healthy.version.as_str(),
+            b"healthy local bytes",
+        )
+        .expect("healthy content");
+    healthy.current_locations = vec![node_id.clone()];
+    healthy.content_hash = Some(healthy_manifest.content_hash.clone());
+    healthy.content_size_bytes = Some(healthy_manifest.size_bytes);
+
+    {
+        let backend = dfs.metadata_backend.as_mut().expect("metadata backend");
+        backend.put_object(&stale_a).expect("stale a metadata");
+        backend.put_object(&stale_b).expect("stale b metadata");
+        backend.put_object(&healthy).expect("healthy metadata");
+    }
+
+    let first = dfs
+        .run_local_content_anti_entropy(DfsAntiEntropyOptions {
+            file_system_id: file_system_id.clone(),
+            after: None,
+            max_objects: 1,
+            max_issues: 1,
+            repair_metadata: true,
+        })
+        .expect("first anti-entropy page");
+    assert_eq!(first.scanned_object_count, 1);
+    assert_eq!(first.checked_local_location_count, 1);
+    assert_eq!(first.stale_local_location_count, 1);
+    assert_eq!(first.repaired_location_count, 1);
+    assert_eq!(first.issue_count, 1);
+    assert_eq!(first.issues.len(), 1);
+    assert!(first.issues[0].repaired);
+    assert!(first.next_cursor.is_some());
+
+    let backend = dfs.metadata_backend().expect("metadata backend");
+    let repaired_a = backend
+        .get_object(&stale_a.object_id)
+        .expect("stale a object")
+        .expect("stale a after repair");
+    assert!(!repaired_a.current_locations.contains(&node_id));
+    let repaired_a_version = backend
+        .get_version(&stale_a.object_id, &stale_a.version)
+        .expect("stale a version")
+        .expect("stale a version after repair");
+    assert!(!repaired_a_version.locations.contains(&node_id));
+
+    let second = dfs
+        .run_local_content_anti_entropy(DfsAntiEntropyOptions {
+            file_system_id: file_system_id.clone(),
+            after: first.next_cursor,
+            max_objects: 8,
+            max_issues: 8,
+            repair_metadata: true,
+        })
+        .expect("second anti-entropy page");
+    assert_eq!(second.scanned_object_count, 2);
+    assert_eq!(second.checked_local_location_count, 2);
+    assert_eq!(second.stale_local_location_count, 1);
+    assert_eq!(second.repaired_location_count, 1);
+    assert!(second.next_cursor.is_none());
+
+    let backend = dfs.metadata_backend().expect("metadata backend");
+    let repaired_b = backend
+        .get_object(&stale_b.object_id)
+        .expect("stale b object")
+        .expect("stale b after repair");
+    assert!(!repaired_b.current_locations.contains(&node_id));
+    let healthy_object = backend
+        .get_object(&healthy.object_id)
+        .expect("healthy object")
+        .expect("healthy remains");
+    assert!(healthy_object.current_locations.contains(&node_id));
 
     std::fs::remove_dir_all(root).ok();
 }
