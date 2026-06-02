@@ -10,12 +10,13 @@ use sinomo_core::{
 };
 use sinomo_dfs::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsDistributedWriteResult,
-    DfsExposeStore, DfsFileSystemConfig, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAntiEntropyOptions,
+    DfsDistributedWriteResult, DfsExposeStore, DfsFileSystemConfig, DfsLifecycleMaintenanceOptions,
+    DfsLifecycleMaintenanceReport, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
     DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement,
-    DfsObjectVersionRecord, DfsOperatorInspector, DfsProtocolFrameCommand,
+    DfsObjectPageCursor, DfsObjectVersionRecord, DfsOperatorInspector, DfsProtocolFrameCommand,
     DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions,
     LocalContentStore, LocalJsonMetadataBackend, LocalShardedMetadataBackend, NetworkedDfsService,
     NetworkedDfsServiceEvent, content_service_key, content_services_prefix,
@@ -44,6 +45,8 @@ const DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_s
 const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
 const DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
+const DFS_ANTI_ENTROPY_MAINTENANCE_MAX_OBJECTS_PER_FILE_SYSTEM: usize = 1024;
+const DFS_ANTI_ENTROPY_MAINTENANCE_MAX_ISSUES_PER_FILE_SYSTEM: usize = 64;
 #[cfg(not(test))]
 const DFS_PROTOCOL_METADATA_PUBLISH_RETRY_ROUNDS: usize = 3;
 #[cfg(not(test))]
@@ -231,6 +234,13 @@ struct LegacyDaemonDfsMetadataReplicationCursor {
     target_node_id: sinomo_node::NodeId,
     shard_id: DfsMetadataShardId,
     next_after_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct DaemonDfsAntiEntropyCursor {
+    file_system_id: sinomo_dfs::DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<DfsObjectPageCursor>,
 }
 
 pub fn ensure_default_local_dfs_expose(paths: &DaemonPaths) -> Result<(), DaemonError> {
@@ -777,6 +787,8 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
         DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
     )?;
     log_dfs_namespace_job_maintenance_report(&namespace_jobs);
+    let lifecycle_reports = run_daemon_dfs_lifecycle_maintenance(&data_dir, &mut service)?;
+    log_dfs_lifecycle_maintenance_reports(&lifecycle_reports);
     let scheduled_repairs = service.retry_pending_repairs()?;
     if !scheduled_repairs.is_empty() {
         service.process_incoming()?;
@@ -797,6 +809,62 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     Ok(())
 }
 
+fn run_daemon_dfs_lifecycle_maintenance<T: NetworkTransport>(
+    data_dir: &SinomoDataDir,
+    service: &mut NetworkedDfsService<T>,
+) -> Result<Vec<DfsLifecycleMaintenanceReport>, DaemonError> {
+    let Some(metadata_backend) = service.metadata_backend() else {
+        return Ok(Vec::new());
+    };
+    let file_systems = metadata_backend.list_file_systems()?;
+    let mut reports = Vec::with_capacity(file_systems.len());
+
+    for file_system in file_systems {
+        let cursor_path =
+            daemon_dfs_anti_entropy_cursor_path(data_dir, &file_system.file_system_id);
+        let saved_cursor = read_daemon_dfs_anti_entropy_cursor(&cursor_path)?;
+        if let Some(saved_cursor) = saved_cursor.as_ref()
+            && saved_cursor.file_system_id != file_system.file_system_id
+        {
+            return Err(DaemonError::Parse {
+                detail: format!(
+                    "DFS anti-entropy cursor {} does not match file system {}",
+                    cursor_path.display(),
+                    file_system.file_system_id,
+                ),
+            });
+        }
+        let after = saved_cursor.and_then(|cursor| cursor.next_cursor);
+        let report = service.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            anti_entropy: Some(DfsAntiEntropyOptions {
+                file_system_id: file_system.file_system_id.clone(),
+                after,
+                max_objects: DFS_ANTI_ENTROPY_MAINTENANCE_MAX_OBJECTS_PER_FILE_SYSTEM,
+                max_issues: DFS_ANTI_ENTROPY_MAINTENANCE_MAX_ISSUES_PER_FILE_SYSTEM,
+                repair_metadata: true,
+            }),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })?;
+
+        if let Some(anti_entropy) = report.anti_entropy.as_ref() {
+            if let Some(next_cursor) = anti_entropy.next_cursor.clone() {
+                write_daemon_dfs_anti_entropy_cursor(
+                    &cursor_path,
+                    &DaemonDfsAntiEntropyCursor {
+                        file_system_id: file_system.file_system_id.clone(),
+                        next_cursor: Some(next_cursor),
+                    },
+                )?;
+            } else {
+                clear_daemon_dfs_anti_entropy_cursor(&cursor_path)?;
+            }
+        }
+        reports.push(report);
+    }
+
+    Ok(reports)
+}
+
 fn log_dfs_namespace_job_maintenance_report(report: &sinomo_dfs::DfsNamespaceJobMaintenanceReport) {
     if report.resumed_job_count == 0 && report.failed_job_count == 0 {
         return;
@@ -814,6 +882,43 @@ fn log_dfs_namespace_job_maintenance_report(report: &sinomo_dfs::DfsNamespaceJob
             "sinomo daemon DFS namespace job {} ({:?}) failed: {}",
             failure.job_id, failure.kind, failure.reason
         );
+    }
+}
+
+fn log_dfs_lifecycle_maintenance_reports(reports: &[DfsLifecycleMaintenanceReport]) {
+    for report in reports {
+        let Some(anti_entropy) = report.anti_entropy.as_ref() else {
+            continue;
+        };
+        if anti_entropy.stale_local_location_count == 0
+            && anti_entropy.repaired_location_count == 0
+            && anti_entropy.issue_count == 0
+            && !anti_entropy.max_issues_reached
+        {
+            continue;
+        }
+        eprintln!(
+            "sinomo daemon DFS anti-entropy {}: scanned={}, checked_local={}, stale_local={}, repaired={}, issues={}, next_cursor={}",
+            anti_entropy.file_system_id,
+            anti_entropy.scanned_object_count,
+            anti_entropy.checked_local_location_count,
+            anti_entropy.stale_local_location_count,
+            anti_entropy.repaired_location_count,
+            anti_entropy.issue_count,
+            anti_entropy.next_cursor.is_some()
+        );
+        for issue in &anti_entropy.issues {
+            eprintln!(
+                "sinomo daemon DFS anti-entropy issue {} {} {}: {} (repaired={})",
+                issue.object_id, issue.version, issue.path, issue.reason, issue.repaired
+            );
+        }
+        if anti_entropy.max_issues_reached {
+            eprintln!(
+                "sinomo daemon DFS anti-entropy {} stopped after reaching the issue limit",
+                anti_entropy.file_system_id
+            );
+        }
     }
 }
 
@@ -2152,6 +2257,68 @@ fn write_legacy_dfs_metadata_replication_cursor(
     })
 }
 
+fn daemon_dfs_anti_entropy_cursor_path(
+    data_dir: &SinomoDataDir,
+    file_system_id: &sinomo_dfs::DfsFileSystemId,
+) -> std::path::PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("anti-entropy-cursors")
+        .join(format!(
+            "{}.json",
+            path_safe_segment(&file_system_id.to_string())
+        ))
+}
+
+fn read_daemon_dfs_anti_entropy_cursor(
+    path: &std::path::Path,
+) -> Result<Option<DaemonDfsAntiEntropyCursor>, DaemonError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| DaemonError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn write_daemon_dfs_anti_entropy_cursor(
+    path: &std::path::Path,
+    cursor: &DaemonDfsAntiEntropyCursor,
+) -> Result<(), DaemonError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(cursor).map_err(|source| DaemonError::Json {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::write(path, bytes).map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn clear_daemon_dfs_anti_entropy_cursor(path: &std::path::Path) -> Result<(), DaemonError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
 fn path_safe_segment(value: &str) -> String {
     value
         .chars()
@@ -2619,6 +2786,109 @@ mod tests {
             b"daemon namespace job"
         );
         assert!(service.posix_read_file(&old_file).is_err());
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_maintenance_tick_runs_anti_entropy() {
+        let root = temp_root("daemon_dfs_maintenance_anti_entropy");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_anti_entropy_tick")
+                .expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_dfs_anti_entropy_tick").expect("node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "daemon dfs anti entropy",
+            node_id.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+
+        let file_system = default_cluster_sifs(&state);
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_daemon_dfs_anti_entropy_tick").expect("object");
+        let version =
+            DfsVersion::from_legacy_named("version_daemon_dfs_anti_entropy_tick").expect("version");
+        let missing_hash = format!(
+            "blake3:{}",
+            blake3::hash(b"missing daemon anti entropy bytes").to_hex()
+        );
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: file_system.file_system_id.clone(),
+            path: "/services/daemon-anti-entropy/missing.bin".to_string(),
+            kind: DfsObjectKind::File,
+            owner_node_id: node_id.clone(),
+            current_locations: vec![node_id.clone()],
+            content_hash: Some(missing_hash),
+            content_size_bytes: Some(33),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        {
+            let content =
+                LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
+            let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("metadata backend");
+            let mut service = NetworkedDfsService::new(
+                DaemonDfsEndpointTransport::new(node_id.clone(), Vec::new()),
+                content,
+            )
+            .with_boxed_metadata_backend(metadata)
+            .expect("service backend");
+            service
+                .bootstrap_distributed_sifs()
+                .expect("bootstrap sifs");
+            service
+                .add_object_metadata(object.clone())
+                .expect("missing object metadata");
+        }
+
+        run_daemon_dfs_maintenance_tick(&paths).expect("maintenance tick");
+
+        let backend =
+            open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata backend");
+        let repaired_object = backend
+            .get_object(&object_id)
+            .expect("get repaired object")
+            .expect("repaired object");
+        assert!(
+            !repaired_object.current_locations.contains(&node_id),
+            "anti-entropy must remove stale local object locations"
+        );
+        let repaired_version = backend
+            .get_version(&object_id, &version)
+            .expect("get repaired version")
+            .expect("repaired version");
+        assert!(
+            !repaired_version.locations.contains(&node_id),
+            "anti-entropy must remove stale local version locations"
+        );
+        assert!(
+            !daemon_dfs_anti_entropy_cursor_path(&data_dir, &file_system.file_system_id).exists(),
+            "completed scans should clear their cursor"
+        );
 
         cleanup(&root);
     }
