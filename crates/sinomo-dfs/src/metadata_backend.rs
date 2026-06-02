@@ -966,35 +966,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn objects_for_file_system(
         &self,
         file_system_id: &DfsFileSystemId,
-    ) -> Result<Vec<DfsObjectMetadata>>;
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut objects = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            objects.extend(page.objects);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(objects)
+    }
+
     fn objects_for_file_system_page(
         &self,
         file_system_id: &DfsFileSystemId,
         after: Option<&DfsObjectPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsObjectPage> {
-        if max_entries == 0 {
-            return Ok(DfsObjectPage {
-                objects: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut objects = self.objects_for_file_system(file_system_id)?;
-        if let Some(after) = after {
-            objects.retain(|object| object_page_key(object) > (&after.path, &after.object_id));
-        }
-        let has_more = objects.len() > max_entries;
-        objects.truncate(max_entries);
-        let next_cursor = if has_more {
-            objects.last().map(object_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsObjectPage {
-            objects,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsObjectPage>;
     fn count_objects_for_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<usize> {
         const COUNT_PAGE_SIZE: usize = 4096;
         let mut count = 0usize;
@@ -1286,35 +1281,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>>;
-    fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>>;
+    fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
+        let mut versions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.versions_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(versions)
+    }
+
     fn versions_for_object_page(
         &self,
         object_id: &DfsObjectId,
         after: Option<&DfsObjectVersionPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsObjectVersionPage> {
-        if max_entries == 0 {
-            return Ok(DfsObjectVersionPage {
-                versions: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut versions = self.versions_for_object(object_id)?;
-        if let Some(after) = after {
-            versions.retain(|version| version.version > after.version);
-        }
-        let has_more = versions.len() > max_entries;
-        versions.truncate(max_entries);
-        let next_cursor = if has_more {
-            versions.last().map(object_version_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsObjectVersionPage {
-            versions,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsObjectVersionPage>;
     fn put_receipt(&mut self, receipt: &DfsReplicaReceiptRecord)
     -> Result<DfsMetadataJournalEntry>;
     fn put_receipt_for_object(
@@ -1329,36 +1319,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
-    ) -> Result<Vec<DfsReplicaReceiptRecord>>;
+    ) -> Result<Vec<DfsReplicaReceiptRecord>> {
+        let mut receipts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.receipts_for_version_page(
+                object_id,
+                version,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            receipts.extend(page.receipts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(receipts)
+    }
+
     fn receipts_for_version_page(
         &self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
         after: Option<&DfsReplicaReceiptPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsReplicaReceiptPage> {
-        if max_entries == 0 {
-            return Ok(DfsReplicaReceiptPage {
-                receipts: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut receipts = self.receipts_for_version(object_id, version)?;
-        if let Some(after) = after {
-            receipts.retain(|receipt| receipt.replica_node_id > after.replica_node_id);
-        }
-        let has_more = receipts.len() > max_entries;
-        receipts.truncate(max_entries);
-        let next_cursor = if has_more {
-            receipts.last().map(replica_receipt_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsReplicaReceiptPage {
-            receipts,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsReplicaReceiptPage>;
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry>;
     fn put_intent_for_object(
         &mut self,
@@ -1373,35 +1359,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
-    fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>>;
+    fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
+        let mut intents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.intents_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(intents)
+    }
+
     fn intents_for_object_page(
         &self,
         object_id: &DfsObjectId,
         after: Option<&DfsWriteIntentPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsWriteIntentPage> {
-        if max_entries == 0 {
-            return Ok(DfsWriteIntentPage {
-                intents: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut intents = self.intents_for_object(object_id)?;
-        if let Some(after) = after {
-            intents.retain(|intent| intent.intent_id > after.intent_id);
-        }
-        let has_more = intents.len() > max_entries;
-        intents.truncate(max_entries);
-        let next_cursor = if has_more {
-            intents.last().map(write_intent_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsWriteIntentPage {
-            intents,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsWriteIntentPage>;
     fn write_intents_page(
         &self,
         after: Option<&DfsWriteIntentScanCursor>,
@@ -5994,35 +5975,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
-        let tables = self.current_tables_snapshot()?;
         let mut objects = Vec::new();
-        for ((record_file_system_id, _), path_record) in tables
-            .file_system_objects
-            .range((
-                Included((file_system_id.clone(), id_lower_bound())),
-                Unbounded,
-            ))
-            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
-        {
-            if record_file_system_id != file_system_id
-                || path_record.file_system_id != *file_system_id
-            {
-                continue;
-            }
-            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
-                continue;
+        let mut cursor = None;
+        loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            objects.extend(page.objects);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
             };
-            if object.file_system_id == *file_system_id
-                && normalize_path(&object.path) == path_record.path
-            {
-                objects.push(object);
-            }
+            cursor = Some(next_cursor);
         }
-        objects.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.object_id.cmp(&right.object_id))
-        });
         Ok(objects)
     }
 
@@ -6433,16 +6399,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        let mut versions = tables
-            .versions
-            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
-            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-            .map(|(_, version)| version)
-            .filter(|version| version.object_id == *object_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        versions.sort_by(|left, right| left.version.cmp(&right.version));
+        let mut versions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.versions_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
         Ok(versions)
     }
 
@@ -6547,23 +6517,22 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Vec<DfsReplicaReceiptRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        Ok(tables
-            .receipts
-            .range((
-                Included((object_id.clone(), version.clone(), id_lower_bound())),
-                Unbounded,
-            ))
-            .take_while(|((record_object_id, record_version, _), _)| {
-                record_object_id == object_id && record_version == version
-            })
-            .map(|(_, receipt)| receipt)
-            .filter(|receipt| {
-                receipt.receipt.object_id == *object_id
-                    && receipt.receipt.committed_version == *version
-            })
-            .cloned()
-            .collect())
+        let mut receipts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.receipts_for_version_page(
+                object_id,
+                version,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            receipts.extend(page.receipts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(receipts)
     }
 
     fn receipts_for_version_page(
@@ -6650,16 +6619,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        let mut intents = tables
-            .intents
-            .range((Included((object_id.clone(), String::new())), Unbounded))
-            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-            .map(|(_, intent)| intent)
-            .filter(|intent| intent.object_id == *object_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+        let mut intents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.intents_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
         Ok(intents)
     }
 
