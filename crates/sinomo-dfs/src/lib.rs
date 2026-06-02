@@ -2127,7 +2127,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .as_ref()
             .expect("metadata backend checked above")
             .list_file_systems()?;
-        let mut intents = Vec::new();
 
         self.metadata = DfsMetadataStore::new();
         self.tombstones_by_metadata_path.clear();
@@ -2172,29 +2171,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     self.metadata.add_object(object.clone())?;
 
                     self.add_backend_conflict_pages_to_memory(&object.object_id)?;
-                    let mut intent_cursor = None;
-                    loop {
-                        let intent_page = self
-                            .metadata_backend
-                            .as_ref()
-                            .expect("metadata backend checked above")
-                            .intents_for_object_page(
-                                &object.object_id,
-                                intent_cursor.as_ref(),
-                                DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-                            )?;
-                        for intent in intent_page.intents {
-                            self.coordinator
-                                .observe_restored_intent_id(&intent.intent_id);
-                            if write_intent_status_requires_hydrate_restore(&intent.status) {
-                                intents.push(intent);
-                            }
-                        }
-                        let Some(next_cursor) = intent_page.next_cursor else {
-                            break;
-                        };
-                        intent_cursor = Some(next_cursor);
-                    }
                 }
                 let Some(next_cursor) = page.next_cursor else {
                     break;
@@ -2203,89 +2179,109 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         }
 
-        intents.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.intent_id.cmp(&right.intent_id))
-        });
         let mut pending_write_records = Vec::new();
-        for mut intent_record in intents {
-            self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
-            let intent = distributed_intent_from_record(&intent_record);
-            match self.coordinator.restore_intent(intent) {
-                Ok(()) => {}
-                Err(error @ DfsDistributedError::PendingIntentConflict { .. })
-                    if matches!(
-                        intent_record.status,
-                        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-                    ) =>
-                {
-                    let object = self.current_read_object_metadata(&intent_record.object_id)?;
-                    self.create_write_conflict(
-                        &object,
-                        intent_record.base_version.clone(),
-                        intent_record.target_version.clone(),
-                        intent_record.coordinator_node_id.clone(),
-                        intent_record.content_hash.clone(),
-                        error.to_string(),
-                        Some(intent_record.intent_id.clone()),
-                    )?;
-                    let mut conflict_record = intent_record.clone();
-                    conflict_record.status = DfsWriteIntentStatus::Conflict;
-                    conflict_record.updated_at = Some(OffsetDateTime::now_utc());
-                    if let Some(backend) = self.metadata_backend.as_mut() {
-                        backend.put_intent(&conflict_record)?;
-                    }
-                    self.coordinator
-                        .restore_intent(distributed_intent_from_record(&conflict_record))?;
+        let mut intent_scan_cursor = None;
+        loop {
+            let intent_page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .write_intents_page(
+                    intent_scan_cursor.as_ref(),
+                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+                )?;
+            for mut intent_record in intent_page.intents {
+                if self.metadata.object(&intent_record.object_id).is_none() {
                     continue;
                 }
-                Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
-                    if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
-                        && self
-                            .current_read_object_metadata(&intent_record.object_id)
-                            .is_ok_and(|object| {
-                                object.version == intent_record.target_version
-                                    && intent_record.content_hash.as_deref().is_none_or(
-                                        |content_hash| {
-                                            object.content_hash.as_deref() == Some(content_hash)
-                                        },
-                                    )
-                            })
+                self.coordinator
+                    .observe_restored_intent_id(&intent_record.intent_id);
+                if !write_intent_status_requires_hydrate_restore(&intent_record.status) {
+                    continue;
+                }
+                self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
+                let intent = distributed_intent_from_record(&intent_record);
+                match self.coordinator.restore_intent(intent) {
+                    Ok(()) => {}
+                    Err(error @ DfsDistributedError::PendingIntentConflict { .. })
+                        if matches!(
+                            intent_record.status,
+                            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                        ) =>
                     {
-                        self.restore_visible_committed_object_location_receipts(&intent_record)?;
+                        let object = self.current_read_object_metadata(&intent_record.object_id)?;
+                        self.create_write_conflict(
+                            &object,
+                            intent_record.base_version.clone(),
+                            intent_record.target_version.clone(),
+                            intent_record.coordinator_node_id.clone(),
+                            intent_record.content_hash.clone(),
+                            error.to_string(),
+                            Some(intent_record.intent_id.clone()),
+                        )?;
+                        let mut conflict_record = intent_record.clone();
+                        conflict_record.status = DfsWriteIntentStatus::Conflict;
+                        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+                        if let Some(backend) = self.metadata_backend.as_mut() {
+                            backend.put_intent(&conflict_record)?;
+                        }
+                        self.coordinator
+                            .restore_intent(distributed_intent_from_record(&conflict_record))?;
                         continue;
                     }
-                    let object = self.current_read_object_metadata(&intent_record.object_id)?;
-                    self.create_write_conflict(
-                        &object,
-                        intent_record.base_version.clone(),
-                        intent_record.target_version.clone(),
-                        intent_record.coordinator_node_id.clone(),
-                        intent_record.content_hash.clone(),
-                        error.to_string(),
-                        Some(intent_record.intent_id.clone()),
-                    )?;
-                    let mut conflict_record = intent_record.clone();
-                    conflict_record.status = DfsWriteIntentStatus::Conflict;
-                    conflict_record.updated_at = Some(OffsetDateTime::now_utc());
-                    if let Some(backend) = self.metadata_backend.as_mut() {
-                        backend.put_intent(&conflict_record)?;
+                    Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
+                        if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                            && self
+                                .current_read_object_metadata(&intent_record.object_id)
+                                .is_ok_and(|object| {
+                                    object.version == intent_record.target_version
+                                        && intent_record.content_hash.as_deref().is_none_or(
+                                            |content_hash| {
+                                                object.content_hash.as_deref() == Some(content_hash)
+                                            },
+                                        )
+                                })
+                        {
+                            self.restore_visible_committed_object_location_receipts(
+                                &intent_record,
+                            )?;
+                            continue;
+                        }
+                        let object = self.current_read_object_metadata(&intent_record.object_id)?;
+                        self.create_write_conflict(
+                            &object,
+                            intent_record.base_version.clone(),
+                            intent_record.target_version.clone(),
+                            intent_record.coordinator_node_id.clone(),
+                            intent_record.content_hash.clone(),
+                            error.to_string(),
+                            Some(intent_record.intent_id.clone()),
+                        )?;
+                        let mut conflict_record = intent_record.clone();
+                        conflict_record.status = DfsWriteIntentStatus::Conflict;
+                        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+                        if let Some(backend) = self.metadata_backend.as_mut() {
+                            backend.put_intent(&conflict_record)?;
+                        }
+                        continue;
                     }
-                    continue;
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
+                self.restore_backend_receipt_pages_for_intent(&intent_record)?;
+                self.restore_visible_committed_object_location_receipts(&intent_record)?;
+                if matches!(
+                    intent_record.status,
+                    DfsWriteIntentStatus::Staging
+                        | DfsWriteIntentStatus::ReceiptsPending
+                        | DfsWriteIntentStatus::Committed
+                ) {
+                    pending_write_records.push(intent_record);
+                }
             }
-            self.restore_backend_receipt_pages_for_intent(&intent_record)?;
-            self.restore_visible_committed_object_location_receipts(&intent_record)?;
-            if matches!(
-                intent_record.status,
-                DfsWriteIntentStatus::Staging
-                    | DfsWriteIntentStatus::ReceiptsPending
-                    | DfsWriteIntentStatus::Committed
-            ) {
-                pending_write_records.push(intent_record);
-            }
+            let Some(next_cursor) = intent_page.next_cursor else {
+                break;
+            };
+            intent_scan_cursor = Some(next_cursor);
         }
 
         let repair_intent_ids: BTreeSet<String> = self

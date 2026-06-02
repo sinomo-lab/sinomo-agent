@@ -482,6 +482,21 @@ pub struct DfsWriteIntentPage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsWriteIntentScanCursor {
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub intent_id: String,
+    pub object_id: DfsObjectId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsWriteIntentScanPage {
+    pub intents: Vec<DfsWriteIntentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsWriteIntentScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsDirectoryPageCursor {
     pub path: String,
     pub object_id: DfsObjectId,
@@ -1378,6 +1393,36 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             next_cursor,
         })
     }
+    fn write_intents_page(
+        &self,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentScanPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut intents = self.all_intents()?;
+        intents.sort_by(write_intent_scan_order);
+        if let Some(after) = after {
+            intents.retain(|intent| {
+                write_intent_scan_key(intent) > write_intent_scan_cursor_key(after)
+            });
+        }
+        let has_more = intents.len() > max_entries;
+        intents.truncate(max_entries);
+        let next_cursor = if has_more {
+            intents.last().map(write_intent_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsWriteIntentScanPage {
+            intents,
+            next_cursor,
+        })
+    }
     /// Returns every version record in the backend. The default aggregates per
     /// object so any backend stays correct; backends with a materialized table
     /// should override this with a single scan to avoid per-object queries.
@@ -1905,6 +1950,7 @@ struct DfsMetadataTables {
     versions: BTreeMap<(DfsObjectId, DfsVersion), DfsObjectVersionRecord>,
     receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptRecord>,
     intents: BTreeMap<(DfsObjectId, String), DfsWriteIntentRecord>,
+    intent_order: BTreeMap<(OffsetDateTime, String, DfsObjectId), (DfsObjectId, String)>,
     conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
@@ -1989,6 +2035,25 @@ impl DfsMetadataTables {
             || !self.namespace_jobs.is_empty()
             || !self.compacted_tombstones.is_empty()
             || !self.visible_commits.is_empty()
+    }
+
+    fn put_intent_indexed(&mut self, intent: DfsWriteIntentRecord) {
+        let key = (intent.object_id.clone(), intent.intent_id.clone());
+        if let Some(previous) = self.intents.insert(key.clone(), intent.clone()) {
+            self.intent_order.remove(&write_intent_scan_key(&previous));
+        }
+        self.intent_order
+            .insert(write_intent_scan_key(&intent), key);
+    }
+
+    fn rebuild_intent_order_index(&mut self) {
+        self.intent_order.clear();
+        for intent in self.intents.values() {
+            self.intent_order.insert(
+                write_intent_scan_key(intent),
+                (intent.object_id.clone(), intent.intent_id.clone()),
+            );
+        }
     }
 
     fn apply(&mut self, op: DfsMetadataTableOp) {
@@ -2094,8 +2159,7 @@ impl DfsMetadataTables {
                 );
             }
             DfsMetadataTableOp::PutIntent { intent } => {
-                self.intents
-                    .insert((intent.object_id.clone(), intent.intent_id.clone()), intent);
+                self.put_intent_indexed(intent);
             }
             DfsMetadataTableOp::PutConflict { conflict } => {
                 self.conflicts.insert(
@@ -2415,6 +2479,7 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.versions, self.versions);
         rollback_map(&mut tables.receipts, self.receipts);
         rollback_map(&mut tables.intents, self.intents);
+        tables.rebuild_intent_order_index();
         rollback_map(&mut tables.conflicts, self.conflicts);
         rollback_map(&mut tables.visible_commits, self.visible_commits);
         rollback_map(
@@ -3877,6 +3942,43 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         };
         Ok(DfsWriteIntentPage {
             intents: entries.into_iter().map(|(intent, _)| intent).collect(),
+            next_cursor,
+        })
+    }
+
+    fn write_intents_page(
+        &self,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentScanPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut intents = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
+        for backend in self.shards.values() {
+            let page = backend.write_intents_page(after, max_entries.saturating_add(1))?;
+            for intent in page.intents {
+                if seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {
+                    intents.push(intent);
+                }
+            }
+        }
+        intents.sort_by(write_intent_scan_order);
+        let has_more = intents.len() > max_entries;
+        if has_more {
+            intents.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            intents.last().map(write_intent_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsWriteIntentScanPage {
+            intents,
             next_cursor,
         })
     }
@@ -6457,6 +6559,59 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         })
     }
 
+    fn write_intents_page(
+        &self,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentScanPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let mut intents = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        let mut collect_intent = |intent_key: &(DfsObjectId, String)| -> Result<bool> {
+            let Some(intent) = tables.intents.get(intent_key) else {
+                return Ok(false);
+            };
+            if intents.len() >= max_entries {
+                return Ok(true);
+            }
+            last_cursor = Some(write_intent_scan_cursor(intent));
+            intents.push(intent.clone());
+            Ok(false)
+        };
+        match after {
+            Some(after) => {
+                for (_, intent_key) in tables
+                    .intent_order
+                    .range((Excluded(write_intent_scan_cursor_key(after)), Unbounded))
+                {
+                    if collect_intent(intent_key)? {
+                        has_more = true;
+                        break;
+                    }
+                }
+            }
+            None => {
+                for intent_key in tables.intent_order.values() {
+                    if collect_intent(intent_key)? {
+                        has_more = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(DfsWriteIntentScanPage {
+            intents,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
+    }
+
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -7787,6 +7942,39 @@ fn write_intent_page_cursor(intent: &DfsWriteIntentRecord) -> DfsWriteIntentPage
     DfsWriteIntentPageCursor {
         intent_id: intent.intent_id.clone(),
         shard_id: None,
+    }
+}
+
+fn write_intent_scan_key(intent: &DfsWriteIntentRecord) -> (OffsetDateTime, String, DfsObjectId) {
+    (
+        intent.created_at,
+        intent.intent_id.clone(),
+        intent.object_id.clone(),
+    )
+}
+
+fn write_intent_scan_cursor_key(
+    cursor: &DfsWriteIntentScanCursor,
+) -> (OffsetDateTime, String, DfsObjectId) {
+    (
+        cursor.created_at,
+        cursor.intent_id.clone(),
+        cursor.object_id.clone(),
+    )
+}
+
+fn write_intent_scan_order(
+    left: &DfsWriteIntentRecord,
+    right: &DfsWriteIntentRecord,
+) -> std::cmp::Ordering {
+    write_intent_scan_key(left).cmp(&write_intent_scan_key(right))
+}
+
+fn write_intent_scan_cursor(intent: &DfsWriteIntentRecord) -> DfsWriteIntentScanCursor {
+    DfsWriteIntentScanCursor {
+        created_at: intent.created_at,
+        intent_id: intent.intent_id.clone(),
+        object_id: intent.object_id.clone(),
     }
 }
 
@@ -10055,6 +10243,23 @@ mod tests {
                 .map(|shard_id| shard_id.0.as_str()),
             Some("services")
         );
+        let first_scan_page = backend
+            .write_intents_page(None, 2)
+            .expect("first write intent scan page");
+        assert_eq!(first_scan_page.intents.len(), 2);
+        assert!(first_scan_page.next_cursor.is_some());
+        let second_scan_page = backend
+            .write_intents_page(first_scan_page.next_cursor.as_ref(), 2)
+            .expect("second write intent scan page");
+        assert_eq!(second_scan_page.intents.len(), 1);
+        assert!(second_scan_page.next_cursor.is_none());
+        let scanned_intent_ids = first_scan_page
+            .intents
+            .into_iter()
+            .chain(second_scan_page.intents)
+            .map(|intent| intent.intent_id)
+            .collect::<Vec<_>>();
+        assert_eq!(scanned_intent_ids, vec!["intent-0", "intent-1", "intent-2"]);
 
         cleanup(&root);
     }
@@ -11923,6 +12128,26 @@ mod tests {
         }
         assert_eq!(
             paged_intents,
+            (0..5)
+                .map(|index| format!("intent-{index}"))
+                .collect::<Vec<_>>()
+        );
+
+        let mut scan_cursor = None;
+        let mut scanned_intents = Vec::new();
+        loop {
+            let page = backend
+                .write_intents_page(scan_cursor.as_ref(), 2)
+                .expect("intent scan page");
+            assert!(page.intents.len() <= 2);
+            scanned_intents.extend(page.intents.into_iter().map(|intent| intent.intent_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            scan_cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            scanned_intents,
             (0..5)
                 .map(|index| format!("intent-{index}"))
                 .collect::<Vec<_>>()
