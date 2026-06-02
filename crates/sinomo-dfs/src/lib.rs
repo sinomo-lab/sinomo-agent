@@ -2128,7 +2128,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .expect("metadata backend checked above")
             .list_file_systems()?;
         let mut intents = Vec::new();
-        let mut tombstones = Vec::new();
         let mut receipts_by_intent =
             BTreeMap::<(DfsObjectId, String), Vec<DfsReplicaReceiptRecord>>::new();
 
@@ -2171,11 +2170,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         object.object_id.clone(),
                         object.version.clone(),
                     );
-                    if object.kind == DfsObjectKind::Tombstone {
-                        tombstones.push(object.clone());
-                    } else {
-                        self.track_metadata_tombstone(&object);
-                    }
+                    self.track_hydrated_metadata_tombstone(&object);
                     self.metadata.add_object(object.clone())?;
 
                     self.add_backend_conflict_pages_to_memory(&object.object_id)?;
@@ -2226,16 +2221,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     break;
                 };
                 cursor = Some(next_cursor);
-            }
-        }
-        for tombstone in tombstones {
-            let path = metadata_path(&tombstone.path);
-            if self
-                .metadata
-                .object_by_normalized_posix_path(&tombstone.file_system_id, &path)
-                .is_none()
-            {
-                self.track_metadata_tombstone(&tombstone);
             }
         }
 
@@ -2957,6 +2942,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             return;
         }
         self.tombstones_by_metadata_path.remove(&key);
+    }
+
+    fn track_hydrated_metadata_tombstone(&mut self, object: &DfsObjectMetadata) {
+        if object.kind != DfsObjectKind::Tombstone {
+            self.track_metadata_tombstone(object);
+            return;
+        }
+        let live_path = path_index_key(&object.file_system_id, &object.path).map(|(_, path)| path);
+        if self
+            .metadata
+            .object_by_normalized_posix_path(
+                &object.file_system_id,
+                live_path.as_deref().unwrap_or(&object.path),
+            )
+            .is_none()
+        {
+            self.track_metadata_tombstone(object);
+        }
     }
 
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {

@@ -1451,6 +1451,61 @@ fn hydrate_from_metadata_backend_walks_multiple_object_pages() {
 }
 
 #[test]
+fn hydrated_tombstone_tracking_is_incremental_and_live_path_aware() {
+    let root = temp_root("hydrate-incremental-tombstones");
+    let node_id = NodeId::from_legacy_named("node_hydrate_tombstones").expect("node");
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.metadata = DfsMetadataStore::new();
+    dfs.metadata.add_file_system(file_system(node_id.clone()));
+    dfs.tombstones_by_metadata_path.clear();
+
+    let mut live_first = file_metadata(node_id.clone());
+    live_first.object_id =
+        DfsObjectId::from_legacy_named("obj_hydrate_live_first").expect("object");
+    live_first.path = "/users/hydrate/live-first.txt".to_string();
+    dfs.metadata
+        .add_object(live_first.clone())
+        .expect("live object");
+
+    let mut late_tombstone = file_metadata(node_id.clone());
+    late_tombstone.object_id =
+        DfsObjectId::from_legacy_named("obj_hydrate_late_tombstone").expect("object");
+    late_tombstone.kind = DfsObjectKind::Tombstone;
+    late_tombstone.path = live_first.path.clone();
+    dfs.track_hydrated_metadata_tombstone(&late_tombstone);
+    assert!(
+        !dfs.tombstones_by_metadata_path
+            .contains_key(&(sifs_file_system_id(), metadata_path(&late_tombstone.path))),
+        "hydration must not retain a tombstone for a path already owned by a live object"
+    );
+
+    let mut early_tombstone = file_metadata(node_id.clone());
+    early_tombstone.object_id =
+        DfsObjectId::from_legacy_named("obj_hydrate_early_tombstone").expect("object");
+    early_tombstone.kind = DfsObjectKind::Tombstone;
+    early_tombstone.path = "/users/hydrate/live-after-tombstone.txt".to_string();
+    dfs.track_hydrated_metadata_tombstone(&early_tombstone);
+    assert!(
+        dfs.tombstones_by_metadata_path
+            .contains_key(&(sifs_file_system_id(), metadata_path(&early_tombstone.path))),
+        "a tombstone should be tracked until hydration sees a live object for the path"
+    );
+
+    let mut live_later = file_metadata(node_id);
+    live_later.object_id =
+        DfsObjectId::from_legacy_named("obj_hydrate_live_later").expect("object");
+    live_later.path = early_tombstone.path.clone();
+    dfs.track_hydrated_metadata_tombstone(&live_later);
+    assert!(
+        !dfs.tombstones_by_metadata_path
+            .contains_key(&(sifs_file_system_id(), metadata_path(&early_tombstone.path))),
+        "a later live object should clear a previously tracked hydrated tombstone"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn hydrate_from_metadata_backend_walks_multiple_conflict_pages() {
     let root = temp_root("hydrate-multiple-conflict-pages");
     let node_id = NodeId::from_legacy_named("node_hydrate_conflict_pages").expect("node");
