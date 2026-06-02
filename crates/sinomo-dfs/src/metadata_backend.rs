@@ -1423,6 +1423,49 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         after: Option<&DfsWriteIntentPageCursor>,
         max_entries: usize,
     ) -> Result<DfsWriteIntentPage>;
+    fn intents_for_object_version_page(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+        after: Option<&DfsWriteIntentPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut intents = Vec::new();
+        let mut cursor = after.cloned();
+        loop {
+            let page = self.intents_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for intent in page.intents {
+                if intent.target_version != *target_version {
+                    continue;
+                }
+                if intents.len() >= max_entries {
+                    return Ok(DfsWriteIntentPage {
+                        next_cursor: intents.last().map(write_intent_page_cursor),
+                        intents,
+                    });
+                }
+                intents.push(intent);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(DfsWriteIntentPage {
+            intents,
+            next_cursor: None,
+        })
+    }
     fn write_intents_page(
         &self,
         after: Option<&DfsWriteIntentScanCursor>,
@@ -1892,6 +1935,7 @@ struct DfsMetadataTables {
     receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptRecord>,
     intents: BTreeMap<(DfsObjectId, String), DfsWriteIntentRecord>,
     intent_order: BTreeMap<(OffsetDateTime, String, DfsObjectId), (DfsObjectId, String)>,
+    intent_targets: BTreeMap<(DfsObjectId, DfsVersion, String), (DfsObjectId, String)>,
     conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
@@ -1982,18 +2026,24 @@ impl DfsMetadataTables {
         let key = (intent.object_id.clone(), intent.intent_id.clone());
         if let Some(previous) = self.intents.insert(key.clone(), intent.clone()) {
             self.intent_order.remove(&write_intent_scan_key(&previous));
+            self.intent_targets
+                .remove(&write_intent_target_key(&previous));
         }
         self.intent_order
             .insert(write_intent_scan_key(&intent), key);
+        self.intent_targets
+            .insert(write_intent_target_key(&intent), intent_key(&intent));
     }
 
-    fn rebuild_intent_order_index(&mut self) {
+    fn rebuild_intent_indexes(&mut self) {
         self.intent_order.clear();
+        self.intent_targets.clear();
         for intent in self.intents.values() {
-            self.intent_order.insert(
-                write_intent_scan_key(intent),
-                (intent.object_id.clone(), intent.intent_id.clone()),
-            );
+            let key = intent_key(intent);
+            self.intent_order
+                .insert(write_intent_scan_key(intent), key.clone());
+            self.intent_targets
+                .insert(write_intent_target_key(intent), key);
         }
     }
 
@@ -2420,7 +2470,7 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.versions, self.versions);
         rollback_map(&mut tables.receipts, self.receipts);
         rollback_map(&mut tables.intents, self.intents);
-        tables.rebuild_intent_order_index();
+        tables.rebuild_intent_indexes();
         rollback_map(&mut tables.conflicts, self.conflicts);
         rollback_map(&mut tables.visible_commits, self.visible_commits);
         rollback_map(
@@ -3910,6 +3960,98 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 )?;
                 let next_local_cursor = page.next_cursor;
                 for intent in page.intents {
+                    if !seen_intent_ids.insert(intent.intent_id.clone()) {
+                        continue;
+                    }
+                    let cursor = write_intent_page_cursor_with_shard(
+                        write_intent_page_cursor(&intent),
+                        shard_id,
+                    );
+                    entries.push((intent, cursor));
+                    if entries.len() > max_entries {
+                        break 'shards;
+                    }
+                }
+                let Some(next_local_cursor) = next_local_cursor else {
+                    break;
+                };
+                local_after = Some(next_local_cursor);
+            }
+        }
+        let has_more = entries.len() > max_entries;
+        if has_more {
+            entries.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        Ok(DfsWriteIntentPage {
+            intents: entries.into_iter().map(|(intent, _)| intent).collect(),
+            next_cursor,
+        })
+    }
+
+    fn intents_for_object_version_page(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+        after: Option<&DfsWriteIntentPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        if let Some(shard_id) = self.shard_id_for_object(object_id)? {
+            let local_after = after.map(local_write_intent_page_cursor);
+            let mut page = self
+                .shard_backend(&shard_id)?
+                .intents_for_object_version_page(
+                    object_id,
+                    target_version,
+                    local_after.as_ref(),
+                    max_entries,
+                )?;
+            if page.next_cursor.is_some() {
+                page.next_cursor = page
+                    .next_cursor
+                    .map(|cursor| write_intent_page_cursor_with_shard(cursor, &shard_id));
+            }
+            return Ok(page);
+        }
+
+        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
+        let mut entries = Vec::<(DfsWriteIntentRecord, DfsWriteIntentPageCursor)>::new();
+        let mut seen_intent_ids = BTreeSet::<String>::new();
+        'shards: for (shard_id, backend) in &self.shards {
+            if let Some(resume_shard_id) = resume_shard_id
+                && shard_id < resume_shard_id
+            {
+                continue;
+            }
+            let mut local_after = match resume_shard_id {
+                Some(resume_shard_id) if resume_shard_id == shard_id => {
+                    after.map(local_write_intent_page_cursor)
+                }
+                Some(_) => None,
+                None => after.map(local_write_intent_page_cursor),
+            };
+            loop {
+                let page = backend.intents_for_object_version_page(
+                    object_id,
+                    target_version,
+                    local_after.as_ref(),
+                    max_entries.saturating_add(1),
+                )?;
+                let next_local_cursor = page.next_cursor;
+                for intent in page.intents {
+                    if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+                        continue;
+                    }
                     if !seen_intent_ids.insert(intent.intent_id.clone()) {
                         continue;
                     }
@@ -6967,6 +7109,60 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         })
     }
 
+    fn intents_for_object_version_page(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+        after: Option<&DfsWriteIntentPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = match after {
+            Some(after) => Excluded((
+                object_id.clone(),
+                target_version.clone(),
+                after.intent_id.clone(),
+            )),
+            None => Included((object_id.clone(), target_version.clone(), String::new())),
+        };
+        let mut intents = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_version, _), intent_key) in tables
+            .intent_targets
+            .range((start, Unbounded))
+            .take_while(|((record_object_id, record_version, _), _)| {
+                record_object_id == object_id && record_version == target_version
+            })
+        {
+            if record_object_id != object_id || record_version != target_version {
+                continue;
+            }
+            let Some(intent) = tables.intents.get(intent_key) else {
+                continue;
+            };
+            if intent.object_id != *object_id || intent.target_version != *target_version {
+                continue;
+            }
+            if intents.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(write_intent_page_cursor(intent));
+            intents.push(intent.clone());
+        }
+        Ok(DfsWriteIntentPage {
+            intents,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
+    }
+
     fn write_intents_page(
         &self,
         after: Option<&DfsWriteIntentScanCursor>,
@@ -8416,6 +8612,18 @@ fn write_intent_scan_key(intent: &DfsWriteIntentRecord) -> (OffsetDateTime, Stri
         intent.created_at,
         intent.intent_id.clone(),
         intent.object_id.clone(),
+    )
+}
+
+fn intent_key(intent: &DfsWriteIntentRecord) -> (DfsObjectId, String) {
+    (intent.object_id.clone(), intent.intent_id.clone())
+}
+
+fn write_intent_target_key(intent: &DfsWriteIntentRecord) -> (DfsObjectId, DfsVersion, String) {
+    (
+        intent.object_id.clone(),
+        intent.target_version.clone(),
+        intent.intent_id.clone(),
     )
 }
 
@@ -10819,6 +11027,63 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(scanned_intent_ids, vec!["intent-0", "intent-1", "intent-2"]);
 
+        let target_version = version("version_shared_target");
+        for index in 0..3 {
+            let intent = DfsWriteIntentRecord {
+                intent_id: format!("intent-shared-target-{index}"),
+                file_system_id: file.file_system_id.clone(),
+                object_id: file.object_id.clone(),
+                base_version: Some(version("version_0")),
+                target_version: target_version.clone(),
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner")],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                content_hash: Some(format!("blake3:shared-target-{index}")),
+                object_metadata: Some(file.clone()),
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: None,
+            };
+            backend.put_intent(&intent).expect("shared target intent");
+        }
+        let first_target_page = backend
+            .intents_for_object_version_page(&file.object_id, &target_version, None, 2)
+            .expect("first target intent page");
+        assert_eq!(first_target_page.intents.len(), 2);
+        assert_eq!(
+            first_target_page
+                .next_cursor
+                .as_ref()
+                .and_then(|cursor| cursor.shard_id.as_ref())
+                .map(|shard_id| shard_id.0.as_str()),
+            Some("services")
+        );
+        let second_target_page = backend
+            .intents_for_object_version_page(
+                &file.object_id,
+                &target_version,
+                first_target_page.next_cursor.as_ref(),
+                2,
+            )
+            .expect("second target intent page");
+        assert_eq!(second_target_page.intents.len(), 1);
+        assert!(second_target_page.next_cursor.is_none());
+        let shared_target_ids = first_target_page
+            .intents
+            .into_iter()
+            .chain(second_target_page.intents)
+            .map(|intent| intent.intent_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shared_target_ids,
+            vec![
+                "intent-shared-target-0".to_string(),
+                "intent-shared-target-1".to_string(),
+                "intent-shared-target-2".to_string()
+            ]
+        );
+
         let mut transient_object = file.clone();
         transient_object.object_id = DfsObjectId::from_legacy_named("obj_sharded_transient_intent")
             .expect("transient object id");
@@ -10843,6 +11108,21 @@ mod tests {
         backend
             .put_intent_for_object(Some(&transient_object), &transient_intent)
             .expect("transient intent");
+        assert_eq!(
+            backend
+                .intents_for_object_version_page(
+                    &transient_object.object_id,
+                    &transient_intent.target_version,
+                    None,
+                    1,
+                )
+                .expect("transient target intent page")
+                .intents
+                .into_iter()
+                .map(|intent| intent.intent_id)
+                .collect::<Vec<_>>(),
+            vec!["intent-transient-create"]
+        );
 
         let mut moved_object = object(version("version_1"));
         moved_object.object_id = DfsObjectId::from_legacy_named("obj_sharded_stale_intent_source")
@@ -10874,6 +11154,19 @@ mod tests {
         backend
             .put_object(&moved_target_object)
             .expect("move object to services");
+        assert!(
+            backend
+                .intents_for_object_version_page(
+                    &moved_object.object_id,
+                    &stale_source_intent.target_version,
+                    None,
+                    1,
+                )
+                .expect("stale source target intent page")
+                .intents
+                .is_empty(),
+            "target-version lookups should hide source-shard intents after the object index moves"
+        );
 
         let mut scan_cursor = None;
         let mut visible_scan_ids = BTreeSet::new();
@@ -12878,6 +13171,103 @@ mod tests {
                 .map(|intent| intent.intent_id)
                 .collect::<Vec<_>>(),
             scanned_intents
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_pages_intents_by_target_version_after_reopen() {
+        let root = temp_root("local_backend_pages_intents_by_target_version");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let file = object(version("version_0"));
+        backend.put_object(&file).expect("object");
+        for index in 0..6 {
+            let target_version = if index % 2 == 0 {
+                version("version_even")
+            } else {
+                version("version_odd")
+            };
+            let intent = DfsWriteIntentRecord {
+                intent_id: format!("intent-target-{index}"),
+                file_system_id: file.file_system_id.clone(),
+                object_id: file.object_id.clone(),
+                base_version: Some(version("version_0")),
+                target_version,
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner")],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                content_hash: Some(format!("blake3:intent-target-{index}")),
+                object_metadata: Some(file.clone()),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: None,
+            };
+            backend.put_intent(&intent).expect("intent");
+        }
+
+        let first_even_page = backend
+            .intents_for_object_version_page(&file.object_id, &version("version_even"), None, 2)
+            .expect("first even intent page");
+        assert_eq!(
+            first_even_page
+                .intents
+                .iter()
+                .map(|intent| intent.intent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["intent-target-0", "intent-target-2"]
+        );
+        assert!(first_even_page.next_cursor.is_some());
+        let second_even_page = backend
+            .intents_for_object_version_page(
+                &file.object_id,
+                &version("version_even"),
+                first_even_page.next_cursor.as_ref(),
+                2,
+            )
+            .expect("second even intent page");
+        assert_eq!(
+            second_even_page
+                .intents
+                .iter()
+                .map(|intent| intent.intent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["intent-target-4"]
+        );
+        assert!(second_even_page.next_cursor.is_none());
+
+        drop(backend);
+        let reopened =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("reopen");
+        let mut cursor = None;
+        let mut odd_intents = Vec::new();
+        loop {
+            let page = reopened
+                .intents_for_object_version_page(
+                    &file.object_id,
+                    &version("version_odd"),
+                    cursor.as_ref(),
+                    1,
+                )
+                .expect("odd intent page");
+            assert!(page.intents.len() <= 1);
+            odd_intents.extend(page.intents.into_iter().map(|intent| intent.intent_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            odd_intents,
+            vec![
+                "intent-target-1".to_string(),
+                "intent-target-3".to_string(),
+                "intent-target-5".to_string()
+            ]
         );
 
         cleanup(&root);

@@ -3218,17 +3218,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_ref() {
             let mut intent_cursor = None;
             loop {
-                let page = backend.intents_for_object_page(
+                let page = backend.intents_for_object_version_page(
                     object_id,
+                    version,
                     intent_cursor.as_ref(),
                     DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
                 )?;
-                intent_ids.extend(
-                    page.intents
-                        .into_iter()
-                        .filter(|intent| intent.target_version == *version)
-                        .map(|intent| intent.intent_id),
-                );
+                intent_ids.extend(page.intents.into_iter().map(|intent| intent.intent_id));
                 let Some(next_cursor) = page.next_cursor else {
                     break;
                 };
