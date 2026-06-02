@@ -3104,15 +3104,22 @@ pub fn sync_cluster_node_status_to_kv(
     let key = cluster_node_status_key(&status.node_id);
     let node_id = status.node_id.clone();
     let rollout = status.rollout.clone();
-    let snapshot = append_cluster_raft_command(
+    let rollout_key = cluster_rollout_node_key(&node_id);
+    let mut success = vec![KvOp::put_serde(key, &status, None)?];
+    if let Some(rollout) = rollout {
+        success.push(KvOp::put_serde(rollout_key, &rollout, None)?);
+    } else {
+        success.push(KvOp::Delete { key: rollout_key });
+    }
+    append_cluster_raft_command(
         paths,
         &state.local_node_id,
-        KvCommand::Op(KvOp::put_serde(key, &status, None)?),
-    )?;
-    if let Some(rollout) = rollout {
-        return sync_cluster_rollout_node_to_kv(paths, &rollout, &node_id);
-    }
-    Ok(snapshot)
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success,
+            failure: Vec::new(),
+        }),
+    )
 }
 
 pub fn sync_cluster_network_info_to_kv(

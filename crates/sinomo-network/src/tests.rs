@@ -3120,6 +3120,9 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
         observed_at: now,
     };
+    let mut clean_status = status.clone();
+    clean_status.rollout = None;
+
     sync_cluster_node_status_to_kv(&paths, status).expect("sync status");
     let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
     assert_eq!(statuses.len(), 1);
@@ -3129,6 +3132,16 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
             .expect("cluster kv store")
             .get(&cluster_rollout_node_key(&state.local_node_id))
             .is_some()
+    );
+    sync_cluster_node_status_to_kv(&paths, clean_status).expect("clear rollout status");
+    let statuses = read_cluster_node_statuses_from_kv(&paths).expect("clean statuses");
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].rollout, None);
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("cluster kv store")
+            .get(&cluster_rollout_node_key(&state.local_node_id))
+            .is_none()
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()

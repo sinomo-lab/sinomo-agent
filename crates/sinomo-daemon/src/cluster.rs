@@ -2708,6 +2708,10 @@ pub fn sync_cluster_node_status_to_kv(
             &rollout,
             None,
         )?);
+    } else {
+        success.push(KvOp::Delete {
+            key: sinomo_network::cluster_rollout_node_key(&status.node_id),
+        });
     }
     let result = commit_cluster_kv_txn_with_quorum(
         paths,

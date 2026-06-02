@@ -840,7 +840,7 @@ pub(crate) fn rollout_clear_status(options: RolloutOptions) -> Result<(), CliErr
         if let Some(status) = default_main_daemon_status()? {
             match daemon_send_daemon_rollout_clear_status(
                 &status.address,
-                CLUSTER_HEALTH_PROBE_TIMEOUT,
+                DAEMON_CLUSTER_KV_TXN_TIMEOUT,
             )
             .map_err(CliError::from)
             {
@@ -863,7 +863,7 @@ pub(crate) fn rollout_clear_status(options: RolloutOptions) -> Result<(), CliErr
     }
 
     for target in unique_rollout_targets(options.targets) {
-        match daemon_send_daemon_rollout_clear_status(&target, CLUSTER_HEALTH_PROBE_TIMEOUT)
+        match daemon_send_daemon_rollout_clear_status(&target, DAEMON_CLUSTER_KV_TXN_TIMEOUT)
             .map_err(CliError::from)
         {
             Ok(response) => print!("{target}: {response}"),
