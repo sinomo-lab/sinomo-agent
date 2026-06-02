@@ -23,6 +23,7 @@ use sinomo_network::{
 };
 use sinomo_node::NodeId;
 use std::fs;
+use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1299,6 +1300,201 @@ fn networked_dfs_transfers_large_writes_in_chunks() {
         .expect("replica object");
     assert_eq!(read.version, version_2);
     assert_eq!(read.bytes, bytes);
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_streams_large_writes_from_reader() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_large_reader").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_large_reader_write");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "large-reader.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica filesystem");
+    owner_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("owner object");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
+
+    let byte_count = 150_000;
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner,
+            },
+            PatternReader::new(byte_count),
+            vec![owner_dfs.node_id().clone(), replica.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("large reader write");
+    assert!(matches!(write, NetworkedDfsWriteOutcome::Pending { .. }));
+
+    let replica_events = replica_dfs.process_incoming().expect("replica chunks");
+    assert!(replica_events.iter().any(|event| {
+        matches!(event, NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id)
+    }));
+    owner_dfs.process_incoming().expect("owner ack");
+    replica_dfs.process_incoming().expect("replica commit");
+
+    let read = replica_dfs
+        .read_local_object(&object_id)
+        .expect("read replica")
+        .expect("replica object");
+    assert_eq!(read.version, version_2);
+    assert_eq!(read.bytes, pattern_bytes(byte_count));
+
+    cleanup(&root);
+}
+
+#[test]
+fn networked_dfs_reader_write_resumes_stage_windows() {
+    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_replica").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_large_reader_window").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let root = temp_root("networked_large_reader_write_window");
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner")).expect("owner store"),
+    );
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("replica")).expect("replica store"),
+    );
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "repo".to_string(),
+        owner_node_id: owner.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let metadata = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "large-reader-window.bin".to_string(),
+        kind: DfsObjectKind::Artifact,
+        owner_node_id: owner.clone(),
+        current_locations: vec![owner.clone()],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    owner_dfs
+        .add_file_system(file_system.clone())
+        .expect("owner filesystem");
+    replica_dfs
+        .add_file_system(file_system)
+        .expect("replica filesystem");
+    owner_dfs
+        .add_object_metadata(metadata.clone())
+        .expect("owner object");
+    replica_dfs
+        .add_object_metadata(metadata)
+        .expect("replica object");
+
+    let byte_count = 65 * 64 * 1024 + 17;
+    let write = owner_dfs
+        .write_distributed_eventual_from_reader(
+            DfsWriteRequest {
+                file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: owner,
+            },
+            PatternReader::new(byte_count),
+            vec![owner_dfs.node_id().clone(), replica.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("windowed reader write");
+    assert!(matches!(write, NetworkedDfsWriteOutcome::Pending { .. }));
+
+    let first_replica_events = replica_dfs.process_incoming().expect("first stage window");
+    assert!(
+        !first_replica_events.iter().any(|event| {
+            matches!(event, NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id)
+        }),
+        "the first stage window should not complete a transfer larger than the window"
+    );
+
+    owner_dfs
+        .retry_pending_repairs()
+        .expect("send next stage window");
+    let second_replica_events = replica_dfs.process_incoming().expect("second stage window");
+    assert!(second_replica_events.iter().any(|event| {
+        matches!(event, NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. } if staged == &object_id)
+    }));
+    owner_dfs.process_incoming().expect("owner ack");
+    replica_dfs.process_incoming().expect("replica commit");
+
+    let read = replica_dfs
+        .read_local_object(&object_id)
+        .expect("read replica")
+        .expect("replica object");
+    assert_eq!(read.version, version_2);
+    assert_eq!(read.bytes, pattern_bytes(byte_count));
 
     cleanup(&root);
 }
@@ -11443,6 +11639,39 @@ fn temp_root(name: &str) -> PathBuf {
 
 fn content_hash(bytes: &[u8]) -> String {
     format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+struct PatternReader {
+    remaining: usize,
+    index: usize,
+}
+
+impl PatternReader {
+    fn new(bytes: usize) -> Self {
+        Self {
+            remaining: bytes,
+            index: 0,
+        }
+    }
+}
+
+impl Read for PatternReader {
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let to_fill = buf.len().min(self.remaining);
+        for byte in &mut buf[..to_fill] {
+            *byte = (self.index % 251) as u8;
+            self.index = self.index.saturating_add(1);
+        }
+        self.remaining -= to_fill;
+        Ok(to_fill)
+    }
+}
+
+fn pattern_bytes(bytes: usize) -> Vec<u8> {
+    (0..bytes).map(|index| (index % 251) as u8).collect()
 }
 
 fn blob_path_for_hash(root: &Path, hash: &str) -> PathBuf {

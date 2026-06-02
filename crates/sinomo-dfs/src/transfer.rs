@@ -14,6 +14,7 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) stage_retries: BTreeMap<NodeId, RepairRetryState>,
     pub(crate) repair_retries: BTreeMap<NodeId, RepairRetryState>,
     pub(crate) stage_inflight_request_ids: BTreeMap<NodeId, String>,
+    pub(crate) stage_next_chunk_indexes: BTreeMap<NodeId, u32>,
     pub(crate) repair_inflight_request_ids: BTreeMap<NodeId, String>,
     pub(crate) fetch_inflight_from: BTreeSet<NodeId>,
     pub(crate) fetch_inflight_request_ids: BTreeMap<NodeId, String>,

@@ -26,7 +26,7 @@ struct Args {
     file_bytes: usize,
     blob_bytes: u64,
     blob_range_bytes: usize,
-    network_blob_bytes: usize,
+    network_blob_bytes: u64,
     list_page_size: usize,
     keep: bool,
 }
@@ -87,7 +87,7 @@ impl Args {
         let mut blob_bytes = env_u64("SINOMO_DFS_BENCH_BLOB_BYTES", 64 * 1024 * 1024)?;
         let mut blob_range_bytes = env_usize("SINOMO_DFS_BENCH_BLOB_RANGE_BYTES", 1024 * 1024)?;
         let mut network_blob_bytes =
-            env_usize("SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES", 8 * 1024 * 1024)?;
+            env_u64("SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES", 8 * 1024 * 1024)?;
         let mut list_page_size = env_usize("SINOMO_DFS_BENCH_LIST_PAGE_SIZE", 1024)?;
         let mut keep = false;
 
@@ -100,7 +100,7 @@ impl Args {
                 "--file-bytes" => file_bytes = parse_usize(&arg, args.next())?,
                 "--blob-bytes" => blob_bytes = parse_u64(&arg, args.next())?,
                 "--blob-range-bytes" => blob_range_bytes = parse_usize(&arg, args.next())?,
-                "--network-blob-bytes" => network_blob_bytes = parse_usize(&arg, args.next())?,
+                "--network-blob-bytes" => network_blob_bytes = parse_u64(&arg, args.next())?,
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
                 "--keep" => keep = true,
                 "--bench" => {}
@@ -468,77 +468,99 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     owner_dfs.add_object_metadata(object.clone())?;
     replica_dfs.add_object_metadata(object)?;
 
-    let bytes = vec![0x5a; args.network_blob_bytes];
+    let replica_object_id = object_id.clone();
+    let replica_worker = std::thread::spawn(move || -> BenchResult<ReplicaWorkerReport> {
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let mut report = ReplicaWorkerReport::default();
+        loop {
+            let events = replica_dfs.process_incoming()?;
+            report.process_loops = report.process_loops.saturating_add(1);
+            report.event_count = report.event_count.saturating_add(events.len());
+            report.staged |= events.iter().any(|event| {
+                matches!(
+                    event,
+                    NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. }
+                        if staged == &replica_object_id
+                )
+            });
+            report.committed |= events.iter().any(|event| {
+                matches!(
+                    event,
+                    NetworkedDfsServiceEvent::VersionCommitted { object_id: committed, .. }
+                        if committed == &replica_object_id
+                )
+            });
+            if report.committed {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("replica did not observe network blob commit before timeout".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(report)
+    });
+
     let write_start = Instant::now();
-    let write = owner_dfs.write_distributed_eventual(
+    let write = owner_dfs.write_distributed_eventual_from_reader(
         DfsWriteRequest {
             file_system_id,
             object_id: object_id.clone(),
             target_version: target_version.clone(),
             requesting_node_id: owner.clone(),
         },
-        bytes,
+        RepeatingReader::new(args.network_blob_bytes),
         vec![owner.clone(), replica.clone()],
         DfsReplicationPolicy::new(2, 2)?,
     )?;
 
-    let mut owner_events = Vec::new();
-    let mut replica_events = Vec::new();
-    for _ in 0..8 {
-        replica_events.extend(replica_dfs.process_incoming()?);
-        owner_events.extend(owner_dfs.process_incoming()?);
-        replica_events.extend(replica_dfs.process_incoming()?);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let mut owner_event_count = 0usize;
+    let owner_committed = loop {
+        owner_dfs.retry_pending_repairs()?;
+        owner_event_count = owner_event_count.saturating_add(owner_dfs.process_incoming()?.len());
         let owner_committed = owner_dfs
             .metadata()
             .object(&object_id)
             .is_some_and(|object| object.version == target_version);
-        let replica_committed = replica_events.iter().any(|event| {
-            matches!(
-                event,
-                NetworkedDfsServiceEvent::VersionCommitted { object_id: committed, .. }
-                    if committed == &object_id
-            )
-        });
-        if owner_committed && replica_committed {
-            break;
+        if owner_committed {
+            break true;
         }
-    }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
     let write_elapsed = write_start.elapsed();
-    let owner_committed = owner_dfs
-        .metadata()
-        .object(&object_id)
-        .is_some_and(|object| object.version == target_version);
-    let replica_staged = replica_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::BlobStaged { object_id: staged, .. }
-                if staged == &object_id
-        )
-    });
-    let replica_committed = replica_events.iter().any(|event| {
-        matches!(
-            event,
-            NetworkedDfsServiceEvent::VersionCommitted { object_id: committed, .. }
-                if committed == &object_id
-        )
-    });
+    let replica_report = replica_worker
+        .join()
+        .map_err(|_| "replica network blob worker panicked")??;
 
     emit(
         "network_blob_replicated_write",
         write_elapsed,
         json!({
             "bytes": args.network_blob_bytes,
-            "mib_per_second": mib_per_second(args.network_blob_bytes as u64, write_elapsed),
+            "mib_per_second": mib_per_second(args.network_blob_bytes, write_elapsed),
             "initial_outcome": format!("{write:?}"),
-            "owner_events": owner_events.len(),
-            "replica_events": replica_events.len(),
-            "replica_staged": replica_staged,
+            "owner_events": owner_event_count,
+            "replica_events": replica_report.event_count,
+            "replica_process_loops": replica_report.process_loops,
+            "replica_staged": replica_report.staged,
             "owner_committed": owner_committed,
-            "replica_committed": replica_committed,
+            "replica_committed": replica_report.committed,
         }),
     );
 
     Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct ReplicaWorkerReport {
+    event_count: usize,
+    process_loops: usize,
+    staged: bool,
+    committed: bool,
 }
 
 fn file_metadata(

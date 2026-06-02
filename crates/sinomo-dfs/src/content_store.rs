@@ -373,6 +373,7 @@ pub struct ObjectVersionReader {
 #[derive(Debug)]
 enum ObjectVersionReaderInner {
     Blob(BlobReader),
+    Range(BlobRangeReader),
     Extents(ExtentReader),
 }
 
@@ -387,12 +388,21 @@ impl ObjectVersionReader {
             inner: ObjectVersionReaderInner::Blob(reader),
         }
     }
+
+    pub fn from_blob_range(reader: BlobRangeReader) -> Self {
+        let size_bytes = reader.remaining_bytes();
+        Self {
+            size_bytes,
+            inner: ObjectVersionReaderInner::Range(reader),
+        }
+    }
 }
 
 impl Read for ObjectVersionReader {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
             ObjectVersionReaderInner::Blob(reader) => reader.read(buffer),
+            ObjectVersionReaderInner::Range(reader) => reader.read(buffer),
             ObjectVersionReaderInner::Extents(reader) => reader.read(buffer),
         }
     }
@@ -933,6 +943,67 @@ impl LocalContentStore {
             inner: ObjectVersionReaderInner::Extents(ExtentReader {
                 store: self.clone(),
                 extents,
+                next_extent_index: 0,
+                current: None,
+            }),
+        };
+        Ok((manifest, reader))
+    }
+
+    pub fn open_object_version_range_stream(
+        &self,
+        object_id: &str,
+        version: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(ContentManifest, ObjectVersionReader)> {
+        let manifest = self.read_manifest(object_id, version)?;
+        let start = offset.min(manifest.size_bytes);
+        let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+        let end = start.saturating_add(max_bytes_u64).min(manifest.size_bytes);
+        if manifest.extents.is_empty() {
+            let reader = self.open_blob_range_stream(&manifest.content_hash, start, max_bytes)?;
+            return Ok((manifest, ObjectVersionReader::from_blob_range(reader)));
+        }
+
+        let mut range_extents = Vec::new();
+        for extent in self.logical_extents_for_manifest(&manifest)? {
+            let extent_end = extent
+                .logical_offset
+                .checked_add(extent.size_bytes)
+                .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                    message: format!(
+                        "extent range overflows object size: object={}, version={}",
+                        manifest.object_id, manifest.version
+                    ),
+                })?;
+            let range_start = start.max(extent.logical_offset);
+            let range_end = end.min(extent_end);
+            if range_start >= range_end {
+                continue;
+            }
+            let extent_delta = range_start - extent.logical_offset;
+            range_extents.push(ContentExtent {
+                logical_offset: range_start - start,
+                size_bytes: range_end - range_start,
+                content_hash: extent.content_hash,
+                blob_offset: extent
+                    .blob_offset
+                    .checked_add(extent_delta)
+                    .ok_or_else(|| ContentStoreError::InvalidChunkedContent {
+                        message: format!(
+                            "extent blob offset overflows: object={}, version={}",
+                            manifest.object_id, manifest.version
+                        ),
+                    })?,
+            });
+        }
+        self.ensure_extents_readable(&range_extents)?;
+        let reader = ObjectVersionReader {
+            size_bytes: end.saturating_sub(start),
+            inner: ObjectVersionReaderInner::Extents(ExtentReader {
+                store: self.clone(),
+                extents: range_extents,
                 next_extent_index: 0,
                 current: None,
             }),
