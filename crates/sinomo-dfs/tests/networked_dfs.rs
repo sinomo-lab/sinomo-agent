@@ -10781,6 +10781,76 @@ fn posix_write_file_from_reader_streams_content() {
 }
 
 #[test]
+fn posix_open_file_stream_reads_file_and_range_incrementally() {
+    let owner = NodeId::from_legacy_named("node_posix_stream_reader_owner").expect("node");
+    let root = temp_root("posix_open_file_stream_reader");
+    let network = InProcessNetwork::new();
+    let backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
+
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services/web").expect("mkdir service");
+    let bytes = 256 * 1024 + 31;
+    let stat = dfs
+        .posix_write_file_from_reader(
+            "/services/web/stream-read.bin",
+            PatternReader::new(bytes),
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("streaming POSIX write");
+
+    let mut stream = dfs
+        .posix_open_file_stream("/services/web/stream-read.bin")
+        .expect("open file stream");
+    assert_eq!(stream.object_id, stat.object_id);
+    assert_eq!(stream.version, stat.version);
+    assert_eq!(stream.content_hash, stat.content_hash);
+    assert_eq!(stream.size_bytes, bytes as u64);
+    let mut streamed = Vec::new();
+    let mut buffer = [0_u8; 4093];
+    loop {
+        let read = stream.reader.read(&mut buffer).expect("read stream");
+        if read == 0 {
+            break;
+        }
+        streamed.extend_from_slice(&buffer[..read]);
+    }
+    assert_eq!(streamed, pattern_bytes(bytes));
+
+    let offset = 4097_u64;
+    let range_len = 8192 + 13;
+    let mut range_stream = dfs
+        .posix_open_file_range_stream("/services/web/stream-read.bin", offset, range_len)
+        .expect("open range stream");
+    assert_eq!(range_stream.object_id, stat.object_id);
+    assert_eq!(range_stream.version, stat.version);
+    assert_eq!(range_stream.content_hash, stat.content_hash);
+    assert_eq!(range_stream.offset, offset);
+    assert_eq!(range_stream.total_size_bytes, bytes as u64);
+    assert_eq!(range_stream.range_size_bytes, range_len as u64);
+    let mut streamed_range = Vec::new();
+    range_stream
+        .reader
+        .read_to_end(&mut streamed_range)
+        .expect("read range stream");
+    let expected = pattern_bytes(bytes);
+    let range_start = offset as usize;
+    assert_eq!(
+        streamed_range,
+        expected[range_start..range_start + range_len].to_vec()
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn posix_self_only_create_publishes_object_and_version_without_namespace_transaction() {
     let owner = NodeId::from_legacy_named("node_posix_create_grouped_owner").expect("node");
     let root = temp_root("posix_create_grouped_metadata");

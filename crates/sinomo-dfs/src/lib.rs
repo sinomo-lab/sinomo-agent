@@ -69,7 +69,7 @@ pub use operator::{
 };
 pub use posix::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
-    DfsPosixError, DfsStat, DfsWriteOptions,
+    DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, DfsWriteOptions,
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsCommitVersionCommand, DfsCommitVersionResponse,

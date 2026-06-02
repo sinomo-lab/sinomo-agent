@@ -11,8 +11,9 @@ use crate::{
     DfsControlPlaneStore, DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem,
     DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
     DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsReadData, DfsReadRangeData,
-    DfsReplicationPolicy, NetworkedDfsRangeReadOutcome, NetworkedDfsReadOutcome,
-    NetworkedDfsService, NetworkedDfsWriteOutcome, sifs_file_system_id,
+    DfsReplicationPolicy, NetworkedDfsRangeReadOutcome, NetworkedDfsRangeReadStreamOutcome,
+    NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome, NetworkedDfsService,
+    NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
@@ -99,6 +100,26 @@ pub struct DfsDirEntry {
 pub struct DfsDirEntryPage {
     pub entries: Vec<DfsDirEntry>,
     pub next_cursor: Option<DfsDirectoryPageCursor>,
+}
+
+#[derive(Debug)]
+pub struct DfsPosixFileReadStream {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: Option<String>,
+    pub size_bytes: u64,
+    pub reader: ObjectVersionReader,
+}
+
+#[derive(Debug)]
+pub struct DfsPosixFileRangeReadStream {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: Option<String>,
+    pub offset: u64,
+    pub total_size_bytes: u64,
+    pub range_size_bytes: u64,
+    pub reader: ObjectVersionReader,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -871,6 +892,74 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
             | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
             NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+                Err(read_conflict_error(path, conflicts))
+            }
+        }
+    }
+
+    pub fn posix_open_file_stream(&self, path: &str) -> Result<DfsPosixFileReadStream> {
+        let path = self.resolve_existing_posix_path(path, true)?;
+        let object = self
+            .lookup_sifs_path(&path)?
+            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        let object = self.resolve_hardlink_target(&object)?;
+        if object.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory { path });
+        }
+        match self.open_local_current_object_stream_with_state(&object.object_id)? {
+            NetworkedDfsReadStreamOutcome::Found(stream) => Ok(DfsPosixFileReadStream {
+                object_id: stream.data.object_id,
+                version: stream.data.version,
+                content_hash: stream.data.content_hash,
+                size_bytes: stream.total_size_bytes,
+                reader: stream.reader,
+            }),
+            NetworkedDfsReadStreamOutcome::PendingReplication
+            | NetworkedDfsReadStreamOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsReadStreamOutcome::Conflicted { conflicts } => {
+                Err(read_conflict_error(path, conflicts))
+            }
+        }
+    }
+
+    pub fn posix_open_file_range_stream(
+        &self,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<DfsPosixFileRangeReadStream> {
+        let path = self.resolve_existing_posix_path(path, true)?;
+        let object = self
+            .lookup_sifs_path(&path)?
+            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        if object.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path });
+        }
+        let object = self.resolve_hardlink_target(&object)?;
+        if object.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory { path });
+        }
+        match self.open_local_current_object_range_stream_with_state(
+            &object.object_id,
+            offset,
+            max_bytes,
+            0,
+        )? {
+            NetworkedDfsRangeReadStreamOutcome::Found(stream) => Ok(DfsPosixFileRangeReadStream {
+                object_id: stream.data.object_id,
+                version: stream.data.version,
+                content_hash: stream.data.content_hash,
+                offset: stream.data.offset,
+                total_size_bytes: stream.data.total_size_bytes,
+                range_size_bytes: stream.range_size_bytes,
+                reader: stream.reader,
+            }),
+            NetworkedDfsRangeReadStreamOutcome::PendingReplication
+            | NetworkedDfsRangeReadStreamOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsRangeReadStreamOutcome::Conflicted { conflicts } => {
                 Err(read_conflict_error(path, conflicts))
             }
         }
