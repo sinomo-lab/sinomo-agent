@@ -2,8 +2,9 @@ use serde_json::json;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, DfsWriteOptions, LocalContentStore,
-    LocalJsonMetadataBackend, NetworkedDfsService, NetworkedDfsServiceEvent,
+    DfsObjectMetadata, DfsReadResult, DfsReplicationPolicy, DfsVersion, DfsWriteOptions,
+    LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsRangeReadOutcome, NetworkedDfsService,
+    NetworkedDfsServiceEvent,
 };
 use sinomo_network::InProcessNetwork;
 use sinomo_node::NodeId;
@@ -12,7 +13,7 @@ use std::fs;
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -30,6 +31,7 @@ struct Args {
     network_blob_bytes: u64,
     list_page_size: usize,
     metadata_batch_size: usize,
+    network_timeout_secs: u64,
     keep: bool,
 }
 
@@ -60,6 +62,7 @@ struct BenchDefaults {
     network_blob_bytes: u64,
     list_page_size: usize,
     metadata_batch_size: usize,
+    network_timeout_secs: u64,
 }
 
 impl Scenario {
@@ -119,6 +122,7 @@ impl Preset {
                 network_blob_bytes: 8 * 1024 * 1024,
                 list_page_size: 1024,
                 metadata_batch_size: 1024,
+                network_timeout_secs: 60,
             },
             Self::Scale => BenchDefaults {
                 files: 100_000,
@@ -129,6 +133,7 @@ impl Preset {
                 network_blob_bytes: 512 * 1024 * 1024,
                 list_page_size: 4096,
                 metadata_batch_size: 4096,
+                network_timeout_secs: 300,
             },
             Self::Production => BenchDefaults {
                 files: 1_000_000,
@@ -139,6 +144,7 @@ impl Preset {
                 network_blob_bytes: 4 * 1024 * 1024 * 1024,
                 list_page_size: 4096,
                 metadata_batch_size: 4096,
+                network_timeout_secs: 1800,
             },
         }
     }
@@ -201,6 +207,10 @@ impl Args {
             "SINOMO_DFS_BENCH_METADATA_BATCH_SIZE",
             defaults.metadata_batch_size,
         )?;
+        let mut network_timeout_secs = env_u64(
+            "SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS",
+            defaults.network_timeout_secs,
+        )?;
         let mut keep = false;
 
         while let Some(arg) = args.next() {
@@ -217,6 +227,7 @@ impl Args {
                     network_blob_bytes = defaults.network_blob_bytes;
                     list_page_size = defaults.list_page_size;
                     metadata_batch_size = defaults.metadata_batch_size;
+                    network_timeout_secs = defaults.network_timeout_secs;
                 }
                 "--root" => root = Some(PathBuf::from(required_value(&arg, args.next())?)),
                 "--files" => files = parse_usize(&arg, args.next())?,
@@ -230,6 +241,7 @@ impl Args {
                 "--network-blob-bytes" => network_blob_bytes = parse_byte_count(&arg, args.next())?,
                 "--list-page-size" => list_page_size = parse_usize(&arg, args.next())?,
                 "--metadata-batch-size" => metadata_batch_size = parse_usize(&arg, args.next())?,
+                "--network-timeout-secs" => network_timeout_secs = parse_u64(&arg, args.next())?,
                 "--keep" => keep = true,
                 "--bench" => {}
                 "--help" | "-h" => {
@@ -248,6 +260,9 @@ impl Args {
         }
         if metadata_batch_size == 0 {
             return Err("--metadata-batch-size must be greater than zero".into());
+        }
+        if network_timeout_secs == 0 {
+            return Err("--network-timeout-secs must be greater than zero".into());
         }
 
         let (root, explicit_root) = match root {
@@ -268,6 +283,7 @@ impl Args {
             network_blob_bytes,
             list_page_size,
             metadata_batch_size,
+            network_timeout_secs,
             keep,
         })
     }
@@ -293,6 +309,7 @@ impl Args {
                 "network_blob_bytes": self.network_blob_bytes,
                 "list_page_size": self.list_page_size,
                 "metadata_batch_size": self.metadata_batch_size,
+                "network_timeout_secs": self.network_timeout_secs,
                 "keep": self.keep,
             }),
         );
@@ -712,6 +729,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
 
     let owner = node("node_dfs_bench_net_owner");
     let replica = node("node_dfs_bench_net_replica");
+    let reader = node("node_dfs_bench_net_reader");
     let network = InProcessNetwork::new();
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -759,9 +777,10 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
     owner_dfs.add_object_metadata(object.clone())?;
     replica_dfs.add_object_metadata(object)?;
 
+    let network_timeout = Duration::from_secs(args.network_timeout_secs);
     let replica_object_id = object_id.clone();
     let replica_worker = std::thread::spawn(move || -> BenchResult<ReplicaWorkerReport> {
-        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = Instant::now() + network_timeout;
         let mut report = ReplicaWorkerReport::default();
         loop {
             let events = replica_dfs.process_incoming()?;
@@ -787,7 +806,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             if Instant::now() >= deadline {
                 return Err("replica did not observe network blob commit before timeout".into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1));
         }
         Ok(report)
     });
@@ -805,7 +824,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         DfsReplicationPolicy::new(2, 2)?,
     )?;
 
-    let deadline = Instant::now() + std::time::Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
     let mut owner_event_count = 0usize;
     let owner_committed = loop {
         owner_dfs.retry_pending_repairs()?;
@@ -820,7 +839,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         if Instant::now() >= deadline {
             break false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(1));
     };
     let write_elapsed = write_start.elapsed();
     let replica_report = replica_worker
@@ -840,6 +859,111 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
             "replica_staged": replica_report.staged,
             "owner_committed": owner_committed,
             "replica_committed": replica_report.committed,
+        }),
+    );
+
+    if !owner_committed {
+        return Err("owner did not observe network blob commit before timeout".into());
+    }
+
+    let mut reader_dfs = NetworkedDfsService::new(
+        network.add_node(reader.clone()),
+        LocalContentStore::new(root.join("reader-content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        root.join("reader-metadata"),
+    )?)?;
+    reader_dfs.add_file_system(DfsFileSystem::sifs(owner.clone()))?;
+    let mut reader_object = owner_dfs
+        .metadata()
+        .object(&object_id)
+        .ok_or("owner metadata missing committed network blob object")?
+        .clone();
+    reader_object.current_locations = vec![owner.clone()];
+    let expected_content_hash = reader_object.content_hash.clone();
+    reader_dfs.add_object_metadata(reader_object)?;
+
+    let read_start = Instant::now();
+    let requested_sources = reader_dfs.request_remote_object_read(&object_id)?;
+    if requested_sources.is_empty() {
+        return Err("remote read benchmark could not route initial read request".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(args.network_timeout_secs);
+    let mut owner_read_events = 0usize;
+    let mut reader_read_events = 0usize;
+    let mut read_process_loops = 0usize;
+    loop {
+        let owner_events = owner_dfs.process_incoming()?;
+        let reader_events = reader_dfs.process_incoming()?;
+        owner_read_events = owner_read_events.saturating_add(owner_events.len());
+        reader_read_events = reader_read_events.saturating_add(reader_events.len());
+        read_process_loops = read_process_loops.saturating_add(1);
+        let mut completed = false;
+        for event in &reader_events {
+            if let NetworkedDfsServiceEvent::RemoteReadCompleted {
+                object_id: completed_object_id,
+                result,
+                ..
+            } = event
+                && completed_object_id == &object_id
+            {
+                match result {
+                    DfsReadResult::Found(data) if data.content_hash == expected_content_hash => {
+                        completed = true;
+                    }
+                    DfsReadResult::Found(data) => {
+                        return Err(format!(
+                            "remote read completed with unexpected content hash {:?}, expected {:?}",
+                            data.content_hash, expected_content_hash
+                        )
+                        .into());
+                    }
+                    other => {
+                        return Err(format!(
+                            "remote read benchmark completed without object bytes: {other:?}"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        if completed {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err("remote read benchmark did not complete before timeout".into());
+        }
+        if owner_events.is_empty() && reader_events.is_empty() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let read_elapsed = read_start.elapsed();
+    let verify_bytes = byte_count_to_usize(
+        "network read verification bytes",
+        args.network_blob_bytes.min(args.blob_range_bytes as u64),
+    )?;
+    let cached_range =
+        match reader_dfs.read_local_object_range_with_state(&object_id, 0, verify_bytes, false)? {
+            NetworkedDfsRangeReadOutcome::Found { data, .. } => data.bytes.len(),
+            other => {
+                return Err(format!(
+                    "remote read benchmark did not cache a readable object range: {other:?}"
+                )
+                .into());
+            }
+        };
+    emit(
+        "network_blob_remote_read",
+        read_elapsed,
+        json!({
+            "bytes": args.network_blob_bytes,
+            "mib_per_second": mib_per_second(args.network_blob_bytes, read_elapsed),
+            "initial_sources": requested_sources,
+            "owner_events": owner_read_events,
+            "reader_events": reader_read_events,
+            "reader_process_loops": read_process_loops,
+            "verification_range_bytes": cached_range,
         }),
     );
 
@@ -952,12 +1076,29 @@ fn env_usize(name: &str, default: usize) -> BenchResult<usize> {
     }
 }
 
+fn env_u64(name: &str, default: u64) -> BenchResult<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map_err(|error| format!("{name}={value:?} is not a u64: {error}").into()),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("could not read {name}: {error}").into()),
+    }
+}
+
 fn env_bytes(name: &str, default: u64) -> BenchResult<u64> {
     match env::var(name) {
         Ok(value) => parse_byte_count_value(name, &value),
         Err(env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(format!("could not read {name}: {error}").into()),
     }
+}
+
+fn parse_u64(flag: &str, value: Option<String>) -> BenchResult<u64> {
+    let value = required_value(flag, value)?;
+    value
+        .parse::<u64>()
+        .map_err(|error| format!("{flag} value {value:?} is not a u64: {error}").into())
 }
 
 fn parse_usize(flag: &str, value: Option<String>) -> BenchResult<usize> {
@@ -1034,6 +1175,7 @@ fn print_help() {
            --network-blob-bytes BYTES\n\
            --list-page-size COUNT\n\
            --metadata-batch-size COUNT\n\
+           --network-timeout-secs SECONDS\n\
            --keep\n\
          \n\
          Environment defaults:\n\
@@ -1043,12 +1185,13 @@ fn print_help() {
            SINOMO_DFS_BENCH_BLOB_RANGE_BYTES,\n\
            SINOMO_DFS_BENCH_NETWORK_BLOB_BYTES,\n\
            SINOMO_DFS_BENCH_LIST_PAGE_SIZE,\n\
-           SINOMO_DFS_BENCH_METADATA_BATCH_SIZE\n\
+           SINOMO_DFS_BENCH_METADATA_BATCH_SIZE,\n\
+           SINOMO_DFS_BENCH_NETWORK_TIMEOUT_SECS\n\
          \n\
          Presets:\n\
-           smoke: 10k files, 64 MiB local blob, 8 MiB network blob\n\
-           scale: 100k files, 1 GiB local blob, 512 MiB network blob\n\
-           production: 1M files, 4 GiB local blob, 4 GiB network blob\n\
+           smoke: 10k files, 64 MiB local blob, 8 MiB network blob, 60s network timeout\n\
+           scale: 100k files, 1 GiB local blob, 512 MiB network blob, 300s network timeout\n\
+           production: 1M files, 4 GiB local blob, 4 GiB network blob, 1800s network timeout\n\
          \n\
          Byte flags accept B, KB, MB, GB, TB, KiB, MiB, GiB, and TiB suffixes."
     );
