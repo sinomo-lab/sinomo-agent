@@ -21,6 +21,7 @@ pub(crate) struct PendingNetworkedWrite {
     pub(crate) fetch_inflight_from: BTreeSet<NodeId>,
     pub(crate) fetch_inflight_request_ids: BTreeMap<NodeId, String>,
     pub(crate) fetch_inflight_started_ticks: BTreeMap<NodeId, u64>,
+    pub(crate) fetch_next_chunk_indexes: BTreeMap<NodeId, u32>,
     pub(crate) fetch_failed_from: BTreeSet<NodeId>,
 }
 
@@ -157,6 +158,10 @@ impl InProgressFetchBlobTransfer {
         self.assembler
             .insert_chunk(chunk_index, &bytes)
             .map_err(DfsError::from)
+    }
+
+    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+        self.assembler.contiguous_received_chunk_count()
     }
 }
 

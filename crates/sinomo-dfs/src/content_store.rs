@@ -539,6 +539,15 @@ impl ChunkedBlobAssembler {
         self.received_count == self.total_chunks
     }
 
+    pub fn contiguous_received_chunk_count(&self) -> u32 {
+        self.received_chunks
+            .iter()
+            .take_while(|received| **received)
+            .count()
+            .try_into()
+            .expect("chunk count fits in u32")
+    }
+
     pub fn total_size_bytes(&self) -> u64 {
         self.total_size_bytes
     }

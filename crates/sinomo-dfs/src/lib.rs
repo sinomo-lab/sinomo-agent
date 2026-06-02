@@ -5609,6 +5609,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 pending.fetch_inflight_from.remove(&source);
                 pending.fetch_inflight_request_ids.remove(&source);
                 pending.fetch_inflight_started_ticks.remove(&source);
+                pending.fetch_next_chunk_indexes.remove(&source);
                 pending.fetch_failed_from.insert(source);
             }
             if has_expired_source {
@@ -7788,10 +7789,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     if stream_manifest.content_hash == command.content_hash
                         && stream_manifest.size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 =>
                 {
+                    let reader = if command.start_chunk_index == 0 {
+                        reader
+                    } else {
+                        self.open_fetch_response_chunk_reader(&stream_manifest, &command)?
+                    };
                     self.send_fetch_blob_response_chunks_from_reader(
                         &requester_node_id,
                         &command,
                         reader,
+                        stream_manifest.size_bytes,
                     )?;
                     sent_chunked_response = true;
                     DfsFetchBlobResult::Found {
@@ -7802,18 +7809,39 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 Ok((stream_manifest, mut reader))
                     if stream_manifest.content_hash == command.content_hash =>
                 {
-                    match read_small_blob_from_reader(
-                        &command.content_hash,
-                        stream_manifest.size_bytes,
-                        &mut reader,
-                    ) {
-                        Ok(bytes) => DfsFetchBlobResult::Found {
-                            content_hash: command.content_hash.clone(),
-                            bytes,
-                        },
-                        Err(error) => DfsFetchBlobResult::Rejected {
-                            reason: error.to_string(),
-                        },
+                    if command.start_chunk_index > 0 {
+                        match self.open_fetch_response_chunk_reader(&stream_manifest, &command) {
+                            Ok(reader) => {
+                                self.send_fetch_blob_response_chunks_from_reader(
+                                    &requester_node_id,
+                                    &command,
+                                    reader,
+                                    stream_manifest.size_bytes,
+                                )?;
+                                sent_chunked_response = true;
+                                DfsFetchBlobResult::Found {
+                                    content_hash: command.content_hash.clone(),
+                                    bytes: Vec::new(),
+                                }
+                            }
+                            Err(error) => DfsFetchBlobResult::Rejected {
+                                reason: error.to_string(),
+                            },
+                        }
+                    } else {
+                        match read_small_blob_from_reader(
+                            &command.content_hash,
+                            stream_manifest.size_bytes,
+                            &mut reader,
+                        ) {
+                            Ok(bytes) => DfsFetchBlobResult::Found {
+                                content_hash: command.content_hash.clone(),
+                                bytes,
+                            },
+                            Err(error) => DfsFetchBlobResult::Rejected {
+                                reason: error.to_string(),
+                            },
+                        }
                     }
                 }
                 Ok((stream_manifest, _)) => DfsFetchBlobResult::Rejected {
@@ -7880,7 +7908,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         bytes: &[u8],
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count(bytes)?;
-        for (chunk_index, chunk) in bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
+        for (chunk_index, chunk) in bytes
+            .chunks(DFS_BLOB_CHUNK_BYTES)
+            .enumerate()
+            .skip(command.start_chunk_index as usize)
+        {
             let sent = self.send_dfs_message_if_routable(
                 requester_node_id,
                 DfsNetworkMessage::FetchBlobResponseChunk(DfsFetchBlobResponseChunk {
@@ -7909,11 +7941,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         requester_node_id: &NodeId,
         command: &DfsFetchBlobCommand,
         mut reader: ObjectVersionReader,
+        total_size_bytes: u64,
     ) -> Result<(), DfsError> {
-        let total_size_bytes = reader.size_bytes();
         let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
         let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in 0..total_chunks {
+        for chunk_index in command.start_chunk_index..total_chunks {
             let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
             let chunk_len = (total_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
             let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
@@ -7948,6 +7980,51 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         }
         Ok(())
+    }
+
+    fn open_fetch_response_chunk_reader(
+        &self,
+        manifest: &ContentManifest,
+        command: &DfsFetchBlobCommand,
+    ) -> Result<ObjectVersionReader, DfsError> {
+        let total_chunks = blob_chunk_count_for_size(manifest.size_bytes)?;
+        if command.start_chunk_index >= total_chunks {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "DFS fetch resume chunk {} is outside total chunks {} for {} {}",
+                    command.start_chunk_index, total_chunks, command.object_id, command.version
+                ),
+            });
+        }
+        let start_offset = u64::from(command.start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+        let remaining_bytes = manifest.size_bytes.saturating_sub(start_offset);
+        let remaining_bytes = usize::try_from(remaining_bytes).map_err(|_| {
+            DfsError::Distributed {
+                message: format!(
+                    "DFS fetch response range is too large to fit in memory window: {remaining_bytes} bytes"
+                ),
+            }
+        })?;
+        let (range_manifest, reader) = self
+            .content
+            .open_object_version_range_stream(
+                command.object_id.as_str(),
+                command.version.as_str(),
+                start_offset,
+                remaining_bytes,
+            )
+            .map_err(DfsError::from)?;
+        if range_manifest.content_hash != command.content_hash
+            || range_manifest.size_bytes != manifest.size_bytes
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "object manifest changed while opening fetch resume range for {} {}",
+                    command.object_id, command.version
+                ),
+            });
+        }
+        Ok(reader)
     }
 
     fn handle_fetch_blob_response(
@@ -8311,12 +8388,20 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             match transfer.insert_chunk(chunk.chunk_index, chunk.total_chunks, chunk.bytes.clone())
             {
                 Ok(true) => true,
-                Ok(false) => return Ok(None),
+                Ok(false) => false,
                 Err(error) => {
                     return self
                         .reject_fetch_response_chunk_and_fail_source(chunk, error.to_string());
                 }
             };
+        let next_chunk_index = transfer.contiguous_received_chunk_count();
+        if let Some(pending) = self.pending_writes.get_mut(&intent_id) {
+            let entry = pending
+                .fetch_next_chunk_indexes
+                .entry(source_node_id.clone())
+                .or_insert(0);
+            *entry = (*entry).max(next_chunk_index);
+        }
         if !transfer_complete {
             return Ok(None);
         }
@@ -8328,6 +8413,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending.fetch_inflight_from.remove(&source_node_id);
             pending.fetch_inflight_request_ids.remove(&source_node_id);
             pending.fetch_inflight_started_ticks.remove(&source_node_id);
+            pending.fetch_next_chunk_indexes.remove(&source_node_id);
         }
         if let Some(local_size_bytes) =
             self.local_object_version_manifest_size_if_matches(&object_id, &version, &content_hash)
@@ -8491,6 +8577,20 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     }
 
     fn wake_pending_retries_after_fetch_success(&mut self, intent_id: &str) {
+        let stale_request_ids = self
+            .pending_writes
+            .get(intent_id)
+            .map(|pending| {
+                pending
+                    .fetch_inflight_request_ids
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for request_id in stale_request_ids {
+            self.incoming_fetch_transfers.remove(&request_id);
+        }
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
             for state in pending.repair_retries.values_mut() {
                 state.next_retry_tick = 0;
@@ -8500,6 +8600,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 state.next_retry_tick = 0;
                 state.inflight = false;
             }
+            pending.fetch_inflight_from.clear();
+            pending.fetch_inflight_request_ids.clear();
+            pending.fetch_inflight_started_ticks.clear();
+            pending.fetch_next_chunk_indexes.clear();
             pending.fetch_failed_from.clear();
         }
     }
@@ -8515,6 +8619,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending.fetch_inflight_from.remove(source_node_id);
             pending.fetch_inflight_request_ids.remove(source_node_id);
             pending.fetch_inflight_started_ticks.remove(source_node_id);
+            pending.fetch_next_chunk_indexes.remove(source_node_id);
         }
     }
 
@@ -8523,10 +8628,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         intent_id: &str,
         source_node_id: &NodeId,
     ) {
+        let stale_request_id = self
+            .pending_writes
+            .get_mut(intent_id)
+            .and_then(|pending| pending.fetch_inflight_request_ids.remove(source_node_id));
+        if let Some(request_id) = stale_request_id {
+            self.incoming_fetch_transfers.remove(&request_id);
+        }
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
             pending.fetch_inflight_from.remove(source_node_id);
-            pending.fetch_inflight_request_ids.remove(source_node_id);
             pending.fetch_inflight_started_ticks.remove(source_node_id);
+            pending.fetch_next_chunk_indexes.remove(source_node_id);
             pending.fetch_failed_from.insert(source_node_id.clone());
             for state in pending.stage_retries.values_mut() {
                 state.next_retry_tick = 0;
@@ -9890,7 +10002,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 skipped_failed_source = true;
                 continue;
             }
-            let request_id = self.next_request_id();
+            let request_id = pending
+                .fetch_inflight_request_ids
+                .get(&source_node_id)
+                .cloned()
+                .unwrap_or_else(|| self.next_request_id());
             let sent = self.send_dfs_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -9899,6 +10015,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: pending.object_id.clone(),
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
+                    start_chunk_index: pending
+                        .fetch_next_chunk_indexes
+                        .get(&source_node_id)
+                        .copied()
+                        .unwrap_or(0),
                 }),
             )?;
             if sent {
@@ -9960,7 +10081,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
             for source_node_id in expired_sources {
                 pending.fetch_inflight_from.remove(&source_node_id);
-                pending.fetch_inflight_request_ids.remove(&source_node_id);
                 pending.fetch_inflight_started_ticks.remove(&source_node_id);
                 pending.fetch_failed_from.insert(source_node_id);
             }
@@ -10165,7 +10285,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 skipped_failed_source = true;
                 continue;
             }
-            let request_id = self.next_request_id();
+            let request_id = pending
+                .fetch_inflight_request_ids
+                .get(&source_node_id)
+                .cloned()
+                .unwrap_or_else(|| self.next_request_id());
             let sent = self.send_dfs_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -10174,6 +10298,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: pending.object_id.clone(),
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
+                    start_chunk_index: pending
+                        .fetch_next_chunk_indexes
+                        .get(&source_node_id)
+                        .copied()
+                        .unwrap_or(0),
                 }),
             )?;
             if sent {
@@ -12106,6 +12235,7 @@ fn pending_networked_write_with_patch(
         fetch_inflight_from: BTreeSet::new(),
         fetch_inflight_request_ids: BTreeMap::new(),
         fetch_inflight_started_ticks: BTreeMap::new(),
+        fetch_next_chunk_indexes: BTreeMap::new(),
         fetch_failed_from: BTreeSet::new(),
     }
 }

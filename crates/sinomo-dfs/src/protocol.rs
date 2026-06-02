@@ -7,6 +7,10 @@ use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
 use sinomo_network::NetworkFrame;
 use sinomo_node::NodeId;
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsReadData {
     pub object_id: DfsObjectId,
@@ -267,6 +271,8 @@ pub struct DfsFetchBlobCommand {
     pub object_id: DfsObjectId,
     pub version: DfsVersion,
     pub content_hash: String,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub start_chunk_index: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
