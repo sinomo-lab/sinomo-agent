@@ -10504,6 +10504,153 @@ fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
 }
 
 #[test]
+fn sifs_posix_write_at_replicates_large_extent_patch_in_chunks_without_full_blob() {
+    let root = temp_root("sifs-posix-write-at-large-patch-chunks");
+    let owner = NodeId::from_legacy_named("node_sifs_write_at_large_patch_owner").expect("owner");
+    let replica =
+        NodeId::from_legacy_named("node_sifs_write_at_large_patch_replica").expect("replica");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_sifs_write_at_large_patch").expect("object");
+    let base_version =
+        DfsVersion::from_legacy_named("version_sifs_write_at_large_patch_base").expect("base");
+    let path = "/services/replicated-write-at-large-patch.bin";
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner backend");
+    let mut replica_dfs = NetworkedDfsService::new(
+        network.add_node(replica.clone()),
+        LocalContentStore::new(root.join("replica-content")).expect("replica content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(
+            DfsMetadataShardId::new("replica"),
+            root.join("replica-meta"),
+        )
+        .expect("replica metadata"),
+    )
+    .expect("replica backend");
+    owner_dfs.bootstrap_distributed_sifs().expect("owner sifs");
+    replica_dfs
+        .bootstrap_distributed_sifs()
+        .expect("replica sifs");
+
+    let mut initial = vec![0_u8; 768 * 1024 + 19];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 241) as u8;
+    }
+    let owner_base = owner_dfs
+        .content()
+        .put_object_version(object_id.as_str(), base_version.as_str(), &initial)
+        .expect("owner base content");
+    let replica_base = replica_dfs
+        .content()
+        .put_object_version(object_id.as_str(), base_version.as_str(), &initial)
+        .expect("replica base content");
+    assert_eq!(owner_base.content_hash, replica_base.content_hash);
+    let mut object = file_metadata(owner.clone());
+    object.object_id = object_id.clone();
+    object.path = path.to_string();
+    object.version = base_version.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![owner.clone(), replica.clone()];
+    object.content_hash = Some(owner_base.content_hash.clone());
+    object.content_size_bytes = Some(owner_base.size_bytes);
+    owner_dfs
+        .add_object_metadata(object.clone())
+        .expect("owner object metadata");
+    replica_dfs
+        .add_object_metadata(object)
+        .expect("replica object metadata");
+
+    let mut patch = vec![0_u8; 160 * 1024 + 17];
+    for (index, byte) in patch.iter_mut().enumerate() {
+        *byte = 255_u8.wrapping_sub((index % 251) as u8);
+    }
+    let patch_hash = content_hash(&patch);
+    let patch_offset = 257 * 1024 + 3;
+    let mut expected = initial.clone();
+    expected[patch_offset..patch_offset + patch.len()].copy_from_slice(&patch);
+    let expected_hash = content_hash(&expected);
+    owner_dfs
+        .posix_write_file_at(
+            path,
+            patch_offset as u64,
+            &patch,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: false,
+            },
+        )
+        .expect("owner large patch write");
+
+    let mut committed = false;
+    for _ in 0..16 {
+        replica_dfs.process_incoming().expect("replica incoming");
+        owner_dfs.process_incoming().expect("owner incoming");
+        replica_dfs
+            .process_incoming()
+            .expect("replica commit incoming");
+        let owner_object = owner_dfs
+            .current_read_object_metadata(&object_id)
+            .expect("owner object");
+        let replica_object = replica_dfs
+            .current_read_object_metadata(&object_id)
+            .expect("replica object");
+        if owner_object.content_hash.as_deref() == Some(expected_hash.as_str())
+            && replica_object.content_hash.as_deref() == Some(expected_hash.as_str())
+        {
+            committed = true;
+            break;
+        }
+    }
+    assert!(committed, "chunked replicated patch write did not commit");
+
+    let committed_owner = owner_dfs
+        .current_read_object_metadata(&object_id)
+        .expect("committed owner metadata");
+    assert_eq!(
+        owner_dfs
+            .posix_read_file_range(path, patch_offset as u64, patch.len())
+            .expect("owner patched range"),
+        patch
+    );
+    let replica_manifest = replica_dfs
+        .content()
+        .read_manifest(object_id.as_str(), committed_owner.version.as_str())
+        .expect("replica patched manifest");
+    assert_eq!(replica_manifest.content_hash, expected_hash);
+    assert!(
+        replica_manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == owner_base.content_hash)
+    );
+    assert!(
+        replica_manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == patch_hash)
+    );
+    assert!(
+        !replica_dfs
+            .content()
+            .has_blob(&replica_manifest.content_hash)
+            .expect("logical blob check"),
+        "chunked patch stage should not materialize a full replacement blob"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
     let root = temp_root("sifs-posix-write-at-patch-retry");
     let owner = NodeId::from_legacy_named("node_sifs_write_at_patch_retry_owner").expect("owner");
@@ -10581,6 +10728,92 @@ fn sifs_posix_write_at_retries_lost_patch_stage_as_patch() {
             .iter()
             .all(|message| !matches!(message, DfsNetworkMessage::StageBlobChunk(_))),
         "patch retry should not fall back to full-object chunks before an explicit patch rejection"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_posix_write_at_retries_lost_large_patch_stage_as_patch_chunks() {
+    let root = temp_root("sifs-posix-write-at-large-patch-chunk-retry");
+    let owner =
+        NodeId::from_legacy_named("node_sifs_write_at_large_patch_retry_owner").expect("owner");
+    let replica =
+        NodeId::from_legacy_named("node_sifs_write_at_large_patch_retry_replica").expect("replica");
+    let path = "/services/retry-write-at-large-patch.bin";
+    let network = InProcessNetwork::new();
+    let mut owner_dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata"),
+    )
+    .expect("owner backend");
+    let mut replica_mailbox = network.add_node(replica.clone());
+    owner_dfs.bootstrap_distributed_sifs().expect("owner sifs");
+
+    let mut initial = vec![0_u8; 512 * 1024 + 11];
+    for (index, byte) in initial.iter_mut().enumerate() {
+        *byte = (index % 251) as u8;
+    }
+    owner_dfs
+        .posix_write_file(
+            path,
+            &initial,
+            DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("initial self write");
+
+    let mut patch = vec![0_u8; 160 * 1024 + 5];
+    for (index, byte) in patch.iter_mut().enumerate() {
+        *byte = (index % 239) as u8;
+    }
+    owner_dfs
+        .posix_write_file_at(
+            path,
+            96 * 1024 + 5,
+            &patch,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("strict policy"),
+                replica_candidates: vec![owner.clone(), replica.clone()],
+                wait_for_commit: false,
+            },
+        )
+        .expect("large patch write");
+
+    let first_messages = drain_dfs_messages(&mut replica_mailbox);
+    assert!(
+        first_messages
+            .iter()
+            .any(|message| matches!(message, DfsNetworkMessage::StagePatchChunk(_))),
+        "first large patch stage should send patch chunks"
+    );
+    assert!(
+        first_messages
+            .iter()
+            .all(|message| !matches!(message, DfsNetworkMessage::StageBlobChunk(_))),
+        "large patch stage should not send full-object chunks"
+    );
+
+    owner_dfs.repair_retry_tick = 16;
+    owner_dfs
+        .retry_pending_repairs()
+        .expect("retry pending large patch stage");
+
+    let retry_messages = drain_dfs_messages(&mut replica_mailbox);
+    assert!(
+        retry_messages
+            .iter()
+            .any(|message| matches!(message, DfsNetworkMessage::StagePatchChunk(_))),
+        "lost large patch stage should be retried as patch chunks"
+    );
+    assert!(
+        retry_messages
+            .iter()
+            .all(|message| !matches!(message, DfsNetworkMessage::StageBlobChunk(_))),
+        "large patch retry should not fall back to full-object chunks before an explicit patch rejection"
     );
 
     std::fs::remove_dir_all(root).ok();

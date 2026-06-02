@@ -202,6 +202,27 @@ pub struct DfsStagePatchCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStagePatchChunkCommand {
+    pub request_id: String,
+    pub intent_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub base_version: DfsVersion,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub offset: u64,
+    pub patch_hash: String,
+    pub total_size_bytes: u64,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_hash: Option<String>,
+    pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsCommitVersionCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -406,6 +427,7 @@ pub enum DfsNetworkMessage {
     StageBlob(DfsStageBlobCommand),
     StageBlobChunk(DfsStageBlobChunkCommand),
     StagePatch(DfsStagePatchCommand),
+    StagePatchChunk(DfsStagePatchChunkCommand),
     StageBlobResponse(DfsStageBlobResponse),
     CommitVersion(DfsCommitVersionCommand),
     CommitVersionResponse(DfsCommitVersionResponse),

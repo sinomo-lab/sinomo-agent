@@ -243,6 +243,83 @@ impl InProgressBlobTransfer {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct InProgressPatchTransfer {
+    pub(crate) request_id: String,
+    pub(crate) intent_id: String,
+    pub(crate) file_system_id: DfsFileSystemId,
+    pub(crate) object_id: DfsObjectId,
+    pub(crate) base_version: DfsVersion,
+    pub(crate) version: DfsVersion,
+    pub(crate) content_hash: String,
+    pub(crate) offset: u64,
+    pub(crate) patch_hash: String,
+    pub(crate) total_size_bytes: u64,
+    pub(crate) last_updated_at: Instant,
+    pub(crate) assembler: ChunkedBlobAssembler,
+}
+
+impl InProgressPatchTransfer {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        request_id: String,
+        intent_id: String,
+        file_system_id: DfsFileSystemId,
+        object_id: DfsObjectId,
+        base_version: DfsVersion,
+        version: DfsVersion,
+        content_hash: String,
+        offset: u64,
+        patch_hash: String,
+        total_size_bytes: u64,
+        total_chunks: u32,
+        assembler: ChunkedBlobAssembler,
+    ) -> Result<Self, DfsError> {
+        validate_chunked_transfer_shape(
+            "chunked DFS patch transfer",
+            total_size_bytes,
+            total_chunks,
+        )?;
+        Ok(Self {
+            request_id,
+            intent_id,
+            file_system_id,
+            object_id,
+            base_version,
+            version,
+            content_hash,
+            offset,
+            patch_hash,
+            total_size_bytes,
+            last_updated_at: Instant::now(),
+            assembler,
+        })
+    }
+
+    pub(crate) fn insert_chunk(
+        &mut self,
+        chunk_index: u32,
+        total_chunks: u32,
+        bytes: Vec<u8>,
+    ) -> Result<bool, DfsError> {
+        validate_chunk_bytes(
+            "chunked DFS patch transfer",
+            self.total_size_bytes,
+            chunk_index,
+            total_chunks,
+            &bytes,
+        )?;
+        self.last_updated_at = Instant::now();
+        self.assembler
+            .insert_chunk(chunk_index, &bytes)
+            .map_err(DfsError::from)
+    }
+
+    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+        self.assembler.contiguous_received_chunk_count()
+    }
+}
+
 pub(crate) fn blob_chunk_count(bytes: &[u8]) -> Result<u32, DfsError> {
     blob_chunk_count_for_size(bytes.len() as u64)
 }

@@ -789,6 +789,54 @@ impl LocalContentStore {
         Ok(manifest)
     }
 
+    pub fn commit_chunked_object_version_patch(
+        &self,
+        mut assembler: ChunkedBlobAssembler,
+        base_version: &str,
+        offset: u64,
+    ) -> Result<ContentManifest> {
+        if !assembler.is_complete() {
+            return Err(ContentStoreError::IncompleteChunkedContent {
+                object_id: assembler.object_id.clone(),
+                version: assembler.version.clone(),
+            });
+        }
+        assembler
+            .file
+            .sync_all()
+            .map_err(|source| ContentStoreError::Io {
+                path: assembler.path.clone(),
+                source,
+            })?;
+        let (actual_hash, actual_size_bytes) = file_content_hash_and_size(&assembler.path)?;
+        if actual_size_bytes != assembler.total_size_bytes {
+            return Err(ContentStoreError::InvalidChunkedContent {
+                message: format!(
+                    "assembled chunked patch has wrong size for object {}, version {}: expected {}, actual {actual_size_bytes}",
+                    assembler.object_id, assembler.version, assembler.total_size_bytes
+                ),
+            });
+        }
+        if actual_hash != assembler.expected_hash {
+            return Err(ContentStoreError::ChunkHashMismatch {
+                object_id: assembler.object_id.clone(),
+                version: assembler.version.clone(),
+                expected_hash: assembler.expected_hash.clone(),
+                actual_hash,
+            });
+        }
+        let manifest = self.put_object_version_patch_from_file(
+            &assembler.object_id,
+            base_version,
+            &assembler.version,
+            offset,
+            &assembler.path,
+        )?;
+        remove_file_if_exists(&assembler.path)?;
+        assembler.cleanup_on_drop = false;
+        Ok(manifest)
+    }
+
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(hash)?;
         let bytes = read_file(&path)?;
