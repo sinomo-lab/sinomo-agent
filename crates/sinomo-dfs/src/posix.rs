@@ -28,6 +28,7 @@ const POSIX_LIST_DIR_COLLECT_PAGE_SIZE: usize = 4096;
 const POSIX_LINK_COUNT_PAGE_SIZE: usize = 4096;
 const POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS: usize = 512;
 const POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE: usize = 128;
+const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
 
 #[derive(Debug, Error)]
 pub enum DfsPosixError {
@@ -1391,54 +1392,61 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         max_jobs: usize,
         max_steps_per_job: usize,
     ) -> Result<DfsNamespaceJobMaintenanceReport> {
-        let Some(backend) = self.metadata_backend.as_ref() else {
+        if self.metadata_backend.is_none() {
             return Ok(DfsNamespaceJobMaintenanceReport::default());
-        };
-        let mut jobs = backend.list_namespace_jobs()?;
-        jobs.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.job_id.cmp(&right.job_id))
-        });
-
-        let mut report = DfsNamespaceJobMaintenanceReport {
-            scanned_job_count: jobs.len(),
-            ..DfsNamespaceJobMaintenanceReport::default()
-        };
-        for job in jobs {
-            if job.status != DfsNamespaceJobStatus::Running {
-                continue;
-            }
-            if report.resumed_job_count >= max_jobs {
-                report.remaining_running_job_count =
-                    report.remaining_running_job_count.saturating_add(1);
-                continue;
-            }
-            report.resumed_job_count = report.resumed_job_count.saturating_add(1);
-            match self.posix_resume_namespace_job_bounded(&job.job_id, max_steps_per_job) {
-                Ok(updated) => match updated.status {
-                    DfsNamespaceJobStatus::Completed => {
-                        report.completed_job_count = report.completed_job_count.saturating_add(1);
-                    }
-                    DfsNamespaceJobStatus::Running => {
-                        report.remaining_running_job_count =
-                            report.remaining_running_job_count.saturating_add(1);
-                    }
-                    DfsNamespaceJobStatus::Failed => {
+        }
+        let mut cursor = None;
+        let mut report = DfsNamespaceJobMaintenanceReport::default();
+        loop {
+            let page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .list_namespace_jobs_page(
+                    cursor.as_ref(),
+                    POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
+                )?;
+            report.scanned_job_count = report.scanned_job_count.saturating_add(page.jobs.len());
+            for job in page.jobs {
+                if job.status != DfsNamespaceJobStatus::Running {
+                    continue;
+                }
+                if report.resumed_job_count >= max_jobs {
+                    report.remaining_running_job_count =
+                        report.remaining_running_job_count.saturating_add(1);
+                    continue;
+                }
+                report.resumed_job_count = report.resumed_job_count.saturating_add(1);
+                match self.posix_resume_namespace_job_bounded(&job.job_id, max_steps_per_job) {
+                    Ok(updated) => match updated.status {
+                        DfsNamespaceJobStatus::Completed => {
+                            report.completed_job_count =
+                                report.completed_job_count.saturating_add(1);
+                        }
+                        DfsNamespaceJobStatus::Running => {
+                            report.remaining_running_job_count =
+                                report.remaining_running_job_count.saturating_add(1);
+                        }
+                        DfsNamespaceJobStatus::Failed => {
+                            report.failed_job_count = report.failed_job_count.saturating_add(1);
+                        }
+                    },
+                    Err(error) => {
+                        let reason = error.to_string();
+                        let failed = self.fail_namespace_job(job, reason.clone())?;
                         report.failed_job_count = report.failed_job_count.saturating_add(1);
+                        report.failures.push(DfsNamespaceJobFailure {
+                            job_id: failed.job_id,
+                            kind: failed.kind,
+                            reason,
+                        });
                     }
-                },
-                Err(error) => {
-                    let reason = error.to_string();
-                    let failed = self.fail_namespace_job(job, reason.clone())?;
-                    report.failed_job_count = report.failed_job_count.saturating_add(1);
-                    report.failures.push(DfsNamespaceJobFailure {
-                        job_id: failed.job_id,
-                        kind: failed.kind,
-                        reason,
-                    });
                 }
             }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(report)
     }

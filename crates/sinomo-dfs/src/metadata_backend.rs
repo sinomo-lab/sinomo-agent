@@ -506,6 +506,18 @@ pub struct DfsDirectoryPage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceJobPageCursor {
+    pub job_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceJobPage {
+    pub jobs: Vec<DfsNamespaceJobRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsNamespaceJobPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsTombstoneCompactionOptions {
     pub dry_run: bool,
     pub min_tombstone_age_nanos: u64,
@@ -1735,7 +1747,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
-        Ok(Vec::new())
+        let mut jobs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            jobs.extend(page.jobs);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(jobs)
+    }
+    fn list_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        let _ = after;
+        let _ = max_entries;
+        Ok(DfsNamespaceJobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
+        })
     }
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry>;
     fn get_conflict(
@@ -3987,6 +4022,41 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             }
         }
         Ok(jobs.into_values().collect())
+    }
+
+    fn list_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        if max_entries == 0 {
+            return Ok(DfsNamespaceJobPage {
+                jobs: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut merged = BTreeMap::<String, DfsNamespaceJobRecord>::new();
+        let mut shard_has_more = false;
+        for backend in self.shards.values() {
+            let page = backend.list_namespace_jobs_page(after, max_entries.saturating_add(1))?;
+            shard_has_more |= page.next_cursor.is_some();
+            for job in page.jobs {
+                merged.insert(job.job_id.clone(), job);
+            }
+        }
+        let mut jobs = merged.into_values().collect::<Vec<_>>();
+        let has_more = jobs.len() > max_entries || shard_has_more;
+        if jobs.len() > max_entries {
+            jobs.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            jobs.last().map(|job| DfsNamespaceJobPageCursor {
+                job_id: job.job_id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(DfsNamespaceJobPage { jobs, next_cursor })
     }
 
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
@@ -6506,6 +6576,41 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_jobs.values().cloned().collect())
+    }
+
+    fn list_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        if max_entries == 0 {
+            return Ok(DfsNamespaceJobPage {
+                jobs: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = match after {
+            Some(after) => Excluded(after.job_id.clone()),
+            None => Included(String::new()),
+        };
+        let mut jobs = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for (job_id, job) in tables.namespace_jobs.range((start, Unbounded)) {
+            if jobs.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(DfsNamespaceJobPageCursor {
+                job_id: job_id.clone(),
+            });
+            jobs.push(job.clone());
+        }
+        Ok(DfsNamespaceJobPage {
+            jobs,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
@@ -9226,6 +9331,24 @@ mod tests {
         }
     }
 
+    fn namespace_job(index: usize, root_path: &str) -> DfsNamespaceJobRecord {
+        let timestamp = OffsetDateTime::from_unix_timestamp(index as i64).expect("valid timestamp");
+        DfsNamespaceJobRecord {
+            job_id: format!("job_namespace_page_{index:02}"),
+            file_system_id: file_system_id(),
+            kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: root_path.to_string(),
+            target_path: None,
+            pending_frames: Vec::new(),
+            processed_object_count: 0,
+            created_at: timestamp,
+            updated_at: timestamp,
+            completed_at: None,
+            failure_reason: None,
+        }
+    }
+
     fn shard_config(
         shard_id: &str,
         assignment: DfsMetadataShardAssignment,
@@ -9755,6 +9878,68 @@ mod tests {
         assert!(
             saw_directory_shard_cursor,
             "sharded directory pages should carry shard cursors for bounded continuation"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_pages_namespace_jobs() {
+        let root = temp_root("sharded_backend_pages_namespace_jobs");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+
+        for index in 0..6 {
+            let root_path = if index % 2 == 0 {
+                format!("/jobs/{index}")
+            } else {
+                format!("/services/jobs/{index}")
+            };
+            backend
+                .put_namespace_job(&namespace_job(index, &root_path))
+                .expect("namespace job");
+        }
+
+        let mut cursor = None;
+        let mut job_ids = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let page = backend
+                .list_namespace_jobs_page(cursor.as_ref(), 2)
+                .expect("job page");
+            assert!(page.jobs.len() <= 2);
+            job_ids.extend(page.jobs.iter().map(|job| job.job_id.clone()));
+            pages = pages.saturating_add(1);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            job_ids,
+            (0..6)
+                .map(|index| format!("job_namespace_page_{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pages, 3);
+        assert_eq!(
+            backend
+                .get_namespace_job("job_namespace_page_05")
+                .expect("get job")
+                .expect("job")
+                .root_path,
+            "/services/jobs/5"
         );
 
         cleanup(&root);
@@ -11559,6 +11744,50 @@ mod tests {
             ]
         );
         assert_eq!(pages, 3);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_pages_namespace_jobs() {
+        let root = temp_root("local_backend_pages_namespace_jobs");
+        let mut backend =
+            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+        for index in 0..5 {
+            backend
+                .put_namespace_job(&namespace_job(index, &format!("/jobs/{index}")))
+                .expect("namespace job");
+        }
+
+        let empty = backend
+            .list_namespace_jobs_page(None, 0)
+            .expect("empty page");
+        assert!(empty.jobs.is_empty());
+        assert!(empty.next_cursor.is_none());
+
+        let mut cursor = None;
+        let mut job_ids = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let page = backend
+                .list_namespace_jobs_page(cursor.as_ref(), 2)
+                .expect("job page");
+            assert!(page.jobs.len() <= 2);
+            job_ids.extend(page.jobs.iter().map(|job| job.job_id.clone()));
+            pages = pages.saturating_add(1);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            job_ids,
+            (0..5)
+                .map(|index| format!("job_namespace_page_{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pages, 3);
+        assert_eq!(backend.list_namespace_jobs().expect("legacy list").len(), 5);
 
         cleanup(&root);
     }
