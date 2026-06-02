@@ -103,6 +103,10 @@ pub struct DfsDistributedWriteCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_base_version: Option<DfsVersion>,
     pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_size_bytes: Option<u64>,
     pub desired_replica_nodes: Vec<NodeId>,
     pub policy: DfsReplicationPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]

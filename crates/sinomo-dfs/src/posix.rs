@@ -19,6 +19,7 @@ use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_events::EventId;
 use sinomo_network::NetworkTransport;
 use sinomo_node::NodeId;
+use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -255,6 +256,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         options: DfsWriteOptions,
     ) -> Result<DfsStat> {
+        self.posix_write_file_from_reader(path, Cursor::new(bytes), options)
+    }
+
+    pub fn posix_write_file_from_reader<R: Read>(
+        &mut self,
+        path: &str,
+        reader: R,
+        options: DfsWriteOptions,
+    ) -> Result<DfsStat> {
         let (path, requires_directory) = normalize_posix_path_with_trailing_directory(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if requires_directory {
@@ -297,19 +307,20 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }
         };
         let target_version = next_version(&object.version);
+        let target_version_for_stat = target_version.clone();
         let mut candidates = options.replica_candidates;
         if !candidates.contains(&self.node_id) {
             candidates.insert(0, self.node_id.clone());
         }
         let committed_locations = candidates.clone();
-        let outcome = self.write_distributed_eventual_with_candidates(
+        let outcome = self.write_distributed_eventual_from_reader_with_candidates(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),
                 object_id: object.object_id.clone(),
                 target_version,
                 requesting_node_id: self.node_id.clone(),
             },
-            bytes.to_vec(),
+            reader,
             candidates,
             options.policy,
         );
@@ -344,8 +355,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 let mut committed_object = object.clone();
                 committed_object.version = version;
                 committed_object.content_hash = Some(content_hash);
-                committed_object.content_size_bytes = Some(bytes.len() as u64);
                 committed_object.current_locations = committed_locations;
+                committed_object.content_size_bytes =
+                    self.object_content_size_hint(&committed_object)?;
                 let now = crate::dfs_now_unix_nanos();
                 committed_object.modified_at_unix_nanos = now;
                 committed_object.changed_at_unix_nanos = now;
@@ -373,7 +385,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 let object = self.stat_target_for_path(&path)?;
                 let mut stat = self.stat_object(&object)?;
                 stat.path = path.clone();
-                stat.size_bytes = Some(bytes.len() as u64);
+                if let Ok(manifest) = self
+                    .content
+                    .read_manifest(object.object_id.as_str(), target_version_for_stat.as_str())
+                {
+                    stat.size_bytes = Some(manifest.size_bytes);
+                }
                 let _ = intent_id;
                 let _ = durable_receipts;
                 let _ = required_receipts;

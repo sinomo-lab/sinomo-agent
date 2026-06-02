@@ -3082,6 +3082,211 @@ fn networked_dfs_routes_non_primary_write_to_metadata_shard_primary() {
 }
 
 #[test]
+fn networked_dfs_routes_reader_write_to_metadata_primary_via_fetch() {
+    let writer = NodeId::from_legacy_named("node_route_reader_writer").expect("node");
+    let primary = NodeId::from_legacy_named("node_route_reader_primary").expect("node");
+    let witness = NodeId::from_legacy_named("node_route_reader_witness").expect("node");
+    let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
+    let object_id = DfsObjectId::from_legacy_named("obj_route_reader_primary").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_route_reader_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_route_reader_2").expect("version");
+    let root = temp_root("networked_route_reader_primary_write");
+    let network = InProcessNetwork::new();
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone(), witness])
+            .expect("control-plane kv cluster"),
+    );
+    control_plane.with_client(|kv| {
+        DfsControlPlaneStore::new(kv)
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 4,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let primary_backend = LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("services"),
+        root.join("primary-meta"),
+    )
+    .expect("primary metadata backend");
+    let mut writer_dfs = NetworkedDfsService::new(
+        network.add_node(writer.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("writer-content")).expect("writer content"),
+    )
+    .with_control_plane(control_plane.clone());
+    let mut primary_dfs = NetworkedDfsService::new(
+        network.add_node(primary.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("primary-content")).expect("primary content"),
+    )
+    .with_control_plane(control_plane)
+    .with_metadata_backend(primary_backend)
+    .expect("primary metadata backend");
+    let file_system = DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "sifs".to_string(),
+        owner_node_id: primary.clone(),
+        subtree_policies: Vec::new(),
+    };
+    let object = DfsObjectMetadata {
+        object_id: object_id.clone(),
+        file_system_id: file_system_id.clone(),
+        path: "/services/routed-reader.bin".to_string(),
+        kind: DfsObjectKind::File,
+        owner_node_id: primary.clone(),
+        current_locations: vec![writer.clone()],
+        content_hash: Some(content_hash(b"old routed reader bytes")),
+        content_size_bytes: Some(b"old routed reader bytes".len() as u64),
+        link_target_object_id: None,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: version_1,
+        policy: DfsObjectPolicy::ReplicatedEventual,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    };
+    writer_dfs
+        .add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    primary_dfs
+        .add_file_system(file_system)
+        .expect("primary filesystem");
+    writer_dfs
+        .add_object_metadata(object)
+        .expect("writer object metadata");
+
+    let byte_count = 65 * 1024 + 17;
+    let routed = writer_dfs
+        .write_distributed_eventual_from_reader(
+            DfsWriteRequest {
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            PatternReader::new(byte_count),
+            vec![writer.clone(), primary.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("routed reader write request");
+    assert!(matches!(
+        routed,
+        NetworkedDfsWriteOutcome::Pending {
+            durable_receipts: 0,
+            required_receipts: 1,
+            ..
+        }
+    ));
+
+    let primary_events = primary_dfs
+        .process_incoming()
+        .expect("primary routed write");
+    assert!(primary_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                requester_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Pending { .. },
+                    },
+                ..
+            } if requester_node_id == &writer
+        )
+    }));
+    let writer_events = writer_dfs.process_incoming().expect("writer fetch");
+    assert!(writer_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobFetched {
+                source_node_id,
+                object_id: fetched,
+                ..
+            } if source_node_id == &writer && fetched == &object_id
+        )
+    }));
+    let primary_events = primary_dfs
+        .process_incoming()
+        .expect("primary fetch response");
+    assert!(primary_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::BlobFetched {
+                source_node_id,
+                object_id: fetched,
+                ..
+            } if source_node_id == &writer && fetched == &object_id
+        )
+    }));
+    assert!(primary_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteServed {
+                requester_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                    },
+                ..
+            } if requester_node_id == &writer
+        )
+    }));
+    let writer_events = writer_dfs
+        .process_incoming()
+        .expect("writer committed routed response");
+    assert!(writer_events.iter().any(|event| {
+        matches!(
+            event,
+            NetworkedDfsServiceEvent::RemoteWriteCompleted {
+                primary_node_id,
+                result:
+                    DfsDistributedWriteResult::Outcome {
+                        outcome: NetworkedDfsWriteOutcome::Committed { .. },
+                    },
+                ..
+            } if primary_node_id == &primary
+        )
+    }));
+    let primary_object = primary_dfs
+        .metadata_backend()
+        .expect("primary metadata backend")
+        .get_object(&object_id)
+        .expect("primary object")
+        .expect("primary object");
+    let expected_bytes = pattern_bytes(byte_count);
+    let expected_hash = content_hash(&expected_bytes);
+    assert_eq!(primary_object.version, version_2);
+    assert_eq!(
+        primary_object.content_hash.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert_eq!(primary_object.content_size_bytes, Some(byte_count as u64));
+    assert!(primary_object.current_locations.contains(&writer));
+    assert!(primary_object.current_locations.contains(&primary));
+    assert_eq!(
+        primary_dfs
+            .read_local_object(&object_id)
+            .expect("primary read")
+            .expect("primary data")
+            .bytes,
+        expected_bytes
+    );
+
+    cleanup(&root);
+}
+
+#[test]
 fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
     let owner = NodeId::from_legacy_named("node_metadata_bounded_config_owner").expect("node");
     let replica = NodeId::from_legacy_named("node_metadata_bounded_config_replica").expect("node");
@@ -10264,6 +10469,54 @@ fn posix_write_file_does_not_expose_new_file_until_content_commits() {
             .expect("backend lookup")
             .is_none()
     );
+
+    cleanup(&root);
+}
+
+#[test]
+fn posix_write_file_from_reader_streams_content() {
+    let owner = NodeId::from_legacy_named("node_posix_reader_owner").expect("node");
+    let root = temp_root("posix_write_file_from_reader");
+    let network = InProcessNetwork::new();
+    let backend =
+        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("owner"), root.join("owner-meta"))
+            .expect("owner metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(owner.clone()),
+        sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
+    )
+    .with_metadata_backend(backend)
+    .expect("metadata backend");
+
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    dfs.posix_mkdir_all("/services/web").expect("mkdir service");
+
+    let bytes = 128 * 1024 + 17;
+    let stat = dfs
+        .posix_write_file_from_reader(
+            "/services/web/stream.bin",
+            PatternReader::new(bytes),
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        )
+        .expect("streaming POSIX write");
+
+    assert_eq!(stat.size_bytes, Some(bytes as u64));
+    assert_eq!(
+        dfs.posix_read_file("/services/web/stream.bin")
+            .expect("read streamed POSIX file"),
+        pattern_bytes(bytes)
+    );
+    let backend_object = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .get_object_by_path(
+            &sinomo_dfs::sifs_file_system_id(),
+            "/services/web/stream.bin",
+        )
+        .expect("backend path lookup")
+        .expect("streamed object metadata");
+    assert_eq!(backend_object.content_size_bytes, Some(bytes as u64));
+    assert_eq!(backend_object.content_hash, stat.content_hash);
 
     cleanup(&root);
 }

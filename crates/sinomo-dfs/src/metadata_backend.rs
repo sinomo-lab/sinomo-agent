@@ -992,6 +992,24 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             next_cursor,
         })
     }
+    fn count_objects_for_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<usize> {
+        const COUNT_PAGE_SIZE: usize = 4096;
+        let mut count = 0usize;
+        let mut cursor = None;
+        loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                cursor.as_ref(),
+                COUNT_PAGE_SIZE,
+            )?;
+            count = count.saturating_add(page.objects.len());
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(count)
+    }
     fn object_page_cursor_for_object(
         &self,
         object: &DfsObjectMetadata,
@@ -5105,6 +5123,34 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             objects,
             next_cursor: has_more.then_some(last_cursor).flatten(),
         })
+    }
+
+    fn count_objects_for_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<usize> {
+        let tables = self.current_tables_snapshot()?;
+        let mut count = 0usize;
+        for ((record_file_system_id, _), path_record) in tables
+            .file_system_objects
+            .range((
+                Included((file_system_id.clone(), id_lower_bound())),
+                Unbounded,
+            ))
+            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
+        {
+            if record_file_system_id != file_system_id
+                || path_record.file_system_id != *file_system_id
+            {
+                continue;
+            }
+            let Some(object) = tables.objects.get(&path_record.object_id) else {
+                continue;
+            };
+            if object.file_system_id == *file_system_id
+                && normalize_path(&object.path) == path_record.path
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        Ok(count)
     }
 
     fn child_objects_for_directory(
@@ -10381,6 +10427,12 @@ mod tests {
             .expect("second object page");
         assert_eq!(second_object_page.objects.len(), 3);
         assert!(second_object_page.next_cursor.is_none());
+        assert_eq!(
+            backend
+                .count_objects_for_file_system(&file_system_id())
+                .expect("count objects"),
+            6
+        );
 
         let mut cursor = None;
         let mut child_names = Vec::new();

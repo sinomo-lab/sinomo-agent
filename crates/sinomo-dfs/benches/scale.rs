@@ -2,7 +2,7 @@ use serde_json::json;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
     DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, LocalContentStore,
+    DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, DfsWriteOptions, LocalContentStore,
     LocalJsonMetadataBackend, NetworkedDfsService, NetworkedDfsServiceEvent,
 };
 use sinomo_network::InProcessNetwork;
@@ -35,6 +35,7 @@ struct Args {
 enum Scenario {
     All,
     Namespace,
+    PosixCreate,
     MetadataReplication,
     Blob,
     NetworkBlob,
@@ -45,11 +46,12 @@ impl Scenario {
         match value {
             "all" => Ok(Self::All),
             "namespace" => Ok(Self::Namespace),
+            "posix-create" => Ok(Self::PosixCreate),
             "metadata-replication" => Ok(Self::MetadataReplication),
             "blob" => Ok(Self::Blob),
             "network-blob" => Ok(Self::NetworkBlob),
             _ => Err(format!(
-                "unknown scenario `{value}`; use all, namespace, metadata-replication, blob, or network-blob"
+                "unknown scenario `{value}`; use all, namespace, posix-create, metadata-replication, blob, or network-blob"
             )
             .into()),
         }
@@ -61,11 +63,13 @@ fn main() -> BenchResult<()> {
     match args.scenario {
         Scenario::All => {
             run_namespace(&args)?;
+            run_posix_create(&args)?;
             run_metadata_replication(&args)?;
             run_blob(&args)?;
             run_network_blob(&args)?;
         }
         Scenario::Namespace => run_namespace(&args)?,
+        Scenario::PosixCreate => run_posix_create(&args)?,
         Scenario::MetadataReplication => run_metadata_replication(&args)?,
         Scenario::Blob => run_blob(&args)?,
         Scenario::NetworkBlob => run_network_blob(&args)?,
@@ -256,10 +260,123 @@ fn run_namespace(args: &Args) -> BenchResult<()> {
     let reopened_objects = reopened
         .metadata_backend()
         .expect("metadata backend")
-        .objects_for_file_system(&sifs_id())?
-        .len();
+        .count_objects_for_file_system(&sifs_id())?;
     emit(
         "namespace_reopen_hydrate",
+        reopen_elapsed,
+        json!({
+            "files": args.files,
+            "dirs": args.dirs,
+            "objects_loaded": reopened_objects,
+            "objects_per_second": rate(reopened_objects as u64, reopen_elapsed),
+        }),
+    );
+
+    Ok(())
+}
+
+fn run_posix_create(args: &Args) -> BenchResult<()> {
+    let root = args.scenario_root("posix-create");
+    remove_dir_all_if_exists(&root)?;
+    fs::create_dir_all(&root)?;
+
+    let node = node("node_dfs_bench_posix_create");
+    let network = InProcessNetwork::new();
+    let metadata_root = root.join("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(root.join("content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        &metadata_root,
+    )?)?;
+
+    let setup_start = Instant::now();
+    dfs.bootstrap_distributed_sifs()?;
+    dfs.posix_mkdir_all("/services/dfs-scale")?;
+    for dir_index in 0..args.dirs {
+        dfs.posix_mkdir_all(&bench_dir(dir_index))?;
+    }
+    emit(
+        "posix_create_setup",
+        setup_start.elapsed(),
+        json!({ "dirs": args.dirs, "root": root }),
+    );
+
+    let options = DfsWriteOptions::replicated_eventual(vec![node.clone()]);
+    let create_start = Instant::now();
+    let mut written_bytes = 0u64;
+    for index in 0..args.files {
+        let path = format!("{}/file-{index:08}.bin", bench_dir(index % args.dirs));
+        dfs.posix_write_file_from_reader(
+            &path,
+            RepeatingReader::new(args.file_bytes as u64),
+            options.clone(),
+        )?;
+        written_bytes = written_bytes.saturating_add(args.file_bytes as u64);
+    }
+    let create_elapsed = create_start.elapsed();
+    emit(
+        "posix_stream_create_files",
+        create_elapsed,
+        json!({
+            "files": args.files,
+            "dirs": args.dirs,
+            "file_bytes": args.file_bytes,
+            "written_bytes": written_bytes,
+            "files_per_second": rate(args.files as u64, create_elapsed),
+            "mib_per_second": mib_per_second(written_bytes, create_elapsed),
+        }),
+    );
+
+    let paged_list_start = Instant::now();
+    let mut paged_listed = 0usize;
+    let mut pages = 0usize;
+    for dir_index in 0..args.dirs {
+        let dir = bench_dir(dir_index);
+        let mut cursor = None;
+        loop {
+            let page = dfs.posix_list_dir_page(&dir, cursor.as_ref(), args.list_page_size)?;
+            paged_listed = paged_listed.saturating_add(page.entries.len());
+            pages = pages.saturating_add(1);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+    let paged_list_elapsed = paged_list_start.elapsed();
+    emit(
+        "posix_create_list_all_dirs_paged",
+        paged_list_elapsed,
+        json!({
+            "files": args.files,
+            "dirs": args.dirs,
+            "listed": paged_listed,
+            "pages": pages,
+            "page_size": args.list_page_size,
+            "entries_per_second": rate(paged_listed as u64, paged_list_elapsed),
+        }),
+    );
+
+    drop(dfs);
+    let reopen_start = Instant::now();
+    let reopened = NetworkedDfsService::new(
+        network.add_node(node.clone()),
+        LocalContentStore::new(root.join("content"))?,
+    )
+    .with_metadata_backend(LocalJsonMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        &metadata_root,
+    )?)?;
+    let reopen_elapsed = reopen_start.elapsed();
+    let reopened_objects = reopened
+        .metadata_backend()
+        .expect("metadata backend")
+        .count_objects_for_file_system(&sifs_id())?;
+    emit(
+        "posix_create_reopen_hydrate",
         reopen_elapsed,
         json!({
             "files": args.files,
@@ -333,8 +450,7 @@ fn run_metadata_replication(args: &Args) -> BenchResult<()> {
     let replica_objects = replica_dfs
         .metadata_backend()
         .expect("metadata backend")
-        .objects_for_file_system(&sifs_id())?
-        .len();
+        .count_objects_for_file_system(&sifs_id())?;
     emit(
         "metadata_replication_catchup",
         catchup_elapsed,
@@ -694,7 +810,7 @@ fn print_help() {
         "Usage: cargo bench -p sinomo-dfs --bench scale -- [OPTIONS]\n\
          \n\
          Options:\n\
-           --scenario all|namespace|metadata-replication|blob|network-blob\n\
+           --scenario all|namespace|posix-create|metadata-replication|blob|network-blob\n\
            --root PATH\n\
            --files COUNT\n\
            --dirs COUNT\n\
