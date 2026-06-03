@@ -300,18 +300,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-mod cui;
 mod error;
 mod help;
 mod providers;
 #[cfg(test)]
 mod tests;
+mod tui;
 
-pub use cui::*;
 use error::CliError;
 use help::*;
 pub use providers::*;
 use time::format_description::well_known::Rfc3339;
+pub use tui::*;
 
 mod commands;
 mod completion;
@@ -712,7 +712,7 @@ pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
 
 pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> bool {
     match command {
-        CliCommand::Cui
+        CliCommand::Tui
         | CliCommand::Models(_)
         | CliCommand::Providers(_)
         | CliCommand::Agent(_) => true,
@@ -806,7 +806,7 @@ pub(crate) fn with_cli_force_local_mode<T>(force_local: bool, f: impl FnOnce() -
 
 #[derive(Debug, Clone)]
 pub(crate) enum CliCommand {
-    Cui,
+    Tui,
     Help,
     Cluster(ClusterCliCommand),
     InstallHelp,
@@ -839,7 +839,7 @@ pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, Cli
 
 pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError> {
     match args.split_first() {
-        None => Ok(CliCommand::Cui),
+        None => Ok(CliCommand::Tui),
         Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
             Ok(CliCommand::Help)
         }
@@ -1311,7 +1311,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
     }
 
     match command {
-        CliCommand::Cui => run_cui(),
+        CliCommand::Tui => run_tui(),
         CliCommand::Help => {
             print_usage();
             Ok(())

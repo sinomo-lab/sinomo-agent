@@ -62,7 +62,7 @@ When adding imports in an R2/application crate, prefer `use sinomo_runtime::core
 
 `sinomo` is the single entry point. Top-level commands (see `print_usage` in `crates/sinomo-cli/src/lib.rs`):
 
-- `sinomo` (no args) — interactive CUI loop (`run_cui`).
+- `sinomo` (no args) — interactive TUI loop (`run_tui`).
 - `sinomo daemon run|start|status|stop` — local control-plane daemon, default `127.0.0.1:21353`. Owns `$SINOMO_DATA_DIR/daemon/{daemon.lock,status.json}`.
 - `sinomo daemon shadow run|start|status|stop` — supervisor for the main daemon, default port `21354`, separate state dir `shadow-daemon/`.
 - `sinomo rollout init-source|apply|status` — manages the data-dir source repo at `$SINOMO_DATA_DIR/source/sinomo` and the installed binaries at `$SINOMO_DATA_DIR/bin/sinomo-{main,shadow}`. `apply` runs `cargo build -p sinomo` on the data-dir source and atomically swaps binaries.

@@ -79,11 +79,11 @@ The main daemon and shadow daemon are separate cluster nodes that share the same
 
 Daemon lifecycle is local infrastructure and is allowed before cluster registration. This lets `sinomo install` prepare an orphan machine and start both daemons before the operator runs `sinomo cluster join`. When no cluster state exists, daemon status reports no cluster registration and the daemon does not publish cluster KV heartbeats. After `cluster init` or `cluster join` creates local cluster state, the running daemon updates its status registration and begins publishing member and node-status records without requiring a restart.
 
-The default `sinomo` command is daemon-first. When the local main daemon is running and registered with a cluster, the CLI treats that daemon as the local cluster runtime for the orphan guard and starts the CUI session under the daemon's cluster node identity. If no daemon is reachable, the CLI falls back to the local cluster state and reports the normal orphan guidance when neither path exists. Explicit lifecycle commands such as `sinomo daemon run`, `sinomo daemon start`, and `sinomo install` remain opt-in process-management operations.
+The default `sinomo` command is daemon-first. When the local main daemon is running and registered with a cluster, the CLI treats that daemon as the local cluster runtime for the orphan guard and starts the TUI session under the daemon's cluster node identity. If no daemon is reachable, the CLI falls back to the local cluster state and reports the normal orphan guidance when neither path exists. Explicit lifecycle commands such as `sinomo daemon run`, `sinomo daemon start`, and `sinomo install` remain opt-in process-management operations.
 
 The global `--local` flag forces a local file-backed CLI mode for feature testing and node-local overrides:
 
-- `sinomo --local` starts the CUI without requiring the local daemon or cluster runtime.
+- `sinomo --local` starts the TUI without requiring the local daemon or cluster runtime.
 - `sinomo --local providers auth <provider>` and `sinomo --local providers test <provider>` use local provider credentials and local model config even when the node is already clustered.
 - `sinomo --local models default ...`, `sinomo --local models runtime set ...`, `sinomo --local sandbox policy set ...`, and `sinomo --local evolve trusted-signers list` use local config or registry files instead of cluster KV.
 - Cluster quorum/orphan guards are skipped for commands that have a meaningful local implementation, but distributed cluster operations are not emulated. DFS local-owned data and local sandbox state remain usable through their normal local stores.

@@ -21,21 +21,20 @@ use super::{
     cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
     cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
     cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
-    compact_default_invite_introducers, cui_default_daemon_status,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, daemon_remove_cluster_members, daemon_run_toolchain_request,
-    data_dir_storage_contract_findings, decode_cluster_join_invite, elect_cluster_raft_leader,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
-    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
-    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
-    handle_daemon_cluster_raft_vote_request, handle_daemon_connection,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version, daemon_remove_cluster_members,
+    daemon_run_toolchain_request, data_dir_storage_contract_findings, decode_cluster_join_invite,
+    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
+    expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
+    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
+    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
+    handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
+    install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    load_cui_model_runtime_config, main_agent_handler_for_cui_with_data_dir, managed_source_status,
+    load_tui_model_runtime_config, main_agent_handler_for_tui_with_data_dir, managed_source_status,
     merge_benchmark_gate_requests, merge_module_replay_report_refs, model_config_uses_cluster,
     models_default_with_data_dir, normalize_model_provider,
     open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
@@ -51,8 +50,8 @@ use super::{
     rollout_endpoint_candidates, rollout_progress_bar, rollout_status_matches_expectation,
     rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
     rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
-    rollout_terminal_response, run_cui_with_handler_io, run_cui_with_handler_io_and_daemon,
-    run_evolve_command, run_shadow_daemon_with_paths, sandbox_cat_with_store,
+    rollout_terminal_response, run_evolve_command, run_shadow_daemon_with_paths,
+    run_tui_with_handler_io, run_tui_with_handler_io_and_daemon, sandbox_cat_with_store,
     sandbox_checkpoint_with_store, sandbox_config_with_store, sandbox_create_with_store,
     sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
     sandbox_doctor_findings_with_stores_and_events,
@@ -66,9 +65,9 @@ use super::{
     sandbox_write_with_store_and_event_store, send_cluster_join_registration_over_iroh,
     shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
     sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, uninstall_with_layout, with_cli_force_local_mode,
-    write_daemon_status, write_model_runtime_config_for_node, write_rollout_status,
-    write_sandbox_policy_config_for_node,
+    sync_cluster_state_to_kv, tui_default_daemon_status, uninstall_with_layout,
+    with_cli_force_local_mode, write_daemon_status, write_model_runtime_config_for_node,
+    write_rollout_status, write_sandbox_policy_config_for_node,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -227,8 +226,8 @@ fn top_level_cli_parser_accepts_local_flag_before_command() {
 #[test]
 fn top_level_cli_parser_routes_subcommands() {
     assert!(matches!(
-        parse_cli_command(&[]).expect("cui"),
-        CliCommand::Cui
+        parse_cli_command(&[]).expect("tui"),
+        CliCommand::Tui
     ));
     assert!(matches!(
         parse_cli_command(&["help".to_string()]).expect("help"),
@@ -15953,7 +15952,7 @@ fn minicpm_tool_call_response_maps_to_agent_decision_json() {
 #[test]
 fn cui_entry_starts_without_daemon_using_local_runtime_config() {
     let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cui-no-daemon-{}",
+        "sinomo-cli-tui-no-daemon-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
@@ -15965,7 +15964,7 @@ fn cui_entry_starts_without_daemon_using_local_runtime_config() {
         ClusterInitOptions {
             cluster_id: Some(ClusterId::from_legacy_named("cui_no_daemon").expect("cluster")),
             node_id: Some(NodeId::from_legacy_named("cui_no_daemon_node").expect("node")),
-            name: "cui no daemon".to_string(),
+            name: "tui no daemon".to_string(),
         },
         &cluster_paths,
     )
@@ -15996,18 +15995,18 @@ fn cui_entry_starts_without_daemon_using_local_runtime_config() {
     })
     .expect("write local runtime config");
 
-    let (loaded, loaded_path) = load_cui_model_runtime_config(&data_dir, false)
-        .expect("load daemonless cui runtime config");
+    let (loaded, loaded_path) = load_tui_model_runtime_config(&data_dir, false)
+        .expect("load daemonless tui runtime config");
     assert_eq!(loaded, local_config);
     assert_eq!(loaded_path, local_path);
 
     let (handler, daemon) =
-        main_agent_handler_for_cui_with_data_dir(None, &data_dir).expect("daemonless handler");
+        main_agent_handler_for_tui_with_data_dir(None, &data_dir).expect("daemonless handler");
     assert!(daemon.is_none());
     let mut output = Vec::new();
 
-    run_cui_with_handler_io_and_daemon(Cursor::new("/quit\n"), &mut output, handler, daemon)
-        .expect("daemonless cui starts");
+    run_tui_with_handler_io_and_daemon(Cursor::new("/quit\n"), &mut output, handler, daemon)
+        .expect("daemonless tui starts");
 
     let output = String::from_utf8(output).expect("utf8");
     assert!(output.contains("Sinomo main agent"));
@@ -16019,7 +16018,7 @@ fn cui_entry_starts_without_daemon_using_local_runtime_config() {
 
 #[test]
 fn cui_local_mode_skips_default_daemon_probe() {
-    let daemon = with_cli_force_local_mode(true, cui_default_daemon_status)
+    let daemon = with_cli_force_local_mode(true, tui_default_daemon_status)
         .expect("local mode daemon status");
 
     assert!(daemon.is_none());
@@ -16029,12 +16028,12 @@ fn cui_local_mode_skips_default_daemon_probe() {
 fn cui_loop_starts_and_exits_from_quit_command() {
     let mut output = Vec::new();
 
-    run_cui_with_handler_io(
+    run_tui_with_handler_io(
         Cursor::new("/quit\n"),
         &mut output,
         fixture_handler("unused"),
     )
-    .expect("cui");
+    .expect("tui");
 
     let output = String::from_utf8(output).expect("utf8");
     assert!(output.contains("Sinomo main agent"));
@@ -16068,13 +16067,13 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
         idle_stats: None,
     };
 
-    run_cui_with_handler_io_and_daemon(
+    run_tui_with_handler_io_and_daemon(
         Cursor::new("/quit\n"),
         &mut output,
         fixture_handler("unused"),
         Some(daemon),
     )
-    .expect("cui");
+    .expect("tui");
 
     let output = String::from_utf8(output).expect("utf8");
     assert!(output.contains(&format!(

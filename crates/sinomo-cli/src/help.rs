@@ -24,12 +24,12 @@ pub fn print_usage() {
     println!();
     println!("Run `sinomo <subcommand> help` for detailed commands.");
     println!();
-    println!("CUI:");
+    println!("TUI:");
     println!(
         "  Run `sinomo` with no arguments to connect the command-line user interface to the local daemon when available."
     );
     println!("  Run `sinomo --local` to start without probing the daemon or cluster.");
-    println!("  Inside the CUI, prefix any CLI command with `/`, for example `/models list`.");
+    println!("  Inside the TUI, prefix any CLI command with `/`, for example `/models list`.");
     println!("  Use `/quit` or `/exit` to end the session.");
     println!();
     println!("Environment:");
@@ -400,7 +400,7 @@ pub(super) fn print_models_help() {
     println!("  sinomo models list [--provider <provider>]");
     println!("      List available or known models.");
     println!("  sinomo models default --provider <provider> --model <model>");
-    println!("      Set the default model for CUI and model-backed commands.");
+    println!("      Set the default model for TUI and model-backed commands.");
     println!(
         "  sinomo models options [show] [--provider <provider>] [--account <account>] [--model <model>]"
     );

@@ -169,6 +169,10 @@ const TUI_FILE_TARGET_CHOICES: &[ValueChoice] = &[
         value: "sifs:/users",
         detail: "browse user-owned SIFS files",
     },
+    ValueChoice {
+        value: "local:.",
+        detail: "browse local files from the current directory",
+    },
 ];
 
 const NODE_ROLE_CHOICES: &[ValueChoice] = &[
@@ -1276,16 +1280,16 @@ fn tui_slash_command_layer() -> Vec<CommandSpec> {
     vec![
         cmd(
             "files",
-            "open the TUI file manager for local files or SIFS",
+            "open the TUI file manager for SIFS by default",
             vec![],
             vec![option(
                 "--sifs",
-                "browse SIFS instead of local files",
+                "browse SIFS explicitly",
                 Some(value("path", "SIFS path", TUI_FILE_TARGET_CHOICES)),
             )],
             vec![value(
                 "path",
-                "local path or sifs:/path to open",
+                "SIFS path or local:<path> to open",
                 TUI_FILE_TARGET_CHOICES,
             )],
         ),
@@ -2290,6 +2294,20 @@ mod tests {
         );
         assert!(completions.items.iter().any(|item| item.label == "resume"));
         assert!(completions.items.iter().any(|item| item.label == "cluster"));
+
+        let file_targets = slash_completions_for_layer(
+            "/files ",
+            "/files ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("file target completions");
+        assert!(file_targets.items.iter().any(|item| item.label == "sifs:/"));
+        assert!(
+            file_targets
+                .items
+                .iter()
+                .any(|item| item.label == "local:.")
+        );
     }
 
     #[test]
