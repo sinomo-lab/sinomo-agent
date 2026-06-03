@@ -271,7 +271,7 @@ fn command_record_events_fetch_remote_sifs_log_content() {
     let reader = NodeId::from_legacy_named("node_sifs_command_events_reader").expect("reader");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -304,7 +304,7 @@ fn command_record_events_fetch_remote_sifs_log_content() {
     let owner_dfs = Arc::new(Mutex::new(owner_fs.into_inner()));
 
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("reader metadata");
     let reader_dfs = NetworkedDfsService::new(
         network.add_node(reader.clone()),
@@ -490,7 +490,7 @@ fn sandbox_workspace_sync_fetches_remote_sifs_source_content() {
     let reader = NodeId::from_legacy_named("node_sync_sifs_remote_reader").expect("reader");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -523,7 +523,7 @@ fn sandbox_workspace_sync_fetches_remote_sifs_source_content() {
     let owner_dfs = Arc::new(Mutex::new(owner_fs.into_inner()));
 
     let reader_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("reader metadata");
     let reader_dfs = NetworkedDfsService::new(
         network.add_node(reader),

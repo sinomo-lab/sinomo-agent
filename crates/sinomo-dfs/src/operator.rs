@@ -257,7 +257,7 @@ impl<'a> DfsOperatorInspector<'a> {
             receipts.extend(version_receipts);
         }
         let intents = intents_for_object_from_backend(self.backend, object_id)?;
-        let conflicts = self.backend.conflicts_for_object(object_id)?;
+        let conflicts = conflicts_for_object_from_backend(self.backend, object_id)?;
         let repairs = repairs_from_intents_and_receipts(&object, &intents, &receipts_by_version);
         let agent_state = agent_state_for(&object, &intents, &conflicts, &repairs);
         Ok(Some(DfsOperatorObjectView {
@@ -290,7 +290,10 @@ impl<'a> DfsOperatorInspector<'a> {
         let backend = self.backend;
         let mut conflicts = Vec::new();
         self.for_filtered_objects(file_system_id, object_id, |object| {
-            conflicts.extend(backend.conflicts_for_object(&object.object_id)?);
+            conflicts.extend(conflicts_for_object_from_backend(
+                backend,
+                &object.object_id,
+            )?);
             Ok(())
         })?;
         conflicts.sort_by(|left, right| {
@@ -421,11 +424,7 @@ impl<'a> DfsOperatorInspector<'a> {
         repairs.sort_by(|left, right| {
             left.object_id
                 .cmp(&right.object_id)
-                .then_with(|| left.version.cmp(&right.version))
-                .then_with(|| {
-                    left.missing_replica_node_id
-                        .cmp(&right.missing_replica_node_id)
-                })
+                .then_with(|| repair_view_order(left, right))
         });
         Ok(repairs)
     }
@@ -546,14 +545,14 @@ impl<'a> DfsOperatorInspector<'a> {
         let mut objects = Vec::new();
         self.for_filtered_objects(Some(file_system_id), None, |object| {
             let intents = intents_for_object_from_backend(backend, &object.object_id)?;
-            let conflicts = backend.conflicts_for_object(&object.object_id)?;
+            let has_open_conflict = object_has_open_conflict(backend, &object.object_id)?;
             let repairs = repairs_for_object_from_backend(backend, &object, &intents)?;
             objects.push(DfsAgentObjectSummary {
                 object_id: object.object_id.clone(),
                 path: object.path.clone(),
                 version: object.version.clone(),
                 content_hash: object.content_hash.clone(),
-                state: agent_state_for(&object, &intents, &conflicts, &repairs),
+                state: agent_state_from_flags(&object, &intents, has_open_conflict, &repairs),
             });
             Ok(())
         })?;
@@ -722,21 +721,58 @@ impl<'a> DfsOperatorInspector<'a> {
         limit: usize,
         output: &mut Vec<DfsOperatorRepairView>,
     ) -> Result<bool, MetadataBackendError> {
-        let intents = intents_for_object_from_backend(self.backend, &object.object_id)?;
-        let mut repairs = repairs_for_object_from_backend(self.backend, object, &intents)?;
-        repairs.sort_by(repair_view_order);
-        let mut emitted = 0usize;
-        for repair in repairs {
-            if !repair_is_after_cursor(&repair, cursor) {
-                continue;
-            }
-            if emitted >= limit {
-                return Ok(true);
-            }
-            output.push(repair);
-            emitted = emitted.saturating_add(1);
+        if limit == 0 {
+            return Ok(true);
         }
-        Ok(false)
+
+        let receipt_nodes_by_hash = current_version_receipt_nodes_by_hash(self.backend, object)?;
+        let mut candidates = BTreeMap::<(DfsVersion, NodeId, String), DfsOperatorRepairView>::new();
+        let mut intent_cursor = None;
+        loop {
+            let page = self.backend.intents_for_object_page(
+                &object.object_id,
+                intent_cursor.as_ref(),
+                OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for intent in page.intents {
+                if intent.status != DfsWriteIntentStatus::Committed
+                    || intent.target_version != object.version
+                {
+                    continue;
+                }
+                let receipt_nodes =
+                    receipt_nodes_for_intent_hash(&receipt_nodes_by_hash, &intent.content_hash);
+                let mut desired_replica_node_ids = intent.desired_replica_node_ids.clone();
+                desired_replica_node_ids.sort();
+                for node_id in desired_replica_node_ids {
+                    if receipt_nodes.contains(&node_id) {
+                        continue;
+                    }
+                    let repair = DfsOperatorRepairView {
+                        intent_id: intent.intent_id.clone(),
+                        file_system_id: intent.file_system_id.clone(),
+                        object_id: intent.object_id.clone(),
+                        version: intent.target_version.clone(),
+                        content_hash: intent.content_hash.clone(),
+                        missing_replica_node_id: node_id,
+                    };
+                    if !repair_is_after_cursor(&repair, cursor) {
+                        continue;
+                    }
+                    candidates.insert(repair_view_key(&repair), repair);
+                    if candidates.len() > limit.saturating_add(1) {
+                        candidates.pop_last();
+                    }
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            intent_cursor = Some(next_cursor);
+        }
+        let has_remaining = candidates.len() > limit;
+        output.extend(candidates.into_values().take(limit));
+        Ok(has_remaining)
     }
 }
 
@@ -805,13 +841,15 @@ fn repair_view_order(
     left: &DfsOperatorRepairView,
     right: &DfsOperatorRepairView,
 ) -> std::cmp::Ordering {
-    left.version
-        .cmp(&right.version)
-        .then_with(|| {
-            left.missing_replica_node_id
-                .cmp(&right.missing_replica_node_id)
-        })
-        .then_with(|| left.intent_id.cmp(&right.intent_id))
+    repair_view_key(left).cmp(&repair_view_key(right))
+}
+
+fn repair_view_key(repair: &DfsOperatorRepairView) -> (DfsVersion, NodeId, String) {
+    (
+        repair.version.clone(),
+        repair.missing_replica_node_id.clone(),
+        repair.intent_id.clone(),
+    )
 }
 
 fn repair_is_after_cursor(
@@ -899,6 +937,27 @@ fn intents_for_object_from_backend(
     Ok(intents)
 }
 
+fn conflicts_for_object_from_backend(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+) -> Result<Vec<DfsConflictRecord>, MetadataBackendError> {
+    let mut conflicts = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = backend.conflicts_for_object_page(
+            object_id,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        conflicts.extend(page.conflicts);
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(conflicts)
+}
+
 fn repairs_for_object_from_backend(
     backend: &dyn DfsMetadataBackend,
     object: &DfsObjectMetadata,
@@ -925,6 +984,74 @@ fn repairs_for_object_from_backend(
         intents,
         &receipts_by_version,
     ))
+}
+
+fn object_has_open_conflict(
+    backend: &dyn DfsMetadataBackend,
+    object_id: &DfsObjectId,
+) -> Result<bool, MetadataBackendError> {
+    let mut cursor = None;
+    loop {
+        let page = backend.conflicts_for_object_page(
+            object_id,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        if page
+            .conflicts
+            .iter()
+            .any(|conflict| conflict.status == DfsConflictStatus::Open)
+        {
+            return Ok(true);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(false);
+        };
+        cursor = Some(next_cursor);
+    }
+}
+
+fn current_version_receipt_nodes_by_hash(
+    backend: &dyn DfsMetadataBackend,
+    object: &DfsObjectMetadata,
+) -> Result<BTreeMap<Option<String>, BTreeSet<NodeId>>, MetadataBackendError> {
+    let mut nodes_by_hash = BTreeMap::<Option<String>, BTreeSet<NodeId>>::new();
+    let mut cursor = None;
+    loop {
+        let page = backend.receipts_for_version_page(
+            &object.object_id,
+            &object.version,
+            cursor.as_ref(),
+            OPERATOR_OBJECT_LOCAL_METADATA_PAGE_SIZE,
+        )?;
+        for receipt in page.receipts {
+            nodes_by_hash
+                .entry(receipt.content_hash.clone())
+                .or_default()
+                .insert(receipt.replica_node_id);
+        }
+        let Some(next_cursor) = page.next_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+    Ok(nodes_by_hash)
+}
+
+fn receipt_nodes_for_intent_hash(
+    nodes_by_hash: &BTreeMap<Option<String>, BTreeSet<NodeId>>,
+    content_hash: &Option<String>,
+) -> BTreeSet<NodeId> {
+    match content_hash {
+        Some(content_hash) => nodes_by_hash
+            .get(&Some(content_hash.clone()))
+            .cloned()
+            .unwrap_or_default(),
+        None => nodes_by_hash
+            .values()
+            .flat_map(|nodes| nodes.iter().cloned())
+            .collect(),
+    }
 }
 
 fn repairs_from_intents_and_receipts(
@@ -1097,10 +1224,19 @@ fn agent_state_for(
     conflicts: &[DfsConflictRecord],
     repairs: &[DfsOperatorRepairView],
 ) -> DfsAgentObjectState {
-    if conflicts
+    let has_open_conflict = conflicts
         .iter()
-        .any(|conflict| conflict.status == DfsConflictStatus::Open)
-    {
+        .any(|conflict| conflict.status == DfsConflictStatus::Open);
+    agent_state_from_flags(object, intents, has_open_conflict, repairs)
+}
+
+fn agent_state_from_flags(
+    object: &DfsObjectMetadata,
+    intents: &[DfsWriteIntentRecord],
+    has_open_conflict: bool,
+    repairs: &[DfsOperatorRepairView],
+) -> DfsAgentObjectState {
+    if has_open_conflict {
         return DfsAgentObjectState::Conflicted;
     }
     if intents
@@ -1199,7 +1335,7 @@ mod tests {
     use crate::{
         DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
         DfsObjectKind, DfsObjectMetadata, DfsReplicaReceiptRecord, DfsReplicationPolicy,
-        DfsWriteIntentRecord, LocalJsonMetadataBackend,
+        DfsWriteIntentRecord, LocalSobjMetadataBackend,
     };
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
     use sinomo_events::EventId;
@@ -1209,7 +1345,7 @@ mod tests {
     fn operator_inspector_reports_status_object_conflicts_and_repairs() {
         let root = temp_root("operator_inspector_reports_status_object_conflicts_and_repairs");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -1335,7 +1471,7 @@ mod tests {
     fn operator_inspector_counts_staging_intents_as_pending_writes() {
         let root = temp_root("operator_inspector_counts_staging_intents_as_pending_writes");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -1405,7 +1541,7 @@ mod tests {
     fn operator_inspector_ignores_superseded_version_repairs() {
         let root = temp_root("operator_inspector_ignores_superseded_version_repairs");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = DfsFileSystem {
             file_system_id: file_system_id(),
@@ -1529,7 +1665,7 @@ mod tests {
     fn operator_inspection_scans_conflicts_repairs_and_agent_summary_in_pages() {
         let root = temp_root("operator_inspection_scans_conflicts_repairs_in_pages");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend
             .put_file_system(&DfsFileSystem {
@@ -1733,6 +1869,139 @@ mod tests {
     }
 
     #[test]
+    fn operator_repair_pages_preserve_order_without_full_object_materialization() {
+        let root = temp_root("operator_repair_pages_preserve_order");
+        let mut backend =
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = DfsFileSystem {
+            file_system_id: file_system_id(),
+            display_name: "repo".to_string(),
+            owner_node_id: node("node_owner"),
+            subtree_policies: Vec::new(),
+        };
+        let object = DfsObjectMetadata {
+            object_id: object_id(),
+            file_system_id: file_system_id(),
+            path: "artifact.bin".to_string(),
+            kind: DfsObjectKind::Artifact,
+            owner_node_id: node("node_owner"),
+            current_locations: vec![node("node_owner")],
+            content_hash: Some("blake3:new".to_string()),
+            content_size_bytes: Some(1024),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: version("version_2"),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        backend.put_file_system(&file_system).expect("filesystem");
+        backend.put_object(&object).expect("object");
+        for (replica_node_id, content_hash) in [
+            (node("node_owner"), Some("blake3:new".to_string())),
+            (
+                node("node_seen_other_hash"),
+                Some("blake3:other".to_string()),
+            ),
+        ] {
+            backend
+                .put_receipt(&DfsReplicaReceiptRecord {
+                    receipt: DfsWriteReceipt {
+                        file_system_id: file_system_id(),
+                        object_id: object_id(),
+                        committed_version: version("version_2"),
+                        owner_node_id: node("node_owner"),
+                        event_id: EventId::generate(),
+                    },
+                    replica_node_id,
+                    content_hash,
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                })
+                .expect("receipt");
+        }
+        for (intent_id, content_hash, desired_replica_node_ids) in [
+            (
+                "dfs_intent_missing_b",
+                Some("blake3:new".to_string()),
+                vec![node("node_owner"), node("node_b")],
+            ),
+            (
+                "dfs_intent_missing_a",
+                Some("blake3:new".to_string()),
+                vec![node("node_owner"), node("node_a")],
+            ),
+            (
+                "dfs_intent_missing_c_hashless",
+                None,
+                vec![
+                    node("node_owner"),
+                    node("node_seen_other_hash"),
+                    node("node_c"),
+                ],
+            ),
+        ] {
+            backend
+                .put_intent(&DfsWriteIntentRecord {
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id(),
+                    object_id: object_id(),
+                    base_version: Some(version("version_1")),
+                    target_version: version("version_2"),
+                    coordinator_node_id: node("node_owner"),
+                    owner_epoch: 1,
+                    desired_replica_node_ids,
+                    policy: DfsReplicationPolicy::new(1, 3).expect("policy"),
+                    status: DfsWriteIntentStatus::Committed,
+                    content_hash,
+                    object_metadata: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH,
+                    updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                })
+                .expect("intent");
+        }
+
+        let inspector = DfsOperatorInspector::new(&backend);
+        let first_page = inspector
+            .repairs_page(None, Some(&object_id()), Some(2), None)
+            .expect("first page");
+        assert_eq!(
+            first_page
+                .repairs
+                .iter()
+                .map(|repair| repair.missing_replica_node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![node("node_a"), node("node_b")]
+        );
+        assert!(first_page.next_cursor.is_some());
+        let second_page = inspector
+            .repairs_page(
+                None,
+                Some(&object_id()),
+                Some(2),
+                first_page.next_cursor.as_ref(),
+            )
+            .expect("second page");
+        assert_eq!(
+            second_page
+                .repairs
+                .iter()
+                .map(|repair| repair.missing_replica_node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![node("node_c")]
+        );
+        assert!(second_page.next_cursor.is_none());
+
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn local_pin_store_adds_lists_and_removes_records() {
         let root = temp_root("local_pin_store_adds_lists_and_removes_records");
         let store = LocalDfsPinStore::new(&root);
@@ -1802,7 +2071,7 @@ mod tests {
     fn operator_status_aggregates_counts_across_multiple_objects() {
         let root = temp_root("operator_status_aggregates_counts_across_multiple_objects");
         let mut backend =
-            LocalJsonMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(crate::DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend
             .put_file_system(&DfsFileSystem {

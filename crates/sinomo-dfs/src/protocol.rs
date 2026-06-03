@@ -39,6 +39,10 @@ pub struct DfsReadRequest {
     pub range_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub range_max_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub start_chunk_index: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_chunks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -55,6 +59,10 @@ pub struct DfsReadResponseChunk {
     pub version: DfsVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_total_size_bytes: Option<u64>,
     pub total_size_bytes: u64,
     pub chunk_index: u32,
     pub total_chunks: u32,
@@ -194,6 +202,27 @@ pub struct DfsStagePatchCommand {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsStagePatchChunkCommand {
+    pub request_id: String,
+    pub intent_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub base_version: DfsVersion,
+    pub version: DfsVersion,
+    pub content_hash: String,
+    pub offset: u64,
+    pub patch_hash: String,
+    pub total_size_bytes: u64,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_hash: Option<String>,
+    pub bytes: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_metadata: Option<DfsObjectMetadata>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsCommitVersionCommand {
     pub request_id: String,
     pub intent_id: String,
@@ -273,6 +302,8 @@ pub struct DfsFetchBlobCommand {
     pub content_hash: String,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub start_chunk_index: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub max_chunks: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -396,6 +427,7 @@ pub enum DfsNetworkMessage {
     StageBlob(DfsStageBlobCommand),
     StageBlobChunk(DfsStageBlobChunkCommand),
     StagePatch(DfsStagePatchCommand),
+    StagePatchChunk(DfsStagePatchChunkCommand),
     StageBlobResponse(DfsStageBlobResponse),
     CommitVersion(DfsCommitVersionCommand),
     CommitVersionResponse(DfsCommitVersionResponse),

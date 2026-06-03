@@ -8,6 +8,7 @@ use crate::DfsFileSystemId;
 use crate::{SIFS_FILE_SYSTEM_ID, namespace::sifs_node_files_path};
 use serde::{Deserialize, Serialize};
 use sinomo_node::NodeId;
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
@@ -20,7 +21,7 @@ pub enum DfsExposeStoreError {
     #[error("io error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("config serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
+    Serde(String),
     #[error("invalid DFS exposure config: {0}")]
     InvalidConfig(String),
 }
@@ -151,6 +152,12 @@ pub struct DfsExposeStore {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DfsExposeConfigFormat {
+    Sobj,
+    Json,
+}
+
 impl DfsExposeStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -161,16 +168,11 @@ impl DfsExposeStore {
     }
 
     pub fn load(&self) -> Result<DfsExposeConfig, DfsExposeStoreError> {
-        if !self.path.exists() {
-            return Ok(DfsExposeConfig::empty());
-        }
-        let bytes = fs::read(&self.path).map_err(|source| DfsExposeStoreError::Io {
-            path: self.path.clone(),
-            source,
-        })?;
-        let config: DfsExposeConfig = serde_json::from_slice(&bytes)?;
-        config.validate()?;
-        Ok(config)
+        self.load_source().map(|loaded| {
+            loaded
+                .map(|(config, _)| config)
+                .unwrap_or_else(DfsExposeConfig::empty)
+        })
     }
 
     pub fn save(&self, config: &DfsExposeConfig) -> Result<(), DfsExposeStoreError> {
@@ -187,7 +189,7 @@ impl DfsExposeStore {
                 source,
             })?;
         }
-        let bytes = serde_json::to_vec_pretty(config)?;
+        let bytes = encode_expose_config(config, expose_config_format(&self.path))?;
         write_expose_config_atomic(&self.path, &bytes)
     }
 
@@ -196,8 +198,10 @@ impl DfsExposeStore {
         data_dir: &Path,
         node_id: NodeId,
     ) -> Result<DfsExposeConfig, DfsExposeStoreError> {
-        let mut config = self.load()?;
-        if config.ensure_default_for_node(data_dir, node_id) {
+        let (mut config, loaded_from_legacy_json) = self
+            .load_source()?
+            .unwrap_or_else(|| (DfsExposeConfig::empty(), false));
+        if config.ensure_default_for_node(data_dir, node_id) || loaded_from_legacy_json {
             self.save(&config)?;
         }
         Ok(config)
@@ -237,6 +241,20 @@ impl DfsExposeStore {
         let removed = before != config.entries.len();
         self.save(&config)?;
         Ok((config, removed))
+    }
+
+    fn load_source(&self) -> Result<Option<(DfsExposeConfig, bool)>, DfsExposeStoreError> {
+        if self.path.exists() {
+            return read_expose_config(&self.path, expose_config_format(&self.path))
+                .map(|config| Some((config, false)));
+        }
+        if let Some(legacy_path) = legacy_json_path(&self.path)
+            && legacy_path.exists()
+        {
+            return read_expose_config(&legacy_path, DfsExposeConfigFormat::Json)
+                .map(|config| Some((config, true)));
+        }
+        Ok(None)
     }
 }
 
@@ -492,6 +510,48 @@ fn info_for_path(
     }
 }
 
+fn expose_config_format(path: &Path) -> DfsExposeConfigFormat {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+        DfsExposeConfigFormat::Json
+    } else {
+        DfsExposeConfigFormat::Sobj
+    }
+}
+
+fn legacy_json_path(path: &Path) -> Option<PathBuf> {
+    (expose_config_format(path) == DfsExposeConfigFormat::Sobj).then(|| path.with_extension("json"))
+}
+
+fn read_expose_config(
+    path: &Path,
+    format: DfsExposeConfigFormat,
+) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+    let bytes = fs::read(path).map_err(|source| DfsExposeStoreError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let config: DfsExposeConfig = match format {
+        DfsExposeConfigFormat::Sobj => sinomo_object_serde::from_bytes(&bytes)
+            .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))?,
+        DfsExposeConfigFormat::Json => serde_json::from_slice(&bytes)
+            .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))?,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn encode_expose_config(
+    config: &DfsExposeConfig,
+    format: DfsExposeConfigFormat,
+) -> Result<Vec<u8>, DfsExposeStoreError> {
+    match format {
+        DfsExposeConfigFormat::Sobj => sinomo_object_serde::to_bytes(config, 1, LengthMode::U32)
+            .map_err(|source| DfsExposeStoreError::Serde(source.to_string())),
+        DfsExposeConfigFormat::Json => serde_json::to_vec_pretty(config)
+            .map_err(|source| DfsExposeStoreError::Serde(source.to_string())),
+    }
+}
+
 fn write_expose_config_atomic(path: &Path, bytes: &[u8]) -> Result<(), DfsExposeStoreError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| DfsExposeStoreError::Io {
@@ -623,7 +683,8 @@ mod tests {
     #[test]
     fn expose_store_adds_replaces_and_removes_entries() {
         let root = temp_root("store_mutations");
-        let store = DfsExposeStore::new(root.join("expose.json"));
+        let store_path = root.join("expose.sobj");
+        let store = DfsExposeStore::new(&store_path);
         let node_id = NodeId::from_legacy_named("node_alpha").expect("node id");
 
         let config = store
@@ -661,6 +722,39 @@ mod tests {
         let (config, removed) = store.remove_entry("project").expect("remove");
         assert!(removed);
         assert!(config.entries.is_empty());
+        let stored_config: DfsExposeConfig =
+            sinomo_object_serde::from_bytes(&fs::read(&store_path).expect("read config"))
+                .expect("sobj config");
+        assert_eq!(stored_config, config);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expose_store_migrates_legacy_json_config_to_sobj_default() {
+        let root = temp_root("store_legacy_json_migration");
+        let legacy_path = root.join("dfs-expose.json");
+        let store_path = root.join("dfs-expose.sobj");
+        let node_id = NodeId::from_legacy_named("node_alpha").expect("node id");
+        let config = DfsExposeConfig::default_for_node(&root, node_id.clone());
+        fs::create_dir_all(&root).expect("root");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&config).expect("legacy json"),
+        )
+        .expect("write legacy json");
+
+        let store = DfsExposeStore::new(&store_path);
+        assert_eq!(store.load().expect("load legacy json"), config);
+
+        let migrated = store
+            .ensure_default(&root, node_id)
+            .expect("ensure default migrates");
+        assert_eq!(migrated, config);
+        let stored_config: DfsExposeConfig =
+            sinomo_object_serde::from_bytes(&fs::read(&store_path).expect("read sobj"))
+                .expect("sobj config");
+        assert_eq!(stored_config, config);
+
         let _ = fs::remove_dir_all(root);
     }
 

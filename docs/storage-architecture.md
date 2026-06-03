@@ -11,13 +11,13 @@ The storage crate exposes the vocabulary and mechanics:
 
 Downstream crates expose `register_storage_paths(&mut StorageLayout)` functions. The runtime facade composes the R1 catalog from those owner-crate functions instead of asking `sinomo-storage` to know every subsystem path. Application commands can extend that composed layout with higher-ring registrations before verification; for example, install-time verification adds the self-evolution storage subtree from `sinomo-evolution`.
 
-The default storage rule is binary first. Internal state should use `sinomo-object` or another binary format. Human-readable text is reserved for files people are expected to inspect or edit directly, such as local configuration. External-system files may use the format required by that system.
+The default storage rule is binary first. Internal state should use `sinomo-object` or another binary format. Human-readable text is reserved for files people are expected to inspect or edit directly, for CLI/service display, or for artifacts intended for human or agent review. External-system files may use the format required by that system.
 
 Layouts may include escape paths for intentionally open subtrees. For example, `workspace/` can be declared as an escape path when it may contain arbitrary user files. Escape paths must include a reason so agents and diagnostics can explain why detailed file ownership stops at that directory. Escape registration still belongs next to the subsystem that owns or exposes that subtree.
 
-Human and external configuration subtrees are also explicit escapes. The local crate registers `config/` for local human-readable configuration and `providers/` for provider credentials or provider-specific files whose formats are dictated by external systems.
+Human and external configuration subtrees are also explicit escapes. The local crate registers `config/` for local configuration and `providers/` for provider credentials or provider-specific files whose formats are dictated by external systems. Files under `config/` are not all text: subsystem-owned internal config may use SOBJ when humans are not expected to edit it directly. DFS local exposure config defaults to `config/dfs-expose.sobj` and keeps legacy JSON reads only for migration or explicit compatibility paths.
 
-Dynamic DFS roots are registered by `sinomo-dfs` as escapes at the subtree level. That registration covers content-addressed blob/object storage, metadata records and journals, the default `dfs/metadata/root` shard, operator records, pin records, and local-owned `files/`.
+Dynamic DFS roots are registered by `sinomo-dfs` as escapes at the subtree level. That registration covers content-addressed blob/object storage, metadata table snapshots and logs, metadata journals, the default `dfs/metadata/root` shard, shard-index records, metadata-replication cursors, operator records, pin records, and local-owned `files/`.
 
 Higher-ring agent artifacts are tracked at subtree boundaries by their owning crate. `sinomo-evolution` registers `evolution/` as an R2 escape because it stores campaign/job JSON, logs, and candidate workspaces intended for agent and operator inspection.
 

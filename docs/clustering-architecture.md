@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Sinomo clustering turns a single local runtime into a small to medium trusted node set. The cluster is the control plane for distributed sessions, service placement, replicated configuration, and the distributed filesystem metadata layer.
+Sinomo clustering turns a single local runtime into a small to medium trusted node set. The cluster is the control plane for distributed sessions, service placement, replicated configuration, and distributed filesystem routing.
 
 The first implementation should optimize for correctness, debuggability, and local-first operation rather than internet-scale membership. A normal cluster is expected to fit comfortably in memory on every node. Every node may store basic metadata for every other node, including identity, capabilities, advertised endpoints, health, and replication role.
 
@@ -12,7 +12,7 @@ The first implementation should optimize for correctness, debuggability, and loc
 - Large fleet orchestration.
 - Anonymous peer-to-peer membership.
 - Replacing Git, object stores, or local filesystems.
-- High-throughput data-plane replication for large file content in the cluster KV.
+- Using the cluster KV as a high-throughput large-content replication path.
 
 The cluster KV is for compact, strongly ordered control-plane state. Large artifacts and file bytes belong in DFS content stores, local filesystems, Git repositories, or future object stores.
 
@@ -240,7 +240,7 @@ The KV is not a general database. It stores:
 - capability advertisements
 - service registry records
 - active session summaries
-- DFS workspace and object metadata
+- DFS filesystem config, shard placement, service routing, and compact policies
 - policy config
 - rollout desired state
 - small coordination leases
@@ -334,10 +334,12 @@ Use slash-delimited namespaces:
 /services/<service_name>/<node_id>
 /sessions/<session_id>/summary
 /sessions/<session_id>/participants/<node_id>
-/dfs/workspaces/<workspace_id>
-/dfs/objects/<workspace_id>/<object_id>
-/dfs/paths/<workspace_id>/<escaped_path>
-/dfs/locks/<workspace_id>/<object_id>
+/dfs/filesystems/<file_system_id>/config
+/dfs/filesystems/<file_system_id>/metadata-shards/<shard_id>
+/dfs/services/metadata/<node_id>
+/dfs/services/content/<node_id>
+/dfs/policies/<policy_id>
+/dfs/locks/<file_system_id>/<object_id>
 /policy/<domain>/<key>
 ```
 
@@ -353,36 +355,42 @@ Leases are used for ephemeral liveness and coordination:
 - DFS write locks where a policy requires serialization
 - temporary rollout reservations
 
-Lease loss must be treated as a hint, not proof that durable state should be deleted. Durable membership and DFS metadata require explicit committed mutations.
+Lease loss must be treated as a hint, not proof that durable state should be deleted. Durable membership and DFS shard assignments require explicit committed mutations.
 
 ## DFS Foundation
 
-The DFS builds on the cluster KV as its metadata and coordination plane.
+The DFS uses the cluster KV for compact routing and placement configuration. High-cardinality namespace, object, version, receipt, intent, conflict, and directory records live in DFS metadata shards, not in the cluster KV.
 
-KV-owned DFS metadata:
+KV-owned DFS control records:
 
-- workspace records
-- object metadata
-- path-to-object indexes
-- owner node
-- current locations
-- object policy
-- version and content hash
-- replica requirements
+- filesystem config
+- metadata-shard primary and replica assignment
+- metadata service advertisements
+- content service advertisements
+- compact policy records
+- optional coarse write locks where a policy requires serialization
+
+DFS metadata shards own the durable filesystem truth:
+
+- object metadata and path indexes
+- owner node and visible version
+- content hashes and manifests
+- replica requirements and receipts
 - conflict records
 - write intent records
+- namespace transactions and bounded namespace jobs
 
-DFS content remains outside the KV. Content is stored locally on owner/replica nodes and addressed by object ID, version, and content hash.
+DFS content also remains outside the KV. Content is stored locally on owner/replica nodes and addressed by object ID, version, and content hash.
 
 Write behavior:
 
-- `local-owned`: KV records route writes to the owner node.
-- `replicated-confirmed`: KV write intent is committed, replicas store content, then visible version advances after required receipts.
+- `local-owned`: shard metadata routes writes to the owner node.
+- `replicated-confirmed`: a DFS write intent is committed, replicas store content, then visible version advances after required receipts.
 - `replicated-eventual`: owner advances visible version and schedules replication.
 - `append-only`: each append creates an immutable object version or chunk.
 - `ephemeral-local`: no cluster KV metadata unless promoted.
 
-The KV gives every node a consistent answer to "who owns this object, what version is current, and where can I fetch it?" The DFS data plane handles bytes separately.
+The KV gives every node a consistent answer to "which metadata shard is responsible and where is its primary?" The DFS metadata plane answers "who owns this object, what version is current, and where can I fetch it?" The DFS data plane handles bytes separately.
 
 ## Event Routing Integration
 
@@ -472,9 +480,9 @@ Phase 4, roaming:
 
 Phase 5, DFS integration:
 
-- Move DFS metadata coordination into the KV.
-- Implement write intents, replica receipts, object version advancement, and conflict records.
-- Keep content transfer in DFS data-plane protocols.
+- Integrate DFS with the KV for filesystem config, metadata-shard assignment, and service routing. Implemented as compact DFS control-plane records while high-cardinality metadata remains in DFS metadata backends.
+- Implement write intents, replica receipts, object version advancement, and conflict records. Implemented in DFS metadata shards with replayable journals, compact materialized tables, and restart recovery.
+- Keep content transfer in DFS data-plane protocols. Implemented through DFS network messages, including chunked large-object transfer with bounded windows and per-chunk checksums.
 
 Phase 6, operations:
 

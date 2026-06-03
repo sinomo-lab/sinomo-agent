@@ -482,6 +482,61 @@ pub struct DfsWriteIntentPage {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsWriteIntentScanCursor {
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub intent_id: String,
+    pub object_id: DfsObjectId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsWriteIntentScanPage {
+    pub intents: Vec<DfsWriteIntentRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsWriteIntentScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectVersionScanCursor {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsObjectVersionScanPage {
+    pub versions: Vec<DfsObjectVersionRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsObjectVersionScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaReceiptScanCursor {
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub replica_node_id: NodeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsReplicaReceiptScanPage {
+    pub receipts: Vec<DfsReplicaReceiptRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsReplicaReceiptScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsConflictScanCursor {
+    pub object_id: DfsObjectId,
+    pub conflict_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsConflictScanPage {
+    pub conflicts: Vec<DfsConflictRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsConflictScanCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsDirectoryPageCursor {
     pub path: String,
     pub object_id: DfsObjectId,
@@ -503,6 +558,18 @@ pub struct DfsDirectoryPage {
     pub objects: Vec<DfsObjectMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<DfsDirectoryPageCursor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceJobPageCursor {
+    pub job_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceJobPage {
+    pub jobs: Vec<DfsNamespaceJobRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsNamespaceJobPageCursor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -939,35 +1006,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     fn objects_for_file_system(
         &self,
         file_system_id: &DfsFileSystemId,
-    ) -> Result<Vec<DfsObjectMetadata>>;
+    ) -> Result<Vec<DfsObjectMetadata>> {
+        let mut objects = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            objects.extend(page.objects);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(objects)
+    }
+
     fn objects_for_file_system_page(
         &self,
         file_system_id: &DfsFileSystemId,
         after: Option<&DfsObjectPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsObjectPage> {
-        if max_entries == 0 {
-            return Ok(DfsObjectPage {
-                objects: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut objects = self.objects_for_file_system(file_system_id)?;
-        if let Some(after) = after {
-            objects.retain(|object| object_page_key(object) > (&after.path, &after.object_id));
-        }
-        let has_more = objects.len() > max_entries;
-        objects.truncate(max_entries);
-        let next_cursor = if has_more {
-            objects.last().map(object_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsObjectPage {
-            objects,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsObjectPage>;
     fn count_objects_for_file_system(&self, file_system_id: &DfsFileSystemId) -> Result<usize> {
         const COUNT_PAGE_SIZE: usize = 4096;
         let mut count = 0usize;
@@ -1053,20 +1115,59 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 next_cursor: None,
             });
         }
-        let mut objects = self.child_objects_for_directory(file_system_id, directory_path)?;
-        if let Some(after) = after {
-            objects.retain(|object| directory_page_key(object) > (&after.path, &after.object_id));
-        }
-        let has_more = objects.len() > max_entries;
-        objects.truncate(max_entries);
-        let next_cursor = if has_more {
-            objects.last().map(directory_page_cursor)
+        let directory_path = normalize_posix_path(directory_path);
+        let prefix = if directory_path == "/" {
+            "/".to_string()
         } else {
-            None
+            format!("{}/", directory_path.trim_end_matches('/'))
         };
+        let mut object_cursor = after.map(|cursor| DfsObjectPageCursor {
+            path: cursor.path.clone(),
+            object_id: cursor.object_id.clone(),
+            shard_id: cursor.shard_id.clone(),
+        });
+        let mut objects = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        'pages: loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                object_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for object in page.objects {
+                let object_path = normalize_posix_path(&object.path);
+                if object.kind == DfsObjectKind::Tombstone
+                    || object_path == directory_path
+                    || !object_path.starts_with(&prefix)
+                {
+                    continue;
+                }
+                let rest = object_path.trim_start_matches(&prefix);
+                if rest.is_empty() || rest.contains('/') {
+                    continue;
+                }
+                if objects.len() >= max_entries {
+                    has_more = true;
+                    break 'pages;
+                }
+                let object_cursor = self.object_page_cursor_for_object(&object)?;
+                last_cursor = Some(DfsDirectoryPageCursor {
+                    path: object_cursor.path,
+                    object_id: object_cursor.object_id,
+                    dentry: None,
+                    shard_id: object_cursor.shard_id,
+                });
+                objects.push(object);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            object_cursor = Some(next_cursor);
+        }
         Ok(DfsDirectoryPage {
             objects,
-            next_cursor,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
         })
     }
     fn hardlinks_to_object(
@@ -1114,20 +1215,37 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 next_cursor: None,
             });
         }
-        let mut hardlinks = self.hardlinks_to_object(file_system_id, target_object_id)?;
-        if let Some(after) = after {
-            hardlinks.retain(|object| object_page_key(object) > (&after.path, &after.object_id));
+        let mut object_cursor = after.cloned();
+        let mut hardlinks = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        'pages: loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                object_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for object in page.objects {
+                if object.kind != DfsObjectKind::Hardlink
+                    || object.link_target_object_id.as_ref() != Some(target_object_id)
+                {
+                    continue;
+                }
+                if hardlinks.len() >= max_entries {
+                    has_more = true;
+                    break 'pages;
+                }
+                last_cursor = Some(self.object_page_cursor_for_object(&object)?);
+                hardlinks.push(object);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            object_cursor = Some(next_cursor);
         }
-        let has_more = hardlinks.len() > max_entries;
-        hardlinks.truncate(max_entries);
-        let next_cursor = if has_more {
-            hardlinks.last().map(object_page_cursor)
-        } else {
-            None
-        };
         Ok(DfsObjectPage {
             objects: hardlinks,
-            next_cursor,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
         })
     }
     fn hardlink_count_to_object(
@@ -1189,40 +1307,44 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         }
     }
     fn put_version(&mut self, version: &DfsObjectVersionRecord) -> Result<DfsMetadataJournalEntry>;
+    fn put_object_and_version(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let object_entry = self.put_object(object)?;
+        let version_entry = self.put_version(version)?;
+        Ok(vec![object_entry, version_entry])
+    }
     fn get_version(
         &self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>>;
-    fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>>;
+    fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
+        let mut versions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.versions_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(versions)
+    }
+
     fn versions_for_object_page(
         &self,
         object_id: &DfsObjectId,
         after: Option<&DfsObjectVersionPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsObjectVersionPage> {
-        if max_entries == 0 {
-            return Ok(DfsObjectVersionPage {
-                versions: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut versions = self.versions_for_object(object_id)?;
-        if let Some(after) = after {
-            versions.retain(|version| version.version > after.version);
-        }
-        let has_more = versions.len() > max_entries;
-        versions.truncate(max_entries);
-        let next_cursor = if has_more {
-            versions.last().map(object_version_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsObjectVersionPage {
-            versions,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsObjectVersionPage>;
     fn put_receipt(&mut self, receipt: &DfsReplicaReceiptRecord)
     -> Result<DfsMetadataJournalEntry>;
     fn put_receipt_for_object(
@@ -1237,36 +1359,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
-    ) -> Result<Vec<DfsReplicaReceiptRecord>>;
+    ) -> Result<Vec<DfsReplicaReceiptRecord>> {
+        let mut receipts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.receipts_for_version_page(
+                object_id,
+                version,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            receipts.extend(page.receipts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(receipts)
+    }
+
     fn receipts_for_version_page(
         &self,
         object_id: &DfsObjectId,
         version: &DfsVersion,
         after: Option<&DfsReplicaReceiptPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsReplicaReceiptPage> {
-        if max_entries == 0 {
-            return Ok(DfsReplicaReceiptPage {
-                receipts: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut receipts = self.receipts_for_version(object_id, version)?;
-        if let Some(after) = after {
-            receipts.retain(|receipt| receipt.replica_node_id > after.replica_node_id);
-        }
-        let has_more = receipts.len() > max_entries;
-        receipts.truncate(max_entries);
-        let next_cursor = if has_more {
-            receipts.last().map(replica_receipt_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsReplicaReceiptPage {
-            receipts,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsReplicaReceiptPage>;
     fn put_intent(&mut self, intent: &DfsWriteIntentRecord) -> Result<DfsMetadataJournalEntry>;
     fn put_intent_for_object(
         &mut self,
@@ -1281,10 +1399,34 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         intent_id: &str,
     ) -> Result<Option<DfsWriteIntentRecord>>;
-    fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>>;
+    fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
+        let mut intents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.intents_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(intents)
+    }
+
     fn intents_for_object_page(
         &self,
         object_id: &DfsObjectId,
+        after: Option<&DfsWriteIntentPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentPage>;
+    fn intents_for_object_version_page(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
         after: Option<&DfsWriteIntentPageCursor>,
         max_entries: usize,
     ) -> Result<DfsWriteIntentPage> {
@@ -1294,172 +1436,116 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
                 next_cursor: None,
             });
         }
-        let mut intents = self.intents_for_object(object_id)?;
-        if let Some(after) = after {
-            intents.retain(|intent| intent.intent_id > after.intent_id);
+        let mut intents = Vec::new();
+        let mut cursor = after.cloned();
+        loop {
+            let page = self.intents_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            for intent in page.intents {
+                if intent.target_version != *target_version {
+                    continue;
+                }
+                if intents.len() >= max_entries {
+                    return Ok(DfsWriteIntentPage {
+                        next_cursor: intents.last().map(write_intent_page_cursor),
+                        intents,
+                    });
+                }
+                intents.push(intent);
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
-        let has_more = intents.len() > max_entries;
-        intents.truncate(max_entries);
-        let next_cursor = if has_more {
-            intents.last().map(write_intent_page_cursor)
-        } else {
-            None
-        };
         Ok(DfsWriteIntentPage {
             intents,
-            next_cursor,
+            next_cursor: None,
         })
     }
-    /// Returns every version record in the backend. The default aggregates per
-    /// object so any backend stays correct; backends with a materialized table
-    /// should override this with a single scan to avoid per-object queries.
+    fn write_intents_page(
+        &self,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentScanPage>;
+    fn version_records_page(
+        &self,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectVersionScanPage>;
+    fn receipt_records_page(
+        &self,
+        after: Option<&DfsReplicaReceiptScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsReplicaReceiptScanPage>;
+    fn conflict_records_page(
+        &self,
+        after: Option<&DfsConflictScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictScanPage>;
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
         let mut versions = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut version_cursor = None;
-                    loop {
-                        let version_page = self.versions_for_object_page(
-                            &object.object_id,
-                            version_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        versions.extend(version_page.versions);
-                        let Some(next_cursor) = version_page.next_cursor else {
-                            break;
-                        };
-                        version_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page =
+                self.version_records_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(versions)
     }
-    /// Returns every replica receipt in the backend. See [`Self::all_versions`].
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
         let mut receipts = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut version_cursor = None;
-                    loop {
-                        let version_page = self.versions_for_object_page(
-                            &object.object_id,
-                            version_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        for version in version_page.versions {
-                            let mut receipt_cursor = None;
-                            loop {
-                                let receipt_page = self.receipts_for_version_page(
-                                    &object.object_id,
-                                    &version.version,
-                                    receipt_cursor.as_ref(),
-                                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                                )?;
-                                receipts.extend(receipt_page.receipts);
-                                let Some(next_cursor) = receipt_page.next_cursor else {
-                                    break;
-                                };
-                                receipt_cursor = Some(next_cursor);
-                            }
-                        }
-                        let Some(next_cursor) = version_page.next_cursor else {
-                            break;
-                        };
-                        version_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page =
+                self.receipt_records_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            receipts.extend(page.receipts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(receipts)
     }
-    /// Returns every write intent in the backend. See [`Self::all_versions`].
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
         let mut intents = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut intent_cursor = None;
-                    loop {
-                        let intent_page = self.intents_for_object_page(
-                            &object.object_id,
-                            intent_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        intents.extend(intent_page.intents);
-                        let Some(next_cursor) = intent_page.next_cursor else {
-                            break;
-                        };
-                        intent_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page = self.write_intents_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(intents)
     }
-    /// Returns every conflict record in the backend. See [`Self::all_versions`].
+    /// Compatibility helper for callers that still need a full materialized
+    /// list. Implementations should expose the paged scan APIs as primitives.
     fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
         let mut conflicts = Vec::new();
-        for file_system in self.list_file_systems()? {
-            let mut object_cursor = None;
-            loop {
-                let object_page = self.objects_for_file_system_page(
-                    &file_system.file_system_id,
-                    object_cursor.as_ref(),
-                    OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                )?;
-                for object in object_page.objects {
-                    let mut conflict_cursor = None;
-                    loop {
-                        let conflict_page = self.conflicts_for_object_page(
-                            &object.object_id,
-                            conflict_cursor.as_ref(),
-                            OBJECT_LOCAL_METADATA_PAGE_SIZE,
-                        )?;
-                        conflicts.extend(conflict_page.conflicts);
-                        let Some(next_cursor) = conflict_page.next_cursor else {
-                            break;
-                        };
-                        conflict_cursor = Some(next_cursor);
-                    }
-                }
-                let Some(next_cursor) = object_page.next_cursor else {
-                    break;
-                };
-                object_cursor = Some(next_cursor);
-            }
+        let mut cursor = None;
+        loop {
+            let page =
+                self.conflict_records_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(conflicts)
     }
@@ -1601,22 +1687,32 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         summary: &mut DfsMetadataSummary,
         file_system_scope: Option<&DfsFileSystemId>,
     ) -> Result<()> {
-        for job in self.list_namespace_jobs()? {
-            if file_system_scope.is_some_and(|file_system_id| job.file_system_id != *file_system_id)
-            {
-                continue;
-            }
-            match job.status {
-                DfsNamespaceJobStatus::Running => {
-                    summary.pending_namespace_job_count =
-                        summary.pending_namespace_job_count.saturating_add(1);
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            for job in page.jobs {
+                if file_system_scope
+                    .is_some_and(|file_system_id| job.file_system_id != *file_system_id)
+                {
+                    continue;
                 }
-                DfsNamespaceJobStatus::Failed => {
-                    summary.failed_namespace_job_count =
-                        summary.failed_namespace_job_count.saturating_add(1);
+                match job.status {
+                    DfsNamespaceJobStatus::Running => {
+                        summary.pending_namespace_job_count =
+                            summary.pending_namespace_job_count.saturating_add(1);
+                    }
+                    DfsNamespaceJobStatus::Failed => {
+                        summary.failed_namespace_job_count =
+                            summary.failed_namespace_job_count.saturating_add(1);
+                    }
+                    DfsNamespaceJobStatus::Completed => {}
                 }
-                DfsNamespaceJobStatus::Completed => {}
             }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(())
     }
@@ -1663,6 +1759,13 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         &mut self,
         transaction: &DfsNamespaceTransaction,
     ) -> Result<DfsMetadataJournalEntry>;
+    fn get_namespace_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransaction>> {
+        let _ = transaction_id;
+        Ok(None)
+    }
     fn compact_tombstones(
         &mut self,
         options: DfsTombstoneCompactionOptions,
@@ -1679,7 +1782,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         Ok(None)
     }
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
-        Ok(Vec::new())
+        let mut jobs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            jobs.extend(page.jobs);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(jobs)
+    }
+    fn list_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        let _ = after;
+        let _ = max_entries;
+        Ok(DfsNamespaceJobPage {
+            jobs: Vec::new(),
+            next_cursor: None,
+        })
     }
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry>;
     fn get_conflict(
@@ -1687,36 +1813,30 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         conflict_id: &str,
     ) -> Result<Option<DfsConflictRecord>>;
-    fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>>;
+    fn conflicts_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsConflictRecord>> {
+        let mut conflicts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.conflicts_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(conflicts)
+    }
+
     fn conflicts_for_object_page(
         &self,
         object_id: &DfsObjectId,
         after: Option<&DfsConflictPageCursor>,
         max_entries: usize,
-    ) -> Result<DfsConflictPage> {
-        if max_entries == 0 {
-            return Ok(DfsConflictPage {
-                conflicts: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        let mut conflicts = self.conflicts_for_object(object_id)?;
-        conflicts.sort_by(|left, right| left.conflict_id.cmp(&right.conflict_id));
-        if let Some(after) = after {
-            conflicts.retain(|conflict| conflict.conflict_id > after.conflict_id);
-        }
-        let has_more = conflicts.len() > max_entries;
-        conflicts.truncate(max_entries);
-        let next_cursor = if has_more {
-            conflicts.last().map(conflict_page_cursor)
-        } else {
-            None
-        };
-        Ok(DfsConflictPage {
-            conflicts,
-            next_cursor,
-        })
-    }
+    ) -> Result<DfsConflictPage>;
     fn update_conflict_status(
         &mut self,
         object_id: &DfsObjectId,
@@ -1782,7 +1902,7 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
 }
 
 #[derive(Clone, Debug)]
-pub struct LocalJsonMetadataBackend {
+pub struct LocalSobjMetadataBackend {
     shard_id: DfsMetadataShardId,
     root: PathBuf,
     next_sequence: u64,
@@ -1814,6 +1934,8 @@ struct DfsMetadataTables {
     versions: BTreeMap<(DfsObjectId, DfsVersion), DfsObjectVersionRecord>,
     receipts: BTreeMap<(DfsObjectId, DfsVersion, NodeId), DfsReplicaReceiptRecord>,
     intents: BTreeMap<(DfsObjectId, String), DfsWriteIntentRecord>,
+    intent_order: BTreeMap<(OffsetDateTime, String, DfsObjectId), (DfsObjectId, String)>,
+    intent_targets: BTreeMap<(DfsObjectId, DfsVersion, String), (DfsObjectId, String)>,
     conflicts: BTreeMap<(DfsObjectId, String), DfsConflictRecord>,
     visible_commits: BTreeMap<(DfsObjectId, DfsVersion), DfsVisibleVersionCommitRecord>,
     namespace_transactions: BTreeMap<String, DfsNamespaceTransaction>,
@@ -1898,6 +2020,31 @@ impl DfsMetadataTables {
             || !self.namespace_jobs.is_empty()
             || !self.compacted_tombstones.is_empty()
             || !self.visible_commits.is_empty()
+    }
+
+    fn put_intent_indexed(&mut self, intent: DfsWriteIntentRecord) {
+        let key = (intent.object_id.clone(), intent.intent_id.clone());
+        if let Some(previous) = self.intents.insert(key.clone(), intent.clone()) {
+            self.intent_order.remove(&write_intent_scan_key(&previous));
+            self.intent_targets
+                .remove(&write_intent_target_key(&previous));
+        }
+        self.intent_order
+            .insert(write_intent_scan_key(&intent), key);
+        self.intent_targets
+            .insert(write_intent_target_key(&intent), intent_key(&intent));
+    }
+
+    fn rebuild_intent_indexes(&mut self) {
+        self.intent_order.clear();
+        self.intent_targets.clear();
+        for intent in self.intents.values() {
+            let key = intent_key(intent);
+            self.intent_order
+                .insert(write_intent_scan_key(intent), key.clone());
+            self.intent_targets
+                .insert(write_intent_target_key(intent), key);
+        }
     }
 
     fn apply(&mut self, op: DfsMetadataTableOp) {
@@ -2003,8 +2150,7 @@ impl DfsMetadataTables {
                 );
             }
             DfsMetadataTableOp::PutIntent { intent } => {
-                self.intents
-                    .insert((intent.object_id.clone(), intent.intent_id.clone()), intent);
+                self.put_intent_indexed(intent);
             }
             DfsMetadataTableOp::PutConflict { conflict } => {
                 self.conflicts.insert(
@@ -2324,6 +2470,7 @@ impl DfsMetadataTableRollback {
         rollback_map(&mut tables.versions, self.versions);
         rollback_map(&mut tables.receipts, self.receipts);
         rollback_map(&mut tables.intents, self.intents);
+        tables.rebuild_intent_indexes();
         rollback_map(&mut tables.conflicts, self.conflicts);
         rollback_map(&mut tables.visible_commits, self.visible_commits);
         rollback_map(
@@ -2502,7 +2649,7 @@ enum DfsMetadataTableOp {
 pub struct LocalShardedMetadataBackend {
     root: PathBuf,
     shard_configs: BTreeMap<String, DfsMetadataShardConfig>,
-    shards: BTreeMap<DfsMetadataShardId, LocalJsonMetadataBackend>,
+    shards: BTreeMap<DfsMetadataShardId, LocalSobjMetadataBackend>,
 }
 
 #[derive(Clone, Debug)]
@@ -2542,7 +2689,7 @@ impl LocalShardedMetadataBackend {
                     shard.shard_id
                 )));
             }
-            let backend = LocalJsonMetadataBackend::new(
+            let backend = LocalSobjMetadataBackend::new(
                 shard_id.clone(),
                 root.join(key_segment(&shard_id.0)),
             )?;
@@ -2570,7 +2717,7 @@ impl LocalShardedMetadataBackend {
         &self,
         object_id: &DfsObjectId,
     ) -> Result<Option<DfsObjectShardIndexRecord>> {
-        read_json_optional(&self.object_shard_index_path(object_id))
+        read_sobj_optional(&self.object_shard_index_path(object_id))
     }
 
     fn write_object_shard_index(
@@ -2578,7 +2725,7 @@ impl LocalShardedMetadataBackend {
         object: &DfsObjectMetadata,
         shard_id: &DfsMetadataShardId,
     ) -> Result<()> {
-        write_json_atomic(
+        write_sobj_atomic(
             &self.object_shard_index_path(&object.object_id),
             &DfsObjectShardIndexRecord {
                 object_id: object.object_id.clone(),
@@ -2593,7 +2740,7 @@ impl LocalShardedMetadataBackend {
         remove_file_if_exists(&self.object_shard_index_path(object_id))
     }
 
-    fn shard_backend(&self, shard_id: &DfsMetadataShardId) -> Result<&LocalJsonMetadataBackend> {
+    fn shard_backend(&self, shard_id: &DfsMetadataShardId) -> Result<&LocalSobjMetadataBackend> {
         self.shards.get(shard_id).ok_or_else(|| {
             MetadataBackendError::Serde(format!("unknown local DFS metadata shard: {}", shard_id.0))
         })
@@ -2602,7 +2749,7 @@ impl LocalShardedMetadataBackend {
     fn shard_backend_mut(
         &mut self,
         shard_id: &DfsMetadataShardId,
-    ) -> Result<&mut LocalJsonMetadataBackend> {
+    ) -> Result<&mut LocalSobjMetadataBackend> {
         self.shards.get_mut(shard_id).ok_or_else(|| {
             MetadataBackendError::Serde(format!("unknown local DFS metadata shard: {}", shard_id.0))
         })
@@ -2673,6 +2820,30 @@ impl LocalShardedMetadataBackend {
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
         if let Some(index) = self.read_object_shard_index(&object.object_id)?
+            && self.shards.contains_key(&index.shard_id)
+            && index.shard_id != *shard_id
+        {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn intent_is_listable_from_shard(
+        &self,
+        intent: &DfsWriteIntentRecord,
+        backend: &LocalSobjMetadataBackend,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<bool> {
+        if let Some(object) = backend.get_object(&intent.object_id)? {
+            return self.object_is_listable_from_shard(&object, shard_id);
+        }
+        if let Some(object) = intent.object_metadata.as_ref()
+            && object.object_id == intent.object_id
+            && object.file_system_id == intent.file_system_id
+        {
+            return self.object_is_listable_from_shard(object, shard_id);
+        }
+        if let Some(index) = self.read_object_shard_index(&intent.object_id)?
             && self.shards.contains_key(&index.shard_id)
             && index.shard_id != *shard_id
         {
@@ -2920,7 +3091,20 @@ impl LocalShardedMetadataBackend {
             };
             intent_cursor = Some(next_cursor);
         }
-        let conflicts = source.conflicts_for_object(object_id)?;
+        let mut conflicts = Vec::new();
+        let mut conflict_cursor = None;
+        loop {
+            let page = source.conflicts_for_object_page(
+                object_id,
+                conflict_cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            conflict_cursor = Some(next_cursor);
+        }
         Ok(DfsObjectShardMigrationBundle {
             object,
             versions,
@@ -3495,6 +3679,25 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend_mut(&shard_id)?.put_version(version)
     }
 
+    fn put_object_and_version(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let object = normalized_object_metadata(object);
+        let target_shard_id =
+            self.select_shard_id_for_path(&object.file_system_id, &object.path)?;
+        let source_shard_id = self.shard_id_for_object(&object.object_id)?;
+        let entries = self
+            .shard_backend_mut(&target_shard_id)?
+            .put_object_and_version(&object, version)?;
+        self.write_object_shard_index(&object, &target_shard_id)?;
+        if let Some(source_shard_id) = source_shard_id {
+            self.put_cross_shard_tombstone(&object, &source_shard_id, &target_shard_id)?;
+        }
+        Ok(entries)
+    }
+
     fn get_version(
         &self,
         object_id: &DfsObjectId,
@@ -3790,6 +3993,344 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         })
     }
 
+    fn intents_for_object_version_page(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+        after: Option<&DfsWriteIntentPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        if let Some(shard_id) = self.shard_id_for_object(object_id)? {
+            let local_after = after.map(local_write_intent_page_cursor);
+            let mut page = self
+                .shard_backend(&shard_id)?
+                .intents_for_object_version_page(
+                    object_id,
+                    target_version,
+                    local_after.as_ref(),
+                    max_entries,
+                )?;
+            if page.next_cursor.is_some() {
+                page.next_cursor = page
+                    .next_cursor
+                    .map(|cursor| write_intent_page_cursor_with_shard(cursor, &shard_id));
+            }
+            return Ok(page);
+        }
+
+        let resume_shard_id = after.and_then(|cursor| cursor.shard_id.as_ref());
+        let mut entries = Vec::<(DfsWriteIntentRecord, DfsWriteIntentPageCursor)>::new();
+        let mut seen_intent_ids = BTreeSet::<String>::new();
+        'shards: for (shard_id, backend) in &self.shards {
+            if let Some(resume_shard_id) = resume_shard_id
+                && shard_id < resume_shard_id
+            {
+                continue;
+            }
+            let mut local_after = match resume_shard_id {
+                Some(resume_shard_id) if resume_shard_id == shard_id => {
+                    after.map(local_write_intent_page_cursor)
+                }
+                Some(_) => None,
+                None => after.map(local_write_intent_page_cursor),
+            };
+            loop {
+                let page = backend.intents_for_object_version_page(
+                    object_id,
+                    target_version,
+                    local_after.as_ref(),
+                    max_entries.saturating_add(1),
+                )?;
+                let next_local_cursor = page.next_cursor;
+                for intent in page.intents {
+                    if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+                        continue;
+                    }
+                    if !seen_intent_ids.insert(intent.intent_id.clone()) {
+                        continue;
+                    }
+                    let cursor = write_intent_page_cursor_with_shard(
+                        write_intent_page_cursor(&intent),
+                        shard_id,
+                    );
+                    entries.push((intent, cursor));
+                    if entries.len() > max_entries {
+                        break 'shards;
+                    }
+                }
+                let Some(next_local_cursor) = next_local_cursor else {
+                    break;
+                };
+                local_after = Some(next_local_cursor);
+            }
+        }
+        let has_more = entries.len() > max_entries;
+        if has_more {
+            entries.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            entries.last().map(|(_, cursor)| cursor.clone())
+        } else {
+            None
+        };
+        Ok(DfsWriteIntentPage {
+            intents: entries.into_iter().map(|(intent, _)| intent).collect(),
+            next_cursor,
+        })
+    }
+
+    fn write_intents_page(
+        &self,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentScanPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut intents = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_intents = 0usize;
+            loop {
+                let page = backend.write_intents_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for intent in page.intents {
+                    if !self.intent_is_listable_from_shard(&intent, backend, shard_id)? {
+                        continue;
+                    }
+                    if seen.insert((intent.object_id.clone(), intent.intent_id.clone())) {
+                        intents.push(intent);
+                        shard_intents = shard_intents.saturating_add(1);
+                    }
+                    if shard_intents > max_entries {
+                        break;
+                    }
+                }
+                if shard_intents > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        intents.sort_by(write_intent_scan_order);
+        let has_more = intents.len() > max_entries;
+        if has_more {
+            intents.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            intents.last().map(write_intent_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsWriteIntentScanPage {
+            intents,
+            next_cursor,
+        })
+    }
+
+    fn version_records_page(
+        &self,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectVersionScanPage {
+                versions: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut versions = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, DfsVersion)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_versions = 0usize;
+            loop {
+                let page = backend.version_records_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for version in page.versions {
+                    let Some(object) = backend.get_object(&version.object_id)? else {
+                        continue;
+                    };
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    if seen.insert((version.object_id.clone(), version.version.clone())) {
+                        versions.push(version);
+                        shard_versions = shard_versions.saturating_add(1);
+                    }
+                    if shard_versions > max_entries {
+                        break;
+                    }
+                }
+                if shard_versions > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        versions.sort_by(|left, right| {
+            object_version_scan_key(left).cmp(&object_version_scan_key(right))
+        });
+        let has_more = versions.len() > max_entries;
+        if has_more {
+            versions.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            versions.last().map(object_version_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsObjectVersionScanPage {
+            versions,
+            next_cursor,
+        })
+    }
+
+    fn receipt_records_page(
+        &self,
+        after: Option<&DfsReplicaReceiptScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsReplicaReceiptScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsReplicaReceiptScanPage {
+                receipts: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut receipts = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, DfsVersion, NodeId)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_receipts = 0usize;
+            loop {
+                let page = backend.receipt_records_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for receipt in page.receipts {
+                    let Some(object) = backend.get_object(&receipt.receipt.object_id)? else {
+                        continue;
+                    };
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    let key = (
+                        receipt.receipt.object_id.clone(),
+                        receipt.receipt.committed_version.clone(),
+                        receipt.replica_node_id.clone(),
+                    );
+                    if seen.insert(key) {
+                        receipts.push(receipt);
+                        shard_receipts = shard_receipts.saturating_add(1);
+                    }
+                    if shard_receipts > max_entries {
+                        break;
+                    }
+                }
+                if shard_receipts > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        receipts.sort_by(|left, right| {
+            replica_receipt_scan_key(left).cmp(&replica_receipt_scan_key(right))
+        });
+        let has_more = receipts.len() > max_entries;
+        if has_more {
+            receipts.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            receipts.last().map(replica_receipt_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsReplicaReceiptScanPage {
+            receipts,
+            next_cursor,
+        })
+    }
+
+    fn conflict_records_page(
+        &self,
+        after: Option<&DfsConflictScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsConflictScanPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let per_shard_limit = max_entries.saturating_add(1);
+        let mut conflicts = Vec::new();
+        let mut seen = BTreeSet::<(DfsObjectId, String)>::new();
+        for (shard_id, backend) in &self.shards {
+            let mut cursor = after.cloned();
+            let mut shard_conflicts = 0usize;
+            loop {
+                let page = backend.conflict_records_page(cursor.as_ref(), per_shard_limit)?;
+                let next_cursor = page.next_cursor;
+                for conflict in page.conflicts {
+                    let Some(object) = backend.get_object(&conflict.object_id)? else {
+                        continue;
+                    };
+                    if !self.object_is_listable_from_shard(&object, shard_id)? {
+                        continue;
+                    }
+                    if seen.insert((conflict.object_id.clone(), conflict.conflict_id.clone())) {
+                        conflicts.push(conflict);
+                        shard_conflicts = shard_conflicts.saturating_add(1);
+                    }
+                    if shard_conflicts > max_entries {
+                        break;
+                    }
+                }
+                if shard_conflicts > max_entries {
+                    break;
+                }
+                let Some(next_cursor) = next_cursor else {
+                    break;
+                };
+                cursor = Some(next_cursor);
+            }
+        }
+        conflicts.sort_by(|left, right| conflict_scan_key(left).cmp(&conflict_scan_key(right)));
+        let has_more = conflicts.len() > max_entries;
+        if has_more {
+            conflicts.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            conflicts.last().map(conflict_scan_cursor)
+        } else {
+            None
+        };
+        Ok(DfsConflictScanPage {
+            conflicts,
+            next_cursor,
+        })
+    }
+
     fn commit_visible_version(
         &mut self,
         expected_version: &DfsVersion,
@@ -3914,6 +4455,18 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         self.shard_backend_mut(&shard_id)?.put_namespace_job(job)
     }
 
+    fn get_namespace_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransaction>> {
+        for backend in self.shards.values() {
+            if let Some(transaction) = backend.get_namespace_transaction(transaction_id)? {
+                return Ok(Some(transaction));
+            }
+        }
+        Ok(None)
+    }
+
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
         for backend in self.shards.values() {
             if let Some(job) = backend.get_namespace_job(job_id)? {
@@ -3925,12 +4478,54 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
 
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
         let mut jobs = BTreeMap::<String, DfsNamespaceJobRecord>::new();
-        for backend in self.shards.values() {
-            for job in backend.list_namespace_jobs()? {
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            for job in page.jobs {
                 jobs.insert(job.job_id.clone(), job);
             }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
         Ok(jobs.into_values().collect())
+    }
+
+    fn list_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        if max_entries == 0 {
+            return Ok(DfsNamespaceJobPage {
+                jobs: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut merged = BTreeMap::<String, DfsNamespaceJobRecord>::new();
+        let mut shard_has_more = false;
+        for backend in self.shards.values() {
+            let page = backend.list_namespace_jobs_page(after, max_entries.saturating_add(1))?;
+            shard_has_more |= page.next_cursor.is_some();
+            for job in page.jobs {
+                merged.insert(job.job_id.clone(), job);
+            }
+        }
+        let mut jobs = merged.into_values().collect::<Vec<_>>();
+        let has_more = jobs.len() > max_entries || shard_has_more;
+        if jobs.len() > max_entries {
+            jobs.truncate(max_entries);
+        }
+        let next_cursor = if has_more {
+            jobs.last().map(|job| DfsNamespaceJobPageCursor {
+                job_id: job.job_id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(DfsNamespaceJobPage { jobs, next_cursor })
     }
 
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
@@ -4046,8 +4641,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let Some(shard_id) = self.shard_id_for_object(object_id)? else {
             return Ok(Vec::new());
         };
-        self.shard_backend(&shard_id)?
-            .conflicts_for_object(object_id)
+        let mut conflicts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.shard_backend(&shard_id)?.conflicts_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(conflicts)
     }
 
     fn conflicts_for_object_page(
@@ -4181,7 +4789,7 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 }
 
-impl LocalJsonMetadataBackend {
+impl LocalSobjMetadataBackend {
     pub fn new(shard_id: DfsMetadataShardId, root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         create_dir_all(root.join("records"))?;
@@ -4222,7 +4830,7 @@ impl LocalJsonMetadataBackend {
         for entry in &batch.entries {
             if !replay_cursors.contains_key(&entry.shard_id) {
                 let replay_cursor_path = self.replay_cursor_path(&entry.shard_id);
-                let cursor = read_json_optional::<DfsMetadataReplayCursor>(&replay_cursor_path)?
+                let cursor = read_sobj_optional::<DfsMetadataReplayCursor>(&replay_cursor_path)?
                     .unwrap_or(DfsMetadataReplayCursor {
                         shard_id: entry.shard_id.clone(),
                         last_sequence: 0,
@@ -4271,7 +4879,7 @@ impl LocalJsonMetadataBackend {
         }
         for shard_id in advanced_cursors {
             if let Some(cursor) = replay_cursors.get(&shard_id) {
-                write_json_atomic(&self.replay_cursor_path(&cursor.shard_id), cursor)?;
+                write_sobj_atomic(&self.replay_cursor_path(&cursor.shard_id), cursor)?;
             }
         }
         Ok(applied)
@@ -4304,7 +4912,7 @@ impl LocalJsonMetadataBackend {
         self.table_log_offset = 0;
         self.next_sequence = replayed_through_sequence.saturating_add(1).max(1);
         persist_metadata_table_snapshot(&self.root, &self.tables)?;
-        write_json_atomic(
+        write_sobj_atomic(
             &self.replay_cursor_path(&source_shard_id),
             &DfsMetadataReplayCursor {
                 shard_id: source_shard_id,
@@ -4315,7 +4923,7 @@ impl LocalJsonMetadataBackend {
             shard_id: self.shard_id.clone(),
             last_sequence: replayed_through_sequence,
         })?;
-        write_json_atomic(
+        write_sobj_atomic(
             &self.journal_head_path(),
             &DfsMetadataJournalHead {
                 next_sequence: self.next_sequence,
@@ -4412,7 +5020,7 @@ impl LocalJsonMetadataBackend {
             return Ok(());
         }
         self.next_sequence = next_sequence;
-        write_json_atomic(
+        write_sobj_atomic(
             &self.journal_head_path(),
             &DfsMetadataJournalHead {
                 next_sequence: self.next_sequence,
@@ -4911,7 +5519,7 @@ impl LocalJsonMetadataBackend {
             if path.extension().and_then(|ext| ext.to_str()) != Some("sobj") {
                 continue;
             }
-            if let Some(cursor) = read_json_optional::<DfsMetadataReplayCursor>(&path)? {
+            if let Some(cursor) = read_sobj_optional::<DfsMetadataReplayCursor>(&path)? {
                 cursors.push(DfsMetadataReplayCursorStatus {
                     source_shard_id: cursor.shard_id,
                     replayed_through_sequence: cursor.last_sequence,
@@ -4972,6 +5580,40 @@ impl LocalJsonMetadataBackend {
             } if conflict.is_none() => {
                 *conflict = self.get_conflict(object_id, conflict_id)?;
             }
+            DfsMetadataMutation::CommitVisibleVersion {
+                object_id,
+                committed_version,
+                committed_object,
+                visible_version,
+                ..
+            } if committed_object.is_none() || visible_version.is_none() => {
+                let commit_key = (object_id.clone(), committed_version.clone());
+                if let Some(commit) = self.tables.visible_commits.get(&commit_key) {
+                    if committed_object.is_none() {
+                        *committed_object = Some(commit.committed_object.clone());
+                    }
+                    if visible_version.is_none() {
+                        *visible_version = Some(commit.visible_version.clone());
+                    }
+                } else {
+                    if committed_object.is_none()
+                        && let Some(object) = self.get_object(object_id)?
+                        && object.version == *committed_version
+                    {
+                        *committed_object = Some(object);
+                    }
+                    if visible_version.is_none() {
+                        *visible_version = self.get_version(object_id, committed_version)?;
+                    }
+                }
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction_id,
+                transaction,
+                ..
+            } if transaction.is_none() => {
+                *transaction = self.get_namespace_transaction(transaction_id)?;
+            }
             _ => {}
         }
         Ok(entry)
@@ -4997,7 +5639,7 @@ impl LocalJsonMetadataBackend {
         };
         append_segmented_journal_entry(&self.root, &entry)?;
         self.next_sequence = sequence.saturating_add(1);
-        write_json_atomic(
+        write_sobj_atomic(
             &self.journal_head_path(),
             &DfsMetadataJournalHead {
                 next_sequence: self.next_sequence,
@@ -5039,7 +5681,7 @@ impl LocalJsonMetadataBackend {
             let chunk = entries[chunk_start..chunk_end].iter().collect::<Vec<_>>();
             append_segmented_journal_entries(&self.root, &chunk)?;
             self.next_sequence = entries[chunk_end - 1].sequence.saturating_add(1);
-            write_json_atomic(
+            write_sobj_atomic(
                 &self.journal_head_path(),
                 &DfsMetadataJournalHead {
                     next_sequence: self.next_sequence,
@@ -5059,7 +5701,7 @@ impl LocalJsonMetadataBackend {
         } else {
             0
         };
-        write_json_atomic(
+        write_sobj_atomic(
             &self.local_materialization_cursor_path(),
             &DfsMetadataReplayCursor {
                 shard_id: self.shard_id.clone(),
@@ -5069,7 +5711,7 @@ impl LocalJsonMetadataBackend {
     }
 
     fn local_materialization_cursor(&self) -> Result<DfsMetadataReplayCursor> {
-        Ok(read_json_optional::<DfsMetadataReplayCursor>(
+        Ok(read_sobj_optional::<DfsMetadataReplayCursor>(
             &self.local_materialization_cursor_path(),
         )?
         .unwrap_or(DfsMetadataReplayCursor {
@@ -5102,7 +5744,7 @@ impl LocalJsonMetadataBackend {
     }
 
     fn write_local_materialization_cursor(&self, cursor: &DfsMetadataReplayCursor) -> Result<()> {
-        write_json_atomic(&self.local_materialization_cursor_path(), cursor)
+        write_sobj_atomic(&self.local_materialization_cursor_path(), cursor)
     }
 
     fn recover_unmaterialized_local_journal_entries(&mut self) -> Result<()> {
@@ -5499,7 +6141,7 @@ struct MetadataWriteLock {
 }
 
 /// In-process mutual exclusion for metadata writes, keyed by backend root. Two
-/// `LocalJsonMetadataBackend` handles on the same `root` (e.g. several threads, or
+/// `LocalSobjMetadataBackend` handles on the same `root` (e.g. several threads, or
 /// the main + shadow daemon in one process) serialize here; handles on different
 /// roots never contend (distinct keys). Cross-process exclusion is layered on top
 /// via the `journal/write.lock` flock in `metadata_write_lock`.
@@ -5543,7 +6185,7 @@ impl Drop for MetadataPathWriteGuard {
     }
 }
 
-impl DfsMetadataBackend for LocalJsonMetadataBackend {
+impl DfsMetadataBackend for LocalSobjMetadataBackend {
     fn put_file_system(&mut self, file_system: &DfsFileSystem) -> Result<DfsMetadataJournalEntry> {
         let _lock = self.begin_metadata_write()?;
         let entry = self.write_journal_unlocked(DfsMetadataMutation::PutFileSystem {
@@ -5682,35 +6324,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         &self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<Vec<DfsObjectMetadata>> {
-        let tables = self.current_tables_snapshot()?;
         let mut objects = Vec::new();
-        for ((record_file_system_id, _), path_record) in tables
-            .file_system_objects
-            .range((
-                Included((file_system_id.clone(), id_lower_bound())),
-                Unbounded,
-            ))
-            .take_while(|((record_file_system_id, _), _)| record_file_system_id == file_system_id)
-        {
-            if record_file_system_id != file_system_id
-                || path_record.file_system_id != *file_system_id
-            {
-                continue;
-            }
-            let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
-                continue;
+        let mut cursor = None;
+        loop {
+            let page = self.objects_for_file_system_page(
+                file_system_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            objects.extend(page.objects);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
             };
-            if object.file_system_id == *file_system_id
-                && normalize_path(&object.path) == path_record.path
-            {
-                objects.push(object);
-            }
+            cursor = Some(next_cursor);
         }
-        objects.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.object_id.cmp(&right.object_id))
-        });
         Ok(objects)
     }
 
@@ -6047,6 +6674,67 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         Ok(entry)
     }
 
+    fn put_object_and_version(
+        &mut self,
+        object: &DfsObjectMetadata,
+        version: &DfsObjectVersionRecord,
+    ) -> Result<Vec<DfsMetadataJournalEntry>> {
+        let _lock = self.begin_metadata_write()?;
+        let object = normalized_object_metadata(object);
+        let version = normalized_version_record(version);
+        let metadata_matches = object.file_system_id == version.file_system_id
+            && object.object_id == version.object_id;
+        if !metadata_matches {
+            return Err(MetadataBackendError::Serde(format!(
+                "object {} {} does not match version {} {}",
+                object.file_system_id, object.object_id, version.file_system_id, version.object_id
+            )));
+        }
+        if self.get_file_system(&object.file_system_id)?.is_none() {
+            return Err(MetadataBackendError::UnknownFileSystem {
+                file_system_id: object.file_system_id.clone(),
+            });
+        }
+        let previous = self.get_object(&object.object_id)?;
+        let entries = self.write_journal_entries_unlocked(vec![
+            DfsMetadataMutation::PutObject {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                path: object.path.clone(),
+                object: Some(object.clone()),
+            },
+            DfsMetadataMutation::PutVersion {
+                file_system_id: version.file_system_id.clone(),
+                object_id: version.object_id.clone(),
+                version: version.version.clone(),
+                version_record: Some(version.clone()),
+            },
+        ])?;
+        let mut table_ops = Vec::new();
+        let mut rollback = DfsMetadataTableRollback::default();
+        if let Err(error) = self.plan_object_index_table_ops_with_previous(
+            &object,
+            previous.as_ref(),
+            &mut table_ops,
+            &mut rollback,
+        ) {
+            rollback.rollback(&mut self.tables);
+            return Err(error);
+        }
+        self.plan_preapplied_table_op(
+            DfsMetadataTableOp::PutVersion { version },
+            &mut table_ops,
+            &mut rollback,
+        );
+        let last_sequence = entries
+            .last()
+            .map(|entry| entry.sequence)
+            .unwrap_or_else(|| self.next_sequence.saturating_sub(1));
+        self.append_preapplied_table_ops(last_sequence, table_ops, rollback)?;
+        self.checkpoint_local_materialization_cursor_if_due(last_sequence)?;
+        Ok(entries)
+    }
+
     fn get_version(
         &self,
         object_id: &DfsObjectId,
@@ -6060,16 +6748,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        let mut versions = tables
-            .versions
-            .range((Included((object_id.clone(), id_lower_bound())), Unbounded))
-            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-            .map(|(_, version)| version)
-            .filter(|version| version.object_id == *object_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        versions.sort_by(|left, right| left.version.cmp(&right.version));
+        let mut versions = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.versions_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
         Ok(versions)
     }
 
@@ -6114,24 +6806,141 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         })
     }
 
-    fn all_versions(&self) -> Result<Vec<DfsObjectVersionRecord>> {
+    fn version_records_page(
+        &self,
+        after: Option<&DfsObjectVersionScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsObjectVersionScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsObjectVersionScanPage {
+                versions: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.versions.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded((after.object_id.clone(), after.version.clone())),
+            None => Included((id_lower_bound(), id_lower_bound())),
+        };
+        let mut versions = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_version), version) in
+            tables.versions.range((start, Unbounded))
+        {
+            if record_object_id != &version.object_id || record_version != &version.version {
+                continue;
+            }
+            if versions.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(object_version_scan_cursor(version));
+            versions.push(version.clone());
+        }
+        Ok(DfsObjectVersionScanPage {
+            versions,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
-    fn all_receipts(&self) -> Result<Vec<DfsReplicaReceiptRecord>> {
+    fn receipt_records_page(
+        &self,
+        after: Option<&DfsReplicaReceiptScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsReplicaReceiptScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsReplicaReceiptScanPage {
+                receipts: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.receipts.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded((
+                after.object_id.clone(),
+                after.version.clone(),
+                after.replica_node_id.clone(),
+            )),
+            None => Included((id_lower_bound(), id_lower_bound(), id_lower_bound())),
+        };
+        let mut receipts = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_version, record_replica_node_id), receipt) in
+            tables.receipts.range((start, Unbounded))
+        {
+            if record_object_id != &receipt.receipt.object_id
+                || record_version != &receipt.receipt.committed_version
+                || record_replica_node_id != &receipt.replica_node_id
+            {
+                continue;
+            }
+            if receipts.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(replica_receipt_scan_cursor(receipt));
+            receipts.push(receipt.clone());
+        }
+        Ok(DfsReplicaReceiptScanPage {
+            receipts,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn all_intents(&self) -> Result<Vec<DfsWriteIntentRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        Ok(tables.intents.values().cloned().collect())
+        let mut intents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.write_intents_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(intents)
     }
 
-    fn all_conflicts(&self) -> Result<Vec<DfsConflictRecord>> {
+    fn conflict_records_page(
+        &self,
+        after: Option<&DfsConflictScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsConflictScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsConflictScanPage {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.conflicts.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded((after.object_id.clone(), after.conflict_id.clone())),
+            None => Included((id_lower_bound(), String::new())),
+        };
+        let mut conflicts = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_conflict_id), conflict) in
+            tables.conflicts.range((start, Unbounded))
+        {
+            if record_object_id != &conflict.object_id
+                || record_conflict_id != &conflict.conflict_id
+            {
+                continue;
+            }
+            if conflicts.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(conflict_scan_cursor(conflict));
+            conflicts.push(conflict.clone());
+        }
+        Ok(DfsConflictScanPage {
+            conflicts,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
@@ -6174,23 +6983,22 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Vec<DfsReplicaReceiptRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        Ok(tables
-            .receipts
-            .range((
-                Included((object_id.clone(), version.clone(), id_lower_bound())),
-                Unbounded,
-            ))
-            .take_while(|((record_object_id, record_version, _), _)| {
-                record_object_id == object_id && record_version == version
-            })
-            .map(|(_, receipt)| receipt)
-            .filter(|receipt| {
-                receipt.receipt.object_id == *object_id
-                    && receipt.receipt.committed_version == *version
-            })
-            .cloned()
-            .collect())
+        let mut receipts = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.receipts_for_version_page(
+                object_id,
+                version,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            receipts.extend(page.receipts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(receipts)
     }
 
     fn receipts_for_version_page(
@@ -6277,16 +7085,20 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn intents_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsWriteIntentRecord>> {
-        let tables = self.current_tables_snapshot()?;
-        let mut intents = tables
-            .intents
-            .range((Included((object_id.clone(), String::new())), Unbounded))
-            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
-            .map(|(_, intent)| intent)
-            .filter(|intent| intent.object_id == *object_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        intents.sort_by(|left, right| left.intent_id.cmp(&right.intent_id));
+        let mut intents = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.intents_for_object_page(
+                object_id,
+                cursor.as_ref(),
+                OBJECT_LOCAL_METADATA_PAGE_SIZE,
+            )?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
         Ok(intents)
     }
 
@@ -6326,6 +7138,113 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
             intents.push(intent.clone());
         }
         Ok(DfsWriteIntentPage {
+            intents,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
+    }
+
+    fn intents_for_object_version_page(
+        &self,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+        after: Option<&DfsWriteIntentPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let start = match after {
+            Some(after) => Excluded((
+                object_id.clone(),
+                target_version.clone(),
+                after.intent_id.clone(),
+            )),
+            None => Included((object_id.clone(), target_version.clone(), String::new())),
+        };
+        let mut intents = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for ((record_object_id, record_version, _), intent_key) in tables
+            .intent_targets
+            .range((start, Unbounded))
+            .take_while(|((record_object_id, record_version, _), _)| {
+                record_object_id == object_id && record_version == target_version
+            })
+        {
+            if record_object_id != object_id || record_version != target_version {
+                continue;
+            }
+            let Some(intent) = tables.intents.get(intent_key) else {
+                continue;
+            };
+            if intent.object_id != *object_id || intent.target_version != *target_version {
+                continue;
+            }
+            if intents.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(write_intent_page_cursor(intent));
+            intents.push(intent.clone());
+        }
+        Ok(DfsWriteIntentPage {
+            intents,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
+    }
+
+    fn write_intents_page(
+        &self,
+        after: Option<&DfsWriteIntentScanCursor>,
+        max_entries: usize,
+    ) -> Result<DfsWriteIntentScanPage> {
+        if max_entries == 0 {
+            return Ok(DfsWriteIntentScanPage {
+                intents: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let tables = self.current_tables_snapshot()?;
+        let mut intents = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        let mut collect_intent = |intent_key: &(DfsObjectId, String)| -> Result<bool> {
+            let Some(intent) = tables.intents.get(intent_key) else {
+                return Ok(false);
+            };
+            if intents.len() >= max_entries {
+                return Ok(true);
+            }
+            last_cursor = Some(write_intent_scan_cursor(intent));
+            intents.push(intent.clone());
+            Ok(false)
+        };
+        match after {
+            Some(after) => {
+                for (_, intent_key) in tables
+                    .intent_order
+                    .range((Excluded(write_intent_scan_cursor_key(after)), Unbounded))
+                {
+                    if collect_intent(intent_key)? {
+                        has_more = true;
+                        break;
+                    }
+                }
+            }
+            None => {
+                for intent_key in tables.intent_order.values() {
+                    if collect_intent(intent_key)? {
+                        has_more = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(DfsWriteIntentScanPage {
             intents,
             next_cursor: has_more.then_some(last_cursor).flatten(),
         })
@@ -6442,14 +7361,67 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         )
     }
 
+    fn get_namespace_transaction(
+        &self,
+        transaction_id: &str,
+    ) -> Result<Option<DfsNamespaceTransaction>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(tables.namespace_transactions.get(transaction_id).cloned())
+    }
+
     fn get_namespace_job(&self, job_id: &str) -> Result<Option<DfsNamespaceJobRecord>> {
         let tables = self.current_tables_snapshot()?;
         Ok(tables.namespace_jobs.get(job_id).cloned())
     }
 
     fn list_namespace_jobs(&self) -> Result<Vec<DfsNamespaceJobRecord>> {
+        let mut jobs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                self.list_namespace_jobs_page(cursor.as_ref(), OBJECT_LOCAL_METADATA_PAGE_SIZE)?;
+            jobs.extend(page.jobs);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(jobs)
+    }
+
+    fn list_namespace_jobs_page(
+        &self,
+        after: Option<&DfsNamespaceJobPageCursor>,
+        max_entries: usize,
+    ) -> Result<DfsNamespaceJobPage> {
+        if max_entries == 0 {
+            return Ok(DfsNamespaceJobPage {
+                jobs: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let tables = self.current_tables_snapshot()?;
-        Ok(tables.namespace_jobs.values().cloned().collect())
+        let start = match after {
+            Some(after) => Excluded(after.job_id.clone()),
+            None => Included(String::new()),
+        };
+        let mut jobs = Vec::new();
+        let mut last_cursor = None;
+        let mut has_more = false;
+        for (job_id, job) in tables.namespace_jobs.range((start, Unbounded)) {
+            if jobs.len() >= max_entries {
+                has_more = true;
+                break;
+            }
+            last_cursor = Some(DfsNamespaceJobPageCursor {
+                job_id: job_id.clone(),
+            });
+            jobs.push(job.clone());
+        }
+        Ok(DfsNamespaceJobPage {
+            jobs,
+            next_cursor: has_more.then_some(last_cursor).flatten(),
+        })
     }
 
     fn put_conflict(&mut self, conflict: &DfsConflictRecord) -> Result<DfsMetadataJournalEntry> {
@@ -6558,7 +7530,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         after_sequence: u64,
         max_entries: usize,
     ) -> Result<Vec<DfsMetadataJournalEntry>> {
-        LocalJsonMetadataBackend::journal_since_limited(self, after_sequence, max_entries)
+        LocalSobjMetadataBackend::journal_since_limited(self, after_sequence, max_entries)
     }
 
     fn journal_batch_since_limited(
@@ -6567,7 +7539,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         max_entries: usize,
         max_encoded_bytes: usize,
     ) -> Result<Option<DfsMetadataJournalBatch>> {
-        LocalJsonMetadataBackend::journal_batch_since_limited(
+        LocalSobjMetadataBackend::journal_batch_since_limited(
             self,
             after_sequence,
             max_entries,
@@ -6585,7 +7557,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         if shard_id != &self.shard_id {
             return Ok(None);
         }
-        LocalJsonMetadataBackend::journal_batch_since_limited(
+        LocalSobjMetadataBackend::journal_batch_since_limited(
             self,
             after_sequence,
             max_entries,
@@ -6598,7 +7570,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<u64> {
-        Ok(read_json_optional::<DfsMetadataReplayCursor>(
+        Ok(read_sobj_optional::<DfsMetadataReplayCursor>(
             &self.metadata_replication_cursor_path(target_node_id, shard_id),
         )?
         .map(|cursor| cursor.last_sequence)
@@ -6614,7 +7586,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
         let _lock = self.begin_metadata_write()?;
         let next_after_sequence =
             next_after_sequence.max(self.metadata_replication_cursor(target_node_id, shard_id)?);
-        write_json_atomic(
+        write_sobj_atomic(
             &self.metadata_replication_cursor_path(target_node_id, shard_id),
             &DfsMetadataReplayCursor {
                 shard_id: shard_id.clone(),
@@ -6639,7 +7611,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
-        LocalJsonMetadataBackend::apply_journal_batch(self, batch)
+        LocalSobjMetadataBackend::apply_journal_batch(self, batch)
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
@@ -6662,7 +7634,7 @@ impl DfsMetadataBackend for LocalJsonMetadataBackend {
     }
 }
 
-impl LocalJsonMetadataBackend {
+impl LocalSobjMetadataBackend {
     fn recover_namespace_transactions(&mut self) -> Result<()> {
         for transaction in self
             .tables
@@ -7553,6 +8525,17 @@ fn object_version_page_cursor(version: &DfsObjectVersionRecord) -> DfsObjectVers
     }
 }
 
+fn object_version_scan_cursor(version: &DfsObjectVersionRecord) -> DfsObjectVersionScanCursor {
+    DfsObjectVersionScanCursor {
+        object_id: version.object_id.clone(),
+        version: version.version.clone(),
+    }
+}
+
+fn object_version_scan_key(version: &DfsObjectVersionRecord) -> (DfsObjectId, DfsVersion) {
+    (version.object_id.clone(), version.version.clone())
+}
+
 fn object_version_page_cursor_with_shard(
     mut cursor: DfsObjectVersionPageCursor,
     shard_id: &DfsMetadataShardId,
@@ -7575,6 +8558,24 @@ fn replica_receipt_page_cursor(receipt: &DfsReplicaReceiptRecord) -> DfsReplicaR
         replica_node_id: receipt.replica_node_id.clone(),
         shard_id: None,
     }
+}
+
+fn replica_receipt_scan_cursor(receipt: &DfsReplicaReceiptRecord) -> DfsReplicaReceiptScanCursor {
+    DfsReplicaReceiptScanCursor {
+        object_id: receipt.receipt.object_id.clone(),
+        version: receipt.receipt.committed_version.clone(),
+        replica_node_id: receipt.replica_node_id.clone(),
+    }
+}
+
+fn replica_receipt_scan_key(
+    receipt: &DfsReplicaReceiptRecord,
+) -> (DfsObjectId, DfsVersion, NodeId) {
+    (
+        receipt.receipt.object_id.clone(),
+        receipt.receipt.committed_version.clone(),
+        receipt.replica_node_id.clone(),
+    )
 }
 
 fn replica_receipt_page_cursor_with_shard(
@@ -7626,6 +8627,62 @@ fn write_intent_page_cursor(intent: &DfsWriteIntentRecord) -> DfsWriteIntentPage
     DfsWriteIntentPageCursor {
         intent_id: intent.intent_id.clone(),
         shard_id: None,
+    }
+}
+
+fn conflict_scan_cursor(conflict: &DfsConflictRecord) -> DfsConflictScanCursor {
+    DfsConflictScanCursor {
+        object_id: conflict.object_id.clone(),
+        conflict_id: conflict.conflict_id.clone(),
+    }
+}
+
+fn conflict_scan_key(conflict: &DfsConflictRecord) -> (DfsObjectId, String) {
+    (conflict.object_id.clone(), conflict.conflict_id.clone())
+}
+
+fn write_intent_scan_key(intent: &DfsWriteIntentRecord) -> (OffsetDateTime, String, DfsObjectId) {
+    (
+        intent.created_at,
+        intent.intent_id.clone(),
+        intent.object_id.clone(),
+    )
+}
+
+fn intent_key(intent: &DfsWriteIntentRecord) -> (DfsObjectId, String) {
+    (intent.object_id.clone(), intent.intent_id.clone())
+}
+
+fn write_intent_target_key(intent: &DfsWriteIntentRecord) -> (DfsObjectId, DfsVersion, String) {
+    (
+        intent.object_id.clone(),
+        intent.target_version.clone(),
+        intent.intent_id.clone(),
+    )
+}
+
+fn write_intent_scan_cursor_key(
+    cursor: &DfsWriteIntentScanCursor,
+) -> (OffsetDateTime, String, DfsObjectId) {
+    (
+        cursor.created_at,
+        cursor.intent_id.clone(),
+        cursor.object_id.clone(),
+    )
+}
+
+fn write_intent_scan_order(
+    left: &DfsWriteIntentRecord,
+    right: &DfsWriteIntentRecord,
+) -> std::cmp::Ordering {
+    write_intent_scan_key(left).cmp(&write_intent_scan_key(right))
+}
+
+fn write_intent_scan_cursor(intent: &DfsWriteIntentRecord) -> DfsWriteIntentScanCursor {
+    DfsWriteIntentScanCursor {
+        created_at: intent.created_at,
+        intent_id: intent.intent_id.clone(),
+        object_id: intent.object_id.clone(),
     }
 }
 
@@ -7694,15 +8751,6 @@ fn local_object_page_cursor(cursor: &DfsObjectPageCursor) -> DfsObjectPageCursor
 
 fn directory_page_key(object: &DfsObjectMetadata) -> (&String, &DfsObjectId) {
     (&object.path, &object.object_id)
-}
-
-fn directory_page_cursor(object: &DfsObjectMetadata) -> DfsDirectoryPageCursor {
-    DfsDirectoryPageCursor {
-        path: object.path.clone(),
-        object_id: object.object_id.clone(),
-        dentry: None,
-        shard_id: None,
-    }
 }
 
 fn directory_page_cursor_with_dentry(
@@ -7909,7 +8957,7 @@ fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
     if !path.is_file() {
         return Ok(DfsMetadataTableState::default());
     }
-    let snapshot: DfsMetadataTableSnapshot = read_json(&path)?;
+    let snapshot: DfsMetadataTableSnapshot = read_sobj(&path)?;
     let format_version = snapshot.format_version;
     let tables = metadata_tables_from_table_snapshot(
         snapshot,
@@ -8067,7 +9115,7 @@ fn append_metadata_table_batch(root: &Path, batch: &DfsMetadataTableBatch) -> Re
 }
 
 fn persist_metadata_table_snapshot(root: &Path, tables: &DfsMetadataTables) -> Result<()> {
-    write_json_atomic(
+    write_sobj_atomic(
         &metadata_table_snapshot_path(root),
         &DfsMetadataTableSnapshot {
             format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
@@ -8377,10 +9425,10 @@ fn truncate_metadata_table_log(root: &Path) -> Result<()> {
 fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
     let records = root.join("records");
     let mut tables = DfsMetadataTables::default();
-    for file_system in read_json_tree::<DfsFileSystem>(&records.join("filesystems"))? {
+    for file_system in read_sobj_tree::<DfsFileSystem>(&records.join("filesystems"))? {
         tables.apply(DfsMetadataTableOp::PutFileSystem { file_system });
     }
-    for object in read_json_tree::<DfsObjectMetadata>(&records.join("objects"))? {
+    for object in read_sobj_tree::<DfsObjectMetadata>(&records.join("objects"))? {
         let object = normalized_object_metadata(&object);
         let path_record = path_record_for_object(&object);
         tables.apply(DfsMetadataTableOp::PutObject {
@@ -8410,36 +9458,36 @@ fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
             });
         }
     }
-    for path_record in read_json_tree::<DfsPathRecord>(&records.join("filesystem-objects"))? {
+    for path_record in read_sobj_tree::<DfsPathRecord>(&records.join("filesystem-objects"))? {
         tables.apply(DfsMetadataTableOp::PutFileSystemObject { path_record });
     }
-    for path_record in read_json_tree::<DfsPathRecord>(&records.join("paths"))? {
+    for path_record in read_sobj_tree::<DfsPathRecord>(&records.join("paths"))? {
         tables.apply(DfsMetadataTableOp::PutPath { path_record });
     }
-    for inode in read_json_tree::<DfsInodeRecord>(&records.join("inodes"))? {
+    for inode in read_sobj_tree::<DfsInodeRecord>(&records.join("inodes"))? {
         tables.apply(DfsMetadataTableOp::PutInode { inode });
     }
-    for dirfrag in read_json_tree::<DfsDirFragmentRecord>(&records.join("dirfrags"))? {
+    for dirfrag in read_sobj_tree::<DfsDirFragmentRecord>(&records.join("dirfrags"))? {
         tables.apply(DfsMetadataTableOp::PutDirFragment { dirfrag });
     }
-    for path_record in read_json_tree::<DfsPathRecord>(&records.join("dentries"))? {
+    for path_record in read_sobj_tree::<DfsPathRecord>(&records.join("dentries"))? {
         tables.apply(DfsMetadataTableOp::PutDentry { path_record });
     }
-    for version in read_json_tree::<DfsObjectVersionRecord>(&records.join("versions"))? {
+    for version in read_sobj_tree::<DfsObjectVersionRecord>(&records.join("versions"))? {
         tables.apply(DfsMetadataTableOp::PutVersion {
             version: normalized_version_record(&version),
         });
     }
-    for receipt in read_json_tree::<DfsReplicaReceiptRecord>(&records.join("receipts"))? {
+    for receipt in read_sobj_tree::<DfsReplicaReceiptRecord>(&records.join("receipts"))? {
         tables.apply(DfsMetadataTableOp::PutReceipt { receipt });
     }
-    for intent in read_json_tree::<DfsWriteIntentRecord>(&records.join("intents"))? {
+    for intent in read_sobj_tree::<DfsWriteIntentRecord>(&records.join("intents"))? {
         tables.apply(DfsMetadataTableOp::PutIntent { intent });
     }
-    for conflict in read_json_tree::<DfsConflictRecord>(&records.join("conflicts"))? {
+    for conflict in read_sobj_tree::<DfsConflictRecord>(&records.join("conflicts"))? {
         tables.apply(DfsMetadataTableOp::PutConflict { conflict });
     }
-    for commit in read_json_tree::<DfsVisibleVersionCommitRecord>(&records.join("visible-commits"))?
+    for commit in read_sobj_tree::<DfsVisibleVersionCommitRecord>(&records.join("visible-commits"))?
     {
         tables.apply(DfsMetadataTableOp::PutVisibleCommit {
             object_id: commit.committed_object.object_id.clone(),
@@ -8448,7 +9496,7 @@ fn load_legacy_metadata_tables(root: &Path) -> Result<DfsMetadataTables> {
         });
     }
     for transaction in
-        read_json_tree::<DfsNamespaceTransaction>(&records.join("namespace-transactions"))?
+        read_sobj_tree::<DfsNamespaceTransaction>(&records.join("namespace-transactions"))?
     {
         tables.apply(DfsMetadataTableOp::PutNamespaceTransaction { transaction });
     }
@@ -8461,7 +9509,7 @@ fn fast_next_journal_sequence(root: &Path) -> Result<u64> {
         return Ok(1);
     }
     if let Some(head) =
-        read_json_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
+        read_sobj_optional::<DfsMetadataJournalHead>(&journal_dir.join("head.sobj"))?
         && head.next_sequence > 0
     {
         return Ok(head.next_sequence);
@@ -8476,7 +9524,7 @@ fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
     }
     let head_path = journal_dir.join("head.sobj");
     let head_next_sequence =
-        read_json_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
+        read_sobj_optional::<DfsMetadataJournalHead>(&head_path)?.map(|head| head.next_sequence);
     let mut max_sequence = head_next_sequence
         .map(|next_sequence| next_sequence.saturating_sub(1))
         .unwrap_or(0);
@@ -8488,7 +9536,7 @@ fn recover_next_journal_sequence(root: &Path) -> Result<u64> {
 
     let next_sequence = max_sequence.saturating_add(1).max(1);
     if head_next_sequence != Some(next_sequence) {
-        write_json_atomic(&head_path, &DfsMetadataJournalHead { next_sequence })?;
+        write_sobj_atomic(&head_path, &DfsMetadataJournalHead { next_sequence })?;
     }
     Ok(next_sequence)
 }
@@ -8522,7 +9570,7 @@ fn highest_segmented_journal_path(root: &Path) -> Result<Option<PathBuf>> {
 
 fn journal_head_next_sequence(root: &Path) -> Result<Option<u64>> {
     Ok(
-        read_json_optional::<DfsMetadataJournalHead>(&root.join("journal").join("head.sobj"))?
+        read_sobj_optional::<DfsMetadataJournalHead>(&root.join("journal").join("head.sobj"))?
             .and_then(|head| (head.next_sequence > 0).then_some(head.next_sequence)),
     )
 }
@@ -8768,7 +9816,7 @@ fn legacy_journal_entry_paths_since(
     }
     let mut entries = Vec::new();
     for path in paths.into_values() {
-        let entry: DfsMetadataJournalEntry = read_json(&path)?;
+        let entry: DfsMetadataJournalEntry = read_sobj(&path)?;
         entries.push((entry.sequence, path, entry));
     }
     Ok(entries)
@@ -8971,7 +10019,7 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     })
 }
 
-fn read_json<T>(path: &Path) -> Result<T>
+fn read_sobj<T>(path: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -8979,17 +10027,17 @@ where
         .map_err(|source| MetadataBackendError::Serde(source.to_string()))
 }
 
-fn read_json_optional<T>(path: &Path) -> Result<Option<T>>
+fn read_sobj_optional<T>(path: &Path) -> Result<Option<T>>
 where
     T: DeserializeOwned,
 {
     if !path.exists() {
         return Ok(None);
     }
-    read_json(path).map(Some)
+    read_sobj(path).map(Some)
 }
 
-fn read_json_tree<T>(path: &Path) -> Result<Vec<T>>
+fn read_sobj_tree<T>(path: &Path) -> Result<Vec<T>>
 where
     T: DeserializeOwned,
 {
@@ -8997,33 +10045,33 @@ where
         return Ok(Vec::new());
     }
     let mut records = Vec::new();
-    read_json_tree_into(path, &mut records)?;
+    read_sobj_tree_into(path, &mut records)?;
     Ok(records)
 }
 
-fn read_json_tree_into<T>(path: &Path, records: &mut Vec<T>) -> Result<()>
+fn read_sobj_tree_into<T>(path: &Path, records: &mut Vec<T>) -> Result<()>
 where
     T: DeserializeOwned,
 {
     for entry in read_dir(path)? {
         let path = entry.path();
         if path.is_dir() {
-            read_json_tree_into(&path, records)?;
+            read_sobj_tree_into(&path, records)?;
         } else if path.extension().and_then(|ext| ext.to_str()) == Some("sobj") {
-            records.push(read_json(&path)?);
+            records.push(read_sobj(&path)?);
         }
     }
     Ok(())
 }
 
-fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
+fn write_sobj_atomic<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,
 {
-    write_json_atomic_if_changed(path, value).map(|_| ())
+    write_sobj_atomic_if_changed(path, value).map(|_| ())
 }
 
-fn write_json_atomic_if_changed<T>(path: &Path, value: &T) -> Result<bool>
+fn write_sobj_atomic_if_changed<T>(path: &Path, value: &T) -> Result<bool>
 where
     T: Serialize,
 {
@@ -9179,6 +10227,24 @@ mod tests {
         }
     }
 
+    fn namespace_job(index: usize, root_path: &str) -> DfsNamespaceJobRecord {
+        let timestamp = OffsetDateTime::from_unix_timestamp(index as i64).expect("valid timestamp");
+        DfsNamespaceJobRecord {
+            job_id: format!("job_namespace_page_{index:02}"),
+            file_system_id: file_system_id(),
+            kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: root_path.to_string(),
+            target_path: None,
+            pending_frames: Vec::new(),
+            processed_object_count: 0,
+            created_at: timestamp,
+            updated_at: timestamp,
+            completed_at: None,
+            failure_reason: None,
+        }
+    }
+
     fn shard_config(
         shard_id: &str,
         assignment: DfsMetadataShardAssignment,
@@ -9195,7 +10261,7 @@ mod tests {
     }
 
     fn table_path_record(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> DfsPathRecord {
@@ -9208,7 +10274,7 @@ mod tests {
     }
 
     fn table_path_exists(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> bool {
@@ -9219,7 +10285,7 @@ mod tests {
     }
 
     fn table_dentry_exists(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         path_record: &DfsPathRecord,
     ) -> bool {
         backend
@@ -9229,7 +10295,7 @@ mod tests {
     }
 
     fn table_dirfrag(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         dir_inode_id: &DfsInodeId,
         dirfrag_id: &DfsDirFragmentId,
     ) -> DfsDirFragmentRecord {
@@ -9242,7 +10308,7 @@ mod tests {
     }
 
     fn table_file_system_object_exists(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         file_system_id: &DfsFileSystemId,
         object_id: &DfsObjectId,
     ) -> bool {
@@ -9253,7 +10319,7 @@ mod tests {
     }
 
     fn table_hardlink_exists(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         target_object_id: &DfsObjectId,
         hardlink_object_id: &DfsObjectId,
     ) -> bool {
@@ -9264,14 +10330,14 @@ mod tests {
     }
 
     fn force_table_replay_from_journal(
-        backend: &LocalJsonMetadataBackend,
+        backend: &LocalSobjMetadataBackend,
         root: &Path,
         last_materialized_sequence: u64,
     ) {
         remove_file_if_exists(&metadata_table_path(root)).expect("remove metadata table log");
         remove_file_if_exists(&metadata_table_snapshot_path(root))
             .expect("remove metadata table snapshot");
-        write_json_atomic(
+        write_sobj_atomic(
             &backend.local_materialization_cursor_path(),
             &DfsMetadataReplayCursor {
                 shard_id: backend.shard_id.clone(),
@@ -9325,7 +10391,7 @@ mod tests {
     fn local_backend_persists_file_system_object_path_and_journal() {
         let root = temp_root("local_backend_persists_file_system_object_path_and_journal");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let object = object(version("version_1"));
@@ -9393,7 +10459,7 @@ mod tests {
             "new object writes should not create one file per path index record"
         );
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(1).expect("journal").len(), 1);
 
@@ -9404,7 +10470,7 @@ mod tests {
     fn local_backend_batches_object_metadata_into_one_table_batch() {
         let root = temp_root("local_backend_batches_object_metadata_into_one_table_batch");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         backend.put_file_system(&file_system).expect("filesystem");
@@ -9444,7 +10510,7 @@ mod tests {
             );
         }
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(
             reopened
@@ -9714,6 +10780,118 @@ mod tests {
     }
 
     #[test]
+    fn sharded_backend_pages_namespace_jobs() {
+        let root = temp_root("sharded_backend_pages_namespace_jobs");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+
+        for index in 0..6 {
+            let root_path = if index % 2 == 0 {
+                format!("/jobs/{index}")
+            } else {
+                format!("/services/jobs/{index}")
+            };
+            backend
+                .put_namespace_job(&namespace_job(index, &root_path))
+                .expect("namespace job");
+        }
+
+        let mut cursor = None;
+        let mut job_ids = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let page = backend
+                .list_namespace_jobs_page(cursor.as_ref(), 2)
+                .expect("job page");
+            assert!(page.jobs.len() <= 2);
+            job_ids.extend(page.jobs.iter().map(|job| job.job_id.clone()));
+            pages = pages.saturating_add(1);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            job_ids,
+            (0..6)
+                .map(|index| format!("job_namespace_page_{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pages, 3);
+        assert_eq!(
+            backend
+                .get_namespace_job("job_namespace_page_05")
+                .expect("get job")
+                .expect("job")
+                .root_path,
+            "/services/jobs/5"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn sharded_backend_gets_namespace_transaction_by_shard_transaction_id() {
+        let root = temp_root("sharded_backend_get_namespace_transaction");
+        let mut backend = LocalShardedMetadataBackend::new(
+            &root,
+            vec![
+                shard_config("root", DfsMetadataShardAssignment::Root),
+                shard_config(
+                    "services",
+                    DfsMetadataShardAssignment::PathPrefix {
+                        prefix: "/services".to_string(),
+                    },
+                ),
+            ],
+        )
+        .expect("sharded backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut object = object(version("version_1"));
+        object.path = "/services/namespace-transaction.txt".to_string();
+
+        let entry = backend
+            .apply_namespace_transaction(&DfsNamespaceTransaction {
+                transaction_id: "move-to-services".to_string(),
+                file_system_id: file_system.file_system_id.clone(),
+                objects: vec![object.clone()],
+                versions: Vec::new(),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .expect("namespace transaction");
+        let transaction_id = match &entry.mutation {
+            DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
+                transaction_id.clone()
+            }
+            other => panic!("expected namespace transaction journal entry, got {other:?}"),
+        };
+
+        let recovered = backend
+            .get_namespace_transaction(&transaction_id)
+            .expect("lookup transaction")
+            .expect("transaction");
+        assert_eq!(recovered.transaction_id, transaction_id);
+        assert_eq!(
+            recovered.objects.first().map(|object| &object.object_id),
+            Some(&object.object_id)
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn sharded_backend_pages_object_local_records_with_shard_cursors() {
         let root = temp_root("sharded_backend_pages_object_local_records");
         let mut backend = LocalShardedMetadataBackend::new(
@@ -9763,6 +10941,27 @@ mod tests {
                 .map(|shard_id| shard_id.0.as_str()),
             Some("services")
         );
+        let first_version_scan = backend
+            .version_records_page(None, 2)
+            .expect("first version scan page");
+        assert_eq!(first_version_scan.versions.len(), 2);
+        assert!(first_version_scan.next_cursor.is_some());
+        let second_version_scan = backend
+            .version_records_page(first_version_scan.next_cursor.as_ref(), 2)
+            .expect("second version scan page");
+        assert_eq!(second_version_scan.versions.len(), 1);
+        assert!(second_version_scan.next_cursor.is_none());
+        let scanned_versions = first_version_scan
+            .versions
+            .into_iter()
+            .chain(second_version_scan.versions)
+            .map(|version_record| version_record.version)
+            .collect::<Vec<_>>();
+        let mut expected_versions = (0..3)
+            .map(|index| version(&format!("version_{index}")))
+            .collect::<Vec<_>>();
+        expected_versions.sort();
+        assert_eq!(scanned_versions, expected_versions);
 
         for index in 0..3 {
             let receipt = DfsReplicaReceiptRecord {
@@ -9791,6 +10990,27 @@ mod tests {
                 .map(|shard_id| shard_id.0.as_str()),
             Some("services")
         );
+        let first_receipt_scan = backend
+            .receipt_records_page(None, 2)
+            .expect("first receipt scan page");
+        assert_eq!(first_receipt_scan.receipts.len(), 2);
+        assert!(first_receipt_scan.next_cursor.is_some());
+        let second_receipt_scan = backend
+            .receipt_records_page(first_receipt_scan.next_cursor.as_ref(), 2)
+            .expect("second receipt scan page");
+        assert_eq!(second_receipt_scan.receipts.len(), 1);
+        assert!(second_receipt_scan.next_cursor.is_none());
+        let scanned_receipts = first_receipt_scan
+            .receipts
+            .into_iter()
+            .chain(second_receipt_scan.receipts)
+            .map(|receipt| receipt.replica_node_id)
+            .collect::<Vec<_>>();
+        let mut expected_receipts = (0..3)
+            .map(|index| node(&format!("node_replica_{index}")))
+            .collect::<Vec<_>>();
+        expected_receipts.sort();
+        assert_eq!(scanned_receipts, expected_receipts);
 
         for index in 0..3 {
             let intent = DfsWriteIntentRecord {
@@ -9822,6 +11042,236 @@ mod tests {
                 .and_then(|cursor| cursor.shard_id.as_ref())
                 .map(|shard_id| shard_id.0.as_str()),
             Some("services")
+        );
+        let first_scan_page = backend
+            .write_intents_page(None, 2)
+            .expect("first write intent scan page");
+        assert_eq!(first_scan_page.intents.len(), 2);
+        assert!(first_scan_page.next_cursor.is_some());
+        let second_scan_page = backend
+            .write_intents_page(first_scan_page.next_cursor.as_ref(), 2)
+            .expect("second write intent scan page");
+        assert_eq!(second_scan_page.intents.len(), 1);
+        assert!(second_scan_page.next_cursor.is_none());
+        let scanned_intent_ids = first_scan_page
+            .intents
+            .into_iter()
+            .chain(second_scan_page.intents)
+            .map(|intent| intent.intent_id)
+            .collect::<Vec<_>>();
+        assert_eq!(scanned_intent_ids, vec!["intent-0", "intent-1", "intent-2"]);
+
+        let target_version = version("version_shared_target");
+        for index in 0..3 {
+            let intent = DfsWriteIntentRecord {
+                intent_id: format!("intent-shared-target-{index}"),
+                file_system_id: file.file_system_id.clone(),
+                object_id: file.object_id.clone(),
+                base_version: Some(version("version_0")),
+                target_version: target_version.clone(),
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner")],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                content_hash: Some(format!("blake3:shared-target-{index}")),
+                object_metadata: Some(file.clone()),
+                created_at: OffsetDateTime::now_utc(),
+                updated_at: None,
+            };
+            backend.put_intent(&intent).expect("shared target intent");
+        }
+        let first_target_page = backend
+            .intents_for_object_version_page(&file.object_id, &target_version, None, 2)
+            .expect("first target intent page");
+        assert_eq!(first_target_page.intents.len(), 2);
+        assert_eq!(
+            first_target_page
+                .next_cursor
+                .as_ref()
+                .and_then(|cursor| cursor.shard_id.as_ref())
+                .map(|shard_id| shard_id.0.as_str()),
+            Some("services")
+        );
+        let second_target_page = backend
+            .intents_for_object_version_page(
+                &file.object_id,
+                &target_version,
+                first_target_page.next_cursor.as_ref(),
+                2,
+            )
+            .expect("second target intent page");
+        assert_eq!(second_target_page.intents.len(), 1);
+        assert!(second_target_page.next_cursor.is_none());
+        let shared_target_ids = first_target_page
+            .intents
+            .into_iter()
+            .chain(second_target_page.intents)
+            .map(|intent| intent.intent_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shared_target_ids,
+            vec![
+                "intent-shared-target-0".to_string(),
+                "intent-shared-target-1".to_string(),
+                "intent-shared-target-2".to_string()
+            ]
+        );
+
+        let mut transient_object = file.clone();
+        transient_object.object_id = DfsObjectId::from_legacy_named("obj_sharded_transient_intent")
+            .expect("transient object id");
+        transient_object.path = "/services/transient-create.txt".to_string();
+        transient_object.version = version("version_transient_1");
+        let transient_intent = DfsWriteIntentRecord {
+            intent_id: "intent-transient-create".to_string(),
+            file_system_id: transient_object.file_system_id.clone(),
+            object_id: transient_object.object_id.clone(),
+            base_version: None,
+            target_version: version("version_transient_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::Staging,
+            content_hash: Some("blake3:transient".to_string()),
+            object_metadata: Some(transient_object.clone()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: None,
+        };
+        backend
+            .put_intent_for_object(Some(&transient_object), &transient_intent)
+            .expect("transient intent");
+        assert_eq!(
+            backend
+                .intents_for_object_version_page(
+                    &transient_object.object_id,
+                    &transient_intent.target_version,
+                    None,
+                    1,
+                )
+                .expect("transient target intent page")
+                .intents
+                .into_iter()
+                .map(|intent| intent.intent_id)
+                .collect::<Vec<_>>(),
+            vec!["intent-transient-create"]
+        );
+
+        let mut moved_object = object(version("version_1"));
+        moved_object.object_id = DfsObjectId::from_legacy_named("obj_sharded_stale_intent_source")
+            .expect("stale intent object id");
+        moved_object.path = "/stale-intent-source.txt".to_string();
+        backend.put_object(&moved_object).expect("root object");
+        let stale_source_intent = DfsWriteIntentRecord {
+            intent_id: "intent-stale-source".to_string(),
+            file_system_id: moved_object.file_system_id.clone(),
+            object_id: moved_object.object_id.clone(),
+            base_version: Some(moved_object.version.clone()),
+            target_version: version("version_stale_source_2"),
+            coordinator_node_id: node("node_owner"),
+            owner_epoch: 1,
+            desired_replica_node_ids: vec![node("node_owner")],
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            status: DfsWriteIntentStatus::ReceiptsPending,
+            content_hash: Some("blake3:stale-source".to_string()),
+            object_metadata: Some(moved_object.clone()),
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: None,
+        };
+        backend
+            .put_intent(&stale_source_intent)
+            .expect("source shard intent");
+        let mut moved_target_object = moved_object.clone();
+        moved_target_object.path = "/services/stale-intent-source.txt".to_string();
+        moved_target_object.version = version("version_stale_source_3");
+        backend
+            .put_object(&moved_target_object)
+            .expect("move object to services");
+        assert!(
+            backend
+                .intents_for_object_version_page(
+                    &moved_object.object_id,
+                    &stale_source_intent.target_version,
+                    None,
+                    1,
+                )
+                .expect("stale source target intent page")
+                .intents
+                .is_empty(),
+            "target-version lookups should hide source-shard intents after the object index moves"
+        );
+
+        let mut scan_cursor = None;
+        let mut visible_scan_ids = BTreeSet::new();
+        loop {
+            let page = backend
+                .write_intents_page(scan_cursor.as_ref(), 2)
+                .expect("visible intent scan page");
+            assert!(page.intents.len() <= 2);
+            visible_scan_ids.extend(page.intents.into_iter().map(|intent| intent.intent_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            scan_cursor = Some(next_cursor);
+        }
+        assert!(
+            visible_scan_ids.contains("intent-transient-create"),
+            "transient create intents should remain visible in global scans"
+        );
+        assert!(
+            !visible_scan_ids.contains("intent-stale-source"),
+            "global scans should hide source-shard intents after the object index moves"
+        );
+        assert_eq!(
+            backend
+                .all_intents()
+                .expect("all intents")
+                .into_iter()
+                .map(|intent| intent.intent_id)
+                .collect::<BTreeSet<_>>(),
+            visible_scan_ids
+        );
+
+        for index in 0..3 {
+            let conflict = DfsConflictRecord {
+                conflict_id: format!("conflict-{index}"),
+                file_system_id: file.file_system_id.clone(),
+                object_id: file.object_id.clone(),
+                path: file.path.clone(),
+                base_version: Some(version("version_0")),
+                local_version: version(&format!("version_local_{index}")),
+                remote_version: version(&format!("version_remote_{index}")),
+                detected_by_node_id: node("node_owner"),
+                reason: format!("conflict {index}"),
+                local_content_hash: Some(format!("blake3:local-{index}")),
+                remote_content_hash: Some(format!("blake3:remote-{index}")),
+                created_by_intent_id: None,
+                strategy: Some("branch".to_string()),
+                status: DfsConflictStatus::Open,
+                detected_at: OffsetDateTime::UNIX_EPOCH,
+            };
+            backend.put_conflict(&conflict).expect("conflict");
+        }
+        let first_conflict_scan = backend
+            .conflict_records_page(None, 2)
+            .expect("first conflict scan page");
+        assert_eq!(first_conflict_scan.conflicts.len(), 2);
+        assert!(first_conflict_scan.next_cursor.is_some());
+        let second_conflict_scan = backend
+            .conflict_records_page(first_conflict_scan.next_cursor.as_ref(), 2)
+            .expect("second conflict scan page");
+        assert_eq!(second_conflict_scan.conflicts.len(), 1);
+        assert!(second_conflict_scan.next_cursor.is_none());
+        let scanned_conflicts = first_conflict_scan
+            .conflicts
+            .into_iter()
+            .chain(second_conflict_scan.conflicts)
+            .map(|conflict| conflict.conflict_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scanned_conflicts,
+            vec!["conflict-0", "conflict-1", "conflict-2"]
         );
 
         cleanup(&root);
@@ -10409,7 +11859,7 @@ mod tests {
     fn local_backend_does_not_materialize_object_when_journal_append_fails() {
         let root = temp_root("local_backend_journal_failure_does_not_materialize_object");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let object = object(version("version_1"));
@@ -10448,7 +11898,7 @@ mod tests {
         let object = object(version("version_1"));
         let journaled_sequence = {
             let mut backend =
-                LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                     .expect("backend");
             let file_system = file_system();
             backend.put_file_system(&file_system).expect("filesystem");
@@ -10469,7 +11919,7 @@ mod tests {
             entry.sequence
         };
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
 
         assert_eq!(
@@ -10480,7 +11930,7 @@ mod tests {
             "reopen should replay journaled metadata that was not yet materialized"
         );
         assert_eq!(
-            read_json::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+            read_sobj::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
                 .expect("materialization cursor")
                 .last_sequence,
             journaled_sequence
@@ -10496,7 +11946,7 @@ mod tests {
         let object = object(version("version_1"));
         let (last_sequence, table_len_before) = {
             let mut backend =
-                LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
             backend.put_file_system(&file_system()).expect("filesystem");
             let entry = backend.put_object(&object).expect("object");
             let table_len = fs::metadata(metadata_table_path(&root))
@@ -10504,7 +11954,7 @@ mod tests {
                 .len();
             (entry.sequence, table_len)
         };
-        write_json_atomic(
+        write_sobj_atomic(
             &root
                 .join("records")
                 .join("local-materialization")
@@ -10516,7 +11966,7 @@ mod tests {
         )
         .expect("stale materialization cursor");
 
-        let reopened = LocalJsonMetadataBackend::new(shard_id, &root).expect("reopen");
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen");
 
         assert_eq!(
             reopened
@@ -10526,7 +11976,7 @@ mod tests {
             "stale cursor recovery must preserve the materialized object"
         );
         assert_eq!(
-            read_json::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+            read_sobj::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
                 .expect("materialization cursor")
                 .last_sequence,
             last_sequence
@@ -10549,7 +11999,7 @@ mod tests {
         let mut expected_objects = Vec::new();
         let (last_sequence, table_len_before) = {
             let mut backend =
-                LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
             backend.put_file_system(&file_system()).expect("filesystem");
             let mut last_sequence = 0;
             for index in 0..8 {
@@ -10563,7 +12013,7 @@ mod tests {
                 expected_objects.push(object);
             }
             let cursor =
-                read_json::<DfsMetadataReplayCursor>(&backend.local_materialization_cursor_path())
+                read_sobj::<DfsMetadataReplayCursor>(&backend.local_materialization_cursor_path())
                     .expect("materialization cursor");
             assert_eq!(
                 cursor.last_sequence, 0,
@@ -10576,7 +12026,7 @@ mod tests {
         };
 
         let reopened =
-            LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("reopen backend");
+            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("reopen backend");
 
         for object in expected_objects {
             assert_eq!(
@@ -10588,7 +12038,7 @@ mod tests {
             );
         }
         assert_eq!(
-            read_json::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
+            read_sobj::<DfsMetadataReplayCursor>(&reopened.local_materialization_cursor_path())
                 .expect("materialization cursor")
                 .last_sequence,
             last_sequence,
@@ -10609,7 +12059,7 @@ mod tests {
     fn local_backend_open_does_not_rewrite_existing_metadata_table() {
         let root = temp_root("local_backend_open_preserves_metadata_table");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
         backend
@@ -10618,7 +12068,7 @@ mod tests {
         let table_path = metadata_table_path(&root);
         let before_len = fs::metadata(&table_path).expect("metadata table").len();
 
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen backend");
 
         let after_len = fs::metadata(&table_path)
@@ -10635,7 +12085,7 @@ mod tests {
     fn local_backend_compacts_materialized_table_log_to_snapshot() {
         let root = temp_root("local_backend_compacts_materialized_table_log");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         backend.put_file_system(&file_system).expect("filesystem");
@@ -10664,7 +12114,7 @@ mod tests {
             "compaction should persist a compact materialized table snapshot"
         );
         let snapshot: DfsMetadataTableSnapshot =
-            read_json(&metadata_table_snapshot_path(&root)).expect("metadata table snapshot");
+            read_sobj(&metadata_table_snapshot_path(&root)).expect("metadata table snapshot");
         assert_eq!(
             snapshot.format_version, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             "new compactions should use structured metadata table snapshots"
@@ -10678,7 +12128,7 @@ mod tests {
             0,
             "compaction should truncate historical table ops after the snapshot is durable"
         );
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen compacted backend");
         for object in expected_objects {
             assert_eq!(
@@ -10698,10 +12148,10 @@ mod tests {
         let object = object(version("version_1"));
         {
             let mut backend =
-                LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
             backend.put_file_system(&file_system()).expect("filesystem");
             backend.put_object(&object).expect("object");
-            write_json_atomic(
+            write_sobj_atomic(
                 &metadata_table_snapshot_path(&root),
                 &DfsMetadataTableSnapshot {
                     format_version: LEGACY_METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
@@ -10713,7 +12163,7 @@ mod tests {
             truncate_metadata_table_log(&root).expect("truncate table log");
         }
 
-        let reopened = LocalJsonMetadataBackend::new(shard_id, &root).expect("reopen");
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen");
 
         assert_eq!(
             reopened
@@ -10722,7 +12172,7 @@ mod tests {
             Some(object)
         );
         let snapshot: DfsMetadataTableSnapshot =
-            read_json(&metadata_table_snapshot_path(&root)).expect("migrated snapshot");
+            read_sobj(&metadata_table_snapshot_path(&root)).expect("migrated snapshot");
         assert_eq!(
             snapshot.format_version, METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
             "opening a legacy op snapshot should migrate it to the structured snapshot format"
@@ -10743,10 +12193,10 @@ mod tests {
     #[test]
     fn local_backend_allocates_journal_sequences_across_open_handles() {
         let root = temp_root("local_backend_allocates_journal_sequences_across_open_handles");
-        let mut first = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let mut first = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("first backend");
         let mut second =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("second backend");
         let file_system = file_system();
         let mut object = object(version("version_1"));
@@ -10780,9 +12230,9 @@ mod tests {
     #[test]
     fn local_backend_readers_see_table_batches_from_other_open_handles() {
         let root = temp_root("local_backend_readers_see_table_batches_from_other_open_handles");
-        let mut first = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let mut first = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("first backend");
-        let second = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let second = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("second backend");
         let file_system = file_system();
         let object = object(version("version_1"));
@@ -10816,7 +12266,7 @@ mod tests {
     fn local_backend_serializes_concurrent_metadata_writers() {
         let root = temp_root("local_backend_serializes_concurrent_metadata_writers");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
         drop(backend);
@@ -10830,7 +12280,7 @@ mod tests {
             let barrier = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 let mut backend =
-                    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                         .expect("backend");
                 barrier.wait();
                 for object_index in 0..writes_per_writer {
@@ -10848,7 +12298,7 @@ mod tests {
             handle.join().expect("writer thread");
         }
 
-        let backend = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         let journal = backend.journal_since(0).expect("journal");
         assert_eq!(journal.len(), 1 + writer_count * writes_per_writer);
@@ -10877,7 +12327,7 @@ mod tests {
     fn local_backend_readers_never_observe_torn_metadata_during_writes() {
         let root = temp_root("local_backend_readers_during_writes");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
         drop(backend);
@@ -10900,7 +12350,7 @@ mod tests {
             let barrier = barrier.clone();
             readers.push(std::thread::spawn(move || {
                 let backend =
-                    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                         .expect("reader backend");
                 barrier.wait();
                 // Read at least once, then keep reading until the writer signals stop.
@@ -10924,7 +12374,7 @@ mod tests {
         }
 
         let mut writer =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("writer backend");
         barrier.wait();
         for i in 0..total_writes {
@@ -10941,7 +12391,7 @@ mod tests {
             assert!(reads > 0, "reader must have completed at least one read");
         }
 
-        let backend = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let backend = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(
             backend
@@ -10959,7 +12409,7 @@ mod tests {
     fn local_backend_appends_journal_entries_to_segment_files() {
         let root = temp_root("local_backend_appends_journal_entries_to_segment_files");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let object = object(version("version_1"));
@@ -10988,7 +12438,7 @@ mod tests {
         assert_eq!(backend.journal_since(0).expect("journal").len(), 2);
         assert_eq!(backend.journal_since(1).expect("journal").len(), 1);
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(reopened.journal_since(0).expect("journal").len(), 2);
 
@@ -11001,7 +12451,7 @@ mod tests {
         let shard_id = DfsMetadataShardId::new("shard-root");
         let file_system = file_system();
         let object = object(version("version_1"));
-        let mut backend = LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&object).expect("object");
         backend
@@ -11022,14 +12472,14 @@ mod tests {
             },
         )
         .expect("high segment entry");
-        write_json_atomic(
+        write_sobj_atomic(
             &root.join("journal").join("head.sobj"),
             &DfsMetadataJournalHead {
                 next_sequence: high_sequence + 1,
             },
         )
         .expect("journal head");
-        write_json_atomic(
+        write_sobj_atomic(
             &backend.local_materialization_cursor_path(),
             &DfsMetadataReplayCursor {
                 shard_id: shard_id.clone(),
@@ -11046,7 +12496,7 @@ mod tests {
         .expect("corrupt consumed segment");
         drop(backend);
 
-        let reopened = LocalJsonMetadataBackend::new(shard_id, &root)
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &root)
             .expect("reopen should not scan consumed journal segments");
         assert_eq!(
             reopened.get_object(&object.object_id).expect("object"),
@@ -11066,7 +12516,7 @@ mod tests {
     fn local_backend_reads_bounded_journal_batches() {
         let root = temp_root("local_backend_reads_bounded_journal_batches");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         backend.put_file_system(&file_system).expect("filesystem");
@@ -11113,7 +12563,7 @@ mod tests {
     fn local_backend_reads_byte_bounded_journal_batches() {
         let root = temp_root("local_backend_reads_byte_bounded_journal_batches");
         let shard_id = DfsMetadataShardId::new("shard-root");
-        let mut backend = LocalJsonMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+        let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
         for index in 0..3 {
             let mut object = object(version("version_1"));
@@ -11182,10 +12632,10 @@ mod tests {
                 file_system: Some(file_system()),
             },
         };
-        write_json_atomic(&legacy_path, &legacy_entry).expect("legacy journal entry");
+        write_sobj_atomic(&legacy_path, &legacy_entry).expect("legacy journal entry");
 
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         assert!(
             !legacy_path.exists(),
@@ -11215,7 +12665,7 @@ mod tests {
     fn local_backend_hydrates_legacy_journal_payloads_from_records() {
         let root = temp_root("local_backend_hydrates_legacy_journal_payloads_from_records");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
         backend
@@ -11234,6 +12684,44 @@ mod tests {
                 visible: true,
             })
             .expect("version");
+        let mut committed_object = object(version("version_2"));
+        committed_object.content_hash = Some("blake3:new".to_string());
+        committed_object.content_size_bytes = Some(128);
+        let visible_version = DfsObjectVersionRecord {
+            file_system_id: file_system_id(),
+            object_id: object_id(),
+            version: version("version_2"),
+            content_hash: committed_object.content_hash.clone(),
+            size_bytes: committed_object.content_size_bytes,
+            locations: vec![node("node_owner")],
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        backend
+            .commit_visible_version(
+                &version("version_1"),
+                &committed_object,
+                &visible_version,
+                &[],
+            )
+            .expect("commit visible version");
+        let mut transaction_object = object(version("version_namespace_tx"));
+        transaction_object.object_id =
+            DfsObjectId::from_legacy_named("obj_hydrated_namespace_tx").expect("object");
+        transaction_object.path = "docs/transaction.md".to_string();
+        transaction_object.content_hash = None;
+        transaction_object.content_size_bytes = None;
+        let transaction = DfsNamespaceTransaction {
+            transaction_id: "namespace_tx_hydrate_legacy".to_string(),
+            file_system_id: file_system_id(),
+            objects: vec![transaction_object],
+            versions: Vec::new(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        backend
+            .apply_namespace_transaction(&transaction)
+            .expect("namespace transaction");
 
         let legacy_entries = backend
             .journal_since(0)
@@ -11249,6 +12737,17 @@ mod tests {
                     }
                     DfsMetadataMutation::PutVersion { version_record, .. } => {
                         *version_record = None;
+                    }
+                    DfsMetadataMutation::CommitVisibleVersion {
+                        committed_object,
+                        visible_version,
+                        ..
+                    } => {
+                        *committed_object = None;
+                        *visible_version = None;
+                    }
+                    DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
+                        *transaction = None;
                     }
                     _ => {}
                 }
@@ -11280,6 +12779,22 @@ mod tests {
                 ..
             }
         ));
+        assert!(hydrated.iter().any(|entry| matches!(
+            &entry.mutation,
+            DfsMetadataMutation::CommitVisibleVersion {
+                committed_object: Some(object),
+                visible_version: Some(version_record),
+                ..
+            } if object.version == version("version_2")
+                && version_record.version == version("version_2")
+        )));
+        assert!(hydrated.iter().any(|entry| matches!(
+            &entry.mutation,
+            DfsMetadataMutation::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } if transaction.transaction_id == "namespace_tx_hydrate_legacy"
+        )));
 
         cleanup(&root);
     }
@@ -11298,7 +12813,7 @@ mod tests {
     fn local_backend_reopen_recovers_next_sequence_from_segment_tail() {
         let root = temp_root("local_backend_reopen_recovers_next_sequence_from_segment_tail");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -11319,7 +12834,7 @@ mod tests {
         .expect("append segment entry without advancing head");
 
         let mut reopened =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("reopen");
         let mut object = object(version("version_1"));
         object.object_id =
@@ -11338,7 +12853,7 @@ mod tests {
     fn local_backend_lists_directory_children_from_dentry_index() {
         let root = temp_root("local_backend_lists_directory_children_from_dentry_index");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -11380,7 +12895,7 @@ mod tests {
     fn local_backend_routes_new_large_directory_entries_to_hash_fragments() {
         let root = temp_root("local_backend_routes_new_large_directory_entries_to_hash_fragments");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -11440,7 +12955,7 @@ mod tests {
     fn local_backend_pages_filesystem_objects_and_directory_children() {
         let root = temp_root("local_backend_pages_objects_and_children");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
         let mut dir = object(version("version_1"));
@@ -11517,10 +13032,54 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_pages_namespace_jobs() {
+        let root = temp_root("local_backend_pages_namespace_jobs");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+        for index in 0..5 {
+            backend
+                .put_namespace_job(&namespace_job(index, &format!("/jobs/{index}")))
+                .expect("namespace job");
+        }
+
+        let empty = backend
+            .list_namespace_jobs_page(None, 0)
+            .expect("empty page");
+        assert!(empty.jobs.is_empty());
+        assert!(empty.next_cursor.is_none());
+
+        let mut cursor = None;
+        let mut job_ids = Vec::new();
+        let mut pages = 0usize;
+        loop {
+            let page = backend
+                .list_namespace_jobs_page(cursor.as_ref(), 2)
+                .expect("job page");
+            assert!(page.jobs.len() <= 2);
+            job_ids.extend(page.jobs.iter().map(|job| job.job_id.clone()));
+            pages = pages.saturating_add(1);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            job_ids,
+            (0..5)
+                .map(|index| format!("job_namespace_page_{index:02}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(pages, 3);
+        assert_eq!(backend.list_namespace_jobs().expect("legacy list").len(), 5);
+
+        cleanup(&root);
+    }
+
+    #[test]
     fn local_backend_pages_object_versions_receipts_and_intents() {
         let root = temp_root("local_backend_pages_object_local_records");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
         let file = object(version("version_0"));
@@ -11563,6 +13122,20 @@ mod tests {
                 .map(|version| version.version)
                 .collect::<Vec<_>>()
         );
+        let mut version_scan_cursor = None;
+        let mut scanned_versions = Vec::new();
+        loop {
+            let page = backend
+                .version_records_page(version_scan_cursor.as_ref(), 2)
+                .expect("version scan page");
+            assert!(page.versions.len() <= 2);
+            scanned_versions.extend(page.versions.into_iter().map(|version| version.version));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            version_scan_cursor = Some(next_cursor);
+        }
+        assert_eq!(scanned_versions, paged_versions);
 
         for index in 0..5 {
             let receipt = DfsReplicaReceiptRecord {
@@ -11611,6 +13184,24 @@ mod tests {
                 .map(|receipt| receipt.replica_node_id)
                 .collect::<Vec<_>>()
         );
+        let mut receipt_scan_cursor = None;
+        let mut scanned_receipts = Vec::new();
+        loop {
+            let page = backend
+                .receipt_records_page(receipt_scan_cursor.as_ref(), 2)
+                .expect("receipt scan page");
+            assert!(page.receipts.len() <= 2);
+            scanned_receipts.extend(
+                page.receipts
+                    .into_iter()
+                    .map(|receipt| receipt.replica_node_id),
+            );
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            receipt_scan_cursor = Some(next_cursor);
+        }
+        assert_eq!(scanned_receipts, paged_receipts);
 
         for index in 0..5 {
             let intent = DfsWriteIntentRecord {
@@ -11652,6 +13243,132 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
+        let mut scan_cursor = None;
+        let mut scanned_intents = Vec::new();
+        loop {
+            let page = backend
+                .write_intents_page(scan_cursor.as_ref(), 2)
+                .expect("intent scan page");
+            assert!(page.intents.len() <= 2);
+            scanned_intents.extend(page.intents.into_iter().map(|intent| intent.intent_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            scan_cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            scanned_intents,
+            (0..5)
+                .map(|index| format!("intent-{index}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            backend
+                .all_intents()
+                .expect("all intents")
+                .into_iter()
+                .map(|intent| intent.intent_id)
+                .collect::<Vec<_>>(),
+            scanned_intents
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_pages_intents_by_target_version_after_reopen() {
+        let root = temp_root("local_backend_pages_intents_by_target_version");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+
+        let file = object(version("version_0"));
+        backend.put_object(&file).expect("object");
+        for index in 0..6 {
+            let target_version = if index % 2 == 0 {
+                version("version_even")
+            } else {
+                version("version_odd")
+            };
+            let intent = DfsWriteIntentRecord {
+                intent_id: format!("intent-target-{index}"),
+                file_system_id: file.file_system_id.clone(),
+                object_id: file.object_id.clone(),
+                base_version: Some(version("version_0")),
+                target_version,
+                coordinator_node_id: node("node_owner"),
+                owner_epoch: 1,
+                desired_replica_node_ids: vec![node("node_owner")],
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                status: DfsWriteIntentStatus::ReceiptsPending,
+                content_hash: Some(format!("blake3:intent-target-{index}")),
+                object_metadata: Some(file.clone()),
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                updated_at: None,
+            };
+            backend.put_intent(&intent).expect("intent");
+        }
+
+        let first_even_page = backend
+            .intents_for_object_version_page(&file.object_id, &version("version_even"), None, 2)
+            .expect("first even intent page");
+        assert_eq!(
+            first_even_page
+                .intents
+                .iter()
+                .map(|intent| intent.intent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["intent-target-0", "intent-target-2"]
+        );
+        assert!(first_even_page.next_cursor.is_some());
+        let second_even_page = backend
+            .intents_for_object_version_page(
+                &file.object_id,
+                &version("version_even"),
+                first_even_page.next_cursor.as_ref(),
+                2,
+            )
+            .expect("second even intent page");
+        assert_eq!(
+            second_even_page
+                .intents
+                .iter()
+                .map(|intent| intent.intent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["intent-target-4"]
+        );
+        assert!(second_even_page.next_cursor.is_none());
+
+        drop(backend);
+        let reopened =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("reopen");
+        let mut cursor = None;
+        let mut odd_intents = Vec::new();
+        loop {
+            let page = reopened
+                .intents_for_object_version_page(
+                    &file.object_id,
+                    &version("version_odd"),
+                    cursor.as_ref(),
+                    1,
+                )
+                .expect("odd intent page");
+            assert!(page.intents.len() <= 1);
+            odd_intents.extend(page.intents.into_iter().map(|intent| intent.intent_id));
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        assert_eq!(
+            odd_intents,
+            vec![
+                "intent-target-1".to_string(),
+                "intent-target-3".to_string(),
+                "intent-target-5".to_string()
+            ]
+        );
+
         cleanup(&root);
     }
 
@@ -11659,7 +13376,7 @@ mod tests {
     fn local_backend_content_update_does_not_rewrite_stable_namespace_indexes() {
         let root = temp_root("local_backend_content_update_skips_stable_indexes");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -11751,7 +13468,7 @@ mod tests {
     fn local_backend_removes_stale_path_and_dentry_indexes() {
         let root = temp_root("local_backend_removes_stale_path_and_dentry_indexes");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -11847,7 +13564,7 @@ mod tests {
     fn local_backend_compacts_retention_eligible_tombstones_to_path_markers() {
         let root = temp_root("local_backend_compacts_tombstones_to_markers");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let mut tombstone = object(version("version_2"));
@@ -11916,7 +13633,7 @@ mod tests {
         );
 
         drop(backend);
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
         assert_eq!(
             reopened
@@ -11946,7 +13663,7 @@ mod tests {
     fn local_backend_tombstone_compaction_retains_young_and_referenced_tombstones() {
         let root = temp_root("local_backend_tombstone_compaction_retains");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         backend.put_file_system(&file_system).expect("filesystem");
@@ -12011,7 +13728,7 @@ mod tests {
     fn local_backend_recreating_compacted_tombstone_path_removes_marker() {
         let root = temp_root("local_backend_recreate_compacted_tombstone_path");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let mut tombstone = object(version("version_2"));
@@ -12122,7 +13839,7 @@ mod tests {
         let root = temp_root("local_backend_rebuilds_dirfrag_counts");
         {
             let mut backend =
-                LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                     .expect("backend");
             backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -12148,7 +13865,7 @@ mod tests {
             force_table_replay_from_journal(&backend, &root, 0);
         }
 
-        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let recovered = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         let path_record = path_record_for_object(&object(version("version_1")));
         assert_eq!(
@@ -12168,7 +13885,7 @@ mod tests {
     fn local_backend_lists_objects_from_filesystem_object_index() {
         let root = temp_root("local_backend_lists_objects_from_filesystem_object_index");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let other_file_system = DfsFileSystem {
@@ -12241,7 +13958,7 @@ mod tests {
         let root =
             temp_root("local_backend_removes_stale_path_index_when_object_moves_filesystems");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let other_file_system = DfsFileSystem {
@@ -12299,7 +14016,7 @@ mod tests {
         let root = temp_root("local_backend_recovers_secondary_indexes_for_legacy_object_records");
         {
             let mut backend =
-                LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                     .expect("backend");
             backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -12319,7 +14036,7 @@ mod tests {
             fs::remove_dir_all(root.join("records").join(index_dir)).ok();
         }
 
-        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let recovered = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         assert_eq!(
             recovered
@@ -12356,7 +14073,7 @@ mod tests {
     fn local_backend_lists_hardlinks_from_target_index() {
         let root = temp_root("local_backend_lists_hardlinks_from_target_index");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -12459,7 +14176,7 @@ mod tests {
     fn local_backend_removes_stale_hardlink_target_index_entries() {
         let root = temp_root("local_backend_removes_stale_hardlink_target_index_entries");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
@@ -12516,7 +14233,7 @@ mod tests {
     fn local_backend_persists_intents_and_polls_subscription_batches() {
         let root = temp_root("local_backend_persists_intents_and_polls_subscription_batches");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let intent = DfsWriteIntentRecord {
             intent_id: "dfs_intent_1".to_string(),
@@ -12568,7 +14285,7 @@ mod tests {
 
         fs::write(
             root.join("journal").join("00000000000000000001.sobj"),
-            b"not json",
+            b"not sobj",
         )
         .expect("corrupt already-consumed journal entry");
         let third_batch = backend
@@ -12584,7 +14301,7 @@ mod tests {
     fn commit_visible_version_requires_expected_version_and_receipts() {
         let root = temp_root("commit_visible_version_requires_expected_version_and_receipts");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let initial = object(version("version_1"));
@@ -12678,9 +14395,9 @@ mod tests {
         let leader_root = temp_root("local_backend_replays_journal_batch_into_follower_leader");
         let follower_root = temp_root("local_backend_replays_journal_batch_into_follower_follower");
         let mut leader =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-leader"), &leader_root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-leader"), &leader_root)
                 .expect("leader backend");
-        let mut follower = LocalJsonMetadataBackend::new(
+        let mut follower = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("shard-follower"),
             &follower_root,
         )
@@ -12793,7 +14510,7 @@ mod tests {
             "idempotent replays must not append duplicate follower journal entries"
         );
         assert_eq!(
-            read_json::<DfsMetadataReplayCursor>(
+            read_sobj::<DfsMetadataReplayCursor>(
                 &follower.replay_cursor_path(&DfsMetadataShardId::new("shard-leader"))
             )
             .expect("replay cursor")
@@ -12832,8 +14549,8 @@ mod tests {
         let follower_root = temp_root("local_backend_snapshot_repair_follower");
         let shard_id = DfsMetadataShardId::new("root");
         let mut leader =
-            LocalJsonMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader backend");
-        let mut follower = LocalJsonMetadataBackend::new(shard_id.clone(), &follower_root)
+            LocalSobjMetadataBackend::new(shard_id.clone(), &leader_root).expect("leader backend");
+        let mut follower = LocalSobjMetadataBackend::new(shard_id.clone(), &follower_root)
             .expect("follower backend");
 
         let leader_file_system = file_system();
@@ -12935,7 +14652,7 @@ mod tests {
         let target_node_id = node("node_cursor_target");
         let shard_id = DfsMetadataShardId::new("root");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("backend");
         assert_eq!(
             backend
                 .metadata_replication_cursor(&target_node_id, &shard_id)
@@ -12950,7 +14667,7 @@ mod tests {
             .put_metadata_replication_cursor(&target_node_id, &shard_id, 7)
             .expect("stale cursor");
         let reopened =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("reopen");
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), &root).expect("reopen");
 
         assert_eq!(
             reopened
@@ -12966,7 +14683,7 @@ mod tests {
     fn local_backend_replays_semantically_duplicate_receipt_as_idempotent() {
         let root = temp_root("local_backend_duplicate_receipt_semantic_idempotent");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let object = object(version("version_1"));
@@ -13022,7 +14739,7 @@ mod tests {
     fn local_backend_recovers_object_locations_from_visible_version() {
         let root = temp_root("local_backend_recovers_object_locations_from_visible_version");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let owner = node("node_owner");
         let replica = node("node_replica");
@@ -13044,7 +14761,7 @@ mod tests {
         };
         backend.put_version(&version_record).expect("version");
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen");
 
         assert_eq!(
@@ -13062,7 +14779,7 @@ mod tests {
     fn local_backend_rejects_replay_entries_without_record_payloads() {
         let root = temp_root("local_backend_rejects_replay_entries_without_record_payloads");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let entry = DfsMetadataJournalEntry {
             shard_id: DfsMetadataShardId::new("shard-leader"),
@@ -13090,7 +14807,7 @@ mod tests {
     fn local_backend_normalizes_replica_locations_at_persistence_boundary() {
         let root = temp_root("local_backend_normalizes_replica_locations");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let owner = node("node_owner");
         let replica = node("node_replica");
@@ -13184,7 +14901,7 @@ mod tests {
     fn local_backend_recovers_interrupted_visible_version_commit() {
         let root = temp_root("local_backend_recovers_interrupted_visible_version_commit");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let initial = object(version("version_1"));
@@ -13231,7 +14948,7 @@ mod tests {
         force_table_replay_from_journal(&backend, &root, 0);
         drop(backend);
 
-        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let recovered = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         assert_eq!(
             recovered
@@ -13257,7 +14974,7 @@ mod tests {
             "local_backend_recovers_latest_visible_version_without_resurrecting_deleted_objects",
         );
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let initial = object(version("version_1"));
@@ -13338,7 +15055,7 @@ mod tests {
 
         backend.put_object(&version_2).expect("stale object");
         drop(backend);
-        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let recovered = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         assert_eq!(
             recovered
@@ -13351,7 +15068,7 @@ mod tests {
         drop(recovered);
 
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let mut tombstone = version_3.clone();
         tombstone.kind = DfsObjectKind::Tombstone;
@@ -13361,7 +15078,7 @@ mod tests {
         backend.put_object(&tombstone).expect("tombstone");
         drop(backend);
 
-        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let recovered = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         assert_eq!(
             recovered
@@ -13379,7 +15096,7 @@ mod tests {
     fn local_backend_recovers_interrupted_namespace_transaction() {
         let root = temp_root("local_backend_recovers_interrupted_namespace_transaction");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let mut source = object(version("version_1"));
@@ -13413,7 +15130,7 @@ mod tests {
         force_table_replay_from_journal(&backend, &root, 0);
         drop(backend);
 
-        let recovered = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let recovered = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("recovered backend");
         assert_eq!(
             recovered
@@ -13437,7 +15154,7 @@ mod tests {
     fn local_backend_reopen_does_not_rejournal_healthy_namespace_transactions() {
         let root = temp_root("local_backend_reopen_does_not_rejournal_namespace_transactions");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         let mut source = object(version("version_1"));
@@ -13465,7 +15182,7 @@ mod tests {
         let journal_len = backend.journal_since(0).expect("journal").len();
         drop(backend);
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopened backend");
 
         assert_eq!(
@@ -13477,10 +15194,79 @@ mod tests {
     }
 
     #[test]
+    fn local_backend_put_object_and_version_uses_one_table_batch_without_namespace_transaction() {
+        let root = temp_root("local_backend_object_version_grouped_table_batch");
+        let mut backend =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+                .expect("backend");
+        let file_system = file_system();
+        backend.put_file_system(&file_system).expect("filesystem");
+        let mut object = object(version("version_2"));
+        object.path = "/services/web/grouped.bin".to_string();
+        object.content_hash = Some("blake3:grouped-object-version".to_string());
+        object.content_size_bytes = Some(4096);
+        let version_record = DfsObjectVersionRecord {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            version: object.version.clone(),
+            content_hash: object.content_hash.clone(),
+            size_bytes: object.content_size_bytes,
+            locations: object.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let table_batches_before = metadata_table_batch_count(&root);
+
+        let entries = backend
+            .put_object_and_version(&object, &version_record)
+            .expect("grouped object version");
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            entries[0].mutation,
+            DfsMetadataMutation::PutObject { .. }
+        ));
+        assert!(matches!(
+            entries[1].mutation,
+            DfsMetadataMutation::PutVersion { .. }
+        ));
+        assert_eq!(
+            metadata_table_batch_count(&root),
+            table_batches_before + 1,
+            "object and visible version should materialize in one table batch"
+        );
+        assert_eq!(
+            backend
+                .get_object(&object.object_id)
+                .expect("object lookup"),
+            Some(object.clone())
+        );
+        assert_eq!(
+            backend
+                .get_version(&object.object_id, &object.version)
+                .expect("version lookup"),
+            Some(normalized_version_record(&version_record))
+        );
+        assert!(backend.tables.namespace_transactions.is_empty());
+        let journal_len = backend.journal_since(0).expect("journal").len();
+        drop(backend);
+
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            .expect("reopened backend");
+        assert_eq!(
+            reopened.journal_since(0).expect("journal").len(),
+            journal_len,
+            "grouped object/version write must not create a recoverable namespace transaction"
+        );
+        cleanup(&root);
+    }
+
+    #[test]
     fn namespace_transaction_publishes_object_and_version_in_one_table_batch() {
         let root = temp_root("namespace_transaction_object_version_single_batch");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let file_system = file_system();
         backend.put_file_system(&file_system).expect("filesystem");
@@ -13531,7 +15317,7 @@ mod tests {
         let table_batches_after_transaction = metadata_table_batch_count(&root);
         drop(backend);
 
-        let reopened = LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+        let reopened = LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
             .expect("reopen backend");
 
         assert_eq!(
@@ -13553,7 +15339,7 @@ mod tests {
     fn local_backend_persists_lists_and_updates_conflicts() {
         let root = temp_root("local_backend_persists_lists_and_updates_conflicts");
         let mut backend =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-root"), &root)
                 .expect("backend");
         let conflict = DfsConflictRecord {
             conflict_id: "conflict_a".to_string(),
@@ -13611,6 +15397,26 @@ mod tests {
                 .expect("empty conflict page")
                 .conflicts
                 .is_empty()
+        );
+        let first_scan_page = backend
+            .conflict_records_page(None, 1)
+            .expect("first conflict scan page");
+        assert_eq!(first_scan_page.conflicts, vec![conflict.clone()]);
+        let second_scan_page = backend
+            .conflict_records_page(first_scan_page.next_cursor.as_ref(), 1)
+            .expect("second conflict scan page");
+        assert_eq!(second_scan_page.conflicts, vec![conflict_b.clone()]);
+        assert!(second_scan_page.next_cursor.is_none());
+        assert!(
+            backend
+                .conflict_records_page(None, 0)
+                .expect("empty conflict scan")
+                .conflicts
+                .is_empty()
+        );
+        assert_eq!(
+            backend.all_conflicts().expect("all conflicts"),
+            vec![conflict.clone(), conflict_b.clone()]
         );
 
         let resolved = backend

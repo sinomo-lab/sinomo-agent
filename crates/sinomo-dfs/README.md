@@ -52,9 +52,11 @@ The default filesystem is SIFS. From this crate's perspective SIFS is ordinary D
 
 Object versions are protected by hash. Rewriting the same `(object_id, version)` with different bytes is rejected. Storage writes use unique temporary files, atomic rename, and fsync of the file and parent directory.
 
+Large objects are represented as manifests over extents. Full-object writes remain the compact fast path, while chunked assembly and write-at patches publish extent manifests so random writes and remote patch replication do not rewrite the full base object. Local APIs expose bounded range reads and range streams for serving large blobs without materializing the whole object in memory.
+
 ### Metadata Backend
 
-`DfsMetadataBackend` is the durable metadata interface. The current `LocalJsonMetadataBackend` stores materialized shard state as a structured table snapshot under `records/tables/snapshot.sobj` plus a packed tail log under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. Local materialization cursors are checkpointed periodically instead of after every mutation, and namespace transactions can publish object records and their visible version records in one replayable table batch. This avoids creating one host file per object, path, dentry, receipt, or version while reducing per-file metadata write amplification for large namespace imports and first-visible-version commits.
+`DfsMetadataBackend` is the durable metadata interface. The current `LocalSobjMetadataBackend` stores materialized shard state as a structured table snapshot under `records/tables/snapshot.sobj` plus a packed tail log under `records/tables/materialized.slog`; the shard journal remains the replay and replication source of truth. Local materialization cursors are checkpointed periodically instead of after every mutation, and namespace transactions can publish object records and their visible version records in one replayable table batch. This avoids creating one host file per object, path, dentry, receipt, or version while reducing per-file metadata write amplification for large namespace imports and first-visible-version commits.
 
 - filesystem records,
 - object and path records,
@@ -74,6 +76,8 @@ The table tail log is compacted into a structured snapshot after it grows large 
 Legacy per-record `.sobj` metadata layouts are loaded into the compact table snapshot during backend open. New writes use the packed table path only.
 
 Operator status includes per-shard journal positions, inbound replay cursors, and configured replica cursor lag so cluster checks can distinguish object-level repair work from metadata replication backlog.
+
+Sparse legacy journal entries are hydrated from keyed backend records before replication when possible. If an unrecoverable namespace transaction lacks its transaction record, service replay fails explicitly instead of importing an entire filesystem as a fallback.
 
 ### Scale Benchmarks
 
@@ -113,6 +117,21 @@ Replica-side commands are authorized against object ownership, metadata-shard pr
 
 Repair is restart-aware. On service hydration, persisted intents and receipts rebuild coordinator state and missing-replica jobs. Repair retries have backoff-like scheduling, and a recovered coordinator that no longer has local blob bytes can fetch the blob from another durable replica before repairing a missing node.
 
+Large data-plane flows use chunk windows for stage, repair, fetch, and remote read responses. Chunks include object/version metadata, offsets or chunk indexes, declared total size, and optional checksums; retry paths resume from the next missing prefix instead of reloading or resending entire blobs.
+
+### Lifecycle Maintenance
+
+`NetworkedDfsService::run_lifecycle_maintenance` combines the operational lifecycle paths:
+
+- content scrub,
+- local content anti-entropy,
+- old-version collection with retention,
+- orphan blob GC,
+- metadata tombstone compaction,
+- metadata-backed namespace-job maintenance through daemon ticks.
+
+`LocalContentStore` can enforce blob, logical-object, manifest, and staging-byte quotas and reports content footprint through operational metrics.
+
 ## Policies
 
 The main object policies currently used by the crate are:
@@ -135,13 +154,14 @@ dfs/metadata/records
 dfs/metadata/records/tables
 dfs/metadata/journal
 dfs/metadata/root
+dfs/metadata/shard-index
 dfs/metadata-replication-cursors
 dfs/operator
 dfs/pins
 files
 ```
 
-The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly.
+The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly. Local DFS exposure config defaults to `$SINOMO_DATA_DIR/config/dfs-expose.sobj`; legacy `dfs-expose.json` is read for migration and explicit `.json` config paths remain supported for compatibility.
 
 ## Usage Examples
 
@@ -303,7 +323,9 @@ Ok(())
 ## Operational Notes
 
 - Do not put large file bytes in `sinomo-kv`; DFS content stores carry bytes.
+- Do not put per-file metadata, content manifests, intents, receipts, or conflicts in `sinomo-kv`; DFS metadata shards carry high-cardinality state.
 - Treat metadata backend records as the source of restart recovery.
+- Use SOBJ or packed binary formats for internal DFS storage; JSON/JSONL is reserved for CLI output, service display, benchmark artifacts, and legacy migration.
 - Use SIFS path APIs for filesystem-like workflows and object/version APIs for replication, repair, audit, and operator tooling.
 - Prefer explicit conflict records over silent overwrite when base versions do not match.
 - Local-owned subtrees remain useful for sensitive or node-specific files even inside the cluster root filesystem.

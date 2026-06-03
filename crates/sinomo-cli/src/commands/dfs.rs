@@ -65,7 +65,7 @@ struct DfsRepairCliPage {
 }
 
 pub(crate) enum DfsInspectionMetadata {
-    Root(LocalJsonMetadataBackend),
+    Root(LocalSobjMetadataBackend),
     Sharded(LocalShardedMetadataBackend),
 }
 

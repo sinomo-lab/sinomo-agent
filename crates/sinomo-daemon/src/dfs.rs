@@ -18,7 +18,7 @@ use sinomo_dfs::{
     DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement,
     DfsObjectPageCursor, DfsObjectVersionRecord, DfsOperatorInspector, DfsProtocolFrameCommand,
     DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions,
-    LocalContentStore, LocalJsonMetadataBackend, LocalShardedMetadataBackend, NetworkedDfsService,
+    LocalContentStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsService,
     NetworkedDfsServiceEvent, content_service_key, content_services_prefix,
     default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
     fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
@@ -27,6 +27,7 @@ use sinomo_dfs::{
 use sinomo_kv::{KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::sync::Arc;
@@ -416,7 +417,7 @@ pub fn handle_daemon_dfs_metadata_journal_batch(
     if let Some(response) = validate_dfs_metadata_journal_batch_source(&data_dir, &command)? {
         return Ok(response);
     }
-    let mut backend = LocalJsonMetadataBackend::new(
+    let mut backend = LocalSobjMetadataBackend::new(
         command.batch.shard_id.clone(),
         data_dir
             .dfs_dir()
@@ -579,7 +580,7 @@ pub fn handle_daemon_dfs_metadata_snapshot_install(
             },
         });
     }
-    let mut backend = LocalJsonMetadataBackend::new(
+    let mut backend = LocalSobjMetadataBackend::new(
         command.shard_id.clone(),
         data_dir
             .dfs_dir()
@@ -1249,7 +1250,7 @@ fn default_metadata_shard_primary_transfer_ready(
         return Ok(false);
     }
     let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
-    let backend = LocalJsonMetadataBackend::new(
+    let backend = LocalSobjMetadataBackend::new(
         shard_id.clone(),
         data_dir
             .dfs_dir()
@@ -1583,7 +1584,7 @@ fn publish_default_dfs_metadata_journal_with_senders(
             });
             continue;
         }
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir
                 .dfs_dir()
@@ -2138,6 +2139,7 @@ fn dfs_protocol_events_should_publish_metadata(events: &[NetworkedDfsServiceEven
         | NetworkedDfsServiceEvent::BlobFetched { .. }
         | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
         | NetworkedDfsServiceEvent::RemoteReadServed { .. }
+        | NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived { .. }
         | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
         | NetworkedDfsServiceEvent::RepairRejected { .. }
         | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
@@ -2168,7 +2170,7 @@ fn local_dfs_protocol_node_id(
 }
 
 fn migrate_legacy_dfs_metadata_replication_cursor(
-    backend: &mut LocalJsonMetadataBackend,
+    backend: &mut LocalSobjMetadataBackend,
     data_dir: &SinomoDataDir,
     target_node_id: &sinomo_node::NodeId,
     shard_id: &DfsMetadataShardId,
@@ -2265,12 +2267,40 @@ fn daemon_dfs_anti_entropy_cursor_path(
         .dfs_dir()
         .join("anti-entropy-cursors")
         .join(format!(
-            "{}.json",
+            "{}.sobj",
             path_safe_segment(&file_system_id.to_string())
         ))
 }
 
+fn legacy_daemon_dfs_anti_entropy_cursor_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("json")
+}
+
 fn read_daemon_dfs_anti_entropy_cursor(
+    path: &std::path::Path,
+) -> Result<Option<DaemonDfsAntiEntropyCursor>, DaemonError> {
+    match fs::read(path) {
+        Ok(bytes) => sinomo_object_serde::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|source| DaemonError::Parse {
+                detail: format!(
+                    "DFS anti-entropy cursor object error at {}: {source}",
+                    path.display()
+                ),
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            read_legacy_daemon_dfs_anti_entropy_cursor(&legacy_daemon_dfs_anti_entropy_cursor_path(
+                path,
+            ))
+        }
+        Err(source) => Err(DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn read_legacy_daemon_dfs_anti_entropy_cursor(
     path: &std::path::Path,
 ) -> Result<Option<DaemonDfsAntiEntropyCursor>, DaemonError> {
     match fs::read(path) {
@@ -2298,17 +2328,27 @@ fn write_daemon_dfs_anti_entropy_cursor(
             detail: source.to_string(),
         })?;
     }
-    let bytes = serde_json::to_vec_pretty(cursor).map_err(|source| DaemonError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
+    let bytes = sinomo_object_serde::to_bytes(cursor, 1, LengthMode::U32).map_err(|source| {
+        DaemonError::Parse {
+            detail: format!(
+                "DFS anti-entropy cursor object error at {}: {source}",
+                path.display()
+            ),
+        }
     })?;
     fs::write(path, bytes).map_err(|source| DaemonError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
-    })
+    })?;
+    clear_daemon_dfs_cursor_file(&legacy_daemon_dfs_anti_entropy_cursor_path(path))
 }
 
 fn clear_daemon_dfs_anti_entropy_cursor(path: &std::path::Path) -> Result<(), DaemonError> {
+    clear_daemon_dfs_cursor_file(path)?;
+    clear_daemon_dfs_cursor_file(&legacy_daemon_dfs_anti_entropy_cursor_path(path))
+}
+
+fn clear_daemon_dfs_cursor_file(path: &std::path::Path) -> Result<(), DaemonError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2369,6 +2409,20 @@ mod tests {
                 version: version.clone(),
                 source_node_id: node.clone(),
                 content_hash: content_hash.clone(),
+            },
+            NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+                request_id: "range_read_only".to_string(),
+                object_id: object_id.clone(),
+                source_node_id: node.clone(),
+                version: version.clone(),
+                content_hash: Some(content_hash.clone()),
+                range_offset: 0,
+                range_size_bytes: 4,
+                object_total_size_bytes: 4,
+                chunk_index: 0,
+                total_chunks: 1,
+                bytes: b"read".to_vec(),
+                complete: true,
             },
             NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
                 request_id: "metadata_batch".to_string(),
@@ -2460,7 +2514,7 @@ mod tests {
             .next()
             .expect("bootstrap object");
         let mut source =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), source_root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), source_root)
                 .expect("source backend");
         source.put_file_system(&file_system).expect("filesystem");
         source.put_object(&object).expect("object");
@@ -2494,7 +2548,7 @@ mod tests {
         assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
         assert_eq!(response.applied_entries, 3);
 
-        let target = LocalJsonMetadataBackend::new(
+        let target = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("root"),
             root.join("data").join("dfs").join("metadata").join("root"),
         )
@@ -2520,7 +2574,7 @@ mod tests {
             .expect("bootstrap object");
         let shard_id = DfsMetadataShardId::new("root/frag");
         let mut source =
-            LocalJsonMetadataBackend::new(shard_id.clone(), source_root).expect("source backend");
+            LocalSobjMetadataBackend::new(shard_id.clone(), source_root).expect("source backend");
         source.put_file_system(&file_system).expect("filesystem");
         source.put_object(&object).expect("object");
         let mut subscription = source.subscribe(0);
@@ -2539,7 +2593,7 @@ mod tests {
         .expect("apply batch");
         assert_eq!(response.result, DfsMetadataJournalBatchResult::Applied);
 
-        let target = LocalJsonMetadataBackend::new(
+        let target = LocalSobjMetadataBackend::new(
             shard_id,
             root.join("data")
                 .join("dfs")
@@ -2610,7 +2664,7 @@ mod tests {
         .expect("write shard config");
         let source_root = root.join("source-meta");
         let mut source =
-            LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), source_root)
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), source_root)
                 .expect("source backend");
         source.put_file_system(&file_system).expect("filesystem");
         let object = distributed_sifs_bootstrap_objects(primary.clone())
@@ -2638,7 +2692,7 @@ mod tests {
             DfsMetadataJournalBatchResult::Rejected { ref reason }
                 if reason.contains(&format!("source {stale} is not shard root primary {primary}"))
         ));
-        let target = LocalJsonMetadataBackend::new(
+        let target = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("root"),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -2667,7 +2721,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("bootstrap object");
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("root"),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -2693,6 +2747,56 @@ mod tests {
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 1);
         assert_eq!(status.version_count, 1);
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_anti_entropy_cursor_migrates_legacy_json() {
+        let root = temp_root("daemon_dfs_anti_entropy_cursor_migrates_legacy_json");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let file_system_id =
+            sinomo_dfs::DfsFileSystemId::from_legacy_named("fs_anti_entropy_cursor_migration")
+                .expect("file system");
+        let object_id =
+            DfsObjectId::from_legacy_named("obj_anti_entropy_cursor_migration").expect("object");
+        let cursor = DaemonDfsAntiEntropyCursor {
+            file_system_id: file_system_id.clone(),
+            next_cursor: Some(DfsObjectPageCursor {
+                path: "/services/cursor-migration".to_string(),
+                object_id,
+                shard_id: None,
+            }),
+        };
+        let path = daemon_dfs_anti_entropy_cursor_path(&data_dir, &file_system_id);
+        let legacy_path = legacy_daemon_dfs_anti_entropy_cursor_path(&path);
+        fs::create_dir_all(legacy_path.parent().expect("legacy cursor parent"))
+            .expect("create legacy cursor parent");
+        fs::write(
+            &legacy_path,
+            serde_json::to_vec_pretty(&cursor).expect("legacy cursor json"),
+        )
+        .expect("write legacy cursor");
+
+        let loaded = read_daemon_dfs_anti_entropy_cursor(&path)
+            .expect("read legacy cursor")
+            .expect("legacy cursor");
+        assert_eq!(loaded, cursor);
+        assert!(!path.exists());
+        assert!(legacy_path.exists());
+
+        write_daemon_dfs_anti_entropy_cursor(&path, &loaded).expect("write sobj cursor");
+        assert!(path.exists());
+        assert!(!legacy_path.exists());
+        assert_eq!(
+            read_daemon_dfs_anti_entropy_cursor(&path).expect("read sobj cursor"),
+            Some(cursor)
+        );
+
+        clear_daemon_dfs_anti_entropy_cursor(&path).expect("clear cursor");
+        assert!(!path.exists());
+        assert!(!legacy_path.exists());
 
         cleanup(&root);
     }
@@ -3162,7 +3266,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("bootstrap object");
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3235,7 +3339,7 @@ mod tests {
             vec![2, 3]
         );
         drop(sent);
-        let backend = LocalJsonMetadataBackend::new(
+        let backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3327,7 +3431,7 @@ mod tests {
                 DfsObjectId::from_legacy_named(format!("obj_metadata_shard_{shard_name}"))
                     .expect("object");
             object.path = format!("/{shard_name}/metadata.txt");
-            let mut backend = LocalJsonMetadataBackend::new(
+            let mut backend = LocalSobjMetadataBackend::new(
                 DfsMetadataShardId::new(shard_name),
                 data_dir
                     .dfs_dir()
@@ -3452,7 +3556,7 @@ mod tests {
         )
         .expect("write shard config");
 
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3528,7 +3632,7 @@ mod tests {
             ]
         );
         drop(sent);
-        let backend = LocalJsonMetadataBackend::new(
+        let backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3605,7 +3709,7 @@ mod tests {
         )
         .expect("write shard config");
 
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3632,7 +3736,7 @@ mod tests {
             [DaemonDfsMetadataReplicationOutcome::Failed { reason, .. }]
                 if reason.contains("mismatched metadata journal response")
         ));
-        let backend = LocalJsonMetadataBackend::new(
+        let backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3709,7 +3813,7 @@ mod tests {
         )
         .expect("write shard config");
 
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3747,7 +3851,7 @@ mod tests {
             [DaemonDfsMetadataReplicationOutcome::Rejected { reason, .. }]
                 if reason.contains("conflicting journal entry")
         ));
-        let backend = LocalJsonMetadataBackend::new(
+        let backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3824,7 +3928,7 @@ mod tests {
         )
         .expect("write shard config");
 
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3880,7 +3984,7 @@ mod tests {
             }]
         );
         assert_eq!(snapshot_installs.lock().expect("lock").len(), 1);
-        let backend = LocalJsonMetadataBackend::new(
+        let backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -3979,7 +4083,7 @@ mod tests {
             ),
         )
         .expect("write shard config");
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir.dfs_dir().join("metadata").join("root"),
         )
@@ -4700,7 +4804,7 @@ mod tests {
         )
         .expect("write services shard");
         let shard_id = DfsMetadataShardId::new("services");
-        let mut backend = LocalJsonMetadataBackend::new(
+        let mut backend = LocalSobjMetadataBackend::new(
             shard_id.clone(),
             data_dir
                 .dfs_dir()
@@ -4787,7 +4891,7 @@ mod tests {
             DfsObjectId::from_legacy_named("obj_legacy_services_metadata").expect("object");
         legacy_object.path = "/services/legacy.txt".to_string();
         {
-            let mut legacy_root = LocalJsonMetadataBackend::new(
+            let mut legacy_root = LocalSobjMetadataBackend::new(
                 DfsMetadataShardId::new("root"),
                 data_dir.dfs_dir().join("metadata").join("root"),
             )
@@ -4827,7 +4931,7 @@ mod tests {
             Some(legacy_object.clone())
         );
         assert_eq!(
-            LocalJsonMetadataBackend::new(
+            LocalSobjMetadataBackend::new(
                 DfsMetadataShardId::new("root"),
                 data_dir.dfs_dir().join("metadata").join("root"),
             )
@@ -4883,7 +4987,7 @@ mod tests {
         ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), false)
             .expect("bootstrap dfs");
 
-        let backend = LocalJsonMetadataBackend::new(
+        let backend = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("root"),
             data_dir.dfs_dir().join("metadata").join("root"),
         )

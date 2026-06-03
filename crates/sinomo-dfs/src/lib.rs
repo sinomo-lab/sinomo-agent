@@ -40,19 +40,20 @@ pub use local_owned::{
 };
 pub use metadata_backend::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictStatus,
-    DfsDentryPageCursor, DfsDirFragmentId, DfsDirFragmentRecord, DfsDirectoryPage,
-    DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord, DfsMetadataBackend,
-    DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation,
+    DfsConflictPage, DfsConflictPageCursor, DfsConflictRecord, DfsConflictScanCursor,
+    DfsConflictScanPage, DfsConflictStatus, DfsDentryPageCursor, DfsDirFragmentId,
+    DfsDirFragmentRecord, DfsDirectoryPage, DfsDirectoryPageCursor, DfsInodeId, DfsInodeRecord,
+    DfsMetadataBackend, DfsMetadataJournalBatch, DfsMetadataJournalEntry, DfsMetadataMutation,
     DfsMetadataReplayCursorStatus, DfsMetadataReplicaLagStatus, DfsMetadataShardId,
     DfsMetadataShardStatus, DfsMetadataSubscription, DfsMetadataSummary, DfsMetadataTableSnapshot,
     DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
     DfsNamespaceTransaction, DfsObjectPage, DfsObjectPageCursor, DfsObjectVersionPage,
-    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptPage,
-    DfsReplicaReceiptPageCursor, DfsReplicaReceiptRecord, DfsTombstoneCompactionOptions,
-    DfsTombstoneCompactionReport, DfsWriteIntentPage, DfsWriteIntentPageCursor,
-    DfsWriteIntentRecord, DfsWriteIntentStatus, LocalJsonMetadataBackend,
-    LocalShardedMetadataBackend, MetadataBackendError,
+    DfsObjectVersionPageCursor, DfsObjectVersionRecord, DfsObjectVersionScanCursor,
+    DfsObjectVersionScanPage, DfsPathRecord, DfsReplicaReceiptPage, DfsReplicaReceiptPageCursor,
+    DfsReplicaReceiptRecord, DfsReplicaReceiptScanCursor, DfsReplicaReceiptScanPage,
+    DfsTombstoneCompactionOptions, DfsTombstoneCompactionReport, DfsWriteIntentPage,
+    DfsWriteIntentPageCursor, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    LocalShardedMetadataBackend, LocalSobjMetadataBackend, MetadataBackendError,
 };
 use namespace::metadata_path;
 pub use namespace::{
@@ -69,7 +70,7 @@ pub use operator::{
 };
 pub use posix::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
-    DfsPosixError, DfsStat, DfsWriteOptions,
+    DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, DfsWriteOptions,
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsCommitVersionCommand, DfsCommitVersionResponse,
@@ -81,7 +82,8 @@ pub use protocol::{
     DfsProtocolFrameResponse, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
     DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand,
     DfsRepairReplicaResponse, DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse,
-    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
+    DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse,
+    DfsWriteResult,
 };
 
 pub type DfsFileSystemId = sinomo_core::Id;
@@ -110,10 +112,10 @@ use time::OffsetDateTime;
 #[cfg(test)]
 use transfer::RepairRetryState;
 use transfer::{
-    InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressReadTransfer,
-    PendingNetworkedRead, PendingNetworkedWrite, PendingNetworkedWritePatch, blob_chunk_count,
-    blob_chunk_count_for_size, blob_transfer_key, chunk_hash, validate_chunk_bytes,
-    validate_chunk_hash, validate_chunked_transfer_shape,
+    InProgressBlobTransfer, InProgressFetchBlobTransfer, InProgressPatchTransfer,
+    InProgressReadTransfer, PendingNetworkedRead, PendingNetworkedWrite,
+    PendingNetworkedWritePatch, blob_chunk_count, blob_chunk_count_for_size, blob_transfer_key,
+    chunk_hash, validate_chunk_bytes, validate_chunk_hash, validate_chunked_transfer_shape,
 };
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
@@ -122,6 +124,8 @@ pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 64 * 1024;
 const DFS_BLOB_CHUNK_BYTES: usize = 64 * 1024;
 const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 64;
+const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 64;
+const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 64;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
@@ -282,8 +286,8 @@ pub fn remove_local_dfs_pin(
 
 pub fn open_root_local_metadata_backend(
     root: impl Into<PathBuf>,
-) -> Result<LocalJsonMetadataBackend, MetadataBackendError> {
-    LocalJsonMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
+) -> Result<LocalSobjMetadataBackend, MetadataBackendError> {
+    LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.into())
 }
 
 pub fn open_local_sharded_metadata_backend(
@@ -782,10 +786,23 @@ pub struct DfsOperationalMetrics {
     pub repair_inflight_count: usize,
     pub fetch_inflight_count: usize,
     pub fetch_failed_source_count: usize,
+    pub stage_window_resume_count: usize,
+    pub stage_window_resume_bytes: u64,
+    pub repair_window_resume_count: usize,
+    pub repair_window_resume_bytes: u64,
+    pub fetch_window_resume_count: usize,
+    pub fetch_window_resume_bytes: u64,
+    pub pending_read_window_resume_count: usize,
+    pub pending_read_window_resume_bytes: u64,
     pub incoming_blob_transfer_count: usize,
+    pub incoming_patch_transfer_count: usize,
     pub incoming_fetch_transfer_count: usize,
     pub incoming_read_transfer_count: usize,
     pub incoming_transfer_bytes: u64,
+    pub incoming_blob_transfer_received_bytes: u64,
+    pub incoming_patch_transfer_received_bytes: u64,
+    pub incoming_fetch_transfer_received_bytes: u64,
+    pub incoming_read_transfer_received_bytes: u64,
     pub active_replica_stage_count: usize,
     pub metadata_replication_cursor_count: usize,
     pub pending_metadata_replication_count: usize,
@@ -973,6 +990,8 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                         object_id: object_id.clone(),
                         range_offset: None,
                         range_max_bytes: None,
+                        start_chunk_index: 0,
+                        max_chunks: 0,
                     }),
                 )?;
                 Ok(DfsReadOutcome::Routed {
@@ -1078,6 +1097,7 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
                 DfsNetworkMessage::StageBlob(_)
                 | DfsNetworkMessage::StageBlobChunk(_)
                 | DfsNetworkMessage::StagePatch(_)
+                | DfsNetworkMessage::StagePatchChunk(_)
                 | DfsNetworkMessage::StageBlobResponse(_)
                 | DfsNetworkMessage::CommitVersion(_)
                 | DfsNetworkMessage::CommitVersionResponse(_)
@@ -1378,8 +1398,21 @@ struct NetworkedDfsReadStream {
     reader: ObjectVersionReader,
 }
 
+struct NetworkedDfsRangeReadStream {
+    data: DfsReadRangeData,
+    range_size_bytes: u64,
+    reader: ObjectVersionReader,
+}
+
 enum NetworkedDfsReadStreamOutcome {
     Found(NetworkedDfsReadStream),
+    PendingReplication,
+    Conflicted { conflicts: Vec<DfsConflictReadView> },
+    NotFound,
+}
+
+enum NetworkedDfsRangeReadStreamOutcome {
+    Found(NetworkedDfsRangeReadStream),
     PendingReplication,
     Conflicted { conflicts: Vec<DfsConflictReadView> },
     NotFound,
@@ -1548,6 +1581,20 @@ pub enum NetworkedDfsServiceEvent {
         requester_node_id: NodeId,
         result: DfsReadResult,
     },
+    RemoteRangeReadChunkReceived {
+        request_id: String,
+        object_id: DfsObjectId,
+        source_node_id: NodeId,
+        version: DfsVersion,
+        content_hash: Option<String>,
+        range_offset: u64,
+        range_size_bytes: u64,
+        object_total_size_bytes: u64,
+        chunk_index: u32,
+        total_chunks: u32,
+        bytes: Vec<u8>,
+        complete: bool,
+    },
     RemoteReadCompleted {
         request_id: String,
         object_id: DfsObjectId,
@@ -1621,6 +1668,7 @@ pub struct NetworkedDfsService<T> {
     incoming_read_transfers: BTreeMap<String, InProgressReadTransfer>,
     incoming_fetch_transfers: BTreeMap<String, InProgressFetchBlobTransfer>,
     incoming_blob_transfers: BTreeMap<String, InProgressBlobTransfer>,
+    incoming_patch_transfers: BTreeMap<String, InProgressPatchTransfer>,
     metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
@@ -1652,6 +1700,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             incoming_read_transfers: BTreeMap::new(),
             incoming_fetch_transfers: BTreeMap::new(),
             incoming_blob_transfers: BTreeMap::new(),
+            incoming_patch_transfers: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
             pending_metadata_replications: BTreeMap::new(),
             pending_routed_writes: BTreeMap::new(),
@@ -1758,10 +1807,95 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .values()
             .map(|pending| pending.fetch_failed_from.len())
             .sum();
+        let stage_window_resume_count = self
+            .pending_writes
+            .values()
+            .map(|pending| pending.stage_next_chunk_indexes.len())
+            .sum();
+        let stage_window_resume_bytes = self
+            .pending_writes
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .stage_next_chunk_indexes
+                    .iter()
+                    .map(|(node_id, next_chunk_index)| {
+                        let size_bytes = pending_stage_transfer_size_bytes(pending, node_id);
+                        chunk_prefix_bytes(size_bytes, *next_chunk_index)
+                    })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let repair_window_resume_count = self
+            .pending_writes
+            .values()
+            .map(|pending| pending.repair_next_chunk_indexes.len())
+            .sum();
+        let repair_window_resume_bytes = self
+            .pending_writes
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .repair_next_chunk_indexes
+                    .values()
+                    .map(|next_chunk_index| {
+                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
+                    })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let fetch_window_resume_count = self
+            .pending_writes
+            .values()
+            .map(|pending| {
+                pending
+                    .fetch_next_chunk_indexes
+                    .values()
+                    .filter(|next_chunk_index| **next_chunk_index > 0)
+                    .count()
+            })
+            .sum();
+        let fetch_window_resume_bytes = self
+            .pending_writes
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .fetch_next_chunk_indexes
+                    .values()
+                    .filter(|next_chunk_index| **next_chunk_index > 0)
+                    .map(|next_chunk_index| {
+                        chunk_prefix_bytes(pending.size_bytes, *next_chunk_index)
+                    })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let pending_read_window_resume_count = self
+            .pending_reads
+            .values()
+            .filter(|pending| pending.next_chunk_index > 0)
+            .count();
+        let pending_read_window_resume_bytes = self
+            .pending_reads
+            .values()
+            .filter_map(|pending| {
+                pending.content_size_bytes.map(|size_bytes| {
+                    let transfer_size_bytes = match (pending.range_offset, pending.range_max_bytes)
+                    {
+                        (Some(offset), Some(max_bytes)) => {
+                            range_transfer_size_bytes(size_bytes, offset, max_bytes)
+                        }
+                        _ => size_bytes,
+                    };
+                    chunk_prefix_bytes(transfer_size_bytes, pending.next_chunk_index)
+                })
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
         let incoming_transfer_bytes = self
             .incoming_blob_transfers
             .values()
             .map(|transfer| transfer.total_size_bytes)
+            .chain(
+                self.incoming_patch_transfers
+                    .values()
+                    .map(|transfer| transfer.total_size_bytes),
+            )
             .chain(
                 self.incoming_fetch_transfers
                     .values()
@@ -1773,6 +1907,46 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     .map(|transfer| transfer.total_size_bytes),
             )
             .fold(0_u64, |total, size| total.saturating_add(size));
+        let incoming_blob_transfer_received_bytes = self
+            .incoming_blob_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let incoming_patch_transfer_received_bytes = self
+            .incoming_patch_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let incoming_fetch_transfer_received_bytes = self
+            .incoming_fetch_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
+        let incoming_read_transfer_received_bytes = self
+            .incoming_read_transfers
+            .values()
+            .map(|transfer| {
+                chunk_prefix_bytes(
+                    transfer.total_size_bytes,
+                    transfer.contiguous_received_chunk_count(),
+                )
+            })
+            .fold(0_u64, |total, bytes| total.saturating_add(bytes));
 
         Ok(DfsOperationalMetrics {
             node_id: self.node_id.clone(),
@@ -1791,10 +1965,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             repair_inflight_count,
             fetch_inflight_count,
             fetch_failed_source_count,
+            stage_window_resume_count,
+            stage_window_resume_bytes,
+            repair_window_resume_count,
+            repair_window_resume_bytes,
+            fetch_window_resume_count,
+            fetch_window_resume_bytes,
+            pending_read_window_resume_count,
+            pending_read_window_resume_bytes,
             incoming_blob_transfer_count: self.incoming_blob_transfers.len(),
+            incoming_patch_transfer_count: self.incoming_patch_transfers.len(),
             incoming_fetch_transfer_count: self.incoming_fetch_transfers.len(),
             incoming_read_transfer_count: self.incoming_read_transfers.len(),
             incoming_transfer_bytes,
+            incoming_blob_transfer_received_bytes,
+            incoming_patch_transfer_received_bytes,
+            incoming_fetch_transfer_received_bytes,
+            incoming_read_transfer_received_bytes,
             active_replica_stage_count: self.active_replica_stages.len(),
             metadata_replication_cursor_count: self.metadata_replication_cursors.len(),
             pending_metadata_replication_count: self.pending_metadata_replications.len(),
@@ -2123,10 +2310,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .as_ref()
             .expect("metadata backend checked above")
             .list_file_systems()?;
-        let mut intents = Vec::new();
-        let mut tombstones = Vec::new();
-        let mut receipts_by_intent =
-            BTreeMap::<(DfsObjectId, String), Vec<DfsReplicaReceiptRecord>>::new();
 
         self.metadata = DfsMetadataStore::new();
         self.tombstones_by_metadata_path.clear();
@@ -2136,6 +2319,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.incoming_read_transfers.clear();
         self.incoming_fetch_transfers.clear();
         self.incoming_blob_transfers.clear();
+        self.incoming_patch_transfers.clear();
 
         for file_system in &file_systems {
             self.metadata.add_file_system(file_system.clone());
@@ -2167,56 +2351,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                         object.object_id.clone(),
                         object.version.clone(),
                     );
-                    if object.kind == DfsObjectKind::Tombstone {
-                        tombstones.push(object.clone());
-                    } else {
-                        self.track_metadata_tombstone(&object);
-                    }
+                    self.track_hydrated_metadata_tombstone(&object);
                     self.metadata.add_object(object.clone())?;
 
                     self.add_backend_conflict_pages_to_memory(&object.object_id)?;
-                    let mut intent_cursor = None;
-                    loop {
-                        let intent_page = self
-                            .metadata_backend
-                            .as_ref()
-                            .expect("metadata backend checked above")
-                            .intents_for_object_page(
-                                &object.object_id,
-                                intent_cursor.as_ref(),
-                                DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
-                            )?;
-                        for intent in intent_page.intents {
-                            let mut receipt_cursor = None;
-                            let mut receipts = Vec::new();
-                            loop {
-                                let receipt_page = self
-                                    .metadata_backend
-                                    .as_ref()
-                                    .expect("metadata backend checked above")
-                                    .receipts_for_version_page(
-                                        &object.object_id,
-                                        &intent.target_version,
-                                        receipt_cursor.as_ref(),
-                                        DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
-                                    )?;
-                                receipts.extend(receipt_page.receipts);
-                                let Some(next_cursor) = receipt_page.next_cursor else {
-                                    break;
-                                };
-                                receipt_cursor = Some(next_cursor);
-                            }
-                            receipts_by_intent.insert(
-                                (object.object_id.clone(), intent.intent_id.clone()),
-                                receipts,
-                            );
-                            intents.push(intent);
-                        }
-                        let Some(next_cursor) = intent_page.next_cursor else {
-                            break;
-                        };
-                        intent_cursor = Some(next_cursor);
-                    }
                 }
                 let Some(next_cursor) = page.next_cursor else {
                     break;
@@ -2224,122 +2362,110 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 cursor = Some(next_cursor);
             }
         }
-        for tombstone in tombstones {
-            let path = metadata_path(&tombstone.path);
-            if self
-                .metadata
-                .object_by_normalized_posix_path(&tombstone.file_system_id, &path)
-                .is_none()
-            {
-                self.track_metadata_tombstone(&tombstone);
-            }
-        }
 
-        intents.sort_by(|left, right| {
-            left.created_at
-                .cmp(&right.created_at)
-                .then_with(|| left.intent_id.cmp(&right.intent_id))
-        });
         let mut pending_write_records = Vec::new();
-        for mut intent_record in intents {
-            self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
-            let intent = distributed_intent_from_record(&intent_record);
-            match self.coordinator.restore_intent(intent) {
-                Ok(()) => {}
-                Err(error @ DfsDistributedError::PendingIntentConflict { .. })
-                    if matches!(
-                        intent_record.status,
-                        DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
-                    ) =>
-                {
-                    let object = self.current_read_object_metadata(&intent_record.object_id)?;
-                    self.create_write_conflict(
-                        &object,
-                        intent_record.base_version.clone(),
-                        intent_record.target_version.clone(),
-                        intent_record.coordinator_node_id.clone(),
-                        intent_record.content_hash.clone(),
-                        error.to_string(),
-                        Some(intent_record.intent_id.clone()),
-                    )?;
-                    let mut conflict_record = intent_record.clone();
-                    conflict_record.status = DfsWriteIntentStatus::Conflict;
-                    conflict_record.updated_at = Some(OffsetDateTime::now_utc());
-                    if let Some(backend) = self.metadata_backend.as_mut() {
-                        backend.put_intent(&conflict_record)?;
-                    }
-                    self.coordinator
-                        .restore_intent(distributed_intent_from_record(&conflict_record))?;
+        let mut intent_scan_cursor = None;
+        loop {
+            let intent_page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .write_intents_page(
+                    intent_scan_cursor.as_ref(),
+                    DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
+                )?;
+            for mut intent_record in intent_page.intents {
+                if self.metadata.object(&intent_record.object_id).is_none() {
                     continue;
                 }
-                Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
-                    if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
-                        && self
-                            .current_read_object_metadata(&intent_record.object_id)
-                            .is_ok_and(|object| {
-                                object.version == intent_record.target_version
-                                    && intent_record.content_hash.as_deref().is_none_or(
-                                        |content_hash| {
-                                            object.content_hash.as_deref() == Some(content_hash)
-                                        },
-                                    )
-                            })
-                    {
-                        self.restore_visible_committed_object_location_receipts(&intent_record)?;
-                        continue;
-                    }
-                    let object = self.current_read_object_metadata(&intent_record.object_id)?;
-                    self.create_write_conflict(
-                        &object,
-                        intent_record.base_version.clone(),
-                        intent_record.target_version.clone(),
-                        intent_record.coordinator_node_id.clone(),
-                        intent_record.content_hash.clone(),
-                        error.to_string(),
-                        Some(intent_record.intent_id.clone()),
-                    )?;
-                    let mut conflict_record = intent_record.clone();
-                    conflict_record.status = DfsWriteIntentStatus::Conflict;
-                    conflict_record.updated_at = Some(OffsetDateTime::now_utc());
-                    if let Some(backend) = self.metadata_backend.as_mut() {
-                        backend.put_intent(&conflict_record)?;
-                    }
+                self.coordinator
+                    .observe_restored_intent_id(&intent_record.intent_id);
+                if !write_intent_status_requires_hydrate_restore(&intent_record.status) {
                     continue;
                 }
-                Err(error) => return Err(error.into()),
-            }
-            if let Some(receipts) = receipts_by_intent.get(&(
-                intent_record.object_id.clone(),
-                intent_record.intent_id.clone(),
-            )) {
-                for receipt in receipts {
-                    if let Some(expected_hash) = intent_record.content_hash.as_deref()
-                        && receipt.content_hash.as_deref() != Some(expected_hash)
+                self.repair_visible_committed_pending_intent_record(&mut intent_record)?;
+                let intent = distributed_intent_from_record(&intent_record);
+                match self.coordinator.restore_intent(intent) {
+                    Ok(()) => {}
+                    Err(error @ DfsDistributedError::PendingIntentConflict { .. })
+                        if matches!(
+                            intent_record.status,
+                            DfsWriteIntentStatus::Staging | DfsWriteIntentStatus::ReceiptsPending
+                        ) =>
                     {
+                        let object = self.current_read_object_metadata(&intent_record.object_id)?;
+                        self.create_write_conflict(
+                            &object,
+                            intent_record.base_version.clone(),
+                            intent_record.target_version.clone(),
+                            intent_record.coordinator_node_id.clone(),
+                            intent_record.content_hash.clone(),
+                            error.to_string(),
+                            Some(intent_record.intent_id.clone()),
+                        )?;
+                        let mut conflict_record = intent_record.clone();
+                        conflict_record.status = DfsWriteIntentStatus::Conflict;
+                        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+                        if let Some(backend) = self.metadata_backend.as_mut() {
+                            backend.put_intent(&conflict_record)?;
+                        }
+                        self.coordinator
+                            .restore_intent(distributed_intent_from_record(&conflict_record))?;
                         continue;
                     }
-                    match self.coordinator.restore_durable_receipt(
-                        &intent_record.intent_id,
-                        receipt.replica_node_id.clone(),
-                    ) {
-                        Ok(()) => {}
-                        Err(
-                            DfsDistributedError::UnexpectedReplica { .. }
-                            | DfsDistributedError::IntentClosed { .. },
-                        ) => continue,
-                        Err(error) => return Err(error.into()),
+                    Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
+                        if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                            && self
+                                .current_read_object_metadata(&intent_record.object_id)
+                                .is_ok_and(|object| {
+                                    object.version == intent_record.target_version
+                                        && intent_record.content_hash.as_deref().is_none_or(
+                                            |content_hash| {
+                                                object.content_hash.as_deref() == Some(content_hash)
+                                            },
+                                        )
+                                })
+                        {
+                            self.restore_visible_committed_object_location_receipts(
+                                &intent_record,
+                            )?;
+                            continue;
+                        }
+                        let object = self.current_read_object_metadata(&intent_record.object_id)?;
+                        self.create_write_conflict(
+                            &object,
+                            intent_record.base_version.clone(),
+                            intent_record.target_version.clone(),
+                            intent_record.coordinator_node_id.clone(),
+                            intent_record.content_hash.clone(),
+                            error.to_string(),
+                            Some(intent_record.intent_id.clone()),
+                        )?;
+                        let mut conflict_record = intent_record.clone();
+                        conflict_record.status = DfsWriteIntentStatus::Conflict;
+                        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+                        if let Some(backend) = self.metadata_backend.as_mut() {
+                            backend.put_intent(&conflict_record)?;
+                        }
+                        continue;
                     }
+                    Err(error) => return Err(error.into()),
+                }
+                self.restore_backend_receipt_pages_for_intent(&intent_record)?;
+                self.restore_visible_committed_object_location_receipts(&intent_record)?;
+                if matches!(
+                    intent_record.status,
+                    DfsWriteIntentStatus::Staging
+                        | DfsWriteIntentStatus::ReceiptsPending
+                        | DfsWriteIntentStatus::Committed
+                ) {
+                    pending_write_records.push(intent_record);
                 }
             }
-            self.restore_visible_committed_object_location_receipts(&intent_record)?;
-            if matches!(
-                intent_record.status,
-                DfsWriteIntentStatus::Staging
-                    | DfsWriteIntentStatus::ReceiptsPending
-                    | DfsWriteIntentStatus::Committed
-            ) {
-                pending_write_records.push(intent_record);
-            }
+            let Some(next_cursor) = intent_page.next_cursor else {
+                break;
+            };
+            intent_scan_cursor = Some(next_cursor);
         }
 
         let repair_intent_ids: BTreeSet<String> = self
@@ -2396,6 +2522,51 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             self.cleanup_committed_pending_write_if_repaired(&intent_id);
         }
 
+        Ok(())
+    }
+
+    fn restore_backend_receipt_pages_for_intent(
+        &mut self,
+        intent_record: &DfsWriteIntentRecord,
+    ) -> Result<(), DfsError> {
+        if self.metadata_backend.is_none() {
+            return Ok(());
+        }
+        let mut receipt_cursor = None;
+        loop {
+            let receipt_page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .receipts_for_version_page(
+                    &intent_record.object_id,
+                    &intent_record.target_version,
+                    receipt_cursor.as_ref(),
+                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+                )?;
+            for receipt in receipt_page.receipts {
+                if let Some(expected_hash) = intent_record.content_hash.as_deref()
+                    && receipt.content_hash.as_deref() != Some(expected_hash)
+                {
+                    continue;
+                }
+                match self
+                    .coordinator
+                    .restore_durable_receipt(&intent_record.intent_id, receipt.replica_node_id)
+                {
+                    Ok(()) => {}
+                    Err(
+                        DfsDistributedError::UnexpectedReplica { .. }
+                        | DfsDistributedError::IntentClosed { .. },
+                    ) => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let Some(next_cursor) = receipt_page.next_cursor else {
+                break;
+            };
+            receipt_cursor = Some(next_cursor);
+        }
         Ok(())
     }
 
@@ -2542,41 +2713,35 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &mut self,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
-        let mut needs_full_hydration = false;
         for entry in &batch.entries {
-            if self.apply_metadata_journal_entry_to_service_state(entry)? {
-                needs_full_hydration = true;
-                break;
-            }
-        }
-        if needs_full_hydration {
-            self.hydrate_from_metadata_backend()?;
+            self.apply_metadata_journal_entry_to_service_state(entry)?;
         }
         Ok(())
     }
 
-    /// Returns `true` when the entry cannot be applied from replay payloads alone
-    /// and the caller should fall back to a full backend hydration.
     fn apply_metadata_journal_entry_to_service_state(
         &mut self,
         entry: &DfsMetadataJournalEntry,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<(), DfsError> {
         match &entry.mutation {
             DfsMetadataMutation::PutFileSystem { file_system, .. } => {
                 let Some(file_system) = file_system.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.metadata.add_file_system(file_system.clone());
             }
             DfsMetadataMutation::PutObject { object, .. } => {
                 let Some(object) = object.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.apply_metadata_object_to_service_state(object.clone())?;
             }
             DfsMetadataMutation::PutVersion { version_record, .. } => {
                 let Some(version_record) = version_record.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.apply_metadata_version_to_service_state(version_record);
             }
@@ -2588,60 +2753,273 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ..
             } => {
                 if receipt.is_none() {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 }
                 self.apply_metadata_receipt_to_service_state(object_id, version, replica_node_id)?;
             }
             DfsMetadataMutation::PutIntent { intent, .. } => {
                 let Some(intent) = intent.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
-                if self.apply_metadata_intent_to_service_state(intent)? {
-                    return Ok(true);
-                }
+                self.apply_metadata_intent_to_service_state(intent)?;
             }
             DfsMetadataMutation::CommitVisibleVersion {
                 committed_object,
                 visible_version,
+                object_id,
+                committed_version,
                 ..
             } => {
                 let Some(committed_object) = committed_object.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 let Some(visible_version) = visible_version.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.apply_metadata_object_to_service_state(committed_object.clone())?;
                 self.apply_metadata_version_to_service_state(visible_version);
+                self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
             }
             DfsMetadataMutation::PutConflict { conflict, .. } => {
                 let Some(conflict) = conflict.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
                 self.metadata.add_conflict(conflict.clone());
             }
             DfsMetadataMutation::ApplyNamespaceTransaction { transaction, .. } => {
                 let Some(transaction) = transaction.as_ref() else {
-                    return Ok(true);
+                    self.apply_missing_payload_metadata_journal_entry_to_service_state(entry)?;
+                    return Ok(());
                 };
-                let mut objects = transaction.objects.clone();
-                objects.sort_by(|left, right| {
-                    let left_is_tombstone = left.kind == DfsObjectKind::Tombstone;
-                    let right_is_tombstone = right.kind == DfsObjectKind::Tombstone;
-                    right_is_tombstone
-                        .cmp(&left_is_tombstone)
-                        .then_with(|| left.path.cmp(&right.path))
-                        .then_with(|| left.object_id.cmp(&right.object_id))
-                });
-                for object in objects {
-                    self.apply_metadata_object_to_service_state(object)?;
+                self.apply_metadata_namespace_transaction_to_service_state(transaction)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_missing_payload_metadata_journal_entry_to_service_state(
+        &mut self,
+        entry: &DfsMetadataJournalEntry,
+    ) -> Result<(), DfsError> {
+        match &entry.mutation {
+            DfsMetadataMutation::PutFileSystem { file_system_id, .. } => {
+                let file_system = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_file_system(file_system_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(file_system) = file_system {
+                    self.metadata.add_file_system(file_system);
                 }
-                for version in &transaction.versions {
-                    self.apply_metadata_version_to_service_state(version);
+            }
+            DfsMetadataMutation::PutObject { object_id, .. } => {
+                self.apply_backend_object_to_service_state(object_id)?;
+            }
+            DfsMetadataMutation::PutVersion {
+                object_id, version, ..
+            } => {
+                let version_record = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_version(object_id, version))
+                    .transpose()?
+                    .flatten();
+                if let Some(version_record) = version_record {
+                    self.apply_metadata_version_to_service_state(&version_record);
+                }
+            }
+            DfsMetadataMutation::PutReceipt {
+                object_id,
+                version,
+                replica_node_id,
+                ..
+            } => {
+                if self
+                    .backend_receipt_for_replica(object_id, version, replica_node_id)?
+                    .is_some()
+                {
+                    self.apply_metadata_receipt_to_service_state(
+                        object_id,
+                        version,
+                        replica_node_id,
+                    )?;
+                }
+            }
+            DfsMetadataMutation::PutIntent {
+                object_id,
+                intent_id,
+                ..
+            } => {
+                let intent = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_intent(object_id, intent_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(intent) = intent {
+                    self.apply_metadata_intent_to_service_state(&intent)?;
+                }
+            }
+            DfsMetadataMutation::CommitVisibleVersion {
+                object_id,
+                committed_version,
+                ..
+            } => {
+                self.apply_backend_object_to_service_state(object_id)?;
+                let version_record = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_version(object_id, committed_version))
+                    .transpose()?
+                    .flatten();
+                if let Some(version_record) = version_record {
+                    self.apply_metadata_version_to_service_state(&version_record);
+                }
+                self.restore_backend_receipts_for_visible_version(object_id, committed_version)?;
+            }
+            DfsMetadataMutation::PutConflict {
+                object_id,
+                conflict_id,
+                ..
+            } => {
+                let conflict = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_conflict(object_id, conflict_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(conflict) = conflict {
+                    self.metadata.add_conflict(conflict);
+                }
+            }
+            DfsMetadataMutation::ApplyNamespaceTransaction { transaction_id, .. } => {
+                let transaction = self
+                    .metadata_backend
+                    .as_ref()
+                    .map(|backend| backend.get_namespace_transaction(transaction_id))
+                    .transpose()?
+                    .flatten();
+                if let Some(transaction) = transaction {
+                    self.apply_metadata_namespace_transaction_to_service_state(&transaction)?;
+                } else {
+                    return Err(DfsError::Metadata {
+                        message: format!(
+                            "metadata journal entry {}:{} cannot apply namespace transaction {} without its transaction payload",
+                            entry.shard_id.0, entry.sequence, transaction_id
+                        ),
+                    });
                 }
             }
         }
-        Ok(false)
+        Ok(())
+    }
+
+    fn apply_metadata_namespace_transaction_to_service_state(
+        &mut self,
+        transaction: &DfsNamespaceTransaction,
+    ) -> Result<(), DfsError> {
+        let mut objects = transaction.objects.clone();
+        objects.sort_by(|left, right| {
+            let left_is_tombstone = left.kind == DfsObjectKind::Tombstone;
+            let right_is_tombstone = right.kind == DfsObjectKind::Tombstone;
+            right_is_tombstone
+                .cmp(&left_is_tombstone)
+                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.object_id.cmp(&right.object_id))
+        });
+        for object in objects {
+            self.apply_metadata_object_to_service_state(object)?;
+        }
+        for version in &transaction.versions {
+            self.apply_metadata_version_to_service_state(version);
+        }
+        Ok(())
+    }
+
+    fn apply_backend_object_to_service_state(
+        &mut self,
+        object_id: &DfsObjectId,
+    ) -> Result<(), DfsError> {
+        let object = self
+            .metadata_backend
+            .as_ref()
+            .map(|backend| backend.get_object(object_id))
+            .transpose()?
+            .flatten();
+        if let Some(object) = object {
+            self.apply_metadata_object_to_service_state(object)?;
+        }
+        Ok(())
+    }
+
+    fn backend_receipt_for_replica(
+        &self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        replica_node_id: &NodeId,
+    ) -> Result<Option<DfsReplicaReceiptRecord>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let mut cursor = None;
+        loop {
+            let page = backend.receipts_for_version_page(
+                object_id,
+                version,
+                cursor.as_ref(),
+                DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+            )?;
+            for receipt in page.receipts {
+                if receipt.replica_node_id == *replica_node_id {
+                    return Ok(Some(receipt));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next_cursor);
+        }
+    }
+
+    fn restore_backend_receipts_for_visible_version(
+        &mut self,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+    ) -> Result<(), DfsError> {
+        if self.metadata_backend.is_none() {
+            return Ok(());
+        }
+        let mut cursor = None;
+        loop {
+            let page = self
+                .metadata_backend
+                .as_ref()
+                .expect("metadata backend checked above")
+                .receipts_for_version_page(
+                    object_id,
+                    version,
+                    cursor.as_ref(),
+                    DFS_METADATA_OBJECT_RECEIPT_PAGE_SIZE,
+                )?;
+            for receipt in page.receipts {
+                self.apply_metadata_receipt_to_service_state(
+                    object_id,
+                    version,
+                    &receipt.replica_node_id,
+                )?;
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        Ok(())
     }
 
     fn apply_metadata_object_to_service_state(
@@ -2701,15 +3079,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     fn apply_metadata_intent_to_service_state(
         &mut self,
         intent_record: &DfsWriteIntentRecord,
-    ) -> Result<bool, DfsError> {
+    ) -> Result<(), DfsError> {
         let intent = distributed_intent_from_record(intent_record);
         match self.coordinator.restore_intent(intent) {
             Ok(()) => {}
             Err(error @ DfsDistributedError::PendingIntentConflict { .. }) => {
-                eprintln!(
-                    "warning: falling back to full DFS metadata hydration after journal intent conflict: {error}"
-                );
-                return Ok(true);
+                self.mark_replayed_intent_as_conflict(intent_record, error.to_string(), true)?;
+                return Ok(());
             }
             Err(error @ DfsDistributedError::DuplicateIntentId { .. }) => {
                 if self
@@ -2718,11 +3094,22 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     .is_some_and(|intent| distributed_intent_matches_record(intent, intent_record))
                 {
                     // Same intent replayed after local state had already advanced.
+                } else if matches!(intent_record.status, DfsWriteIntentStatus::Committed)
+                    && self
+                        .current_read_object_metadata(&intent_record.object_id)
+                        .is_ok_and(|object| {
+                            object.version == intent_record.target_version
+                                && intent_record.content_hash.as_deref().is_none_or(
+                                    |content_hash| {
+                                        object.content_hash.as_deref() == Some(content_hash)
+                                    },
+                                )
+                        })
+                {
+                    self.restore_visible_committed_object_location_receipts(intent_record)?;
                 } else {
-                    eprintln!(
-                        "warning: falling back to full DFS metadata hydration after duplicate journal intent: {error}"
-                    );
-                    return Ok(true);
+                    self.mark_replayed_intent_as_conflict(intent_record, error.to_string(), false)?;
+                    return Ok(());
                 }
             }
             Err(error) => return Err(error.into()),
@@ -2753,7 +3140,44 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 ),
             );
         }
-        Ok(false)
+        Ok(())
+    }
+
+    fn mark_replayed_intent_as_conflict(
+        &mut self,
+        intent_record: &DfsWriteIntentRecord,
+        reason: String,
+        restore_conflict_intent: bool,
+    ) -> Result<(), DfsError> {
+        let object = match self.current_read_object_metadata(&intent_record.object_id) {
+            Ok(object) => object,
+            Err(DfsError::UnknownObject { .. }) => {
+                self.apply_backend_object_to_service_state(&intent_record.object_id)?;
+                self.current_read_object_metadata(&intent_record.object_id)?
+            }
+            Err(error) => return Err(error),
+        };
+        self.create_write_conflict(
+            &object,
+            intent_record.base_version.clone(),
+            intent_record.target_version.clone(),
+            intent_record.coordinator_node_id.clone(),
+            intent_record.content_hash.clone(),
+            reason,
+            Some(intent_record.intent_id.clone()),
+        )?;
+        let mut conflict_record = intent_record.clone();
+        conflict_record.status = DfsWriteIntentStatus::Conflict;
+        conflict_record.updated_at = Some(OffsetDateTime::now_utc());
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.put_intent(&conflict_record)?;
+        }
+        self.remove_pending_write_state(&conflict_record.intent_id);
+        if restore_conflict_intent {
+            self.coordinator
+                .restore_intent(distributed_intent_from_record(&conflict_record))?;
+        }
+        Ok(())
     }
 
     fn apply_metadata_receipt_to_service_state(
@@ -2766,17 +3190,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_ref() {
             let mut intent_cursor = None;
             loop {
-                let page = backend.intents_for_object_page(
+                let page = backend.intents_for_object_version_page(
                     object_id,
+                    version,
                     intent_cursor.as_ref(),
                     DFS_METADATA_OBJECT_INTENT_PAGE_SIZE,
                 )?;
-                intent_ids.extend(
-                    page.intents
-                        .into_iter()
-                        .filter(|intent| intent.target_version == *version)
-                        .map(|intent| intent.intent_id),
-                );
+                intent_ids.extend(page.intents.into_iter().map(|intent| intent.intent_id));
                 let Some(next_cursor) = page.next_cursor else {
                     break;
                 };
@@ -2955,6 +3375,24 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.tombstones_by_metadata_path.remove(&key);
     }
 
+    fn track_hydrated_metadata_tombstone(&mut self, object: &DfsObjectMetadata) {
+        if object.kind != DfsObjectKind::Tombstone {
+            self.track_metadata_tombstone(object);
+            return;
+        }
+        let live_path = path_index_key(&object.file_system_id, &object.path).map(|(_, path)| path);
+        if self
+            .metadata
+            .object_by_normalized_posix_path(
+                &object.file_system_id,
+                live_path.as_deref().unwrap_or(&object.path),
+            )
+            .is_none()
+        {
+            self.track_metadata_tombstone(object);
+        }
+    }
+
     pub fn remove_transient_object_metadata(&mut self, object_id: &DfsObjectId) {
         self.metadata.remove_object(object_id);
     }
@@ -3079,13 +3517,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<NodeId>, DfsError> {
-        if max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "remote DFS range read window {max_bytes} exceeds inline limit {DFS_BLOB_INLINE_LIMIT_BYTES}"
-                ),
-            });
-        }
         self.request_remote_object_read_inner(object_id, Some((offset, max_bytes)))
     }
 
@@ -3118,6 +3549,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     requested.push(node_id.clone());
                     break;
                 }
+                if self.pending_remote_read_has_resume_state(&request_id, &pending)
+                    && self.retry_remote_read_request_to(&request_id, &pending, node_id, now)?
+                {
+                    requested.push(node_id.clone());
+                    break;
+                }
                 self.pending_reads.remove(&request_id);
                 self.incoming_read_transfers.remove(&request_id);
                 expired_candidates.push(node_id.clone());
@@ -3147,6 +3584,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         range: Option<(u64, usize)>,
     ) -> Result<bool, DfsError> {
         let request_id = self.next_request_id();
+        let chunked_range =
+            range.is_some_and(|(_, max_bytes)| max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES);
+        let (start_chunk_index, max_chunks, window_end_chunk_index) = match range {
+            Some(_) if chunked_range => (
+                0,
+                DFS_READ_CHUNK_WINDOW_SIZE,
+                Self::read_window_end_chunk_index(0, DFS_READ_CHUNK_WINDOW_SIZE),
+            ),
+            Some(_) => (0, 0, None),
+            None => (
+                0,
+                DFS_READ_CHUNK_WINDOW_SIZE,
+                Self::read_window_end_chunk_index(0, DFS_READ_CHUNK_WINDOW_SIZE),
+            ),
+        };
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
             DfsNetworkMessage::ReadRequest(DfsReadRequest {
@@ -3154,6 +3606,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 object_id: object.object_id.clone(),
                 range_offset: range.map(|(offset, _)| offset),
                 range_max_bytes: range.map(|(_, max_bytes)| max_bytes),
+                start_chunk_index,
+                max_chunks,
             }),
         )?;
         if sent {
@@ -3166,10 +3620,49 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     content_size_bytes: object.content_size_bytes,
                     range_offset: range.map(|(offset, _)| offset),
                     range_max_bytes: range.map(|(_, max_bytes)| max_bytes),
+                    next_chunk_index: 0,
+                    window_end_chunk_index,
                     target_node_id: target_node_id.clone(),
                     next_retry_at: now + DFS_REMOTE_READ_RETRY_DELAY,
                 },
             );
+        }
+        Ok(sent)
+    }
+
+    fn pending_remote_read_has_resume_state(
+        &self,
+        request_id: &str,
+        pending: &PendingNetworkedRead,
+    ) -> bool {
+        pending.next_chunk_index > 0 || self.incoming_read_transfers.contains_key(request_id)
+    }
+
+    fn retry_remote_read_request_to(
+        &mut self,
+        request_id: &str,
+        pending: &PendingNetworkedRead,
+        target_node_id: &NodeId,
+        now: Instant,
+    ) -> Result<bool, DfsError> {
+        let start_chunk_index = pending.next_chunk_index;
+        let max_chunks = DFS_READ_CHUNK_WINDOW_SIZE;
+        let sent = self.send_dfs_message_if_routable(
+            target_node_id,
+            DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: request_id.to_string(),
+                object_id: pending.object_id.clone(),
+                range_offset: pending.range_offset,
+                range_max_bytes: pending.range_max_bytes,
+                start_chunk_index,
+                max_chunks,
+            }),
+        )?;
+        if sent && let Some(pending) = self.pending_reads.get_mut(request_id) {
+            pending.target_node_id = target_node_id.clone();
+            pending.next_retry_at = now + DFS_REMOTE_READ_RETRY_DELAY;
+            pending.window_end_chunk_index =
+                Self::read_window_end_chunk_index(start_chunk_index, max_chunks);
         }
         Ok(sent)
     }
@@ -3477,6 +3970,189 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
+    fn open_local_current_object_read_window_stream_with_state(
+        &self,
+        object_id: &DfsObjectId,
+        start_chunk_index: u32,
+        max_chunks: u32,
+    ) -> Result<NetworkedDfsReadStreamOutcome, DfsError> {
+        let object = self.current_read_object_metadata(object_id)?;
+        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        if !open_conflicts.is_empty() {
+            return Ok(NetworkedDfsReadStreamOutcome::Conflicted {
+                conflicts: open_conflicts
+                    .into_iter()
+                    .map(DfsConflictReadView::from)
+                    .collect(),
+            });
+        }
+
+        if let Ok(manifest) = self
+            .content
+            .read_manifest(object.object_id.as_str(), object.version.as_str())
+            && object
+                .content_hash
+                .as_ref()
+                .is_none_or(|expected_hash| expected_hash == &manifest.content_hash)
+        {
+            let range_len =
+                read_response_window_range_len(start_chunk_index, manifest.size_bytes, max_chunks)?;
+            let (manifest, reader) = self.content.open_object_version_range_stream(
+                object.object_id.as_str(),
+                object.version.as_str(),
+                u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64,
+                range_len,
+            )?;
+            return Ok(NetworkedDfsReadStreamOutcome::Found(
+                NetworkedDfsReadStream {
+                    data: DfsReadData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(manifest.content_hash),
+                        bytes: Vec::new(),
+                    },
+                    total_size_bytes: manifest.size_bytes,
+                    reader,
+                },
+            ));
+        }
+
+        if let Some(expected_hash) = object.content_hash.as_ref()
+            && let Ok(reader) = self.content.open_blob_stream(expected_hash)
+            && object
+                .content_size_bytes
+                .is_none_or(|expected_size| expected_size == reader.size_bytes())
+        {
+            let total_size_bytes = reader.size_bytes();
+            let range_len =
+                read_response_window_range_len(start_chunk_index, total_size_bytes, max_chunks)?;
+            let reader = self.content.open_blob_range_stream(
+                expected_hash,
+                u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64,
+                range_len,
+            )?;
+            return Ok(NetworkedDfsReadStreamOutcome::Found(
+                NetworkedDfsReadStream {
+                    data: DfsReadData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(expected_hash.clone()),
+                        bytes: Vec::new(),
+                    },
+                    total_size_bytes,
+                    reader: ObjectVersionReader::from_blob_range(reader),
+                },
+            ));
+        }
+
+        if object.content_hash.is_some() {
+            Ok(NetworkedDfsReadStreamOutcome::PendingReplication)
+        } else {
+            Ok(NetworkedDfsReadStreamOutcome::NotFound)
+        }
+    }
+
+    fn open_local_current_object_range_stream_with_state(
+        &self,
+        object_id: &DfsObjectId,
+        offset: u64,
+        max_bytes: usize,
+        start_chunk_index: u32,
+    ) -> Result<NetworkedDfsRangeReadStreamOutcome, DfsError> {
+        let object = self.current_read_object_metadata(object_id)?;
+        let open_conflicts = self.open_conflicts_for_object(object_id)?;
+        if !open_conflicts.is_empty() {
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Conflicted {
+                conflicts: open_conflicts
+                    .into_iter()
+                    .map(DfsConflictReadView::from)
+                    .collect(),
+            });
+        }
+
+        if let Ok(manifest) = self
+            .content
+            .read_manifest(object.object_id.as_str(), object.version.as_str())
+            && object
+                .content_hash
+                .as_ref()
+                .is_none_or(|expected_hash| expected_hash == &manifest.content_hash)
+        {
+            let range_offset = offset.min(manifest.size_bytes);
+            let range_size_bytes =
+                range_transfer_size_bytes(manifest.size_bytes, offset, max_bytes);
+            let window_prefix_bytes = chunk_prefix_bytes(range_size_bytes, start_chunk_index);
+            let window_offset = range_offset.saturating_add(window_prefix_bytes);
+            let window_max_bytes = dfs_byte_count_to_usize(
+                "DFS range read window",
+                range_size_bytes.saturating_sub(window_prefix_bytes),
+            )?;
+            let (manifest, reader) = self.content.open_object_version_range_stream(
+                object.object_id.as_str(),
+                object.version.as_str(),
+                window_offset,
+                window_max_bytes,
+            )?;
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
+                NetworkedDfsRangeReadStream {
+                    data: DfsReadRangeData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(manifest.content_hash),
+                        offset: range_offset,
+                        total_size_bytes: manifest.size_bytes,
+                        bytes: Vec::new(),
+                    },
+                    range_size_bytes,
+                    reader,
+                },
+            ));
+        }
+
+        if let Some(expected_hash) = object.content_hash.as_ref()
+            && let Ok(reader) = self.content.open_blob_stream(expected_hash)
+            && object
+                .content_size_bytes
+                .is_none_or(|expected_size| expected_size == reader.size_bytes())
+        {
+            let object_total_size_bytes = reader.size_bytes();
+            let range_offset = offset.min(object_total_size_bytes);
+            let range_size_bytes =
+                range_transfer_size_bytes(object_total_size_bytes, offset, max_bytes);
+            let window_prefix_bytes = chunk_prefix_bytes(range_size_bytes, start_chunk_index);
+            let window_offset = range_offset.saturating_add(window_prefix_bytes);
+            let window_max_bytes = dfs_byte_count_to_usize(
+                "DFS range read window",
+                range_size_bytes.saturating_sub(window_prefix_bytes),
+            )?;
+            let reader = self.content.open_blob_range_stream(
+                expected_hash,
+                window_offset,
+                window_max_bytes,
+            )?;
+            return Ok(NetworkedDfsRangeReadStreamOutcome::Found(
+                NetworkedDfsRangeReadStream {
+                    data: DfsReadRangeData {
+                        object_id: object.object_id.clone(),
+                        version: object.version.clone(),
+                        content_hash: Some(expected_hash.clone()),
+                        offset: range_offset,
+                        total_size_bytes: object_total_size_bytes,
+                        bytes: Vec::new(),
+                    },
+                    range_size_bytes,
+                    reader: ObjectVersionReader::from_blob_range(reader),
+                },
+            ));
+        }
+
+        if object.content_hash.is_some() {
+            Ok(NetworkedDfsRangeReadStreamOutcome::PendingReplication)
+        } else {
+            Ok(NetworkedDfsRangeReadStreamOutcome::NotFound)
+        }
+    }
+
     pub fn read_local_object_range_with_state(
         &self,
         object_id: &DfsObjectId,
@@ -3764,7 +4440,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         )? {
             return Ok(Some(outcome));
         }
-        if bytes.is_empty() || bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES {
+        if bytes.is_empty() {
             return Ok(None);
         }
 
@@ -3838,16 +4514,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             return Ok(None);
         }
 
-        let manifest = match self.content.put_object_version_patch(
+        let patch_info = match self.content.put_object_version_patch_with_info(
             request.object_id.as_str(),
             expected_base_version.as_str(),
             request.target_version.as_str(),
             offset,
             bytes,
         ) {
-            Ok(manifest) => manifest,
+            Ok(patch_info) => patch_info,
             Err(_) => return Ok(None),
         };
+        let manifest = patch_info.manifest;
+        let Some(patch_hash) = patch_info.patch_hash.clone() else {
+            return Ok(None);
+        };
+        let patch_size_bytes = patch_info.patch_size_bytes;
         let intent = match self.coordinator.create_intent_at_epoch(
             request.file_system_id.clone(),
             request.object_id.clone(),
@@ -3863,12 +4544,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
                     && distributed_error_creates_conflict(&error) =>
             {
+                let conflict_content_hash = manifest.content_hash.clone();
                 let conflict = self.create_write_conflict(
                     &object,
                     Some(expected_base_version),
                     request.target_version.clone(),
                     request.requesting_node_id.clone(),
-                    Some(manifest.content_hash),
+                    Some(conflict_content_hash),
                     error.to_string(),
                     None,
                 )?;
@@ -3877,7 +4559,6 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Err(error) => return Err(error.into()),
         };
         self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
-        let patch_hash = content_hash(bytes);
         self.pending_writes.insert(
             intent.intent_id.clone(),
             pending_networked_write_with_patch(
@@ -3889,7 +4570,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     base_version: expected_base_version.clone(),
                     offset,
                     patch_hash: patch_hash.clone(),
-                    bytes: bytes.to_vec(),
+                    patch_size_bytes,
                     full_stage_fallback_nodes: BTreeSet::new(),
                 }),
             ),
@@ -3924,7 +4605,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .collect::<Vec<_>>();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
-                let sent = self.send_stage_patch_if_routable(
+                let outcome = self.send_stage_patch_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
                     &updated_intent.intent_id,
@@ -3935,14 +4616,232 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     &manifest.content_hash,
                     offset,
                     &patch_hash,
-                    bytes,
+                    patch_size_bytes,
+                    0,
+                    DFS_STAGE_CHUNK_WINDOW_SIZE,
                     Some(object.clone()),
                 )?;
-                if sent {
-                    self.record_stage_inflight(
+                if outcome.sent {
+                    self.record_stage_window_progress(
                         &updated_intent.intent_id,
                         &replica_node_id,
                         request_id,
+                        outcome,
+                    );
+                } else {
+                    self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
+                }
+            }
+        }
+
+        let outcome = self.write_outcome(&updated_intent.intent_id)?;
+        self.cleanup_committed_pending_write_if_repaired(&updated_intent.intent_id);
+        Ok(Some(outcome))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_distributed_eventual_patch_from_reader_with_base<R: Read>(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: DfsVersion,
+        offset: u64,
+        reader: &mut R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        if let Some(outcome) = self.write_self_only_eventual_patch_from_reader_with_base(
+            request.clone(),
+            expected_base_version.clone(),
+            offset,
+            reader,
+            desired_replica_nodes.clone(),
+            policy.clone(),
+        )? {
+            return Ok(Some(outcome));
+        }
+
+        let object = self.current_object_for_write(&request.object_id)?;
+        if !matches!(
+            object.policy,
+            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
+        ) {
+            return Ok(None);
+        }
+        if expected_base_version != object.version {
+            return Ok(None);
+        }
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
+            let desired_replicas = desired_replica_nodes.len();
+            let min_commit_replicas = if object.policy == DfsObjectPolicy::ReplicatedConfirmed {
+                desired_replicas
+            } else {
+                policy.min_commit_replicas.min(desired_replicas)
+            };
+            DfsReplicationPolicy::new(min_commit_replicas, desired_replicas)?
+        } else {
+            policy
+        };
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        if object.policy == DfsObjectPolicy::ReplicatedConfirmed && !policy.is_strict_confirmed() {
+            return Err(DfsError::InvalidReplicationPolicy {
+                message:
+                    "replicated-confirmed writes require min_commit_replicas == desired_replicas"
+                        .to_string(),
+            });
+        }
+        let owner_epoch = match self.select_metadata_shard_for_object(&object)? {
+            Some(shard) if shard.primary_node_id != self.node_id => return Ok(None),
+            Some(shard) => shard.epoch,
+            None => 0,
+        };
+
+        if self
+            .ensure_no_backend_pending_write_intent(
+                &request.object_id,
+                &request.target_version,
+                None,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if self
+            .coordinator
+            .validate_new_intent(
+                &request.file_system_id,
+                &request.object_id,
+                Some(&expected_base_version),
+                &request.target_version,
+                &desired_replica_nodes,
+                &policy,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        let patch_info = self
+            .content
+            .put_object_version_patch_from_reader_with_info(
+                request.object_id.as_str(),
+                expected_base_version.as_str(),
+                request.target_version.as_str(),
+                offset,
+                reader,
+            )?;
+        let manifest = patch_info.manifest;
+        let Some(patch_hash) = patch_info.patch_hash.clone() else {
+            return Ok(None);
+        };
+        let patch_size_bytes = patch_info.patch_size_bytes;
+        let intent = match self.coordinator.create_intent_at_epoch(
+            request.file_system_id.clone(),
+            request.object_id.clone(),
+            Some(expected_base_version.clone()),
+            request.target_version.clone(),
+            request.requesting_node_id.clone(),
+            owner_epoch,
+            desired_replica_nodes.clone(),
+            policy,
+        ) {
+            Ok(intent) => intent,
+            Err(error)
+                if object.policy == DfsObjectPolicy::ReplicatedEventual
+                    && distributed_error_creates_conflict(&error) =>
+            {
+                let conflict_content_hash = manifest.content_hash.clone();
+                let conflict = self.create_write_conflict(
+                    &object,
+                    Some(expected_base_version),
+                    request.target_version.clone(),
+                    request.requesting_node_id.clone(),
+                    Some(conflict_content_hash),
+                    error.to_string(),
+                    None,
+                )?;
+                return Ok(Some(NetworkedDfsWriteOutcome::Conflict { conflict }));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.put_metadata_intent(&intent, Some(&manifest.content_hash))?;
+        self.pending_writes.insert(
+            intent.intent_id.clone(),
+            pending_networked_write_with_patch(
+                request.object_id.clone(),
+                request.target_version.clone(),
+                manifest.content_hash.clone(),
+                manifest.size_bytes,
+                Some(PendingNetworkedWritePatch {
+                    base_version: expected_base_version.clone(),
+                    offset,
+                    patch_hash: patch_hash.clone(),
+                    patch_size_bytes,
+                    full_stage_fallback_nodes: BTreeSet::new(),
+                }),
+            ),
+        );
+
+        let updated_intent = if desired_replica_nodes.contains(&self.node_id) {
+            let local_node_id = self.node_id.clone();
+            self.put_metadata_receipt(
+                &request.file_system_id,
+                &request.object_id,
+                &request.target_version,
+                &local_node_id,
+                &manifest.content_hash,
+            )?;
+            self.coordinator
+                .record_durable_receipt(&intent.intent_id, self.node_id.clone())?
+        } else {
+            intent
+        };
+
+        self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
+        if !matches!(
+            self.coordinator
+                .intent(&updated_intent.intent_id)
+                .map(|intent| &intent.state),
+            Some(DfsWriteIntentState::Committed)
+        ) {
+            let stage_targets = desired_replica_nodes
+                .iter()
+                .filter(|node_id| *node_id != &self.node_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            for replica_node_id in stage_targets {
+                let request_id = self.next_request_id();
+                let outcome = self.send_stage_patch_window_if_routable(
+                    &replica_node_id,
+                    request_id.clone(),
+                    &updated_intent.intent_id,
+                    &request.file_system_id,
+                    &request.object_id,
+                    &expected_base_version,
+                    &request.target_version,
+                    &manifest.content_hash,
+                    offset,
+                    &patch_hash,
+                    patch_size_bytes,
+                    0,
+                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    Some(object.clone()),
+                )?;
+                if outcome.sent {
+                    self.record_stage_window_progress(
+                        &updated_intent.intent_id,
+                        &replica_node_id,
+                        request_id,
+                        outcome,
                     );
                 } else {
                     self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
@@ -4035,6 +4934,92 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             Ok(manifest) => manifest,
             Err(_) => return Ok(None),
         };
+        self.commit_self_only_eventual_patch_manifest(request, object, manifest)
+    }
+
+    pub(crate) fn write_self_only_eventual_patch_from_reader_with_base<R: Read>(
+        &mut self,
+        request: DfsWriteRequest,
+        expected_base_version: DfsVersion,
+        offset: u64,
+        reader: &mut R,
+        desired_replica_nodes: Vec<NodeId>,
+        policy: DfsReplicationPolicy,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
+        let object = self.current_object_for_write(&request.object_id)?;
+        if object.policy != DfsObjectPolicy::ReplicatedEventual {
+            return Ok(None);
+        }
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        let desired_replica_nodes =
+            self.normalize_desired_replica_nodes(&object, desired_replica_nodes);
+        let policy = if desired_replica_nodes.len() > policy.desired_replicas {
+            let desired_replicas = desired_replica_nodes.len();
+            DfsReplicationPolicy::new(
+                policy.min_commit_replicas.min(desired_replicas),
+                desired_replicas,
+            )?
+        } else {
+            policy
+        };
+        validate_replication_plan(&desired_replica_nodes, &policy)?;
+        if policy.min_commit_replicas != 1
+            || desired_replica_nodes.len() != 1
+            || desired_replica_nodes[0] != self.node_id
+            || object.owner_node_id != self.node_id
+        {
+            return Ok(None);
+        }
+        if self
+            .select_metadata_shard_for_object(&object)?
+            .is_some_and(|shard| shard.primary_node_id != self.node_id)
+        {
+            return Ok(None);
+        }
+        if expected_base_version != object.version {
+            return Ok(None);
+        }
+        if self
+            .ensure_no_backend_pending_write_intent(
+                &request.object_id,
+                &request.target_version,
+                None,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        if self
+            .coordinator
+            .validate_new_intent(
+                &request.file_system_id,
+                &request.object_id,
+                Some(&expected_base_version),
+                &request.target_version,
+                &desired_replica_nodes,
+                &policy,
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+
+        let manifest = self.content.put_object_version_patch_from_reader(
+            request.object_id.as_str(),
+            expected_base_version.as_str(),
+            request.target_version.as_str(),
+            offset,
+            reader,
+        )?;
+        self.commit_self_only_eventual_patch_manifest(request, object, manifest)
+    }
+
+    fn commit_self_only_eventual_patch_manifest(
+        &mut self,
+        request: DfsWriteRequest,
+        object: DfsObjectMetadata,
+        manifest: ContentManifest,
+    ) -> Result<Option<NetworkedDfsWriteOutcome>, DfsError> {
         let mut committed_object = object.clone();
         let write_time = dfs_now_unix_nanos();
         committed_object.version = request.target_version.clone();
@@ -4044,8 +5029,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         committed_object.changed_at_unix_nanos = write_time;
         committed_object.current_locations = vec![self.node_id.clone()];
         committed_object.last_modified_by_event_id = Some(EventId::generate());
-        self.put_visible_object_in_metadata_backend(&committed_object)?;
-        self.put_object_version_size_in_metadata_backend(
+        self.put_visible_object_and_version_in_metadata_backend(
             &committed_object,
             Some(manifest.size_bytes),
         )?;
@@ -4219,8 +5203,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             committed_object.changed_at_unix_nanos = write_time;
             committed_object.current_locations = vec![self.node_id.clone()];
             committed_object.last_modified_by_event_id = Some(EventId::generate());
-            self.put_visible_object_in_metadata_backend(&committed_object)?;
-            self.put_object_version_size_in_metadata_backend(
+            self.put_visible_object_and_version_in_metadata_backend(
                 &committed_object,
                 Some(manifest.size_bytes),
             )?;
@@ -4705,8 +5688,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             committed_object.changed_at_unix_nanos = write_time;
             committed_object.current_locations = vec![self.node_id.clone()];
             committed_object.last_modified_by_event_id = Some(EventId::generate());
-            self.put_visible_object_in_metadata_backend(&committed_object)?;
-            self.put_object_version_size_in_metadata_backend(
+            self.put_visible_object_and_version_in_metadata_backend(
                 &committed_object,
                 Some(manifest.size_bytes),
             )?;
@@ -4802,7 +5784,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .collect();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
-                let sent = self.send_stage_blob_if_routable(
+                let outcome = self.send_stage_blob_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
                     &updated_intent.intent_id,
@@ -4811,14 +5793,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     updated_intent.base_version.clone(),
                     &request.target_version,
                     &manifest.content_hash,
-                    &bytes,
+                    manifest.size_bytes,
+                    0,
+                    DFS_STAGE_CHUNK_WINDOW_SIZE,
                     Some(object.clone()),
                 )?;
-                if sent {
-                    self.record_stage_inflight(
+                if outcome.sent {
+                    self.record_stage_window_progress(
                         &updated_intent.intent_id,
                         &replica_node_id,
                         request_id,
+                        outcome,
                     );
                 } else {
                     self.record_stage_retry_scheduled(&updated_intent.intent_id, &replica_node_id);
@@ -4979,6 +5964,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
                 DfsNetworkMessage::StagePatch(command) => {
                     events.push(self.handle_stage_patch(source_node_id, command)?);
+                }
+                DfsNetworkMessage::StagePatchChunk(command) => {
+                    if let Some(event) = self.handle_stage_patch_chunk(source_node_id, command)? {
+                        events.push(event);
+                    }
                 }
                 DfsNetworkMessage::StageBlobResponse(response) => {
                     if let Some(event) =
@@ -5573,6 +6563,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.incoming_blob_transfers.retain(|_, transfer| {
             now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
         });
+        self.incoming_patch_transfers.retain(|_, transfer| {
+            now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+        });
         self.incoming_read_transfers.retain(|request_id, transfer| {
             let keep =
                 now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
@@ -5610,6 +6603,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 pending.fetch_inflight_request_ids.remove(&source);
                 pending.fetch_inflight_started_ticks.remove(&source);
                 pending.fetch_next_chunk_indexes.remove(&source);
+                pending.fetch_window_end_chunk_indexes.remove(&source);
                 pending.fetch_failed_from.insert(source);
             }
             if has_expired_source {
@@ -5627,6 +6621,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     fn has_incoming_chunk_transfer_state(&self) -> bool {
         !self.incoming_blob_transfers.is_empty()
+            || !self.incoming_patch_transfers.is_empty()
             || !self.incoming_read_transfers.is_empty()
             || !self.incoming_fetch_transfers.is_empty()
     }
@@ -5815,6 +6810,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             self.incoming_fetch_transfers.remove(request_id);
         }
         self.incoming_blob_transfers
+            .retain(|_, transfer| transfer.intent_id != intent_id);
+        self.incoming_patch_transfers
             .retain(|_, transfer| transfer.intent_id != intent_id);
     }
 
@@ -6468,6 +7465,328 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
             }
         })
+    }
+
+    fn handle_stage_patch_chunk(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStagePatchChunkCommand,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        if command.total_chunks == 0 {
+            let reason = format!(
+                "stage patch chunk transfer {} has no chunks",
+                command.intent_id
+            );
+            return self.reject_stage_patch_chunk(requester_node_id, command, reason);
+        }
+        if let Err(error) = validate_chunk_bytes(
+            "chunked DFS patch transfer",
+            command.total_size_bytes,
+            command.chunk_index,
+            command.total_chunks,
+            &command.bytes,
+        ) {
+            return self.reject_stage_patch_chunk(requester_node_id, command, error.to_string());
+        }
+        let transfer_key = blob_transfer_key(
+            "stage-patch",
+            &requester_node_id,
+            &command.intent_id,
+            &command.request_id,
+        );
+        if let Err(error) = validate_chunk_hash(
+            "chunked DFS patch transfer",
+            command.chunk_index,
+            &command.bytes,
+            command.chunk_hash.as_deref(),
+        ) {
+            self.incoming_patch_transfers.remove(&transfer_key);
+            return self.reject_stage_patch_chunk(requester_node_id, command, error.to_string());
+        }
+        if !self.incoming_patch_transfers.contains_key(&transfer_key) {
+            if let Err(error) = self.ensure_replica_command_authorized_with_metadata(
+                &requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                command.object_metadata.as_ref(),
+            ) {
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            if let Err(error) =
+                self.ensure_replica_object_metadata(command.object_metadata.as_ref())
+            {
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            if let Err(error) = self.ensure_command_base_matches_current(
+                "stage-patch",
+                &command.object_id,
+                Some(&command.base_version),
+                &command.version,
+                &command.content_hash,
+            ) {
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            if let Err(error) = self.ensure_no_conflicting_pending_replica_write(
+                "stage-patch",
+                &requester_node_id,
+                &command.intent_id,
+                &command.object_id,
+                &command.version,
+                &command.content_hash,
+            ) {
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            let local_node_id = self.node_id.clone();
+            if let Err(error) = self.ensure_metadata_receipt_accepts(
+                &command.object_id,
+                &command.version,
+                &local_node_id,
+                &command.content_hash,
+            ) {
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+            if self
+                .local_object_version_manifest_size_if_matches(
+                    &command.object_id,
+                    &command.version,
+                    &command.content_hash,
+                )
+                .is_some()
+            {
+                let local_node_id = self.node_id.clone();
+                if let Err(error) = self.put_replica_receipt_if_authoritative(
+                    &command.file_system_id,
+                    &command.object_id,
+                    &command.version,
+                    &local_node_id,
+                    &command.content_hash,
+                    command.object_metadata.as_ref(),
+                ) {
+                    return self.reject_stage_patch_chunk(
+                        requester_node_id,
+                        command,
+                        error.to_string(),
+                    );
+                }
+                self.record_active_replica_stage(
+                    &command.object_id,
+                    &command.intent_id,
+                    &command.version,
+                    &command.content_hash,
+                    &requester_node_id,
+                );
+                self.send_dfs_message_if_routable(
+                    &requester_node_id,
+                    DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                        request_id: command.request_id,
+                        intent_id: command.intent_id.clone(),
+                        file_system_id: command.file_system_id,
+                        object_id: command.object_id.clone(),
+                        version: command.version.clone(),
+                        replica_node_id: self.node_id.clone(),
+                        result: DfsBlobTransferResult::Durable {
+                            content_hash: command.content_hash.clone(),
+                        },
+                    }),
+                )?;
+                return Ok(Some(NetworkedDfsServiceEvent::BlobStaged {
+                    intent_id: command.intent_id,
+                    object_id: command.object_id,
+                    version: command.version,
+                    replica_node_id: self.node_id.clone(),
+                    content_hash: command.content_hash,
+                }));
+            }
+            let assembler = match self.content.begin_chunked_object_version(
+                command.object_id.as_str(),
+                command.version.as_str(),
+                &command.patch_hash,
+                command.total_size_bytes,
+                command.total_chunks,
+                DFS_BLOB_CHUNK_BYTES,
+            ) {
+                Ok(assembler) => assembler,
+                Err(error) => {
+                    return self.reject_stage_patch_chunk(
+                        requester_node_id,
+                        command,
+                        error.to_string(),
+                    );
+                }
+            };
+            let transfer = InProgressPatchTransfer::new(
+                command.request_id.clone(),
+                command.intent_id.clone(),
+                command.file_system_id.clone(),
+                command.object_id.clone(),
+                command.base_version.clone(),
+                command.version.clone(),
+                command.content_hash.clone(),
+                command.offset,
+                command.patch_hash.clone(),
+                command.total_size_bytes,
+                command.total_chunks,
+                assembler,
+            )?;
+            self.incoming_patch_transfers
+                .insert(transfer_key.clone(), transfer);
+        }
+        let transfer = self
+            .incoming_patch_transfers
+            .get_mut(&transfer_key)
+            .expect("transfer inserted");
+        if transfer.file_system_id != command.file_system_id
+            || transfer.object_id != command.object_id
+            || transfer.base_version != command.base_version
+            || transfer.version != command.version
+            || transfer.content_hash != command.content_hash
+            || transfer.offset != command.offset
+            || transfer.patch_hash != command.patch_hash
+            || transfer.total_size_bytes != command.total_size_bytes
+        {
+            self.incoming_patch_transfers.remove(&transfer_key);
+            let reason = format!(
+                "conflicting stage patch chunk metadata for {}",
+                command.intent_id
+            );
+            return self.reject_stage_patch_chunk(requester_node_id, command, reason);
+        }
+        let transfer_complete = match transfer.insert_chunk(
+            command.chunk_index,
+            command.total_chunks,
+            command.bytes.clone(),
+        ) {
+            Ok(true) => true,
+            Ok(false) => return Ok(None),
+            Err(error) => {
+                self.incoming_patch_transfers.remove(&transfer_key);
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+        };
+        if !transfer_complete {
+            return Ok(None);
+        }
+        let transfer = self
+            .incoming_patch_transfers
+            .remove(&transfer_key)
+            .expect("completed transfer");
+        let manifest = match self.content.commit_chunked_object_version_patch(
+            transfer.assembler,
+            transfer.base_version.as_str(),
+            transfer.offset,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return self.reject_stage_patch_chunk(
+                    requester_node_id,
+                    command,
+                    error.to_string(),
+                );
+            }
+        };
+        if manifest.content_hash != transfer.content_hash {
+            let reason = format!(
+                "stage patch manifest hash mismatch for {}: expected {}, actual {}",
+                transfer.intent_id, transfer.content_hash, manifest.content_hash
+            );
+            return self.reject_stage_patch_chunk(requester_node_id, command, reason);
+        }
+        let local_node_id = self.node_id.clone();
+        self.put_replica_receipt_if_authoritative(
+            &transfer.file_system_id,
+            &transfer.object_id,
+            &transfer.version,
+            &local_node_id,
+            &manifest.content_hash,
+            None,
+        )?;
+        self.record_active_replica_stage(
+            &transfer.object_id,
+            &transfer.intent_id,
+            &transfer.version,
+            &manifest.content_hash,
+            &requester_node_id,
+        );
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                request_id: transfer.request_id,
+                intent_id: transfer.intent_id.clone(),
+                file_system_id: transfer.file_system_id,
+                object_id: transfer.object_id.clone(),
+                version: transfer.version.clone(),
+                replica_node_id: self.node_id.clone(),
+                result: DfsBlobTransferResult::Durable {
+                    content_hash: manifest.content_hash.clone(),
+                },
+            }),
+        )?;
+        Ok(Some(NetworkedDfsServiceEvent::BlobStaged {
+            intent_id: transfer.intent_id,
+            object_id: transfer.object_id,
+            version: transfer.version,
+            replica_node_id: self.node_id.clone(),
+            content_hash: manifest.content_hash,
+        }))
+    }
+
+    fn reject_stage_patch_chunk(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsStagePatchChunkCommand,
+        reason: String,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        let transfer_key = blob_transfer_key(
+            "stage-patch",
+            &requester_node_id,
+            &command.intent_id,
+            &command.request_id,
+        );
+        self.incoming_patch_transfers.remove(&transfer_key);
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                request_id: command.request_id,
+                intent_id: command.intent_id.clone(),
+                file_system_id: command.file_system_id,
+                object_id: command.object_id.clone(),
+                version: command.version,
+                replica_node_id: self.node_id.clone(),
+                result: DfsBlobTransferResult::Rejected {
+                    reason: reason.clone(),
+                },
+            }),
+        )?;
+        Ok(Some(NetworkedDfsServiceEvent::BlobStageRejected {
+            intent_id: command.intent_id,
+            object_id: command.object_id,
+            replica_node_id: self.node_id.clone(),
+            reason,
+        }))
     }
 
     fn handle_stage_blob_chunk(
@@ -7908,10 +9227,13 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         bytes: &[u8],
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count(bytes)?;
+        let end_chunk_index =
+            fetch_response_window_end(command.start_chunk_index, total_chunks, command.max_chunks);
         for (chunk_index, chunk) in bytes
             .chunks(DFS_BLOB_CHUNK_BYTES)
             .enumerate()
             .skip(command.start_chunk_index as usize)
+            .take(end_chunk_index.saturating_sub(command.start_chunk_index) as usize)
         {
             let sent = self.send_dfs_message_if_routable(
                 requester_node_id,
@@ -7944,8 +9266,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         total_size_bytes: u64,
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+        let end_chunk_index =
+            fetch_response_window_end(command.start_chunk_index, total_chunks, command.max_chunks);
         let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in command.start_chunk_index..total_chunks {
+        for chunk_index in command.start_chunk_index..end_chunk_index {
             let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
             let chunk_len = (total_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
             let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
@@ -8025,6 +9349,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
         Ok(reader)
+    }
+
+    fn fetch_window_end_chunk_index(start_chunk_index: u32, max_chunks: u32) -> Option<u32> {
+        (max_chunks > 0).then(|| start_chunk_index.saturating_add(max_chunks))
+    }
+
+    fn read_window_end_chunk_index(start_chunk_index: u32, max_chunks: u32) -> Option<u32> {
+        (max_chunks > 0).then(|| start_chunk_index.saturating_add(max_chunks))
     }
 
     fn handle_fetch_blob_response(
@@ -8403,6 +9735,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             *entry = (*entry).max(next_chunk_index);
         }
         if !transfer_complete {
+            self.request_next_fetch_window_if_due(
+                &intent_id,
+                &source_node_id,
+                next_chunk_index,
+                chunk.total_chunks,
+            )?;
             return Ok(None);
         }
         let transfer = self
@@ -8414,6 +9752,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending.fetch_inflight_request_ids.remove(&source_node_id);
             pending.fetch_inflight_started_ticks.remove(&source_node_id);
             pending.fetch_next_chunk_indexes.remove(&source_node_id);
+            pending
+                .fetch_window_end_chunk_indexes
+                .remove(&source_node_id);
         }
         if let Some(local_size_bytes) =
             self.local_object_version_manifest_size_if_matches(&object_id, &version, &content_hash)
@@ -8604,6 +9945,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending.fetch_inflight_request_ids.clear();
             pending.fetch_inflight_started_ticks.clear();
             pending.fetch_next_chunk_indexes.clear();
+            pending.fetch_window_end_chunk_indexes.clear();
             pending.fetch_failed_from.clear();
         }
     }
@@ -8620,6 +9962,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending.fetch_inflight_request_ids.remove(source_node_id);
             pending.fetch_inflight_started_ticks.remove(source_node_id);
             pending.fetch_next_chunk_indexes.remove(source_node_id);
+            pending
+                .fetch_window_end_chunk_indexes
+                .remove(source_node_id);
         }
     }
 
@@ -8639,6 +9984,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             pending.fetch_inflight_from.remove(source_node_id);
             pending.fetch_inflight_started_ticks.remove(source_node_id);
             pending.fetch_next_chunk_indexes.remove(source_node_id);
+            pending
+                .fetch_window_end_chunk_indexes
+                .remove(source_node_id);
             pending.fetch_failed_from.insert(source_node_id.clone());
             for state in pending.stage_retries.values_mut() {
                 state.next_retry_tick = 0;
@@ -8657,12 +10005,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         request: DfsReadRequest,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let requested_range = match (request.range_offset, request.range_max_bytes) {
-            (Some(offset), Some(max_bytes)) if max_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES => {
-                Ok(Some((offset, max_bytes)))
-            }
-            (Some(_), Some(max_bytes)) => Err(format!(
-                "remote DFS range read window {max_bytes} exceeds inline limit {DFS_BLOB_INLINE_LIMIT_BYTES}"
-            )),
+            (Some(offset), Some(max_bytes)) => Ok(Some((offset, max_bytes))),
             (None, None) => Ok(None),
             _ => Err("DFS read range request must include both offset and max bytes".to_string()),
         };
@@ -8680,64 +10023,144 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 }
                 Ok(_) => match range {
                     Some((offset, max_bytes)) => {
-                        match self.read_local_object_range_with_state(
-                            &request.object_id,
-                            offset,
-                            max_bytes,
-                            false,
-                        )? {
-                            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                                DfsReadResult::RangeFound(data)
-                            }
-                            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                                DfsReadResult::Rejected {
-                                    reason: read_conflicts_reason(conflicts),
+                        let chunked_range = max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES
+                            || request.start_chunk_index != 0
+                            || request.max_chunks != 0;
+                        if chunked_range {
+                            match self.open_local_current_object_range_stream_with_state(
+                                &request.object_id,
+                                offset,
+                                max_bytes,
+                                request.start_chunk_index,
+                            )? {
+                                NetworkedDfsRangeReadStreamOutcome::Found(stream)
+                                    if stream.range_size_bytes > 0 =>
+                                {
+                                    self.send_networked_range_read_response_chunks_from_reader(
+                                        &requester_node_id,
+                                        &request,
+                                        &stream.data,
+                                        stream.range_size_bytes,
+                                        stream.reader,
+                                    )?;
+                                    sent_chunked_response = true;
+                                    DfsReadResult::RangeFound(stream.data)
                                 }
-                            }
-                            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
-                            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
-                            | NetworkedDfsRangeReadOutcome::NotFound => DfsReadResult::NotFound,
-                        }
-                    }
-                    None => match self
-                        .open_local_current_object_stream_with_state(&request.object_id)?
-                    {
-                        NetworkedDfsReadStreamOutcome::Found(stream)
-                            if stream.total_size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 =>
-                        {
-                            self.send_networked_read_response_chunks_from_reader(
-                                &requester_node_id,
-                                &request,
-                                &stream.data,
-                                stream.total_size_bytes,
-                                stream.reader,
-                            )?;
-                            sent_chunked_response = true;
-                            DfsReadResult::Found(stream.data)
-                        }
-                        NetworkedDfsReadStreamOutcome::Found(_) => {
-                            match self.read_local_object_with_state(&request.object_id, false)? {
-                                NetworkedDfsReadOutcome::Found { data, .. } => {
-                                    DfsReadResult::Found(data)
+                                NetworkedDfsRangeReadStreamOutcome::Found(stream) => {
+                                    DfsReadResult::RangeFound(stream.data)
                                 }
-                                NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
+                                NetworkedDfsRangeReadStreamOutcome::Conflicted { conflicts } => {
                                     DfsReadResult::Rejected {
                                         reason: read_conflicts_reason(conflicts),
                                     }
                                 }
-                                NetworkedDfsReadOutcome::PendingReplication { .. }
-                                | NetworkedDfsReadOutcome::NotConfirmed { .. }
-                                | NetworkedDfsReadOutcome::NotFound => DfsReadResult::NotFound,
+                                NetworkedDfsRangeReadStreamOutcome::PendingReplication
+                                | NetworkedDfsRangeReadStreamOutcome::NotFound => {
+                                    DfsReadResult::NotFound
+                                }
+                            }
+                        } else {
+                            match self.read_local_object_range_with_state(
+                                &request.object_id,
+                                offset,
+                                max_bytes,
+                                false,
+                            )? {
+                                NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+                                    DfsReadResult::RangeFound(data)
+                                }
+                                NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+                                    DfsReadResult::Rejected {
+                                        reason: read_conflicts_reason(conflicts),
+                                    }
+                                }
+                                NetworkedDfsRangeReadOutcome::PendingReplication { .. }
+                                | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
+                                | NetworkedDfsRangeReadOutcome::NotFound => DfsReadResult::NotFound,
                             }
                         }
-                        NetworkedDfsReadStreamOutcome::Conflicted { conflicts } => {
-                            DfsReadResult::Rejected {
-                                reason: read_conflicts_reason(conflicts),
+                    }
+                    None => {
+                        let stream_outcome =
+                            self.open_local_current_object_stream_with_state(&request.object_id)?;
+                        match stream_outcome {
+                            NetworkedDfsReadStreamOutcome::Found(stream)
+                                if stream.total_size_bytes > DFS_BLOB_INLINE_LIMIT_BYTES as u64 =>
+                            {
+                                let window_outcome = if request.start_chunk_index == 0
+                                    && request.max_chunks == 0
+                                {
+                                    Ok(NetworkedDfsReadStreamOutcome::Found(stream))
+                                } else {
+                                    self.open_local_current_object_read_window_stream_with_state(
+                                        &request.object_id,
+                                        request.start_chunk_index,
+                                        request.max_chunks,
+                                    )
+                                };
+                                match window_outcome {
+                                    Ok(NetworkedDfsReadStreamOutcome::Found(stream)) => {
+                                        self.send_networked_read_response_chunks_from_reader(
+                                            &requester_node_id,
+                                            &request,
+                                            &stream.data,
+                                            stream.total_size_bytes,
+                                            stream.reader,
+                                        )?;
+                                        sent_chunked_response = true;
+                                        DfsReadResult::Found(stream.data)
+                                    }
+                                    Ok(NetworkedDfsReadStreamOutcome::Conflicted { conflicts }) => {
+                                        DfsReadResult::Rejected {
+                                            reason: read_conflicts_reason(conflicts),
+                                        }
+                                    }
+                                    Ok(NetworkedDfsReadStreamOutcome::PendingReplication)
+                                    | Ok(NetworkedDfsReadStreamOutcome::NotFound) => {
+                                        DfsReadResult::NotFound
+                                    }
+                                    Err(error) => DfsReadResult::Rejected {
+                                        reason: error.to_string(),
+                                    },
+                                }
                             }
+                            NetworkedDfsReadStreamOutcome::Found(_) => {
+                                if request.start_chunk_index != 0 {
+                                    DfsReadResult::Rejected {
+                                        reason: format!(
+                                            "DFS read chunk window starts outside inline object: {}",
+                                            request.start_chunk_index
+                                        ),
+                                    }
+                                } else {
+                                    match self
+                                        .read_local_object_with_state(&request.object_id, false)?
+                                    {
+                                        NetworkedDfsReadOutcome::Found { data, .. } => {
+                                            DfsReadResult::Found(data)
+                                        }
+                                        NetworkedDfsReadOutcome::Conflicted {
+                                            conflicts, ..
+                                        } => DfsReadResult::Rejected {
+                                            reason: read_conflicts_reason(conflicts),
+                                        },
+                                        NetworkedDfsReadOutcome::PendingReplication { .. }
+                                        | NetworkedDfsReadOutcome::NotConfirmed { .. }
+                                        | NetworkedDfsReadOutcome::NotFound => {
+                                            DfsReadResult::NotFound
+                                        }
+                                    }
+                                }
+                            }
+                            NetworkedDfsReadStreamOutcome::Conflicted { conflicts } => {
+                                DfsReadResult::Rejected {
+                                    reason: read_conflicts_reason(conflicts),
+                                }
+                            }
+                            NetworkedDfsReadStreamOutcome::PendingReplication
+                            | NetworkedDfsReadStreamOutcome::NotFound => DfsReadResult::NotFound,
                         }
-                        NetworkedDfsReadStreamOutcome::PendingReplication
-                        | NetworkedDfsReadStreamOutcome::NotFound => DfsReadResult::NotFound,
-                    },
+                    }
                 },
                 Err(DfsError::UnknownObject { .. }) => DfsReadResult::NotFound,
                 Err(error) => return Err(error),
@@ -8745,6 +10168,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         };
         match &result {
             DfsReadResult::Found(_) if sent_chunked_response => {}
+            DfsReadResult::RangeFound(_) if sent_chunked_response => {}
             DfsReadResult::Found(data) if data.bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES => {
                 self.send_networked_read_response_chunks(&requester_node_id, &request, data)?;
             }
@@ -8774,7 +10198,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         data: &DfsReadData,
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count(&data.bytes)?;
-        for (chunk_index, chunk) in data.bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
+        let end_chunk_index =
+            fetch_response_window_end(request.start_chunk_index, total_chunks, request.max_chunks);
+        for (chunk_index, chunk) in data
+            .bytes
+            .chunks(DFS_BLOB_CHUNK_BYTES)
+            .enumerate()
+            .skip(request.start_chunk_index as usize)
+            .take(end_chunk_index.saturating_sub(request.start_chunk_index) as usize)
+        {
             let sent = self.send_dfs_message_if_routable(
                 requester_node_id,
                 DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
@@ -8782,6 +10214,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: request.object_id.clone(),
                     version: data.version.clone(),
                     content_hash: data.content_hash.clone(),
+                    range_offset: None,
+                    object_total_size_bytes: None,
                     total_size_bytes: data.bytes.len() as u64,
                     chunk_index: chunk_index as u32,
                     total_chunks,
@@ -8805,8 +10239,10 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         mut reader: ObjectVersionReader,
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+        let end_chunk_index =
+            fetch_response_window_end(request.start_chunk_index, total_chunks, request.max_chunks);
         let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in 0..total_chunks {
+        for chunk_index in request.start_chunk_index..end_chunk_index {
             let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
             let chunk_len = (total_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
             let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
@@ -8827,7 +10263,68 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: request.object_id.clone(),
                     version: data.version.clone(),
                     content_hash: data.content_hash.clone(),
+                    range_offset: None,
+                    object_total_size_bytes: None,
                     total_size_bytes,
+                    chunk_index,
+                    total_chunks,
+                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
+                    bytes: buffer[..chunk_len].to_vec(),
+                }),
+            )?;
+            if !sent {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_networked_range_read_response_chunks_from_reader(
+        &mut self,
+        requester_node_id: &NodeId,
+        request: &DfsReadRequest,
+        data: &DfsReadRangeData,
+        range_size_bytes: u64,
+        mut reader: ObjectVersionReader,
+    ) -> Result<(), DfsError> {
+        let total_chunks = blob_chunk_count_for_size(range_size_bytes)?;
+        let max_chunks = if request.max_chunks == 0 {
+            DFS_READ_CHUNK_WINDOW_SIZE
+        } else {
+            request.max_chunks
+        };
+        let end_chunk_index =
+            fetch_response_window_end(request.start_chunk_index, total_chunks, max_chunks);
+        if end_chunk_index <= request.start_chunk_index {
+            return Ok(());
+        }
+        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
+        for chunk_index in request.start_chunk_index..end_chunk_index {
+            let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+            let chunk_len = (range_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
+            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
+                message: format!(
+                    "DFS range read chunk is too large to fit in memory: {chunk_len} bytes"
+                ),
+            })?;
+            reader
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|source| DfsError::ContentStore {
+                    message: format!(
+                        "failed to read blob {:?} range chunk {}: {}",
+                        data.content_hash, chunk_index, source
+                    ),
+                })?;
+            let sent = self.send_dfs_message_if_routable(
+                requester_node_id,
+                DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
+                    request_id: request.request_id.clone(),
+                    object_id: request.object_id.clone(),
+                    version: data.version.clone(),
+                    content_hash: data.content_hash.clone(),
+                    range_offset: Some(data.offset),
+                    object_total_size_bytes: Some(data.total_size_bytes),
+                    total_size_bytes: range_size_bytes,
                     chunk_index,
                     total_chunks,
                     chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
@@ -9263,6 +10760,225 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn handle_networked_range_read_response_chunk(
+        &mut self,
+        source_node_id: NodeId,
+        chunk: DfsReadResponseChunk,
+        pending: PendingNetworkedRead,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        let request_id = chunk.request_id.clone();
+        let object_id = chunk.object_id.clone();
+        let version = chunk.version.clone();
+        let content_hash = chunk.content_hash.clone();
+        let Some(requested_offset) = pending.range_offset else {
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "range read chunk is missing requested offset state".to_string(),
+                },
+            }));
+        };
+        let Some(requested_max_bytes) = pending.range_max_bytes else {
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "range read chunk is missing requested max bytes state".to_string(),
+                },
+            }));
+        };
+        if pending.version != chunk.version || pending.content_hash != chunk.content_hash {
+            self.pending_reads.remove(&chunk.request_id);
+            self.mark_remote_read_location_missing(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                &source_node_id,
+            )?;
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "stale DFS range read response chunk".to_string(),
+                },
+            }));
+        }
+        if self.pending_read_metadata_advanced(&pending)? {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "stale DFS range read response: object metadata advanced".to_string(),
+                },
+            }));
+        }
+        if !self.pending_read_source_still_current(&pending, &source_node_id)? {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "stale DFS range read response: source is no longer a current location"
+                        .to_string(),
+                },
+            }));
+        }
+        let Some(object_total_size_bytes) = chunk.object_total_size_bytes else {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: "chunked DFS range read response is missing object size".to_string(),
+                },
+            }));
+        };
+        if let Some(expected_size) = pending.content_size_bytes
+            && expected_size != object_total_size_bytes
+        {
+            self.pending_reads.remove(&chunk.request_id);
+            self.mark_remote_read_location_missing(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                &source_node_id,
+            )?;
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response object size does not match metadata: expected {expected_size}, actual {object_total_size_bytes}"
+                    ),
+                },
+            }));
+        }
+        let expected_range_offset = requested_offset.min(object_total_size_bytes);
+        if chunk.range_offset != Some(expected_range_offset) {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response offset mismatch: expected {expected_range_offset}, actual {:?}",
+                        chunk.range_offset
+                    ),
+                },
+            }));
+        }
+        let expected_range_size_bytes = range_transfer_size_bytes(
+            object_total_size_bytes,
+            requested_offset,
+            requested_max_bytes,
+        );
+        if chunk.total_size_bytes != expected_range_size_bytes {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response size mismatch: expected {expected_range_size_bytes}, actual {}",
+                        chunk.total_size_bytes
+                    ),
+                },
+            }));
+        }
+        if chunk.chunk_index != pending.next_chunk_index {
+            self.pending_reads.remove(&chunk.request_id);
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: format!(
+                        "chunked DFS range read response is out of order: expected chunk {}, actual {}",
+                        pending.next_chunk_index, chunk.chunk_index
+                    ),
+                },
+            }));
+        }
+        if let Err(error) = validate_chunk_bytes(
+            "chunked DFS range read response",
+            chunk.total_size_bytes,
+            chunk.chunk_index,
+            chunk.total_chunks,
+            &chunk.bytes,
+        )
+        .and_then(|()| {
+            validate_chunk_hash(
+                "chunked DFS range read response",
+                chunk.chunk_index,
+                &chunk.bytes,
+                chunk.chunk_hash.as_deref(),
+            )
+        }) {
+            self.pending_reads.remove(&chunk.request_id);
+            self.mark_remote_read_location_missing(
+                &pending.object_id,
+                &pending.version,
+                &pending.content_hash,
+                &source_node_id,
+            )?;
+            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+                request_id,
+                object_id,
+                source_node_id,
+                result: DfsReadResult::Rejected {
+                    reason: error.to_string(),
+                },
+            }));
+        }
+        let next_chunk_index = chunk.chunk_index.saturating_add(1);
+        let complete = next_chunk_index >= chunk.total_chunks;
+        if complete {
+            self.pending_reads.remove(&chunk.request_id);
+        } else if let Some(pending) = self.pending_reads.get_mut(&chunk.request_id) {
+            pending.next_chunk_index = next_chunk_index;
+        }
+        let total_chunks = chunk.total_chunks;
+        let chunk_index = chunk.chunk_index;
+        let bytes = chunk.bytes;
+        if !complete
+            && let Some(event) = self.request_next_read_window_if_due(
+                &request_id,
+                &source_node_id,
+                next_chunk_index,
+                total_chunks,
+            )?
+        {
+            return Ok(Some(event));
+        }
+        Ok(Some(
+            NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
+                request_id,
+                object_id,
+                source_node_id,
+                version,
+                content_hash,
+                range_offset: expected_range_offset,
+                range_size_bytes: expected_range_size_bytes,
+                object_total_size_bytes,
+                chunk_index,
+                total_chunks,
+                bytes,
+                complete,
+            },
+        ))
+    }
+
     fn handle_networked_read_response_chunk(
         &mut self,
         source_node_id: NodeId,
@@ -9311,16 +11027,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             }));
         }
         if pending.range_offset.is_some() || pending.range_max_bytes.is_some() {
-            self.pending_reads.remove(&chunk.request_id);
-            self.incoming_read_transfers.remove(&chunk.request_id);
-            return Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
-                request_id: chunk.request_id,
-                object_id: chunk.object_id,
-                source_node_id,
-                result: DfsReadResult::Rejected {
-                    reason: "unexpected chunked DFS read response for range request".to_string(),
-                },
-            }));
+            return self.handle_networked_range_read_response_chunk(source_node_id, chunk, pending);
         }
         if pending.version != chunk.version || pending.content_hash != chunk.content_hash {
             self.pending_reads.remove(&chunk.request_id);
@@ -9577,7 +11284,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let transfer_complete =
             match transfer.insert_chunk(chunk.chunk_index, chunk.total_chunks, chunk.bytes) {
                 Ok(true) => true,
-                Ok(false) => return Ok(None),
+                Ok(false) => false,
                 Err(error) => {
                     self.clear_read_response_transfer_state(&chunk.request_id);
                     self.mark_remote_read_location_missing(
@@ -9596,8 +11303,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     }));
                 }
             };
+        let next_chunk_index = transfer.contiguous_received_chunk_count();
+        if let Some(pending) = self.pending_reads.get_mut(&request_id) {
+            pending.next_chunk_index = pending.next_chunk_index.max(next_chunk_index);
+        }
         if !transfer_complete {
-            return Ok(None);
+            return self.request_next_read_window_if_due(
+                &request_id,
+                &source_node_id,
+                next_chunk_index,
+                chunk.total_chunks,
+            );
         }
         let transfer = self
             .incoming_read_transfers
@@ -9681,6 +11397,63 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             object_id,
             source_node_id,
             result: DfsReadResult::Found(data),
+        }))
+    }
+
+    fn request_next_read_window_if_due(
+        &mut self,
+        request_id: &str,
+        source_node_id: &NodeId,
+        next_chunk_index: u32,
+        total_chunks: u32,
+    ) -> Result<Option<NetworkedDfsServiceEvent>, DfsError> {
+        if next_chunk_index >= total_chunks {
+            return Ok(None);
+        }
+        let Some(pending) = self.pending_reads.get(request_id).cloned() else {
+            return Ok(None);
+        };
+        let Some(window_end) = pending.window_end_chunk_index else {
+            return Ok(None);
+        };
+        if next_chunk_index < window_end {
+            return Ok(None);
+        }
+        let sent = self.send_dfs_message_if_routable(
+            source_node_id,
+            DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: request_id.to_string(),
+                object_id: pending.object_id.clone(),
+                range_offset: pending.range_offset,
+                range_max_bytes: pending.range_max_bytes,
+                start_chunk_index: next_chunk_index,
+                max_chunks: DFS_READ_CHUNK_WINDOW_SIZE,
+            }),
+        )?;
+        if sent {
+            if let Some(pending) = self.pending_reads.get_mut(request_id) {
+                pending.next_chunk_index = next_chunk_index;
+                pending.window_end_chunk_index =
+                    Self::read_window_end_chunk_index(next_chunk_index, DFS_READ_CHUNK_WINDOW_SIZE);
+                pending.next_retry_at = Instant::now() + DFS_REMOTE_READ_RETRY_DELAY;
+            }
+            return Ok(None);
+        }
+
+        self.clear_read_response_transfer_state(request_id);
+        self.mark_remote_read_location_missing(
+            &pending.object_id,
+            &pending.version,
+            &pending.content_hash,
+            source_node_id,
+        )?;
+        Ok(Some(NetworkedDfsServiceEvent::RemoteReadCompleted {
+            request_id: request_id.to_string(),
+            object_id: pending.object_id,
+            source_node_id: source_node_id.clone(),
+            result: DfsReadResult::Rejected {
+                reason: "unable to route DFS read continuation request".to_string(),
+            },
         }))
     }
 
@@ -9854,10 +11627,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     &pending,
                     object_metadata.clone(),
                 )? {
-                    Some(true) => {
-                        self.record_stage_inflight(&intent_id, &replica_node_id, request_id);
+                    Some(outcome) if outcome.sent => {
+                        self.record_stage_window_progress(
+                            &intent_id,
+                            &replica_node_id,
+                            request_id,
+                            outcome,
+                        );
                     }
-                    Some(false) => {
+                    Some(_) => {
                         self.record_stage_retry_scheduled(&intent_id, &replica_node_id);
                     }
                     None => full_stage_targets.push((replica_node_id, request_id)),
@@ -9917,7 +11695,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         intent: &DistributedWriteIntent,
         pending: &PendingNetworkedWrite,
         object_metadata: Option<DfsObjectMetadata>,
-    ) -> Result<Option<bool>, DfsError> {
+    ) -> Result<Option<StageBlobSendOutcome>, DfsError> {
         let Some(patch) = pending.patch.as_ref() else {
             return Ok(None);
         };
@@ -9930,7 +11708,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if base_version != &patch.base_version {
             return Ok(None);
         }
-        let sent = self.send_stage_patch_if_routable(
+        let start_chunk_index = pending
+            .stage_next_chunk_indexes
+            .get(replica_node_id)
+            .copied()
+            .unwrap_or(0);
+        let outcome = self.send_stage_patch_window_if_routable(
             replica_node_id,
             request_id,
             &intent.intent_id,
@@ -9941,10 +11724,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             &pending.content_hash,
             patch.offset,
             &patch.patch_hash,
-            &patch.bytes,
+            patch.patch_size_bytes,
+            start_chunk_index,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
             object_metadata,
         )?;
-        Ok(Some(sent))
+        Ok(Some(outcome))
     }
 
     fn open_pending_write_blob_stream(
@@ -10007,6 +11792,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .get(&source_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
+            let start_chunk_index = pending
+                .fetch_next_chunk_indexes
+                .get(&source_node_id)
+                .copied()
+                .unwrap_or(0);
+            let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
             let sent = self.send_dfs_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -10015,15 +11806,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: pending.object_id.clone(),
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
-                    start_chunk_index: pending
-                        .fetch_next_chunk_indexes
-                        .get(&source_node_id)
-                        .copied()
-                        .unwrap_or(0),
+                    start_chunk_index,
+                    max_chunks,
                 }),
             )?;
             if sent {
-                self.record_fetch_inflight(&intent.intent_id, source_node_id, request_id);
+                self.record_fetch_inflight(
+                    &intent.intent_id,
+                    source_node_id,
+                    request_id,
+                    start_chunk_index,
+                    max_chunks,
+                );
                 return Ok(true);
             }
         }
@@ -10052,6 +11846,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         intent_id: &str,
         source_node_id: NodeId,
         request_id: String,
+        start_chunk_index: u32,
+        max_chunks: u32,
     ) {
         let tick = self.repair_retry_tick;
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
@@ -10061,7 +11857,88 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .insert(source_node_id.clone(), request_id);
             pending
                 .fetch_inflight_started_ticks
-                .insert(source_node_id, tick);
+                .insert(source_node_id.clone(), tick);
+            if let Some(window_end) =
+                Self::fetch_window_end_chunk_index(start_chunk_index, max_chunks)
+            {
+                pending
+                    .fetch_window_end_chunk_indexes
+                    .insert(source_node_id.clone(), window_end);
+            } else {
+                pending
+                    .fetch_window_end_chunk_indexes
+                    .remove(&source_node_id);
+            }
+        }
+    }
+
+    fn request_next_fetch_window_if_due(
+        &mut self,
+        intent_id: &str,
+        source_node_id: &NodeId,
+        next_chunk_index: u32,
+        total_chunks: u32,
+    ) -> Result<(), DfsError> {
+        if next_chunk_index >= total_chunks {
+            return Ok(());
+        }
+        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+            return Ok(());
+        };
+        let Some(window_end) = pending
+            .fetch_window_end_chunk_indexes
+            .get(source_node_id)
+            .copied()
+        else {
+            return Ok(());
+        };
+        if next_chunk_index < window_end {
+            return Ok(());
+        }
+        let request_id = pending
+            .fetch_inflight_request_ids
+            .get(source_node_id)
+            .cloned()
+            .unwrap_or_else(|| self.next_request_id());
+        let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
+        let sent = self.send_dfs_message_if_routable(
+            source_node_id,
+            DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
+                request_id: request_id.clone(),
+                intent_id: intent_id.to_string(),
+                object_id: pending.object_id,
+                version: pending.version,
+                content_hash: pending.content_hash,
+                start_chunk_index: next_chunk_index,
+                max_chunks,
+            }),
+        )?;
+        if sent {
+            self.record_fetch_inflight(
+                intent_id,
+                source_node_id.clone(),
+                request_id,
+                next_chunk_index,
+                max_chunks,
+            );
+        } else {
+            self.record_fetch_window_retry_needed(intent_id, source_node_id);
+        }
+        Ok(())
+    }
+
+    fn record_fetch_window_retry_needed(&mut self, intent_id: &str, source_node_id: &NodeId) {
+        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+            pending.fetch_inflight_from.remove(source_node_id);
+            pending.fetch_inflight_started_ticks.remove(source_node_id);
+            for state in pending.stage_retries.values_mut() {
+                state.next_retry_tick = 0;
+                state.inflight = false;
+            }
+            for state in pending.repair_retries.values_mut() {
+                state.next_retry_tick = 0;
+                state.inflight = false;
+            }
         }
     }
 
@@ -10290,6 +12167,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .get(&source_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
+            let start_chunk_index = pending
+                .fetch_next_chunk_indexes
+                .get(&source_node_id)
+                .copied()
+                .unwrap_or(0);
+            let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
             let sent = self.send_dfs_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -10298,15 +12181,18 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     object_id: pending.object_id.clone(),
                     version: pending.version.clone(),
                     content_hash: pending.content_hash.clone(),
-                    start_chunk_index: pending
-                        .fetch_next_chunk_indexes
-                        .get(&source_node_id)
-                        .copied()
-                        .unwrap_or(0),
+                    start_chunk_index,
+                    max_chunks,
                 }),
             )?;
             if sent {
-                self.record_fetch_inflight(&job.intent_id, source_node_id, request_id);
+                self.record_fetch_inflight(
+                    &job.intent_id,
+                    source_node_id,
+                    request_id,
+                    start_chunk_index,
+                    max_chunks,
+                );
                 return Ok(true);
             }
         }
@@ -11021,6 +12907,55 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn put_visible_object_and_version_in_metadata_backend(
+        &mut self,
+        object: &DfsObjectMetadata,
+        size_bytes: Option<u64>,
+    ) -> Result<(), DfsError> {
+        let mut object = object.clone();
+        normalize_current_locations(&mut object.current_locations);
+        let size_bytes = match size_bytes {
+            Some(size_bytes) => Some(size_bytes),
+            None => self.object_content_size_hint(&object)?,
+        };
+        let Some(backend) = self.metadata_backend.as_mut() else {
+            return Ok(());
+        };
+        if backend.get_file_system(&object.file_system_id)?.is_none() {
+            backend.put_file_system(&DfsFileSystem {
+                file_system_id: object.file_system_id.clone(),
+                display_name: object.file_system_id.to_string(),
+                owner_node_id: object.owner_node_id.clone(),
+                subtree_policies: Vec::new(),
+            })?;
+        }
+
+        let object_changed = backend.get_object(&object.object_id)?.as_ref() != Some(&object);
+
+        let mut version = object_version_record(&object, size_bytes);
+        let version_changed =
+            if let Some(existing) = backend.get_version(&version.object_id, &version.version)? {
+                version.created_at = existing.created_at;
+                existing != version
+            } else {
+                true
+            };
+
+        match (object_changed, version_changed) {
+            (true, true) => {
+                backend.put_object_and_version(&object, &version)?;
+            }
+            (true, false) => {
+                backend.put_object(&object)?;
+            }
+            (false, true) => {
+                backend.put_version(&version)?;
+            }
+            (false, false) => {}
+        }
+        Ok(())
+    }
+
     fn put_object_version_size_in_metadata_backend(
         &mut self,
         object: &DfsObjectMetadata,
@@ -11650,6 +13585,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
     }
 
+    #[cfg(test)]
     fn send_stage_blob_if_routable(
         &mut self,
         target_node_id: &NodeId,
@@ -11708,7 +13644,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn send_stage_patch_if_routable(
+    fn send_stage_patch_window_if_routable(
         &mut self,
         target_node_id: &NodeId,
         request_id: String,
@@ -11720,28 +13656,113 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         content_hash: &str,
         offset: u64,
         patch_hash: &str,
-        bytes: &[u8],
+        patch_size_bytes: u64,
+        start_chunk_index: u32,
+        max_chunks: u32,
         object_metadata: Option<DfsObjectMetadata>,
-    ) -> Result<bool, DfsError> {
-        if bytes.len() > DFS_BLOB_INLINE_LIMIT_BYTES {
-            return Ok(false);
+    ) -> Result<StageBlobSendOutcome, DfsError> {
+        if patch_size_bytes <= DFS_BLOB_INLINE_LIMIT_BYTES as u64 {
+            let bytes = self.read_patch_blob_range(patch_hash, 0, patch_size_bytes)?;
+            let sent = self.send_best_effort_message_if_routable(
+                target_node_id,
+                DfsNetworkMessage::StagePatch(DfsStagePatchCommand {
+                    request_id,
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    base_version: base_version.clone(),
+                    version: version.clone(),
+                    content_hash: content_hash.to_string(),
+                    offset,
+                    patch_hash: patch_hash.to_string(),
+                    bytes,
+                    object_metadata,
+                }),
+            )?;
+            return Ok(StageBlobSendOutcome {
+                sent,
+                complete: sent,
+                next_chunk_index: 0,
+            });
         }
-        self.send_best_effort_message_if_routable(
-            target_node_id,
-            DfsNetworkMessage::StagePatch(DfsStagePatchCommand {
-                request_id,
-                intent_id: intent_id.to_string(),
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                base_version: base_version.clone(),
-                version: version.clone(),
-                content_hash: content_hash.to_string(),
-                offset,
-                patch_hash: patch_hash.to_string(),
-                bytes: bytes.to_vec(),
-                object_metadata,
-            }),
-        )
+
+        let total_size_bytes = patch_size_bytes;
+        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+        if start_chunk_index >= total_chunks {
+            return Ok(StageBlobSendOutcome {
+                sent: true,
+                complete: true,
+                next_chunk_index: total_chunks,
+            });
+        }
+        let end_chunk_index = start_chunk_index
+            .saturating_add(max_chunks.max(1))
+            .min(total_chunks);
+        for chunk_index in start_chunk_index..end_chunk_index {
+            let chunk_offset = u64::from(chunk_index).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64);
+            let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
+            let chunk = self.read_patch_blob_range(patch_hash, chunk_offset, chunk_len as u64)?;
+            let sent = self.send_best_effort_message_if_routable(
+                target_node_id,
+                DfsNetworkMessage::StagePatchChunk(DfsStagePatchChunkCommand {
+                    request_id: request_id.clone(),
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    base_version: base_version.clone(),
+                    version: version.clone(),
+                    content_hash: content_hash.to_string(),
+                    offset,
+                    patch_hash: patch_hash.to_string(),
+                    total_size_bytes,
+                    chunk_index,
+                    total_chunks,
+                    chunk_hash: Some(chunk_hash(&chunk)),
+                    bytes: chunk,
+                    object_metadata: object_metadata.clone(),
+                }),
+            )?;
+            if !sent {
+                return Ok(StageBlobSendOutcome {
+                    sent: false,
+                    complete: false,
+                    next_chunk_index: chunk_index,
+                });
+            }
+        }
+        Ok(StageBlobSendOutcome {
+            sent: true,
+            complete: end_chunk_index >= total_chunks,
+            next_chunk_index: end_chunk_index,
+        })
+    }
+
+    fn read_patch_blob_range(
+        &self,
+        patch_hash: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, DfsError> {
+        let len = usize::try_from(len).map_err(|_| DfsError::Distributed {
+            message: format!("DFS patch range is too large to fit in memory: {len} bytes"),
+        })?;
+        let mut reader = self
+            .content
+            .open_blob_range_stream(patch_hash, offset, len)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!(
+                    "failed to open DFS patch blob {patch_hash} at {offset}+{len}: {source}"
+                ),
+            })?;
+        let mut bytes = vec![0_u8; len];
+        reader
+            .read_exact(&mut bytes)
+            .map_err(|source| DfsError::ContentStore {
+                message: format!(
+                    "failed to read DFS patch blob {patch_hash} at {offset}+{len}: {source}"
+                ),
+            })?;
+        Ok(bytes)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -12081,6 +14102,73 @@ fn blob_chunk_len(total_size_bytes: u64, chunk_index: u32) -> Result<usize, DfsE
     })
 }
 
+fn chunk_prefix_bytes(total_size_bytes: u64, chunk_count: u32) -> u64 {
+    total_size_bytes.min(u64::from(chunk_count).saturating_mul(DFS_BLOB_CHUNK_BYTES as u64))
+}
+
+fn pending_stage_transfer_size_bytes(
+    pending: &PendingNetworkedWrite,
+    replica_node_id: &NodeId,
+) -> u64 {
+    pending
+        .patch
+        .as_ref()
+        .filter(|patch| !patch.full_stage_fallback_nodes.contains(replica_node_id))
+        .map(|patch| patch.patch_size_bytes)
+        .unwrap_or(pending.size_bytes)
+}
+
+fn range_transfer_size_bytes(
+    object_total_size_bytes: u64,
+    requested_offset: u64,
+    requested_max_bytes: usize,
+) -> u64 {
+    let start = requested_offset.min(object_total_size_bytes);
+    let max_bytes = u64::try_from(requested_max_bytes).unwrap_or(u64::MAX);
+    object_total_size_bytes.saturating_sub(start).min(max_bytes)
+}
+
+fn dfs_byte_count_to_usize(label: &str, value: u64) -> Result<usize, DfsError> {
+    usize::try_from(value).map_err(|_| DfsError::Distributed {
+        message: format!("{label} byte count is too large for this platform: {value}"),
+    })
+}
+
+fn fetch_response_window_end(start_chunk_index: u32, total_chunks: u32, max_chunks: u32) -> u32 {
+    if max_chunks == 0 {
+        return total_chunks;
+    }
+    start_chunk_index
+        .saturating_add(max_chunks)
+        .min(total_chunks)
+}
+
+fn read_response_window_range_len(
+    start_chunk_index: u32,
+    total_size_bytes: u64,
+    max_chunks: u32,
+) -> Result<usize, DfsError> {
+    let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+    if start_chunk_index >= total_chunks {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "DFS read chunk window starts outside object: start={}, total_chunks={total_chunks}",
+                start_chunk_index
+            ),
+        });
+    }
+    let end_chunk_index = fetch_response_window_end(start_chunk_index, total_chunks, max_chunks);
+    let start_offset = u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
+    let end_offset = if end_chunk_index >= total_chunks {
+        total_size_bytes
+    } else {
+        u64::from(end_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64
+    };
+    usize::try_from(end_offset.saturating_sub(start_offset)).map_err(|_| DfsError::Distributed {
+        message: format!("DFS read chunk window is too large: {start_offset}..{end_offset}"),
+    })
+}
+
 fn record_anti_entropy_issue(
     report: &mut DfsAntiEntropyReport,
     max_issues: usize,
@@ -12236,6 +14324,7 @@ fn pending_networked_write_with_patch(
         fetch_inflight_request_ids: BTreeMap::new(),
         fetch_inflight_started_ticks: BTreeMap::new(),
         fetch_next_chunk_indexes: BTreeMap::new(),
+        fetch_window_end_chunk_indexes: BTreeMap::new(),
         fetch_failed_from: BTreeSet::new(),
     }
 }
@@ -12308,6 +14397,15 @@ fn distributed_intent_state_from_status(status: &DfsWriteIntentStatus) -> DfsWri
         DfsWriteIntentStatus::Conflict => DfsWriteIntentState::Conflict,
         DfsWriteIntentStatus::Aborted => DfsWriteIntentState::Aborted,
     }
+}
+
+fn write_intent_status_requires_hydrate_restore(status: &DfsWriteIntentStatus) -> bool {
+    matches!(
+        status,
+        DfsWriteIntentStatus::Staging
+            | DfsWriteIntentStatus::ReceiptsPending
+            | DfsWriteIntentStatus::Committed
+    )
 }
 
 fn repair_retry_delay_ticks(attempts: u32) -> u64 {

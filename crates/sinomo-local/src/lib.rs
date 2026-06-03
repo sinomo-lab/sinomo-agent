@@ -71,7 +71,7 @@ impl SinomoDataDir {
     }
 
     pub fn dfs_expose_config_file(&self) -> PathBuf {
-        self.configs_dir().join("dfs-expose.json")
+        self.configs_dir().join("dfs-expose.sobj")
     }
 
     pub fn providers_dir(&self) -> PathBuf {

@@ -932,7 +932,7 @@ fn sifs_sandbox_toolchain_store_can_replicate_to_candidate_node() {
     let replica = NodeId::from_legacy_named("node_toolchain_replica").expect("replica");
     let metadata_root = runtime_root.join("metadata");
     let owner_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("owner metadata");
     let mut owner_dfs = NetworkedDfsService::new(
         network.add_node(owner.clone()),
@@ -944,7 +944,7 @@ fn sifs_sandbox_toolchain_store_can_replicate_to_candidate_node() {
         .bootstrap_distributed_sifs()
         .expect("owner bootstrap");
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root.clone())
             .expect("replica metadata");
     let mut replica_dfs = NetworkedDfsService::new(
         network.add_node(replica.clone()),
@@ -979,7 +979,7 @@ fn sifs_sandbox_toolchain_store_can_replicate_to_candidate_node() {
     replica_dfs.process_incoming().expect("replica content");
 
     let replica_backend =
-        LocalJsonMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("sifs"), metadata_root)
             .expect("replica metadata reload");
     let replica_dfs = NetworkedDfsService::new(
         network.add_node(replica),

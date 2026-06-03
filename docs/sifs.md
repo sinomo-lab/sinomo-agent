@@ -40,6 +40,8 @@ Current predefined policy model:
 
 The parent directories `/`, `/sinomo`, `/sinomo/nodes`, and `/sinomo/nodes/<node_id>` are namespace anchors. They make the cluster layout inspectable and routable, while the policy boundary for local host-file exposure is the `files` subtree itself.
 
+The default local exposure config lives at `$SINOMO_DATA_DIR/config/dfs-expose.sobj`. Existing `dfs-expose.json` files are read for migration, and explicit `.json` paths remain supported for compatibility, but the default internal config is a Sinomo Object document.
+
 ## KV Boundary
 
 SIFS configuration and DFS service discovery are compact cluster control-plane records under the `sinomo-kv` `/dfs` keyspace:
@@ -59,4 +61,4 @@ Per-path metadata, object metadata, object versions, write intents, replica rece
 
 `crates/sinomo-dfs/src/local_owned.rs` defines the local-owned node file exposure at `/sinomo/nodes/<node_id>/files`.
 
-`crates/sinomo-dfs/src/posix.rs` exposes SIFS through a POSIX-like path API for mkdir, list, stat, read, write, rename, and unlink operations.
+`crates/sinomo-dfs/src/posix.rs` exposes SIFS through a POSIX-like path API for mkdir, paginated list, stat, read, streaming read, write, write-at, rename, and unlink operations. Large recursive clears and directory renames are durable bounded namespace jobs so they can resume after daemon or process restart.

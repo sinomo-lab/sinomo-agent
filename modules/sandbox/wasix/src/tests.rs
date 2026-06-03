@@ -1,7 +1,7 @@
 use super::*;
 use crate::internal::*;
 use sinomo_dfs::{
-    DfsMetadataShardId, LocalContentStore, LocalJsonMetadataBackend, NetworkedDfsService,
+    DfsMetadataShardId, LocalContentStore, LocalSobjMetadataBackend, NetworkedDfsService,
 };
 use sinomo_network::InProcessNetwork;
 use std::fs;
