@@ -1,5 +1,6 @@
 use crate::{
-    RolloutError, SelfRolloutPaths, ensure_rollout_layout, rollout_staged_main_binary,
+    RolloutError, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
+    default_native_dylib_module_builds, ensure_rollout_layout, rollout_staged_main_binary,
     rollout_staged_shadow_binary, stage_rollout_file,
 };
 use std::env;
@@ -75,17 +76,52 @@ pub fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
     actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
 }
 
-pub fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, RolloutError> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RolloutBuiltArtifacts {
+    pub built_binary: PathBuf,
+    pub native_dylib_modules: Vec<LocalRolloutNativeDylibModuleArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRolloutNativeDylibModuleArtifact {
+    pub module_id: String,
+    pub interface_version: String,
+    pub cache_key: String,
+    pub library_name: String,
+    pub built_library: PathBuf,
+    pub source: String,
+}
+
+impl From<SelfRolloutNativeDylibModuleBuild> for LocalRolloutNativeDylibModuleArtifact {
+    fn from(value: SelfRolloutNativeDylibModuleBuild) -> Self {
+        Self {
+            module_id: value.module_id,
+            interface_version: value.interface_version,
+            cache_key: value.cache_key,
+            library_name: value.library_name,
+            built_library: value.built_library,
+            source: value.source,
+        }
+    }
+}
+
+pub fn rollout_build_dev_artifacts(
+    repo: &Path,
+    build_log: &Path,
+) -> Result<RolloutBuiltArtifacts, RolloutError> {
+    let modules = default_native_dylib_module_builds(repo);
+    let build_args = rollout_build_args(&modules);
     let build = Command::new("cargo")
-        .args(["build", "-p", "sinomo"])
+        .args(&build_args)
         .current_dir(repo)
         .output()
         .map_err(|source| RolloutError::Io {
-            path: "cargo build -p sinomo".to_string(),
+            path: format!("cargo {}", build_args.join(" ")),
             detail: source.to_string(),
         })?;
+    let command = format!("cargo {}", build_args.join(" "));
     let log = format!(
-        "command: cargo build -p sinomo\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
         repo.display(),
         build.status,
         String::from_utf8_lossy(&build.stdout),
@@ -97,15 +133,102 @@ pub fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf
     })?;
     if !build.status.success() {
         return Err(RolloutError::Process {
-            command: "cargo build -p sinomo".to_string(),
+            command,
             status: build.status.code().unwrap_or(-1),
             stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
         });
     }
-    Ok(repo
+    let built_binary = repo
         .join("target")
         .join("debug")
-        .join(format!("sinomo{}", env::consts::EXE_SUFFIX)))
+        .join(format!("sinomo{}", env::consts::EXE_SUFFIX));
+    ensure_artifact_exists(&built_binary)?;
+    let native_dylib_modules = modules
+        .into_iter()
+        .map(LocalRolloutNativeDylibModuleArtifact::from)
+        .collect::<Vec<_>>();
+    for module in &native_dylib_modules {
+        ensure_artifact_exists(&module.built_library)?;
+    }
+    Ok(RolloutBuiltArtifacts {
+        built_binary,
+        native_dylib_modules,
+    })
+}
+
+pub fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, RolloutError> {
+    rollout_build_dev_artifacts(repo, build_log).map(|artifacts| artifacts.built_binary)
+}
+
+fn rollout_build_dev_native_dylib_modules(
+    repo: &Path,
+    build_log: &Path,
+) -> Result<Vec<LocalRolloutNativeDylibModuleArtifact>, RolloutError> {
+    let modules = default_native_dylib_module_builds(repo);
+    let build_args = rollout_module_build_args(&modules);
+    let build = Command::new("cargo")
+        .args(&build_args)
+        .current_dir(repo)
+        .output()
+        .map_err(|source| RolloutError::Io {
+            path: format!("cargo {}", build_args.join(" ")),
+            detail: source.to_string(),
+        })?;
+    let command = format!("cargo {}", build_args.join(" "));
+    let log = format!(
+        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        repo.display(),
+        build.status,
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    fs::write(build_log, log).map_err(|source| RolloutError::Io {
+        path: build_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !build.status.success() {
+        return Err(RolloutError::Process {
+            command,
+            status: build.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
+        });
+    }
+    let artifacts = modules
+        .into_iter()
+        .map(LocalRolloutNativeDylibModuleArtifact::from)
+        .collect::<Vec<_>>();
+    for module in &artifacts {
+        ensure_artifact_exists(&module.built_library)?;
+    }
+    Ok(artifacts)
+}
+
+fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
+    let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+    for module in modules {
+        args.push("-p".to_string());
+        args.push(module.package.clone());
+    }
+    args
+}
+
+fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
+    let mut args = vec!["build".to_string()];
+    for module in modules {
+        args.push("-p".to_string());
+        args.push(module.package.clone());
+    }
+    args
+}
+
+fn ensure_artifact_exists(path: &Path) -> Result<(), RolloutError> {
+    if path.exists() {
+        Ok(())
+    } else {
+        Err(RolloutError::MissingArtifact {
+            artifact: path.display().to_string(),
+        })
+    }
 }
 
 pub fn prepare_rollout_dev_binary(
@@ -125,11 +248,31 @@ pub fn prepare_rollout_dev_binary(
     rollout_build_dev_binary(repo, &paths.plan().build_log)
 }
 
+pub fn prepare_rollout_dev_artifacts(
+    paths: &SelfRolloutPaths,
+    repo: &Path,
+    binary: Option<&Path>,
+) -> Result<RolloutBuiltArtifacts, RolloutError> {
+    ensure_rollout_layout(paths)?;
+    if let Some(binary) = binary {
+        ensure_artifact_exists(binary)?;
+        return Ok(RolloutBuiltArtifacts {
+            built_binary: binary.to_path_buf(),
+            native_dylib_modules: rollout_build_dev_native_dylib_modules(
+                repo,
+                &paths.plan().build_log,
+            )?,
+        });
+    }
+    rollout_build_dev_artifacts(repo, &paths.plan().build_log)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalRolloutArtifacts {
     pub built_binary: PathBuf,
     pub staged_main_binary: PathBuf,
     pub staged_shadow_binary: PathBuf,
+    pub native_dylib_modules: Vec<LocalRolloutNativeDylibModuleArtifact>,
 }
 
 pub fn prepare_local_rollout_artifacts(
@@ -139,22 +282,23 @@ pub fn prepare_local_rollout_artifacts(
     ensure_rollout_layout(paths)?;
     ensure_rollout_source_repo(paths, repo)?;
     let plan = paths.plan();
-    let built_binary = rollout_build_dev_binary(&plan.build_dir, &plan.build_log)?;
-    stage_local_rollout_artifacts(paths, built_binary)
+    let built_artifacts = rollout_build_dev_artifacts(&plan.build_dir, &plan.build_log)?;
+    stage_local_rollout_artifacts(paths, built_artifacts)
 }
 
 pub fn stage_local_rollout_artifacts(
     paths: &SelfRolloutPaths,
-    built_binary: PathBuf,
+    built_artifacts: RolloutBuiltArtifacts,
 ) -> Result<LocalRolloutArtifacts, RolloutError> {
     let staged_main_binary = rollout_staged_main_binary(paths);
     let staged_shadow_binary = rollout_staged_shadow_binary(paths);
-    stage_rollout_file(&built_binary, &staged_main_binary)?;
-    stage_rollout_file(&built_binary, &staged_shadow_binary)?;
+    stage_rollout_file(&built_artifacts.built_binary, &staged_main_binary)?;
+    stage_rollout_file(&built_artifacts.built_binary, &staged_shadow_binary)?;
     Ok(LocalRolloutArtifacts {
-        built_binary,
+        built_binary: built_artifacts.built_binary,
         staged_main_binary,
         staged_shadow_binary,
+        native_dylib_modules: built_artifacts.native_dylib_modules,
     })
 }
 
@@ -675,10 +819,25 @@ mod tests {
         let paths = SelfRolloutPaths::new(&data);
         ensure_rollout_layout(&paths).expect("layout");
 
-        let artifacts =
-            stage_local_rollout_artifacts(&paths, source.clone()).expect("local artifacts");
+        let module_artifacts = vec![LocalRolloutNativeDylibModuleArtifact {
+            module_id: "module.test".to_string(),
+            interface_version: "test.v1".to_string(),
+            cache_key: "module/test".to_string(),
+            library_name: "libtest.so".to_string(),
+            built_library: root.join("target").join("debug").join("libtest.so"),
+            source: "test".to_string(),
+        }];
+        let artifacts = stage_local_rollout_artifacts(
+            &paths,
+            RolloutBuiltArtifacts {
+                built_binary: source.clone(),
+                native_dylib_modules: module_artifacts.clone(),
+            },
+        )
+        .expect("local artifacts");
 
         assert_eq!(artifacts.built_binary, source);
+        assert_eq!(artifacts.native_dylib_modules, module_artifacts);
         assert_eq!(
             artifacts.staged_main_binary,
             rollout_staged_main_binary(&paths)

@@ -149,6 +149,7 @@ pub(crate) fn install_with_layout(
     install_current_binary(&layout.binary)?;
     install_current_binary(&layout.shadow_binary)?;
     install_managed_source_repo(layout)?;
+    let installed_modules = install_current_modules(layout)?;
     let managed_source_updated =
         managed_source_head_before != installed_managed_source_head(layout);
     write_boot_entries(layout, &options)?;
@@ -167,6 +168,12 @@ pub(crate) fn install_with_layout(
             .source_repo
             .display()
     );
+    for module in installed_modules {
+        println!(
+            "installed native module: {} ({})",
+            module.state.module_id, module.state.content_hash
+        );
+    }
     println!("boot entry: {}", layout.main_boot_entry.display());
     println!("boot entry: {}", layout.shadow_boot_entry.display());
     println!("data directory retained at: {}", layout.data_dir.display());
@@ -244,6 +251,34 @@ pub(crate) fn install_managed_source_repo(layout: &InstallLayout) -> Result<(), 
             Ok(())
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn install_current_modules(
+    _layout: &InstallLayout,
+) -> Result<Vec<sinomo_runtime::module::NativeDylibModuleInstallResult>, CliError> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(test))]
+pub(crate) fn install_current_modules(
+    layout: &InstallLayout,
+) -> Result<Vec<sinomo_runtime::module::NativeDylibModuleInstallResult>, CliError> {
+    let rollout_paths = SelfRolloutPaths::new(&layout.data_dir);
+    let repo = rollout_paths.source_repo.clone();
+    if !repo.join("Cargo.toml").exists() {
+        println!(
+            "warning: native modules were not installed because the managed source repo is not initialized at {}",
+            repo.display()
+        );
+        return Ok(Vec::new());
+    }
+    let artifacts = prepare_rollout_dev_artifacts(&rollout_paths, &repo, Some(&layout.binary))?;
+    daemon_install_local_rollout_native_dylib_modules(
+        &layout.data_dir,
+        &artifacts.native_dylib_modules,
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn default_boot_dir(data_dir: &SinomoDataDir) -> Result<PathBuf, CliError> {

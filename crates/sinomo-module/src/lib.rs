@@ -15,7 +15,7 @@ use sinomo_object::{LengthMode, serde_ext};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -130,6 +130,24 @@ pub struct NativeDylibModuleLoaderState {
     pub interface_version: String,
     pub activated_at: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDylibModuleInstallRequest {
+    pub expected_module_id: Option<ModuleId>,
+    pub artifact_id: Option<ArtifactId>,
+    pub expected_interface_version: Option<String>,
+    pub cache_key: Option<String>,
+    pub library_name: Option<String>,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDylibModuleInstallResult {
+    pub descriptor_module_id: String,
+    pub state: NativeDylibModuleLoaderState,
+    pub cache_path: PathBuf,
+    pub state_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1173,6 +1191,260 @@ pub fn module_loader_applied_at_now() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+pub fn install_native_dylib_module_from_file(
+    data_dir_root: &Path,
+    source_path: &Path,
+    request: NativeDylibModuleInstallRequest,
+) -> Result<NativeDylibModuleInstallResult, NativeDylibModuleInstallError> {
+    let bytes = fs::read(source_path).map_err(|source| NativeDylibModuleInstallError::Io {
+        path: source_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    install_native_dylib_module_from_path_and_bytes(data_dir_root, source_path, &bytes, request)
+}
+
+pub fn install_native_dylib_module_from_bytes(
+    data_dir_root: &Path,
+    bytes: &[u8],
+    request: NativeDylibModuleInstallRequest,
+) -> Result<NativeDylibModuleInstallResult, NativeDylibModuleInstallError> {
+    let Some(library_name) = request.library_name.as_deref() else {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: "native dylib bytes require an explicit library name".to_string(),
+        });
+    };
+    let library_name = validate_native_dylib_module_library_name(library_name)?;
+    let staging_path = native_dylib_module_staging_path(data_dir_root, &library_name);
+    write_native_dylib_module_file(&staging_path, bytes, None)?;
+    let result = install_native_dylib_module_from_path_and_bytes(
+        data_dir_root,
+        &staging_path,
+        bytes,
+        request,
+    );
+    if let Some(parent) = staging_path.parent() {
+        let _ = fs::remove_dir_all(parent);
+    } else {
+        let _ = fs::remove_file(&staging_path);
+    }
+    result
+}
+
+fn install_native_dylib_module_from_path_and_bytes(
+    data_dir_root: &Path,
+    descriptor_path: &Path,
+    bytes: &[u8],
+    request: NativeDylibModuleInstallRequest,
+) -> Result<NativeDylibModuleInstallResult, NativeDylibModuleInstallError> {
+    let content_hash = sinomo_module_host::native_module_content_hash(bytes);
+    let library_name = match request.library_name.as_deref() {
+        Some(library_name) => validate_native_dylib_module_library_name(library_name)?,
+        None => native_dylib_module_source_library_name(descriptor_path)?,
+    };
+    let native_module = unsafe {
+        sinomo_module_host::NativeModule::load_from_content_addressed_path(
+            descriptor_path,
+            &content_hash,
+        )
+    }?;
+    let descriptor = native_module.descriptor().clone();
+    drop(native_module);
+
+    let descriptor_module_id = descriptor.module_id.clone();
+    let module_id = parse_native_dylib_module_id(&descriptor.module_id)?;
+    if let Some(expected) = request.expected_module_id.as_ref()
+        && module_id != *expected
+    {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native module descriptor module_id `{}` does not match expected `{expected}`",
+                descriptor.module_id
+            ),
+        });
+    }
+    if let Some(expected) = request.expected_interface_version.as_ref()
+        && descriptor.interface_version != *expected
+    {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native module descriptor interface `{}` does not match expected `{expected}`",
+                descriptor.interface_version
+            ),
+        });
+    }
+
+    let cache_key = request
+        .cache_key
+        .unwrap_or_else(|| descriptor.module_id.replace('.', "/"));
+    let cache_key = validate_native_dylib_module_cache_key(&cache_key)?;
+    let cache_path = sinomo_module_host::native_module_cache_path(
+        data_dir_root,
+        &cache_key,
+        &content_hash,
+        &library_name,
+    );
+    write_native_dylib_module_file(&cache_path, bytes, Some(descriptor_path))?;
+
+    let state = NativeDylibModuleLoaderState {
+        module_id,
+        artifact_id: request.artifact_id,
+        content_hash,
+        cache_key,
+        library_name,
+        platform_triple: descriptor.platform_triple,
+        native_abi_version: descriptor.native_abi_version,
+        interface_version: descriptor.interface_version,
+        activated_at: module_loader_applied_at_now(),
+        source: request.source,
+    };
+    let state_path = write_native_dylib_module_loader_state(data_dir_root, &state)?;
+    Ok(NativeDylibModuleInstallResult {
+        descriptor_module_id,
+        state,
+        cache_path,
+        state_path,
+    })
+}
+
+pub fn validate_native_dylib_module_cache_key(
+    value: &str,
+) -> Result<String, NativeDylibModuleInstallError> {
+    let trimmed = non_empty_native_dylib_value(value, "native module cache key")?;
+    let path = Path::new(&trimmed);
+    if path.is_absolute() {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!("native module cache key `{trimmed}` must be relative"),
+        });
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            _ => {
+                return Err(NativeDylibModuleInstallError::Descriptor {
+                    detail: format!(
+                        "native module cache key `{trimmed}` must not contain `.` or `..`"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(trimmed)
+}
+
+pub fn validate_native_dylib_module_library_name(
+    value: &str,
+) -> Result<String, NativeDylibModuleInstallError> {
+    let trimmed = non_empty_native_dylib_value(value, "native module library name")?;
+    let path = Path::new(&trimmed);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(trimmed),
+        _ => Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!("native module library name `{trimmed}` must be a file name"),
+        }),
+    }
+}
+
+fn native_dylib_module_source_library_name(
+    path: &Path,
+) -> Result<String, NativeDylibModuleInstallError> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!("native module path `{}` has no file name", path.display()),
+        });
+    };
+    validate_native_dylib_module_library_name(file_name)
+}
+
+fn non_empty_native_dylib_value(
+    value: &str,
+    label: &str,
+) -> Result<String, NativeDylibModuleInstallError> {
+    let trimmed = value.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!("{label} must be non-empty"),
+        });
+    }
+    Ok(trimmed)
+}
+
+fn parse_native_dylib_module_id(value: &str) -> Result<ModuleId, NativeDylibModuleInstallError> {
+    ModuleId::new(value.to_string())
+        .or_else(|_| ModuleId::from_legacy_named(value))
+        .map_err(|source| NativeDylibModuleInstallError::Descriptor {
+            detail: format!("invalid native module id `{value}`: {source}"),
+        })
+}
+
+fn native_dylib_module_staging_path(data_dir_root: &Path, library_name: &str) -> PathBuf {
+    data_dir_root
+        .join("module")
+        .join("cache")
+        .join("native-dylib")
+        .join(".staged")
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ))
+        .join(library_name)
+}
+
+fn write_native_dylib_module_file(
+    path: &Path,
+    bytes: &[u8],
+    permissions_source: Option<&Path>,
+) -> Result<(), NativeDylibModuleInstallError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NativeDylibModuleInstallError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    if path.exists() {
+        let existing = fs::read(path).map_err(|source| NativeDylibModuleInstallError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if sinomo_module_host::native_module_content_hash(&existing)
+            == sinomo_module_host::native_module_content_hash(bytes)
+        {
+            return Ok(());
+        }
+        fs::remove_file(path).map_err(|source| NativeDylibModuleInstallError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let tmp_path = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("native-module"),
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    ));
+    fs::write(&tmp_path, bytes).map_err(|source| NativeDylibModuleInstallError::Io {
+        path: tmp_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if let Some(source_path) = permissions_source
+        && let Ok(metadata) = fs::metadata(source_path)
+    {
+        let _ = fs::set_permissions(&tmp_path, metadata.permissions());
+    }
+    #[cfg(unix)]
+    if permissions_source.is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755));
+    }
+    fs::rename(&tmp_path, path).map_err(|source| NativeDylibModuleInstallError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
 pub fn route_module_invocation(
     data_dir_root: &Path,
     request: &ModuleRouteRequest,
@@ -2051,6 +2323,18 @@ pub enum ModuleLoaderStoreError {
     Io { path: String, detail: String },
     #[error("module loader state object error at {path}: {detail}")]
     Object { path: String, detail: String },
+}
+
+#[derive(Debug, Error)]
+pub enum NativeDylibModuleInstallError {
+    #[error("native dylib module install I/O error at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error(transparent)]
+    Host(#[from] sinomo_module_host::NativeModuleHostError),
+    #[error(transparent)]
+    Store(#[from] ModuleLoaderStoreError),
+    #[error("native dylib module descriptor mismatch: {detail}")]
+    Descriptor { detail: String },
 }
 
 #[derive(Debug, Error)]

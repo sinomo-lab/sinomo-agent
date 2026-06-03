@@ -1,4 +1,4 @@
-use crate::RolloutError;
+use crate::{RolloutError, source::LocalRolloutNativeDylibModuleArtifact};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointPrivacy};
 use std::path::{Path, PathBuf};
@@ -8,6 +8,8 @@ pub struct ClusterRolloutBinaryRequest {
     pub source: String,
     #[serde(with = "serde_bytes")]
     pub binary: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_dylib_modules: Vec<ClusterRolloutNativeDylibModuleArtifact>,
     #[serde(default)]
     pub target_os: String,
     #[serde(default)]
@@ -16,6 +18,17 @@ pub struct ClusterRolloutBinaryRequest {
     pub port: u16,
     pub shadow_port: u16,
     pub requested_at: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutNativeDylibModuleArtifact {
+    pub module_id: String,
+    pub interface_version: String,
+    pub cache_key: String,
+    pub library_name: String,
+    pub source: String,
+    #[serde(with = "serde_bytes")]
+    pub library: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -46,6 +59,7 @@ pub struct ClusterRolloutBinaryResponse {
 pub fn prepare_cluster_rollout_binary_request(
     source: impl Into<String>,
     binary: &Path,
+    native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
     host: impl Into<String>,
     port: u16,
     shadow_port: u16,
@@ -55,15 +69,37 @@ pub fn prepare_cluster_rollout_binary_request(
         path: binary.display().to_string(),
         detail: source.to_string(),
     })?;
+    let native_dylib_modules = native_dylib_modules
+        .iter()
+        .map(cluster_native_dylib_module_artifact_from_local)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(ClusterRolloutBinaryRequest {
         source: source.into(),
         binary: binary_bytes,
+        native_dylib_modules,
         target_os: std::env::consts::OS.to_string(),
         target_arch: std::env::consts::ARCH.to_string(),
         host: host.into(),
         port,
         shadow_port,
         requested_at: requested_at.into(),
+    })
+}
+
+fn cluster_native_dylib_module_artifact_from_local(
+    artifact: &LocalRolloutNativeDylibModuleArtifact,
+) -> Result<ClusterRolloutNativeDylibModuleArtifact, RolloutError> {
+    let library = std::fs::read(&artifact.built_library).map_err(|source| RolloutError::Io {
+        path: artifact.built_library.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(ClusterRolloutNativeDylibModuleArtifact {
+        module_id: artifact.module_id.clone(),
+        interface_version: artifact.interface_version.clone(),
+        cache_key: artifact.cache_key.clone(),
+        library_name: artifact.library_name.clone(),
+        source: artifact.source.clone(),
+        library,
     })
 }
 
@@ -161,6 +197,7 @@ mod tests {
         let request = prepare_cluster_rollout_binary_request(
             "source",
             &binary,
+            &[],
             "127.0.0.1",
             21353,
             21354,
@@ -175,6 +212,44 @@ mod tests {
         assert_eq!(request.shadow_port, 21354);
         assert!(!request.target_os.is_empty());
         assert!(!request.target_arch.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_cluster_rollout_binary_request_includes_native_module_artifacts() {
+        let root = temp_root("cluster-binary-module-request");
+        std::fs::create_dir_all(&root).expect("root");
+        let binary = root.join("sinomo");
+        let module = root.join("libmodule.so");
+        std::fs::write(&binary, b"binary-bytes").expect("binary");
+        std::fs::write(&module, b"module-bytes").expect("module");
+
+        let request = prepare_cluster_rollout_binary_request(
+            "source",
+            &binary,
+            &[LocalRolloutNativeDylibModuleArtifact {
+                module_id: "module.test".to_string(),
+                interface_version: "test.v1".to_string(),
+                cache_key: "module/test".to_string(),
+                library_name: "libmodule.so".to_string(),
+                built_library: module,
+                source: "test".to_string(),
+            }],
+            "127.0.0.1",
+            21353,
+            21354,
+            "now",
+        )
+        .expect("request");
+
+        assert_eq!(request.native_dylib_modules.len(), 1);
+        let artifact = &request.native_dylib_modules[0];
+        assert_eq!(artifact.module_id, "module.test");
+        assert_eq!(artifact.interface_version, "test.v1");
+        assert_eq!(artifact.cache_key, "module/test");
+        assert_eq!(artifact.library_name, "libmodule.so");
+        assert_eq!(artifact.source, "test");
+        assert_eq!(artifact.library, b"module-bytes".to_vec());
         let _ = std::fs::remove_dir_all(root);
     }
 

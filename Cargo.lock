@@ -6137,6 +6137,7 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-events",
+ "sinomo-module-host",
  "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
@@ -6262,6 +6263,7 @@ dependencies = [
  "sinomo-node",
  "sinomo-object",
  "sinomo-registry",
+ "sinomo-sandbox-wasix-api",
  "sinomo-storage",
  "time",
 ]

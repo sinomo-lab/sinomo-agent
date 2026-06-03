@@ -896,6 +896,10 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     let artifacts = prepare_local_rollout_artifacts(&paths, options.repo.as_deref())?;
 
     let data_dir = SinomoDataDir::from_env_or_home()?;
+    let installed_modules = daemon_install_local_rollout_native_dylib_modules(
+        &data_dir.root(),
+        &artifacts.native_dylib_modules,
+    )?;
     let requested_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -943,6 +947,12 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         "  shadow binary: {}",
         rollout_plan.install_shadow_binary.display()
     );
+    for module in installed_modules {
+        println!(
+            "  native module: {} ({})",
+            module.state.module_id, module.state.content_hash
+        );
+    }
     Ok(())
 }
 
@@ -1066,11 +1076,18 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             continue;
         }
         if binary_request.is_none() {
-            let binary = rollout_prepare_dev_binary(&options)?;
-            println!("cluster rollout binary: {}", binary.display());
+            let artifacts = rollout_prepare_dev_artifacts(&options)?;
+            println!(
+                "cluster rollout binary: {}",
+                artifacts.built_binary.display()
+            );
+            for module in &artifacts.native_dylib_modules {
+                println!("cluster rollout module: {}", module.built_library.display());
+            }
             binary_request = Some(prepare_cluster_rollout_binary_request(
                 source.clone(),
-                &binary,
+                &artifacts.built_binary,
+                &artifacts.native_dylib_modules,
                 options.host.clone(),
                 options.port,
                 options.shadow_port,
@@ -1155,10 +1172,12 @@ pub(crate) fn rollout_source_bundle(
     prepare_rollout_source_bundle(&paths, &repo).map_err(Into::into)
 }
 
-pub(crate) fn rollout_prepare_dev_binary(options: &RolloutOptions) -> Result<PathBuf, CliError> {
+pub(crate) fn rollout_prepare_dev_artifacts(
+    options: &RolloutOptions,
+) -> Result<sinomo_runtime::rollout::RolloutBuiltArtifacts, CliError> {
     let repo = rollout_source_repo_from_options(options)?;
     let paths = rollout_paths_from_defaults()?;
-    prepare_rollout_dev_binary(&paths, &repo, options.binary.as_deref()).map_err(Into::into)
+    prepare_rollout_dev_artifacts(&paths, &repo, options.binary.as_deref()).map_err(Into::into)
 }
 
 pub(crate) fn rollout_source_repo_from_options(

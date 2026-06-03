@@ -31,6 +31,7 @@ sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
+sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-registry = { path = "../sinomo-registry" }
@@ -44,4 +45,3 @@ time.workspace = true
 tokio = { version = "1.44", features = ["rt-multi-thread"] }
 
 [dev-dependencies]
-sinomo-module = { path = "../sinomo-module" }

@@ -11,7 +11,8 @@ use sinomo_network::is_loopback_connect_address;
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    LocalRolloutArtifacts, MainExitObservation, PendingShadowRolloutContext,
+    ClusterRolloutNativeDylibModuleArtifact, LocalRolloutArtifacts,
+    LocalRolloutNativeDylibModuleArtifact, MainExitObservation, PendingShadowRolloutContext,
     ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutFailureDiagnostics, RolloutMainActivation,
     SelfRolloutPaths, classify_main_exit, clear_rollout_status, deploy_managed_source_bundle,
     ensure_rollout_layout, install_binary_atomically, managed_source_status,
@@ -19,7 +20,7 @@ use sinomo_rollout::{
     record_activation_failure, record_main_activation_staged,
     record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
     record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
-    rollout_artifact_suffix, rollout_build_dev_binary, rollout_diagnostics_report,
+    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_diagnostics_report,
     rollout_main_activation_path, rollout_remote_repo_path, rollout_shadow_finalize_path,
     rollout_staged_main_binary, rollout_staged_shadow_binary, source_heads_match,
     stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file, write_json,
@@ -319,6 +320,74 @@ pub fn prepare_local_rollout_main_activation(
         },
         previous_main_status,
     }
+}
+
+pub fn install_local_rollout_native_dylib_modules(
+    data_dir: &Path,
+    artifacts: &[LocalRolloutNativeDylibModuleArtifact],
+) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, DaemonError> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            sinomo_module::install_native_dylib_module_from_file(
+                data_dir,
+                &artifact.built_library,
+                native_dylib_module_install_request(
+                    &artifact.module_id,
+                    &artifact.interface_version,
+                    &artifact.cache_key,
+                    &artifact.library_name,
+                    &artifact.source,
+                )?,
+            )
+            .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn install_cluster_rollout_native_dylib_modules(
+    data_dir: &Path,
+    artifacts: &[ClusterRolloutNativeDylibModuleArtifact],
+) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, DaemonError> {
+    artifacts
+        .iter()
+        .map(|artifact| {
+            sinomo_module::install_native_dylib_module_from_bytes(
+                data_dir,
+                &artifact.library,
+                native_dylib_module_install_request(
+                    &artifact.module_id,
+                    &artifact.interface_version,
+                    &artifact.cache_key,
+                    &artifact.library_name,
+                    &artifact.source,
+                )?,
+            )
+            .map_err(Into::into)
+        })
+        .collect()
+}
+
+fn native_dylib_module_install_request(
+    module_id: &str,
+    interface_version: &str,
+    cache_key: &str,
+    library_name: &str,
+    source: &str,
+) -> Result<sinomo_module::NativeDylibModuleInstallRequest, DaemonError> {
+    let module_id = sinomo_module::ModuleId::new(module_id.to_string())
+        .or_else(|_| sinomo_module::ModuleId::from_legacy_named(module_id))
+        .map_err(|error| DaemonError::Parse {
+            detail: format!("invalid native dylib module id `{module_id}`: {error}"),
+        })?;
+    Ok(sinomo_module::NativeDylibModuleInstallRequest {
+        expected_module_id: Some(module_id),
+        artifact_id: None,
+        expected_interface_version: Some(interface_version.to_string()),
+        cache_key: Some(cache_key.to_string()),
+        library_name: Some(library_name.to_string()),
+        source: source.to_string(),
+    })
 }
 
 pub fn prepare_local_shadow_rollout_restart(
@@ -952,6 +1021,47 @@ pub fn handle_daemon_rollout_binary_request(
     )?;
     stage_rollout_bytes(&binary, &staged_main_binary)?;
     stage_rollout_bytes(&binary, &staged_shadow_binary)?;
+    if !request.native_dylib_modules.is_empty() {
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "in-progress",
+            "cluster-binary-push",
+            Some(format!(
+                "installing {} native module artifact(s)",
+                request.native_dylib_modules.len()
+            )),
+            &source,
+            &requested_at,
+            "staging-modules",
+            3,
+            "installing native module artifacts",
+        )?;
+        if let Err(error) =
+            install_cluster_rollout_native_dylib_modules(data_dir, &request.native_dylib_modules)
+        {
+            let detail = format!("install native module artifacts failed: {error}");
+            let _ = write_cluster_rollout_progress(
+                paths,
+                &rollout_paths,
+                "rejected",
+                "cluster-binary-push",
+                Some(detail.clone()),
+                &source,
+                &requested_at,
+                "module-install-failed",
+                CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+                "module install failed",
+            );
+            return Ok(ClusterRolloutBinaryResponse {
+                status: "rejected".to_string(),
+                detail,
+                main_binary: PathBuf::new(),
+                shadow_binary: PathBuf::new(),
+                source_head: None,
+            });
+        }
+    }
 
     write_cluster_rollout_progress(
         paths,
@@ -1916,11 +2026,11 @@ pub fn handle_daemon_rollout_build_request(
         "building",
         2,
     );
-    let built_binary = match rollout_build_dev_binary(&repo, &rollout_paths.build_log) {
-        Ok(binary) => {
+    let built_artifacts = match rollout_build_dev_artifacts(&repo, &rollout_paths.build_log) {
+        Ok(artifacts) => {
             let _ = heartbeat_stop.send(());
             let _ = heartbeat.join();
-            binary
+            artifacts
         }
         Err(error) => {
             let _ = heartbeat_stop.send(());
@@ -1963,8 +2073,50 @@ pub fn handle_daemon_rollout_build_request(
         3,
         "staging built binaries",
     )?;
-    stage_rollout_file(&built_binary, &staged_main_binary)?;
-    stage_rollout_file(&built_binary, &staged_shadow_binary)?;
+    stage_rollout_file(&built_artifacts.built_binary, &staged_main_binary)?;
+    stage_rollout_file(&built_artifacts.built_binary, &staged_shadow_binary)?;
+    if !built_artifacts.native_dylib_modules.is_empty() {
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "in-progress",
+            "cluster-remote-build",
+            Some(format!(
+                "installing {} native module artifact(s)",
+                built_artifacts.native_dylib_modules.len()
+            )),
+            &source,
+            &requested_at,
+            "staging-modules",
+            3,
+            "installing native module artifacts",
+        )?;
+        if let Err(error) = install_local_rollout_native_dylib_modules(
+            data_dir,
+            &built_artifacts.native_dylib_modules,
+        ) {
+            let detail = format!("install native module artifacts failed: {error}");
+            let _ = write_cluster_rollout_progress(
+                paths,
+                &rollout_paths,
+                "rejected",
+                "cluster-remote-build",
+                Some(detail.clone()),
+                &source,
+                &requested_at,
+                "module-install-failed",
+                CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+                "module install failed",
+            );
+            return Ok(ClusterRolloutBinaryResponse {
+                status: "rejected".to_string(),
+                detail,
+                main_binary: PathBuf::new(),
+                shadow_binary: PathBuf::new(),
+                source_head: None,
+            });
+        }
+    }
 
     write_cluster_rollout_progress(
         paths,
@@ -1994,7 +2146,7 @@ pub fn handle_daemon_rollout_build_request(
     )?;
     let activation_strategy =
         stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
-    let _ = (repo, built_binary);
+    let _ = (repo, built_artifacts);
     publish_rollout_progress_to_cluster(paths);
     Ok(ClusterRolloutBinaryResponse {
         status: "accepted".to_string(),
@@ -2307,6 +2459,7 @@ mod tests {
             built_binary: root.join("build").join("sinomo"),
             staged_main_binary: root.join("rollout").join("main-staged"),
             staged_shadow_binary: root.join("rollout").join("shadow-staged"),
+            native_dylib_modules: Vec::new(),
         };
 
         let plan = prepare_local_rollout_main_activation(

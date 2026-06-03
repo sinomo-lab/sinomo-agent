@@ -234,3 +234,16 @@ impl From<sinomo_rollout::RolloutError> for DaemonError {
         }
     }
 }
+
+impl From<sinomo_module::NativeDylibModuleInstallError> for DaemonError {
+    fn from(error: sinomo_module::NativeDylibModuleInstallError) -> Self {
+        match error {
+            sinomo_module::NativeDylibModuleInstallError::Io { path, detail } => {
+                Self::Io { path, detail }
+            }
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}

@@ -1,5 +1,4 @@
 use super::*;
-use std::path::Component;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum ModuleCliCommand {
@@ -280,95 +279,32 @@ fn unload_wasix_native_module() -> Result<(), CliError> {
 fn activate_native_dylib_module(options: ModuleNativeDylibActivateOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
-    let bytes = fs::read(&options.source_path).map_err(|source| CliError::Io {
-        path: options.source_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let content_hash = sinomo_runtime::module_host::native_module_content_hash(&bytes);
-    let library_name = match options.library_name {
-        Some(library_name) => library_name,
-        None => source_library_name(&options.source_path)?,
-    };
-    let native_module = unsafe {
-        sinomo_runtime::module_host::NativeModule::load_from_content_addressed_path(
-            &options.source_path,
-            &content_hash,
-        )
-    }
-    .map_err(native_module_host_error_to_cli)?;
-    let descriptor = native_module.descriptor().clone();
-    drop(native_module);
+    let result = sinomo_runtime::module::install_native_dylib_module_from_file(
+        &data_dir.root(),
+        &options.source_path,
+        sinomo_runtime::module::NativeDylibModuleInstallRequest {
+            expected_module_id: options.expected_module_id,
+            artifact_id: options.artifact_id,
+            expected_interface_version: options.expected_interface_version,
+            cache_key: options.cache_key,
+            library_name: options.library_name,
+            source: options
+                .source
+                .unwrap_or_else(|| format!("local:{}", options.source_path.display())),
+        },
+    )
+    .map_err(native_dylib_module_install_error_to_cli)?;
 
-    let descriptor_module_id = descriptor.module_id.clone();
-    let descriptor_platform_triple = descriptor.platform_triple.clone();
-    let descriptor_interface_version = descriptor.interface_version.clone();
-    let module_id = parse_cli_module_id(&descriptor.module_id)?;
-    if let Some(expected) = options.expected_module_id.as_ref() {
-        if module_id != *expected {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "native module descriptor module_id `{}` does not match expected `{expected}`",
-                    descriptor.module_id
-                ),
-            });
-        }
-    }
-    if let Some(expected) = options.expected_interface_version.as_ref() {
-        if descriptor.interface_version != *expected {
-            return Err(CliError::Parse {
-                detail: format!(
-                    "native module descriptor interface `{}` does not match expected `{expected}`",
-                    descriptor.interface_version
-                ),
-            });
-        }
-    }
-
-    let cache_key = options
-        .cache_key
-        .unwrap_or_else(|| descriptor.module_id.replace('.', "/"));
-    let cache_key = validate_native_module_cache_key(&cache_key)?;
-    let cache_path = sinomo_runtime::module_host::native_module_cache_path(
-        data_dir.root(),
-        &cache_key,
-        &content_hash,
-        &library_name,
-    );
-    write_native_module_cache_file(&cache_path, &bytes, &options.source_path)?;
-
-    let activated_at = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .map_err(|source| CliError::Parse {
-            detail: format!("format native module activation timestamp: {source}"),
-        })?;
-    let state = sinomo_runtime::module::NativeDylibModuleLoaderState {
-        module_id: module_id.clone(),
-        artifact_id: options.artifact_id.clone(),
-        content_hash: content_hash.clone(),
-        cache_key,
-        library_name,
-        platform_triple: descriptor_platform_triple,
-        native_abi_version: descriptor.native_abi_version,
-        interface_version: descriptor_interface_version,
-        activated_at,
-        source: options
-            .source
-            .unwrap_or_else(|| format!("local:{}", options.source_path.display())),
-    };
-    let state_path =
-        sinomo_runtime::module::write_native_dylib_module_loader_state(&data_dir.root(), &state)
-            .map_err(module_loader_store_error_to_cli)?;
-
-    println!("module: {descriptor_module_id}");
-    println!("module-state-id: {}", state.module_id);
-    if let Some(artifact_id) = state.artifact_id.as_ref() {
+    println!("module: {}", result.descriptor_module_id);
+    println!("module-state-id: {}", result.state.module_id);
+    if let Some(artifact_id) = result.state.artifact_id.as_ref() {
         println!("artifact: {artifact_id}");
     }
-    println!("interface: {}", state.interface_version);
-    println!("platform: {}", state.platform_triple);
-    println!("hash: {}", state.content_hash);
-    println!("cache: {}", cache_path.display());
-    println!("state: {}", state_path.display());
+    println!("interface: {}", result.state.interface_version);
+    println!("platform: {}", result.state.platform_triple);
+    println!("hash: {}", result.state.content_hash);
+    println!("cache: {}", result.cache_path.display());
+    println!("state: {}", result.state_path.display());
     Ok(())
 }
 
@@ -479,95 +415,14 @@ fn unload_native_dylib_module(options: ModuleNativeDylibUnloadOptions) -> Result
     Ok(())
 }
 
-fn write_native_module_cache_file(
-    path: &Path,
-    bytes: &[u8],
-    source_path: &Path,
-) -> Result<(), CliError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    if path.exists() {
-        let existing = fs::read(path).map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        if sinomo_runtime::module_host::native_module_content_hash(&existing)
-            == sinomo_runtime::module_host::native_module_content_hash(bytes)
-        {
-            return Ok(());
-        }
-        fs::remove_file(path).map_err(|source| CliError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("native-module"),
-        std::process::id(),
-        OffsetDateTime::now_utc().unix_timestamp_nanos()
-    ));
-    fs::write(&tmp_path, bytes).map_err(|source| CliError::Io {
-        path: tmp_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if let Ok(metadata) = fs::metadata(source_path) {
-        let _ = fs::set_permissions(&tmp_path, metadata.permissions());
-    }
-    fs::rename(&tmp_path, path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn source_library_name(path: &Path) -> Result<String, CliError> {
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return Err(CliError::Parse {
-            detail: format!("native module path `{}` has no file name", path.display()),
-        });
-    };
-    validate_native_module_library_name(file_name)
-}
-
 fn validate_native_module_cache_key(value: &str) -> Result<String, CliError> {
-    let trimmed = non_empty_value(value, "native module cache key")?;
-    let path = Path::new(&trimmed);
-    if path.is_absolute() {
-        return Err(CliError::Parse {
-            detail: format!("native module cache key `{trimmed}` must be relative"),
-        });
-    }
-    for component in path.components() {
-        match component {
-            Component::Normal(_) => {}
-            _ => {
-                return Err(CliError::Parse {
-                    detail: format!(
-                        "native module cache key `{trimmed}` must not contain `.` or `..`"
-                    ),
-                });
-            }
-        }
-    }
-    Ok(trimmed)
+    sinomo_runtime::module::validate_native_dylib_module_cache_key(value)
+        .map_err(native_dylib_module_install_error_to_cli)
 }
 
 fn validate_native_module_library_name(value: &str) -> Result<String, CliError> {
-    let trimmed = non_empty_value(value, "native module library name")?;
-    let path = Path::new(&trimmed);
-    let mut components = path.components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(_)), None) => Ok(trimmed),
-        _ => Err(CliError::Parse {
-            detail: format!("native module library name `{trimmed}` must be a file name"),
-        }),
-    }
+    sinomo_runtime::module::validate_native_dylib_module_library_name(value)
+        .map_err(native_dylib_module_install_error_to_cli)
 }
 
 fn non_empty_value(value: &str, label: &str) -> Result<String, CliError> {
@@ -605,6 +460,25 @@ fn module_loader_store_error_to_cli(
         sinomo_runtime::module::ModuleLoaderStoreError::Io { path, detail }
         | sinomo_runtime::module::ModuleLoaderStoreError::Object { path, detail } => {
             CliError::Io { path, detail }
+        }
+    }
+}
+
+fn native_dylib_module_install_error_to_cli(
+    error: sinomo_runtime::module::NativeDylibModuleInstallError,
+) -> CliError {
+    match error {
+        sinomo_runtime::module::NativeDylibModuleInstallError::Io { path, detail } => {
+            CliError::Io { path, detail }
+        }
+        sinomo_runtime::module::NativeDylibModuleInstallError::Host(source) => {
+            native_module_host_error_to_cli(source)
+        }
+        sinomo_runtime::module::NativeDylibModuleInstallError::Store(source) => {
+            module_loader_store_error_to_cli(source)
+        }
+        sinomo_runtime::module::NativeDylibModuleInstallError::Descriptor { detail } => {
+            CliError::Parse { detail }
         }
     }
 }

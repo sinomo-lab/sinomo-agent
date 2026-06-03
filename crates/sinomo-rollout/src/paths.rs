@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const SANDBOX_WASIX_MODULE_PACKAGE: &str = "sinomo-sandbox-wasix-module";
+pub const SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY: &str = "module/sandbox/wasix";
+pub const SANDBOX_WASIX_NATIVE_MODULE_SOURCE: &str = "rollout:modules/sandbox/wasix";
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SelfRolloutPaths {
     pub root: PathBuf,
@@ -30,9 +34,15 @@ impl SelfRolloutPaths {
     }
 
     pub fn plan(&self) -> SelfRolloutPlan {
+        let native_dylib_modules = default_native_dylib_module_builds(&self.source_repo);
+        let mut build_args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+        for module in &native_dylib_modules {
+            build_args.push("-p".to_string());
+            build_args.push(module.package.clone());
+        }
         SelfRolloutPlan {
             build_program: "cargo".to_string(),
-            build_args: vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()],
+            build_args,
             build_dir: self.source_repo.clone(),
             built_binary: self
                 .source_repo
@@ -41,6 +51,7 @@ impl SelfRolloutPaths {
                 .join(executable_name("sinomo")),
             install_main_binary: self.main_binary.clone(),
             install_shadow_binary: self.shadow_binary.clone(),
+            native_dylib_modules,
             build_log: self.build_log.clone(),
             state: self.state.clone(),
         }
@@ -55,8 +66,20 @@ pub struct SelfRolloutPlan {
     pub built_binary: PathBuf,
     pub install_main_binary: PathBuf,
     pub install_shadow_binary: PathBuf,
+    pub native_dylib_modules: Vec<SelfRolloutNativeDylibModuleBuild>,
     pub build_log: PathBuf,
     pub state: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SelfRolloutNativeDylibModuleBuild {
+    pub package: String,
+    pub module_id: String,
+    pub interface_version: String,
+    pub cache_key: String,
+    pub library_name: String,
+    pub built_library: PathBuf,
+    pub source: String,
 }
 
 pub fn executable_name(stem: &str) -> String {
@@ -65,6 +88,36 @@ pub fn executable_name(stem: &str) -> String {
     } else {
         stem.to_string()
     }
+}
+
+pub fn native_dylib_library_name(stem: &str) -> String {
+    if cfg!(windows) {
+        format!("{stem}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
+pub fn sandbox_wasix_native_module_library_name() -> String {
+    native_dylib_library_name("sinomo_sandbox_wasix_module")
+}
+
+pub fn default_native_dylib_module_builds(
+    build_dir: &Path,
+) -> Vec<SelfRolloutNativeDylibModuleBuild> {
+    let library_name = sandbox_wasix_native_module_library_name();
+    vec![SelfRolloutNativeDylibModuleBuild {
+        package: SANDBOX_WASIX_MODULE_PACKAGE.to_string(),
+        module_id: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID.to_string(),
+        interface_version: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION
+            .to_string(),
+        cache_key: SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY.to_string(),
+        library_name: library_name.clone(),
+        built_library: build_dir.join("target").join("debug").join(library_name),
+        source: SANDBOX_WASIX_NATIVE_MODULE_SOURCE.to_string(),
+    }]
 }
 
 pub fn ensure_rollout_layout(paths: &SelfRolloutPaths) -> Result<(), RolloutError> {
@@ -115,7 +168,13 @@ mod tests {
         assert_eq!(plan.build_program, "cargo");
         assert_eq!(
             plan.build_args,
-            vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()]
+            vec![
+                "build".to_string(),
+                "-p".to_string(),
+                "sinomo".to_string(),
+                "-p".to_string(),
+                SANDBOX_WASIX_MODULE_PACKAGE.to_string()
+            ]
         );
         assert_eq!(plan.build_dir, paths.source_repo);
         assert_eq!(
@@ -127,5 +186,9 @@ mod tests {
         );
         assert_eq!(plan.install_main_binary, paths.main_binary);
         assert_eq!(plan.install_shadow_binary, paths.shadow_binary);
+        assert_eq!(
+            plan.native_dylib_modules,
+            default_native_dylib_module_builds(&plan.build_dir)
+        );
     }
 }

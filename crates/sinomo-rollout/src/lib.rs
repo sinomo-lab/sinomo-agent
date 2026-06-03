@@ -27,21 +27,29 @@ pub use controller::{
     shadow_telemetry_scorecard_from_event_store, shadow_telemetry_scorecard_from_events,
 };
 pub use error::RolloutError;
-pub use paths::{SelfRolloutPaths, SelfRolloutPlan, ensure_rollout_layout, executable_name};
+pub use paths::{
+    SANDBOX_WASIX_MODULE_PACKAGE, SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY,
+    SANDBOX_WASIX_NATIVE_MODULE_SOURCE, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
+    SelfRolloutPlan, default_native_dylib_module_builds, ensure_rollout_layout, executable_name,
+    native_dylib_library_name, sandbox_wasix_native_module_library_name,
+};
 pub use process::{MainExitKind, MainExitObservation, classify_main_exit};
 pub use protocol::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    cluster_rollout_targets_from_state, prepare_cluster_rollout_binary_request,
-    prepare_cluster_rollout_build_request, prepare_rollout_cluster_targets, unique_rollout_targets,
+    ClusterRolloutNativeDylibModuleArtifact, cluster_rollout_targets_from_state,
+    prepare_cluster_rollout_binary_request, prepare_cluster_rollout_build_request,
+    prepare_rollout_cluster_targets, unique_rollout_targets,
 };
 pub use source::{
-    LocalRolloutArtifacts, ManagedSourceStatus, RolloutStatusView, create_source_repo_bundle,
+    LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact, ManagedSourceStatus,
+    RolloutBuiltArtifacts, RolloutStatusView, create_source_repo_bundle,
     create_source_repo_bundle_bytes, deploy_managed_source_bundle, deploy_managed_source_repo,
     deploy_managed_source_repo_or_current, discover_current_git_repo, ensure_rollout_source_repo,
-    managed_source_status, prepare_local_rollout_artifacts, prepare_rollout_dev_binary,
-    prepare_rollout_source_bundle, remove_dir_if_exists, rollout_artifact_suffix,
-    rollout_build_dev_binary, rollout_remote_repo_path, rollout_source_head, rollout_status_view,
-    source_heads_match, stage_local_rollout_artifacts, sync_external_repo_from_managed,
+    managed_source_status, prepare_local_rollout_artifacts, prepare_rollout_dev_artifacts,
+    prepare_rollout_dev_binary, prepare_rollout_source_bundle, remove_dir_if_exists,
+    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_build_dev_binary,
+    rollout_remote_repo_path, rollout_source_head, rollout_status_view, source_heads_match,
+    stage_local_rollout_artifacts, sync_external_repo_from_managed,
 };
 pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,

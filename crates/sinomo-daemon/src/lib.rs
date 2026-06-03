@@ -136,13 +136,14 @@ pub use rollout::{
     handle_daemon_finalize_shadow_rollout, handle_daemon_rollout_binary_request,
     handle_daemon_rollout_build_request, handle_daemon_rollout_diagnostics,
     handle_pending_shadow_main_process_exit, handle_shadow_main_process_exit,
-    prepare_local_rollout_main_activation, prepare_local_shadow_rollout_restart,
-    promote_shadow_main_rollout, recover_failed_shadow_main_rollout,
-    rollout_target_platform_matches_local, run_shadow_daemon_supervision_loop,
-    shadow_main_binary_from_env, shadow_main_options_from_env, sleep_for_shadow_start_delay,
-    spawn_shadow_for_cluster_rollout, stage_rollout_main_activation, start_shadow_main_if_needed,
-    wait_for_local_shadow_rollout_completion, wait_for_main_daemon_health,
-    wait_for_shadow_rollout_health, write_rollout_main_failure_diagnostics,
+    install_local_rollout_native_dylib_modules, prepare_local_rollout_main_activation,
+    prepare_local_shadow_rollout_restart, promote_shadow_main_rollout,
+    recover_failed_shadow_main_rollout, rollout_target_platform_matches_local,
+    run_shadow_daemon_supervision_loop, shadow_main_binary_from_env, shadow_main_options_from_env,
+    sleep_for_shadow_start_delay, spawn_shadow_for_cluster_rollout, stage_rollout_main_activation,
+    start_shadow_main_if_needed, wait_for_local_shadow_rollout_completion,
+    wait_for_main_daemon_health, wait_for_shadow_rollout_health,
+    write_rollout_main_failure_diagnostics,
 };
 pub use sinomo_dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 pub use status::{
