@@ -4739,7 +4739,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
         .expect("read canary module state")
         .expect("canary module state");
     assert_eq!(canary_module_state.traffic_weight_bps, 500);
-    assert_eq!(canary_module_state.last_rollout_action, "advance-canary");
+    assert_eq!(canary_module_state.last_loader_action, "advance-canary");
 
     let candidate_route_key = candidate_canary_route_key(&root, &module_id);
     let bad_candidate_outcome = invoke_bad_candidate_for_self_evolution_flow(
@@ -4786,7 +4786,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
         .expect("read rolled back module state")
         .expect("rolled back module state");
     assert_eq!(rolled_back_module_state.traffic_weight_bps, 0);
-    assert_eq!(rolled_back_module_state.last_rollout_action, "rollback");
+    assert_eq!(rolled_back_module_state.last_loader_action, "rollback");
     assert!(
         std::fs::read_to_string(source_repo.join(SELF_EVOLUTION_CANDIDATE_MODULE_WAT_REL))
             .expect("promoted candidate source")
@@ -4955,8 +4955,8 @@ fn write_self_evolution_module_replay_report(
         data_dir_root,
         &sinomo_runtime::module::ModuleLoaderRuntimeState {
             node_id: NodeId::from_legacy_named("node_self_evolution_module_replay").expect("node"),
-            rollout_plan_id: Id::from_legacy_named("rollout_module_candidate_replay")
-                .expect("rollout"),
+            activation_id: Id::from_legacy_named("module_activation_candidate_replay")
+                .expect("activation"),
             module_id: module_id.clone(),
             loader_state: sinomo_runtime::core::ModuleLoaderState {
                 module_id: module_id.clone(),
@@ -4967,8 +4967,8 @@ fn write_self_evolution_module_replay_report(
                 hot_swap_state: sinomo_runtime::core::HotSwapState::Shadowing,
             },
             traffic_weight_bps: 0,
-            last_rollout_action: "start-shadow".to_string(),
-            last_rollout_stage: "shadow".to_string(),
+            last_loader_action: "start-shadow".to_string(),
+            last_loader_stage: "shadow".to_string(),
             last_transition_record_id: Id::from_legacy_named("transition_module_candidate_replay")
                 .expect("transition"),
             reason: "self-evolution sandbox replay evidence".to_string(),

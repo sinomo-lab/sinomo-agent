@@ -378,7 +378,7 @@ Suggested service responsibilities:
 - `sinomo-audio`: VAD/ASR/prosody/audio events.
 - `sinomo-video`: frame sampling/OCR/vision events.
 - `sinomo-fusion`: align audio, video, transcript, and screen events.
-- `sinomo-trigger`: timing policy and interrupt handling.
+- Future trigger policy service: timing policy and interrupt handling.
 - `sinomo-agent`: interactive loop over context packets.
 - `sinomo-deliberation`: async slow LLM jobs.
 - `sinomo-voice`: realtime speech session, TTS, barge-in.

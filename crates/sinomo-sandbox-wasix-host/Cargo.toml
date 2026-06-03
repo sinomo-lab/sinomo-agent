@@ -15,7 +15,6 @@ ring = "r1"
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-module-host = { path = "../sinomo-module-host" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }

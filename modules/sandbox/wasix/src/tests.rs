@@ -46,7 +46,7 @@ fn sandbox_run_passes_when_scope_and_commands_pass() {
             limits: ModuleResourceLimits::default(),
             commands: vec![SandboxCommand {
                 name: "unit tests".to_string(),
-                command: "cargo test -p sinomo-trigger".to_string(),
+                command: "cargo test -p sinomo-agent".to_string(),
                 expected_exit_code: 0,
                 observed_exit_code: 0,
             }],

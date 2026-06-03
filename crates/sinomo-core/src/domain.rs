@@ -659,7 +659,7 @@ mod tests {
         let mut manifest = ModuleManifest::r3_wasm(
             Id::from_legacy_named("module.trigger.silence_policy").expect("module id"),
             "0.3.7",
-            "sinomo-trigger",
+            "trigger-policy",
         );
         manifest
             .capabilities

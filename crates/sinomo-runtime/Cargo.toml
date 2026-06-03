@@ -26,7 +26,6 @@ sinomo-local = { path = "../sinomo-local" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-module-host = { path = "../sinomo-module-host" }
 sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-policy = { path = "../sinomo-policy" }
@@ -38,4 +37,3 @@ sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host" }
 sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 sinomo-supervision = { path = "../sinomo-supervision" }
-sinomo-sync = { path = "../sinomo-sync" }

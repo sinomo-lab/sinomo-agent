@@ -78,14 +78,14 @@ fn active_native_module_runs_preview1_module_when_env_set() {
 
 fn install_active_wasix_module(data_dir_root: &Path, module_path: &Path) {
     let bytes = fs::read(module_path).expect("read WASIX native module");
-    let content_hash = sinomo_module_host::native_module_content_hash(&bytes);
+    let content_hash = sinomo_module::native_module_content_hash(&bytes);
     let library_name = module_path
         .file_name()
         .and_then(|name| name.to_str())
         .expect("module library file name")
         .to_string();
     let cache_key = "module/sandbox/wasix";
-    let cache_path = sinomo_module_host::native_module_cache_path(
+    let cache_path = sinomo_module::native_module_cache_path(
         data_dir_root,
         cache_key,
         &content_hash,

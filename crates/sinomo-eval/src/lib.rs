@@ -977,7 +977,7 @@ mod tests {
                 baseline_artifact_id: None,
                 specs: vec![CommandEvaluationSpec {
                     gate: EvaluationGate::ReplayTests,
-                    command: "cargo test -p sinomo-trigger".to_string(),
+                    command: "cargo test -p sinomo-agent".to_string(),
                     expected_exit_code: 0,
                     observed_exit_code: 0,
                     replay_fixtures: vec![ReplayFixtureRef {

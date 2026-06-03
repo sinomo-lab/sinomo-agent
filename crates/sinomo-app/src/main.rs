@@ -18,8 +18,10 @@ use sinomo_memory::{MemoryManager, MemoryPolicy};
 use sinomo_runtime::api::ApiService;
 use sinomo_runtime::core::{
     ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, CapabilityName,
-    DeviceCapability, DfsObjectPolicy, DfsWriteRequest, EvaluationGate, ModuleManifest,
-    ModuleResourceLimits, NodeCapability, RolloutPlan, RolloutStrategy, SyncPolicy, TrustRing,
+    Confidence, DeviceCapability, DfsObjectPolicy, DfsWriteRequest, EvaluationGate, EventEnvelope,
+    EventKind, LatencyClass, ModuleManifest, ModuleResourceLimits, NodeCapability, PrivacyClass,
+    RolloutPlan, RolloutStrategy, RoutingMetadata, RoutingScope, Salience, Source, TriggerAction,
+    TriggerDecision, TrustRing,
 };
 use sinomo_runtime::device::{DevicePermission, DeviceProfile};
 use sinomo_runtime::dfs::{
@@ -30,19 +32,19 @@ use sinomo_runtime::eval::{
     CommandEvaluationSpec, CommandEvaluationSuite, LocalEvalHarness, ReplayFixtureRef,
 };
 use sinomo_runtime::events::{
-    EventSequence, EventStore, InMemoryEventStore, ReplayQuery, SessionId, StoredEvent,
+    EventId, EventSequence, EventStore, InMemoryEventStore, ReplayQuery, SessionId, StoredEvent,
 };
-use sinomo_runtime::module::{ArtifactId, LoadRequest, ModuleId, ModuleLoader, RolloutPlanId};
+use sinomo_runtime::module::{ArtifactId, ModuleId};
 use sinomo_runtime::network::{InProcessRouter, PeerRegistry};
 use sinomo_runtime::node::{HostedService, NodeId, NodeProfile};
 use sinomo_runtime::policy::{PolicyEngine, PolicyInput};
 use sinomo_runtime::registry::{ArtifactRegistry, CandidateRecord, RegistryEntry, RegistryStatus};
-use sinomo_runtime::rollout::{RolloutController, RolloutObservation};
+use sinomo_runtime::rollout::{
+    LoadRequest, ModuleLoader, RolloutController, RolloutObservation, RolloutPlanId,
+};
 use sinomo_runtime::sandbox::{
     SandboxCommand, SandboxHarness, SandboxRunRequest, SandboxRunSubject, SandboxWorkspaceSnapshot,
 };
-use sinomo_runtime::sync::{ParticipantRole, SessionParticipant, SessionSyncState, SyncRegistry};
-use sinomo_trigger::RuleBasedTrigger;
 use sinomo_video::VideoPerceptionWorker;
 use sinomo_voice::{SpeechOutputRequest, VoiceOutputService};
 use std::env;
@@ -109,26 +111,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_permission(DevicePermission::EmitOutput);
 
     let session_id = SessionId::generate();
-    let mut sync_registry = SyncRegistry::new();
-    let mut sync_state = SessionSyncState::new(session_id.clone(), SyncPolicy::Session);
-    sync_state.add_participant(SessionParticipant {
-        node_id: workstation.node_id.clone(),
-        active_devices: vec![
-            workspace_device.device_id.clone(),
-            microphone.device_id.clone(),
-            screen.device_id.clone(),
-            speaker.device_id.clone(),
-        ],
-        role: ParticipantRole::Origin,
-        joined_at: OffsetDateTime::now_utc(),
-    });
-    sync_state.add_participant(SessionParticipant {
-        node_id: home_server.node_id.clone(),
-        active_devices: Vec::new(),
-        role: ParticipantRole::MemoryHome,
-        joined_at: OffsetDateTime::now_utc(),
-    });
-    sync_registry.upsert_session(sync_state);
 
     let workspace_id = WorkspaceId::from_legacy_named("workspace_evolution_trigger")?;
     let candidate_object_id = DfsObjectId::from_legacy_named("obj_trigger_candidate")?;
@@ -167,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     let module_id = ModuleId::from_legacy_named("module.trigger.silence_policy")?;
-    let module_manifest = ModuleManifest::r3_wasm(module_id.clone(), "0.3.7", "sinomo-trigger");
+    let module_manifest = ModuleManifest::r3_wasm(module_id.clone(), "0.3.7", "trigger-policy");
     let candidate_artifact_id = ArtifactId::generate();
     let planner = EvolutionPlanner::new(workstation.node_id.clone());
     let (evolution_job, candidate_workspace) = planner.scope_job(EvolutionOpportunity {
@@ -177,10 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         objective: "Reduce false positive interruptions during low-salience screen changes"
             .to_string(),
         workspace_id: workspace_id.clone(),
-        allowed_paths: vec![
-            "crates/sinomo-trigger/**".to_string(),
-            "modules/trigger/**".to_string(),
-        ],
+        allowed_paths: vec!["modules/trigger/**".to_string()],
         forbidden_paths: vec![
             "crates/sinomo-core/**".to_string(),
             "docs/security/**".to_string(),
@@ -203,7 +182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         limits: ModuleResourceLimits::default(),
         commands: vec![SandboxCommand {
             name: "trigger replay unit tests".to_string(),
-            command: "cargo test -p sinomo-trigger".to_string(),
+            command: "cargo test -p sinomo-agent".to_string(),
             expected_exit_code: 0,
             observed_exit_code: 0,
         }],
@@ -223,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             CommandEvaluationSpec {
                 gate: EvaluationGate::ReplayTests,
-                command: "cargo test -p sinomo-trigger".to_string(),
+                command: "cargo test -p sinomo-agent".to_string(),
                 expected_exit_code: 0,
                 observed_exit_code: 0,
                 replay_fixtures: vec![ReplayFixtureRef {
@@ -303,9 +282,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     store.append(fused_event)?;
     let trigger_source = trigger_source.expect("synthetic audio produced transcript event");
-    let trigger = RuleBasedTrigger::default();
-    let trigger_decision = trigger.evaluate(&trigger_source);
-    let trigger_event = trigger.decision_event(&trigger_decision, &trigger_source.event);
+    let trigger_decision = TriggerDecision {
+        trigger_event_id: trigger_source.event.event_id.clone(),
+        action: TriggerAction::Acknowledge,
+        reason: "stale app wiring acknowledges synthetic alert transcript".to_string(),
+    };
+    let mut trigger_event = EventEnvelope::new(
+        EventId::generate(),
+        trigger_source.event.time,
+        trigger_source.event.origin_node_id.clone(),
+        Source::new("trigger.inline").expect("valid source"),
+        EventKind::new("trigger.decision.created").expect("valid event kind"),
+        Salience::new(0.5).expect("valid salience"),
+        Confidence::new(1.0).expect("valid confidence"),
+        RoutingMetadata::new(
+            RoutingScope::Session,
+            LatencyClass::Reactive,
+            PrivacyClass::Derived,
+        ),
+    )
+    .with_payload(serde_json::json!({
+        "trigger_event_id": trigger_decision.trigger_event_id,
+        "action": trigger_decision.action,
+        "reason": trigger_decision.reason,
+    }));
+    if let Some(session_id) = trigger_source.event.session_id.clone() {
+        trigger_event = trigger_event.with_session(session_id);
+    }
+    trigger_event
+        .links
+        .caused_by
+        .push(trigger_source.event.event_id.clone());
     store.append(trigger_event)?;
 
     let context = BoundedContextBuilder::new(8).build(&store, session_id.clone())?;

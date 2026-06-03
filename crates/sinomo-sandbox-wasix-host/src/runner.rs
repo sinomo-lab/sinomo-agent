@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use sinomo_dfs::NetworkedDfsService;
 use sinomo_module::{
-    ModuleId, NativeDylibModuleLoaderState, read_native_dylib_module_loader_state,
+    ModuleId, NativeDylibModuleLoaderState, NativeModuleUnloadReport, native_module_cache_path,
+    read_native_dylib_module_loader_state,
 };
-use sinomo_module_host::native_module_cache_path;
 use sinomo_network::NetworkTransport;
 use sinomo_sandbox::*;
 use sinomo_sandbox_wasix_api::{
@@ -37,7 +37,7 @@ impl SandboxWasixModuleCommandRunner {
         Self { module }
     }
 
-    pub fn unload(self) -> sinomo_module_host::NativeModuleUnloadReport {
+    pub fn unload(self) -> NativeModuleUnloadReport {
         self.module.unload()
     }
 

@@ -353,9 +353,9 @@ Initial crate ownership:
 | Group | Crates |
 |---|---|
 | R0 | `sinomo-core` |
-| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-module-api`, `sinomo-module-host`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision`, `sinomo-sync` |
+| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-module-api`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision` |
 | R0/R1 boundary | `sinomo-runtime` |
-| R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-trigger`, `sinomo-video`, `sinomo-voice` |
+| R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-video`, `sinomo-voice` |
 | Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli` |
 
 ### Evolution Delivery Model
@@ -456,7 +456,7 @@ Responsibilities:
 - Capability discovery.
 - Trust, authentication, and node-local sandbox policy boundaries.
 
-Primary crates: `sinomo-node`, `sinomo-device`, `sinomo-network`, `sinomo-sync`, `sinomo-dfs`.
+Primary crates: `sinomo-node`, `sinomo-device`, `sinomo-network`, `sinomo-dfs`.
 
 ### Ingestion Plane
 
@@ -512,7 +512,7 @@ Decides what Sinomo should do next. This plane is split into three loops:
 | Interactive loop | 200 ms-2 s | Dialogue, short retrieval, lightweight tool calls, task state, compact responses |
 | Deliberative loop | 2 s+ | Planning, reflection, branch comparison, memory consolidation, long-running generation |
 
-Primary crates: `sinomo-trigger`, `sinomo-agent`, `sinomo-deliberation`.
+Primary crates: `sinomo-agent`, `sinomo-deliberation`.
 
 ### Evolution / Delivery Plane
 
@@ -565,13 +565,11 @@ sinomo-agent/
     sinomo-node/          # Node identity, local runtime metadata, capability model
     sinomo-device/        # Device registry, source/action target metadata
     sinomo-network/       # Peer discovery, transport, authentication, routing
-    sinomo-sync/          # Session, world-state, event, and memory synchronization
     sinomo-dfs/           # Local-first distributed workspace filesystem
     sinomo-policy/        # Trusted policy decision contracts and verifier
     sinomo-registry/      # Module artifact registry and provenance metadata
-    sinomo-module/        # Module lifecycle, registry, routing, and node-local loader state
+    sinomo-module/        # Module lifecycle, registry, routing, native loading, and node-local loader state
     sinomo-module-api/    # Stable native dynamic-library module ABI
-    sinomo-module-host/   # Trusted native dynamic-library loading backend
     sinomo-sandbox/       # Sandboxed candidate execution and test jobs
     sinomo-eval/          # Evaluation definitions, replay suites, and scorecards
     sinomo-evolution/     # Evolution job orchestration
@@ -582,7 +580,6 @@ sinomo-agent/
     sinomo-fusion/        # Cross-modal alignment on a shared timeline
     sinomo-events/        # Event persistence, replay, entity/world-state reducers
     sinomo-memory/        # Hot/warm/cold/procedural memory and retrieval policy
-    sinomo-trigger/       # Timing policy for speak/act/alert/silence decisions
     sinomo-agent/         # Interactive controller and dialogue/task loop
     sinomo-deliberation/  # Long-running planning, reflection, and generation jobs
     sinomo-actions/       # Tool, automation, notification, and environment actions
@@ -678,19 +675,6 @@ Responsibilities:
 - Own the Sinomo Object wire codec for cluster communication.
 - Provide message and streaming abstractions over direct peer links, home-node sync APIs, or future protocols.
 
-### `sinomo-sync`
-
-Distributed session, event, world-state, and memory synchronization.
-
-Responsibilities:
-
-- Track session participants across nodes.
-- Replicate selected event envelopes.
-- Merge world-state updates.
-- Coordinate handoff between devices.
-- Apply sync policies for privacy, bandwidth, durability, and latency.
-- Recover after node sleep, disconnect, or restart.
-
 ### `sinomo-dfs`
 
 Local-first distributed filesystem for agent workspaces and task staging.
@@ -739,6 +723,10 @@ Responsibilities:
 - Verify manifests and artifact compatibility before load.
 - Support activation, drain, quiesce, hot-swap, and rollback state transitions.
 - Emit module load, unload, shadow decision, crash, timeout, and policy-blocked events.
+- Verify content hashes before loading native dynamic-library module artifacts.
+- Check ABI, interface, module identity, and platform descriptors.
+- Invoke native dynamic-library modules through the generic `sinomo-module-api`
+  C/SOBJ boundary.
 
 ### `sinomo-module-api`
 
@@ -752,17 +740,6 @@ Responsibilities:
   invocation.
 - Stay independent of dynamic loading, sandbox execution, Wasm runtimes, and
   high-level services.
-
-### `sinomo-module-host`
-
-Trusted native dynamic-library loader.
-
-Responsibilities:
-
-- Verify content hashes before loading native module artifacts.
-- Check ABI, interface, module identity, and platform descriptors.
-- Invoke modules through the generic `sinomo-module-api` C/SOBJ boundary.
-- Keep dynamic loading separate from typed module-specific host wrappers.
 
 ### `sinomo-sandbox`
 
@@ -882,17 +859,6 @@ Responsibilities:
 - Maintain semantic/cold memory records and embeddings.
 - Manage procedural memory references.
 - Return bounded context packages to control loops.
-
-### `sinomo-trigger`
-
-Fast timing policy service.
-
-Responsibilities:
-
-- Decide whether to stay silent, speak, interrupt, alert, or schedule deeper work.
-- Debounce noisy alerts.
-- Respect speaking/listening state.
-- Use salience, urgency, confidence, user state, and alert fatigue signals.
 
 ### `sinomo-agent`
 
@@ -1201,7 +1167,7 @@ Default behavior:
 
 ### World-State Merge
 
-World-state should be federated. Each node can maintain local reducers for the entities and devices it observes, while `sinomo-sync` merges updates into a shared session view.
+World-state should be federated. Each node can maintain local reducers for the entities and devices it observes. A future session synchronization service should merge updates into a shared session view once that design is concrete.
 
 Merge guidance:
 
@@ -1288,7 +1254,7 @@ Capability discovery allows Sinomo to defer exact placement decisions while keep
 
 1. `sinomo-gateway` receives microphone audio.
 2. `sinomo-audio` emits VAD and transcript events.
-3. `sinomo-trigger` sees a high-salience interruption cue.
+3. A future trigger policy sees a high-salience interruption cue.
 4. The fast reactive loop decides whether to interrupt, acknowledge, alert, or wait.
 5. `sinomo-agent` retrieves recent context and produces a short response.
 6. If ambiguity remains, `sinomo-deliberation` receives a follow-up job.
@@ -1424,13 +1390,13 @@ The first useful MVP should prove the event-centric, three-speed runtime without
 Build first:
 
 - `sinomo-core` event and domain contracts.
-- `sinomo-node`, `sinomo-device`, `sinomo-network`, `sinomo-sync`, and `sinomo-dfs` foundation contracts.
+- `sinomo-node`, `sinomo-device`, `sinomo-network`, and `sinomo-dfs` foundation contracts.
 - R0/R1 trust ring contracts, module manifests, artifact IDs, policy decisions, evaluation scorecards, and rollout plan placeholders.
 - `sinomo-events` persistence and replay.
 - DFS metadata tables and local content storage for one-node and simulated two-node workspaces.
 - `sinomo-gateway` for text plus one audio input and one screen/video input.
 - Basic `sinomo-audio` and `sinomo-video` event producers.
-- `sinomo-trigger` with rule-based timing decisions.
+- Trigger decision contracts and placeholder timing policy hooks.
 - `sinomo-agent` interactive loop with bounded retrieval and limited tool use.
 - One `sinomo-deliberation` worker for asynchronous jobs.
 - Minimal `sinomo-api` health, debug, and event inspection endpoints.
@@ -1466,7 +1432,6 @@ Defer:
 ### Phase 2: Distributed Runtime Skeleton
 
 - Create `sinomo-network`.
-- Create `sinomo-sync`.
 - Create `sinomo-dfs`.
 - Create skeletons for `sinomo-policy`, `sinomo-registry`, and `sinomo-module`.
 - Add local peer registry and static node configuration.
@@ -1486,8 +1451,7 @@ Defer:
 
 ### Phase 4: Trigger and Interactive Loop
 
-- Create `sinomo-trigger`.
-- Implement rule-based trigger decisions.
+- Implement trigger policy decisions once the session/attention design is concrete.
 - Create `sinomo-agent`.
 - Add bounded context retrieval and simple action requests.
 - Route action requests to the node that owns the target device.
@@ -1533,17 +1497,15 @@ The next structural step should be to add the crates in dependency order:
 3. `sinomo-device`
 4. `sinomo-events`
 5. `sinomo-network`
-6. `sinomo-sync`
-7. `sinomo-dfs`
-8. `sinomo-policy`
-9. `sinomo-registry`
-10. `sinomo-module`
+6. `sinomo-dfs`
+7. `sinomo-policy`
+8. `sinomo-registry`
+9. `sinomo-module`
 11. `sinomo-gateway`
-12. `sinomo-trigger`
-13. `sinomo-agent`
-14. `sinomo-memory`
-15. `sinomo-eval`
-16. `sinomo-sandbox`
+12. `sinomo-agent`
+13. `sinomo-memory`
+14. `sinomo-eval`
+15. `sinomo-sandbox`
 17. `sinomo-evolution`
 18. `sinomo-rollout`
 19. perception/action/support crates as skeletons

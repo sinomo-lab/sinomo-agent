@@ -3,6 +3,7 @@
 mod artifact;
 mod controller;
 mod error;
+mod module_load;
 mod paths;
 mod process;
 mod protocol;
@@ -27,6 +28,9 @@ pub use controller::{
     shadow_telemetry_scorecard_from_event_store, shadow_telemetry_scorecard_from_events,
 };
 pub use error::RolloutError;
+pub use module_load::{
+    LoadDecision, LoadRequest, LoaderAction, ModuleLoadError, ModuleLoader, ModulePolicyViolation,
+};
 pub use paths::{
     SANDBOX_WASIX_MODULE_PACKAGE, SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY,
     SANDBOX_WASIX_NATIVE_MODULE_SOURCE, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,

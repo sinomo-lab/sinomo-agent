@@ -32,7 +32,6 @@ default-members = [
     "crates/sinomo-models",
     "crates/sinomo-module",
     "crates/sinomo-module-api",
-    "crates/sinomo-module-host",
     "crates/sinomo-network",
     "crates/sinomo-node",
     "crates/sinomo-object",
@@ -47,8 +46,6 @@ default-members = [
     "crates/sinomo-service",
     "crates/sinomo-storage",
     "crates/sinomo-supervision",
-    "crates/sinomo-sync",
-    "crates/sinomo-trigger",
     "crates/sinomo-video",
     "crates/sinomo-voice",
 ]

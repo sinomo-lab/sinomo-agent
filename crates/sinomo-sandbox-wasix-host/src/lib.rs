@@ -1,6 +1,6 @@
 //! Typed host wrapper for the trusted native-dylib WASIX sandbox module.
 //!
-//! The dynamic loading logic lives in `sinomo-module-host`; this crate only
+//! The dynamic loading logic lives in `sinomo-module`; this crate only
 //! adapts the generic native-module request envelope to WASIX sandbox payloads.
 
 mod runner;
@@ -8,11 +8,14 @@ mod runner;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use sinomo_module::{
+    NativeModule, NativeModuleHostCallbacks, NativeModuleHostError, NativeModuleUnloadReport,
+    native_module_cache_path,
+};
 use sinomo_module_api::{
     NativeModuleInvocationRequest, NativeModuleRequest, NativeModuleResponse, decode_sobj,
     encode_sobj,
 };
-use sinomo_module_host::{NativeModule, NativeModuleHostCallbacks, NativeModuleHostError};
 use sinomo_sandbox::{SandboxOutputChunk, SandboxOutputSink};
 use sinomo_sandbox_wasix_api::{
     SINOMO_SANDBOX_WASIX_INTERFACE_VERSION, SINOMO_SANDBOX_WASIX_MODULE_ID,
@@ -102,7 +105,7 @@ impl SandboxWasixNativeModule {
         self.module.descriptor()
     }
 
-    pub fn unload(self) -> sinomo_module_host::NativeModuleUnloadReport {
+    pub fn unload(self) -> NativeModuleUnloadReport {
         self.module.unload()
     }
 
@@ -182,7 +185,7 @@ pub fn sandbox_wasix_native_module_cache_path(
     data_dir_root: impl AsRef<Path>,
     content_hash: &str,
 ) -> PathBuf {
-    sinomo_module_host::native_module_cache_path(
+    native_module_cache_path(
         data_dir_root,
         "module/sandbox/wasix",
         content_hash,

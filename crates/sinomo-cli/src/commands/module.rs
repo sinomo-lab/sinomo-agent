@@ -332,7 +332,7 @@ fn unload_native_dylib_module(options: ModuleNativeDylibUnloadOptions) -> Result
         content_hash = Some(state.content_hash.clone());
         cache_key = Some(state.cache_key.clone());
         library_name = Some(state.library_name.clone());
-        let path = sinomo_runtime::module_host::native_module_cache_path(
+        let path = sinomo_runtime::module::native_module_cache_path(
             data_dir.root(),
             &state.cache_key,
             &state.content_hash,
@@ -342,7 +342,7 @@ fn unload_native_dylib_module(options: ModuleNativeDylibUnloadOptions) -> Result
         if path.exists() {
             runtime_unload_attempted = true;
             match unsafe {
-                sinomo_runtime::module_host::NativeModule::load_from_content_addressed_path(
+                sinomo_runtime::module::NativeModule::load_from_content_addressed_path(
                     &path,
                     &state.content_hash,
                 )
@@ -472,7 +472,7 @@ fn native_dylib_module_install_error_to_cli(
             CliError::Io { path, detail }
         }
         sinomo_runtime::module::NativeDylibModuleInstallError::Host(source) => {
-            native_module_host_error_to_cli(source)
+            native_module_error_to_cli(source)
         }
         sinomo_runtime::module::NativeDylibModuleInstallError::Store(source) => {
             module_loader_store_error_to_cli(source)
@@ -483,12 +483,10 @@ fn native_dylib_module_install_error_to_cli(
     }
 }
 
-fn native_module_host_error_to_cli(
-    error: sinomo_runtime::module_host::NativeModuleHostError,
-) -> CliError {
+fn native_module_error_to_cli(error: sinomo_runtime::module::NativeModuleHostError) -> CliError {
     match error {
-        sinomo_runtime::module_host::NativeModuleHostError::Io { path, detail }
-        | sinomo_runtime::module_host::NativeModuleHostError::Load { path, detail } => {
+        sinomo_runtime::module::NativeModuleHostError::Io { path, detail }
+        | sinomo_runtime::module::NativeModuleHostError::Load { path, detail } => {
             CliError::Io { path, detail }
         }
         other => CliError::Parse {

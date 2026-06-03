@@ -125,10 +125,6 @@ fn wasix_native_module_is_not_a_default_workspace_build_member() {
         "the generic native module ABI crate should remain in default builds"
     );
     assert!(
-        default_members.contains(&"crates/sinomo-module-host".to_string()),
-        "the generic native module host loader should remain in default builds"
-    );
-    assert!(
         default_members.contains(&"crates/sinomo-sandbox-wasix-host".to_string()),
         "the lightweight WASIX host loader should remain in default builds"
     );

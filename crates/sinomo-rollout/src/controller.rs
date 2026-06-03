@@ -1,8 +1,9 @@
 use crate::{
-    RecordedRolloutTransition, RolloutTelemetryAdvanceState, RolloutTelemetryGateConfig,
-    RolloutTransitionRecord, SelfRolloutPaths, read_rollout_runtime_state,
-    read_rollout_telemetry_advance_state, record_rollout_transition, rollout_runtime_state_path,
-    write_rollout_runtime_state, write_rollout_telemetry_advance_state,
+    LoadDecision, LoadRequest, LoaderAction, ModuleLoader, RecordedRolloutTransition,
+    RolloutTelemetryAdvanceState, RolloutTelemetryGateConfig, RolloutTransitionRecord,
+    SelfRolloutPaths, read_rollout_runtime_state, read_rollout_telemetry_advance_state,
+    record_rollout_transition, rollout_runtime_state_path, write_rollout_runtime_state,
+    write_rollout_telemetry_advance_state,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
@@ -15,12 +16,11 @@ use sinomo_events::{
     EventId, EventSequence, EventStore, ReplayDirection, ReplayQuery, StoredEvent,
 };
 use sinomo_module::{
-    ArtifactId, LoadDecision, LoadRequest, LoaderAction, MODULE_CRASH_EVENT_KIND,
-    MODULE_INVOCATION_DECISION_EVENT_KIND, MODULE_POLICY_BLOCKED_EVENT_KIND,
-    MODULE_SHADOW_DECISION_EVENT_KIND, MODULE_TIMEOUT_EVENT_KIND,
-    MODULE_USER_CORRECTION_EVENT_KIND, ModuleCanaryTelemetryReport, ModuleLoader,
-    ModuleLoaderRuntimeState, ModuleShadowTelemetryReport, module_loader_applied_at_now,
-    module_loader_state_path, verify_artifact_signature, write_module_loader_runtime_state,
+    ArtifactId, MODULE_CRASH_EVENT_KIND, MODULE_INVOCATION_DECISION_EVENT_KIND,
+    MODULE_POLICY_BLOCKED_EVENT_KIND, MODULE_SHADOW_DECISION_EVENT_KIND, MODULE_TIMEOUT_EVENT_KIND,
+    MODULE_USER_CORRECTION_EVENT_KIND, ModuleCanaryTelemetryReport, ModuleLoaderRuntimeState,
+    ModuleShadowTelemetryReport, module_loader_applied_at_now, module_loader_state_path,
+    verify_artifact_signature, write_module_loader_runtime_state,
 };
 use sinomo_node::NodeId;
 use sinomo_registry::{TrustedArtifactSigner, authorize_artifact_signature};
@@ -1340,7 +1340,7 @@ impl RolloutController {
         let data_dir_root = data_dir_root.as_ref();
         let module_state = ModuleLoaderRuntimeState {
             node_id: recorded.record.node_id.clone(),
-            rollout_plan_id: recorded.record.rollout_plan_id.clone(),
+            activation_id: recorded.record.rollout_plan_id.clone(),
             module_id: recorded.record.module_id.clone(),
             loader_state: ModuleLoaderState {
                 module_id: recorded.record.module_id.clone(),
@@ -1354,8 +1354,8 @@ impl RolloutController {
                 &recorded.record.action,
                 recorded.record.current_weight_bps,
             ),
-            last_rollout_action: rollout_action_label(&recorded.record.action).to_string(),
-            last_rollout_stage: rollout_stage_label(&recorded.record.stage).to_string(),
+            last_loader_action: rollout_action_label(&recorded.record.action).to_string(),
+            last_loader_stage: rollout_stage_label(&recorded.record.stage).to_string(),
             last_transition_record_id: recorded.record.record_id.clone(),
             reason: recorded.record.reason.clone(),
             applied_at: module_loader_applied_at_now(),
@@ -2537,7 +2537,7 @@ mod tests {
         assert_eq!(applied.transition.record_id, recorded.record.record_id);
         assert_eq!(applied.transition_path, recorded.path);
         assert_eq!(applied.module_state.traffic_weight_bps, 500);
-        assert_eq!(applied.module_state.last_rollout_action, "advance-canary");
+        assert_eq!(applied.module_state.last_loader_action, "advance-canary");
         assert_eq!(
             read_module_loader_runtime_state(&root, &applied.module_state.module_id)
                 .expect("module state"),

@@ -340,7 +340,7 @@ Add or plan these capabilities:
 - `sinomo-sim`: test environments and replayable sandboxes.
 - `sinomo-skills`: executable game/computer-use skill library.
 
-The existing `sinomo-trigger`, `sinomo-agent`, and `sinomo-deliberation` split still holds, but gaming needs a new high-rate action plane below the interactive loop.
+The existing trigger-policy, interactive-agent, and deliberation split still holds conceptually, but gaming needs a new high-rate action plane below the interactive loop.
 
 ## Practical recommendation
 

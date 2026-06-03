@@ -440,22 +440,25 @@ The crate boundary follows the trust-ring architecture:
 
 - `sinomo-core` owns foundational module manifest vocabulary that must be
   visible below higher-level services.
-- `sinomo-module` owns backend-neutral lifecycle, routing, loader state, raw
-  replay and module telemetry contracts, and serializable module surface
-  declarations. It must not own self-evolution scoring policy.
+- `sinomo-module` owns low-level module glue: backend-neutral catalog
+  registration, loader activation state, routing and invocation primitives,
+  native dynamic-library host loading, unload records, raw replay contracts,
+  module telemetry contracts, and serializable module surface declarations. It
+  must not own policy decisions, rollout admission, rollout transition state,
+  or self-evolution scoring.
 - `sinomo-module-api` owns the stable native dynamic-library ABI surface.
-- `sinomo-module-host` owns trusted native dynamic-library loading behavior.
+- `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
   signer records.
 - `sinomo-rollout` owns cluster rollout transitions, rollout telemetry gates,
-  and rollback coordination.
-- `sinomo-evolution` owns candidate-bundle evidence interpretation, including
-  self-evolution scorecard adapters for module replay and module telemetry.
+  rollout load admission, promotion decisions, and rollback coordination. It
+  may write node-local module activation state when applying a rollout
+  transition, but the rollout decision model stays outside `sinomo-module`.
 - `sinomo-sandbox` owns sandbox-process containment and optional sandboxed
   execution backends.
-- `sinomo-evolution` owns candidate generation, evidence assembly, and
-  promotion requests; it consumes module lifecycle contracts but does not define
-  R1 module primitives.
+- `sinomo-evolution` owns candidate generation, evidence assembly, evidence
+  interpretation, self-evolution scorecard adapters, and promotion requests; it
+  consumes module lifecycle contracts but does not define R1 module primitives.
 - Domain module crates own their domain route names, event kinds, storage roots,
   and host-service binding helpers. Generic infrastructure crates own framing,
   dispatch, storage verification, and daemon event-loop mechanics.
