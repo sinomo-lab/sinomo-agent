@@ -1,8 +1,10 @@
 use super::*;
 use crate::file_manager::{
-    FileManagerEntryKind, FileManagerPrompt, FileManagerState, format_file_size,
+    FileManagerEntryKind, FileManagerPreviewer, FileManagerPrompt, FileManagerState,
+    format_file_size,
 };
 use crate::sifs_file_manager::SifsFileManagerBackend;
+use crate::sobj_file_preview::SobjFilePreviewer;
 #[cfg(feature = "native-models")]
 use candle_core::{DType, Device, Tensor};
 use crossterm::{
@@ -190,6 +192,7 @@ pub(super) fn run_tui_with_handler_io_and_daemon<
                 InteractionOutput::Line(line) => {
                     writeln!(writer, "{line}").map_err(CliError::stdio)?;
                 }
+                InteractionOutput::ModelUsage { .. } => {}
                 InteractionOutput::Exit => return Ok(()),
             }
         }
@@ -488,6 +491,36 @@ struct TuiCompletionState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TuiChatSelection {
+    anchor: usize,
+    focus: usize,
+    dragging: bool,
+}
+
+impl TuiChatSelection {
+    fn new(line: usize, dragging: bool) -> Self {
+        Self {
+            anchor: line,
+            focus: line,
+            dragging,
+        }
+    }
+
+    fn range(&self) -> (usize, usize) {
+        if self.anchor <= self.focus {
+            (self.anchor, self.focus)
+        } else {
+            (self.focus, self.anchor)
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        let (start, end) = self.range();
+        end.saturating_sub(start).saturating_add(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TuiViewMode {
     Chat,
     Files,
@@ -512,6 +545,43 @@ struct TuiSessionRecord {
 struct TuiSessionTranscript {
     schema_version: u32,
     messages: Vec<TuiMessage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_model_usage: Option<TuiTokenUsage>,
+    #[serde(default, skip_serializing_if = "TuiTokenUsage::is_empty")]
+    session_token_usage: TuiTokenUsage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+struct TuiTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl TuiTokenUsage {
+    fn from_language_model_usage(usage: &sinomo_lm::LanguageModelUsage) -> Option<Self> {
+        let input_tokens = usage.input_tokens.unwrap_or(0);
+        let output_tokens = usage.output_tokens.unwrap_or(0);
+        if input_tokens == 0 && output_tokens == 0 {
+            return None;
+        }
+        Some(Self {
+            input_tokens,
+            output_tokens,
+        })
+    }
+
+    fn add(&mut self, usage: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+    }
+
+    fn total_tokens(self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -578,6 +648,11 @@ impl TuiSessionStore {
     }
 
     fn save_state(&self, session: &InteractionSession, state: &TuiState) -> Result<(), CliError> {
+        if state.is_empty_session() {
+            self.discard_session(&session.session_id)?;
+            return Ok(());
+        }
+
         let now = OffsetDateTime::now_utc();
         let existing = self.load_record(&session.session_id)?;
         let created_at = existing
@@ -598,11 +673,25 @@ impl TuiSessionStore {
         let transcript = TuiSessionTranscript {
             schema_version: TUI_SESSION_SCHEMA_VERSION,
             messages: state.messages.clone(),
+            last_model_usage: state.last_model_usage,
+            session_token_usage: state.session_token_usage,
         };
         write_tui_json_atomic(
             &self.transcript_path_for_session(&session.session_id),
             &transcript,
         )
+    }
+
+    fn discard_session(&self, session_id: &SessionId) -> Result<(), CliError> {
+        let path = self.session_dir(session_id);
+        match fs::remove_dir_all(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CliError::Io {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }),
+        }
     }
 
     fn load_record(&self, session_id: &SessionId) -> Result<Option<TuiSessionRecord>, CliError> {
@@ -628,7 +717,10 @@ impl TuiSessionStore {
         Ok(Some(record))
     }
 
-    fn load_transcript(&self, session_id: &SessionId) -> Result<Option<Vec<TuiMessage>>, CliError> {
+    fn load_transcript(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<TuiSessionTranscript>, CliError> {
         let path = self.transcript_path_for_session(session_id);
         if !path.exists() {
             return Ok(None);
@@ -651,7 +743,7 @@ impl TuiSessionStore {
                 ),
             });
         }
-        Ok(Some(transcript.messages))
+        Ok(Some(transcript))
     }
 
     fn load_session(&self, session_id: &SessionId) -> Result<TuiSessionRecord, CliError> {
@@ -685,6 +777,13 @@ impl TuiSessionStore {
                 continue;
             };
             if let Some(record) = self.load_record(&session_id)? {
+                if self
+                    .load_transcript(&session_id)?
+                    .is_some_and(|transcript| tui_session_messages_are_empty(&transcript.messages))
+                {
+                    self.discard_session(&session_id)?;
+                    continue;
+                }
                 sessions.push(record);
             }
         }
@@ -726,6 +825,10 @@ pub(crate) struct TuiAgentRuntimeInfo {
     provider: String,
     model: String,
     account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ProviderReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_budget_tokens: Option<u32>,
 }
 
 impl TuiAgentRuntimeInfo {
@@ -739,6 +842,17 @@ impl TuiAgentRuntimeInfo {
             None => format!("{}/{}", self.provider, self.model),
         }
     }
+
+    fn reasoning_label(&self) -> String {
+        let effort = self
+            .reasoning_effort
+            .map(|effort| effort.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        match self.reasoning_budget_tokens {
+            Some(tokens) => format!("{effort}/{}", format_tui_token_count(u64::from(tokens))),
+            None => effort,
+        }
+    }
 }
 
 impl Default for TuiAgentRuntimeInfo {
@@ -748,6 +862,8 @@ impl Default for TuiAgentRuntimeInfo {
             provider: MINICPM_PROVIDER_ID.to_string(),
             model: MINICPM_DEFAULT_MODEL.to_string(),
             account: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
         }
     }
 }
@@ -785,6 +901,8 @@ struct TuiState {
     daemon_connected: bool,
     cluster_label: Option<String>,
     runtime_info: TuiAgentRuntimeInfo,
+    last_model_usage: Option<TuiTokenUsage>,
+    session_token_usage: TuiTokenUsage,
     view_mode: TuiViewMode,
     file_browser: Option<FileManagerState>,
     file_prompt: Option<FileManagerPrompt>,
@@ -793,6 +911,7 @@ struct TuiState {
     input_cursor: usize,
     messages: Vec<TuiMessage>,
     stream_message: Option<usize>,
+    chat_selection: Option<TuiChatSelection>,
     completions: Option<TuiCompletionState>,
     status: String,
     scrollback: u16,
@@ -813,6 +932,8 @@ impl TuiState {
             daemon_connected: daemon.is_some(),
             cluster_label,
             runtime_info,
+            last_model_usage: None,
+            session_token_usage: TuiTokenUsage::default(),
             view_mode: TuiViewMode::Chat,
             file_browser: None,
             file_prompt: None,
@@ -821,6 +942,7 @@ impl TuiState {
             input_cursor: 0,
             messages: Vec::new(),
             stream_message: None,
+            chat_selection: None,
             completions: None,
             status: "listening".to_string(),
             scrollback: 0,
@@ -847,6 +969,22 @@ impl TuiState {
             KeyCode::F(3) => TuiInputAction::OpenSessions,
             _ if self.view_mode == TuiViewMode::Files => self.apply_file_browser_key_event(key),
             _ if self.view_mode == TuiViewMode::Sessions => self.apply_session_list_key_event(key),
+            KeyCode::Char('s')
+                if self.view_mode == TuiViewMode::Chat
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.toggle_chat_selection_mode();
+                TuiInputAction::None
+            }
+            KeyCode::Esc
+                if self.view_mode == TuiViewMode::Chat && self.chat_selection.is_some() =>
+            {
+                self.clear_chat_selection();
+                TuiInputAction::None
+            }
+            _ if self.view_mode == TuiViewMode::Chat && self.chat_selection.is_some() => {
+                self.apply_chat_selection_key_event(key)
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.clear();
                 self.input_cursor = 0;
@@ -932,6 +1070,14 @@ impl TuiState {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.apply_mouse_left_click(&layout, mouse.column, mouse.row)
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.apply_mouse_left_drag(&layout, mouse.column, mouse.row);
+                TuiInputAction::None
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.finish_mouse_chat_selection();
+                TuiInputAction::None
+            }
             MouseEventKind::ScrollUp => {
                 self.apply_mouse_scroll(&layout, mouse.column, mouse.row, true);
                 TuiInputAction::None
@@ -975,6 +1121,10 @@ impl TuiState {
 
         match self.view_mode {
             TuiViewMode::Chat => {
+                let (_, transcript_area) = tui_chat_areas(layout.main);
+                if self.select_chat_line_at(transcript_area, column, row, true) {
+                    return TuiInputAction::None;
+                }
                 if let Some(completions_area) = layout.completions {
                     self.select_completion_at(completions_area, column, row);
                 }
@@ -990,6 +1140,20 @@ impl TuiState {
         TuiInputAction::None
     }
 
+    fn apply_mouse_left_drag(&mut self, layout: &TuiLayoutAreas, column: u16, row: u16) {
+        if self.view_mode != TuiViewMode::Chat {
+            return;
+        }
+        let Some(selection) = self.chat_selection else {
+            return;
+        };
+        if !selection.dragging {
+            return;
+        }
+        let (_, transcript_area) = tui_chat_areas(layout.main);
+        self.extend_chat_selection_at(transcript_area, column, row, true);
+    }
+
     fn apply_mouse_scroll(&mut self, layout: &TuiLayoutAreas, column: u16, row: u16, up: bool) {
         match self.view_mode {
             TuiViewMode::Chat => {
@@ -1003,7 +1167,8 @@ impl TuiState {
                     }
                     return;
                 }
-                if rect_contains(layout.main, column, row) {
+                let (_, transcript_area) = tui_chat_areas(layout.main);
+                if rect_contains(transcript_area, column, row) {
                     if up {
                         self.scrollback = self
                             .scrollback
@@ -1067,6 +1232,64 @@ impl TuiState {
         };
         if selected {
             self.apply_selected_completion_preview();
+        }
+    }
+
+    fn select_chat_line_at(&mut self, area: Rect, column: u16, row: u16, dragging: bool) -> bool {
+        let Some(line) = self.chat_line_index_at(area, column, row, false) else {
+            return false;
+        };
+        self.chat_selection = Some(TuiChatSelection::new(line, dragging));
+        self.completions = None;
+        self.update_chat_selection_status();
+        true
+    }
+
+    fn extend_chat_selection_at(&mut self, area: Rect, column: u16, row: u16, clamp: bool) -> bool {
+        let Some(line) = self.chat_line_index_at(area, column, row, clamp) else {
+            return false;
+        };
+        let Some(selection) = self.chat_selection.as_mut() else {
+            return false;
+        };
+        selection.focus = line;
+        self.update_chat_selection_status();
+        true
+    }
+
+    fn chat_line_index_at(&self, area: Rect, column: u16, row: u16, clamp: bool) -> Option<usize> {
+        let line_count = tui_message_line_count(&self.messages);
+        if line_count == 0 {
+            return None;
+        }
+        let inner = tui_inner_rect(area);
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        if !clamp && !rect_contains(inner, column, row) {
+            return None;
+        }
+        if clamp && (column < inner.x || column >= inner.x.saturating_add(inner.width)) {
+            return None;
+        }
+
+        let visible_height = usize::from(inner.height);
+        let visible_start =
+            tui_transcript_visible_start(line_count, visible_height, self.scrollback);
+        let visible_row = if row < inner.y {
+            0
+        } else if row >= inner.y.saturating_add(inner.height) {
+            visible_height.saturating_sub(1)
+        } else {
+            usize::from(row - inner.y)
+        };
+        let line = visible_start.saturating_add(visible_row);
+        if line < line_count {
+            Some(line)
+        } else if clamp {
+            Some(line_count - 1)
+        } else {
+            None
         }
     }
 
@@ -1166,6 +1389,33 @@ impl TuiState {
                 .unwrap_or(TuiInputAction::None),
             _ => TuiInputAction::None,
         }
+    }
+
+    fn apply_chat_selection_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
+        match key.code {
+            KeyCode::Esc => self.clear_chat_selection(),
+            KeyCode::Up => self.move_chat_selection_focus(-1),
+            KeyCode::Down => self.move_chat_selection_focus(1),
+            KeyCode::PageUp => {
+                self.move_chat_selection_focus(-8);
+                self.scrollback = self.scrollback.saturating_add(8);
+            }
+            KeyCode::PageDown => {
+                self.move_chat_selection_focus(8);
+                self.scrollback = self.scrollback.saturating_sub(8);
+            }
+            KeyCode::Home => self.set_chat_selection_focus(0),
+            KeyCode::End => {
+                if let Some(last) = tui_message_line_count(&self.messages).checked_sub(1) {
+                    self.set_chat_selection_focus(last);
+                }
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.select_all_chat_lines();
+            }
+            _ => {}
+        }
+        TuiInputAction::None
     }
 
     fn apply_file_browser_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
@@ -1302,6 +1552,91 @@ impl TuiState {
         self.runtime_info = runtime_info;
     }
 
+    fn toggle_chat_selection_mode(&mut self) {
+        if self.chat_selection.is_some() {
+            self.clear_chat_selection();
+            return;
+        }
+        let Some(last_line) = tui_message_line_count(&self.messages).checked_sub(1) else {
+            return;
+        };
+        self.chat_selection = Some(TuiChatSelection::new(last_line, false));
+        self.completions = None;
+        self.update_chat_selection_status();
+    }
+
+    fn clear_chat_selection(&mut self) {
+        self.chat_selection = None;
+        if self.view_mode == TuiViewMode::Chat && !self.exit_requested {
+            self.status = "listening".to_string();
+        }
+    }
+
+    fn finish_mouse_chat_selection(&mut self) {
+        if let Some(selection) = self.chat_selection.as_mut() {
+            selection.dragging = false;
+            self.update_chat_selection_status();
+        }
+    }
+
+    fn move_chat_selection_focus(&mut self, delta: isize) {
+        let Some(selection) = self.chat_selection else {
+            return;
+        };
+        let line_count = tui_message_line_count(&self.messages);
+        if line_count == 0 {
+            self.clear_chat_selection();
+            return;
+        }
+        let focus = if delta.is_negative() {
+            selection.focus.saturating_sub(delta.unsigned_abs())
+        } else {
+            selection
+                .focus
+                .saturating_add(delta as usize)
+                .min(line_count - 1)
+        };
+        self.set_chat_selection_focus(focus);
+    }
+
+    fn set_chat_selection_focus(&mut self, focus: usize) {
+        let line_count = tui_message_line_count(&self.messages);
+        if line_count == 0 {
+            self.clear_chat_selection();
+            return;
+        }
+        if let Some(selection) = self.chat_selection.as_mut() {
+            selection.focus = focus.min(line_count - 1);
+            selection.dragging = false;
+            self.update_chat_selection_status();
+        }
+    }
+
+    fn select_all_chat_lines(&mut self) {
+        let Some(last_line) = tui_message_line_count(&self.messages).checked_sub(1) else {
+            return;
+        };
+        self.chat_selection = Some(TuiChatSelection {
+            anchor: 0,
+            focus: last_line,
+            dragging: false,
+        });
+        self.completions = None;
+        self.update_chat_selection_status();
+    }
+
+    fn update_chat_selection_status(&mut self) {
+        let Some(selection) = self.chat_selection else {
+            return;
+        };
+        let label = if selection.line_count() == 1 {
+            "line"
+        } else {
+            "lines"
+        };
+        self.status = format!("selection: {} {label}", selection.line_count());
+    }
+
     fn open_chat_tab(&mut self) {
         match self.view_mode {
             TuiViewMode::Chat => {}
@@ -1311,7 +1646,7 @@ impl TuiState {
     }
 
     fn open_file_browser_at(&mut self, target: PathBuf) {
-        match FileManagerState::open_local(target) {
+        match FileManagerState::open_local(target).map(with_tui_file_previewers) {
             Ok(browser) => {
                 self.install_file_browser(browser);
             }
@@ -1324,6 +1659,7 @@ impl TuiState {
     fn open_sifs_file_browser_at(&mut self, data_dir: &SinomoDataDir, target: &str) {
         match SifsFileManagerBackend::open(data_dir)
             .and_then(|backend| FileManagerState::open(Arc::new(backend), target))
+            .map(with_tui_file_previewers)
         {
             Ok(browser) => self.install_file_browser(browser),
             Err(error) => {
@@ -1343,6 +1679,7 @@ impl TuiState {
         let current_path = browser.current_path().to_string();
         let source = browser.source_label().to_string();
         self.view_mode = TuiViewMode::Files;
+        self.chat_selection = None;
         self.file_browser = Some(browser);
         self.file_prompt = None;
         self.session_list = None;
@@ -1369,6 +1706,7 @@ impl TuiState {
         self.input_cursor = 0;
         self.completions = None;
         self.session_list = Some(TuiSessionListState::new(sessions, &self.session_id));
+        self.chat_selection = None;
         self.status = format!("showing {count} session(s)");
     }
 
@@ -1386,6 +1724,8 @@ impl TuiState {
         session: &InteractionSession,
         runtime_info: TuiAgentRuntimeInfo,
         mut messages: Vec<TuiMessage>,
+        last_model_usage: Option<TuiTokenUsage>,
+        session_token_usage: TuiTokenUsage,
     ) {
         if messages.is_empty() {
             messages.push(TuiMessage {
@@ -1395,6 +1735,8 @@ impl TuiState {
         }
         self.session_id = session.session_id.to_string();
         self.runtime_info = runtime_info;
+        self.last_model_usage = last_model_usage;
+        self.session_token_usage = session_token_usage;
         self.view_mode = TuiViewMode::Chat;
         self.file_browser = None;
         self.file_prompt = None;
@@ -1402,6 +1744,7 @@ impl TuiState {
         self.input.clear();
         self.input_cursor = 0;
         self.completions = None;
+        self.chat_selection = None;
         self.messages = messages;
         self.stream_message = None;
         self.scrollback = 0;
@@ -1509,6 +1852,7 @@ impl TuiState {
     }
 
     fn begin_submission(&mut self, line: &str) {
+        self.chat_selection = None;
         let kind = if line.trim_start().starts_with('/') {
             TuiMessageKind::Command
         } else {
@@ -1531,12 +1875,25 @@ impl TuiState {
         }
     }
 
+    fn is_empty_session(&self) -> bool {
+        tui_session_messages_are_empty(&self.messages)
+    }
+
     fn apply_output(&mut self, output: InteractionOutput) {
         match output {
             InteractionOutput::Chunk(chunk) => self.append_chunk(&chunk),
             InteractionOutput::Line(line) => self.append_line(&line),
+            InteractionOutput::ModelUsage { usage, .. } => self.apply_model_usage(&usage),
             InteractionOutput::Exit => self.request_exit(),
         }
+    }
+
+    fn apply_model_usage(&mut self, usage: &sinomo_lm::LanguageModelUsage) {
+        let Some(usage) = TuiTokenUsage::from_language_model_usage(usage) else {
+            return;
+        };
+        self.last_model_usage = Some(usage);
+        self.session_token_usage.add(usage);
     }
 
     fn append_chunk(&mut self, chunk: &str) {
@@ -1811,6 +2168,15 @@ impl TuiState {
     }
 }
 
+fn tui_file_previewers() -> Vec<Arc<dyn FileManagerPreviewer>> {
+    vec![Arc::new(SobjFilePreviewer)]
+}
+
+fn with_tui_file_previewers(mut browser: FileManagerState) -> FileManagerState {
+    browser.set_file_previewers(tui_file_previewers());
+    browser
+}
+
 fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliError> {
     let Some(args) = parse_slash_command(line)? else {
         return Ok(None);
@@ -1975,10 +2341,22 @@ fn resume_tui_session<H: TuiAgentRuntimeControl>(
         record.session.clone(),
     );
     runtime.append_session_context(daemon_context_event(&record.session, daemon))?;
-    let messages = session_store
-        .load_transcript(&session_id)?
-        .unwrap_or_else(Vec::new);
-    state.replace_session(&record.session, restored_info, messages);
+    let transcript = session_store.load_transcript(&session_id)?;
+    let (messages, last_model_usage, session_token_usage) = match transcript {
+        Some(transcript) => (
+            transcript.messages,
+            transcript.last_model_usage,
+            transcript.session_token_usage,
+        ),
+        None => (Vec::new(), None, TuiTokenUsage::default()),
+    };
+    state.replace_session(
+        &record.session,
+        restored_info,
+        messages,
+        last_model_usage,
+        session_token_usage,
+    );
     outputs.insert(
         0,
         InteractionOutput::Line(format!("resumed session: {}", record.session.session_id)),
@@ -2023,6 +2401,7 @@ fn tui_model_status_outputs(info: &TuiAgentRuntimeInfo) -> Vec<InteractionOutput
             "account: {}",
             info.account.as_deref().unwrap_or("default")
         )),
+        InteractionOutput::Line(format!("reasoning: {}", info.reasoning_label())),
     ]
 }
 
@@ -2182,6 +2561,45 @@ fn truncate_tui_text(value: &str, max_chars: usize) -> String {
         output.push(character);
     }
     output
+}
+
+fn tui_session_messages_are_empty(messages: &[TuiMessage]) -> bool {
+    !messages
+        .iter()
+        .any(|message| message.kind == TuiMessageKind::User && !message.text.trim().is_empty())
+}
+
+fn format_tui_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_tui_context_usage(usage: Option<TuiTokenUsage>) -> String {
+    match usage {
+        Some(usage) => format!(
+            "{} in/{} out",
+            format_tui_token_count(usage.input_tokens),
+            format_tui_token_count(usage.output_tokens)
+        ),
+        None => "unknown".to_string(),
+    }
+}
+
+fn format_tui_session_token_usage(usage: TuiTokenUsage) -> String {
+    if usage.is_empty() {
+        return "0 tok".to_string();
+    }
+    format!(
+        "{} tok ({} in/{} out)",
+        format_tui_token_count(usage.total_tokens()),
+        format_tui_token_count(usage.input_tokens),
+        format_tui_token_count(usage.output_tokens)
+    )
 }
 
 fn format_tui_timestamp(value: OffsetDateTime) -> String {
@@ -2350,7 +2768,9 @@ fn render_tui(frame: &mut Frame<'_>, state: &TuiState) {
         TuiViewMode::Sessions => render_tui_session_list(frame, areas.main, state),
         TuiViewMode::Files => render_tui_file_browser(frame, areas.main, state),
         TuiViewMode::Chat => {
-            render_tui_transcript(frame, areas.main, state);
+            let (info_area, transcript_area) = tui_chat_areas(areas.main);
+            render_tui_chat_info_bar(frame, info_area, state);
+            render_tui_transcript(frame, transcript_area, state);
             if let Some(completions) = areas.completions {
                 render_tui_completions(frame, completions, state);
             }
@@ -2460,23 +2880,100 @@ fn tui_cluster_status_label(state: &TuiState) -> String {
     }
 }
 
+fn tui_chat_areas(area: Rect) -> (Rect, Rect) {
+    if area.height == 0 {
+        return (area, area);
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    (chunks[0], chunks[1])
+}
+
+fn render_tui_chat_info_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    if area.is_empty() {
+        return;
+    }
+    let cwd = env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|error| format!("cwd unavailable: {error}"));
+    let cwd_budget = usize::from(area.width).saturating_sub(96).clamp(16, 80);
+    let line = Line::from(vec![
+        Span::styled("model ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            state.runtime_info.model_label(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  "),
+        Span::styled("reason ", Style::default().fg(Color::DarkGray)),
+        Span::raw(state.runtime_info.reasoning_label()),
+        Span::raw("  "),
+        Span::styled("context ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format_tui_context_usage(state.last_model_usage)),
+        Span::raw("  "),
+        Span::styled("session ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format_tui_session_token_usage(state.session_token_usage)),
+        Span::raw("  "),
+        Span::styled("cwd ", Style::default().fg(Color::DarkGray)),
+        Span::raw(truncate_tui_text(&cwd, cwd_budget)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 fn render_tui_transcript(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let lines = tui_message_lines(&state.messages);
-    let visible_height = area.height.saturating_sub(2);
-    let max_scroll = lines
-        .len()
-        .saturating_sub(usize::from(visible_height))
-        .min(usize::from(u16::MAX)) as u16;
-    let scroll = max_scroll.saturating_sub(state.scrollback.min(max_scroll));
+    let selection = state.chat_selection.map(|selection| selection.range());
+    let lines = tui_message_lines(&state.messages, selection);
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    let scroll = tui_transcript_visible_start(lines.len(), visible_height, state.scrollback);
     let block = Block::default()
-        .title("Session")
+        .title(tui_transcript_title(
+            state,
+            scroll,
+            visible_height,
+            lines.len(),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     let transcript = Paragraph::new(Text::from(lines))
         .block(block)
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+        .scroll((scroll as u16, 0));
     frame.render_widget(transcript, area);
+}
+
+fn tui_transcript_visible_start(
+    line_count: usize,
+    visible_height: usize,
+    scrollback: u16,
+) -> usize {
+    let max_scroll = line_count
+        .saturating_sub(visible_height)
+        .min(usize::from(u16::MAX));
+    max_scroll.saturating_sub(usize::from(scrollback).min(max_scroll))
+}
+
+fn tui_transcript_title(
+    state: &TuiState,
+    visible_start: usize,
+    visible_height: usize,
+    line_count: usize,
+) -> String {
+    let visible_end = visible_start.saturating_add(visible_height).min(line_count);
+    let mut title = if visible_start > 0 || visible_end < line_count {
+        format!(
+            "Session {}-{}/{}",
+            visible_start + 1,
+            visible_end,
+            line_count
+        )
+    } else {
+        "Session".to_string()
+    };
+    if let Some(selection) = state.chat_selection {
+        title.push_str(&format!("  selected {}", selection.line_count()));
+    }
+    title
 }
 
 fn render_tui_completions(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -2808,6 +3305,27 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
+    if let Some(selection) = state.chat_selection {
+        let line = Line::from(vec![
+            Span::styled(
+                format!("selection: {} line(s)", selection.line_count()),
+                status_style.add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled("Mouse drag", Style::default().fg(Color::DarkGray)),
+            Span::raw(" extend   "),
+            Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
+            Span::raw(" extend   "),
+            Span::styled("Ctrl+A", Style::default().fg(Color::DarkGray)),
+            Span::raw(" all   "),
+            Span::styled("Esc/Alt+S", Style::default().fg(Color::DarkGray)),
+            Span::raw(" clear   "),
+            Span::styled("Wheel/PgUp/PgDn", Style::default().fg(Color::DarkGray)),
+            Span::raw(" scroll"),
+        ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
     let line = Line::from(vec![
         Span::styled(
             state.status.clone(),
@@ -2818,6 +3336,8 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::raw(" send   "),
         Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
         Span::raw(" select   "),
+        Span::styled("Alt+S", Style::default().fg(Color::DarkGray)),
+        Span::raw(" select mode   "),
         Span::styled("Tab/Right", Style::default().fg(Color::DarkGray)),
         Span::raw(" accept   "),
         Span::styled("Esc", Style::default().fg(Color::DarkGray)),
@@ -2830,28 +3350,72 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn tui_message_lines(messages: &[TuiMessage]) -> Vec<Line<'static>> {
+fn tui_message_lines(
+    messages: &[TuiMessage],
+    selection: Option<(usize, usize)>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
+    let mut transcript_line_index = 0;
     for message in messages {
         let prefix = tui_message_prefix(&message.kind);
         let style = tui_message_style(&message.kind);
         if message.text.is_empty() {
-            lines.push(Line::from(vec![Span::styled(prefix, style)]));
+            let selected = tui_line_is_selected(transcript_line_index, selection);
+            let selected_style = tui_transcript_selection_style(selected);
+            lines.push(Line::from(vec![Span::styled(
+                prefix,
+                selected_style.unwrap_or(style),
+            )]));
+            transcript_line_index += 1;
             continue;
         }
         for (line_index, text) in message.text.lines().enumerate() {
+            let selected = tui_line_is_selected(transcript_line_index, selection);
+            let selected_style = tui_transcript_selection_style(selected);
             let display_prefix = if line_index == 0 {
                 prefix.to_string()
             } else {
                 " ".repeat(prefix.len())
             };
             lines.push(Line::from(vec![
-                Span::styled(display_prefix, style),
-                Span::raw(text.to_string()),
+                Span::styled(display_prefix, selected_style.unwrap_or(style)),
+                Span::styled(
+                    text.to_string(),
+                    selected_style.unwrap_or_else(Style::default),
+                ),
             ]));
+            transcript_line_index += 1;
         }
     }
     lines
+}
+
+fn tui_line_is_selected(line_index: usize, selection: Option<(usize, usize)>) -> bool {
+    selection
+        .map(|(start, end)| line_index >= start && line_index <= end)
+        .unwrap_or(false)
+}
+
+fn tui_transcript_selection_style(selected: bool) -> Option<Style> {
+    selected.then_some(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
+fn tui_message_line_count(messages: &[TuiMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            if message.text.is_empty() {
+                1
+            } else {
+                message.text.lines().count().max(1)
+            }
+        })
+        .sum()
 }
 
 fn tui_message_prefix(kind: &TuiMessageKind) -> &'static str {
@@ -2891,6 +3455,10 @@ mod tui_tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn press_mod(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -2964,6 +3532,75 @@ mod tui_tests {
         assert_eq!(state.messages[3].kind, TuiMessageKind::Agent);
         assert_eq!(state.messages[3].text, "done");
         assert_eq!(state.status, "listening");
+    }
+
+    #[test]
+    fn tui_chat_selection_mode_extends_with_keyboard() {
+        let mut state = fixture_tui_state();
+        state.push_message(TuiMessageKind::User, "one");
+        state.push_message(TuiMessageKind::Agent, "two");
+
+        assert_eq!(
+            state.apply_key_event(press_mod(KeyCode::Char('s'), KeyModifiers::ALT)),
+            TuiInputAction::None
+        );
+        assert_eq!(state.chat_selection.expect("selection").range(), (2, 2));
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Up)),
+            TuiInputAction::None
+        );
+        assert_eq!(state.chat_selection.expect("selection").range(), (1, 2));
+        assert_eq!(
+            state.apply_key_event(press_mod(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            TuiInputAction::None
+        );
+        assert_eq!(state.chat_selection.expect("selection").range(), (0, 2));
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::Esc)),
+            TuiInputAction::None
+        );
+        assert!(state.chat_selection.is_none());
+    }
+
+    #[test]
+    fn tui_state_tracks_model_usage_without_transcript_message() {
+        let mut state = fixture_tui_state();
+
+        state.begin_submission("hello");
+        state.apply_output(InteractionOutput::ModelUsage {
+            provider: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            usage: sinomo_lm::LanguageModelUsage {
+                input_tokens: Some(1234),
+                output_tokens: Some(56),
+            },
+        });
+        state.apply_output(InteractionOutput::Line("sinomo: done".to_string()));
+        state.finish_submission();
+
+        assert_eq!(state.messages.len(), 3);
+        assert_eq!(
+            state.last_model_usage,
+            Some(TuiTokenUsage {
+                input_tokens: 1234,
+                output_tokens: 56,
+            })
+        );
+        assert_eq!(
+            state.session_token_usage,
+            TuiTokenUsage {
+                input_tokens: 1234,
+                output_tokens: 56,
+            }
+        );
+        assert_eq!(
+            format_tui_context_usage(state.last_model_usage),
+            "1.2k in/56 out"
+        );
+        assert_eq!(
+            format_tui_session_token_usage(state.session_token_usage),
+            "1.3k tok (1.2k in/56 out)"
+        );
     }
 
     #[test]
@@ -3371,6 +4008,58 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_mouse_selects_chat_transcript_lines() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut state = fixture_tui_state();
+        state.push_message(TuiMessageKind::User, "first");
+        state.push_message(TuiMessageKind::Agent, "second");
+
+        let layout = tui_layout_areas(area, &state);
+        let (_, transcript_area) = tui_chat_areas(layout.main);
+        let transcript_inner = tui_inner_rect(transcript_area);
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::Down(MouseButton::Left),
+                    transcript_inner.x,
+                    transcript_inner.y.saturating_add(1),
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        let selection = state.chat_selection.expect("selection");
+        assert_eq!(selection.range(), (1, 1));
+        assert!(selection.dragging);
+
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    transcript_inner.x,
+                    transcript_inner.y.saturating_add(2),
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        assert_eq!(state.chat_selection.expect("selection").range(), (1, 2));
+
+        assert_eq!(
+            state.apply_mouse_event(
+                mouse(
+                    MouseEventKind::Up(MouseButton::Left),
+                    transcript_inner.x,
+                    transcript_inner.y.saturating_add(2),
+                ),
+                area,
+            ),
+            TuiInputAction::None
+        );
+        assert!(!state.chat_selection.expect("selection").dragging);
+    }
+
+    #[test]
     fn file_browser_loads_directory_and_previews_text_file() {
         let root = temp_file_browser_root("preview");
         fs::create_dir(root.join("src")).expect("dir");
@@ -3399,6 +4088,76 @@ mod tui_tests {
         browser.update_preview();
         assert!(browser.preview.lines.iter().any(|line| line == "hello"));
         assert!(browser.preview.lines.iter().any(|line| line == "world"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn file_browser_previews_sobj_file() {
+        let root = temp_file_browser_root("sobj-preview");
+        let document = sinomo_runtime::object::Document::dynamic(
+            1,
+            sinomo_runtime::object::LengthMode::U32,
+            sinomo_runtime::object::Value::Object(sinomo_runtime::object::Object::new(vec![
+                sinomo_runtime::object::Field::new(
+                    "name",
+                    sinomo_runtime::object::Value::String("demo".into()),
+                ),
+                sinomo_runtime::object::Field::new(
+                    "enabled",
+                    sinomo_runtime::object::Value::Boolean(true),
+                ),
+                sinomo_runtime::object::Field::new(
+                    "payload",
+                    sinomo_runtime::object::Value::Bytes(vec![0, 1, 2, 3, 4]),
+                ),
+            ])),
+        );
+        fs::write(
+            root.join("config.sobj"),
+            document.to_bytes().expect("document bytes"),
+        )
+        .expect("file");
+
+        let mut browser =
+            with_tui_file_previewers(FileManagerState::open_local(&root).expect("browser"));
+        let file_index = browser
+            .entries
+            .iter()
+            .position(|entry| entry.name == "config.sobj")
+            .expect("file");
+        browser.selected = file_index;
+        browser.update_preview();
+
+        assert_eq!(browser.preview.title, "SOBJ config.sobj");
+        assert!(
+            browser
+                .preview
+                .lines
+                .iter()
+                .any(|line| line == "SOBJ document")
+        );
+        assert!(
+            browser
+                .preview
+                .lines
+                .iter()
+                .any(|line| line.contains("\"name\": string(4 chars): \"demo\""))
+        );
+        assert!(
+            browser
+                .preview
+                .lines
+                .iter()
+                .any(|line| line.contains("\"enabled\": true"))
+        );
+        assert!(
+            browser
+                .preview
+                .lines
+                .iter()
+                .any(|line| line.contains("\"payload\": bytes(5 B): 00 01 02 03 04"))
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -3535,6 +4294,14 @@ mod tui_tests {
         let mut state = TuiState::new(&session, None, TuiAgentRuntimeInfo::default());
         state.push_message(TuiMessageKind::User, "continue previous work");
         state.push_message(TuiMessageKind::Agent, "ok");
+        state.apply_output(InteractionOutput::ModelUsage {
+            provider: "codex".to_string(),
+            model: "gpt-5".to_string(),
+            usage: sinomo_lm::LanguageModelUsage {
+                input_tokens: Some(11),
+                output_tokens: Some(7),
+            },
+        });
 
         store.save_state(&session, &state).expect("save");
         let sessions = store.list_sessions().expect("list");
@@ -3546,7 +4313,53 @@ mod tui_tests {
             .load_transcript(&session.session_id)
             .expect("load")
             .expect("transcript");
-        assert_eq!(transcript, state.messages);
+        assert_eq!(transcript.messages, state.messages);
+        assert_eq!(transcript.last_model_usage, state.last_model_usage);
+        assert_eq!(transcript.session_token_usage, state.session_token_usage);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_session_store_discards_empty_sessions() {
+        let root = temp_file_browser_root("empty-sessions");
+        let data_dir = SinomoDataDir::new(root.clone());
+        let store = TuiSessionStore::for_data_dir(&data_dir);
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_empty").expect("node"),
+            InteractionSurface::new("surface.empty", InteractionSurfaceKind::CommandLine),
+        );
+        let state = TuiState::new(&session, None, TuiAgentRuntimeInfo::default());
+
+        store.save_state(&session, &state).expect("save");
+
+        assert!(!store.session_dir(&session.session_id).exists());
+        assert!(store.list_sessions().expect("list").is_empty());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_session_store_discards_command_only_sessions() {
+        let root = temp_file_browser_root("command-only-sessions");
+        let data_dir = SinomoDataDir::new(root.clone());
+        let store = TuiSessionStore::for_data_dir(&data_dir);
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_command_only").expect("node"),
+            InteractionSurface::new("surface.command-only", InteractionSurfaceKind::CommandLine),
+        );
+        let mut state = TuiState::new(&session, None, TuiAgentRuntimeInfo::default());
+        state.begin_submission("/quit");
+        state.apply_output(InteractionOutput::Line("ending session".to_string()));
+        state.apply_output(InteractionOutput::Exit);
+        state.finish_submission();
+
+        store.save_state(&session, &state).expect("save");
+
+        assert!(!store.session_dir(&session.session_id).exists());
+        assert!(store.list_sessions().expect("list").is_empty());
 
         fs::remove_dir_all(root).ok();
     }
@@ -3821,6 +4634,8 @@ impl DefaultMainAgentChatModel {
                 provider: MINICPM_PROVIDER_ID.to_string(),
                 model: MINICPM_DEFAULT_MODEL.to_string(),
                 account: None,
+                reasoning_effort: None,
+                reasoning_budget_tokens: None,
             };
         }
         TuiAgentRuntimeInfo {
@@ -3828,6 +4643,8 @@ impl DefaultMainAgentChatModel {
             provider: default_main_agent_chat_model_provider().to_string(),
             model: default_main_agent_chat_model_id().to_string(),
             account: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
         }
     }
 
@@ -3909,6 +4726,8 @@ pub struct MainAgentInteractionHandler<M> {
     provider: String,
     model_name: String,
     account: Option<String>,
+    reasoning_effort: Option<ProviderReasoningEffort>,
+    reasoning_budget_tokens: Option<u32>,
 }
 
 #[derive(Default)]
@@ -3987,6 +4806,8 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
             provider,
             model_name,
             account: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
         }
     }
 
@@ -4011,6 +4832,8 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
             provider,
             model_name,
             account: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
         }
     }
 
@@ -4026,6 +4849,8 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
             provider: self.provider.clone(),
             model: self.model_name.clone(),
             account: self.account.clone(),
+            reasoning_effort: self.reasoning_effort,
+            reasoning_budget_tokens: self.reasoning_budget_tokens,
         }
     }
 
@@ -4035,6 +4860,7 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         provider: String,
         model_name: String,
         account: Option<String>,
+        options: LanguageModelProviderOptions,
     ) -> TuiAgentRuntimeInfo {
         self.agent = MainAgentLoop::with_definition(
             model,
@@ -4045,6 +4871,8 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         self.provider = provider;
         self.model_name = model_name;
         self.account = account;
+        self.reasoning_effort = options.reasoning_effort;
+        self.reasoning_budget_tokens = options.reasoning_budget_tokens;
         self.runtime_info()
     }
 }
@@ -4085,7 +4913,13 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         runtime_config,
                         self.thinking.clone(),
                     );
-                    Ok(self.replace_model(model, info.provider, info.model, info.account))
+                    Ok(self.replace_model(
+                        model,
+                        info.provider,
+                        info.model,
+                        info.account,
+                        LanguageModelProviderOptions::default(),
+                    ))
                 }
                 MINICPM_PROVIDER_ID => {
                     let model_name = if selection.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
@@ -4100,20 +4934,20 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         None,
                         runtime_config,
                     );
-                    Ok(
-                        self.replace_model(
-                            model,
-                            MINICPM_PROVIDER_ID.to_string(),
-                            model_name,
-                            None,
-                        ),
-                    )
+                    Ok(self.replace_model(
+                        model,
+                        MINICPM_PROVIDER_ID.to_string(),
+                        model_name,
+                        None,
+                        LanguageModelProviderOptions::default(),
+                    ))
                 }
                 provider => {
                     let (config, _) = load_model_config_for_node(data_dir)?;
                     let account =
                         provider_account_config(&config, provider, Some(&selection.account))
                             .cloned();
+                    let options = provider_options_for_model(account.as_ref(), &selection.model);
                     let model = DefaultMainAgentChatModel::configured(
                         data_dir,
                         provider.to_string(),
@@ -4126,6 +4960,7 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         provider.to_string(),
                         selection.model,
                         Some(selection.account),
+                        options,
                     ))
                 }
             }
@@ -4282,17 +5117,18 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
 
         let mut thinking_stream = ThinkingStreamDisplay::new(self.thinking.is_enabled());
         let decision_result = if let Some(emit) = emit.as_deref_mut() {
-            self.agent.decide_streaming(&input, &mut |delta| {
-                for chunk in thinking_stream.push(delta) {
-                    emit(InteractionOutput::Chunk(chunk));
-                }
-            })
+            self.agent
+                .decide_streaming_with_usage(&input, &mut |delta| {
+                    for chunk in thinking_stream.push(delta) {
+                        emit(InteractionOutput::Chunk(chunk));
+                    }
+                })
         } else {
-            self.agent.decide(&input)
+            self.agent.decide_with_usage(&input)
         };
 
         match decision_result {
-            Ok(decision) => {
+            Ok((decision, usage)) => {
                 let response_event = interaction_event(
                     session,
                     "interaction.main_agent.responded",
@@ -4303,7 +5139,8 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
                         "text": decision.text,
                         "tool_calls": decision.tool_calls,
                         "background_handoff": decision.background_handoff,
-                        "next_state": decision.next_state
+                        "next_state": decision.next_state,
+                        "usage": usage.clone()
                     }),
                 )
                 .caused_by(&requested.event_id);
@@ -4313,7 +5150,15 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
                     .get("text")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                Ok(vec![InteractionOutput::Line(format!("sinomo: {text}"))])
+                let mut outputs = vec![InteractionOutput::Line(format!("sinomo: {text}"))];
+                if let Some(usage) = usage {
+                    outputs.push(InteractionOutput::ModelUsage {
+                        provider: self.provider.clone(),
+                        model: self.model_name.clone(),
+                        usage,
+                    });
+                }
+                Ok(outputs)
             }
             Err(error) => {
                 let failure = interaction_event(

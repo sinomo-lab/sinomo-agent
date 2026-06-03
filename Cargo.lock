@@ -6279,6 +6279,7 @@ dependencies = [
  "sinomo-module-api",
  "sinomo-network",
  "sinomo-node",
+ "sinomo-object",
  "sinomo-policy",
  "sinomo-registry",
  "sinomo-rollout",

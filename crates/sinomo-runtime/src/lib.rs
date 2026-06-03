@@ -14,6 +14,7 @@
 pub mod r0 {
     pub use sinomo_core as core;
     pub use sinomo_core::*;
+    pub use sinomo_object as object;
 }
 
 /// R1 trusted-runtime services and contracts.
@@ -171,7 +172,7 @@ pub mod r1 {
     }
 }
 
-pub use r0::core;
+pub use r0::{core, object};
 pub use r1::{
     api, daemon, device, dfs, eval, events, kv, local, module, module_api, modules, network, node,
     policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host, service, storage,

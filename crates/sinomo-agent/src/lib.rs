@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelError, LanguageModelMessage, LanguageModelProvider, LanguageModelRequest,
     LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelStreamEvent,
+    LanguageModelStreamEvent, LanguageModelUsage,
 };
 use sinomo_runtime::core::{
     ActionRequest, Confidence, ContextPacket, EventEnvelope, EventKind, Id, LatencyClass,
@@ -646,6 +646,13 @@ impl<M: InteractionModel> MainAgentLoop<M> {
     }
 
     pub fn decide(&self, input: &AgentLoopInput) -> Result<AgentLoopDecision, AgentError> {
+        self.decide_with_usage(input).map(|(decision, _)| decision)
+    }
+
+    pub fn decide_with_usage(
+        &self,
+        input: &AgentLoopInput,
+    ) -> Result<(AgentLoopDecision, Option<LanguageModelUsage>), AgentError> {
         self.decide_with_model(input, |model, request| model.complete(request))
     }
 
@@ -654,6 +661,15 @@ impl<M: InteractionModel> MainAgentLoop<M> {
         input: &AgentLoopInput,
         on_delta: &mut dyn FnMut(&str),
     ) -> Result<AgentLoopDecision, AgentError> {
+        self.decide_streaming_with_usage(input, on_delta)
+            .map(|(decision, _)| decision)
+    }
+
+    pub fn decide_streaming_with_usage(
+        &self,
+        input: &AgentLoopInput,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<(AgentLoopDecision, Option<LanguageModelUsage>), AgentError> {
         self.decide_with_model(input, |model, request| {
             model.complete_streaming(request, on_delta)
         })
@@ -666,16 +682,19 @@ impl<M: InteractionModel> MainAgentLoop<M> {
             &M,
             &LanguageModelRequest,
         ) -> Result<LanguageModelResponse, LanguageModelError>,
-    ) -> Result<AgentLoopDecision, AgentError> {
+    ) -> Result<(AgentLoopDecision, Option<LanguageModelUsage>), AgentError> {
         if let Some(update) = &input.async_update
             && !update.needs_user_attention
             && update.next_action_hint == AsyncTaskNextAction::ContinueSilently
         {
-            return Ok(AgentLoopDecision::silent());
+            return Ok((AgentLoopDecision::silent(), None));
         }
         let request = self.request(input)?;
         let response = complete(&self.model, &request)?;
-        parse_agent_loop_response(&self.definition.output_format, &response.content)
+        let usage = response.usage.clone();
+        let decision =
+            parse_agent_loop_response(&self.definition.output_format, &response.content)?;
+        Ok((decision, usage))
     }
 
     pub fn request(&self, input: &AgentLoopInput) -> Result<LanguageModelRequest, AgentError> {
@@ -863,6 +882,11 @@ pub enum InteractionInputKind {
 pub enum InteractionOutput {
     Chunk(String),
     Line(String),
+    ModelUsage {
+        provider: String,
+        model: String,
+        usage: LanguageModelUsage,
+    },
     Exit,
 }
 

@@ -53,7 +53,7 @@ pub(crate) struct FileManagerPreview {
 }
 
 impl FileManagerPreview {
-    fn new(title: impl Into<String>, lines: Vec<String>) -> Self {
+    pub(crate) fn new(title: impl Into<String>, lines: Vec<String>) -> Self {
         Self {
             title: title.into(),
             lines,
@@ -90,9 +90,18 @@ pub(crate) trait FileManagerBackend: fmt::Debug + Send + Sync {
     fn delete_dir(&self, path: &str) -> Result<(), String>;
 }
 
+pub(crate) trait FileManagerPreviewer: fmt::Debug + Send + Sync {
+    fn preview_file(
+        &self,
+        entry: &FileManagerEntry,
+        read: &FileManagerRead,
+    ) -> Option<FileManagerPreview>;
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FileManagerState {
     backend: Arc<dyn FileManagerBackend>,
+    file_previewers: Vec<Arc<dyn FileManagerPreviewer>>,
     current_path: String,
     pub(crate) entries: Vec<FileManagerEntry>,
     pub(crate) selected: usize,
@@ -116,6 +125,7 @@ impl FileManagerState {
         };
         let mut browser = Self {
             backend,
+            file_previewers: Vec::new(),
             current_path,
             entries: Vec::new(),
             selected: 0,
@@ -141,6 +151,14 @@ impl FileManagerState {
 
     pub(crate) fn current_path(&self) -> &str {
         &self.current_path
+    }
+
+    pub(crate) fn set_file_previewers(
+        &mut self,
+        file_previewers: Vec<Arc<dyn FileManagerPreviewer>>,
+    ) {
+        self.file_previewers = file_previewers;
+        self.update_preview();
     }
 
     pub(crate) fn refresh(&mut self) -> Result<(), String> {
@@ -355,6 +373,11 @@ impl FileManagerState {
                 );
             }
         };
+        for previewer in &self.file_previewers {
+            if let Some(preview) = previewer.preview_file(entry, &read) {
+                return preview;
+            }
+        }
         if read.bytes.iter().any(|byte| *byte == 0) {
             return FileManagerPreview::new(
                 format!("Binary {}", entry.name),

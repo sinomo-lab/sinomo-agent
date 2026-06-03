@@ -317,6 +317,7 @@ mod commands;
 mod completion;
 mod file_manager;
 mod sifs_file_manager;
+mod sobj_file_preview;
 pub(crate) use commands::*;
 pub(crate) use completion::*;
 
