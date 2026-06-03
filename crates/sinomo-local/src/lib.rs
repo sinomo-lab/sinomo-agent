@@ -14,13 +14,13 @@ pub fn register_storage_paths(
         "sinomo-local",
         StorageRing::Application,
         "config",
-        "human-readable local configuration files",
+        "legacy human-readable local configuration files",
     )?;
     layout.register_escape_path(
         "sinomo-local",
         StorageRing::Application,
         "providers",
-        "external provider credential and configuration files",
+        "legacy external provider credential and configuration files",
     )?;
     layout.register_escape_path(
         "sinomo-local",
@@ -62,6 +62,10 @@ impl SinomoDataDir {
         self.root.join("config")
     }
 
+    pub fn shared_configs_dir(&self) -> PathBuf {
+        self.root.join("configs")
+    }
+
     pub fn dfs_dir(&self) -> PathBuf {
         self.root.join("dfs")
     }
@@ -71,7 +75,7 @@ impl SinomoDataDir {
     }
 
     pub fn dfs_expose_config_file(&self) -> PathBuf {
-        self.configs_dir().join("dfs-expose.sobj")
+        self.shared_configs_dir().join("dfs").join("expose.json")
     }
 
     pub fn providers_dir(&self) -> PathBuf {
@@ -83,6 +87,13 @@ impl SinomoDataDir {
     }
 
     pub fn provider_credentials_file(&self, provider: &str) -> PathBuf {
+        self.shared_configs_dir()
+            .join("lm")
+            .join("credentials")
+            .join(format!("{provider}.json"))
+    }
+
+    pub fn legacy_provider_credentials_file(&self, provider: &str) -> PathBuf {
         self.provider_dir(provider).join("credentials.json")
     }
 
@@ -90,6 +101,7 @@ impl SinomoDataDir {
         for path in [
             self.root(),
             self.configs_dir(),
+            self.shared_configs_dir(),
             self.dfs_dir(),
             self.files_dir(),
             self.providers_dir(),
@@ -126,15 +138,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_credentials_live_under_provider_dir() {
+    fn provider_credentials_live_under_shared_configs_dir() {
         let data = SinomoDataDir::new("root");
 
         assert_eq!(
             data.provider_credentials_file("github-copilot"),
             PathBuf::from("root")
+                .join("configs")
+                .join("lm")
+                .join("credentials")
+                .join("github-copilot.json")
+        );
+    }
+
+    #[test]
+    fn legacy_provider_credentials_path_stays_available_for_migration() {
+        let data = SinomoDataDir::new("root");
+
+        assert_eq!(
+            data.legacy_provider_credentials_file("github-copilot"),
+            PathBuf::from("root")
                 .join("providers")
                 .join("github-copilot")
                 .join("credentials.json")
+        );
+    }
+
+    #[test]
+    fn dfs_expose_config_lives_under_shared_configs_dir() {
+        let data = SinomoDataDir::new("root");
+
+        assert_eq!(
+            data.dfs_expose_config_file(),
+            PathBuf::from("root")
+                .join("configs")
+                .join("dfs")
+                .join("expose.json")
         );
     }
 }

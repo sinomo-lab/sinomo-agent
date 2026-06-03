@@ -682,6 +682,33 @@ pub enum SandboxPolicyConfigError {
     Invalid { path: String, detail: String },
 }
 
+pub fn sandbox_policy_config_definition()
+-> Result<sinomo_config::ConfigDefinition, SandboxPolicyConfigError> {
+    let definition = sinomo_config::ConfigDefinition::new(
+        SANDBOX_POLICY_CONFIG_KEY,
+        SANDBOX_STORAGE_MODULE,
+        sinomo_config::ConfigValueType::Object {
+            schema_name: "SandboxClusterPolicyConfig".to_string(),
+        },
+        "Sandbox execution policy, including mount, toolchain, network, and resource limits.",
+        sinomo_config::ConfigClusterMode::ClusterOverrideLocal,
+    )
+    .map_err(map_sandbox_config_error)?
+    .with_default(&SandboxClusterPolicyConfig::default())
+    .map_err(map_sandbox_config_error)?
+    .with_local_legacy_path("config/sandbox-policy.json");
+    debug_assert_eq!(definition.cluster_key(), SANDBOX_POLICY_CONFIG_KV_KEY);
+    Ok(definition)
+}
+
+pub fn register_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, SandboxPolicyConfigError> {
+    builder
+        .register(sandbox_policy_config_definition()?)
+        .map_err(map_sandbox_config_error)
+}
+
 pub fn sandbox_policy_config_from_cluster_kv_snapshot(
     snapshot: &KvSnapshot,
 ) -> Result<Option<SandboxClusterPolicyConfig>, SandboxPolicyConfigError> {
@@ -691,14 +718,59 @@ pub fn sandbox_policy_config_from_cluster_kv_snapshot(
 pub fn sandbox_policy_config_from_cluster_kv_entries(
     entries: &[KvEntry],
 ) -> Result<Option<SandboxClusterPolicyConfig>, SandboxPolicyConfigError> {
+    let definition = sandbox_policy_config_definition()?;
+    let cluster_key = definition.cluster_key();
     entries
         .iter()
-        .find(|entry| entry.key == SANDBOX_POLICY_CONFIG_KV_KEY)
-        .map(decode_sandbox_policy_config_entry)
+        .find(|entry| entry.key == cluster_key)
+        .map(|entry| decode_sandbox_policy_config_entry(entry, &definition))
         .transpose()
 }
 
 fn decode_sandbox_policy_config_entry(
+    entry: &KvEntry,
+    definition: &sinomo_config::ConfigDefinition,
+) -> Result<SandboxClusterPolicyConfig, SandboxPolicyConfigError> {
+    let config = match sinomo_config::decode_cluster_config_entry(entry, definition) {
+        Ok(value) => {
+            serde_json::from_value(value).map_err(|source| SandboxPolicyConfigError::Store {
+                path: entry.key.clone(),
+                detail: source.to_string(),
+            })?
+        }
+        Err(config_error) => {
+            decode_legacy_sandbox_policy_config_entry(entry).map_err(|source| {
+                SandboxPolicyConfigError::Store {
+                    path: entry.key.clone(),
+                    detail: format!("not a sinomo-config document ({config_error}); {source}"),
+                }
+            })?
+        }
+    };
+    validate_sandbox_policy_config(&config)?;
+    Ok(config)
+}
+
+fn map_sandbox_config_error(source: sinomo_config::ConfigError) -> SandboxPolicyConfigError {
+    SandboxPolicyConfigError::Store {
+        path: SANDBOX_POLICY_CONFIG_KV_KEY.to_string(),
+        detail: source.to_string(),
+    }
+}
+
+pub fn sandbox_policy_config_cluster_kv_txn(
+    config: &SandboxClusterPolicyConfig,
+) -> Result<KvTxn, SandboxPolicyConfigError> {
+    validate_sandbox_policy_config(config)?;
+    let definition = sandbox_policy_config_definition()?;
+    let value = serde_json::to_value(config).map_err(|source| SandboxPolicyConfigError::Store {
+        path: SANDBOX_POLICY_CONFIG_KV_KEY.to_string(),
+        detail: source.to_string(),
+    })?;
+    sinomo_config::cluster_config_put_txn(&definition, value).map_err(map_sandbox_config_error)
+}
+
+fn decode_legacy_sandbox_policy_config_entry(
     entry: &KvEntry,
 ) -> Result<SandboxClusterPolicyConfig, SandboxPolicyConfigError> {
     let config: SandboxClusterPolicyConfig =
@@ -710,25 +782,7 @@ fn decode_sandbox_policy_config_entry(
     Ok(config)
 }
 
-pub fn sandbox_policy_config_cluster_kv_txn(
-    config: &SandboxClusterPolicyConfig,
-) -> Result<KvTxn, SandboxPolicyConfigError> {
-    validate_sandbox_policy_config(config)?;
-    Ok(KvTxn {
-        compares: Vec::new(),
-        success: vec![
-            KvOp::put_serde(SANDBOX_POLICY_CONFIG_KV_KEY, config, None).map_err(|source| {
-                SandboxPolicyConfigError::Store {
-                    path: SANDBOX_POLICY_CONFIG_KV_KEY.to_string(),
-                    detail: source.to_string(),
-                }
-            })?,
-        ],
-        failure: Vec::new(),
-    })
-}
-
-fn validate_sandbox_policy_config(
+pub fn validate_sandbox_policy_config(
     config: &SandboxClusterPolicyConfig,
 ) -> Result<(), SandboxPolicyConfigError> {
     for prefix in &config.policy.allowed_mount_prefixes {
@@ -878,4 +932,60 @@ fn local_owned_mount_nodes(mounts: &[SandboxMount]) -> Result<Vec<NodeId>, Sandb
         }
     }
     Ok(nodes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_kv::{KvOp, KvRevision, KvVersion};
+
+    fn kv_entry_from_put(op: KvOp) -> KvEntry {
+        let KvOp::Put { key, value, .. } = op else {
+            panic!("expected put op")
+        };
+        KvEntry {
+            key,
+            value,
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(1),
+            version: KvVersion(1),
+            lease_id: None,
+        }
+    }
+
+    #[test]
+    fn sandbox_policy_config_txn_writes_config_document() {
+        let mut config = SandboxClusterPolicyConfig::default();
+        config.policy.allow_unsigned_toolchains = true;
+
+        let txn = sandbox_policy_config_cluster_kv_txn(&config).expect("policy config txn");
+        assert_eq!(txn.success.len(), 1);
+        let entry = kv_entry_from_put(txn.success.into_iter().next().expect("put op"));
+        assert_eq!(entry.key, SANDBOX_POLICY_CONFIG_KV_KEY);
+
+        let document: sinomo_config::ConfigDocument = entry.decode().expect("config document");
+        assert_eq!(document.key.as_str(), SANDBOX_POLICY_CONFIG_KEY);
+        let decoded: SandboxClusterPolicyConfig =
+            serde_json::from_value(document.value).expect("policy config value");
+        assert_eq!(decoded, config);
+
+        let from_entries = sandbox_policy_config_from_cluster_kv_entries(&[entry])
+            .expect("decode entries")
+            .expect("policy config");
+        assert_eq!(from_entries, config);
+    }
+
+    #[test]
+    fn sandbox_policy_config_reads_legacy_raw_kv_value() {
+        let mut config = SandboxClusterPolicyConfig::default();
+        config.policy.allow_remote_local_owned_mounts = true;
+        let op =
+            KvOp::put_serde(SANDBOX_POLICY_CONFIG_KV_KEY, &config, None).expect("legacy policy op");
+        let entry = kv_entry_from_put(op);
+
+        let decoded = sandbox_policy_config_from_cluster_kv_entries(&[entry])
+            .expect("decode entries")
+            .expect("policy config");
+        assert_eq!(decoded, config);
+    }
 }

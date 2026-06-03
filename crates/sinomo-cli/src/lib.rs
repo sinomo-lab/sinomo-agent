@@ -35,9 +35,10 @@ macro_rules! eprintln {
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sinomo_agent::{
-    AgentLoopInput, BoundedContextBuilder, EventEnvelopeExt, InteractionModel, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, MainAgentLoop,
-    interaction_event, interaction_model_request, user_interaction_input_event,
+    AgentLoopInput, BoundedContextBuilder, ConfigAgentToolConfig, EventEnvelopeExt,
+    InteractionModel, InteractionOutput, InteractionSession, InteractionSurface,
+    InteractionSurfaceKind, MainAgentLoop, interaction_event, interaction_model_request,
+    user_interaction_input_event,
 };
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
@@ -72,21 +73,22 @@ use sinomo_evolution::{EvolutionJobStatus, is_terminal_status};
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
     DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
-    LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError,
-    LanguageModelModelOptions, LanguageModelProviderOptions, LanguageModelProviderUsage,
-    LanguageModelRequest, LanguageModelResponse, ModelConfig, ModelPaths, ModelRuntimeConfig,
-    NvidiaProvider, OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort,
-    ProviderTextVerbosity, codex_provider, collect_provider_model_catalogs, collect_provider_usage,
+    LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_CONFIG_KV_KEY, LM_RUNTIME_CONFIG_KEY,
+    LM_RUNTIME_CONFIG_KV_KEY, LanguageModelError, LanguageModelModelOptions,
+    LanguageModelProviderOptions, LanguageModelProviderUsage, LanguageModelRequest,
+    LanguageModelResponse, ModelConfig, ModelPaths, ModelRuntimeConfig, NvidiaProvider,
+    OpenAiProvider, ProviderAccountConfig, ProviderReasoningEffort, ProviderTextVerbosity,
+    codex_provider, collect_provider_model_catalogs, collect_provider_usage,
     complete_configured_model_request_with_account,
     current_default_model as resolve_current_default_model, default_model_provider_ids,
     github_copilot_provider, load_model_config, model_config_cluster_kv_txn,
-    model_config_from_cluster_kv_snapshot, model_runtime_config_cluster_kv_txn,
+    model_config_definition, model_config_from_cluster_kv_snapshot, model_config_store,
+    model_runtime_config_cluster_kv_txn, model_runtime_config_definition,
     model_runtime_config_from_cluster_kv_snapshot, normalize_model_id_for_provider,
     normalize_model_provider, normalize_provider_account_name, provider_account_config,
     provider_api_key_from_env, provider_options_for_model, resolve_default_model,
-    save_model_config, save_provider_api_key, save_provider_api_key_in_model_config,
-    subscription_usage_provider_ids, test_provider_account_credentials, test_provider_credentials,
-    write_default_model_config,
+    save_provider_api_key, save_provider_api_key_in_model_config, subscription_usage_provider_ids,
+    test_provider_account_credentials, test_provider_credentials, write_default_model_config,
 };
 use sinomo_pytorch::{
     MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, ManagedPytorchServer, ManagedPytorchServerConfig,
@@ -1248,15 +1250,18 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     let provider = options.provider.clone();
     let model = options.model.clone();
     let (runtime_config, _) = load_model_runtime_config_for_node(&data_dir)?;
+    let tool_registry = main_agent_config_tool_registry(&data_dir)?;
     let loop_model = ConfiguredInteractionModel {
-        data_dir,
+        data_dir: data_dir.clone(),
         provider: provider.clone(),
         model: model.clone(),
         account,
         runtime_config,
         managed_pytorch: Mutex::new(None),
     };
-    let decision = MainAgentLoop::new(loop_model, provider, model).decide(&input)?;
+    let decision = MainAgentLoop::new(loop_model, provider, model)
+        .with_tool_registry(tool_registry)
+        .decide(&input)?;
     if decision.text.trim().is_empty() {
         println!("{}", agent_decision_json(&decision)?);
     } else {
@@ -1266,6 +1271,27 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn main_agent_config_tool_registry(
+    data_dir: &SinomoDataDir,
+) -> Result<sinomo_agent::AgentToolRegistry, CliError> {
+    let store = main_agent_config_store()?;
+    Ok(sinomo_agent::AgentToolRegistry::config_management(
+        ConfigAgentToolConfig::new(data_dir.clone(), store),
+    ))
+}
+
+pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {
+    let builder = sinomo_runtime::config::ConfigRegistry::builder();
+    let builder = sinomo_runtime::dfs::register_dfs_config_definitions(builder)?;
+    let builder =
+        sinomo_runtime::rollout::register_config_definitions(builder).map_err(CliError::from)?;
+    let builder = sinomo_runtime::sandbox::register_config_definitions(builder)?;
+    let builder =
+        sinomo_lm::register_config_definitions(builder).map_err(CliError::LanguageModel)?;
+    let builder = sinomo_evolution::register_config_definitions(builder).map_err(CliError::from)?;
+    Ok(sinomo_runtime::config::ConfigStore::new(builder.build()))
 }
 
 fn agent_decision_json(decision: &sinomo_agent::AgentLoopDecision) -> Result<String, CliError> {

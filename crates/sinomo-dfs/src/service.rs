@@ -13,7 +13,7 @@
 //! plane routes still require daemon-owned cluster access and remain registered by the
 //! daemon data-plane adapter.
 
-use sinomo_dfs::{
+use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_STATUS_ROUTE,
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeStore, DfsMetadataBackend,
@@ -30,7 +30,10 @@ use sinomo_network::{
     read_cluster_kv_prefix_values, read_cluster_state_without_kv,
 };
 
-use crate::{Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture};
+use sinomo_service::{
+    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
+    ServiceRegistryBuilder,
+};
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
@@ -41,6 +44,10 @@ impl DfsService {
     pub fn new() -> Self {
         Self
     }
+}
+
+pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
+    builder.register(DfsService::new())
 }
 
 impl Service for DfsService {
@@ -438,12 +445,12 @@ fn dfs_metadata_snapshot_install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ResponseSink, ServiceRegistry, ServiceSigner};
-    use sinomo_dfs::DFS_RPC_CATEGORY;
-    use sinomo_dfs::{
+    use crate::DFS_RPC_CATEGORY;
+    use crate::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig,
         DfsMetadataJournalBatch, DfsMetadataShardId,
     };
+    use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -496,9 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn dfs_status_serves_in_local_mode_without_a_cluster() {
-        let registry = ServiceRegistry::builder()
-            .register(DfsService::new())
-            .build();
+        let registry = register_services(ServiceRegistry::builder()).build();
         let (disposition, response) =
             dispatch_local(&registry, temp_data_dir(), DFS_STATUS_ROUTE, &()).await;
         assert_eq!(disposition, ServiceDisposition::Continue);
@@ -507,9 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn dfs_expose_config_serves_default_in_local_mode() {
-        let registry = ServiceRegistry::builder()
-            .register(DfsService::new())
-            .build();
+        let registry = register_services(ServiceRegistry::builder()).build();
         let (disposition, response) =
             dispatch_local(&registry, temp_data_dir(), DFS_EXPOSE_CONFIG_ROUTE, &()).await;
         assert_eq!(disposition, ServiceDisposition::Continue);
@@ -521,9 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn dfs_metadata_journal_batch_applies_locally_without_a_cluster() {
-        let registry = ServiceRegistry::builder()
-            .register(DfsService::new())
-            .build();
+        let registry = register_services(ServiceRegistry::builder()).build();
         let command = DfsMetadataJournalBatchCommand {
             request_id: "req-journal-1".to_string(),
             source_node_id: None,
@@ -550,9 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn dfs_inspection_status_serves_in_local_mode() {
-        let registry = ServiceRegistry::builder()
-            .register(DfsService::new())
-            .build();
+        let registry = register_services(ServiceRegistry::builder()).build();
         let (disposition, response) = dispatch_local(
             &registry,
             temp_data_dir(),

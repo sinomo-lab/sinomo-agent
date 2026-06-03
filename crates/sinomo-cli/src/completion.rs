@@ -1301,6 +1301,13 @@ fn tui_slash_command_layer() -> Vec<CommandSpec> {
             vec![],
         ),
         cmd(
+            "settings",
+            "open the TUI settings page",
+            vec![],
+            vec![],
+            vec![],
+        ),
+        cmd(
             "resume",
             "resume a local TUI session",
             vec![],
@@ -2291,6 +2298,12 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.label == "sessions")
+        );
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == "settings")
         );
         assert!(completions.items.iter().any(|item| item.label == "resume"));
         assert!(completions.items.iter().any(|item| item.label == "cluster"));

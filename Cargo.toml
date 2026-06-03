@@ -15,6 +15,7 @@ default-members = [
     "crates/sinomo-audio",
     "crates/sinomo-benchmarks",
     "crates/sinomo-cli",
+    "crates/sinomo-config",
     "crates/sinomo-core",
     "crates/sinomo-daemon",
     "crates/sinomo-deliberation",

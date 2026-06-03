@@ -5916,6 +5916,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-kv",
+ "sinomo-local",
+ "sinomo-network",
+ "sinomo-service",
+ "sinomo-storage",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
+]
+
+[[package]]
 name = "sinomo-core"
 version = "0.1.0"
 dependencies = [
@@ -5938,6 +5954,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-events",
@@ -5989,6 +6006,7 @@ dependencies = [
  "fs2",
  "serde",
  "serde_json",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-events",
  "sinomo-kv",
@@ -5997,9 +6015,11 @@ dependencies = [
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-service",
  "sinomo-storage",
  "thiserror 2.0.18",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -6250,6 +6270,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-events",
  "sinomo-local",
@@ -6271,6 +6292,7 @@ name = "sinomo-runtime"
 version = "0.1.0"
 dependencies = [
  "sinomo-api",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-daemon",
  "sinomo-device",
@@ -6303,18 +6325,22 @@ dependencies = [
  "getrandom 0.2.17",
  "serde",
  "serde_json",
+ "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-events",
  "sinomo-kv",
+ "sinomo-local",
  "sinomo-module",
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-service",
  "sinomo-storage",
  "tar",
  "thiserror 2.0.18",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -6388,11 +6414,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-core",
- "sinomo-dfs",
  "sinomo-kv",
  "sinomo-local",
  "sinomo-network",
- "sinomo-sandbox",
  "thiserror 2.0.18",
  "tokio",
 ]

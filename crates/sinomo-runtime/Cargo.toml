@@ -16,6 +16,7 @@ sandbox = ["sinomo-daemon/sandbox"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api" }
+sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-daemon = { path = "../sinomo-daemon" }
 sinomo-device = { path = "../sinomo-device" }

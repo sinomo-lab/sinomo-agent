@@ -231,6 +231,7 @@ pub enum AgentToolCapability {
     CallModel,
     ManageBackgroundTask,
     InspectClusterState,
+    ManageConfig,
 }
 
 impl AgentToolCapability {
@@ -247,6 +248,7 @@ impl AgentToolCapability {
             AgentToolCapability::CallModel => "call_model",
             AgentToolCapability::ManageBackgroundTask => "manage_background_task",
             AgentToolCapability::InspectClusterState => "inspect_cluster_state",
+            AgentToolCapability::ManageConfig => "manage_config",
         }
     }
 }

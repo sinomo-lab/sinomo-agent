@@ -18,7 +18,12 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use sinomo_dfs::{DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE};
+use sinomo_config::{
+    ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
+};
+use sinomo_dfs::{
+    DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE, register_services as register_dfs_services,
+};
 use sinomo_kv::{KvEntry, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -35,23 +40,22 @@ use sinomo_rollout::{
 use sinomo_sandbox::{
     LocalSandboxBackend, SandboxAddToolchainArtifactRequest, SandboxAddToolchainArtifactResponse,
     SandboxAddToolchainCommandRequest, SandboxAddToolchainCommandResponse, SandboxBackend,
-    SandboxBackendError, SandboxCheckpointRequest, SandboxCheckpointResponse,
-    SandboxCreateInstanceRequest, SandboxCreateInstanceResponse, SandboxDestroyRequest,
-    SandboxDestroyResponse, SandboxHttpFetchFileResult, SandboxHttpFetchToFileRequest,
-    SandboxHttpRequest, SandboxHttpResponse, SandboxImportBusyBoxToolchainRequest,
-    SandboxImportBusyBoxToolchainResponse, SandboxImportToolchainPackageFromPathRequest,
-    SandboxImportToolchainPackageRequest, SandboxImportToolchainPackageResponse,
-    SandboxListRequest, SandboxListResponse, SandboxLocalCommandOutcome, SandboxProcessPlanOutcome,
-    SandboxReadRequest, SandboxReadResponse, SandboxRebootRequest, SandboxRebootResponse,
-    SandboxResumeRequest, SandboxResumeResponse, SandboxRunProcessPlanRequest,
-    SandboxRunToolchainRequest, SandboxStatusRequest, SandboxStatusResponse,
-    SandboxUpdateInstanceRequest, SandboxUpdateInstanceResponse, SandboxWriteRequest,
-    SandboxWriteResponse,
+    SandboxBackendError, SandboxBackendFactory, SandboxCheckpointRequest,
+    SandboxCheckpointResponse, SandboxCreateInstanceRequest, SandboxCreateInstanceResponse,
+    SandboxDestroyRequest, SandboxDestroyResponse, SandboxHttpFetchFileResult,
+    SandboxHttpFetchToFileRequest, SandboxHttpRequest, SandboxHttpResponse,
+    SandboxImportBusyBoxToolchainRequest, SandboxImportBusyBoxToolchainResponse,
+    SandboxImportToolchainPackageFromPathRequest, SandboxImportToolchainPackageRequest,
+    SandboxImportToolchainPackageResponse, SandboxListRequest, SandboxListResponse,
+    SandboxLocalCommandOutcome, SandboxProcessPlanOutcome, SandboxReadRequest, SandboxReadResponse,
+    SandboxRebootRequest, SandboxRebootResponse, SandboxResumeRequest, SandboxResumeResponse,
+    SandboxRunProcessPlanRequest, SandboxRunToolchainRequest, SandboxStatusRequest,
+    SandboxStatusResponse, SandboxUpdateInstanceRequest, SandboxUpdateInstanceResponse,
+    SandboxWriteRequest, SandboxWriteResponse,
 };
 use sinomo_service::{
-    ClusterAccess, DfsService, ResponseSink, SandboxBackendFactory, SandboxService, Service,
-    ServiceContext, ServiceDisposition, ServiceError, ServiceFuture, ServiceRegistry,
-    ServiceRegistryBuilder, ServiceSigner,
+    ClusterAccess, ResponseSink, Service, ServiceContext, ServiceDisposition, ServiceError,
+    ServiceFuture, ServiceRegistry, ServiceRegistryBuilder, ServiceSigner,
 };
 
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
@@ -552,8 +556,10 @@ fn daemon_service_registry(
     paths: &DaemonPaths,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> ServiceRegistry {
-    let builder: ServiceRegistryBuilder = ServiceRegistry::builder().register(DfsService::new());
-    register_rollout_services(builder)
+    let builder: ServiceRegistryBuilder = register_dfs_services(ServiceRegistry::builder());
+    let config_registry = daemon_config_registry();
+    let builder = register_config_services(builder, config_registry);
+    let builder = register_rollout_services(builder)
         .register(DaemonControlService {
             paths: paths.clone(),
         })
@@ -569,11 +575,30 @@ fn daemon_service_registry(
         })
         .register(DaemonDfsDataPlaneService {
             paths: paths.clone(),
-        })
-        .register(SandboxService::new(Arc::new(DaemonSandboxBackendFactory {
+        });
+    sinomo_sandbox::register_services_with_factory(
+        builder,
+        Arc::new(DaemonSandboxBackendFactory {
             paths: paths.clone(),
-        })))
+        }),
+    )
+    .build()
+}
+
+fn daemon_config_registry() -> ConfigRegistry {
+    register_daemon_config_definitions(ConfigRegistry::builder())
+        .expect("daemon config definitions must be valid")
         .build()
+}
+
+fn register_daemon_config_definitions(
+    builder: ConfigRegistryBuilder,
+) -> Result<ConfigRegistryBuilder, String> {
+    let builder =
+        sinomo_dfs::register_dfs_config_definitions(builder).map_err(|error| error.to_string())?;
+    let builder =
+        sinomo_rollout::register_config_definitions(builder).map_err(|error| error.to_string())?;
+    sinomo_sandbox::register_config_definitions(builder).map_err(|error| error.to_string())
 }
 
 /// Collects a service's response frame(s) so the daemon can write them to the blocking

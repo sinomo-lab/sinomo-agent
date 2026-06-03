@@ -15,11 +15,9 @@ ring = "r1"
 serde_json.workspace = true
 thiserror.workspace = true
 sinomo-core = { path = "../sinomo-core" }
-sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
-sinomo-sandbox = { path = "../sinomo-sandbox" }
 
 [dev-dependencies]
 serde.workspace = true

@@ -20,6 +20,8 @@ time.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
+sinomo-config = { path = "../sinomo-config" }
+sinomo-local = { path = "../sinomo-local" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
@@ -29,5 +31,4 @@ sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 
 [dev-dependencies]
-sinomo-local = { path = "../sinomo-local" }
 tokio = { version = "1.44", features = ["macros", "rt", "rt-multi-thread", "time"] }

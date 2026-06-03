@@ -10,6 +10,7 @@
 
 use std::sync::Arc;
 
+use crate::{LocalSandboxBackend, SandboxBackend, SandboxBackendError};
 use sinomo_network::{
     ObjectRpcRequest, ObjectRpcResponse, SANDBOX_CHECKPOINT_ROUTE, SANDBOX_CREATE_ROUTE,
     SANDBOX_DESTROY_ROUTE, SANDBOX_HTTP_FETCH_ROUTE, SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
@@ -19,9 +20,11 @@ use sinomo_network::{
     SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE, SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
     SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
 };
-use sinomo_sandbox::{LocalSandboxBackend, SandboxBackend, SandboxBackendError};
 
-use crate::{Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture};
+use sinomo_service::{
+    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
+    ServiceRegistryBuilder,
+};
 
 impl From<SandboxBackendError> for ServiceError {
     fn from(error: SandboxBackendError) -> Self {
@@ -59,6 +62,17 @@ impl SandboxService {
     pub fn new(factory: Arc<dyn SandboxBackendFactory>) -> Self {
         Self { factory }
     }
+}
+
+pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
+    register_services_with_factory(builder, Arc::new(LocalSandboxBackendFactory))
+}
+
+pub fn register_services_with_factory(
+    builder: ServiceRegistryBuilder,
+    factory: Arc<dyn SandboxBackendFactory>,
+) -> ServiceRegistryBuilder {
+    builder.register(SandboxService::new(factory))
 }
 
 impl Service for SandboxService {
@@ -219,7 +233,7 @@ mod tests {
 
     use sinomo_local::SinomoDataDir;
 
-    use crate::{ResponseSink, ServiceRegistry, ServiceSigner};
+    use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
 
     #[derive(Clone, Default)]
     struct CollectingSink {
@@ -264,9 +278,11 @@ mod tests {
     /// propagates the factory's error (the request body is never decoded in this path).
     #[tokio::test]
     async fn factory_error_propagates() {
-        let registry = ServiceRegistry::builder()
-            .register(SandboxService::new(Arc::new(UnavailableFactory)))
-            .build();
+        let registry = register_services_with_factory(
+            ServiceRegistry::builder(),
+            Arc::new(UnavailableFactory),
+        )
+        .build();
         assert!(registry.owns(SANDBOX_STATUS_ROUTE));
 
         let request =

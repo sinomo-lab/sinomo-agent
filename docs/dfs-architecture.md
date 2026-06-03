@@ -823,4 +823,4 @@ These events carry node, filesystem, object, version, policy, content hash, and 
 - Lifecycle maintenance can scrub content, run local content anti-entropy, collect old object versions, reclaim orphan blobs, compact tombstones, and report skipped work when a metadata backend is absent.
 - Content quotas cover blob, logical object, manifest, and staging bytes.
 - Operational metrics report repair backlog, metadata counts, content footprint, transfer windows, and incoming transfer progress.
-- DFS expose config defaults to `config/dfs-expose.sobj`; legacy `dfs-expose.json` is read for migration and explicit `.json` paths remain supported for compatibility.
+- DFS expose config defaults to `configs/dfs/expose.json` as a shared `sinomo-config` document; legacy `config/dfs-expose.sobj` and `config/dfs-expose.json` are read for migration, and explicit `.sobj` or `.json` paths remain supported for compatibility.

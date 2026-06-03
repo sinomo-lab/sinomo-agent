@@ -73,6 +73,9 @@ pub enum AgentToolKind {
     WriteFile,
     SearchFiles,
     ApplyPatch,
+    ConfigSearch,
+    ConfigGet,
+    ConfigSet,
     StartCommandSession,
     InspectCommandSession,
     WriteCommandStdin,
@@ -289,6 +292,24 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
             "observe_vision",
             "Attach a current screen/camera observation for multimodal reasoning.",
             false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ConfigSearch,
+            "config_search",
+            "Search registered Sinomo configuration keys by key, owner, or description.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ConfigGet,
+            "config_get",
+            "Read a registered Sinomo configuration value through the shared config resolver.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ConfigSet,
+            "config_set",
+            "Update a registered Sinomo configuration value through the shared config resolver.",
+            true,
         ),
     ]
 }
@@ -606,6 +627,7 @@ pub struct MainAgentLoop<M> {
     provider: String,
     model_id: String,
     definition: AgentDefinition,
+    tools: AgentToolRegistry,
 }
 
 impl<M: InteractionModel> MainAgentLoop<M> {
@@ -624,6 +646,7 @@ impl<M: InteractionModel> MainAgentLoop<M> {
             provider: provider.into(),
             model_id: model_id.into(),
             definition,
+            tools: AgentToolRegistry::new(),
         }
     }
 
@@ -635,6 +658,15 @@ impl<M: InteractionModel> MainAgentLoop<M> {
     pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
         self.definition = definition;
         self
+    }
+
+    pub fn with_tool_registry(mut self, tools: AgentToolRegistry) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub fn tool_registry(&self) -> AgentToolRegistry {
+        self.tools.clone()
     }
 
     pub fn definition(&self) -> &AgentDefinition {
@@ -698,14 +730,25 @@ impl<M: InteractionModel> MainAgentLoop<M> {
     }
 
     pub fn request(&self, input: &AgentLoopInput) -> Result<LanguageModelRequest, AgentError> {
-        let tools = self.definition.resolve_tool_specs(&input.tool_specs);
+        let system_content = if self.tools.is_empty() {
+            let tools = self.definition.resolve_tool_specs(&input.tool_specs);
+            render_agent_system_prompt(&self.definition, tools)
+        } else {
+            let tool_plan = AgentToolPlanner::plan(
+                self.tools.descriptors(),
+                input.tool_specs.clone(),
+                self.definition.tools.clone(),
+                input.tool_specs.is_empty(),
+            );
+            render_agent_system_prompt_with_descriptors(&self.definition, &tool_plan.descriptors())
+        };
         Ok(LanguageModelRequest {
             provider: self.provider.clone(),
             model: self.model_id.clone(),
             messages: vec![
                 LanguageModelMessage {
                     role: LanguageModelRole::System,
-                    content: render_agent_system_prompt(&self.definition, tools),
+                    content: system_content,
                 },
                 LanguageModelMessage {
                     role: LanguageModelRole::User,

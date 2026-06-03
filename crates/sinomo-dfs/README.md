@@ -161,7 +161,7 @@ dfs/pins
 files
 ```
 
-The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly. Local DFS exposure config defaults to `$SINOMO_DATA_DIR/config/dfs-expose.sobj`; legacy `dfs-expose.json` is read for migration and explicit `.json` config paths remain supported for compatibility.
+The exact storage format is intentionally hidden behind crate APIs and metadata backend traits. Other crates should use the DFS interfaces instead of reading these files directly. Local DFS exposure config defaults to `$SINOMO_DATA_DIR/configs/dfs/expose.json` as a shared `sinomo-config` document; legacy `$SINOMO_DATA_DIR/config/dfs-expose.sobj` and `dfs-expose.json` are read for migration, and explicit `.sobj` or `.json` config paths remain supported for compatibility.
 
 ## Usage Examples
 

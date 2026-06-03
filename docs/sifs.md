@@ -40,7 +40,7 @@ Current predefined policy model:
 
 The parent directories `/`, `/sinomo`, `/sinomo/nodes`, and `/sinomo/nodes/<node_id>` are namespace anchors. They make the cluster layout inspectable and routable, while the policy boundary for local host-file exposure is the `files` subtree itself.
 
-The default local exposure config lives at `$SINOMO_DATA_DIR/config/dfs-expose.sobj`. Existing `dfs-expose.json` files are read for migration, and explicit `.json` paths remain supported for compatibility, but the default internal config is a Sinomo Object document.
+The default local exposure config lives at `$SINOMO_DATA_DIR/configs/dfs/expose.json` as a shared `sinomo-config` document. Existing `$SINOMO_DATA_DIR/config/dfs-expose.sobj` and `dfs-expose.json` files are read for migration, and explicit `.sobj` or `.json` paths remain supported for compatibility.
 
 ## KV Boundary
 

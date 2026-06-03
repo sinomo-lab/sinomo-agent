@@ -3135,50 +3135,74 @@ pub(crate) fn write_sandbox_policy_config_for_node(
 }
 
 fn local_sandbox_policy_config_path(data_dir: &SinomoDataDir) -> PathBuf {
-    data_dir.configs_dir().join("sandbox-policy.json")
+    sandbox_policy_config_definition()
+        .map(|definition| definition.local_path(data_dir))
+        .unwrap_or_else(|_| {
+            sinomo_runtime::config::configs_dir(data_dir)
+                .join("sandbox")
+                .join("policy.json")
+        })
 }
 
 fn load_local_sandbox_policy_config(
     data_dir: &SinomoDataDir,
 ) -> Result<(sinomo_runtime::sandbox::SandboxClusterPolicyConfig, String), CliError> {
-    let path = local_sandbox_policy_config_path(data_dir);
-    if !path.exists() {
-        return Ok((
-            sinomo_runtime::sandbox::SandboxClusterPolicyConfig::default(),
-            "built-in default".to_string(),
-        ));
-    }
-    let content = std::fs::read_to_string(&path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let config = serde_json::from_str(&content).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok((config, path.display().to_string()))
+    let store = sandbox_policy_config_store()?;
+    let resolution = store.get(
+        data_dir,
+        None,
+        sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KEY,
+    )?;
+    let config: sinomo_runtime::sandbox::SandboxClusterPolicyConfig =
+        serde_json::from_value(resolution.value).map_err(|source| CliError::Json {
+            path: resolution.definition.key.to_string(),
+            detail: source.to_string(),
+        })?;
+    sinomo_runtime::sandbox::validate_sandbox_policy_config(&config)?;
+    let source = match resolution.source {
+        sinomo_runtime::config::ConfigValueSource::Default => "built-in default".to_string(),
+        sinomo_runtime::config::ConfigValueSource::MigratedLocal => {
+            format!(
+                "{} (migrated)",
+                resolution.definition.local_path(data_dir).display()
+            )
+        }
+        _ => resolution
+            .definition
+            .local_path(data_dir)
+            .display()
+            .to_string(),
+    };
+    Ok((config, source))
 }
 
 fn write_local_sandbox_policy_config(
     data_dir: &SinomoDataDir,
     config: &sinomo_runtime::sandbox::SandboxClusterPolicyConfig,
 ) -> Result<PathBuf, CliError> {
-    let path = local_sandbox_policy_config_path(data_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let content = serde_json::to_string_pretty(config).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    std::fs::write(&path, content).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(path)
+    sinomo_runtime::sandbox::validate_sandbox_policy_config(config)?;
+    let store = sandbox_policy_config_store()?;
+    store.set_typed(
+        data_dir,
+        None,
+        sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KEY,
+        config,
+        sinomo_runtime::config::ConfigWriteTarget::Local,
+    )?;
+    Ok(local_sandbox_policy_config_path(data_dir))
+}
+
+fn sandbox_policy_config_definition() -> Result<sinomo_runtime::config::ConfigDefinition, CliError>
+{
+    sinomo_runtime::sandbox::sandbox_policy_config_definition().map_err(Into::into)
+}
+
+fn sandbox_policy_config_store() -> Result<sinomo_runtime::config::ConfigStore, CliError> {
+    let registry = sinomo_runtime::sandbox::register_config_definitions(
+        sinomo_runtime::config::ConfigRegistry::builder(),
+    )?
+    .build();
+    Ok(sinomo_runtime::config::ConfigStore::new(registry))
 }
 
 fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
@@ -3299,6 +3323,10 @@ fn print_sandbox_policy_config(
     println!("source: {source}");
     println!(
         "key: {}",
+        sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KEY
+    );
+    println!(
+        "cluster key: {}",
         sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KV_KEY
     );
     println!(

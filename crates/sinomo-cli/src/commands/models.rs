@@ -891,8 +891,16 @@ pub(crate) fn load_model_config_for_node(
             .unwrap_or_default();
         return Ok((config, paths.kv_snapshot));
     }
-    let paths = ModelPaths::new(data_dir);
-    Ok((load_model_config(&paths).unwrap_or_default(), paths.config))
+    let store = model_config_store().map_err(CliError::LanguageModel)?;
+    let config = store
+        .get_typed(data_dir, None, LM_PROVIDER_CONFIG_KEY)
+        .map_err(CliError::from)?;
+    Ok((
+        config,
+        model_config_definition()
+            .map_err(CliError::LanguageModel)?
+            .local_path(data_dir),
+    ))
 }
 
 fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
@@ -926,9 +934,19 @@ pub(crate) fn write_model_config_for_node(
         commit_model_config_cluster_txn(data_dir, txn)?;
         return Ok(paths.kv_snapshot);
     }
-    let paths = ModelPaths::new(data_dir);
-    save_model_config(&paths.config, config).map_err(CliError::LanguageModel)?;
-    Ok(paths.config)
+    let store = model_config_store().map_err(CliError::LanguageModel)?;
+    store
+        .set_typed(
+            data_dir,
+            None,
+            LM_PROVIDER_CONFIG_KEY,
+            config,
+            sinomo_runtime::config::ConfigWriteTarget::Local,
+        )
+        .map_err(CliError::from)?;
+    Ok(model_config_definition()
+        .map_err(CliError::LanguageModel)?
+        .local_path(data_dir))
 }
 
 pub(crate) fn load_model_runtime_config_for_node(
@@ -960,47 +978,40 @@ pub(crate) fn write_model_runtime_config_for_node(
 }
 
 fn local_model_runtime_config_path(data_dir: &SinomoDataDir) -> PathBuf {
-    data_dir.configs_dir().join("models-runtime.json")
+    model_runtime_config_definition()
+        .map(|definition| definition.local_path(data_dir))
+        .unwrap_or_else(|_| {
+            sinomo_runtime::config::configs_dir(data_dir)
+                .join("lm")
+                .join("runtime.json")
+        })
 }
 
 fn load_local_model_runtime_config(
     data_dir: &SinomoDataDir,
 ) -> Result<(ModelRuntimeConfig, PathBuf), CliError> {
-    let path = local_model_runtime_config_path(data_dir);
-    if !path.exists() {
-        return Ok((ModelRuntimeConfig::default(), path));
-    }
-    let content = fs::read_to_string(&path).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let config = serde_json::from_str(&content).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok((config, path))
+    let store = model_config_store().map_err(CliError::LanguageModel)?;
+    let config = store
+        .get_typed(data_dir, None, LM_RUNTIME_CONFIG_KEY)
+        .map_err(CliError::from)?;
+    Ok((config, local_model_runtime_config_path(data_dir)))
 }
 
 fn write_local_model_runtime_config(
     data_dir: &SinomoDataDir,
     config: &ModelRuntimeConfig,
 ) -> Result<PathBuf, CliError> {
-    let path = local_model_runtime_config_path(data_dir);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CliError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let content = serde_json::to_string_pretty(config).map_err(|source| CliError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(&path, content).map_err(|source| CliError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(path)
+    let store = model_config_store().map_err(CliError::LanguageModel)?;
+    store
+        .set_typed(
+            data_dir,
+            None,
+            LM_RUNTIME_CONFIG_KEY,
+            config,
+            sinomo_runtime::config::ConfigWriteTarget::Local,
+        )
+        .map_err(CliError::from)?;
+    Ok(local_model_runtime_config_path(data_dir))
 }
 
 #[cfg(test)]

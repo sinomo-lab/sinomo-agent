@@ -31,6 +31,15 @@ impl AgentToolRegistry {
         super::local_workspace::registry(config)
     }
 
+    pub fn config_management(config: super::ConfigAgentToolConfig) -> Self {
+        super::config::registry(config)
+    }
+
+    pub fn with_config_management(self, config: super::ConfigAgentToolConfig) -> Self {
+        super::config::register_tools(&self, config);
+        self
+    }
+
     pub fn with_tool<T: AgentTool + 'static>(self, tool: T) -> Self {
         self.register(tool);
         self

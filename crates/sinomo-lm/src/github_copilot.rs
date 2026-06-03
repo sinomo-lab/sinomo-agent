@@ -2,13 +2,13 @@ use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelProvider, LanguageModelProviderInfo,
     LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse,
     LanguageModelResponseFormat, LanguageModelRole, LanguageModelUsage, LanguageModelUsageLimit,
-    LanguageModelUsageProvider, render_plain_prompt, selected_model, unix_timestamp,
+    LanguageModelUsageProvider, read_provider_credentials_json_value, render_plain_prompt,
+    selected_model, unix_timestamp, write_provider_credentials_json_value,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::local::SinomoDataDir;
-use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use time::OffsetDateTime;
@@ -310,49 +310,38 @@ impl GitHubCopilotProvider {
     }
 
     fn load_stored_github_token(&self) -> Result<Option<StoredGitHubToken>, LanguageModelError> {
-        let Some(path) = &self.config.token_store_path else {
-            return Ok(None);
-        };
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content =
-            fs::read_to_string(path).map_err(|source| LanguageModelError::TokenStore {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        serde_json::from_str(&content)
-            .map(Some)
+        let value =
+            read_provider_credentials_json_value(Self::PROVIDER_ID, &self.config.token_store_path)?;
+        value
+            .map(serde_json::from_value)
+            .transpose()
             .map_err(|source| LanguageModelError::TokenStore {
-                path: path.display().to_string(),
+                path: self
+                    .config
+                    .token_store_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<github-copilot-credentials>".to_string()),
                 detail: source.to_string(),
             })
     }
 
     fn save_github_token(&self, token: &str, source: &str) -> Result<(), LanguageModelError> {
-        let Some(path) = &self.config.token_store_path else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| LanguageModelError::TokenStore {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
         let payload = StoredGitHubToken {
             github_token: token.to_string(),
             source: source.to_string(),
             created_at_unix: unix_timestamp(),
         };
-        let content = serde_json::to_string_pretty(&payload).map_err(|source| {
+        let value = serde_json::to_value(payload).map_err(|source| {
             LanguageModelError::RequestSerialization {
                 detail: source.to_string(),
             }
         })?;
-        fs::write(path, content).map_err(|source| LanguageModelError::TokenStore {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
+        write_provider_credentials_json_value(
+            Self::PROVIDER_ID,
+            &self.config.token_store_path,
+            value,
+        )
     }
 }
 

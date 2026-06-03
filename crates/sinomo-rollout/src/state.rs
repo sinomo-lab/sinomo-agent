@@ -4,8 +4,13 @@ use crate::{
     SelfRolloutPaths, executable_name,
 };
 use serde::{Deserialize, Serialize};
+use sinomo_config::{
+    ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
+    ConfigStore, ConfigValueType, ConfigWriteTarget,
+};
 use sinomo_core::{ClusterNodeRolloutStatus, HotSwapState, Id};
 use sinomo_events::EventSequence;
+use sinomo_local::SinomoDataDir;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext};
 use std::fs;
@@ -15,6 +20,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const ROLLOUT_DIAGNOSTIC_TAIL_BYTES: usize = 8 * 1024;
+pub const ROLLOUT_TELEMETRY_GATE_CONFIG_KEY: &str = "rollout.telemetry.gates";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RolloutMainActivation {
@@ -185,7 +191,65 @@ pub fn rollout_telemetry_advance_state_path(paths: &SelfRolloutPaths) -> PathBuf
 }
 
 pub fn rollout_telemetry_gate_config_path(paths: &SelfRolloutPaths) -> PathBuf {
+    rollout_data_dir_root(paths)
+        .map(|root| {
+            root.join("configs")
+                .join("rollout")
+                .join("telemetry")
+                .join("gates.json")
+        })
+        .unwrap_or_else(|| rollout_telemetry_gate_legacy_config_path(paths))
+}
+
+pub fn rollout_telemetry_gate_legacy_config_path(paths: &SelfRolloutPaths) -> PathBuf {
     paths.root.join("telemetry-gates.sobj")
+}
+
+pub fn rollout_telemetry_gate_config_definition() -> Result<ConfigDefinition, RolloutError> {
+    ConfigDefinition::new(
+        ROLLOUT_TELEMETRY_GATE_CONFIG_KEY,
+        "sinomo-rollout",
+        ConfigValueType::Object {
+            schema_name: "RolloutTelemetryGateConfig".to_string(),
+        },
+        "Local rollout telemetry gates used for shadow/canary auto-promotion.",
+        ConfigClusterMode::LocalOnly,
+    )
+    .map_err(map_rollout_config_error)?
+    .with_default(&RolloutTelemetryGateConfig::default())
+    .map_err(map_rollout_config_error)
+}
+
+pub fn register_config_definitions(
+    builder: ConfigRegistryBuilder,
+) -> Result<ConfigRegistryBuilder, RolloutError> {
+    builder
+        .register(rollout_telemetry_gate_config_definition()?)
+        .map_err(map_rollout_config_error)
+}
+
+fn rollout_config_store() -> Result<ConfigStore, RolloutError> {
+    let registry = register_config_definitions(ConfigRegistry::builder())?.build();
+    Ok(ConfigStore::new(registry))
+}
+
+fn rollout_config_data_dir(paths: &SelfRolloutPaths) -> Result<SinomoDataDir, RolloutError> {
+    let root = rollout_data_dir_root(paths).ok_or_else(|| RolloutError::Io {
+        path: paths.root.display().to_string(),
+        detail: "rollout path does not have a data-dir parent".to_string(),
+    })?;
+    Ok(SinomoDataDir::new(root.to_path_buf()))
+}
+
+fn rollout_data_dir_root(paths: &SelfRolloutPaths) -> Option<&Path> {
+    paths.root.parent()
+}
+
+fn map_rollout_config_error(source: ConfigError) -> RolloutError {
+    RolloutError::Config {
+        key: ROLLOUT_TELEMETRY_GATE_CONFIG_KEY.to_string(),
+        detail: source.to_string(),
+    }
 }
 
 pub fn rollout_staging_dir(paths: &SelfRolloutPaths) -> PathBuf {
@@ -636,13 +700,34 @@ pub fn write_rollout_telemetry_advance_state(
 pub fn read_rollout_telemetry_gate_config(
     rollout_paths: &SelfRolloutPaths,
 ) -> Result<Option<RolloutTelemetryGateConfig>, RolloutError> {
-    let path = rollout_telemetry_gate_config_path(rollout_paths);
-    if !path.exists() {
-        return Ok(None);
+    let data_dir = rollout_config_data_dir(rollout_paths)?;
+    let definition = rollout_telemetry_gate_config_definition()?;
+    let store = rollout_config_store()?;
+    if definition.local_path(&data_dir).exists() {
+        return store
+            .get_typed(&data_dir, None, ROLLOUT_TELEMETRY_GATE_CONFIG_KEY)
+            .map(Some)
+            .map_err(map_rollout_config_error);
     }
-    match read_object(&path) {
-        Ok(config) => Ok(Some(config)),
+    let legacy_path = rollout_telemetry_gate_legacy_config_path(rollout_paths);
+    match read_object(&legacy_path) {
+        Ok(config) => {
+            store
+                .set_typed(
+                    &data_dir,
+                    None,
+                    ROLLOUT_TELEMETRY_GATE_CONFIG_KEY,
+                    &config,
+                    ConfigWriteTarget::Local,
+                )
+                .map_err(map_rollout_config_error)?;
+            Ok(Some(config))
+        }
         Err(RolloutError::Object { .. }) => Ok(None),
+        Err(RolloutError::Io { .. }) if !legacy_path.exists() => store
+            .get_typed(&data_dir, None, ROLLOUT_TELEMETRY_GATE_CONFIG_KEY)
+            .map(Some)
+            .map_err(map_rollout_config_error),
         Err(error) => Err(error),
     }
 }
@@ -651,7 +736,17 @@ pub fn write_rollout_telemetry_gate_config(
     rollout_paths: &SelfRolloutPaths,
     config: &RolloutTelemetryGateConfig,
 ) -> Result<(), RolloutError> {
-    write_object(&rollout_telemetry_gate_config_path(rollout_paths), config)
+    let data_dir = rollout_config_data_dir(rollout_paths)?;
+    rollout_config_store()?
+        .set_typed(
+            &data_dir,
+            None,
+            ROLLOUT_TELEMETRY_GATE_CONFIG_KEY,
+            config,
+            ConfigWriteTarget::Local,
+        )
+        .map(|_| ())
+        .map_err(map_rollout_config_error)
 }
 
 pub fn read_rollout_main_exit(
@@ -943,6 +1038,68 @@ mod tests {
             read_rollout_status(&paths).expect("status"),
             Some(replacement)
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rollout_telemetry_gate_config_writes_shared_config_document() {
+        let root = unique_temp("sinomo-rollout-telemetry-gates-config");
+        let paths = SelfRolloutPaths::new(&root);
+        let config = RolloutTelemetryGateConfig {
+            automatic_promotion_enabled: false,
+            event_limit: 250,
+            minimum_event_count: 20,
+            maximum_automatic_weight_bps: None,
+            maximum_candidate_latency_p95_ms: Some(125),
+        };
+
+        write_rollout_telemetry_gate_config(&paths, &config).expect("write config");
+
+        let path = root
+            .join("configs")
+            .join("rollout")
+            .join("telemetry")
+            .join("gates.json");
+        assert_eq!(rollout_telemetry_gate_config_path(&paths), path);
+        let document: sinomo_config::ConfigDocument =
+            serde_json::from_str(&fs::read_to_string(&path).expect("config document"))
+                .expect("config document");
+        assert_eq!(document.key.as_str(), ROLLOUT_TELEMETRY_GATE_CONFIG_KEY);
+        let stored: RolloutTelemetryGateConfig =
+            serde_json::from_value(document.value).expect("stored config");
+        assert_eq!(stored, config);
+        assert_eq!(
+            read_rollout_telemetry_gate_config(&paths).expect("read config"),
+            Some(config)
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rollout_telemetry_gate_config_migrates_legacy_sobj() {
+        let root = unique_temp("sinomo-rollout-telemetry-gates-migrate");
+        let paths = SelfRolloutPaths::new(&root);
+        let config = RolloutTelemetryGateConfig {
+            automatic_promotion_enabled: false,
+            event_limit: 125,
+            minimum_event_count: 5,
+            maximum_automatic_weight_bps: Some(2000),
+            maximum_candidate_latency_p95_ms: Some(88),
+        };
+        write_object(&rollout_telemetry_gate_legacy_config_path(&paths), &config)
+            .expect("legacy config");
+
+        let stored = read_rollout_telemetry_gate_config(&paths)
+            .expect("read config")
+            .expect("config");
+
+        assert_eq!(stored, config);
+        let document: sinomo_config::ConfigDocument = serde_json::from_str(
+            &fs::read_to_string(rollout_telemetry_gate_config_path(&paths))
+                .expect("migrated config document"),
+        )
+        .expect("config document");
+        assert_eq!(document.key.as_str(), ROLLOUT_TELEMETRY_GATE_CONFIG_KEY);
         fs::remove_dir_all(root).ok();
     }
 

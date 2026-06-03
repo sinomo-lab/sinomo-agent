@@ -34,12 +34,12 @@ use super::{
     handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
     install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state, is_terminal_status,
-    load_tui_model_runtime_config, main_agent_handler_for_tui_with_data_dir, managed_source_status,
-    merge_benchmark_gate_requests, merge_module_replay_report_refs, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    load_tui_model_runtime_config, main_agent_config_tool_registry,
+    main_agent_handler_for_tui_with_data_dir, managed_source_status, merge_benchmark_gate_requests,
+    merge_module_replay_report_refs, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_propose_options, parse_provider_command, parse_rollout_command, parse_sandbox_command,
     parse_slash_command, parse_uninstall_options, parse_usage_options, push_unique_introducer,
@@ -16361,14 +16361,77 @@ fn models_default_writes_global_model_config() {
     )
     .expect("write model defaults");
 
-    let config_path = root.join("config").join("models.json");
-    let config = serde_json::from_str::<serde_json::Value>(
+    let config_path = root.join("configs").join("lm").join("providers.json");
+    let document = serde_json::from_str::<sinomo_runtime::config::ConfigDocument>(
         &std::fs::read_to_string(&config_path).expect("model config"),
     )
-    .expect("model config json");
+    .expect("model config document");
+    assert_eq!(document.key.as_str(), sinomo_lm::LM_PROVIDER_CONFIG_KEY);
+    let config = document.value;
     assert_eq!(config["default_provider"], "openai");
     assert_eq!(config["default_account"], "default");
     assert_eq!(config["default_model"], "gpt-5.5");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn main_agent_config_tool_registry_exposes_host_config_catalog() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-agent-config-tools-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let registry = main_agent_config_tool_registry(&data_dir).expect("config tool registry");
+    let names: Vec<_> = registry
+        .descriptors()
+        .into_iter()
+        .map(|descriptor| descriptor.spec.name)
+        .collect();
+    for expected in ["config_search", "config_get", "config_set"] {
+        assert!(names.iter().any(|name| name == expected), "{expected}");
+    }
+
+    let session = InteractionSession::new(
+        SessionId::generate(),
+        NodeId::from_legacy_named("node_agent_config_tools").expect("node"),
+        InteractionSurface::new("test", InteractionSurfaceKind::CommandLine),
+    );
+    let outcome = registry.execute(
+        &session,
+        0,
+        0,
+        &sinomo_agent::AgentToolCall {
+            tool: "config_search".to_string(),
+            input: serde_json::json!({ "query": "" }),
+            r#async: false,
+            summary: "search configs".to_string(),
+        },
+    );
+    assert_eq!(outcome.status, sinomo_agent::AgentToolStatus::Succeeded);
+    let keys: Vec<_> = outcome
+        .output
+        .get("definitions")
+        .and_then(serde_json::Value::as_array)
+        .expect("definitions")
+        .iter()
+        .filter_map(|definition| definition.get("key").and_then(serde_json::Value::as_str))
+        .collect();
+    for expected in [
+        "dfs.expose",
+        "rollout.telemetry.gates",
+        "sandbox.policy",
+        "lm.providers",
+        "lm.runtime",
+        "lm.credentials.openai",
+        "lm.credentials.codex",
+        "evolution.config",
+    ] {
+        assert!(keys.iter().any(|key| key == &expected), "{expected}");
+    }
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -16404,14 +16467,23 @@ fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
     )
     .expect("write clustered model defaults");
 
-    assert!(!root.join("config").join("models.json").exists());
+    assert!(
+        !root
+            .join("configs")
+            .join("lm")
+            .join("providers.json")
+            .exists()
+    );
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
     );
     let entry = store
         .get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY)
         .expect("lm config kv entry");
-    let config: sinomo_lm::ModelConfig = entry.decode().expect("lm config");
+    let document: sinomo_runtime::config::ConfigDocument =
+        entry.decode().expect("lm config document");
+    assert_eq!(document.key.as_str(), sinomo_lm::LM_PROVIDER_CONFIG_KEY);
+    let config: sinomo_lm::ModelConfig = serde_json::from_value(document.value).expect("lm config");
     assert_eq!(config.default_provider.as_deref(), Some("openai"));
     assert_eq!(config.default_account.as_deref(), Some("work"));
     assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
@@ -16454,11 +16526,14 @@ fn local_mode_forces_model_config_to_local_file_on_clustered_node() {
     .expect("write local model defaults");
 
     assert!(model_config_uses_cluster(&data_dir));
-    let config_path = root.join("config").join("models.json");
-    let config = serde_json::from_str::<sinomo_lm::ModelConfig>(
+    let config_path = root.join("configs").join("lm").join("providers.json");
+    let document = serde_json::from_str::<sinomo_runtime::config::ConfigDocument>(
         &std::fs::read_to_string(&config_path).expect("model config"),
     )
-    .expect("model config json");
+    .expect("model config document");
+    assert_eq!(document.key.as_str(), sinomo_lm::LM_PROVIDER_CONFIG_KEY);
+    let config: sinomo_lm::ModelConfig =
+        serde_json::from_value(document.value).expect("model config json");
     assert_eq!(config.default_provider.as_deref(), Some("openai"));
     assert_eq!(config.default_account.as_deref(), Some("local"));
     assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
@@ -16514,11 +16589,14 @@ fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
     })
     .expect("write daemonless local model defaults");
 
-    let config_path = root.join("config").join("models.json");
-    let config = serde_json::from_str::<sinomo_lm::ModelConfig>(
+    let config_path = root.join("configs").join("lm").join("providers.json");
+    let document = serde_json::from_str::<sinomo_runtime::config::ConfigDocument>(
         &std::fs::read_to_string(&config_path).expect("model config"),
     )
-    .expect("model config json");
+    .expect("model config document");
+    assert_eq!(document.key.as_str(), sinomo_lm::LM_PROVIDER_CONFIG_KEY);
+    let config: sinomo_lm::ModelConfig =
+        serde_json::from_value(document.value).expect("model config json");
     assert_eq!(config.default_provider.as_deref(), Some("openai"));
     assert_eq!(config.default_account.as_deref(), Some("local"));
     assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
@@ -16569,14 +16647,24 @@ fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
     };
     write_model_runtime_config_for_node(&data_dir, &config).expect("write runtime config");
 
-    assert!(!root.join("config").join("models-runtime.json").exists());
+    assert!(
+        !root
+            .join("configs")
+            .join("lm")
+            .join("runtime.json")
+            .exists()
+    );
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
     );
     let entry = store
         .get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY)
         .expect("lm runtime kv entry");
-    let saved: sinomo_lm::ModelRuntimeConfig = entry.decode().expect("runtime config");
+    let document: sinomo_runtime::config::ConfigDocument =
+        entry.decode().expect("runtime config document");
+    assert_eq!(document.key.as_str(), sinomo_lm::LM_RUNTIME_CONFIG_KEY);
+    let saved: sinomo_lm::ModelRuntimeConfig =
+        serde_json::from_value(document.value).expect("runtime config");
     assert_eq!(saved, config);
 
     std::fs::remove_dir_all(root).ok();
@@ -16616,10 +16704,13 @@ fn local_mode_writes_model_runtime_config_to_local_file_on_clustered_node() {
     })
     .expect("write local runtime config");
 
-    assert_eq!(path, root.join("config").join("models-runtime.json"));
-    let saved: sinomo_lm::ModelRuntimeConfig =
+    assert_eq!(path, root.join("configs").join("lm").join("runtime.json"));
+    let document: sinomo_runtime::config::ConfigDocument =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("runtime config"))
-            .expect("runtime config json");
+            .expect("runtime config document");
+    assert_eq!(document.key.as_str(), sinomo_lm::LM_RUNTIME_CONFIG_KEY);
+    let saved: sinomo_lm::ModelRuntimeConfig =
+        serde_json::from_value(document.value).expect("runtime config json");
     assert_eq!(saved, config);
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),
@@ -16818,8 +16909,14 @@ fn sandbox_policy_writes_cluster_policy_config_to_kv_for_clustered_node() {
     let entry = store
         .get(sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KV_KEY)
         .expect("sandbox policy kv entry");
+    let document: sinomo_runtime::config::ConfigDocument =
+        entry.decode().expect("sandbox policy config document");
+    assert_eq!(
+        document.key.as_str(),
+        sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KEY
+    );
     let saved: sinomo_runtime::sandbox::SandboxClusterPolicyConfig =
-        entry.decode().expect("sandbox policy config");
+        serde_json::from_value(document.value).expect("sandbox policy config");
     assert_eq!(saved, config);
 
     std::fs::remove_dir_all(root).ok();
@@ -16859,10 +16956,19 @@ fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
     })
     .expect("write local sandbox policy");
 
-    assert_eq!(path, root.join("config").join("sandbox-policy.json"));
-    let saved: sinomo_runtime::sandbox::SandboxClusterPolicyConfig =
+    assert_eq!(
+        path,
+        root.join("configs").join("sandbox").join("policy.json")
+    );
+    let document: sinomo_runtime::config::ConfigDocument =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("sandbox policy config"))
-            .expect("sandbox policy json");
+            .expect("sandbox policy config document");
+    assert_eq!(
+        document.key.as_str(),
+        sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KEY
+    );
+    let saved: sinomo_runtime::sandbox::SandboxClusterPolicyConfig =
+        serde_json::from_value(document.value).expect("sandbox policy json");
     assert_eq!(saved, config);
     let store = sinomo_runtime::kv::InProcessKvStore::restore(
         sinomo_runtime::network::read_cluster_kv_snapshot(&cluster_paths).expect("cluster kv"),

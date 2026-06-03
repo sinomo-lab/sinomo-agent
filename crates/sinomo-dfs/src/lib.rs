@@ -10,6 +10,7 @@ pub mod namespace;
 pub mod operator;
 pub mod posix;
 pub mod protocol;
+mod service;
 mod transfer;
 
 pub use content_store::{
@@ -35,8 +36,9 @@ pub use distributed::{
     DistributedWriteIntent, plan_replicas, validate_replication_plan,
 };
 pub use local_owned::{
-    DfsExposeAddRequest, DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo, DfsExposeStore,
-    DfsExposeStoreError, DfsExposedDirectory, LocalOwnedDfsError,
+    DFS_EXPOSE_CONFIG_KEY, DfsExposeAddRequest, DfsExposeConfig, DfsExposeEntry, DfsExposeFileInfo,
+    DfsExposeStore, DfsExposeStoreError, DfsExposedDirectory, LocalOwnedDfsError,
+    dfs_expose_config_definition, register_config_definitions as register_dfs_config_definitions,
 };
 pub use metadata_backend::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
@@ -91,6 +93,7 @@ pub type DfsObjectId = sinomo_core::Id;
 pub type DfsVersion = sinomo_core::Id;
 
 use serde::{Deserialize, Serialize};
+pub use service::{DfsService, register_services};
 use sinomo_core::{
     CapabilityName, Confidence, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest, EventEnvelope,
     EventKind, FileSystemAccess, LatencyClass, ModuleCapabilities, ModuleResourceLimits,

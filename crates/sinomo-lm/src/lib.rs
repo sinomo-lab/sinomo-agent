@@ -43,7 +43,7 @@ pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_n
 pub use openai::{OpenAiConfig, OpenAiProvider};
 
 use serde::{Deserialize, Serialize};
-use sinomo_runtime::kv::{KvEntry, KvOp, KvSnapshot, KvTxn, decode_kv_value};
+use sinomo_runtime::kv::{KvEntry, KvSnapshot, KvTxn, decode_kv_value};
 use sinomo_runtime::local::SinomoDataDir;
 use std::collections::BTreeMap;
 use std::env;
@@ -567,6 +567,9 @@ pub struct ProviderAccountInfo {
 }
 
 pub const DEFAULT_PROVIDER_ACCOUNT: &str = "default";
+pub const LM_PROVIDER_CONFIG_KEY: &str = "lm.providers";
+pub const LM_RUNTIME_CONFIG_KEY: &str = "lm.runtime";
+pub const LM_CREDENTIALS_CONFIG_PREFIX: &str = "lm.credentials";
 pub const LM_PROVIDER_CONFIG_KV_KEY: &str = "/config/lm/providers";
 pub const LM_RUNTIME_CONFIG_KV_KEY: &str = "/config/lm/runtime";
 
@@ -685,7 +688,13 @@ pub struct ModelPaths {
 impl ModelPaths {
     pub fn new(data_dir: &SinomoDataDir) -> Self {
         Self {
-            config: data_dir.configs_dir().join("models.json"),
+            config: model_config_definition()
+                .map(|definition| definition.local_path(data_dir))
+                .unwrap_or_else(|_| {
+                    sinomo_runtime::config::configs_dir(data_dir)
+                        .join("lm")
+                        .join("providers.json")
+                }),
         }
     }
 
@@ -735,12 +744,279 @@ pub fn load_model_config(paths: &ModelPaths) -> Result<ModelConfig, LanguageMode
             path: paths.config.display().to_string(),
             detail: source.to_string(),
         })?;
-    serde_json::from_str(&content).map_err(|source| LanguageModelError::RequestSerialization {
+    let value: serde_json::Value = serde_json::from_str(&content).map_err(|source| {
+        LanguageModelError::RequestSerialization {
+            detail: format!(
+                "failed to parse model config at {}: {source}",
+                paths.config.display()
+            ),
+        }
+    })?;
+    model_config_from_json_value(value).map_err(|source| LanguageModelError::RequestSerialization {
         detail: format!(
             "failed to parse model config at {}: {source}",
             paths.config.display()
         ),
     })
+}
+
+pub fn model_config_definition()
+-> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
+    let definition = sinomo_runtime::config::ConfigDefinition::new(
+        LM_PROVIDER_CONFIG_KEY,
+        "sinomo-lm",
+        sinomo_runtime::config::ConfigValueType::Object {
+            schema_name: "ModelConfig".to_string(),
+        },
+        "Language-model provider accounts, defaults, and provider-specific options.",
+        sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal,
+    )
+    .map_err(map_lm_config_error)?
+    .with_default(&ModelConfig::default())
+    .map_err(map_lm_config_error)?
+    .with_local_legacy_path("config/models.json");
+    debug_assert_eq!(definition.cluster_key(), LM_PROVIDER_CONFIG_KV_KEY);
+    Ok(definition)
+}
+
+pub fn model_runtime_config_definition()
+-> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
+    let definition = sinomo_runtime::config::ConfigDefinition::new(
+        LM_RUNTIME_CONFIG_KEY,
+        "sinomo-lm",
+        sinomo_runtime::config::ConfigValueType::Object {
+            schema_name: "ModelRuntimeConfig".to_string(),
+        },
+        "Local and cluster runtime options for native language-model execution.",
+        sinomo_runtime::config::ConfigClusterMode::ClusterOverrideLocal,
+    )
+    .map_err(map_lm_config_error)?
+    .with_default(&ModelRuntimeConfig::default())
+    .map_err(map_lm_config_error)?
+    .with_local_legacy_path("config/models-runtime.json");
+    debug_assert_eq!(definition.cluster_key(), LM_RUNTIME_CONFIG_KV_KEY);
+    Ok(definition)
+}
+
+pub fn provider_credentials_config_key(provider: &str) -> Result<String, LanguageModelError> {
+    let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
+    let key = format!("{LM_CREDENTIALS_CONFIG_PREFIX}.{provider}");
+    sinomo_runtime::config::ConfigKey::new(key.clone()).map_err(map_lm_config_error)?;
+    Ok(key)
+}
+
+pub fn provider_credentials_config_definition(
+    provider: &str,
+) -> Result<sinomo_runtime::config::ConfigDefinition, LanguageModelError> {
+    let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
+    let definition = sinomo_runtime::config::ConfigDefinition::new(
+        provider_credentials_config_key(&provider)?,
+        "sinomo-lm",
+        sinomo_runtime::config::ConfigValueType::Object {
+            schema_name: provider_credentials_schema_name(&provider).to_string(),
+        },
+        format!("Local-only credentials for the `{provider}` language-model provider."),
+        sinomo_runtime::config::ConfigClusterMode::LocalOnly,
+    )
+    .map_err(map_lm_config_error)?
+    .with_local_legacy_path(format!("providers/{provider}/credentials.json"));
+    debug_assert_eq!(
+        definition
+            .local_path(&SinomoDataDir::new("<root>"))
+            .strip_prefix("<root>")
+            .ok()
+            .map(|path| path.to_path_buf()),
+        Some(
+            PathBuf::from("configs")
+                .join("lm")
+                .join("credentials")
+                .join(format!("{provider}.json"))
+        )
+    );
+    Ok(definition)
+}
+
+fn provider_credentials_schema_name(provider: &str) -> &'static str {
+    match provider {
+        GitHubCopilotProvider::PROVIDER_ID => "GitHubCopilotCredential",
+        CODEX_PROVIDER_ID => "CodexChatGptCredential",
+        _ => "ApiKeyCredential",
+    }
+}
+
+fn managed_credentials_provider_ids() -> &'static [&'static str] {
+    &[
+        GitHubCopilotProvider::PROVIDER_ID,
+        CODEX_PROVIDER_ID,
+        AnthropicProvider::PROVIDER_ID,
+        OpenAiProvider::PROVIDER_ID,
+        DeepSeekProvider::PROVIDER_ID,
+        GeminiProvider::PROVIDER_ID,
+        NvidiaProvider::PROVIDER_ID,
+    ]
+}
+
+pub fn register_config_definitions(
+    builder: sinomo_runtime::config::ConfigRegistryBuilder,
+) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, LanguageModelError> {
+    let mut builder = builder
+        .register(model_config_definition()?)
+        .map_err(map_lm_config_error)?
+        .register(model_runtime_config_definition()?)
+        .map_err(map_lm_config_error)?;
+    for provider in managed_credentials_provider_ids() {
+        builder = builder
+            .register(provider_credentials_config_definition(provider)?)
+            .map_err(map_lm_config_error)?;
+    }
+    Ok(builder)
+}
+
+pub fn model_config_store() -> Result<sinomo_runtime::config::ConfigStore, LanguageModelError> {
+    let registry =
+        register_config_definitions(sinomo_runtime::config::ConfigRegistry::builder())?.build();
+    Ok(sinomo_runtime::config::ConfigStore::new(registry))
+}
+
+fn map_lm_config_error(source: sinomo_runtime::config::ConfigError) -> LanguageModelError {
+    LanguageModelError::ConfigStore {
+        path: "sinomo-config".to_string(),
+        detail: source.to_string(),
+    }
+}
+
+pub(crate) fn read_provider_credentials_json_value(
+    provider: &str,
+    credentials_path: &Option<PathBuf>,
+) -> Result<Option<serde_json::Value>, LanguageModelError> {
+    let Some(path) = credentials_path else {
+        return Ok(None);
+    };
+    match read_provider_credentials_json_value_at(provider, path) {
+        Ok(Some(value)) => return Ok(Some(value)),
+        Ok(None) => {}
+        Err(error) => return Err(error),
+    }
+    if !credentials_path_is_config_document(provider, path) {
+        return Ok(None);
+    }
+    let Some(legacy_path) = legacy_provider_credentials_path_for(provider, path) else {
+        return Ok(None);
+    };
+    let Some(value) = read_provider_credentials_json_value_at(provider, &legacy_path)? else {
+        return Ok(None);
+    };
+    write_provider_credentials_json_value(provider, credentials_path, value.clone())?;
+    Ok(Some(value))
+}
+
+pub(crate) fn write_provider_credentials_json_value(
+    provider: &str,
+    credentials_path: &Option<PathBuf>,
+    value: serde_json::Value,
+) -> Result<(), LanguageModelError> {
+    let Some(path) = credentials_path else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| LanguageModelError::TokenStore {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let value = if credentials_path_is_config_document(provider, path) {
+        serde_json::to_value(sinomo_runtime::config::ConfigDocument::new(
+            sinomo_runtime::config::ConfigKey::new(provider_credentials_config_key(provider)?)
+                .map_err(map_lm_config_error)?,
+            value,
+        ))
+        .map_err(|source| LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        })?
+    } else {
+        value
+    };
+    let content = serde_json::to_string_pretty(&value).map_err(|source| {
+        LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        }
+    })?;
+    fs::write(path, content).map_err(|source| LanguageModelError::TokenStore {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn read_provider_credentials_json_value_at(
+    provider: &str,
+    path: &Path,
+) -> Result<Option<serde_json::Value>, LanguageModelError> {
+    let content = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(LanguageModelError::TokenStore {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    let raw_value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|source| LanguageModelError::TokenStore {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let value =
+        match serde_json::from_value::<sinomo_runtime::config::ConfigDocument>(raw_value.clone()) {
+            Ok(document) if document.key.as_str() == provider_credentials_config_key(provider)? => {
+                document.value
+            }
+            _ => raw_value,
+        };
+    Ok(Some(value))
+}
+
+fn credentials_path_is_config_document(provider: &str, path: &Path) -> bool {
+    let expected_file = format!("{provider}.json");
+    let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    if file_name != expected_file {
+        return false;
+    }
+    let Some(credentials_dir) = path.parent() else {
+        return false;
+    };
+    let Some(lm_dir) = credentials_dir.parent() else {
+        return false;
+    };
+    let Some(configs_dir) = lm_dir.parent() else {
+        return false;
+    };
+    credentials_dir.file_name().and_then(|value| value.to_str()) == Some("credentials")
+        && lm_dir.file_name().and_then(|value| value.to_str()) == Some("lm")
+        && configs_dir.file_name().and_then(|value| value.to_str()) == Some("configs")
+}
+
+fn legacy_provider_credentials_path_for(provider: &str, path: &Path) -> Option<PathBuf> {
+    let data_root = path.parent()?.parent()?.parent()?.parent()?;
+    Some(
+        data_root
+            .join("providers")
+            .join(provider)
+            .join("credentials.json"),
+    )
+}
+
+fn model_config_from_json_value(
+    value: serde_json::Value,
+) -> Result<ModelConfig, serde_json::Error> {
+    match serde_json::from_value::<sinomo_runtime::config::ConfigDocument>(value.clone()) {
+        Ok(document) if document.key.as_str() == LM_PROVIDER_CONFIG_KEY => {
+            serde_json::from_value(document.value)
+        }
+        _ => serde_json::from_value(value),
+    }
 }
 
 pub fn model_config_from_cluster_kv_snapshot(
@@ -765,25 +1041,31 @@ pub fn model_config_from_cluster_kv_entries(
 }
 
 fn decode_model_config_entry(entry: &KvEntry) -> Result<ModelConfig, LanguageModelError> {
-    decode_kv_value(&entry.value).map_err(|source| LanguageModelError::ConfigStore {
-        path: LM_PROVIDER_CONFIG_KV_KEY.to_string(),
-        detail: source.to_string(),
-    })
+    let definition = model_config_definition()?;
+    match sinomo_runtime::config::decode_cluster_config_entry(entry, &definition) {
+        Ok(value) => {
+            serde_json::from_value(value).map_err(|source| LanguageModelError::ConfigStore {
+                path: entry.key.clone(),
+                detail: source.to_string(),
+            })
+        }
+        Err(config_error) => {
+            decode_kv_value(&entry.value).map_err(|source| LanguageModelError::ConfigStore {
+                path: entry.key.clone(),
+                detail: format!("not a sinomo-config document ({config_error}); {source}"),
+            })
+        }
+    }
 }
 
 pub fn model_config_cluster_kv_txn(config: &ModelConfig) -> Result<KvTxn, LanguageModelError> {
-    Ok(KvTxn {
-        compares: Vec::new(),
-        success: vec![
-            KvOp::put_serde(LM_PROVIDER_CONFIG_KV_KEY, config, None).map_err(|source| {
-                LanguageModelError::ConfigStore {
-                    path: LM_PROVIDER_CONFIG_KV_KEY.to_string(),
-                    detail: source.to_string(),
-                }
-            })?,
-        ],
-        failure: Vec::new(),
-    })
+    let value = serde_json::to_value(config).map_err(|source| {
+        LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        }
+    })?;
+    sinomo_runtime::config::cluster_config_put_txn(&model_config_definition()?, value)
+        .map_err(map_lm_config_error)
 }
 
 pub fn model_runtime_config_from_cluster_kv_snapshot(
@@ -800,27 +1082,33 @@ pub fn model_runtime_config_from_cluster_kv_snapshot(
 fn decode_model_runtime_config_entry(
     entry: &KvEntry,
 ) -> Result<ModelRuntimeConfig, LanguageModelError> {
-    decode_kv_value(&entry.value).map_err(|source| LanguageModelError::ConfigStore {
-        path: LM_RUNTIME_CONFIG_KV_KEY.to_string(),
-        detail: source.to_string(),
-    })
+    let definition = model_runtime_config_definition()?;
+    match sinomo_runtime::config::decode_cluster_config_entry(entry, &definition) {
+        Ok(value) => {
+            serde_json::from_value(value).map_err(|source| LanguageModelError::ConfigStore {
+                path: entry.key.clone(),
+                detail: source.to_string(),
+            })
+        }
+        Err(config_error) => {
+            decode_kv_value(&entry.value).map_err(|source| LanguageModelError::ConfigStore {
+                path: entry.key.clone(),
+                detail: format!("not a sinomo-config document ({config_error}); {source}"),
+            })
+        }
+    }
 }
 
 pub fn model_runtime_config_cluster_kv_txn(
     config: &ModelRuntimeConfig,
 ) -> Result<KvTxn, LanguageModelError> {
-    Ok(KvTxn {
-        compares: Vec::new(),
-        success: vec![
-            KvOp::put_serde(LM_RUNTIME_CONFIG_KV_KEY, config, None).map_err(|source| {
-                LanguageModelError::ConfigStore {
-                    path: LM_RUNTIME_CONFIG_KV_KEY.to_string(),
-                    detail: source.to_string(),
-                }
-            })?,
-        ],
-        failure: Vec::new(),
-    })
+    let value = serde_json::to_value(config).map_err(|source| {
+        LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        }
+    })?;
+    sinomo_runtime::config::cluster_config_put_txn(&model_runtime_config_definition()?, value)
+        .map_err(map_lm_config_error)
 }
 
 pub fn save_model_config(path: &Path, value: &ModelConfig) -> Result<(), LanguageModelError> {
@@ -830,7 +1118,13 @@ pub fn save_model_config(path: &Path, value: &ModelConfig) -> Result<(), Languag
             detail: source.to_string(),
         })?;
     }
-    let content = serde_json::to_string_pretty(value).map_err(|source| {
+    let document = sinomo_runtime::config::ConfigDocument::new(
+        model_config_definition()?.key,
+        serde_json::to_value(value).map_err(|source| LanguageModelError::RequestSerialization {
+            detail: source.to_string(),
+        })?,
+    );
+    let content = serde_json::to_string_pretty(&document).map_err(|source| {
         LanguageModelError::RequestSerialization {
             detail: source.to_string(),
         }
@@ -845,7 +1139,13 @@ pub fn current_default_model(
     data_dir: &SinomoDataDir,
 ) -> Result<CurrentDefaultModel, LanguageModelError> {
     let model_paths = ModelPaths::new(data_dir);
-    let model_config = load_model_config(&model_paths).ok();
+    let model_config = model_config_store()
+        .and_then(|store| {
+            store
+                .get_typed(data_dir, None, LM_PROVIDER_CONFIG_KEY)
+                .map_err(map_lm_config_error)
+        })
+        .ok();
     let resolved = resolve_default_model(model_config.as_ref(), None)?;
     Ok(CurrentDefaultModel {
         provider: resolved.provider,
@@ -913,7 +1213,15 @@ pub fn write_default_model_config(
         default_model: Some(model.into()),
         accounts: Vec::new(),
     };
-    save_model_config(&model_paths.config, &config)?;
+    model_config_store()?
+        .set_typed(
+            data_dir,
+            None,
+            LM_PROVIDER_CONFIG_KEY,
+            &config,
+            sinomo_runtime::config::ConfigWriteTarget::Local,
+        )
+        .map_err(map_lm_config_error)?;
     Ok(DefaultModelConfigUpdate {
         config,
         config_path: model_paths.config,
@@ -1223,7 +1531,13 @@ pub fn complete_configured_model_request_with_account(
             provider.complete(&request)
         }
         CODEX_PROVIDER_ID => {
-            codex_provider_for_model_with_options(model, provider_options).complete(&request)
+            let credentials_path = data_dir.provider_credentials_file(CODEX_PROVIDER_ID);
+            codex_provider_for_model_with_options_and_credentials(
+                model,
+                provider_options,
+                Some(credentials_path),
+            )
+            .complete(&request)
         }
         ClaudeCodeProvider::PROVIDER_ID => {
             let provider = ClaudeCodeProvider::new(ClaudeCodeConfig {
@@ -1391,12 +1705,9 @@ pub fn github_copilot_provider() -> Result<(GitHubCopilotProvider, PathBuf), Lan
             detail: source.to_string(),
         })?;
     data_dir
-        .ensure_provider_dir(GitHubCopilotProvider::PROVIDER_ID)
+        .ensure_root_layout()
         .map_err(|source| LanguageModelError::ConfigStore {
-            path: data_dir
-                .provider_dir(GitHubCopilotProvider::PROVIDER_ID)
-                .display()
-                .to_string(),
+            path: data_dir.root().display().to_string(),
             detail: source.to_string(),
         })?;
     let credentials_path = data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
@@ -1491,6 +1802,14 @@ pub fn codex_provider_for_model_with_options(
     model: &str,
     options: LanguageModelProviderOptions,
 ) -> CodexProvider {
+    codex_provider_for_model_with_options_and_credentials(model, options, None)
+}
+
+fn codex_provider_for_model_with_options_and_credentials(
+    model: &str,
+    options: LanguageModelProviderOptions,
+    credentials_path: Option<PathBuf>,
+) -> CodexProvider {
     let default_model = model_or_default(model, CODEX_DEFAULT_MODEL.to_string());
     let config_default = OpenAiResponsesCodexConfig::default();
     let client_config = OpenAiResponsesCodexConfig {
@@ -1499,7 +1818,7 @@ pub fn codex_provider_for_model_with_options(
         client_id: config_default.client_id.clone(),
         client_version: config_default.client_version,
         default_model: default_model.clone(),
-        credentials_path: config_default.credentials_path,
+        credentials_path: credentials_path.or(config_default.credentials_path),
     };
     CodexProvider::new(
         CodexConfig {
@@ -1514,16 +1833,16 @@ pub fn codex_provider_for_model_with_options(
     )
 }
 
-fn provider_data_dir(provider: &str) -> Result<SinomoDataDir, LanguageModelError> {
+fn provider_data_dir(_provider: &str) -> Result<SinomoDataDir, LanguageModelError> {
     let data_dir =
         SinomoDataDir::from_env_or_home().map_err(|source| LanguageModelError::ConfigStore {
             path: "<data-dir>".to_string(),
             detail: source.to_string(),
         })?;
     data_dir
-        .ensure_provider_dir(provider)
+        .ensure_root_layout()
         .map_err(|source| LanguageModelError::ConfigStore {
-            path: data_dir.provider_dir(provider).display().to_string(),
+            path: data_dir.root().display().to_string(),
             detail: source.to_string(),
         })?;
     Ok(data_dir)
@@ -2138,12 +2457,76 @@ mod tests {
 
         assert_eq!(update.config.default_provider.as_deref(), Some("openai"));
         assert_eq!(update.config.default_model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(update.config_path, root.join("config").join("models.json"));
+        assert_eq!(
+            update.config_path,
+            root.join("configs").join("lm").join("providers.json")
+        );
         let config = load_model_config(&ModelPaths::new(&data_dir)).expect("model config");
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
         assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn model_config_cluster_txn_writes_config_document() {
+        let config = ModelConfig {
+            default_provider: Some("openai".to_string()),
+            default_account: Some(DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+            accounts: Vec::new(),
+        };
+        let txn = model_config_cluster_kv_txn(&config).expect("model config txn");
+        let Some(sinomo_runtime::kv::KvOp::Put { key, value, .. }) = txn.success.into_iter().next()
+        else {
+            panic!("expected put op");
+        };
+        assert_eq!(key, LM_PROVIDER_CONFIG_KV_KEY);
+        let entry = KvEntry {
+            key,
+            value,
+            create_revision: sinomo_runtime::kv::KvRevision(1),
+            modify_revision: sinomo_runtime::kv::KvRevision(1),
+            version: sinomo_runtime::kv::KvVersion(1),
+            lease_id: None,
+        };
+        let document: sinomo_runtime::config::ConfigDocument =
+            entry.decode().expect("config document");
+        assert_eq!(document.key.as_str(), LM_PROVIDER_CONFIG_KEY);
+        let saved: ModelConfig = serde_json::from_value(document.value).expect("model config");
+        assert_eq!(saved, config);
+        let decoded = model_config_from_cluster_kv_entries(&[entry])
+            .expect("decode entries")
+            .expect("model config");
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn model_config_reads_legacy_raw_cluster_kv_value() {
+        let config = ModelConfig {
+            default_provider: Some("openai".to_string()),
+            default_account: Some(DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+            accounts: Vec::new(),
+        };
+        let sinomo_runtime::kv::KvOp::Put { key, value, .. } =
+            sinomo_runtime::kv::KvOp::put_serde(LM_PROVIDER_CONFIG_KV_KEY, &config, None)
+                .expect("legacy op")
+        else {
+            panic!("expected put op");
+        };
+        let entry = KvEntry {
+            key,
+            value,
+            create_revision: sinomo_runtime::kv::KvRevision(1),
+            modify_revision: sinomo_runtime::kv::KvRevision(1),
+            version: sinomo_runtime::kv::KvVersion(1),
+            lease_id: None,
+        };
+        let decoded = model_config_from_cluster_kv_entries(&[entry])
+            .expect("decode entries")
+            .expect("model config");
+        assert_eq!(decoded, config);
     }
 
     #[test]
@@ -2168,6 +2551,102 @@ mod tests {
 
         assert!(account.options.is_default());
         assert!(account.model_options.is_empty());
+    }
+
+    #[test]
+    fn provider_credentials_write_shared_config_document() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-lm-credentials-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let path = root
+            .join("configs")
+            .join("lm")
+            .join("credentials")
+            .join("openai.json");
+        let credentials_path = Some(path.clone());
+        let payload = serde_json::json!({
+            "api_key": "sk-test",
+            "source": "test",
+            "created_at_unix": 1_u64
+        });
+
+        write_provider_credentials_json_value(
+            OpenAiProvider::PROVIDER_ID,
+            &credentials_path,
+            payload.clone(),
+        )
+        .expect("write credentials");
+
+        let document: sinomo_runtime::config::ConfigDocument =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("credential document"))
+                .expect("config document");
+        assert_eq!(
+            document.key.as_str(),
+            &provider_credentials_config_key(OpenAiProvider::PROVIDER_ID).expect("key")
+        );
+        assert_eq!(document.value, payload);
+        let value =
+            read_provider_credentials_json_value(OpenAiProvider::PROVIDER_ID, &credentials_path)
+                .expect("read credentials")
+                .expect("credentials");
+        assert_eq!(value["api_key"], "sk-test");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn provider_credentials_read_legacy_file_and_migrate_to_shared_config_document() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-lm-credentials-migrate-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let legacy_path = root
+            .join("providers")
+            .join("openai")
+            .join("credentials.json");
+        std::fs::create_dir_all(legacy_path.parent().expect("legacy parent"))
+            .expect("legacy parent");
+        std::fs::write(
+            &legacy_path,
+            serde_json::json!({
+                "api_key": "sk-legacy",
+                "source": "legacy",
+                "created_at_unix": 1_u64
+            })
+            .to_string(),
+        )
+        .expect("legacy credentials");
+        let path = root
+            .join("configs")
+            .join("lm")
+            .join("credentials")
+            .join("openai.json");
+        let credentials_path = Some(path.clone());
+
+        let value =
+            read_provider_credentials_json_value(OpenAiProvider::PROVIDER_ID, &credentials_path)
+                .expect("read credentials")
+                .expect("credentials");
+
+        assert_eq!(value["api_key"], "sk-legacy");
+        let document: sinomo_runtime::config::ConfigDocument = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("migrated credential document"),
+        )
+        .expect("config document");
+        assert_eq!(
+            document.key.as_str(),
+            &provider_credentials_config_key(OpenAiProvider::PROVIDER_ID).expect("key")
+        );
+        assert_eq!(document.value["api_key"], "sk-legacy");
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

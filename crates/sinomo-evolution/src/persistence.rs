@@ -12,6 +12,10 @@ use crate::{
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sinomo_runtime::config::{
+    ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
+    ConfigStore, ConfigValueType, ConfigWriteTarget,
+};
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
@@ -22,6 +26,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+pub const EVOLUTION_CONFIG_KEY: &str = "evolution.config";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionConfig {
@@ -88,6 +94,7 @@ pub struct EvolutionPaths {
     pub proposed_regression_gate_memory_jsonl: PathBuf,
     pub logs: PathBuf,
     pub config: PathBuf,
+    pub legacy_config: PathBuf,
 }
 
 impl EvolutionPaths {
@@ -95,7 +102,7 @@ impl EvolutionPaths {
         let data_dir_root = data_dir.root().to_path_buf();
         let root = data_dir_root.join("evolution");
         Self {
-            data_dir: data_dir_root,
+            data_dir: data_dir_root.clone(),
             jobs: root.join("jobs"),
             campaigns: root.join("campaigns"),
             memory: root.join("memory"),
@@ -108,7 +115,11 @@ impl EvolutionPaths {
                 .join("memory")
                 .join("proposed-regression-gates.jsonl"),
             logs: root.join("logs"),
-            config: root.join("config.json"),
+            config: data_dir_root
+                .join("configs")
+                .join("evolution")
+                .join("config.json"),
+            legacy_config: root.join("config.json"),
             root,
         }
     }
@@ -694,15 +705,71 @@ pub fn list_job_records(
     Ok(records)
 }
 
+pub fn evolution_config_definition() -> Result<ConfigDefinition, EvolutionPersistenceError> {
+    ConfigDefinition::new(
+        EVOLUTION_CONFIG_KEY,
+        "sinomo-evolution",
+        ConfigValueType::Object {
+            schema_name: "EvolutionConfig".to_string(),
+        },
+        "Local self-evolution defaults such as source repo and preferred model.",
+        ConfigClusterMode::LocalOnly,
+    )
+    .map_err(map_evolution_config_error)
+}
+
+pub fn register_config_definitions(
+    builder: ConfigRegistryBuilder,
+) -> Result<ConfigRegistryBuilder, EvolutionPersistenceError> {
+    builder
+        .register(evolution_config_definition()?)
+        .map_err(map_evolution_config_error)
+}
+
 pub fn read_config(paths: &EvolutionPaths) -> Result<EvolutionConfig, EvolutionPersistenceError> {
-    read_json_file(&paths.config)
+    let data_dir = SinomoDataDir::new(paths.data_dir.clone());
+    if paths.config.exists() {
+        return evolution_config_store()?
+            .get_typed(&data_dir, None, EVOLUTION_CONFIG_KEY)
+            .map_err(map_evolution_config_error);
+    }
+    if paths.legacy_config.exists() {
+        let config = read_json_file(&paths.legacy_config)?;
+        write_config(paths, &config)?;
+        return Ok(config);
+    }
+    evolution_config_store()?
+        .get_typed(&data_dir, None, EVOLUTION_CONFIG_KEY)
+        .map_err(map_evolution_config_error)
 }
 
 pub fn write_config(
     paths: &EvolutionPaths,
     config: &EvolutionConfig,
 ) -> Result<(), EvolutionPersistenceError> {
-    write_json(&paths.config, config)
+    let data_dir = SinomoDataDir::new(paths.data_dir.clone());
+    evolution_config_store()?
+        .set_typed(
+            &data_dir,
+            None,
+            EVOLUTION_CONFIG_KEY,
+            config,
+            ConfigWriteTarget::Local,
+        )
+        .map(|_| ())
+        .map_err(map_evolution_config_error)
+}
+
+fn evolution_config_store() -> Result<ConfigStore, EvolutionPersistenceError> {
+    let registry = register_config_definitions(ConfigRegistry::builder())?.build();
+    Ok(ConfigStore::new(registry))
+}
+
+fn map_evolution_config_error(source: ConfigError) -> EvolutionPersistenceError {
+    EvolutionPersistenceError::Config {
+        key: EVOLUTION_CONFIG_KEY.to_string(),
+        detail: source.to_string(),
+    }
 }
 
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), EvolutionPersistenceError> {
@@ -1303,6 +1370,59 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     type ScorecardId = Id;
+
+    #[test]
+    fn evolution_config_writes_shared_config_document() {
+        let root = temp_dir("evolution-config-document");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        let config = EvolutionConfig {
+            repo: root.join("source").display().to_string(),
+            default_provider: Some("openai".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+        };
+
+        write_config(&paths, &config).expect("write config");
+
+        assert_eq!(
+            paths.config,
+            root.join("configs").join("evolution").join("config.json")
+        );
+        let document: sinomo_runtime::config::ConfigDocument =
+            serde_json::from_str(&fs::read_to_string(&paths.config).expect("config document"))
+                .expect("config document");
+        assert_eq!(document.key.as_str(), EVOLUTION_CONFIG_KEY);
+        assert_eq!(
+            serde_json::from_value::<EvolutionConfig>(document.value).expect("stored config"),
+            config
+        );
+        assert_eq!(read_config(&paths).expect("read config"), config);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn evolution_config_migrates_legacy_config_json() {
+        let root = temp_dir("evolution-config-migrate");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let paths = EvolutionPaths::new(&data_dir);
+        let config = EvolutionConfig {
+            repo: root.join("source").display().to_string(),
+            default_provider: Some("codex".to_string()),
+            default_model: Some("gpt-5.5".to_string()),
+        };
+        write_json(&paths.legacy_config, &config).expect("legacy config");
+
+        let migrated = read_config(&paths).expect("read config");
+
+        assert_eq!(migrated, config);
+        let document: sinomo_runtime::config::ConfigDocument = serde_json::from_str(
+            &fs::read_to_string(&paths.config).expect("migrated config document"),
+        )
+        .expect("config document");
+        assert_eq!(document.key.as_str(), EVOLUTION_CONFIG_KEY);
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn record_candidate_decision_persists_decision_manifest_job_and_record() {
@@ -2217,6 +2337,8 @@ pub enum EvolutionPersistenceError {
     Io { path: String, detail: String },
     #[error("evolution JSON error at {path}: {detail}")]
     Json { path: String, detail: String },
+    #[error("evolution config error for {key}: {detail}")]
+    Config { key: String, detail: String },
     #[error("missing evolution artifact: {artifact}")]
     MissingArtifact { artifact: String },
 }

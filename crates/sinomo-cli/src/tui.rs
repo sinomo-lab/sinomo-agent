@@ -341,6 +341,14 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
         TuiInputAction::OpenSessions => {
             open_tui_session_list_view(runtime, state, session_store)?;
         }
+        TuiInputAction::OpenSettings => {
+            open_tui_settings_view(state, data_dir)?;
+            session_store.save_state(runtime.session(), state)?;
+        }
+        TuiInputAction::SaveSetting { key, value } => {
+            save_tui_setting(state, data_dir, &key, &value)?;
+            session_store.save_state(runtime.session(), state)?;
+        }
         TuiInputAction::Resume(session_id) => {
             for output in
                 resume_tui_session(runtime, state, session_store, data_dir, daemon, session_id)?
@@ -478,6 +486,8 @@ enum TuiInputAction {
     Submit(String),
     OpenFiles(TuiFilesTarget),
     OpenSessions,
+    OpenSettings,
+    SaveSetting { key: String, value: String },
     Resume(SessionId),
     Exit,
 }
@@ -525,6 +535,7 @@ enum TuiViewMode {
     Chat,
     Files,
     Sessions,
+    Settings,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -792,6 +803,87 @@ impl TuiSessionStore {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct TuiSettingsEntry {
+    definition: sinomo_runtime::config::ConfigDefinition,
+    source: Option<sinomo_runtime::config::ConfigValueSource>,
+    value: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+impl TuiSettingsEntry {
+    fn key(&self) -> &str {
+        self.definition.key.as_str()
+    }
+
+    fn value_preview(&self) -> String {
+        if tui_config_key_is_sensitive(self.key()) && self.value.is_some() {
+            return "<redacted>".to_string();
+        }
+        match &self.value {
+            Some(value) => compact_tui_json(value),
+            None => self.error.clone().unwrap_or_else(|| "unset".to_string()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TuiSettingsState {
+    entries: Vec<TuiSettingsEntry>,
+    selected: usize,
+    editing_key: Option<String>,
+}
+
+impl TuiSettingsState {
+    fn load(data_dir: &SinomoDataDir) -> Result<Self, CliError> {
+        let store = main_agent_config_store()?;
+        let mut entries = store
+            .registry()
+            .definitions()
+            .map(|definition| {
+                let resolved = store.get(data_dir, None, definition.key.as_str());
+                match resolved {
+                    Ok(resolution) => TuiSettingsEntry {
+                        definition: resolution.definition,
+                        source: Some(resolution.source),
+                        value: Some(resolution.value),
+                        error: None,
+                    },
+                    Err(error) => TuiSettingsEntry {
+                        definition: definition.clone(),
+                        source: None,
+                        value: None,
+                        error: Some(error.to_string()),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.key().cmp(right.key()));
+        Ok(Self {
+            entries,
+            selected: 0,
+            editing_key: None,
+        })
+    }
+
+    fn selected_entry(&self) -> Option<&TuiSettingsEntry> {
+        self.entries.get(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.entries.len() - 1;
+        if delta.is_negative() {
+            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.selected = self.selected.saturating_add(delta as usize).min(last);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiFilesTarget {
     Local(PathBuf),
@@ -802,6 +894,7 @@ enum TuiFilesTarget {
 enum TuiSlashCommand {
     Files { target: TuiFilesTarget },
     Model(TuiModelCommand),
+    Settings,
     Sessions,
     Resume { session_id: SessionId },
 }
@@ -907,6 +1000,7 @@ struct TuiState {
     file_browser: Option<FileManagerState>,
     file_prompt: Option<FileManagerPrompt>,
     session_list: Option<TuiSessionListState>,
+    settings: Option<TuiSettingsState>,
     input: String,
     input_cursor: usize,
     messages: Vec<TuiMessage>,
@@ -938,6 +1032,7 @@ impl TuiState {
             file_browser: None,
             file_prompt: None,
             session_list: None,
+            settings: None,
             input: String::new(),
             input_cursor: 0,
             messages: Vec::new(),
@@ -967,8 +1062,10 @@ impl TuiState {
             }
             KeyCode::F(2) => self.toggle_file_browser(),
             KeyCode::F(3) => TuiInputAction::OpenSessions,
+            KeyCode::F(4) => TuiInputAction::OpenSettings,
             _ if self.view_mode == TuiViewMode::Files => self.apply_file_browser_key_event(key),
             _ if self.view_mode == TuiViewMode::Sessions => self.apply_session_list_key_event(key),
+            _ if self.view_mode == TuiViewMode::Settings => self.apply_settings_key_event(key),
             KeyCode::Char('s')
                 if self.view_mode == TuiViewMode::Chat
                     && key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1116,6 +1213,13 @@ impl TuiState {
                         TuiInputAction::OpenSessions
                     }
                 }
+                TuiViewMode::Settings => {
+                    if self.view_mode == TuiViewMode::Settings {
+                        TuiInputAction::None
+                    } else {
+                        TuiInputAction::OpenSettings
+                    }
+                }
             };
         }
 
@@ -1135,6 +1239,10 @@ impl TuiState {
             }
             TuiViewMode::Sessions => {
                 self.select_session_at(layout.main, column, row);
+            }
+            TuiViewMode::Settings => {
+                let (entries_area, _) = tui_settings_areas(layout.main);
+                self.select_setting_at(entries_area, column, row);
             }
         }
         TuiInputAction::None
@@ -1199,6 +1307,19 @@ impl TuiState {
                     && let Some(list) = self.session_list.as_mut()
                 {
                     list.move_selection(if up {
+                        -TUI_MOUSE_SCROLL_LINES
+                    } else {
+                        TUI_MOUSE_SCROLL_LINES
+                    });
+                }
+            }
+            TuiViewMode::Settings => {
+                let (entries_area, _) = tui_settings_areas(layout.main);
+                let entries_inner = tui_inner_rect(entries_area);
+                if rect_contains(entries_inner, column, row)
+                    && let Some(settings) = self.settings.as_mut()
+                {
+                    settings.move_selection(if up {
                         -TUI_MOUSE_SCROLL_LINES
                     } else {
                         TUI_MOUSE_SCROLL_LINES
@@ -1331,6 +1452,26 @@ impl TuiState {
         }
     }
 
+    fn select_setting_at(&mut self, area: Rect, column: u16, row: u16) {
+        let inner = tui_inner_rect(area);
+        if !rect_contains(inner, column, row) {
+            return;
+        }
+        let Some(settings) = self.settings.as_mut() else {
+            return;
+        };
+        let visible_height = usize::from(inner.height);
+        let (visible_start, visible_end) = completion_visible_range(
+            settings.entries.len(),
+            Some(settings.selected),
+            visible_height,
+        );
+        let index = visible_start + usize::from(row - inner.y);
+        if index < visible_end {
+            settings.selected = index;
+        }
+    }
+
     fn apply_session_list_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
         match key.code {
             KeyCode::Esc => {
@@ -1387,6 +1528,126 @@ impl TuiState {
                 .and_then(TuiSessionListState::selected_session_id)
                 .map(TuiInputAction::Resume)
                 .unwrap_or(TuiInputAction::None),
+            _ => TuiInputAction::None,
+        }
+    }
+
+    fn apply_settings_key_event(&mut self, key: KeyEvent) -> TuiInputAction {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.editing_key.is_some())
+        {
+            return match key.code {
+                KeyCode::Esc => {
+                    self.cancel_setting_edit();
+                    TuiInputAction::None
+                }
+                KeyCode::Enter => {
+                    let Some(key) = self
+                        .settings
+                        .as_ref()
+                        .and_then(|settings| settings.editing_key.clone())
+                    else {
+                        return TuiInputAction::None;
+                    };
+                    let value = std::mem::take(&mut self.input);
+                    self.input_cursor = 0;
+                    TuiInputAction::SaveSetting { key, value }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    TuiInputAction::None
+                }
+                KeyCode::Backspace => {
+                    self.backspace();
+                    TuiInputAction::None
+                }
+                KeyCode::Delete => {
+                    self.delete();
+                    TuiInputAction::None
+                }
+                KeyCode::Left => {
+                    self.move_cursor_left();
+                    TuiInputAction::None
+                }
+                KeyCode::Right => {
+                    self.move_cursor_right();
+                    TuiInputAction::None
+                }
+                KeyCode::Home => {
+                    self.input_cursor = 0;
+                    TuiInputAction::None
+                }
+                KeyCode::End => {
+                    self.input_cursor = self.input.len();
+                    TuiInputAction::None
+                }
+                KeyCode::Char(character)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.input.insert(self.input_cursor, character);
+                    self.input_cursor += character.len_utf8();
+                    TuiInputAction::None
+                }
+                _ => TuiInputAction::None,
+            };
+        }
+
+        match key.code {
+            KeyCode::Esc => {
+                self.close_settings();
+                TuiInputAction::None
+            }
+            KeyCode::Enter | KeyCode::Char('e')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.start_setting_edit();
+                TuiInputAction::None
+            }
+            KeyCode::Char('r') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                TuiInputAction::OpenSettings
+            }
+            KeyCode::Up => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_selection(-1);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Down => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_selection(1);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::PageUp => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_selection(-8);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::PageDown => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.move_selection(8);
+                }
+                TuiInputAction::None
+            }
+            KeyCode::Home => {
+                if let Some(settings) = self.settings.as_mut() {
+                    settings.selected = 0;
+                }
+                TuiInputAction::None
+            }
+            KeyCode::End => {
+                if let Some(settings) = self.settings.as_mut()
+                    && !settings.entries.is_empty()
+                {
+                    settings.selected = settings.entries.len() - 1;
+                }
+                TuiInputAction::None
+            }
             _ => TuiInputAction::None,
         }
     }
@@ -1642,6 +1903,7 @@ impl TuiState {
             TuiViewMode::Chat => {}
             TuiViewMode::Files => self.close_file_browser(),
             TuiViewMode::Sessions => self.close_session_list(),
+            TuiViewMode::Settings => self.close_settings(),
         }
     }
 
@@ -1683,6 +1945,7 @@ impl TuiState {
         self.file_browser = Some(browser);
         self.file_prompt = None;
         self.session_list = None;
+        self.settings = None;
         self.input.clear();
         self.input_cursor = 0;
         self.completions = None;
@@ -1706,6 +1969,7 @@ impl TuiState {
         self.input_cursor = 0;
         self.completions = None;
         self.session_list = Some(TuiSessionListState::new(sessions, &self.session_id));
+        self.settings = None;
         self.chat_selection = None;
         self.status = format!("showing {count} session(s)");
     }
@@ -1717,6 +1981,66 @@ impl TuiState {
         self.input_cursor = 0;
         self.completions = None;
         self.status = "listening".to_string();
+    }
+
+    fn open_settings(&mut self, settings: TuiSettingsState) {
+        let count = settings.entries.len();
+        self.view_mode = TuiViewMode::Settings;
+        self.file_browser = None;
+        self.file_prompt = None;
+        self.session_list = None;
+        self.settings = Some(settings);
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.chat_selection = None;
+        self.status = format!("showing {count} setting(s)");
+    }
+
+    fn close_settings(&mut self) {
+        self.view_mode = TuiViewMode::Chat;
+        self.settings = None;
+        self.input.clear();
+        self.input_cursor = 0;
+        self.completions = None;
+        self.status = "listening".to_string();
+    }
+
+    fn start_setting_edit(&mut self) {
+        let Some(settings) = self.settings.as_mut() else {
+            return;
+        };
+        let Some(entry) = settings.selected_entry() else {
+            self.status = "no setting selected".to_string();
+            return;
+        };
+        if tui_config_key_is_sensitive(entry.key()) {
+            self.status = "sensitive settings are not editable here".to_string();
+            return;
+        }
+        let key = entry.key().to_string();
+        let Some(value) = entry
+            .value
+            .clone()
+            .or_else(|| entry.definition.default_value.clone())
+        else {
+            self.status = "setting has no current value".to_string();
+            return;
+        };
+        settings.editing_key = Some(key.clone());
+        self.input = compact_tui_json(&value);
+        self.input_cursor = self.input.len();
+        self.completions = None;
+        self.status = format!("editing {key}");
+    }
+
+    fn cancel_setting_edit(&mut self) {
+        if let Some(settings) = self.settings.as_mut() {
+            settings.editing_key = None;
+        }
+        self.input.clear();
+        self.input_cursor = 0;
+        self.status = "settings edit cancelled".to_string();
     }
 
     fn replace_session(
@@ -1741,6 +2065,7 @@ impl TuiState {
         self.file_browser = None;
         self.file_prompt = None;
         self.session_list = None;
+        self.settings = None;
         self.input.clear();
         self.input_cursor = 0;
         self.completions = None;
@@ -1829,11 +2154,19 @@ impl TuiState {
         if self.view_mode == TuiViewMode::Sessions {
             return "Sessions";
         }
+        if self.view_mode == TuiViewMode::Settings {
+            return "Settings";
+        }
         "Message"
     }
 
     fn accepts_text_input(&self) -> bool {
-        self.view_mode == TuiViewMode::Chat || self.file_prompt.is_some()
+        self.view_mode == TuiViewMode::Chat
+            || self.file_prompt.is_some()
+            || self
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.editing_key.is_some())
     }
 
     fn request_exit(&mut self) {
@@ -1957,6 +2290,11 @@ impl TuiState {
     fn insert_str(&mut self, text: &str) {
         if (self.view_mode == TuiViewMode::Files && self.file_prompt.is_none())
             || self.view_mode == TuiViewMode::Sessions
+            || (self.view_mode == TuiViewMode::Settings
+                && self
+                    .settings
+                    .as_ref()
+                    .is_none_or(|settings| settings.editing_key.is_none()))
         {
             return;
         }
@@ -2208,6 +2546,10 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
             detail: "usage: /files [path|sifs:/path|local:<path>|--sifs [path]]".to_string(),
         }),
         [command, rest @ ..] if command == "model" => parse_tui_model_command(rest),
+        [command] if command == "settings" => Ok(Some(TuiSlashCommand::Settings)),
+        [command, ..] if command == "settings" => Err(CliError::Parse {
+            detail: "usage: /settings".to_string(),
+        }),
         [command] if command == "sessions" => Ok(Some(TuiSlashCommand::Sessions)),
         [command, ..] if command == "sessions" => Err(CliError::Parse {
             detail: "usage: /sessions".to_string(),
@@ -2293,6 +2635,12 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
                 "loaded {count} session(s)"
             ))])
         }
+        TuiSlashCommand::Settings => {
+            let count = open_tui_settings_view(state, data_dir)?;
+            Ok(vec![InteractionOutput::Line(format!(
+                "loaded {count} setting(s)"
+            ))])
+        }
         TuiSlashCommand::Resume { session_id } => {
             resume_tui_session(runtime, state, session_store, data_dir, daemon, session_id)
         }
@@ -2309,6 +2657,52 @@ fn open_tui_session_list_view<H: TuiAgentRuntimeControl>(
     let count = sessions.len();
     state.open_session_list(sessions);
     Ok(count)
+}
+
+fn open_tui_settings_view(
+    state: &mut TuiState,
+    data_dir: &SinomoDataDir,
+) -> Result<usize, CliError> {
+    let settings = TuiSettingsState::load(data_dir)?;
+    let count = settings.entries.len();
+    state.open_settings(settings);
+    Ok(count)
+}
+
+fn save_tui_setting(
+    state: &mut TuiState,
+    data_dir: &SinomoDataDir,
+    key: &str,
+    value: &str,
+) -> Result<(), CliError> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|source| CliError::Parse {
+            detail: format!("invalid JSON for setting `{key}`: {source}"),
+        })?;
+    let store = main_agent_config_store()?;
+    store
+        .set(
+            data_dir,
+            None,
+            key,
+            parsed,
+            sinomo_runtime::config::ConfigWriteTarget::Auto,
+        )
+        .map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })?;
+    let selected_key = key.to_string();
+    let mut settings = TuiSettingsState::load(data_dir)?;
+    if let Some(index) = settings
+        .entries
+        .iter()
+        .position(|entry| entry.key() == selected_key)
+    {
+        settings.selected = index;
+    }
+    state.open_settings(settings);
+    state.status = format!("saved setting {key}");
+    Ok(())
 }
 
 fn resume_tui_session<H: TuiAgentRuntimeControl>(
@@ -2563,6 +2957,20 @@ fn truncate_tui_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+fn compact_tui_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn tui_config_key_is_sensitive(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    lower.contains("credential")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+}
+
 fn tui_session_messages_are_empty(messages: &[TuiMessage]) -> bool {
     !messages
         .iter()
@@ -2687,7 +3095,10 @@ struct TuiLayoutAreas {
 }
 
 fn tui_layout_areas(area: Rect, state: &TuiState) -> TuiLayoutAreas {
-    if matches!(state.view_mode, TuiViewMode::Files | TuiViewMode::Sessions) {
+    if matches!(
+        state.view_mode,
+        TuiViewMode::Files | TuiViewMode::Sessions | TuiViewMode::Settings
+    ) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2736,6 +3147,14 @@ fn tui_completion_height(state: &TuiState) -> u16 {
 }
 
 fn tui_file_browser_areas(area: Rect) -> (Rect, Rect) {
+    tui_split_list_detail_areas(area)
+}
+
+fn tui_settings_areas(area: Rect) -> (Rect, Rect) {
+    tui_split_list_detail_areas(area)
+}
+
+fn tui_split_list_detail_areas(area: Rect) -> (Rect, Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
@@ -2766,6 +3185,7 @@ fn render_tui(frame: &mut Frame<'_>, state: &TuiState) {
     render_tui_menu_bar(frame, areas.menu, state);
     match state.view_mode {
         TuiViewMode::Sessions => render_tui_session_list(frame, areas.main, state),
+        TuiViewMode::Settings => render_tui_settings(frame, areas.main, state),
         TuiViewMode::Files => render_tui_file_browser(frame, areas.main, state),
         TuiViewMode::Chat => {
             let (info_area, transcript_area) = tui_chat_areas(areas.main);
@@ -2825,7 +3245,7 @@ struct TuiMenuTab {
     active: bool,
 }
 
-fn tui_menu_tabs(view_mode: &TuiViewMode) -> [TuiMenuTab; 3] {
+fn tui_menu_tabs(view_mode: &TuiViewMode) -> [TuiMenuTab; 4] {
     [
         TuiMenuTab {
             label: " Chat (F1) ",
@@ -2839,6 +3259,10 @@ fn tui_menu_tabs(view_mode: &TuiViewMode) -> [TuiMenuTab; 3] {
             label: " Sessions (F3) ",
             active: *view_mode == TuiViewMode::Sessions,
         },
+        TuiMenuTab {
+            label: " Settings (F4) ",
+            active: *view_mode == TuiViewMode::Settings,
+        },
     ]
 }
 
@@ -2850,6 +3274,7 @@ fn tui_menu_tab_at(area: Rect, column: u16, row: u16) -> Option<TuiViewMode> {
         (TuiViewMode::Chat, " Chat (F1) "),
         (TuiViewMode::Files, " Files (F2) "),
         (TuiViewMode::Sessions, " Sessions (F3) "),
+        (TuiViewMode::Settings, " Settings (F4) "),
     ];
     let mut x = area.x;
     for (mode, label) in tabs {
@@ -3113,6 +3538,170 @@ fn render_tui_session_list(frame: &mut Frame<'_>, area: Rect, state: &TuiState) 
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
+fn render_tui_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let Some(settings) = &state.settings else {
+        let block = Block::default()
+            .title("Settings")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Red));
+        frame.render_widget(Paragraph::new("settings are not loaded").block(block), area);
+        return;
+    };
+    let (entries_area, detail_area) = tui_settings_areas(area);
+    render_tui_settings_entries(frame, entries_area, settings);
+    render_tui_settings_detail(frame, detail_area, settings);
+}
+
+fn render_tui_settings_entries(frame: &mut Frame<'_>, area: Rect, settings: &TuiSettingsState) {
+    let visible_height = usize::from(area.height.saturating_sub(2));
+    let (visible_start, visible_end) = completion_visible_range(
+        settings.entries.len(),
+        Some(settings.selected),
+        visible_height,
+    );
+    let lines = settings
+        .entries
+        .iter()
+        .enumerate()
+        .skip(visible_start)
+        .take(visible_end.saturating_sub(visible_start))
+        .map(|(index, entry)| {
+            let selected = settings.selected == index;
+            let key_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if entry.error.is_some() {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let detail_style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let marker = if selected { "> " } else { "  " };
+            let source = entry
+                .source
+                .map(|source| format!("{source:?}"))
+                .unwrap_or_else(|| "unset".to_string());
+            Line::from(vec![
+                Span::styled(marker, key_style),
+                Span::styled(entry.key().to_string(), key_style),
+                Span::styled("  ", detail_style),
+                Span::styled(source, detail_style),
+                Span::styled("  ", detail_style),
+                Span::styled(truncate_tui_text(&entry.value_preview(), 36), detail_style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let title = if visible_start > 0 || visible_end < settings.entries.len() {
+        format!(
+            "Settings {}-{}/{}",
+            visible_start + 1,
+            visible_end,
+            settings.entries.len()
+        )
+    } else {
+        "Settings".to_string()
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_tui_settings_detail(frame: &mut Frame<'_>, area: Rect, settings: &TuiSettingsState) {
+    let lines = match settings.selected_entry() {
+        Some(entry) => tui_settings_detail_lines(entry, settings.editing_key.as_deref()),
+        None => vec![Line::from(Span::raw("no settings"))],
+    };
+    let title = settings
+        .selected_entry()
+        .map(|entry| entry.key().to_string())
+        .unwrap_or_else(|| "Setting".to_string());
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn tui_settings_detail_lines(
+    entry: &TuiSettingsEntry,
+    editing_key: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("owner ", Style::default().fg(Color::DarkGray)),
+            Span::raw(entry.definition.owner.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("mode ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:?}", entry.definition.cluster_mode)),
+        ]),
+        Line::from(vec![
+            Span::styled("type ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!("{:?}", entry.definition.value_type)),
+        ]),
+        Line::from(vec![
+            Span::styled("source ", Style::default().fg(Color::DarkGray)),
+            Span::raw(
+                entry
+                    .source
+                    .map(|source| format!("{source:?}"))
+                    .unwrap_or_else(|| "unset".to_string()),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("local ", Style::default().fg(Color::DarkGray)),
+            Span::raw(entry.definition.key.as_str().replace('.', "/") + ".json"),
+        ]),
+        Line::from(vec![
+            Span::styled("cluster ", Style::default().fg(Color::DarkGray)),
+            Span::raw(entry.definition.cluster_key()),
+        ]),
+        Line::from(""),
+        Line::from(entry.definition.description.clone()),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "value",
+            Style::default().fg(Color::DarkGray),
+        )]),
+    ];
+    match (&entry.error, &entry.value) {
+        (Some(error), None) => lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Yellow),
+        ))),
+        (_, Some(_)) if tui_config_key_is_sensitive(entry.key()) => {
+            lines.push(Line::from("<redacted>"));
+        }
+        (_, Some(value)) => {
+            let pretty =
+                serde_json::to_string_pretty(value).unwrap_or_else(|_| compact_tui_json(value));
+            lines.extend(pretty.lines().map(|line| Line::from(line.to_string())));
+        }
+        _ => lines.push(Line::from("unset")),
+    }
+    if editing_key == Some(entry.key()) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "editing JSON in input",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    lines
+}
+
 fn render_tui_file_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let Some(browser) = &state.file_browser else {
         let block = Block::default()
@@ -3302,6 +3891,45 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::styled("Esc/F1", Style::default().fg(Color::DarkGray)),
             Span::raw(" chat"),
         ]);
+        frame.render_widget(Paragraph::new(line), area);
+        return;
+    }
+    if state.view_mode == TuiViewMode::Settings {
+        let editing = state
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.editing_key.is_some());
+        let line = if editing {
+            Line::from(vec![
+                Span::styled(
+                    state.status.clone(),
+                    status_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("Enter", Style::default().fg(Color::DarkGray)),
+                Span::raw(" save   "),
+                Span::styled("Esc", Style::default().fg(Color::DarkGray)),
+                Span::raw(" cancel   "),
+                Span::styled("Ctrl+U", Style::default().fg(Color::DarkGray)),
+                Span::raw(" clear"),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(
+                    state.status.clone(),
+                    status_style.add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("   "),
+                Span::styled("Up/Down", Style::default().fg(Color::DarkGray)),
+                Span::raw(" move   "),
+                Span::styled("Enter/e", Style::default().fg(Color::DarkGray)),
+                Span::raw(" edit   "),
+                Span::styled("r", Style::default().fg(Color::DarkGray)),
+                Span::raw(" reload   "),
+                Span::styled("Esc/F1", Style::default().fg(Color::DarkGray)),
+                Span::raw(" chat"),
+            ])
+        };
         frame.render_widget(Paragraph::new(line), area);
         return;
     }
@@ -3791,16 +4419,25 @@ mod tui_tests {
         assert!(chat[0].active);
         assert!(!chat[1].active);
         assert!(!chat[2].active);
+        assert!(!chat[3].active);
 
         let files = tui_menu_tabs(&TuiViewMode::Files);
         assert!(!files[0].active);
         assert!(files[1].active);
         assert!(!files[2].active);
+        assert!(!files[3].active);
 
         let sessions = tui_menu_tabs(&TuiViewMode::Sessions);
         assert!(!sessions[0].active);
         assert!(!sessions[1].active);
         assert!(sessions[2].active);
+        assert!(!sessions[3].active);
+
+        let settings = tui_menu_tabs(&TuiViewMode::Settings);
+        assert!(!settings[0].active);
+        assert!(!settings[1].active);
+        assert!(!settings[2].active);
+        assert!(settings[3].active);
     }
 
     #[test]
@@ -3824,6 +4461,18 @@ mod tui_tests {
         );
         assert_eq!(state.view_mode, TuiViewMode::Chat);
 
+        state.open_settings(TuiSettingsState {
+            entries: Vec::new(),
+            selected: 0,
+            editing_key: None,
+        });
+        assert_eq!(state.view_mode, TuiViewMode::Settings);
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::F(1))),
+            TuiInputAction::None
+        );
+        assert_eq!(state.view_mode, TuiViewMode::Chat);
+
         fs::remove_dir_all(root).ok();
     }
 
@@ -3838,6 +4487,35 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_state_f4_opens_settings() {
+        let mut state = fixture_tui_state();
+
+        assert_eq!(
+            state.apply_key_event(press(KeyCode::F(4))),
+            TuiInputAction::OpenSettings
+        );
+    }
+
+    #[test]
+    fn tui_settings_loads_shared_config_catalog() {
+        let root = temp_file_browser_root("settings-catalog");
+        let data_dir = SinomoDataDir::new(&root);
+
+        let settings = TuiSettingsState::load(&data_dir).expect("settings");
+        let keys = settings
+            .entries
+            .iter()
+            .map(TuiSettingsEntry::key)
+            .collect::<Vec<_>>();
+
+        assert!(keys.iter().any(|key| *key == "dfs.expose"));
+        assert!(keys.iter().any(|key| *key == "rollout.telemetry.gates"));
+        assert!(keys.iter().any(|key| *key == "lm.credentials.openai"));
+        assert!(keys.iter().any(|key| *key == "evolution.config"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn tui_mouse_menu_clicks_switch_views() {
         let root = temp_file_browser_root("mouse-menu");
         let area = Rect::new(0, 0, 100, 24);
@@ -3847,6 +4525,7 @@ mod tui_tests {
         assert_eq!(tui_menu_tab_at(menu, 1, 0), Some(TuiViewMode::Chat));
         assert_eq!(tui_menu_tab_at(menu, 13, 0), Some(TuiViewMode::Files));
         assert_eq!(tui_menu_tab_at(menu, 26, 0), Some(TuiViewMode::Sessions));
+        assert_eq!(tui_menu_tab_at(menu, 42, 0), Some(TuiViewMode::Settings));
 
         assert_eq!(
             state.apply_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 13, 0), area),
@@ -3856,6 +4535,11 @@ mod tui_tests {
         assert_eq!(
             state.apply_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 26, 0), area),
             TuiInputAction::OpenSessions
+        );
+
+        assert_eq!(
+            state.apply_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 42, 0), area),
+            TuiInputAction::OpenSettings
         );
 
         state.open_file_browser_at(root.clone());
@@ -4264,13 +4948,19 @@ mod tui_tests {
     }
 
     #[test]
-    fn tui_session_commands_parse_list_and_resume() {
+    fn tui_session_and_settings_commands_parse() {
         let session_id = SessionId::generate();
         assert_eq!(
             parse_tui_slash_command("/sessions")
                 .expect("parse")
                 .expect("sessions"),
             TuiSlashCommand::Sessions
+        );
+        assert_eq!(
+            parse_tui_slash_command("/settings")
+                .expect("parse")
+                .expect("settings"),
+            TuiSlashCommand::Settings
         );
         assert_eq!(
             parse_tui_slash_command(&format!("/resume {session_id}"))
@@ -4843,6 +5533,11 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         self
     }
 
+    pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
+        self.agent = self.agent.with_tool_registry(registry);
+        self
+    }
+
     fn runtime_info(&self) -> TuiAgentRuntimeInfo {
         TuiAgentRuntimeInfo {
             agent: self.agent_definition.name.clone(),
@@ -4862,12 +5557,14 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         account: Option<String>,
         options: LanguageModelProviderOptions,
     ) -> TuiAgentRuntimeInfo {
+        let tool_registry = self.agent.tool_registry();
         self.agent = MainAgentLoop::with_definition(
             model,
             provider.clone(),
             model_name.clone(),
             self.agent_definition.clone(),
-        );
+        )
+        .with_tool_registry(tool_registry);
         self.provider = provider;
         self.model_name = model_name;
         self.account = account;
@@ -4889,12 +5586,10 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
             runtime_config,
             thinking.clone(),
         );
-        Ok(Self::with_thinking(
-            model,
-            runtime_info.provider,
-            runtime_info.model,
-            thinking,
-        ))
+        Ok(
+            Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
+                .with_tool_registry(main_agent_config_tool_registry(data_dir)?),
+        )
     }
 
     fn switch_to_selection(

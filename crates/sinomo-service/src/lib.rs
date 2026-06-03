@@ -27,11 +27,6 @@ use sinomo_kv::{KvEntry, KvError, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 
-mod dfs;
-mod sandbox;
-pub use dfs::DfsService;
-pub use sandbox::{LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService};
-
 /// Whether the host should keep serving after a request (`Stop` == daemon shutdown).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceDisposition {

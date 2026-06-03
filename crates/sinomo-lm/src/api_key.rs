@@ -1,7 +1,9 @@
-use crate::{LanguageModelError, unix_timestamp};
+use crate::{
+    LanguageModelError, read_provider_credentials_json_value, unix_timestamp,
+    write_provider_credentials_json_value,
+};
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::local::SinomoDataDir;
-use std::fs;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -24,7 +26,7 @@ pub(crate) fn resolve_api_key(
         return Ok(api_key.trim().to_string());
     }
 
-    if let Some(stored) = load_api_key_credential(credentials_path)?
+    if let Some(stored) = load_api_key_credential(provider, credentials_path)?
         && !stored.api_key.trim().is_empty()
     {
         return Ok(stored.api_key);
@@ -46,33 +48,22 @@ pub(crate) fn resolve_api_key(
 }
 
 pub(crate) fn save_api_key_credential(
+    provider: &str,
     credentials_path: &Option<PathBuf>,
     api_key: &str,
     source: &str,
 ) -> Result<(), LanguageModelError> {
-    let Some(path) = credentials_path else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| LanguageModelError::TokenStore {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
     let payload = StoredApiKeyCredential {
         api_key: api_key.trim().to_string(),
         source: source.to_string(),
         created_at_unix: unix_timestamp(),
     };
-    let content = serde_json::to_string_pretty(&payload).map_err(|source| {
+    let value = serde_json::to_value(payload).map_err(|source| {
         LanguageModelError::RequestSerialization {
             detail: source.to_string(),
         }
     })?;
-    fs::write(path, content).map_err(|source| LanguageModelError::TokenStore {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    write_provider_credentials_json_value(provider, credentials_path, value)
 }
 
 pub(crate) fn default_api_key_credentials_path(
@@ -88,22 +79,17 @@ pub(crate) fn default_api_key_credentials_path(
 }
 
 fn load_api_key_credential(
+    provider: &str,
     credentials_path: &Option<PathBuf>,
 ) -> Result<Option<StoredApiKeyCredential>, LanguageModelError> {
-    let Some(path) = credentials_path else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(path).map_err(|source| LanguageModelError::TokenStore {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    serde_json::from_str(&content)
-        .map(Some)
+    read_provider_credentials_json_value(provider, credentials_path)?
+        .map(serde_json::from_value)
+        .transpose()
         .map_err(|source| LanguageModelError::TokenStore {
-            path: path.display().to_string(),
+            path: credentials_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<provider-credentials>".to_string()),
             detail: source.to_string(),
         })
 }

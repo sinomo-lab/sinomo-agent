@@ -15,6 +15,7 @@ mod module_artifact;
 mod paths;
 mod policy;
 mod runtime;
+mod service;
 mod storage;
 mod store;
 mod toolchain;
@@ -41,6 +42,10 @@ pub use runtime::{
     sandbox_runtime_supports_child_processes, sandbox_runtime_supports_child_processes_for_abi,
     sandbox_runtime_supports_command_capability_for_abi,
     sandbox_runtime_supports_mvp_virtual_devices,
+};
+pub use service::{
+    LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService, register_services,
+    register_services_with_factory,
 };
 pub use storage::register_storage_paths;
 pub use store::*;

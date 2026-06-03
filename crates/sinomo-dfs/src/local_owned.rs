@@ -97,6 +97,37 @@ impl DfsExposeConfig {
     }
 }
 
+pub const DFS_EXPOSE_CONFIG_KEY: &str = "dfs.expose";
+
+pub fn dfs_expose_config_definition() -> Result<sinomo_config::ConfigDefinition, DfsExposeStoreError>
+{
+    sinomo_config::ConfigDefinition::new(
+        DFS_EXPOSE_CONFIG_KEY,
+        "sinomo-dfs",
+        sinomo_config::ConfigValueType::Object {
+            schema_name: "DfsExposeConfig".to_string(),
+        },
+        "Local-owned DFS directory exposure mappings for this node.",
+        sinomo_config::ConfigClusterMode::LocalOnly,
+    )
+    .map_err(map_dfs_config_error)?
+    .with_default(&DfsExposeConfig::empty())
+    .map_err(map_dfs_config_error)
+    .map(|definition| definition.with_local_legacy_path("config/dfs-expose.json"))
+}
+
+pub fn register_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, DfsExposeStoreError> {
+    builder
+        .register(dfs_expose_config_definition()?)
+        .map_err(map_dfs_config_error)
+}
+
+fn map_dfs_config_error(source: sinomo_config::ConfigError) -> DfsExposeStoreError {
+    DfsExposeStoreError::Serde(source.to_string())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsExposeEntry {
     pub id: String,
@@ -248,11 +279,10 @@ impl DfsExposeStore {
             return read_expose_config(&self.path, expose_config_format(&self.path))
                 .map(|config| Some((config, false)));
         }
-        if let Some(legacy_path) = legacy_json_path(&self.path)
-            && legacy_path.exists()
-        {
-            return read_expose_config(&legacy_path, DfsExposeConfigFormat::Json)
-                .map(|config| Some((config, true)));
+        for (legacy_path, format) in legacy_expose_config_paths(&self.path) {
+            if legacy_path.exists() {
+                return read_expose_config(&legacy_path, format).map(|config| Some((config, true)));
+            }
         }
         Ok(None)
     }
@@ -518,8 +548,36 @@ fn expose_config_format(path: &Path) -> DfsExposeConfigFormat {
     }
 }
 
-fn legacy_json_path(path: &Path) -> Option<PathBuf> {
-    (expose_config_format(path) == DfsExposeConfigFormat::Sobj).then(|| path.with_extension("json"))
+fn legacy_expose_config_paths(path: &Path) -> Vec<(PathBuf, DfsExposeConfigFormat)> {
+    let mut paths = Vec::new();
+    if expose_config_format(path) == DfsExposeConfigFormat::Sobj {
+        paths.push((path.with_extension("json"), DfsExposeConfigFormat::Json));
+    }
+    if let Some(root) = shared_dfs_expose_config_root(path) {
+        paths.push((
+            root.join("config").join("dfs-expose.sobj"),
+            DfsExposeConfigFormat::Sobj,
+        ));
+        paths.push((
+            root.join("config").join("dfs-expose.json"),
+            DfsExposeConfigFormat::Json,
+        ));
+    }
+    paths
+}
+
+fn shared_dfs_expose_config_root(path: &Path) -> Option<PathBuf> {
+    let file = path.file_name()?.to_str()?;
+    let dfs_dir = path.parent()?;
+    let dfs_component = dfs_dir.file_name()?.to_str()?;
+    let configs_dir = dfs_dir.parent()?;
+    let configs_component = configs_dir.file_name()?.to_str()?;
+    (file == "expose.json" && dfs_component == "dfs" && configs_component == "configs").then(|| {
+        configs_dir
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf()
+    })
 }
 
 fn read_expose_config(
@@ -533,8 +591,11 @@ fn read_expose_config(
     let config: DfsExposeConfig = match format {
         DfsExposeConfigFormat::Sobj => sinomo_object_serde::from_bytes(&bytes)
             .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))?,
-        DfsExposeConfigFormat::Json => serde_json::from_slice(&bytes)
-            .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))?,
+        DfsExposeConfigFormat::Json => {
+            let value: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))?;
+            decode_json_expose_config_value(value)?
+        }
     };
     config.validate()?;
     Ok(config)
@@ -547,7 +608,26 @@ fn encode_expose_config(
     match format {
         DfsExposeConfigFormat::Sobj => sinomo_object_serde::to_bytes(config, 1, LengthMode::U32)
             .map_err(|source| DfsExposeStoreError::Serde(source.to_string())),
-        DfsExposeConfigFormat::Json => serde_json::to_vec_pretty(config)
+        DfsExposeConfigFormat::Json => {
+            let value = serde_json::to_value(config)
+                .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))?;
+            let document =
+                sinomo_config::ConfigDocument::new(dfs_expose_config_definition()?.key, value);
+            serde_json::to_vec_pretty(&document)
+                .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))
+        }
+    }
+}
+
+fn decode_json_expose_config_value(
+    value: serde_json::Value,
+) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+    match serde_json::from_value::<sinomo_config::ConfigDocument>(value.clone()) {
+        Ok(document) if document.key.as_str() == DFS_EXPOSE_CONFIG_KEY => {
+            serde_json::from_value(document.value)
+                .map_err(|source| DfsExposeStoreError::Serde(source.to_string()))
+        }
+        _ => serde_json::from_value(value)
             .map_err(|source| DfsExposeStoreError::Serde(source.to_string())),
     }
 }
@@ -753,6 +833,60 @@ mod tests {
         let stored_config: DfsExposeConfig =
             sinomo_object_serde::from_bytes(&fs::read(&store_path).expect("read sobj"))
                 .expect("sobj config");
+        assert_eq!(stored_config, config);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expose_store_writes_config_document_for_json_path() {
+        let root = temp_root("store_config_document");
+        let store_path = root.join("configs").join("dfs").join("expose.json");
+        let store = DfsExposeStore::new(&store_path);
+        let node_id = NodeId::from_legacy_named("node_alpha").expect("node id");
+
+        let config = store
+            .ensure_default(&root, node_id)
+            .expect("ensure default");
+
+        let document: sinomo_config::ConfigDocument =
+            serde_json::from_slice(&fs::read(&store_path).expect("read config document"))
+                .expect("config document");
+        assert_eq!(document.key.as_str(), DFS_EXPOSE_CONFIG_KEY);
+        let stored_config: DfsExposeConfig =
+            serde_json::from_value(document.value).expect("dfs expose config");
+        assert_eq!(stored_config, config);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expose_store_migrates_old_default_sobj_to_shared_config_document() {
+        let root = temp_root("store_old_default_migration");
+        let old_path = root.join("config").join("dfs-expose.sobj");
+        let store_path = root.join("configs").join("dfs").join("expose.json");
+        let node_id = NodeId::from_legacy_named("node_alpha").expect("node id");
+        let config = DfsExposeConfig::default_for_node(&root, node_id.clone());
+        fs::create_dir_all(old_path.parent().expect("old config parent")).expect("old parent");
+        fs::write(
+            &old_path,
+            sinomo_object_serde::to_bytes(&config, 1, LengthMode::U32).expect("legacy sobj"),
+        )
+        .expect("write legacy sobj");
+
+        let store = DfsExposeStore::new(&store_path);
+        assert_eq!(store.load().expect("load legacy sobj"), config);
+
+        let migrated = store
+            .ensure_default(&root, node_id)
+            .expect("ensure default migrates");
+        assert_eq!(migrated, config);
+        let document: sinomo_config::ConfigDocument =
+            serde_json::from_slice(&fs::read(&store_path).expect("read config document"))
+                .expect("config document");
+        assert_eq!(document.key.as_str(), DFS_EXPOSE_CONFIG_KEY);
+        let stored_config: DfsExposeConfig =
+            serde_json::from_value(document.value).expect("dfs expose config");
         assert_eq!(stored_config, config);
 
         let _ = fs::remove_dir_all(root);

@@ -259,6 +259,14 @@ impl From<sinomo_runtime::sandbox::SandboxPolicyConfigError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::config::ConfigError> for CliError {
+    fn from(error: sinomo_runtime::config::ConfigError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<KvError> for CliError {
     fn from(error: KvError) -> Self {
         Self::Kv(error)
@@ -358,6 +366,9 @@ impl From<sinomo_evolution::EvolutionPersistenceError> for CliError {
             sinomo_evolution::EvolutionPersistenceError::Json { path, detail } => {
                 Self::Json { path, detail }
             }
+            sinomo_evolution::EvolutionPersistenceError::Config { key, detail } => Self::Parse {
+                detail: format!("evolution config `{key}`: {detail}"),
+            },
             sinomo_evolution::EvolutionPersistenceError::MissingArtifact { artifact } => {
                 Self::MissingArtifact { artifact }
             }
@@ -410,6 +421,9 @@ impl From<RolloutError> for CliError {
             RolloutError::Json { path, detail } => Self::Json { path, detail },
             RolloutError::Object { path, detail } => Self::Parse {
                 detail: format!("sinomo object error at {path}: {detail}"),
+            },
+            RolloutError::Config { key, detail } => Self::Parse {
+                detail: format!("rollout config `{key}`: {detail}"),
             },
             RolloutError::Process {
                 command,

@@ -1,0 +1,26 @@
+[package]
+name = "sinomo-config"
+version.workspace = true
+description = "Shared Sinomo configuration registry, resolution, and object-RPC management service"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+sinomo-kv = { path = "../sinomo-kv" }
+sinomo-local = { path = "../sinomo-local" }
+sinomo-network = { path = "../sinomo-network" }
+sinomo-service = { path = "../sinomo-service" }
+sinomo-storage = { path = "../sinomo-storage" }
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["macros", "rt", "rt-multi-thread", "time"] }

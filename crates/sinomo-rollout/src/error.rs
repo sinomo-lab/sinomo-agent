@@ -14,6 +14,10 @@ pub enum RolloutError {
         path: String,
         detail: String,
     },
+    Config {
+        key: String,
+        detail: String,
+    },
     Process {
         command: String,
         status: i32,
@@ -43,6 +47,9 @@ impl fmt::Display for RolloutError {
             Self::Json { path, detail } => write!(formatter, "json error at {path}: {detail}"),
             Self::Object { path, detail } => {
                 write!(formatter, "sinomo object error at {path}: {detail}")
+            }
+            Self::Config { key, detail } => {
+                write!(formatter, "config error for {key}: {detail}")
             }
             Self::Process {
                 command,

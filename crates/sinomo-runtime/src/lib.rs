@@ -25,6 +25,7 @@ pub mod r0 {
 /// must not depend back on R2 service crates.
 pub mod r1 {
     pub use sinomo_api as api;
+    pub use sinomo_config as config;
     pub use sinomo_daemon as daemon;
     pub use sinomo_device as device;
     pub use sinomo_dfs as dfs;
@@ -56,6 +57,7 @@ pub mod r1 {
             sinomo_network::register_storage_paths(&mut layout)?;
             sinomo_kv::register_storage_paths(&mut layout)?;
             sinomo_daemon::register_storage_paths(&mut layout)?;
+            sinomo_config::register_storage_paths(&mut layout)?;
             sinomo_module::register_storage_paths(&mut layout)?;
             sinomo_registry::register_storage_paths(&mut layout)?;
             sinomo_node::register_storage_paths(&mut layout)?;
@@ -115,7 +117,7 @@ pub mod r1 {
         const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
             NativeRustModuleBinding {
                 registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-                register_services: None,
+                register_services: Some(sinomo_dfs::register_services),
                 register_storage_paths: Some(sinomo_dfs::register_storage_paths),
             },
             NativeRustModuleBinding {
@@ -180,9 +182,9 @@ pub mod r1 {
 
 pub use r0::{core, object};
 pub use r1::{
-    api, daemon, device, dfs, eval, events, kv, local, module, module_api, modules, network, node,
-    policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host, service, storage,
-    supervision,
+    api, config, daemon, device, dfs, eval, events, kv, local, module, module_api, modules,
+    network, node, policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host,
+    service, storage, supervision,
 };
 
 #[cfg(test)]
@@ -221,6 +223,7 @@ mod tests {
                 "module/loader-state/01kr3d54d45zkm0p0xgps8k7mt.sobj",
                 "module/lifecycle/unload-records/01kr3d54d45zkm0p0xgps8k7mt.sobj",
                 "module/local-command-artifacts.sobj",
+                "configs/rollout/telemetry/gates.json",
                 "rollout/runtime-state.sobj",
                 "rollout/telemetry-advance-state.sobj",
                 "rollout/telemetry-gates.sobj",
@@ -357,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_internal_module_table_binds_dfs_storage_hook() {
+    fn runtime_internal_module_table_binds_dfs_hooks() {
         let table = internal_module_table().expect("module table");
         let module_id = dfs::dfs_module_id();
         let registration = table
@@ -371,8 +374,14 @@ mod tests {
             dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY
         );
         assert_eq!(table.native_rust_bindings.len(), 2);
-        assert!(binding.register_services.is_none());
+        assert!(binding.register_services.is_some());
         assert!(binding.register_storage_paths.is_some());
+
+        let registry =
+            binding.register_services.expect("dfs services")(service::ServiceRegistry::builder())
+                .build();
+        assert!(registry.service_names().contains(&"dfs"));
+        assert!(registry.owns(dfs::DFS_STATUS_ROUTE));
 
         let layout = sinomo_data_dir_layout().expect("layout");
         let Some(StoragePathOwner::Escape(dfs_blobs)) =

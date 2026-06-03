@@ -72,7 +72,12 @@ impl DeepSeekProvider {
     }
 
     pub fn save_api_key(&self, api_key: &str, source: &str) -> Result<(), LanguageModelError> {
-        save_api_key_credential(&self.config.credentials_path, api_key, source)
+        save_api_key_credential(
+            Self::PROVIDER_ID,
+            &self.config.credentials_path,
+            api_key,
+            source,
+        )
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {

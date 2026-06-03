@@ -4,7 +4,8 @@ use crate::{
     LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse,
     LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
     LanguageModelUsageLimit, LanguageModelUsageProvider, PROVIDER_DEFAULT_MODEL,
-    apply_provider_vendor_options_to_payload, selected_model, unix_timestamp,
+    apply_provider_vendor_options_to_payload, read_provider_credentials_json_value, selected_model,
+    unix_timestamp, write_provider_credentials_json_value,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -12,7 +13,6 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -99,17 +99,12 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
 fn read_codex_chatgpt_tokens(
     credentials_path: &PathBuf,
 ) -> Result<Option<CodexChatGptTokens>, LanguageModelError> {
-    let contents = match fs::read_to_string(credentials_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(LanguageModelError::TokenStore {
-                path: credentials_path.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
+    let Some(value) =
+        read_provider_credentials_json_value(CODEX_PROVIDER_ID, &Some(credentials_path.clone()))?
+    else {
+        return Ok(None);
     };
-    let auth = serde_json::from_str::<CodexAuthDotJson>(&contents).map_err(|source| {
+    let auth = serde_json::from_value::<CodexAuthDotJson>(value).map_err(|source| {
         LanguageModelError::TokenStore {
             path: credentials_path.display().to_string(),
             detail: source.to_string(),
@@ -134,12 +129,6 @@ fn save_codex_chatgpt_tokens(
             detail: "could not resolve a Sinomo Codex credentials path; set SINOMO_DATA_DIR or SINOMO_CODEX_CREDENTIALS_FILE".to_string(),
         });
     };
-    if let Some(parent) = credentials_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| LanguageModelError::TokenStore {
-            path: credentials_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
     let last_refresh = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|source| LanguageModelError::RequestSerialization {
@@ -152,15 +141,11 @@ fn save_codex_chatgpt_tokens(
         last_refresh: Some(last_refresh),
         agent_identity: None,
     };
-    let json = serde_json::to_string_pretty(&auth).map_err(|source| {
-        LanguageModelError::RequestSerialization {
+    let value =
+        serde_json::to_value(auth).map_err(|source| LanguageModelError::RequestSerialization {
             detail: source.to_string(),
-        }
-    })?;
-    fs::write(credentials_path, json).map_err(|source| LanguageModelError::TokenStore {
-        path: credentials_path.display().to_string(),
-        detail: source.to_string(),
-    })
+        })?;
+    write_provider_credentials_json_value(CODEX_PROVIDER_ID, &Some(credentials_path.clone()), value)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
