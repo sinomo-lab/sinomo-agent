@@ -57,7 +57,6 @@ pub mod r1 {
             sinomo_kv::register_storage_paths(&mut layout)?;
             sinomo_daemon::register_storage_paths(&mut layout)?;
             sinomo_module::register_storage_paths(&mut layout)?;
-            sinomo_rollout::register_storage_paths(&mut layout)?;
             sinomo_registry::register_storage_paths(&mut layout)?;
             sinomo_node::register_storage_paths(&mut layout)?;
             super::modules::register_internal_module_storage_paths(&mut layout)?;
@@ -113,12 +112,18 @@ pub mod r1 {
             pub native_rust_bindings: &'static [NativeRustModuleBinding],
         }
 
-        const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] =
-            &[NativeRustModuleBinding {
+        const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
+            NativeRustModuleBinding {
                 registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
                 register_services: None,
                 register_storage_paths: Some(sinomo_dfs::register_storage_paths),
-            }];
+            },
+            NativeRustModuleBinding {
+                registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
+                register_services: Some(sinomo_rollout::register_services),
+                register_storage_paths: Some(sinomo_rollout::register_storage_paths),
+            },
+        ];
 
         pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
             let registry = internal_module_registry()?;
@@ -131,6 +136,7 @@ pub mod r1 {
         pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
             let registry = sinomo_module::ModuleRegistry::builder()
                 .register(sinomo_dfs::dfs_module_registration())?
+                .register(sinomo_rollout::rollout_module_registration())?
                 .build();
             Ok(registry)
         }
@@ -185,7 +191,7 @@ mod tests {
         internal_module_registry, internal_module_table, native_rust_binding_for_registration,
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
-    use super::{core, dfs, module};
+    use super::{core, dfs, module, rollout, service};
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {
@@ -293,6 +299,64 @@ mod tests {
     }
 
     #[test]
+    fn runtime_internal_module_registry_includes_rollout() {
+        let registry = internal_module_registry().expect("module registry");
+        let module_id = rollout::rollout_module_id();
+        let registration = registry
+            .get(&module_id)
+            .expect("rollout module registration");
+
+        assert_eq!(registration.manifest.kind, core::ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.target_ring,
+            core::TrustRing::R1TrustedRuntime
+        );
+        assert_eq!(registration.manifest.api_version, rollout::ROLLOUT_PROTOCOL);
+        assert!(
+            registration
+                .manifest
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "rollout.build.apply")
+        );
+        assert_eq!(
+            registration.backend,
+            module::ModuleBackendRegistration::NativeRust {
+                registration: module::NativeRustBackendRegistration::new(
+                    rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
+                    rollout::SINOMO_ROLLOUT_MODULE_OWNER
+                )
+            }
+        );
+        assert_eq!(
+            registration.surfaces.storage_owners,
+            vec![rollout::SINOMO_ROLLOUT_MODULE_OWNER.to_string()]
+        );
+        assert!(
+            registration
+                .surfaces
+                .event_kinds
+                .iter()
+                .any(|event_kind| event_kind.as_str()
+                    == rollout::ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND)
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes.len(),
+            rollout::ROLLOUT_OBJECT_RPC_ROUTES.len()
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == rollout::ROLLOUT_BUILD_ROUTE
+                    && route.category == rollout::ROLLOUT_RPC_CATEGORY
+                    && route.auth == module::ModuleRouteAuth::Admin)
+        );
+    }
+
+    #[test]
     fn runtime_internal_module_table_binds_dfs_storage_hook() {
         let table = internal_module_table().expect("module table");
         let module_id = dfs::dfs_module_id();
@@ -306,7 +370,7 @@ mod tests {
             binding.registration_key,
             dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY
         );
-        assert_eq!(table.native_rust_bindings.len(), 1);
+        assert_eq!(table.native_rust_bindings.len(), 2);
         assert!(binding.register_services.is_none());
         assert!(binding.register_storage_paths.is_some());
 
@@ -317,5 +381,37 @@ mod tests {
             panic!("expected DFS blob storage contract");
         };
         assert_eq!(dfs_blobs.module, dfs::SINOMO_DFS_MODULE_OWNER);
+    }
+
+    #[test]
+    fn runtime_internal_module_table_binds_rollout_storage_hook() {
+        let table = internal_module_table().expect("module table");
+        let module_id = rollout::rollout_module_id();
+        let registration = table
+            .registry
+            .get(&module_id)
+            .expect("rollout module registration");
+        let binding = native_rust_binding_for_registration(registration).expect("rollout binding");
+
+        assert_eq!(
+            binding.registration_key,
+            rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY
+        );
+        assert!(binding.register_services.is_some());
+        assert!(binding.register_storage_paths.is_some());
+
+        let registry = binding.register_services.expect("rollout services")(
+            service::ServiceRegistry::builder(),
+        )
+        .build();
+        assert!(registry.owns(rollout::ROLLOUT_DIAGNOSTICS_ROUTE));
+
+        let layout = sinomo_data_dir_layout().expect("layout");
+        let Some(StoragePathOwner::File(rollout_state)) =
+            layout.owner_for("rollout/runtime-state.sobj")
+        else {
+            panic!("expected rollout runtime state storage contract");
+        };
+        assert_eq!(rollout_state.module, rollout::SINOMO_ROLLOUT_MODULE_OWNER);
     }
 }

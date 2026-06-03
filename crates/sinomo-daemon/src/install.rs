@@ -1,4 +1,3 @@
-use crate::rollout::{SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV};
 use crate::{
     DaemonError, DaemonPaths, DaemonRunOptions, DaemonStatus, daemon_connect_address,
     daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
@@ -6,8 +5,9 @@ use crate::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_rollout::{
-    SelfRolloutPaths, current_executable_should_update, deploy_managed_source_repo,
-    discover_current_git_repo, ensure_rollout_layout,
+    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SelfRolloutPaths,
+    current_executable_should_update, deploy_managed_source_repo, discover_current_git_repo,
+    ensure_rollout_layout,
 };
 use std::env;
 use std::fs;

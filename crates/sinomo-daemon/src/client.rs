@@ -21,6 +21,8 @@ use sinomo_network::{
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
+    ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
+    ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_RPC_CATEGORY,
 };
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -612,11 +614,8 @@ pub fn send_daemon_rollout_binary(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_BINARY_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        request,
-    )?;
+    let rpc_request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
     let response = send_daemon_rpc(address, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -626,11 +625,8 @@ pub fn send_daemon_rollout_binary_to_endpoint(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_BINARY_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        request,
-    )?;
+    let rpc_request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -640,11 +636,8 @@ pub fn send_daemon_rollout_build(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_BUILD_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        request,
-    )?;
+    let rpc_request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
     let response = send_daemon_rpc(address, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -654,11 +647,8 @@ pub fn send_daemon_rollout_build_to_endpoint(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_BUILD_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        request,
-    )?;
+    let rpc_request =
+        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -667,11 +657,8 @@ pub fn send_daemon_finalize_shadow_rollout_request(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        &(),
-    )?;
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_RPC_CATEGORY, &())?;
     let response = send_daemon_rpc(address, &request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -680,11 +667,8 @@ pub fn send_daemon_rollout_clear_status(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        &(),
-    )?;
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?;
     let response = send_daemon_rpc(address, &request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -693,11 +677,8 @@ pub fn send_daemon_rollout_diagnostics(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
-        sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE,
-        sinomo_network::ROLLOUT_RPC_CATEGORY,
-        &(),
-    )?;
+    let request =
+        ObjectRpcRequest::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?;
     let response = send_daemon_rpc(address, &request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -715,6 +696,7 @@ mod tests {
     };
     use sinomo_network::{ClusterId, ObjectRpcResponse};
     use sinomo_node::NodeId;
+    use sinomo_rollout::ROLLOUT_BUILD_ROUTE;
 
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -797,9 +779,8 @@ mod tests {
                 .expect("relay error");
         assert!(is_relay_routing_error(&relay_error));
 
-        let target_error =
-            ObjectRpcResponse::encode_error(sinomo_network::ROLLOUT_BUILD_ROUTE, "build failed")
-                .expect("target error");
+        let target_error = ObjectRpcResponse::encode_error(ROLLOUT_BUILD_ROUTE, "build failed")
+            .expect("target error");
         assert!(!is_relay_routing_error(&target_error));
     }
 }

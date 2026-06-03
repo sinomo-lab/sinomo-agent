@@ -129,8 +129,7 @@ pub use process::{
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, LocalShadowRolloutRestartPlan, PendingShadowMainExit,
-    RolloutActivationStrategy, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
-    SHADOW_START_DELAY_MS_ENV, ShadowMainExit, ShadowMainRolloutMonitor, ShadowMainStart,
+    RolloutActivationStrategy, ShadowMainExit, ShadowMainRolloutMonitor, ShadowMainStart,
     cluster_rollout_should_use_remote_build, daemon_paths_are_shadow,
     ensure_rollout_target_platform_matches_local, handle_daemon_clear_rollout_status,
     handle_daemon_finalize_shadow_rollout, handle_daemon_rollout_binary_request,
@@ -146,6 +145,9 @@ pub use rollout::{
     write_rollout_main_failure_diagnostics,
 };
 pub use sinomo_dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
+pub use sinomo_rollout::{
+    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV,
+};
 pub use status::{
     DAEMON_MAIN_CLUSTER_ROLE, DAEMON_SHADOW_CLUSTER_ROLE, DaemonClusterProcess,
     DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonProbeStatus,

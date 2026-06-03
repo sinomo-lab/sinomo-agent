@@ -10,6 +10,10 @@ use sinomo_node::{
     NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
     load_or_create_node_identity,
 };
+use sinomo_rollout::{
+    ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
+    ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -344,13 +348,13 @@ pub fn authorize_authenticated_daemon_command(
         command if command == daemon_rpc_command(sinomo_network::DAEMON_SHUTDOWN_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
+        command if command == daemon_rpc_command(ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE) => {
+        command if command == daemon_rpc_command(ROLLOUT_DIAGNOSTICS_ROUTE) => {
             authenticated.signer.can_run_admin_command()
         }
-        command if command == daemon_rpc_command(sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE) => {
+        command if command == daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE) => {
             authenticated.signer.can_run_admin_command()
         }
         command if command == daemon_rpc_command(sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE) => {
@@ -452,8 +456,8 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command == daemon_rpc_command(sinomo_network::ROLLOUT_BINARY_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::ROLLOUT_BUILD_ROUTE) =>
+            if command == daemon_rpc_command(ROLLOUT_BINARY_ROUTE)
+                || command == daemon_rpc_command(ROLLOUT_BUILD_ROUTE) =>
         {
             authenticated.signer.can_run_admin_command()
         }
@@ -961,7 +965,7 @@ mod tests {
 
     #[test]
     fn rollout_clear_status_authorizes_admin_signers() {
-        let command = daemon_rpc_command(sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE);
+        let command = daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE);
         for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
             let authenticated = authenticated_command(command.clone(), signer);
             authorize_authenticated_daemon_command(&authenticated)

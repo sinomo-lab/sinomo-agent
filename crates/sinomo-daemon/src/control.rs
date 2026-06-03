@@ -16,7 +16,8 @@ use crate::{
 use sinomo_events::EventStore;
 use sinomo_node::NodeId;
 use sinomo_rollout::{
-    AppliedRolloutTransition, RolloutController, RolloutTelemetryAdvanceOptions,
+    AppliedRolloutTransition, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
+    ROLLOUT_RPC_CATEGORY, RolloutController, RolloutTelemetryAdvanceOptions,
     RolloutTelemetryAdvanceStatus, SelfRolloutPaths, read_rollout_status,
 };
 use sinomo_sandbox::SandboxFileSystem;
@@ -482,36 +483,32 @@ pub fn handle_daemon_connection(
                 write_daemon_rpc_response_frame(stream, response)?;
                 Ok(false)
             }
-            command
-                if command == daemon_rpc_command(sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE) =>
-            {
+            command if command == daemon_rpc_command(ROLLOUT_FINALIZE_SHADOW_ROUTE) => {
                 let request = require_daemon_rpc_request(
                     rpc_request,
-                    sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE,
-                    sinomo_network::ROLLOUT_RPC_CATEGORY,
+                    ROLLOUT_FINALIZE_SHADOW_ROUTE,
+                    ROLLOUT_RPC_CATEGORY,
                 )?;
                 let _: () = request.decode_body().map_err(DaemonError::from)?;
                 let response = handle_daemon_finalize_shadow_rollout(paths)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::ROLLOUT_FINALIZE_SHADOW_ROUTE,
+                    ROLLOUT_FINALIZE_SHADOW_ROUTE,
                     &response,
                 )
                 .map_err(DaemonError::from)?;
                 write_daemon_rpc_response_frame(stream, response)?;
                 Ok(false)
             }
-            command
-                if command == daemon_rpc_command(sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE) =>
-            {
+            command if command == daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE) => {
                 let request = require_daemon_rpc_request(
                     rpc_request,
-                    sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE,
-                    sinomo_network::ROLLOUT_RPC_CATEGORY,
+                    ROLLOUT_CLEAR_STATUS_ROUTE,
+                    ROLLOUT_RPC_CATEGORY,
                 )?;
                 let _: () = request.decode_body().map_err(DaemonError::from)?;
                 let response = handle_daemon_clear_rollout_status(paths)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
-                    sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE,
+                    ROLLOUT_CLEAR_STATUS_ROUTE,
                     &response,
                 )
                 .map_err(DaemonError::from)?;

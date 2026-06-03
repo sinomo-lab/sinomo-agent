@@ -1006,7 +1006,8 @@ impl RolloutController {
             OffsetDateTime::now_utc(),
             self.node_id.clone(),
             Source::new("rollout.controller").expect("valid source"),
-            EventKind::new("rollout.transition.completed").expect("valid event kind"),
+            EventKind::new(crate::ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND)
+                .expect("valid event kind"),
             Salience::new(if decision.action == RolloutAction::RollBack {
                 0.9
             } else {

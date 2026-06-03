@@ -1,24 +1,19 @@
-//! The rollout control-plane service (host-agnostic — read plane only).
+//! Rollout object-RPC services.
 //!
-//! Serves `ROLLOUT_DIAGNOSTICS`: a rollout-state report derived from `ctx.data_dir`, so
-//! it works with no daemon and no cluster.
-//!
-//! The rollout *binary* and *build* routes are intentionally **not** here. They manage
-//! the running daemon's own process — staging, activating, and restarting the
-//! main/shadow binaries, with a stop decision gated on whether this is the main or
-//! shadow daemon — which is daemon-foundational, not host-agnostic. Those routes stay
-//! daemon-owned (and become daemon-local `Service` impls alongside cluster-kv/raft).
+//! The diagnostics route is host-agnostic: it reports rollout state from the local
+//! data directory and works with no daemon and no cluster. Binary/build activation
+//! routes still need daemon-local process ownership and remain daemon adapters.
 
-use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse, ROLLOUT_DIAGNOSTICS_ROUTE};
-use sinomo_rollout::{SelfRolloutPaths, rollout_diagnostics_report};
+use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_service::{
+    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
+    ServiceRegistryBuilder,
+};
 
-use crate::{Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture};
+use crate::{ROLLOUT_DIAGNOSTICS_ROUTE, SelfRolloutPaths, rollout_diagnostics_report};
 
-/// Routes owned by [`RolloutService`].
 const ROLLOUT_ROUTES: &[&str] = &[ROLLOUT_DIAGNOSTICS_ROUTE];
 
-/// Rollout control-plane service. Host-agnostic: reports rollout diagnostics from the
-/// local data directory.
 #[derive(Default)]
 pub struct RolloutService;
 
@@ -56,12 +51,15 @@ impl Service for RolloutService {
     }
 }
 
+pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
+    builder.register(RolloutService::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ResponseSink, ServiceRegistry, ServiceSigner};
     use sinomo_local::SinomoDataDir;
-    use sinomo_network::ROLLOUT_RPC_CATEGORY;
+    use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]
@@ -78,11 +76,9 @@ mod tests {
 
     #[tokio::test]
     async fn rollout_diagnostics_serves_in_local_mode() {
-        let registry = ServiceRegistry::builder()
-            .register(RolloutService::new())
-            .build();
+        let registry = register_services(ServiceRegistry::builder()).build();
         let dir = std::env::temp_dir().join(format!(
-            "sinomo-service-rollout-{}",
+            "sinomo-rollout-service-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
@@ -97,9 +93,12 @@ mod tests {
             signer: ServiceSigner::Local,
             sink: Box::new(sink),
         };
-        let request =
-            ObjectRpcRequest::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY, &())
-                .expect("encode");
+        let request = ObjectRpcRequest::encode_body(
+            ROLLOUT_DIAGNOSTICS_ROUTE,
+            crate::ROLLOUT_RPC_CATEGORY,
+            &(),
+        )
+        .expect("encode");
 
         let disposition = registry.dispatch(ctx, request).await.expect("dispatch");
         assert_eq!(disposition, ServiceDisposition::Continue);

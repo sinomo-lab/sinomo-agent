@@ -421,7 +421,10 @@ impl From<RolloutError> for CliError {
                 stderr,
             },
             RolloutError::MissingArtifact { artifact } => Self::MissingArtifact { artifact },
-            RolloutError::InvalidTransition { detail } => Self::Parse { detail },
+            RolloutError::InvalidArtifact { detail }
+            | RolloutError::InvalidTarget { detail }
+            | RolloutError::ModuleInstall { detail }
+            | RolloutError::InvalidTransition { detail } => Self::Parse { detail },
         }
     }
 }

@@ -5,16 +5,16 @@ use crate::{
     send_daemon_shutdown_request, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     start_daemon_iroh_proxy_if_clustered, start_shadow_daemon_status_publisher,
 };
-use sinomo_core::ClusterNodeRolloutStatus;
-use sinomo_network::is_loopback_connect_address;
 #[cfg(test)]
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
+    CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL, CLUSTER_ROLLOUT_PROGRESS_TOTAL,
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    ClusterRolloutNativeDylibModuleArtifact, LocalRolloutArtifacts,
-    LocalRolloutNativeDylibModuleArtifact, MainExitObservation, PendingShadowRolloutContext,
-    ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutFailureDiagnostics, RolloutMainActivation,
-    SelfRolloutPaths, classify_main_exit, clear_rollout_status, deploy_managed_source_bundle,
+    ClusterRolloutProgressUpdate, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
+    MainExitObservation, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
+    RolloutFailureDiagnostics, RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV,
+    SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, classify_main_exit,
+    clear_rollout_status, cluster_rollout_progress_status, deploy_managed_source_bundle,
     ensure_rollout_layout, install_binary_atomically, managed_source_status,
     read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
     record_activation_failure, record_main_activation_staged,
@@ -22,9 +22,9 @@ use sinomo_rollout::{
     record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
     rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_diagnostics_report,
     rollout_main_activation_path, rollout_remote_repo_path, rollout_shadow_finalize_path,
-    rollout_staged_main_binary, rollout_staged_shadow_binary, source_heads_match,
-    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file, write_json,
-    write_main_activation, write_rollout_status,
+    rollout_staged_main_binary, rollout_staged_shadow_binary, rollout_timestamp_now,
+    source_heads_match, stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
+    write_json, write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fmt::Display;
@@ -34,13 +34,6 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
-
-pub const SHADOW_MAIN_HOST_ENV: &str = "SINOMO_SHADOW_MAIN_HOST";
-pub const SHADOW_MAIN_PORT_ENV: &str = "SINOMO_SHADOW_MAIN_PORT";
-pub const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
-pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAIN_ACTIVATION_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 const STABLE_BINARY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -48,14 +41,6 @@ const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
-const CLUSTER_ROLLOUT_PROGRESS_TOTAL: u32 = 5;
-const CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-
-fn rollout_timestamp_now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string())
-}
 
 #[allow(clippy::too_many_arguments)]
 fn write_cluster_rollout_progress(
@@ -70,30 +55,17 @@ fn write_cluster_rollout_progress(
     progress_current: u32,
     progress_message: impl Into<String>,
 ) -> Result<(), DaemonError> {
-    let now = rollout_timestamp_now();
-    let is_terminal_failure = matches!(status, "failed" | "rejected");
-    write_rollout_status(
-        rollout_paths,
-        &ClusterNodeRolloutStatus {
-            status: status.to_string(),
-            mode: Some(mode.to_string()),
-            detail,
-            phase: Some(phase.to_string()),
-            progress_current: Some(progress_current.min(CLUSTER_ROLLOUT_PROGRESS_TOTAL)),
-            progress_total: Some(CLUSTER_ROLLOUT_PROGRESS_TOTAL),
-            progress_message: Some(progress_message.into()),
-            source: Some(source.to_string()),
-            requested_at: Some(requested_at.to_string()),
-            staged_at: (status == "main-staged").then_some(now.clone()),
-            updated_at: Some(now.clone()),
-            failed_at: is_terminal_failure.then_some(now),
-            diagnostics: None,
-            stdout_log: None,
-            stderr_log: None,
-            stdout_tail: None,
-            stderr_tail: None,
-        },
-    )?;
+    let status = cluster_rollout_progress_status(ClusterRolloutProgressUpdate::new(
+        status,
+        mode,
+        detail,
+        source,
+        requested_at,
+        phase,
+        progress_current,
+        progress_message,
+    ));
+    write_rollout_status(rollout_paths, &status)?;
     publish_rollout_progress_to_cluster(daemon_paths);
     Ok(())
 }
@@ -326,68 +298,8 @@ pub fn install_local_rollout_native_dylib_modules(
     data_dir: &Path,
     artifacts: &[LocalRolloutNativeDylibModuleArtifact],
 ) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, DaemonError> {
-    artifacts
-        .iter()
-        .map(|artifact| {
-            sinomo_module::install_native_dylib_module_from_file(
-                data_dir,
-                &artifact.built_library,
-                native_dylib_module_install_request(
-                    &artifact.module_id,
-                    &artifact.interface_version,
-                    &artifact.cache_key,
-                    &artifact.library_name,
-                    &artifact.source,
-                )?,
-            )
-            .map_err(Into::into)
-        })
-        .collect()
-}
-
-fn install_cluster_rollout_native_dylib_modules(
-    data_dir: &Path,
-    artifacts: &[ClusterRolloutNativeDylibModuleArtifact],
-) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, DaemonError> {
-    artifacts
-        .iter()
-        .map(|artifact| {
-            sinomo_module::install_native_dylib_module_from_bytes(
-                data_dir,
-                &artifact.library,
-                native_dylib_module_install_request(
-                    &artifact.module_id,
-                    &artifact.interface_version,
-                    &artifact.cache_key,
-                    &artifact.library_name,
-                    &artifact.source,
-                )?,
-            )
-            .map_err(Into::into)
-        })
-        .collect()
-}
-
-fn native_dylib_module_install_request(
-    module_id: &str,
-    interface_version: &str,
-    cache_key: &str,
-    library_name: &str,
-    source: &str,
-) -> Result<sinomo_module::NativeDylibModuleInstallRequest, DaemonError> {
-    let module_id = sinomo_module::ModuleId::new(module_id.to_string())
-        .or_else(|_| sinomo_module::ModuleId::from_legacy_named(module_id))
-        .map_err(|error| DaemonError::Parse {
-            detail: format!("invalid native dylib module id `{module_id}`: {error}"),
-        })?;
-    Ok(sinomo_module::NativeDylibModuleInstallRequest {
-        expected_module_id: Some(module_id),
-        artifact_id: None,
-        expected_interface_version: Some(interface_version.to_string()),
-        cache_key: Some(cache_key.to_string()),
-        library_name: Some(library_name.to_string()),
-        source: source.to_string(),
-    })
+    sinomo_rollout::install_local_rollout_native_dylib_modules(data_dir, artifacts)
+        .map_err(Into::into)
 }
 
 pub fn prepare_local_shadow_rollout_restart(
@@ -878,12 +790,10 @@ pub fn shadow_main_binary_from_env(rollout_paths: &SelfRolloutPaths) -> PathBuf 
 }
 
 pub fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
-    match (&status.target_os, &status.target_arch) {
-        (Some(target_os), Some(target_arch)) => {
-            Some(target_os == env::consts::OS && target_arch == env::consts::ARCH)
-        }
-        _ => None,
-    }
+    sinomo_rollout::rollout_target_platform_matches_local(
+        status.target_os.as_deref(),
+        status.target_arch.as_deref(),
+    )
 }
 
 fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
@@ -917,37 +827,24 @@ pub fn cluster_rollout_should_use_remote_build(
     binary_provided: bool,
     platform_matches_local: Option<bool>,
 ) -> bool {
-    remote_build_requested
-        || (!is_loopback_connect_address(address)
-            && !binary_provided
-            && platform_matches_local != Some(true))
+    sinomo_rollout::cluster_rollout_should_use_remote_build(
+        address,
+        remote_build_requested,
+        binary_provided,
+        platform_matches_local,
+    )
 }
 
 pub fn ensure_rollout_target_platform_matches_local(
     address: &str,
     status: &DaemonStatus,
 ) -> Result<(), DaemonError> {
-    let local = is_loopback_connect_address(address);
-    match (&status.target_os, &status.target_arch) {
-        (Some(target_os), Some(target_arch))
-            if target_os == env::consts::OS && target_arch == env::consts::ARCH =>
-        {
-            Ok(())
-        }
-        (Some(target_os), Some(target_arch)) => Err(DaemonError::Parse {
-            detail: format!(
-                "target platform {target_os}/{target_arch} does not match local artifact platform {}/{}",
-                env::consts::OS,
-                env::consts::ARCH
-            ),
-        }),
-        _ if local => Ok(()),
-        _ => Err(DaemonError::Parse {
-            detail:
-                "target daemon does not report platform metadata; update it locally before binary rollout"
-                    .to_string(),
-        }),
-    }
+    sinomo_rollout::ensure_rollout_target_platform_matches_local(
+        address,
+        status.target_os.as_deref(),
+        status.target_arch.as_deref(),
+    )
+    .map_err(Into::into)
 }
 
 pub fn handle_daemon_rollout_binary_request(
@@ -1037,9 +934,10 @@ pub fn handle_daemon_rollout_binary_request(
             3,
             "installing native module artifacts",
         )?;
-        if let Err(error) =
-            install_cluster_rollout_native_dylib_modules(data_dir, &request.native_dylib_modules)
-        {
+        if let Err(error) = sinomo_rollout::install_cluster_rollout_native_dylib_modules(
+            data_dir,
+            &request.native_dylib_modules,
+        ) {
             let detail = format!("install native module artifacts failed: {error}");
             let _ = write_cluster_rollout_progress(
                 paths,
@@ -1701,7 +1599,7 @@ pub fn write_rollout_main_failure_diagnostics(
             "exit_code": observation.and_then(|observation| observation.exit_code),
             "signal": observation.and_then(|observation| observation.signal),
             "requested_shutdown": observation.map(|observation| observation.requested_shutdown),
-            "observed_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "unknown".to_string()),
+            "observed_at": rollout_timestamp_now(),
             "rollout_state": &rollout_paths.state
         }),
     )?;

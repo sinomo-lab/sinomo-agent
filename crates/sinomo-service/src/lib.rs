@@ -28,10 +28,8 @@ use sinomo_local::SinomoDataDir;
 use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
 
 mod dfs;
-mod rollout;
 mod sandbox;
 pub use dfs::DfsService;
-pub use rollout::RolloutService;
 pub use sandbox::{LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService};
 
 /// Whether the host should keep serving after a request (`Stop` == daemon shutdown).

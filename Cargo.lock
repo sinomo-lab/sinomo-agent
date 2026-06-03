@@ -6252,14 +6252,18 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "sinomo-events",
+ "sinomo-local",
  "sinomo-module",
+ "sinomo-network",
  "sinomo-node",
  "sinomo-object",
  "sinomo-registry",
  "sinomo-sandbox-wasix-api",
+ "sinomo-service",
  "sinomo-storage",
  "thiserror 2.0.18",
  "time",
+ "tokio",
 ]
 
 [[package]]
@@ -6388,7 +6392,6 @@ dependencies = [
  "sinomo-kv",
  "sinomo-local",
  "sinomo-network",
- "sinomo-rollout",
  "sinomo-sandbox",
  "thiserror 2.0.18",
  "tokio",

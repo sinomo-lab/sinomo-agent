@@ -7,11 +7,11 @@
 //! dispatch future on a shared runtime and writes the buffered response frames to the
 //! (blocking) control stream afterward.
 //!
-//! The registry mixes two kinds of services: **host-agnostic** ones from `sinomo-service`
-//! ([`DfsService`], [`RolloutService`]) and **daemon-foundational** ones defined here
+//! The registry mixes host-agnostic services from `sinomo-service` and native modules
+//! such as `sinomo-rollout` with **daemon-foundational** services defined here
 //! ([`DaemonControlService`], [`ClusterKvService`]) that own daemon state (their
-//! [`DaemonPaths`], which encode whether this is the main or shadow daemon) and call the
-//! daemon's own cluster/control handlers. Consuming services receive a real
+//! [`DaemonPaths`], which encode whether this is the main or shadow daemon) and call
+//! the daemon's own cluster/control handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
 use std::io::Write;
@@ -25,11 +25,13 @@ use sinomo_network::{
     CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE, CLUSTER_RAFT_APPEND_ROUTE,
     CLUSTER_RAFT_VOTE_ROUTE, ClusterPaths, ClusterRaftAppendRequest, ClusterRaftVoteRequest,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonControlStream, ObjectRpcRequest,
-    ObjectRpcResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
-    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+    ObjectRpcResponse, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
     read_cluster_kv_entry, read_cluster_kv_prefix_entries,
 };
-use sinomo_rollout::ClusterRolloutBinaryResponse;
+use sinomo_rollout::{
+    ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
+    register_services as register_rollout_services,
+};
 use sinomo_sandbox::{
     LocalSandboxBackend, SandboxAddToolchainArtifactRequest, SandboxAddToolchainArtifactResponse,
     SandboxAddToolchainCommandRequest, SandboxAddToolchainCommandResponse, SandboxBackend,
@@ -47,9 +49,9 @@ use sinomo_sandbox::{
     SandboxWriteResponse,
 };
 use sinomo_service::{
-    ClusterAccess, DfsService, ResponseSink, RolloutService, SandboxBackendFactory, SandboxService,
-    Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture, ServiceRegistry,
-    ServiceSigner,
+    ClusterAccess, DfsService, ResponseSink, SandboxBackendFactory, SandboxService, Service,
+    ServiceContext, ServiceDisposition, ServiceError, ServiceFuture, ServiceRegistry,
+    ServiceRegistryBuilder, ServiceSigner,
 };
 
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
@@ -550,9 +552,8 @@ fn daemon_service_registry(
     paths: &DaemonPaths,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> ServiceRegistry {
-    ServiceRegistry::builder()
-        .register(DfsService::new())
-        .register(RolloutService::new())
+    let builder: ServiceRegistryBuilder = ServiceRegistry::builder().register(DfsService::new());
+    register_rollout_services(builder)
         .register(DaemonControlService {
             paths: paths.clone(),
         })

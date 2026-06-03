@@ -22,6 +22,15 @@ pub enum RolloutError {
     MissingArtifact {
         artifact: String,
     },
+    InvalidArtifact {
+        detail: String,
+    },
+    InvalidTarget {
+        detail: String,
+    },
+    ModuleInstall {
+        detail: String,
+    },
     InvalidTransition {
         detail: String,
     },
@@ -46,6 +55,13 @@ impl fmt::Display for RolloutError {
             Self::MissingArtifact { artifact } => {
                 write!(formatter, "{artifact} has not been written")
             }
+            Self::InvalidArtifact { detail } => {
+                write!(formatter, "invalid rollout artifact: {detail}")
+            }
+            Self::InvalidTarget { detail } => write!(formatter, "invalid rollout target: {detail}"),
+            Self::ModuleInstall { detail } => {
+                write!(formatter, "native module install failed: {detail}")
+            }
             Self::InvalidTransition { detail } => {
                 write!(formatter, "invalid rollout transition: {detail}")
             }
@@ -60,6 +76,19 @@ impl From<sinomo_events::EventStoreError> for RolloutError {
         Self::Object {
             path: "events/event-log.jsonl".to_string(),
             detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_module::NativeDylibModuleInstallError> for RolloutError {
+    fn from(error: sinomo_module::NativeDylibModuleInstallError) -> Self {
+        match error {
+            sinomo_module::NativeDylibModuleInstallError::Io { path, detail } => {
+                Self::Io { path, detail }
+            }
+            other => Self::ModuleInstall {
+                detail: other.to_string(),
+            },
         }
     }
 }

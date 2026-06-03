@@ -8676,7 +8676,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::ROLLOUT_DIAGNOSTICS_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8685,7 +8685,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::ROLLOUT_DIAGNOSTICS_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_DIAGNOSTICS_ROUTE),
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8694,7 +8694,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::ROLLOUT_BUILD_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8703,7 +8703,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::ROLLOUT_BUILD_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_BUILD_ROUTE),
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8712,7 +8712,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::ROLLOUT_BINARY_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_BINARY_ROUTE),
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -8730,7 +8730,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::ROLLOUT_FINALIZE_SHADOW_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::rollout::ROLLOUT_FINALIZE_SHADOW_ROUTE),
             super::DaemonSignerAuthority::Local,
             "node_local",
             "pk_local"

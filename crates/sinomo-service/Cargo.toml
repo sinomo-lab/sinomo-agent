@@ -19,7 +19,6 @@ sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-network = { path = "../sinomo-network" }
-sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 
 [dev-dependencies]
