@@ -234,8 +234,8 @@ pub fn fetch_dfs_status_from_endpoint(
     timeout: Duration,
 ) -> Result<DfsOperatorStatus, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::DFS_STATUS_ROUTE,
-        sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_dfs::DFS_STATUS_ROUTE,
+        sinomo_dfs::DFS_RPC_CATEGORY,
         &(),
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
@@ -248,8 +248,8 @@ pub fn fetch_dfs_inspection_from_address(
     timeout: Duration,
 ) -> Result<DaemonDfsInspectionResponse, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::DFS_INSPECTION_ROUTE,
-        sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_dfs::DFS_INSPECTION_ROUTE,
+        sinomo_dfs::DFS_RPC_CATEGORY,
         request,
     )?;
     let response = send_daemon_rpc(address, &rpc_request, timeout)?;
@@ -261,8 +261,8 @@ pub fn run_dfs_smoke_via_daemon(
     timeout: Duration,
 ) -> Result<DaemonDfsSmokeReport, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::DFS_SMOKE_ROUTE,
-        sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_dfs::DFS_SMOKE_ROUTE,
+        sinomo_dfs::DFS_RPC_CATEGORY,
         &(),
     )?;
     let response = send_daemon_rpc(address, &rpc_request, timeout)?;
@@ -275,8 +275,8 @@ pub fn send_dfs_metadata_journal_batch_to_endpoint(
     timeout: Duration,
 ) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-        sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE,
+        sinomo_dfs::DFS_RPC_CATEGORY,
         request,
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
@@ -289,8 +289,8 @@ pub fn send_dfs_metadata_snapshot_install_to_endpoint(
     timeout: Duration,
 ) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-        sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+        sinomo_dfs::DFS_RPC_CATEGORY,
         request,
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
@@ -303,8 +303,8 @@ pub fn send_dfs_protocol_frame_to_endpoint(
     timeout: Duration,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
     let rpc_request = ObjectRpcRequest::encode_body(
-        sinomo_network::DFS_PROTOCOL_FRAME_ROUTE,
-        sinomo_network::DFS_RPC_CATEGORY,
+        sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE,
+        sinomo_dfs::DFS_RPC_CATEGORY,
         request,
     )?;
     let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;

@@ -3,16 +3,19 @@
 //! Serves the DFS object-RPC routes against a [`ServiceContext`]. Everything is derived
 //! from the request's [`ServiceContext::data_dir`] using public `sinomo-dfs`/
 //! `sinomo-network` APIs, so DFS runs with no daemon and no live cluster (limited to
-//! whatever is materialized locally on disk). Cluster-replica routes read the local
+//! whatever is materialized locally on disk). Route names are owned by `sinomo-dfs`;
+//! `sinomo-network` only provides the object-RPC framing. Cluster-replica routes read the local
 //! cluster-KV snapshot to validate shard roles; with no cluster state present they
 //! either apply locally (journal batch) or reject gracefully (snapshot install), the
 //! same way the daemon's handlers do.
 //!
-//! Covers the low-coupling routes: status, expose-config, metadata journal batch, and
-//! metadata snapshot install. Inspection/smoke (DTO relocation) and the protocol-frame
-//! data plane are added later in the migration.
+//! Covers the host-agnostic DFS control-plane routes. Smoke and protocol-frame data
+//! plane routes still require daemon-owned cluster access and remain registered by the
+//! daemon data-plane adapter.
 
 use sinomo_dfs::{
+    DFS_CONTROL_PLANE_ROUTES, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_STATUS_ROUTE,
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeStore, DfsMetadataBackend,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
@@ -23,21 +26,11 @@ use sinomo_dfs::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    ClusterPaths, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE, DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_STATUS_ROUTE, ObjectRpcRequest, ObjectRpcResponse,
-    read_cluster_kv_prefix_entries, read_cluster_kv_prefix_values, read_cluster_state_without_kv,
+    ClusterPaths, ObjectRpcRequest, ObjectRpcResponse, read_cluster_kv_prefix_entries,
+    read_cluster_kv_prefix_values, read_cluster_state_without_kv,
 };
 
 use crate::{Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture};
-
-/// Routes owned by [`DfsService`].
-const DFS_ROUTES: &[&str] = &[
-    DFS_STATUS_ROUTE,
-    DFS_EXPOSE_CONFIG_ROUTE,
-    DFS_INSPECTION_ROUTE,
-    DFS_METADATA_JOURNAL_BATCH_ROUTE,
-    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-];
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
 /// [`ServiceContext::data_dir`], so it runs with or without a daemon/cluster.
@@ -56,7 +49,7 @@ impl Service for DfsService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        DFS_ROUTES
+        DFS_CONTROL_PLANE_ROUTES
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -446,11 +439,11 @@ fn dfs_metadata_snapshot_install(
 mod tests {
     use super::*;
     use crate::{ResponseSink, ServiceRegistry, ServiceSigner};
+    use sinomo_dfs::DFS_RPC_CATEGORY;
     use sinomo_dfs::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig,
         DfsMetadataJournalBatch, DfsMetadataShardId,
     };
-    use sinomo_network::DFS_RPC_CATEGORY;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone, Default)]

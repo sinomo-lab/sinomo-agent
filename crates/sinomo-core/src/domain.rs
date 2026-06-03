@@ -289,6 +289,23 @@ impl ModuleManifest {
             target_ring,
         )
     }
+
+    pub fn native_rust(
+        module_id: Id,
+        version: impl Into<String>,
+        owner: impl Into<String>,
+        api_version: impl Into<String>,
+        target_ring: TrustRing,
+    ) -> Self {
+        Self::new(
+            module_id,
+            ModuleKind::NativeRust,
+            version,
+            api_version,
+            owner,
+            target_ring,
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -676,6 +693,26 @@ mod tests {
         let round_tripped: ModuleManifest =
             serde_json::from_value(json).expect("deserialize manifest");
         assert_eq!(round_tripped.kind, ModuleKind::NativeDylib);
+    }
+
+    #[test]
+    fn native_rust_module_manifest_is_backend_neutral() {
+        let manifest = ModuleManifest::native_rust(
+            Id::from_legacy_named("module.dfs").expect("module id"),
+            "0.1.0",
+            "sinomo-dfs",
+            "sinomo.dfs.v1",
+            TrustRing::R1TrustedRuntime,
+        );
+
+        let json = serde_json::to_value(&manifest).expect("serialize manifest");
+        assert_eq!(json["kind"], "native-rust");
+        assert_eq!(json["api_version"], "sinomo.dfs.v1");
+        assert_eq!(json["target_ring"], "r1-trusted-runtime");
+
+        let round_tripped: ModuleManifest =
+            serde_json::from_value(json).expect("deserialize manifest");
+        assert_eq!(round_tripped.kind, ModuleKind::NativeRust);
     }
 
     #[test]

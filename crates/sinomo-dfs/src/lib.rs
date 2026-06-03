@@ -92,8 +92,9 @@ pub type DfsVersion = sinomo_core::Id;
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    Confidence, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest, EventEnvelope, EventKind,
-    LatencyClass, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source,
+    CapabilityName, Confidence, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest, EventEnvelope,
+    EventKind, FileSystemAccess, LatencyClass, ModuleCapabilities, ModuleResourceLimits,
+    NetworkAccess, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_events::EventId;
 use sinomo_kv::KvError;
@@ -119,6 +120,34 @@ use transfer::{
 };
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
+pub const SINOMO_DFS_MODULE_LEGACY_ID: &str = "module.dfs";
+pub const SINOMO_DFS_MODULE_OWNER: &str = "sinomo-dfs";
+pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
+pub const DFS_RPC_CATEGORY: &str = "dfs";
+pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
+pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
+pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
+pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
+pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
+pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
+pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
+pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
+    DFS_STATUS_ROUTE,
+    DFS_EXPOSE_CONFIG_ROUTE,
+    DFS_INSPECTION_ROUTE,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+];
+pub const DFS_DATA_PLANE_ROUTES: &[&str] = &[DFS_SMOKE_ROUTE, DFS_PROTOCOL_FRAME_ROUTE];
+pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
+    DFS_STATUS_ROUTE,
+    DFS_EXPOSE_CONFIG_ROUTE,
+    DFS_INSPECTION_ROUTE,
+    DFS_METADATA_JOURNAL_BATCH_ROUTE,
+    DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+    DFS_SMOKE_ROUTE,
+    DFS_PROTOCOL_FRAME_ROUTE,
+];
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
 const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 64 * 1024;
@@ -184,6 +213,146 @@ pub fn register_storage_paths(
         layout.register_escape_path("sinomo-dfs", StorageRing::R1, relative_path, reason)?;
     }
     Ok(())
+}
+
+pub fn dfs_module_id() -> sinomo_module::ModuleId {
+    sinomo_module::ModuleId::from_legacy_named(SINOMO_DFS_MODULE_LEGACY_ID)
+        .expect("valid DFS module id")
+}
+
+pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
+    use sinomo_module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleStorageRoot, ModuleSurfaces};
+
+    ModuleSurfaces::default()
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_STATUS_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.status.read",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_EXPOSE_CONFIG_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.expose.configure",
+            ModuleRouteAuth::LocalCommand,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_INSPECTION_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.inspection.read",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_METADATA_JOURNAL_BATCH_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.metadata.replicate",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.metadata.repair",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_SMOKE_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.smoke.run",
+            ModuleRouteAuth::LocalCommand,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            DFS_PROTOCOL_FRAME_ROUTE,
+            DFS_RPC_CATEGORY,
+            "dfs.object.transfer",
+            ModuleRouteAuth::LocalOrClusterMember,
+        ))
+        .with_storage_root(ModuleStorageRoot::new("dfs", SINOMO_DFS_MODULE_OWNER))
+        .with_storage_root(ModuleStorageRoot::new("files", SINOMO_DFS_MODULE_OWNER))
+}
+
+pub fn dfs_module_registration() -> sinomo_module::ModuleRegistration {
+    let mut registration = sinomo_module::ModuleRegistration::native_rust(
+        dfs_module_id(),
+        env!("CARGO_PKG_VERSION"),
+        SINOMO_DFS_MODULE_OWNER,
+        DFS_PROTOCOL,
+        TrustRing::R1TrustedRuntime,
+        SINOMO_DFS_NATIVE_REGISTRATION_KEY,
+    );
+    registration.manifest.capabilities = ModuleCapabilities {
+        imports: vec![
+            dfs_capability("storage.local.read"),
+            dfs_capability("storage.local.write"),
+            dfs_capability("network.object_rpc"),
+            dfs_capability("cluster.kv.read"),
+        ],
+        exports: vec![
+            dfs_capability("dfs.status.read"),
+            dfs_capability("dfs.inspection.read"),
+            dfs_capability("dfs.expose.configure"),
+            dfs_capability("dfs.metadata.replicate"),
+            dfs_capability("dfs.metadata.repair"),
+            dfs_capability("dfs.object.transfer"),
+            dfs_capability("sifs.path.access"),
+        ],
+    };
+    registration.manifest.limits = ModuleResourceLimits {
+        network: NetworkAccess::Allowlisted,
+        filesystem: FileSystemAccess::Scoped,
+        ..ModuleResourceLimits::default()
+    };
+    registration.surfaces = dfs_module_surfaces();
+    registration
+}
+
+fn dfs_capability(name: &str) -> CapabilityName {
+    CapabilityName::new(name).expect("valid DFS module capability")
+}
+
+#[cfg(test)]
+mod module_registration_tests {
+    use super::*;
+    use sinomo_core::ModuleKind;
+    use sinomo_module::ModuleBackendRegistration;
+
+    #[test]
+    fn dfs_registers_as_r1_native_rust_module() {
+        let registration = dfs_module_registration();
+
+        assert_eq!(registration.module_id(), &dfs_module_id());
+        assert_eq!(registration.manifest.kind, ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.target_ring,
+            TrustRing::R1TrustedRuntime
+        );
+        assert_eq!(registration.manifest.api_version, DFS_PROTOCOL);
+        assert!(
+            registration
+                .manifest
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "dfs.metadata.replicate")
+        );
+        assert_eq!(
+            registration.backend,
+            ModuleBackendRegistration::NativeRust {
+                registration_key: SINOMO_DFS_NATIVE_REGISTRATION_KEY.to_string()
+            }
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes.len(),
+            DFS_OBJECT_RPC_ROUTES.len()
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == DFS_PROTOCOL_FRAME_ROUTE
+                    && route.operation == "dfs.object.transfer")
+        );
+    }
 }
 
 pub fn fallback_dfs_node_id() -> NodeId {

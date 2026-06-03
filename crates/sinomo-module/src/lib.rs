@@ -841,11 +841,41 @@ pub trait ModuleArtifactRunner {
 pub struct ModuleRegistration {
     pub manifest: sinomo_core::ModuleManifest,
     pub backend: ModuleBackendRegistration,
+    #[serde(default, skip_serializing_if = "ModuleSurfaces::is_empty")]
+    pub surfaces: ModuleSurfaces,
 }
 
 impl ModuleRegistration {
     pub fn module_id(&self) -> &ModuleId {
         &self.manifest.module_id
+    }
+
+    pub fn native_rust(
+        module_id: ModuleId,
+        version: impl Into<String>,
+        owner: impl Into<String>,
+        api_version: impl Into<String>,
+        target_ring: TrustRing,
+        registration_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            manifest: sinomo_core::ModuleManifest::native_rust(
+                module_id,
+                version,
+                owner,
+                api_version,
+                target_ring,
+            ),
+            backend: ModuleBackendRegistration::NativeRust {
+                registration_key: registration_key.into(),
+            },
+            surfaces: ModuleSurfaces::default(),
+        }
+    }
+
+    pub fn with_surfaces(mut self, surfaces: ModuleSurfaces) -> Self {
+        self.surfaces = surfaces;
+        self
     }
 }
 
@@ -873,6 +903,87 @@ pub enum ModuleBackendRegistration {
         artifact_id: ArtifactId,
         interface_version: String,
     },
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleSurfaces {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_rpc_routes: Vec<ModuleObjectRpcRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_roots: Vec<ModuleStorageRoot>,
+}
+
+impl ModuleSurfaces {
+    pub fn is_empty(&self) -> bool {
+        self.object_rpc_routes.is_empty()
+            && self.event_kinds.is_empty()
+            && self.storage_roots.is_empty()
+    }
+
+    pub fn with_object_rpc_route(mut self, route: ModuleObjectRpcRoute) -> Self {
+        self.object_rpc_routes.push(route);
+        self
+    }
+
+    pub fn with_event_kind(mut self, event_kind: impl Into<String>) -> Self {
+        self.event_kinds.push(event_kind.into());
+        self
+    }
+
+    pub fn with_storage_root(mut self, root: ModuleStorageRoot) -> Self {
+        self.storage_roots.push(root);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleObjectRpcRoute {
+    pub route: String,
+    pub category: String,
+    pub operation: String,
+    pub auth: ModuleRouteAuth,
+}
+
+impl ModuleObjectRpcRoute {
+    pub fn new(
+        route: impl Into<String>,
+        category: impl Into<String>,
+        operation: impl Into<String>,
+        auth: ModuleRouteAuth,
+    ) -> Self {
+        Self {
+            route: route.into(),
+            category: category.into(),
+            operation: operation.into(),
+            auth,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModuleRouteAuth {
+    LocalCommand,
+    LocalOrClusterMember,
+    ClusterMember,
+    Admin,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleStorageRoot {
+    pub root: String,
+    pub owner: String,
+}
+
+impl ModuleStorageRoot {
+    pub fn new(root: impl Into<String>, owner: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            owner: owner.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2496,6 +2607,7 @@ mod tests {
             backend: ModuleBackendRegistration::Declarative {
                 payload_ref: "config://modules/module/agent/prompt_pack/payload".to_string(),
             },
+            surfaces: ModuleSurfaces::default(),
         };
         let second = ModuleRegistration {
             manifest: ModuleManifest::native_dylib(
@@ -2513,6 +2625,7 @@ mod tests {
                 platform_triple: "x86_64-unknown-linux-gnu".to_string(),
                 interface_version: "sinomo.sandbox.wasix.v1".to_string(),
             },
+            surfaces: ModuleSurfaces::default(),
         };
 
         let duplicate = ModuleRegistry::builder()
@@ -2539,6 +2652,67 @@ mod tests {
         assert_eq!(ordered_ids, vec![first_module_id, second_module_id]);
         assert!(registry.contains(&ordered_ids[0]));
         assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn native_rust_registration_constructor_pairs_manifest_and_backend() {
+        let module_id = ModuleId::from_legacy_named("module.dfs").expect("module");
+        let registration = ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "sinomo-dfs",
+            "sinomo.dfs.v1",
+            TrustRing::R1TrustedRuntime,
+            "sinomo-dfs",
+        );
+
+        assert_eq!(registration.module_id(), &module_id);
+        assert_eq!(registration.manifest.kind, ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.target_ring,
+            TrustRing::R1TrustedRuntime
+        );
+        assert_eq!(
+            registration.backend,
+            ModuleBackendRegistration::NativeRust {
+                registration_key: "sinomo-dfs".to_string()
+            }
+        );
+        assert!(registration.surfaces.is_empty());
+    }
+
+    #[test]
+    fn module_registration_surfaces_roundtrip_as_catalog_data() {
+        let module_id = ModuleId::from_legacy_named("module.dfs").expect("module");
+        let registration = ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "sinomo-dfs",
+            "sinomo.dfs.v1",
+            TrustRing::R1TrustedRuntime,
+            "sinomo-dfs",
+        )
+        .with_surfaces(
+            ModuleSurfaces::default()
+                .with_object_rpc_route(ModuleObjectRpcRoute::new(
+                    "/dfs/status",
+                    "dfs",
+                    "dfs.status.read",
+                    ModuleRouteAuth::LocalOrClusterMember,
+                ))
+                .with_storage_root(ModuleStorageRoot::new("dfs", "sinomo-dfs")),
+        );
+
+        let encoded = serde_json::to_string(&registration).expect("encode");
+        let decoded: ModuleRegistration = serde_json::from_str(&encoded).expect("decode");
+
+        assert_eq!(decoded.module_id(), &module_id);
+        assert_eq!(decoded.surfaces.object_rpc_routes.len(), 1);
+        assert_eq!(
+            decoded.surfaces.object_rpc_routes[0].auth,
+            ModuleRouteAuth::LocalOrClusterMember
+        );
+        assert_eq!(decoded.surfaces.storage_roots[0].root, "dfs");
     }
 
     #[test]

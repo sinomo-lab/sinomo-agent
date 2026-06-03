@@ -192,6 +192,45 @@ Executable artifacts are never selected by ambient plugin discovery. A loader
 may only apply an artifact chosen through manifest, content hash, provenance,
 compatibility, policy, and loader or rollout state.
 
+### Catalog Surfaces And Runtime Binding
+
+Module catalog registration is pure data. It records the manifest, backend
+descriptor, declared capabilities, and public surfaces exposed by the module.
+Public surfaces include object-RPC routes, event kinds, and storage roots. This
+data is serializable, inspectable, comparable across nodes, and safe to place in
+registry or cluster desired state.
+
+Runtime binding is separate. A static native Rust module may have a compile-time
+binding table that maps a `native-rust` registration key to service builders,
+maintenance hooks, or other host callbacks. That binding table is not catalog
+state and is not shipped as cluster-desired data. It is deterministic process
+assembly for a particular Sinomo binary.
+
+This split keeps module activation auditable:
+
+- the catalog says what the module version is and what surfaces it owns,
+- the loader says which catalog entry is active on this node,
+- the runtime binding says how this binary materializes that active entry.
+
+For example, `sinomo-dfs` owns the DFS object-RPC route constants and publishes
+them through its module surfaces. `sinomo-network` owns generic object-RPC
+framing and transport mechanics; it does not own DFS route names. The daemon may
+enforce local authentication and drive the service event loop, but the route
+catalog belongs to the module that implements the behavior.
+
+### Host Event Loop
+
+The daemon should trend toward a generic service/event loop that reads module
+catalog surfaces and asks active module bindings to register their runtime
+handlers. Daemon-owned foundational routes, such as process status, shutdown,
+and cluster transport, can remain host services. Domain behavior such as DFS
+metadata repair, object transfer, and operator inspection should live in the
+domain module crate or in a module-owned service binding.
+
+This does not require every module to be dynamically loaded. Static native Rust
+modules still participate through the same catalog and binding split: the
+catalog is data, and the binding is compiled into the host.
+
 ## Lifecycle
 
 The module lifecycle is shared across backends:
@@ -400,7 +439,8 @@ The crate boundary follows the trust-ring architecture:
 - `sinomo-core` owns foundational module manifest vocabulary that must be
   visible below higher-level services.
 - `sinomo-module` owns backend-neutral lifecycle, routing, loader state,
-  replay, and module telemetry primitives.
+  replay, module telemetry primitives, and serializable module surface
+  declarations.
 - `sinomo-module-api` owns the stable native dynamic-library ABI surface.
 - `sinomo-module-host` owns trusted native dynamic-library loading behavior.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
@@ -411,6 +451,9 @@ The crate boundary follows the trust-ring architecture:
 - `sinomo-evolution` owns candidate generation, evidence assembly, and
   promotion requests; it consumes module lifecycle contracts but does not define
   R1 module primitives.
+- Domain module crates own their domain route names, event kinds, storage roots,
+  and host-service binding helpers. Generic infrastructure crates own framing,
+  dispatch, storage verification, and daemon event-loop mechanics.
 
 R2 and application crates cross into these foundations through
 `sinomo-runtime`. R0/R1 crates must not depend on R2 or application crates.
@@ -431,3 +474,5 @@ R2 and application crates cross into these foundations through
 9. Wasm remains optional and backend-specific.
 10. Self-evolution targets modules only when the behavior has a natural,
     evaluable boundary.
+11. Module catalog data must not contain executable bindings; native runtime
+    binding is deterministic host assembly keyed by catalog entries.

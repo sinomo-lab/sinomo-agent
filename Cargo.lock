@@ -5994,6 +5994,7 @@ dependencies = [
  "sinomo-events",
  "sinomo-kv",
  "sinomo-local",
+ "sinomo-module",
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",

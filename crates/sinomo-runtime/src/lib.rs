@@ -91,18 +91,31 @@ pub mod r1 {
             }
         }
     }
+
+    pub mod modules {
+        pub use sinomo_module::{ModuleRegistry, ModuleRegistryError};
+
+        pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
+            let registry = sinomo_module::ModuleRegistry::builder()
+                .register(sinomo_dfs::dfs_module_registration())?
+                .build();
+            Ok(registry)
+        }
+    }
 }
 
 pub use r0::core;
 pub use r1::{
-    api, daemon, device, dfs, eval, events, kv, local, module, module_api, module_host, network,
-    node, policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host, service,
-    storage, supervision, sync,
+    api, daemon, device, dfs, eval, events, kv, local, module, module_api, module_host, modules,
+    network, node, policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host,
+    service, storage, supervision, sync,
 };
 
 #[cfg(test)]
 mod tests {
+    use super::modules::internal_module_registry;
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
+    use super::{core, dfs, module};
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {
@@ -152,5 +165,46 @@ mod tests {
         assert!(report.covered.iter().any(|path| {
             path.relative_path == "sandbox/runtime/active.sobj" && path.module == "sinomo-sandbox"
         }));
+    }
+
+    #[test]
+    fn runtime_internal_module_registry_includes_dfs() {
+        let registry = internal_module_registry().expect("module registry");
+        let module_id = dfs::dfs_module_id();
+        let registration = registry.get(&module_id).expect("dfs module registration");
+
+        assert_eq!(registration.manifest.kind, core::ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.target_ring,
+            core::TrustRing::R1TrustedRuntime
+        );
+        assert_eq!(registration.manifest.api_version, dfs::DFS_PROTOCOL);
+        assert!(
+            registration
+                .manifest
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "dfs.metadata.replicate")
+        );
+        assert_eq!(
+            registration.backend,
+            module::ModuleBackendRegistration::NativeRust {
+                registration_key: dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY.to_string()
+            }
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes.len(),
+            dfs::DFS_OBJECT_RPC_ROUTES.len()
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == dfs::DFS_STATUS_ROUTE
+                    && route.category == dfs::DFS_RPC_CATEGORY
+                    && route.auth == module::ModuleRouteAuth::LocalOrClusterMember)
+        );
     }
 }

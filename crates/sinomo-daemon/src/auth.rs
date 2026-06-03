@@ -353,16 +353,16 @@ pub fn authorize_authenticated_daemon_command(
         command if command == daemon_rpc_command(sinomo_network::ROLLOUT_CLEAR_STATUS_ROUTE) => {
             authenticated.signer.can_run_admin_command()
         }
-        command if command == daemon_rpc_command(sinomo_network::DFS_EXPOSE_CONFIG_ROUTE) => {
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
-        command if command == daemon_rpc_command(sinomo_network::DFS_STATUS_ROUTE) => matches!(
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_STATUS_ROUTE) => matches!(
             authenticated.signer,
             DaemonSignerAuthority::Local
                 | DaemonSignerAuthority::Voter
                 | DaemonSignerAuthority::Member
         ),
-        command if command == daemon_rpc_command(sinomo_network::DFS_INSPECTION_ROUTE) => {
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_INSPECTION_ROUTE) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -370,12 +370,10 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_network::DFS_SMOKE_ROUTE) => {
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_SMOKE_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
-        command
-            if command == daemon_rpc_command(sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE) =>
-        {
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -384,8 +382,7 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command
-                == daemon_rpc_command(sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE) =>
+            if command == daemon_rpc_command(sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE) =>
         {
             matches!(
                 authenticated.signer,
@@ -394,7 +391,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        command if command == daemon_rpc_command(sinomo_network::DFS_PROTOCOL_FRAME_ROUTE) => {
+        command if command == daemon_rpc_command(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -981,7 +978,7 @@ mod tests {
 
     #[test]
     fn dfs_metadata_journal_batch_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::DFS_METADATA_JOURNAL_BATCH_ROUTE);
+        let command = daemon_rpc_command(sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
@@ -995,7 +992,7 @@ mod tests {
 
     #[test]
     fn dfs_metadata_snapshot_install_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE);
+        let command = daemon_rpc_command(sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
@@ -1009,7 +1006,7 @@ mod tests {
 
     #[test]
     fn dfs_status_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::DFS_STATUS_ROUTE);
+        let command = daemon_rpc_command(sinomo_dfs::DFS_STATUS_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
@@ -1023,7 +1020,7 @@ mod tests {
 
     #[test]
     fn dfs_inspection_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::DFS_INSPECTION_ROUTE);
+        let command = daemon_rpc_command(sinomo_dfs::DFS_INSPECTION_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,
@@ -1037,7 +1034,7 @@ mod tests {
 
     #[test]
     fn dfs_smoke_authorizes_only_local_signer() {
-        let command = daemon_rpc_command(sinomo_network::DFS_SMOKE_ROUTE);
+        let command = daemon_rpc_command(sinomo_dfs::DFS_SMOKE_ROUTE);
         authorize_authenticated_daemon_command(&authenticated_command(
             command.clone(),
             DaemonSignerAuthority::Local,
@@ -1055,7 +1052,7 @@ mod tests {
 
     #[test]
     fn dfs_protocol_frame_authorizes_cluster_members() {
-        let command = daemon_rpc_command(sinomo_network::DFS_PROTOCOL_FRAME_ROUTE);
+        let command = daemon_rpc_command(sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE);
         for signer in [
             DaemonSignerAuthority::Local,
             DaemonSignerAuthority::Voter,

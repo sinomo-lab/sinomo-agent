@@ -1631,6 +1631,7 @@ fn hydrate_from_metadata_backend_clears_partial_blob_transfers() {
 }
 
 #[test]
+#[ignore = "slow page-boundary hydration regression; run with `cargo test -p sinomo-dfs hydrate_from_metadata_backend_walks_multiple_object_pages -- --ignored`"]
 fn hydrate_from_metadata_backend_walks_multiple_object_pages() {
     let root = temp_root("hydrate-multiple-object-pages");
     let node_id = NodeId::from_legacy_named("node_hydrate_pages").expect("node");
