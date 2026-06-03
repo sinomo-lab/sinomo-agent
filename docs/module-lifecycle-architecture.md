@@ -196,15 +196,15 @@ compatibility, policy, and loader or rollout state.
 
 Module catalog registration is pure data. It records the manifest, backend
 descriptor, declared capabilities, and public surfaces exposed by the module.
-Public surfaces include object-RPC routes, event kinds, and storage roots. This
-data is serializable, inspectable, comparable across nodes, and safe to place in
-registry or cluster desired state.
+Public surfaces include object-RPC routes, event kinds, capability imports and
+exports, and storage contract owners. This data is serializable, inspectable,
+comparable across nodes, and safe to place in registry or cluster desired state.
 
 Runtime binding is separate. A static native Rust module may have a compile-time
 binding table that maps a `native-rust` registration key to service builders,
-maintenance hooks, or other host callbacks. That binding table is not catalog
-state and is not shipped as cluster-desired data. It is deterministic process
-assembly for a particular Sinomo binary.
+storage contract hooks, maintenance hooks, or other host callbacks. That
+binding table is not catalog state and is not shipped as cluster-desired data.
+It is deterministic process assembly for a particular Sinomo binary.
 
 This split keeps module activation auditable:
 
@@ -212,11 +212,13 @@ This split keeps module activation auditable:
 - the loader says which catalog entry is active on this node,
 - the runtime binding says how this binary materializes that active entry.
 
-For example, `sinomo-dfs` owns the DFS object-RPC route constants and publishes
-them through its module surfaces. `sinomo-network` owns generic object-RPC
-framing and transport mechanics; it does not own DFS route names. The daemon may
-enforce local authentication and drive the service event loop, but the route
-catalog belongs to the module that implements the behavior.
+For example, `sinomo-dfs` publishes the DFS object-RPC routes, DFS/SIFS
+capabilities, DFS event families, and the `sinomo-dfs` storage ownership through
+its module surfaces. Its storage path registration is a native runtime binding.
+`sinomo-network` owns generic object-RPC framing and transport mechanics; it
+does not own DFS route names. The daemon may enforce local authentication and
+drive the service event loop, but the route catalog belongs to the module that
+implements the behavior.
 
 ### Host Event Loop
 

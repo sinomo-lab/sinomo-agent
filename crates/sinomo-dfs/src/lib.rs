@@ -131,6 +131,7 @@ pub const DFS_EXPOSE_CONFIG_ROUTE: &str = "/dfs/expose/config";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
 pub const DFS_PROTOCOL_FRAME_ROUTE: &str = "/dfs/protocol/frame";
+pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 pub const DFS_CONTROL_PLANE_ROUTES: &[&str] = &[
     DFS_STATUS_ROUTE,
     DFS_EXPOSE_CONFIG_ROUTE,
@@ -221,9 +222,9 @@ pub fn dfs_module_id() -> sinomo_module::ModuleId {
 }
 
 pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
-    use sinomo_module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleStorageRoot, ModuleSurfaces};
+    use sinomo_module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleSurfaces};
 
-    ModuleSurfaces::default()
+    let mut surfaces = ModuleSurfaces::default()
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_STATUS_ROUTE,
             DFS_RPC_CATEGORY,
@@ -266,8 +267,10 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             "dfs.object.transfer",
             ModuleRouteAuth::LocalOrClusterMember,
         ))
-        .with_storage_root(ModuleStorageRoot::new("dfs", SINOMO_DFS_MODULE_OWNER))
-        .with_storage_root(ModuleStorageRoot::new("files", SINOMO_DFS_MODULE_OWNER))
+        .with_event_kind_name(DFS_POLICY_VIOLATION_EVENT_KIND)
+        .with_storage_owner(SINOMO_DFS_MODULE_OWNER);
+    surfaces.capabilities = dfs_module_capabilities();
+    surfaces
 }
 
 pub fn dfs_module_registration() -> sinomo_module::ModuleRegistration {
@@ -275,11 +278,23 @@ pub fn dfs_module_registration() -> sinomo_module::ModuleRegistration {
         dfs_module_id(),
         env!("CARGO_PKG_VERSION"),
         SINOMO_DFS_MODULE_OWNER,
+        env!("CARGO_PKG_NAME"),
         DFS_PROTOCOL,
         TrustRing::R1TrustedRuntime,
         SINOMO_DFS_NATIVE_REGISTRATION_KEY,
     );
-    registration.manifest.capabilities = ModuleCapabilities {
+    registration.manifest.capabilities = dfs_module_capabilities();
+    registration.manifest.limits = ModuleResourceLimits {
+        network: NetworkAccess::Allowlisted,
+        filesystem: FileSystemAccess::Scoped,
+        ..ModuleResourceLimits::default()
+    };
+    registration.surfaces = dfs_module_surfaces();
+    registration
+}
+
+pub fn dfs_module_capabilities() -> ModuleCapabilities {
+    ModuleCapabilities {
         imports: vec![
             dfs_capability("storage.local.read"),
             dfs_capability("storage.local.write"),
@@ -295,14 +310,7 @@ pub fn dfs_module_registration() -> sinomo_module::ModuleRegistration {
             dfs_capability("dfs.object.transfer"),
             dfs_capability("sifs.path.access"),
         ],
-    };
-    registration.manifest.limits = ModuleResourceLimits {
-        network: NetworkAccess::Allowlisted,
-        filesystem: FileSystemAccess::Scoped,
-        ..ModuleResourceLimits::default()
-    };
-    registration.surfaces = dfs_module_surfaces();
-    registration
+    }
 }
 
 fn dfs_capability(name: &str) -> CapabilityName {
@@ -313,7 +321,7 @@ fn dfs_capability(name: &str) -> CapabilityName {
 mod module_registration_tests {
     use super::*;
     use sinomo_core::ModuleKind;
-    use sinomo_module::ModuleBackendRegistration;
+    use sinomo_module::{ModuleBackendRegistration, NativeRustBackendRegistration};
 
     #[test]
     fn dfs_registers_as_r1_native_rust_module() {
@@ -337,8 +345,30 @@ mod module_registration_tests {
         assert_eq!(
             registration.backend,
             ModuleBackendRegistration::NativeRust {
-                registration_key: SINOMO_DFS_NATIVE_REGISTRATION_KEY.to_string()
+                registration: NativeRustBackendRegistration::new(
+                    SINOMO_DFS_NATIVE_REGISTRATION_KEY,
+                    SINOMO_DFS_MODULE_OWNER
+                )
             }
+        );
+        assert_eq!(
+            registration.surfaces.storage_owners,
+            vec![SINOMO_DFS_MODULE_OWNER.to_string()]
+        );
+        assert!(
+            registration
+                .surfaces
+                .event_kinds
+                .iter()
+                .any(|event_kind| event_kind.as_str() == DFS_POLICY_VIOLATION_EVENT_KIND)
+        );
+        assert!(
+            registration
+                .surfaces
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "dfs.object.transfer")
         );
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
@@ -635,7 +665,7 @@ impl DfsPolicyViolation {
             OffsetDateTime::now_utc(),
             self.executing_node_id.clone(),
             Source::new("dfs.policy").expect("valid source"),
-            EventKind::new("dfs.policy.violation").expect("valid event kind"),
+            EventKind::new(DFS_POLICY_VIOLATION_EVENT_KIND).expect("valid event kind"),
             Salience::new(0.9).expect("valid salience"),
             Confidence::new(0.96).expect("valid confidence"),
             RoutingMetadata::new(

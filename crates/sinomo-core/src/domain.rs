@@ -331,6 +331,12 @@ pub struct ModuleCapabilities {
     pub exports: Vec<CapabilityName>,
 }
 
+impl ModuleCapabilities {
+    pub fn is_empty(&self) -> bool {
+        self.imports.is_empty() && self.exports.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModuleResourceLimits {
     pub cpu_ms: u64,

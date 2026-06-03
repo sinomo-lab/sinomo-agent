@@ -4,10 +4,11 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactManifest, Confidence, EvaluationGate, EvaluationGateResult, EvaluationMetric,
-    EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind, HotSwapState, LatencyClass,
-    MetricValue, ModuleKind, ModuleLoaderState, PolicyAction, PolicyDecision, PrivacyClass,
-    RolloutPlan, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    ArtifactManifest, CapabilityName, Confidence, EvaluationGate, EvaluationGateResult,
+    EvaluationMetric, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind,
+    HotSwapState, LatencyClass, MetricValue, ModuleCapabilities, ModuleKind, ModuleLoaderState,
+    PolicyAction, PolicyDecision, PrivacyClass, RolloutPlan, RoutingMetadata, RoutingScope,
+    Salience, Source, TrustRing,
 };
 use sinomo_events::{EventId, EventStore, EventStoreError, StoredEvent};
 use sinomo_node::{NodeId, NodeIdentity};
@@ -854,20 +855,22 @@ impl ModuleRegistration {
         module_id: ModuleId,
         version: impl Into<String>,
         owner: impl Into<String>,
+        crate_name: impl Into<String>,
         api_version: impl Into<String>,
         target_ring: TrustRing,
         registration_key: impl Into<String>,
     ) -> Self {
+        let owner = owner.into();
         Self {
             manifest: sinomo_core::ModuleManifest::native_rust(
                 module_id,
                 version,
-                owner,
+                owner.clone(),
                 api_version,
                 target_ring,
             ),
             backend: ModuleBackendRegistration::NativeRust {
-                registration_key: registration_key.into(),
+                registration: NativeRustBackendRegistration::new(registration_key, crate_name),
             },
             surfaces: ModuleSurfaces::default(),
         }
@@ -883,7 +886,8 @@ impl ModuleRegistration {
 #[serde(tag = "backend", rename_all = "kebab-case")]
 pub enum ModuleBackendRegistration {
     NativeRust {
-        registration_key: String,
+        #[serde(flatten)]
+        registration: NativeRustBackendRegistration,
     },
     NativeDylib {
         artifact_id: ArtifactId,
@@ -905,21 +909,39 @@ pub enum ModuleBackendRegistration {
     },
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustBackendRegistration {
+    pub registration_key: String,
+    pub crate_name: String,
+}
+
+impl NativeRustBackendRegistration {
+    pub fn new(registration_key: impl Into<String>, crate_name: impl Into<String>) -> Self {
+        Self {
+            registration_key: registration_key.into(),
+            crate_name: crate_name.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModuleSurfaces {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub object_rpc_routes: Vec<ModuleObjectRpcRoute>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub event_kinds: Vec<String>,
+    pub event_kinds: Vec<EventKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub storage_roots: Vec<ModuleStorageRoot>,
+    pub storage_owners: Vec<String>,
+    #[serde(default, skip_serializing_if = "ModuleCapabilities::is_empty")]
+    pub capabilities: ModuleCapabilities,
 }
 
 impl ModuleSurfaces {
     pub fn is_empty(&self) -> bool {
         self.object_rpc_routes.is_empty()
             && self.event_kinds.is_empty()
-            && self.storage_roots.is_empty()
+            && self.storage_owners.is_empty()
+            && self.capabilities.is_empty()
     }
 
     pub fn with_object_rpc_route(mut self, route: ModuleObjectRpcRoute) -> Self {
@@ -927,13 +949,33 @@ impl ModuleSurfaces {
         self
     }
 
-    pub fn with_event_kind(mut self, event_kind: impl Into<String>) -> Self {
-        self.event_kinds.push(event_kind.into());
+    pub fn with_event_kind(mut self, event_kind: EventKind) -> Self {
+        self.event_kinds.push(event_kind);
         self
     }
 
-    pub fn with_storage_root(mut self, root: ModuleStorageRoot) -> Self {
-        self.storage_roots.push(root);
+    pub fn with_event_kind_name(mut self, event_kind: impl Into<String>) -> Self {
+        self.event_kinds.push(
+            EventKind::new(event_kind.into()).expect("module surface event kind should be valid"),
+        );
+        self
+    }
+
+    pub fn with_storage_owner(mut self, owner: impl Into<String>) -> Self {
+        let owner = owner.into();
+        if !self.storage_owners.contains(&owner) {
+            self.storage_owners.push(owner);
+        }
+        self
+    }
+
+    pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
+        self.capabilities.imports.push(capability);
+        self
+    }
+
+    pub fn with_capability_export(mut self, capability: CapabilityName) -> Self {
+        self.capabilities.exports.push(capability);
         self
     }
 }
@@ -969,21 +1011,6 @@ pub enum ModuleRouteAuth {
     LocalOrClusterMember,
     ClusterMember,
     Admin,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ModuleStorageRoot {
-    pub root: String,
-    pub owner: String,
-}
-
-impl ModuleStorageRoot {
-    pub fn new(root: impl Into<String>, owner: impl Into<String>) -> Self {
-        Self {
-            root: root.into(),
-            owner: owner.into(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2661,6 +2688,7 @@ mod tests {
             module_id.clone(),
             "0.1.0",
             "sinomo-dfs",
+            "sinomo-dfs",
             "sinomo.dfs.v1",
             TrustRing::R1TrustedRuntime,
             "sinomo-dfs",
@@ -2675,7 +2703,7 @@ mod tests {
         assert_eq!(
             registration.backend,
             ModuleBackendRegistration::NativeRust {
-                registration_key: "sinomo-dfs".to_string()
+                registration: NativeRustBackendRegistration::new("sinomo-dfs", "sinomo-dfs")
             }
         );
         assert!(registration.surfaces.is_empty());
@@ -2687,6 +2715,7 @@ mod tests {
         let registration = ModuleRegistration::native_rust(
             module_id.clone(),
             "0.1.0",
+            "sinomo-dfs",
             "sinomo-dfs",
             "sinomo.dfs.v1",
             TrustRing::R1TrustedRuntime,
@@ -2700,7 +2729,11 @@ mod tests {
                     "dfs.status.read",
                     ModuleRouteAuth::LocalOrClusterMember,
                 ))
-                .with_storage_root(ModuleStorageRoot::new("dfs", "sinomo-dfs")),
+                .with_event_kind_name("dfs.metadata.updated")
+                .with_storage_owner("sinomo-dfs")
+                .with_capability_export(
+                    CapabilityName::new("dfs.metadata.replicate").expect("capability"),
+                ),
         );
 
         let encoded = serde_json::to_string(&registration).expect("encode");
@@ -2712,7 +2745,15 @@ mod tests {
             decoded.surfaces.object_rpc_routes[0].auth,
             ModuleRouteAuth::LocalOrClusterMember
         );
-        assert_eq!(decoded.surfaces.storage_roots[0].root, "dfs");
+        assert_eq!(
+            decoded.surfaces.event_kinds[0].as_str(),
+            "dfs.metadata.updated"
+        );
+        assert_eq!(decoded.surfaces.storage_owners[0], "sinomo-dfs");
+        assert_eq!(
+            decoded.surfaces.capabilities.exports[0].as_str(),
+            "dfs.metadata.replicate"
+        );
     }
 
     #[test]

@@ -61,7 +61,7 @@ pub mod r1 {
             sinomo_rollout::register_storage_paths(&mut layout)?;
             sinomo_registry::register_storage_paths(&mut layout)?;
             sinomo_node::register_storage_paths(&mut layout)?;
-            sinomo_dfs::register_storage_paths(&mut layout)?;
+            super::modules::register_internal_module_storage_paths(&mut layout)?;
             sinomo_sandbox::register_storage_paths(&mut layout)?;
             sinomo_local::register_storage_paths(&mut layout)?;
             sinomo_events::register_storage_paths(&mut layout)?;
@@ -93,13 +93,82 @@ pub mod r1 {
     }
 
     pub mod modules {
-        pub use sinomo_module::{ModuleRegistry, ModuleRegistryError};
+        pub use sinomo_module::{ModuleRegistration, ModuleRegistry, ModuleRegistryError};
+
+        pub struct NativeRustModuleBinding {
+            pub registration_key: &'static str,
+            pub register_services: Option<
+                fn(
+                    sinomo_service::ServiceRegistryBuilder,
+                ) -> sinomo_service::ServiceRegistryBuilder,
+            >,
+            pub register_storage_paths: Option<
+                fn(
+                    &mut sinomo_storage::StorageLayout,
+                ) -> Result<(), sinomo_storage::StorageContractError>,
+            >,
+        }
+
+        pub struct InternalModuleTable {
+            pub registry: ModuleRegistry,
+            pub native_rust_bindings: &'static [NativeRustModuleBinding],
+        }
+
+        const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] =
+            &[NativeRustModuleBinding {
+                registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
+                register_services: None,
+                register_storage_paths: Some(sinomo_dfs::register_storage_paths),
+            }];
+
+        pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
+            let registry = internal_module_registry()?;
+            Ok(InternalModuleTable {
+                registry,
+                native_rust_bindings: internal_native_rust_module_bindings(),
+            })
+        }
 
         pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
             let registry = sinomo_module::ModuleRegistry::builder()
                 .register(sinomo_dfs::dfs_module_registration())?
                 .build();
             Ok(registry)
+        }
+
+        pub fn internal_native_rust_module_bindings() -> &'static [NativeRustModuleBinding] {
+            INTERNAL_NATIVE_RUST_MODULE_BINDINGS
+        }
+
+        pub fn native_rust_module_binding(
+            registration_key: &str,
+        ) -> Option<&'static NativeRustModuleBinding> {
+            internal_native_rust_module_bindings()
+                .iter()
+                .find(|binding| binding.registration_key == registration_key)
+        }
+
+        pub fn native_rust_binding_for_registration(
+            registration: &ModuleRegistration,
+        ) -> Option<&'static NativeRustModuleBinding> {
+            let sinomo_module::ModuleBackendRegistration::NativeRust {
+                registration: native_registration,
+            } = &registration.backend
+            else {
+                return None;
+            };
+            native_rust_module_binding(&native_registration.registration_key)
+        }
+
+        pub fn register_internal_module_storage_paths(
+            layout: &mut sinomo_storage::StorageLayout,
+        ) -> Result<(), sinomo_storage::StorageContractError> {
+            for binding in internal_native_rust_module_bindings() {
+                if let Some(register_storage_paths) = binding.register_storage_paths {
+                    register_storage_paths(layout)?;
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -113,7 +182,9 @@ pub use r1::{
 
 #[cfg(test)]
 mod tests {
-    use super::modules::internal_module_registry;
+    use super::modules::{
+        internal_module_registry, internal_module_table, native_rust_binding_for_registration,
+    };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
     use super::{core, dfs, module};
 
@@ -190,8 +261,22 @@ mod tests {
         assert_eq!(
             registration.backend,
             module::ModuleBackendRegistration::NativeRust {
-                registration_key: dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY.to_string()
+                registration: module::NativeRustBackendRegistration::new(
+                    dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
+                    dfs::SINOMO_DFS_MODULE_OWNER
+                )
             }
+        );
+        assert_eq!(
+            registration.surfaces.storage_owners,
+            vec![dfs::SINOMO_DFS_MODULE_OWNER.to_string()]
+        );
+        assert!(
+            registration
+                .surfaces
+                .event_kinds
+                .iter()
+                .any(|event_kind| event_kind.as_str() == dfs::DFS_POLICY_VIOLATION_EVENT_KIND)
         );
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
@@ -206,5 +291,32 @@ mod tests {
                     && route.category == dfs::DFS_RPC_CATEGORY
                     && route.auth == module::ModuleRouteAuth::LocalOrClusterMember)
         );
+    }
+
+    #[test]
+    fn runtime_internal_module_table_binds_dfs_storage_hook() {
+        let table = internal_module_table().expect("module table");
+        let module_id = dfs::dfs_module_id();
+        let registration = table
+            .registry
+            .get(&module_id)
+            .expect("dfs module registration");
+        let binding = native_rust_binding_for_registration(registration).expect("dfs binding");
+
+        assert_eq!(
+            binding.registration_key,
+            dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY
+        );
+        assert_eq!(table.native_rust_bindings.len(), 1);
+        assert!(binding.register_services.is_none());
+        assert!(binding.register_storage_paths.is_some());
+
+        let layout = sinomo_data_dir_layout().expect("layout");
+        let Some(StoragePathOwner::Escape(dfs_blobs)) =
+            layout.owner_for("dfs/content/blobs/object-chunk")
+        else {
+            panic!("expected DFS blob storage contract");
+        };
+        assert_eq!(dfs_blobs.module, dfs::SINOMO_DFS_MODULE_OWNER);
     }
 }
