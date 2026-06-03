@@ -4,11 +4,9 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ArtifactManifest, CapabilityName, Confidence, EvaluationGate, EvaluationGateResult,
-    EvaluationMetric, EvaluationOutcome, EvaluationScorecard, EventEnvelope, EventKind,
-    HotSwapState, LatencyClass, MetricValue, ModuleCapabilities, ModuleKind, ModuleLoaderState,
-    PolicyAction, PolicyDecision, PrivacyClass, RolloutPlan, RoutingMetadata, RoutingScope,
-    Salience, Source, TrustRing,
+    ArtifactManifest, CapabilityName, Confidence, EventEnvelope, EventKind, HotSwapState,
+    LatencyClass, ModuleCapabilities, ModuleKind, ModuleLoaderState, PolicyAction, PolicyDecision,
+    PrivacyClass, RolloutPlan, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_events::{EventId, EventStore, EventStoreError, StoredEvent};
 use sinomo_node::{NodeId, NodeIdentity};
@@ -320,82 +318,6 @@ pub struct ModuleReplayReport {
     pub events: Vec<EventEnvelope>,
 }
 
-impl ModuleReplayReport {
-    pub fn outcome(&self) -> EvaluationOutcome {
-        if self.cases.is_empty() {
-            return EvaluationOutcome::Inconclusive;
-        }
-        if self.missing_route_count == 0
-            && self.primary_error_count == 0
-            && self.shadow_error_count == 0
-            && self.shadow_mismatch_count == 0
-        {
-            EvaluationOutcome::Passed
-        } else {
-            EvaluationOutcome::Failed
-        }
-    }
-
-    pub fn scorecard(
-        &self,
-        baseline_artifact_id: Option<ArtifactId>,
-        candidate_artifact_id: Option<ArtifactId>,
-    ) -> EvaluationScorecard {
-        let outcome = self.outcome();
-        EvaluationScorecard {
-            scorecard_id: sinomo_core::Id::generate(),
-            baseline_artifact_id,
-            candidate_artifact_id,
-            outcome: outcome.clone(),
-            gates: vec![
-                EvaluationGateResult {
-                    gate: EvaluationGate::ReplayTests,
-                    outcome: if self.missing_route_count == 0 && !self.cases.is_empty() {
-                        EvaluationOutcome::Passed
-                    } else {
-                        EvaluationOutcome::Failed
-                    },
-                    summary: format!(
-                        "{} replay cases, {} missing routes",
-                        self.cases.len(),
-                        self.missing_route_count
-                    ),
-                },
-                EvaluationGateResult {
-                    gate: EvaluationGate::ShadowMode,
-                    outcome,
-                    summary: format!(
-                        "{} primary errors, {} shadow errors, {} shadow mismatches",
-                        self.primary_error_count,
-                        self.shadow_error_count,
-                        self.shadow_mismatch_count
-                    ),
-                },
-            ],
-            metrics: vec![
-                replay_metric("module_replay_case_count", self.cases.len() as i64),
-                replay_metric("module_replay_event_count", self.replay_event_count as i64),
-                replay_metric(
-                    "module_replay_missing_route_count",
-                    self.missing_route_count as i64,
-                ),
-                replay_metric(
-                    "module_replay_primary_error_count",
-                    self.primary_error_count as i64,
-                ),
-                replay_metric(
-                    "module_replay_shadow_error_count",
-                    self.shadow_error_count as i64,
-                ),
-                replay_metric(
-                    "module_replay_shadow_mismatch_count",
-                    self.shadow_mismatch_count as i64,
-                ),
-            ],
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModuleShadowTelemetryReport {
     pub module_id: ModuleId,
@@ -459,60 +381,6 @@ impl ModuleShadowTelemetryReport {
             }
         }
         report
-    }
-
-    pub fn outcome(&self) -> EvaluationOutcome {
-        if self.event_count == 0 {
-            return EvaluationOutcome::Inconclusive;
-        }
-        if self.mismatch_count == 0 && self.primary_error_count == 0 && self.shadow_error_count == 0
-        {
-            EvaluationOutcome::Passed
-        } else {
-            EvaluationOutcome::Failed
-        }
-    }
-
-    pub fn scorecard(
-        &self,
-        baseline_artifact_id: Option<ArtifactId>,
-        candidate_artifact_id: Option<ArtifactId>,
-    ) -> EvaluationScorecard {
-        let outcome = self.outcome();
-        EvaluationScorecard {
-            scorecard_id: sinomo_core::Id::generate(),
-            baseline_artifact_id,
-            candidate_artifact_id,
-            outcome: outcome.clone(),
-            gates: vec![EvaluationGateResult {
-                gate: EvaluationGate::ShadowMode,
-                outcome,
-                summary: format!(
-                    "{} live shadow events, {} mismatches, {} primary errors, {} shadow errors",
-                    self.event_count,
-                    self.mismatch_count,
-                    self.primary_error_count,
-                    self.shadow_error_count
-                ),
-            }],
-            metrics: vec![
-                replay_metric("module_shadow_event_count", self.event_count as i64),
-                replay_metric("module_shadow_matched_count", self.matched_count as i64),
-                replay_metric("module_shadow_mismatch_count", self.mismatch_count as i64),
-                replay_metric(
-                    "module_shadow_primary_error_count",
-                    self.primary_error_count as i64,
-                ),
-                replay_metric(
-                    "module_shadow_shadow_error_count",
-                    self.shadow_error_count as i64,
-                ),
-                replay_metric(
-                    "module_shadow_ignored_event_count",
-                    self.ignored_event_count as i64,
-                ),
-            ],
-        }
     }
 }
 
@@ -661,123 +529,6 @@ impl ModuleCanaryTelemetryReport {
             Some("active") => self.active_user_correction_count += 1,
             Some("candidate") => self.candidate_user_correction_count += 1,
             _ => self.unknown_user_correction_count += 1,
-        }
-    }
-
-    pub fn outcome(
-        &self,
-        minimum_candidate_event_count: u64,
-        maximum_candidate_latency_p95_ms: Option<u64>,
-    ) -> EvaluationOutcome {
-        if self.candidate_user_correction_count > 0 {
-            return EvaluationOutcome::Failed;
-        }
-        if self.candidate_primary_count < minimum_candidate_event_count.max(1) {
-            return EvaluationOutcome::Inconclusive;
-        }
-        if self.candidate_error_count > 0 {
-            return EvaluationOutcome::Failed;
-        }
-        if maximum_candidate_latency_p95_ms.is_some_and(|maximum| {
-            self.candidate_latency_p95_ms
-                .is_some_and(|latency| latency > maximum)
-        }) {
-            return EvaluationOutcome::Failed;
-        }
-        EvaluationOutcome::Passed
-    }
-
-    pub fn scorecard(
-        &self,
-        baseline_artifact_id: Option<ArtifactId>,
-        candidate_artifact_id: Option<ArtifactId>,
-        minimum_candidate_event_count: u64,
-        maximum_candidate_latency_p95_ms: Option<u64>,
-    ) -> EvaluationScorecard {
-        let outcome = self.outcome(
-            minimum_candidate_event_count,
-            maximum_candidate_latency_p95_ms,
-        );
-        let mut metrics = vec![
-            replay_metric("module_canary_event_count", self.event_count as i64),
-            replay_metric(
-                "module_canary_candidate_primary_count",
-                self.candidate_primary_count as i64,
-            ),
-            replay_metric(
-                "module_canary_active_primary_count",
-                self.active_primary_count as i64,
-            ),
-            replay_metric(
-                "module_canary_correction_event_count",
-                self.correction_event_count as i64,
-            ),
-            replay_metric(
-                "module_canary_candidate_user_correction_count",
-                self.candidate_user_correction_count as i64,
-            ),
-            replay_metric(
-                "module_canary_active_user_correction_count",
-                self.active_user_correction_count as i64,
-            ),
-            replay_metric(
-                "module_canary_unknown_user_correction_count",
-                self.unknown_user_correction_count as i64,
-            ),
-            replay_metric(
-                "module_canary_candidate_error_count",
-                self.candidate_error_count as i64,
-            ),
-            replay_metric(
-                "module_canary_active_error_count",
-                self.active_error_count as i64,
-            ),
-            replay_metric(
-                "module_canary_candidate_latency_sample_count",
-                self.candidate_latency_sample_count as i64,
-            ),
-            replay_metric(
-                "module_canary_active_latency_sample_count",
-                self.active_latency_sample_count as i64,
-            ),
-            replay_metric(
-                "module_canary_ignored_event_count",
-                self.ignored_event_count as i64,
-            ),
-        ];
-        if let Some(latency_ms) = self.candidate_latency_p95_ms {
-            metrics.push(replay_metric(
-                "module_canary_candidate_latency_p95_ms",
-                latency_ms as i64,
-            ));
-        }
-        if let Some(latency_ms) = self.active_latency_p95_ms {
-            metrics.push(replay_metric(
-                "module_canary_active_latency_p95_ms",
-                latency_ms as i64,
-            ));
-        }
-        EvaluationScorecard {
-            scorecard_id: sinomo_core::Id::generate(),
-            baseline_artifact_id,
-            candidate_artifact_id,
-            outcome: outcome.clone(),
-            gates: vec![EvaluationGateResult {
-                gate: EvaluationGate::CanaryAnalysis,
-                outcome,
-                summary: format!(
-                    "{} canary candidate-primary events, {} candidate errors, {} candidate user corrections, candidate p95 latency {} ms, {} active-primary events, {} active errors",
-                    self.candidate_primary_count,
-                    self.candidate_error_count,
-                    self.candidate_user_correction_count,
-                    self.candidate_latency_p95_ms
-                        .map(|latency| latency.to_string())
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    self.active_primary_count,
-                    self.active_error_count
-                ),
-            }],
-            metrics,
         }
     }
 }
@@ -2159,14 +1910,6 @@ fn module_artifact_error_kind(error: Option<&str>) -> Option<&'static str> {
     Some("runtime-error")
 }
 
-fn replay_metric(name: &str, value: i64) -> EvaluationMetric {
-    EvaluationMetric {
-        name: name.to_string(),
-        value: MetricValue::Integer(value),
-        sample_count: None,
-    }
-}
-
 fn percentile_nearest_rank(mut values: Vec<u64>, percentile: u64) -> Option<u64> {
     if values.is_empty() {
         return None;
@@ -3301,7 +3044,6 @@ mod tests {
         };
 
         let report = run_module_replay_fixture(&root, &fixture, &runner).expect("replay");
-        let scorecard = report.scorecard(Some(active_artifact_id), Some(shadow_artifact_id));
 
         assert_eq!(report.replay_event_count, 1);
         assert_eq!(report.missing_route_count, 0);
@@ -3312,7 +3054,6 @@ mod tests {
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.events[0].kind.as_str(), "module.shadow.decision");
         assert_eq!(report.events[0].payload["shadow_matched"], true);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3355,10 +3096,6 @@ mod tests {
             ))
             .expect("replay events");
         let report = ModuleShadowTelemetryReport::from_stored_events(module_id.clone(), &events);
-        let scorecard = report.scorecard(
-            Some(active_artifact_id.clone()),
-            Some(shadow_artifact_id.clone()),
-        );
 
         assert_eq!(outcome.primary.artifact_id, active_artifact_id);
         assert_eq!(
@@ -3372,7 +3109,6 @@ mod tests {
         assert_eq!(report.event_count, 1);
         assert_eq!(report.matched_count, 1);
         assert_eq!(report.mismatch_count, 0);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3429,12 +3165,6 @@ mod tests {
             Some(&candidate_artifact_id),
             &invocation_events,
         );
-        let scorecard = report.scorecard(
-            Some(active_artifact_id.clone()),
-            Some(candidate_artifact_id.clone()),
-            1,
-            None,
-        );
 
         assert_eq!(outcome.primary.artifact_id, candidate_artifact_id);
         assert_eq!(outcome.primary.lane, ModuleInvocationLane::Candidate);
@@ -3464,8 +3194,6 @@ mod tests {
         assert_eq!(report.active_primary_count, 0);
         assert_eq!(report.candidate_error_count, 0);
         assert_eq!(report.candidate_latency_sample_count, 1);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Passed);
-        assert_eq!(scorecard.gates[0].gate, EvaluationGate::CanaryAnalysis);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3545,20 +3273,6 @@ mod tests {
 
         assert_eq!(report.candidate_primary_count, 1);
         assert_eq!(report.candidate_error_count, 1);
-        assert_eq!(report.outcome(2, None), EvaluationOutcome::Inconclusive);
-        assert_eq!(report.outcome(1, None), EvaluationOutcome::Failed);
-        assert_eq!(
-            report
-                .scorecard(
-                    Some(active_artifact_id),
-                    Some(candidate_artifact_id),
-                    1,
-                    None
-                )
-                .gates[0]
-                .gate,
-            EvaluationGate::CanaryAnalysis
-        );
     }
 
     #[test]
@@ -3602,20 +3316,8 @@ mod tests {
             Some(&candidate_artifact_id),
             &events,
         );
-        let scorecard = report.scorecard(
-            Some(active_artifact_id),
-            Some(candidate_artifact_id),
-            1,
-            Some(200),
-        );
 
         assert_eq!(report.candidate_latency_p95_ms, Some(250));
-        assert_eq!(report.outcome(1, Some(200)), EvaluationOutcome::Failed);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
-        assert!(scorecard.metrics.iter().any(|metric| {
-            metric.name == "module_canary_candidate_latency_p95_ms"
-                && metric.value == MetricValue::Integer(250)
-        }));
     }
 
     #[test]
@@ -3623,7 +3325,6 @@ mod tests {
         let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let active_artifact_id = ArtifactId::from_legacy_named("artifact_active").expect("active");
         let candidate_artifact_id =
             ArtifactId::from_legacy_named("artifact_candidate").expect("candidate");
         let correction_event = EventEnvelope::new(
@@ -3661,22 +3362,10 @@ mod tests {
             Some(&candidate_artifact_id),
             &events,
         );
-        let scorecard = report.scorecard(
-            Some(active_artifact_id),
-            Some(candidate_artifact_id),
-            10,
-            None,
-        );
 
         assert_eq!(report.correction_event_count, 1);
         assert_eq!(report.candidate_user_correction_count, 1);
         assert_eq!(report.candidate_primary_count, 0);
-        assert_eq!(report.outcome(10, None), EvaluationOutcome::Failed);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
-        assert!(scorecard.metrics.iter().any(|metric| {
-            metric.name == "module_canary_candidate_user_correction_count"
-                && metric.value == MetricValue::Integer(1)
-        }));
     }
 
     #[test]
@@ -3716,13 +3405,10 @@ mod tests {
             ))
             .expect("replay events");
         let report = ModuleShadowTelemetryReport::from_stored_events(module_id, &events);
-        let scorecard = report.scorecard(Some(active_artifact_id), Some(shadow_artifact_id));
 
         assert_eq!(report.event_count, 1);
         assert_eq!(report.mismatch_count, 1);
         assert_eq!(report.shadow_error_count, 1);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
-        assert_eq!(scorecard.gates[0].gate, EvaluationGate::ShadowMode);
     }
 
     #[test]
@@ -3756,7 +3442,6 @@ mod tests {
         };
 
         let report = run_module_replay_fixture(&root, &fixture, &runner).expect("replay");
-        let scorecard = report.scorecard(None, Some(shadow_artifact_id));
 
         assert_eq!(
             report.cases[0]
@@ -3771,8 +3456,6 @@ mod tests {
         assert_eq!(report.shadow_mismatch_count, 1);
         assert_eq!(report.cases[0].shadow_matched, Some(false));
         assert_eq!(report.events[0].payload["shadow_matched"], false);
-        assert_eq!(scorecard.outcome, EvaluationOutcome::Failed);
-        assert_eq!(scorecard.gates[1].gate, EvaluationGate::ShadowMode);
         let _ = std::fs::remove_dir_all(root);
     }
 

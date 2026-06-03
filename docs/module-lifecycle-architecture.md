@@ -440,14 +440,17 @@ The crate boundary follows the trust-ring architecture:
 
 - `sinomo-core` owns foundational module manifest vocabulary that must be
   visible below higher-level services.
-- `sinomo-module` owns backend-neutral lifecycle, routing, loader state,
-  replay, module telemetry primitives, and serializable module surface
-  declarations.
+- `sinomo-module` owns backend-neutral lifecycle, routing, loader state, raw
+  replay and module telemetry contracts, and serializable module surface
+  declarations. It must not own self-evolution scoring policy.
 - `sinomo-module-api` owns the stable native dynamic-library ABI surface.
 - `sinomo-module-host` owns trusted native dynamic-library loading behavior.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
   signer records.
-- `sinomo-rollout` owns cluster rollout transitions and rollback coordination.
+- `sinomo-rollout` owns cluster rollout transitions, rollout telemetry gates,
+  and rollback coordination.
+- `sinomo-evolution` owns candidate-bundle evidence interpretation, including
+  self-evolution scorecard adapters for module replay and module telemetry.
 - `sinomo-sandbox` owns sandbox-process containment and optional sandboxed
   execution backends.
 - `sinomo-evolution` owns candidate generation, evidence assembly, and

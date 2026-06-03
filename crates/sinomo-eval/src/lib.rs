@@ -652,7 +652,8 @@ impl<R: CommandRunner> ExecutingEvalHarness<R> {
         let mut module_replay_metrics = Vec::new();
         for report_ref in &plan.module_replay_reports {
             let report = read_module_replay_report(cwd, report_ref)?;
-            let replay_scorecard = report.scorecard(
+            let replay_scorecard = module_replay_report_scorecard(
+                &report,
                 report_ref.baseline_artifact_id.clone(),
                 report_ref.candidate_artifact_id.clone(),
             );
@@ -722,6 +723,91 @@ fn read_module_replay_report(
         path: path.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+fn module_replay_report_scorecard(
+    report: &ModuleReplayReport,
+    baseline_artifact_id: Option<ArtifactId>,
+    candidate_artifact_id: Option<ArtifactId>,
+) -> EvaluationScorecard {
+    let outcome = module_replay_report_outcome(report);
+    EvaluationScorecard {
+        scorecard_id: ScorecardId::generate(),
+        baseline_artifact_id,
+        candidate_artifact_id,
+        outcome: outcome.clone(),
+        gates: vec![
+            EvaluationGateResult {
+                gate: EvaluationGate::ReplayTests,
+                outcome: if report.missing_route_count == 0 && !report.cases.is_empty() {
+                    EvaluationOutcome::Passed
+                } else {
+                    EvaluationOutcome::Failed
+                },
+                summary: format!(
+                    "{} replay cases, {} missing routes",
+                    report.cases.len(),
+                    report.missing_route_count
+                ),
+            },
+            EvaluationGateResult {
+                gate: EvaluationGate::ShadowMode,
+                outcome,
+                summary: format!(
+                    "{} primary errors, {} shadow errors, {} shadow mismatches",
+                    report.primary_error_count,
+                    report.shadow_error_count,
+                    report.shadow_mismatch_count
+                ),
+            },
+        ],
+        metrics: vec![
+            eval_metric("module_replay_case_count", report.cases.len() as i64),
+            eval_metric(
+                "module_replay_event_count",
+                report.replay_event_count as i64,
+            ),
+            eval_metric(
+                "module_replay_missing_route_count",
+                report.missing_route_count as i64,
+            ),
+            eval_metric(
+                "module_replay_primary_error_count",
+                report.primary_error_count as i64,
+            ),
+            eval_metric(
+                "module_replay_shadow_error_count",
+                report.shadow_error_count as i64,
+            ),
+            eval_metric(
+                "module_replay_shadow_mismatch_count",
+                report.shadow_mismatch_count as i64,
+            ),
+        ],
+    }
+}
+
+fn module_replay_report_outcome(report: &ModuleReplayReport) -> EvaluationOutcome {
+    if report.cases.is_empty() {
+        return EvaluationOutcome::Inconclusive;
+    }
+    if report.missing_route_count == 0
+        && report.primary_error_count == 0
+        && report.shadow_error_count == 0
+        && report.shadow_mismatch_count == 0
+    {
+        EvaluationOutcome::Passed
+    } else {
+        EvaluationOutcome::Failed
+    }
+}
+
+fn eval_metric(name: &str, value: i64) -> EvaluationMetric {
+    EvaluationMetric {
+        name: name.to_string(),
+        value: MetricValue::Integer(value),
+        sample_count: None,
+    }
 }
 
 fn resolve_verification_path(cwd: &Path, path: &str) -> PathBuf {

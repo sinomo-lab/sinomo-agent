@@ -241,7 +241,7 @@ Current status: normal `evolve propose` mutation routes through `sinomo-agent`, 
 
 Follow-up update: the desired-state reconciliation part of that next batch is now implemented. Each daemon reconciles active local module rollout targets into `/cluster/module-rollouts/reconcile/<node>/<module>/<rollout>` as `matched`, `material-available`, or `blocked`, while still leaving artifact trust and verified rollout preparation as local node responsibilities.
 
-Follow-up update: user-correction canary gates are now implemented. `module.user.correction` events are folded into `ModuleCanaryTelemetryReport`, emitted as canary scorecard metrics, and passed to the rollout controller as `UserCorrectionSpike` evidence so candidate corrections can trigger rollback even before the minimum candidate-primary event count is reached.
+Follow-up update: user-correction canary gates are now implemented. `module.user.correction` events are folded into raw module canary telemetry, converted to scorecard metrics by rollout/evolution adapters, and passed to the rollout controller as `UserCorrectionSpike` evidence so candidate corrections can trigger rollback even before the minimum candidate-primary event count is reached.
 
 Follow-up update: runtime failure canary rollback is now implemented. `module.crash`, `module.timeout`, and `module.policy.blocked` events are consumed with live canary telemetry, filtered to the current module and candidate artifact, recorded as panic/timeout/policy-blocked canary metrics, and mapped to the rollout policy's `Panic`, `Timeout`, and `PolicyIncident` triggers.
 

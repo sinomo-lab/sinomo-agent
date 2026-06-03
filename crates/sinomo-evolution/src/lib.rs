@@ -1,11 +1,13 @@
 //! Autonomous self-evolution planning skeleton.
 
 mod engine;
+pub mod module_evidence;
 pub mod persistence;
 pub mod tools;
 mod types;
 
 pub use engine::*;
+pub use module_evidence::*;
 pub use persistence::*;
 pub use tools::*;
 pub use types::*;

@@ -757,7 +757,11 @@ fn read_rollout_module_replay_scorecard(
             .or_else(|| state.loader_state.shadow_artifact_id.clone())
             .or_else(|| Some(state.plan.artifact_id.clone()))
     });
-    Ok(report.scorecard(baseline_artifact_id, candidate_artifact_id))
+    Ok(module_replay_report_scorecard(
+        &report,
+        baseline_artifact_id,
+        candidate_artifact_id,
+    ))
 }
 
 fn read_rollout_shadow_telemetry_scorecard(

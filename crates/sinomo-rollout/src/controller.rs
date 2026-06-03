@@ -141,7 +141,7 @@ pub fn shadow_telemetry_scorecard_from_events<'a>(
         .clone()
         .or_else(|| state.loader_state.shadow_artifact_id.clone())
         .or_else(|| Some(state.plan.artifact_id.clone()));
-    report.scorecard(baseline_artifact_id, candidate_artifact_id)
+    shadow_telemetry_scorecard_from_report(&report, baseline_artifact_id, candidate_artifact_id)
 }
 
 pub fn canary_telemetry_scorecard_from_event_store<S>(
@@ -175,12 +175,189 @@ pub fn canary_telemetry_scorecard_from_events<'a>(
         candidate_artifact_id.as_ref(),
         events,
     );
-    report.scorecard(
+    canary_telemetry_scorecard_from_report(
+        &report,
         Some(state.loader_state.active_artifact_id.clone()),
         candidate_artifact_id,
         minimum_candidate_event_count,
         maximum_candidate_latency_p95_ms,
     )
+}
+
+fn shadow_telemetry_scorecard_from_report(
+    report: &ModuleShadowTelemetryReport,
+    baseline_artifact_id: Option<ArtifactId>,
+    candidate_artifact_id: Option<ArtifactId>,
+) -> EvaluationScorecard {
+    let outcome = shadow_telemetry_outcome(report);
+    EvaluationScorecard {
+        scorecard_id: sinomo_core::Id::generate(),
+        baseline_artifact_id,
+        candidate_artifact_id,
+        outcome: outcome.clone(),
+        gates: vec![sinomo_core::EvaluationGateResult {
+            gate: sinomo_core::EvaluationGate::ShadowMode,
+            outcome,
+            summary: format!(
+                "{} live shadow events, {} mismatches, {} primary errors, {} shadow errors",
+                report.event_count,
+                report.mismatch_count,
+                report.primary_error_count,
+                report.shadow_error_count
+            ),
+        }],
+        metrics: vec![
+            rollout_metric("module_shadow_event_count", report.event_count as i64),
+            rollout_metric("module_shadow_matched_count", report.matched_count as i64),
+            rollout_metric("module_shadow_mismatch_count", report.mismatch_count as i64),
+            rollout_metric(
+                "module_shadow_primary_error_count",
+                report.primary_error_count as i64,
+            ),
+            rollout_metric(
+                "module_shadow_shadow_error_count",
+                report.shadow_error_count as i64,
+            ),
+            rollout_metric(
+                "module_shadow_ignored_event_count",
+                report.ignored_event_count as i64,
+            ),
+        ],
+    }
+}
+
+fn shadow_telemetry_outcome(report: &ModuleShadowTelemetryReport) -> EvaluationOutcome {
+    if report.event_count == 0 {
+        return EvaluationOutcome::Inconclusive;
+    }
+    if report.mismatch_count == 0
+        && report.primary_error_count == 0
+        && report.shadow_error_count == 0
+    {
+        EvaluationOutcome::Passed
+    } else {
+        EvaluationOutcome::Failed
+    }
+}
+
+fn canary_telemetry_scorecard_from_report(
+    report: &ModuleCanaryTelemetryReport,
+    baseline_artifact_id: Option<ArtifactId>,
+    candidate_artifact_id: Option<ArtifactId>,
+    minimum_candidate_event_count: u64,
+    maximum_candidate_latency_p95_ms: Option<u64>,
+) -> EvaluationScorecard {
+    let outcome = canary_telemetry_outcome(
+        report,
+        minimum_candidate_event_count,
+        maximum_candidate_latency_p95_ms,
+    );
+    let mut metrics = vec![
+        rollout_metric("module_canary_event_count", report.event_count as i64),
+        rollout_metric(
+            "module_canary_candidate_primary_count",
+            report.candidate_primary_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_active_primary_count",
+            report.active_primary_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_correction_event_count",
+            report.correction_event_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_candidate_user_correction_count",
+            report.candidate_user_correction_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_active_user_correction_count",
+            report.active_user_correction_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_unknown_user_correction_count",
+            report.unknown_user_correction_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_candidate_error_count",
+            report.candidate_error_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_active_error_count",
+            report.active_error_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_candidate_latency_sample_count",
+            report.candidate_latency_sample_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_active_latency_sample_count",
+            report.active_latency_sample_count as i64,
+        ),
+        rollout_metric(
+            "module_canary_ignored_event_count",
+            report.ignored_event_count as i64,
+        ),
+    ];
+    if let Some(latency_ms) = report.candidate_latency_p95_ms {
+        metrics.push(rollout_metric(
+            "module_canary_candidate_latency_p95_ms",
+            latency_ms as i64,
+        ));
+    }
+    if let Some(latency_ms) = report.active_latency_p95_ms {
+        metrics.push(rollout_metric(
+            "module_canary_active_latency_p95_ms",
+            latency_ms as i64,
+        ));
+    }
+    EvaluationScorecard {
+        scorecard_id: sinomo_core::Id::generate(),
+        baseline_artifact_id,
+        candidate_artifact_id,
+        outcome: outcome.clone(),
+        gates: vec![sinomo_core::EvaluationGateResult {
+            gate: sinomo_core::EvaluationGate::CanaryAnalysis,
+            outcome,
+            summary: format!(
+                "{} canary candidate-primary events, {} candidate errors, {} candidate user corrections, candidate p95 latency {} ms, {} active-primary events, {} active errors",
+                report.candidate_primary_count,
+                report.candidate_error_count,
+                report.candidate_user_correction_count,
+                report
+                    .candidate_latency_p95_ms
+                    .map(|latency| latency.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                report.active_primary_count,
+                report.active_error_count
+            ),
+        }],
+        metrics,
+    }
+}
+
+fn canary_telemetry_outcome(
+    report: &ModuleCanaryTelemetryReport,
+    minimum_candidate_event_count: u64,
+    maximum_candidate_latency_p95_ms: Option<u64>,
+) -> EvaluationOutcome {
+    if report.candidate_user_correction_count > 0 {
+        return EvaluationOutcome::Failed;
+    }
+    if report.candidate_primary_count < minimum_candidate_event_count.max(1) {
+        return EvaluationOutcome::Inconclusive;
+    }
+    if report.candidate_error_count > 0 {
+        return EvaluationOutcome::Failed;
+    }
+    if maximum_candidate_latency_p95_ms.is_some_and(|maximum| {
+        report
+            .candidate_latency_p95_ms
+            .is_some_and(|latency| latency > maximum)
+    }) {
+        return EvaluationOutcome::Failed;
+    }
+    EvaluationOutcome::Passed
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -249,6 +426,14 @@ fn append_runtime_failure_metrics(
             sample_count: None,
         },
     ]);
+}
+
+fn rollout_metric(name: &str, value: i64) -> EvaluationMetric {
+    EvaluationMetric {
+        name: name.to_string(),
+        value: MetricValue::Integer(value),
+        sample_count: None,
+    }
 }
 
 fn runtime_failure_trigger_for_event(
@@ -1037,7 +1222,8 @@ impl RolloutController {
                 Some(&candidate_artifact_id),
                 &events,
             );
-            let mut scorecard = report.scorecard(
+            let mut scorecard = canary_telemetry_scorecard_from_report(
+                &report,
                 Some(state.loader_state.active_artifact_id.clone()),
                 Some(candidate_artifact_id.clone()),
                 options.minimum_event_count.max(1),
@@ -1058,7 +1244,8 @@ impl RolloutController {
                 &events,
             );
             (
-                report.scorecard(
+                shadow_telemetry_scorecard_from_report(
+                    &report,
                     Some(state.loader_state.active_artifact_id.clone()),
                     Some(candidate_artifact_id.clone()),
                 ),
