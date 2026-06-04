@@ -93,6 +93,10 @@ fn context_max_bytes_for_window(window_tokens: usize, max_output_tokens: Option<
     input_tokens.saturating_mul(CONTEXT_ESTIMATE_BYTES_PER_TOKEN)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentSession {
     pub session_id: SessionId,
@@ -227,6 +231,160 @@ impl AgentAbortRecord {
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentRunContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<AgentTaskRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<AgentPlacementMetadata>,
+}
+
+impl AgentRunContext {
+    pub fn is_empty(&self) -> bool {
+        self.task.is_none() && self.workspace.is_none() && self.placement.is_none()
+    }
+
+    pub fn with_task(mut self, task: AgentTaskRef) -> Self {
+        self.task = Some(task);
+        self
+    }
+
+    pub fn with_workspace(mut self, workspace: WorkspaceRef) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_placement(mut self, placement: AgentPlacementMetadata) -> Self {
+        self.placement = Some(placement);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentTaskRef {
+    pub task_id: TaskId,
+    pub kind: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_role: Option<AgentRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task_id: Option<TaskId>,
+}
+
+impl AgentTaskRef {
+    pub fn new(kind: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            task_id: TaskId::generate(),
+            kind: kind.into(),
+            summary: summary.into(),
+            owner_role: None,
+            parent_task_id: None,
+        }
+    }
+
+    pub fn with_owner_role(mut self, owner_role: AgentRole) -> Self {
+        self.owner_role = Some(owner_role);
+        self
+    }
+
+    pub fn with_parent_task_id(mut self, parent_task_id: TaskId) -> Self {
+        self.parent_task_id = Some(parent_task_id);
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct WorkspaceRef {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sifs_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_policy: Option<String>,
+}
+
+impl WorkspaceRef {
+    pub fn local_path(path: impl Into<PathBuf>) -> Self {
+        let local_root = path.into();
+        Self {
+            id: local_root.display().to_string(),
+            local_root: Some(local_root),
+            sifs_root: None,
+            owner_node: None,
+            write_policy: Some("local".to_string()),
+        }
+    }
+
+    pub fn sifs(id: impl Into<String>, sifs_root: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            local_root: None,
+            sifs_root: Some(sifs_root.into()),
+            owner_node: None,
+            write_policy: None,
+        }
+    }
+
+    pub fn with_owner_node(mut self, owner_node: impl Into<String>) -> Self {
+        self.owner_node = Some(owner_node.into());
+        self
+    }
+
+    pub fn with_write_policy(mut self, write_policy: impl Into<String>) -> Self {
+        self.write_policy = Some(write_policy.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentPlacementMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_class: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub local_only: bool,
+}
+
+impl AgentPlacementMetadata {
+    pub fn local_current_process() -> Self {
+        Self {
+            origin_node: None,
+            target_node: None,
+            target_os: Some(std::env::consts::OS.to_string()),
+            target_arch: Some(std::env::consts::ARCH.to_string()),
+            sandbox_class: None,
+            local_only: true,
+        }
+    }
+
+    pub fn with_origin_node(mut self, origin_node: impl Into<String>) -> Self {
+        self.origin_node = Some(origin_node.into());
+        self
+    }
+
+    pub fn with_target_node(mut self, target_node: impl Into<String>) -> Self {
+        self.target_node = Some(target_node.into());
+        self
+    }
+
+    pub fn with_sandbox_class(mut self, sandbox_class: impl Into<String>) -> Self {
+        self.sandbox_class = Some(sandbox_class.into());
+        self
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentTraceRecord {
     pub record_id: TaskId,
@@ -253,8 +411,12 @@ pub enum AgentTraceRecordKind {
     RunStarted {
         provider: String,
         model: String,
+        role: AgentRole,
+        policy_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_steps: Option<usize>,
+        #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+        run_context: AgentRunContext,
     },
     ContextReport {
         report: ContextAssemblyReport,
@@ -559,6 +721,8 @@ pub struct TurnContext {
     pub provider: String,
     pub model: String,
     pub system_instructions: String,
+    #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+    pub run_context: AgentRunContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_projection: Option<AgentSessionProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1008,12 +1172,20 @@ impl ContextAssembler {
     ) -> Result<TurnContext, AgentError> {
         let system_instructions =
             render_agent_system_prompt_with_descriptors(&config.definition, &tool_descriptors);
-        let workspace_facts = serde_json::json!({
+        let mut workspace_facts = serde_json::json!({
             "session_id": input.session.session_id,
             "surface": input.session.surface,
             "latest_event_kind": input.latest_event.kind,
             "latest_event_id": input.latest_event.event_id,
         });
+        if !config.run_context.is_empty()
+            && let Some(object) = workspace_facts.as_object_mut()
+        {
+            object.insert(
+                "run_context".to_string(),
+                serde_json::json!(&config.run_context),
+            );
+        }
         let tool_schema_bytes = serde_json::to_vec(&tool_descriptors)
             .map(|bytes| bytes.len())
             .unwrap_or_default();
@@ -1199,6 +1371,7 @@ impl ContextAssembler {
             provider: config.provider.clone(),
             model: config.model.clone(),
             system_instructions,
+            run_context: config.run_context.clone(),
             session_projection,
             transcript_view: transcript.to_vec(),
             workspace_facts,
@@ -1940,6 +2113,8 @@ pub struct AgentConfig {
     pub max_model_repair_attempts: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+    pub run_context: AgentRunContext,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1969,6 +2144,7 @@ impl AgentConfig {
             max_tool_calls_per_step: None,
             max_model_repair_attempts: None,
             workspace_root: None,
+            run_context: AgentRunContext::default(),
             workspace_instruction_files: default_workspace_instruction_files(),
             prompt_reference_max_bytes: None,
             prompt_reference_max_entries: None,
@@ -2009,7 +2185,31 @@ impl AgentConfig {
     }
 
     pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
-        self.workspace_root = Some(workspace_root.into());
+        let workspace_root = workspace_root.into();
+        if self.run_context.workspace.is_none() {
+            self.run_context.workspace = Some(WorkspaceRef::local_path(workspace_root.clone()));
+        }
+        self.workspace_root = Some(workspace_root);
+        self
+    }
+
+    pub fn with_run_context(mut self, run_context: AgentRunContext) -> Self {
+        self.run_context = run_context;
+        self
+    }
+
+    pub fn with_task_ref(mut self, task: AgentTaskRef) -> Self {
+        self.run_context.task = Some(task);
+        self
+    }
+
+    pub fn with_workspace_ref(mut self, workspace: WorkspaceRef) -> Self {
+        self.run_context.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_placement(mut self, placement: AgentPlacementMetadata) -> Self {
+        self.run_context.placement = Some(placement);
         self
     }
 
@@ -2039,6 +2239,8 @@ fn default_workspace_instruction_files() -> Vec<PathBuf> {
 pub struct AgentRun {
     pub final_decision: AgentLoopDecision,
     pub stop_reason: AgentStopReason,
+    #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+    pub run_context: AgentRunContext,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transcript: Vec<AgentTranscriptItem>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2066,6 +2268,149 @@ pub enum AgentStopReason {
     SilentAsyncUpdate,
     MaxStepsReached,
     Aborted,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentOp {
+    pub op_id: TaskId,
+    pub action: AgentOpAction,
+}
+
+impl AgentOp {
+    pub fn new(action: AgentOpAction) -> Self {
+        Self {
+            op_id: TaskId::generate(),
+            action,
+        }
+    }
+
+    pub fn start_turn(input: AgentLoopInput) -> Self {
+        Self::new(AgentOpAction::StartTurn { input })
+    }
+
+    pub fn continue_turn(input: AgentLoopInput) -> Self {
+        Self::new(AgentOpAction::ContinueTurn { input })
+    }
+
+    pub fn steer(message: impl Into<String>) -> Self {
+        Self::new(AgentOpAction::Steer {
+            message: message.into(),
+        })
+    }
+
+    pub fn follow_up(message: impl Into<String>) -> Self {
+        Self::new(AgentOpAction::FollowUp {
+            message: message.into(),
+        })
+    }
+
+    pub fn compact(reason: impl Into<String>) -> Self {
+        Self::new(AgentOpAction::Compact {
+            reason: reason.into(),
+        })
+    }
+
+    pub fn abort(reason: impl Into<String>) -> Self {
+        Self::new(AgentOpAction::Abort {
+            reason: reason.into(),
+        })
+    }
+
+    pub fn snapshot() -> Self {
+        Self::new(AgentOpAction::Snapshot)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentOpAction {
+    StartTurn { input: AgentLoopInput },
+    ContinueTurn { input: AgentLoopInput },
+    Steer { message: String },
+    FollowUp { message: String },
+    Compact { reason: String },
+    Abort { reason: String },
+    Snapshot,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentOpOutcome {
+    pub op_id: TaskId,
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<AgentEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<AgentRun>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentEvent {
+    pub event_id: TaskId,
+    pub op_id: TaskId,
+    pub session_id: SessionId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub emitted_at: time::OffsetDateTime,
+    pub payload: AgentEventPayload,
+}
+
+impl AgentEvent {
+    pub fn new(op_id: TaskId, session_id: SessionId, payload: AgentEventPayload) -> Self {
+        Self {
+            event_id: TaskId::generate(),
+            op_id,
+            session_id,
+            emitted_at: time::OffsetDateTime::now_utc(),
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentEventPayload {
+    TurnStarted {
+        provider: String,
+        model: String,
+        role: AgentRole,
+        policy_id: String,
+        continuation: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_steps: Option<usize>,
+        #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+        run_context: AgentRunContext,
+    },
+    TurnCompleted {
+        stop_reason: AgentStopReason,
+        item_count: usize,
+        event_count: usize,
+        model_turn_count: usize,
+        tool_result_count: usize,
+        #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+        run_context: AgentRunContext,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        emitted_event_ids: Vec<EventId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_evidence_bundle_id: Option<TaskId>,
+    },
+    SteeringQueued {
+        steering: AgentSteeringMessage,
+    },
+    FollowUpQueued {
+        follow_up: AgentFollowUpMessage,
+    },
+    Compacted {
+        summary: AgentCompactionSummary,
+        item_count: usize,
+    },
+    Aborted {
+        abort: AgentAbortRecord,
+    },
+    Snapshot {
+        item_count: usize,
+        steering_count: usize,
+        follow_up_count: usize,
+        aborted: bool,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2432,6 +2777,119 @@ impl<M: InteractionModel> Agent<M> {
             })
     }
 
+    pub fn handle_op(
+        &self,
+        session: &mut AgentSession,
+        op: AgentOp,
+    ) -> Result<AgentOpOutcome, AgentError> {
+        let op_id = op.op_id;
+        let session_id = session.session_id.clone();
+        let mut events = Vec::new();
+        let mut run = None;
+
+        match op.action {
+            AgentOpAction::StartTurn { input } => {
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::TurnStarted {
+                        provider: self.config.provider.clone(),
+                        model: self.config.model.clone(),
+                        role: self.config.definition.role.clone(),
+                        policy_id: self.policy.policy_id.clone(),
+                        continuation: false,
+                        max_steps: self.config.max_steps,
+                        run_context: self.config.run_context.clone(),
+                    },
+                ));
+                let completed_run = self.start_turn(session, &input)?;
+                events.push(turn_completed_agent_event(
+                    &op_id,
+                    &session_id,
+                    &completed_run,
+                ));
+                run = Some(completed_run);
+            }
+            AgentOpAction::ContinueTurn { input } => {
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::TurnStarted {
+                        provider: self.config.provider.clone(),
+                        model: self.config.model.clone(),
+                        role: self.config.definition.role.clone(),
+                        policy_id: self.policy.policy_id.clone(),
+                        continuation: true,
+                        max_steps: self.config.max_steps,
+                        run_context: self.config.run_context.clone(),
+                    },
+                ));
+                let completed_run = self.continue_turn(session, &input)?;
+                events.push(turn_completed_agent_event(
+                    &op_id,
+                    &session_id,
+                    &completed_run,
+                ));
+                run = Some(completed_run);
+            }
+            AgentOpAction::Steer { message } => {
+                let steering = self.steer(session, message)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::SteeringQueued { steering },
+                ));
+            }
+            AgentOpAction::FollowUp { message } => {
+                let follow_up = self.follow_up(session, message)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::FollowUpQueued { follow_up },
+                ));
+            }
+            AgentOpAction::Compact { reason } => {
+                let summary = self.compact(session, reason)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::Compacted {
+                        summary,
+                        item_count: session.transcript.items.len(),
+                    },
+                ));
+            }
+            AgentOpAction::Abort { reason } => {
+                let abort = self.abort(session, reason)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::Aborted { abort },
+                ));
+            }
+            AgentOpAction::Snapshot => {
+                self.save_session(session)?;
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::Snapshot {
+                        item_count: session.transcript.items.len(),
+                        steering_count: session.steering_queue.len(),
+                        follow_up_count: session.follow_up_queue.len(),
+                        aborted: session.is_aborted(),
+                    },
+                ));
+            }
+        }
+
+        Ok(AgentOpOutcome {
+            op_id,
+            session_id,
+            events,
+            run,
+        })
+    }
+
     fn trace(
         &self,
         session_id: &SessionId,
@@ -2489,6 +2947,7 @@ impl<M: InteractionModel> Agent<M> {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
                 stop_reason: AgentStopReason::Aborted,
+                run_context: self.config.run_context.clone(),
                 transcript: Vec::new(),
                 model_turns: Vec::new(),
                 tool_results: Vec::new(),
@@ -2518,7 +2977,10 @@ impl<M: InteractionModel> Agent<M> {
             AgentSessionStoreRecordKind::TurnStarted {
                 provider: self.config.provider.clone(),
                 model: self.config.model.clone(),
+                role: self.config.definition.role.clone(),
+                policy_id: self.policy.policy_id.clone(),
                 max_steps: self.config.max_steps,
+                run_context: self.config.run_context.clone(),
             },
         )?;
         let run = self.run_with_session_context(
@@ -2677,6 +3139,7 @@ impl<M: InteractionModel> Agent<M> {
                     serde_json::json!({
                         "stop_reason": AgentStopReason::SilentAsyncUpdate,
                         "silent_async_update": input.async_update,
+                        "run_context": &self.config.run_context,
                     }),
                 ),
                 input,
@@ -2701,6 +3164,7 @@ impl<M: InteractionModel> Agent<M> {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
                 stop_reason: AgentStopReason::SilentAsyncUpdate,
+                run_context: self.config.run_context.clone(),
                 transcript: Vec::new(),
                 model_turns: Vec::new(),
                 tool_results: Vec::new(),
@@ -2718,7 +3182,10 @@ impl<M: InteractionModel> Agent<M> {
             AgentTraceRecordKind::RunStarted {
                 provider: self.config.provider.clone(),
                 model: self.config.model.clone(),
+                role: self.config.definition.role.clone(),
+                policy_id: self.policy.policy_id.clone(),
                 max_steps: self.config.max_steps,
+                run_context: self.config.run_context.clone(),
             },
         )?;
         let initial_input = render_initial_agent_input(input)?;
@@ -2770,8 +3237,11 @@ impl<M: InteractionModel> Agent<M> {
                 serde_json::json!({
                     "provider": self.config.provider,
                     "model": self.config.model,
+                    "role": self.config.definition.role,
+                    "policy_id": self.policy.policy_id,
                     "max_steps": self.config.max_steps,
                     "max_tool_calls_per_step": self.config.max_tool_calls_per_step,
+                    "run_context": &self.config.run_context,
                 }),
             ),
             input,
@@ -2908,6 +3378,7 @@ impl<M: InteractionModel> Agent<M> {
                     serde_json::json!({
                         "step_index": step_index,
                         "report": turn_context.report.clone(),
+                        "run_context": &turn_context.run_context,
                     }),
                 ),
                 input,
@@ -3252,6 +3723,7 @@ impl<M: InteractionModel> Agent<M> {
                     "model_turn_count": model_turns.len(),
                     "tool_result_count": tool_results.len(),
                     "final_response_mode": final_decision.response_mode,
+                    "run_context": &self.config.run_context,
                 }),
             ),
             input,
@@ -3277,6 +3749,7 @@ impl<M: InteractionModel> Agent<M> {
         Ok(AgentRun {
             final_decision,
             stop_reason,
+            run_context: self.config.run_context.clone(),
             transcript,
             model_turns,
             tool_results,
@@ -3425,6 +3898,7 @@ impl<M: InteractionModel> Agent<M> {
                 "context_report_id": turn_context.report.report_id,
                 "context_budget_estimate": turn_context.budget_estimate,
                 "agent_policy_id": self.policy.policy_id.clone(),
+                "run_context": &turn_context.run_context,
             }),
         })
     }
@@ -3780,6 +4254,7 @@ fn render_turn_context_message(
     serde_json::to_string_pretty(&serde_json::json!({
         "kind": "turn_context",
         "step_index": turn_context.report.step_index,
+        "run_context": &turn_context.run_context,
         "session_projection": turn_context.session_projection,
         "current_work": turn_context
             .session_projection
@@ -4369,6 +4844,42 @@ fn build_candidate_evidence_bundle(
     })
 }
 
+fn agent_session_event(
+    op_id: &TaskId,
+    session_id: &SessionId,
+    payload: AgentEventPayload,
+) -> AgentEvent {
+    AgentEvent::new(op_id.clone(), session_id.clone(), payload)
+}
+
+fn turn_completed_agent_event(
+    op_id: &TaskId,
+    session_id: &SessionId,
+    run: &AgentRun,
+) -> AgentEvent {
+    agent_session_event(
+        op_id,
+        session_id,
+        AgentEventPayload::TurnCompleted {
+            stop_reason: run.stop_reason.clone(),
+            item_count: run.items.len(),
+            event_count: run.events.len(),
+            model_turn_count: run.model_turns.len(),
+            tool_result_count: run.tool_results.len(),
+            run_context: run.run_context.clone(),
+            emitted_event_ids: run
+                .events
+                .iter()
+                .map(|event| event.event_id.clone())
+                .collect(),
+            candidate_evidence_bundle_id: run
+                .candidate_evidence_bundle
+                .as_ref()
+                .map(|bundle| bundle.bundle_id.clone()),
+        },
+    )
+}
+
 fn agent_event(
     session: &InteractionSession,
     kind: &str,
@@ -4665,6 +5176,99 @@ mod tests {
         assert_eq!(config.prompt_reference_max_entries, None);
         assert_eq!(config.context_budget.max_context_bytes, None);
         assert_eq!(config.context_budget.compaction_threshold_bytes(), None);
+    }
+
+    #[test]
+    fn agent_config_workspace_root_populates_local_workspace_ref() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-workspace-{}", TaskId::generate()));
+
+        let config = AgentConfig::new("fake", "fake").with_workspace_root(&root);
+
+        assert_eq!(config.workspace_root.as_deref(), Some(root.as_path()));
+        let workspace = config
+            .run_context
+            .workspace
+            .as_ref()
+            .expect("workspace ref");
+        assert_eq!(workspace.local_root.as_deref(), Some(root.as_path()));
+        assert_eq!(workspace.write_policy.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn agent_run_context_reaches_model_metadata_and_events() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-run-context-{}", TaskId::generate()));
+        fs::create_dir_all(&root).expect("workspace root");
+        let task = AgentTaskRef::new("coding", "fix run context propagation")
+            .with_owner_role(AgentRole::Deliberation);
+        let placement = AgentPlacementMetadata::local_current_process()
+            .with_origin_node("node.origin")
+            .with_sandbox_class("local-process");
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Context recorded.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let config = AgentConfig::new("fake", "fake")
+            .with_workspace_root(&root)
+            .with_task_ref(task.clone())
+            .with_placement(placement);
+        let agent = Agent::new(model, "fake", "fake").with_config(config);
+        let input = agent_input("record context");
+        let mut session =
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+
+        let outcome = agent
+            .handle_op(&mut session, AgentOp::start_turn(input))
+            .expect("op");
+        let run = outcome.run.as_ref().expect("run");
+
+        assert_eq!(
+            run.run_context.task.as_ref().map(|task| &task.task_id),
+            Some(&task.task_id)
+        );
+        assert!(matches!(
+            &outcome.events[0].payload,
+            AgentEventPayload::TurnStarted {
+                role: AgentRole::Deliberation,
+                policy_id,
+                run_context,
+                ..
+            } if policy_id == "deliberation-default"
+                && run_context.task.as_ref().map(|task| &task.task_id) == Some(&task.task_id)
+        ));
+        assert!(matches!(
+            &outcome.events[1].payload,
+            AgentEventPayload::TurnCompleted {
+                run_context,
+                emitted_event_ids,
+                ..
+            } if run_context.task.as_ref().map(|task| &task.task_id) == Some(&task.task_id)
+                && !emitted_event_ids.is_empty()
+        ));
+
+        let request = agent.model.requests.lock().expect("requests")[0].clone();
+        assert_eq!(request.metadata["run_context"]["task"]["kind"], "coding");
+        assert_eq!(
+            request.metadata["run_context"]["placement"]["origin_node"],
+            "node.origin"
+        );
+        let request_text = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_text.contains("\"run_context\""));
+        assert!(request_text.contains("fix run context propagation"));
+        assert!(request_text.contains("local-process"));
+        assert_eq!(
+            run.events[0].payload["run_context"]["task"]["kind"],
+            "coding"
+        );
     }
 
     #[test]
@@ -5240,7 +5844,10 @@ mod tests {
                 AgentTraceRecordKind::RunStarted {
                     provider: "fake".to_string(),
                     model: "fake".to_string(),
+                    role: AgentRole::Deliberation,
+                    policy_id: "test-policy".to_string(),
                     max_steps: Some(1),
+                    run_context: AgentRunContext::default(),
                 },
             ))
             .expect("append trace");
@@ -7773,6 +8380,117 @@ old
         assert_eq!(session.abort, Some(abort));
         let aborted_run = agent.continue_turn(&mut session, &input).expect("aborted");
         assert_eq!(aborted_run.stop_reason, AgentStopReason::Aborted);
+    }
+
+    #[test]
+    fn agent_op_surface_runs_turn_and_emits_lifecycle_events() {
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Done through op.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let agent = Agent::new(model, "fake", "fake");
+        let input = agent_input("hello through op");
+        let mut session =
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+
+        let outcome = agent
+            .handle_op(&mut session, AgentOp::start_turn(input))
+            .expect("op");
+
+        assert_eq!(outcome.session_id, session.session_id);
+        assert_eq!(outcome.events.len(), 2);
+        assert!(matches!(
+            &outcome.events[0].payload,
+            AgentEventPayload::TurnStarted {
+                provider,
+                model,
+                continuation: false,
+                ..
+            } if provider == "fake" && model == "fake"
+        ));
+        assert!(matches!(
+            &outcome.events[1].payload,
+            AgentEventPayload::TurnCompleted {
+                stop_reason: AgentStopReason::FinalDecision,
+                model_turn_count: 1,
+                tool_result_count: 0,
+                ..
+            }
+        ));
+        assert_eq!(
+            outcome.run.expect("run").final_decision.text,
+            "Done through op."
+        );
+        assert!(!session.transcript.items.is_empty());
+    }
+
+    #[test]
+    fn agent_op_surface_wraps_session_control_methods() {
+        let model = SequencedModel::new(Vec::<String>::new());
+        let agent = Agent::new(model, "fake", "fake");
+        let session_id = SessionId::from_legacy_named("sess_agent_ops").expect("session");
+        let mut session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "remember this before compacting".to_string(),
+            event_id: None,
+        });
+
+        let steering = agent
+            .handle_op(&mut session, AgentOp::steer("prefer precise output"))
+            .expect("steer");
+        assert!(matches!(
+            &steering.events[0].payload,
+            AgentEventPayload::SteeringQueued { steering }
+                if steering.message == "prefer precise output"
+        ));
+        assert_eq!(session.steering_queue.len(), 1);
+
+        let follow_up = agent
+            .handle_op(&mut session, AgentOp::follow_up("also mention tests"))
+            .expect("follow up");
+        assert!(matches!(
+            &follow_up.events[0].payload,
+            AgentEventPayload::FollowUpQueued { follow_up }
+                if follow_up.message == "also mention tests"
+        ));
+        assert_eq!(session.follow_up_queue.len(), 1);
+
+        let compaction = agent
+            .handle_op(&mut session, AgentOp::compact("op compaction"))
+            .expect("compact");
+        assert!(matches!(
+            &compaction.events[0].payload,
+            AgentEventPayload::Compacted { summary, item_count }
+                if summary.reason == "op compaction"
+                    && *item_count == session.transcript.items.len()
+        ));
+
+        let snapshot = agent
+            .handle_op(&mut session, AgentOp::snapshot())
+            .expect("snapshot");
+        assert!(matches!(
+            &snapshot.events[0].payload,
+            AgentEventPayload::Snapshot {
+                item_count,
+                steering_count: 1,
+                follow_up_count: 1,
+                aborted: false,
+            } if *item_count == session.transcript.items.len()
+        ));
+
+        let abort = agent
+            .handle_op(&mut session, AgentOp::abort("op abort"))
+            .expect("abort");
+        assert!(matches!(
+            &abort.events[0].payload,
+            AgentEventPayload::Aborted { abort } if abort.reason == "op abort"
+        ));
+        assert!(session.is_aborted());
     }
 
     #[test]

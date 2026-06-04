@@ -1,8 +1,8 @@
 use crate::TaskId;
 use crate::agent::{
-    AgentAbortRecord, AgentCompactionSummary, AgentFollowUpMessage, AgentItem, AgentSession,
-    AgentSessionProjection, AgentSteeringMessage, AgentStopReason, AgentStoragePaths,
-    agent_item_id,
+    AgentAbortRecord, AgentCompactionSummary, AgentFollowUpMessage, AgentItem, AgentRole,
+    AgentRunContext, AgentSession, AgentSessionProjection, AgentSteeringMessage, AgentStopReason,
+    AgentStoragePaths, agent_item_id,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::events::SessionId;
@@ -127,8 +127,12 @@ pub enum AgentSessionStoreRecordKind {
     TurnStarted {
         provider: String,
         model: String,
+        role: AgentRole,
+        policy_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_steps: Option<usize>,
+        #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+        run_context: AgentRunContext,
     },
     TurnCompleted {
         stop_reason: AgentStopReason,
