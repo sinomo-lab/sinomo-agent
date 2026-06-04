@@ -1287,10 +1287,7 @@ async fn send_iroh_daemon_control_request_async(
         };
     connection.close(0_u8.into(), b"done");
     close_iroh_endpoint(&endpoint).await;
-    let mut response = std::io::Cursor::new(response);
-    let response: crate::DaemonControlResponse =
-        crate::read_object_frame_blocking(&mut response, IROH_DAEMON_COMMAND_MAX_BYTES)?;
-    Ok(response)
+    decode_iroh_daemon_control_response_bytes(&response)
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -1298,6 +1295,38 @@ fn iroh_daemon_command_timeout_error(timeout: Duration) -> NetworkError {
     NetworkError::Io {
         operation: "send iroh daemon command".to_string(),
         detail: format!("timed out after {}ms", timeout.as_millis()),
+    }
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn decode_iroh_daemon_control_response_bytes(
+    response: &[u8],
+) -> Result<crate::DaemonControlResponse, NetworkError> {
+    let mut cursor = std::io::Cursor::new(response);
+    let decoded: crate::DaemonControlResponse =
+        crate::read_object_frame_blocking(&mut cursor, IROH_DAEMON_COMMAND_MAX_BYTES)
+            .map_err(iroh_daemon_response_frame_error)?;
+    let consumed = cursor.position() as usize;
+    if consumed != response.len() {
+        return Err(NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: format!(
+                "daemon returned {} trailing bytes after response frame",
+                response.len().saturating_sub(consumed)
+            ),
+        });
+    }
+    Ok(decoded)
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+fn iroh_daemon_response_frame_error(error: NetworkError) -> NetworkError {
+    match error {
+        NetworkError::Io { detail, .. } => NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail,
+        },
+        error => error,
     }
 }
 

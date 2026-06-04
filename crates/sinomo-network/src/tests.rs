@@ -859,6 +859,56 @@ fn iroh_daemon_proxy_error_route_hint_falls_back_for_unreadable_payload() {
 }
 
 #[test]
+fn iroh_daemon_response_decode_reports_remote_close_before_frame() {
+    let error = crate::roaming::decode_iroh_daemon_control_response_bytes(&[])
+        .expect_err("empty iroh response");
+
+    assert_eq!(
+        error,
+        NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+        }
+    );
+}
+
+#[test]
+fn iroh_daemon_response_decode_reports_partial_frame_body() {
+    let mut bytes = 8_u32.to_be_bytes().to_vec();
+    bytes.extend_from_slice(b"abc");
+
+    let error = crate::roaming::decode_iroh_daemon_control_response_bytes(&bytes)
+        .expect_err("partial iroh response body");
+
+    assert_eq!(
+        error,
+        NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed during object frame body: read 3 of 8 bytes".to_string(),
+        }
+    );
+}
+
+#[test]
+fn iroh_daemon_response_decode_rejects_trailing_bytes() {
+    let response = DaemonControlResponse::new("ok");
+    let mut bytes = Vec::new();
+    write_object_frame_blocking(&mut bytes, &response).expect("encode response frame");
+    bytes.extend_from_slice(b"junk");
+
+    let error = crate::roaming::decode_iroh_daemon_control_response_bytes(&bytes)
+        .expect_err("trailing response bytes");
+
+    assert_eq!(
+        error,
+        NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "daemon returned 4 trailing bytes after response frame".to_string(),
+        }
+    );
+}
+
+#[test]
 fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

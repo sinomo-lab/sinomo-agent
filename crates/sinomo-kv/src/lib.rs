@@ -2757,16 +2757,24 @@ impl ReplicatedKvNode {
     /// Loads persisted WAL entries on open. Entries beyond the installed snapshot
     /// are appended (and later applied) as normal; already-applied entries are kept
     /// in the log as a contiguous replication tail (not re-applied — they are
-    /// reflected in the snapshot/store). Any non-contiguous already-applied entry is
-    /// skipped, degrading safely to snapshot-based replication rather than corrupting
-    /// the log.
-    fn load_persisted_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<(), KvError> {
+    /// reflected in the snapshot/store). Any valid-but-non-contiguous record marks
+    /// the remaining WAL tail corrupt so open can rewrite the safe prefix instead
+    /// of bricking recovery on a `LogGap`.
+    fn load_persisted_entries(&mut self, entries: Vec<KvLogEntry>) -> bool {
+        let mut truncated = false;
         for entry in entries {
             if entry.index == 0 {
-                continue;
+                truncated = true;
+                break;
             }
             if entry.index > self.applied_index {
-                self.append_entries(vec![entry])?;
+                if let Err(error) = self.append_entries(vec![entry]) {
+                    eprintln!(
+                        "warning: truncating cluster kv WAL tail at invalid persisted record: {error}"
+                    );
+                    truncated = true;
+                    break;
+                }
                 continue;
             }
             if self
@@ -2782,10 +2790,13 @@ impl ReplicatedKvNode {
             };
             if contiguous {
                 self.log.push(entry);
+            } else {
+                truncated = true;
+                break;
             }
         }
         self.log.sort_by_key(|entry| entry.index);
-        Ok(())
+        truncated
     }
 
     fn append_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<Vec<KvLogEntry>, KvError> {
@@ -2915,6 +2926,12 @@ impl ReplicatedKvNode {
     }
 
     fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
+        let last_log_index = self.last_log_index();
+        if commit_index > last_log_index {
+            return Err(KvError::MissingCommittedEntry {
+                index: last_log_index.saturating_add(1),
+            });
+        }
         if commit_index <= self.applied_index {
             self.hard_state.commit_index = self.hard_state.commit_index.max(commit_index);
             return Ok(());
@@ -2925,6 +2942,20 @@ impl ReplicatedKvNode {
             .filter(|entry| entry.index > self.applied_index && entry.index <= commit_index)
             .cloned()
             .collect::<Vec<_>>();
+        let mut expected_index = self.applied_index.saturating_add(1);
+        for entry in &entries {
+            if entry.index != expected_index {
+                return Err(KvError::MissingCommittedEntry {
+                    index: expected_index,
+                });
+            }
+            expected_index = expected_index.saturating_add(1);
+        }
+        if expected_index != commit_index.saturating_add(1) {
+            return Err(KvError::MissingCommittedEntry {
+                index: expected_index,
+            });
+        }
         for entry in entries {
             let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
             if let Some(log_entry) = self
@@ -3052,10 +3083,25 @@ impl DurableRaftKvNode {
         )?;
         // Preserve the already-applied tail (kept by local_compact for incremental
         // replication) instead of discarding it as append_entries would.
-        node.load_persisted_entries(entries)?;
-        let commit_index = node.hard_state.commit_index.min(node.last_log_index());
+        let load_truncated = node.load_persisted_entries(entries);
+        let mut repaired_hard_state = false;
+        let max_committable_index = node.last_log_index();
+        if node.hard_state.commit_index > max_committable_index {
+            eprintln!(
+                "warning: repairing cluster kv hard-state commit index {} beyond local log {} in {}",
+                node.hard_state.commit_index,
+                max_committable_index,
+                paths.root.display()
+            );
+            node.hard_state.commit_index = max_committable_index;
+            repaired_hard_state = true;
+        }
+        let commit_index = node.hard_state.commit_index;
         node.commit_to(commit_index)?;
-        if truncated {
+        if repaired_hard_state {
+            write_object_file(&paths.hard_state, &node.hard_state)?;
+        }
+        if truncated || load_truncated {
             rewrite_wal_entries(&paths.wal, &node.log)?;
         }
         Ok(Self {
@@ -6724,6 +6770,109 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_rejects_commit_beyond_local_log() {
+        let root = temp_raft_root("sinomo-kv-commit-beyond-log");
+        let node_id = NodeId::from_legacy_named("node_commit_beyond_log").expect("node");
+        let paths = KvWalPaths::new(&root);
+
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            let error = node.commit_to(1).expect_err("missing log entry");
+            assert_eq!(error, KvError::MissingCommittedEntry { index: 1 });
+            assert_eq!(
+                node.hard_state().commit_index,
+                0,
+                "rejected commits must not advance in-memory hard state"
+            );
+        }
+
+        let reopened = DurableRaftKvNode::open(node_id, paths.clone()).expect("reopen");
+        assert_eq!(
+            reopened.hard_state().commit_index,
+            0,
+            "rejected commits must not persist impossible hard state"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_open_repairs_commit_index_beyond_local_log() {
+        let root = temp_raft_root("sinomo-kv-repair-commit-beyond-log");
+        let node_id = NodeId::from_legacy_named("node_repair_commit_beyond_log").expect("node");
+        let paths = KvWalPaths::new(&root);
+        write_object_file(
+            &paths.hard_state,
+            &RaftHardState {
+                commit_index: 7,
+                ..RaftHardState::default()
+            },
+        )
+        .expect("write impossible hard state");
+
+        {
+            let node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open repairs");
+            assert_eq!(
+                node.hard_state().commit_index,
+                0,
+                "open should clamp persisted commit index to the available local log"
+            );
+        }
+
+        assert_eq!(
+            paths
+                .read_persisted_hard_state()
+                .expect("read repaired hard state")
+                .commit_index,
+            0,
+            "repair should be durable so the next open stays cheap"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn replicated_node_commit_gap_does_not_partially_apply() {
+        let mut node = ReplicatedKvNode {
+            store: InProcessKvStore::new(),
+            log: vec![
+                KvLogEntry {
+                    index: 1,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/gap/one".to_string(),
+                        value: b"one".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+                KvLogEntry {
+                    index: 3,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/gap/three".to_string(),
+                        value: b"three".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+            ],
+            hard_state: RaftHardState::default(),
+            applied_index: 0,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            txn_responses: BTreeMap::new(),
+        };
+
+        let error = node.commit_to(3).expect_err("missing middle entry");
+
+        assert_eq!(error, KvError::MissingCommittedEntry { index: 2 });
+        assert_eq!(node.applied_index, 0);
+        assert_eq!(node.hard_state.commit_index, 0);
+        assert_eq!(node.store.revision(), KvRevision::ZERO);
+        assert!(node.store.get("/gap/one").is_none());
+        assert!(node.store.get("/gap/three").is_none());
+    }
+
+    #[test]
     fn durable_raft_discard_uncommitted_tail_keeps_committed_prefix() {
         let root = temp_raft_root("sinomo-kv-discard-uncommitted-tail");
         let node_id = NodeId::from_legacy_named("node_discard_uncommitted_tail").expect("node");
@@ -7320,6 +7469,75 @@ mod tests {
                 .is_some_and(|entry| entry.index > overgrown_log[0].index),
             "repaired WAL should start after the redundant pre-retention records"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_open_repairs_gapped_valid_wal_tail() {
+        let root = temp_raft_root("sinomo-kv-gapped-valid-wal");
+        let node_id = NodeId::from_legacy_named("node_gapped_valid_wal").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+            let first = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/gap/one".to_string(),
+                        value: b"one".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append first");
+            node.commit_to(first.index).expect("commit first");
+        }
+        {
+            let mut wal = OpenOptions::new()
+                .append(true)
+                .open(&paths.wal)
+                .expect("open wal");
+            write_wal_record(
+                &mut wal,
+                &KvLogEntry {
+                    index: 3,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/gap/three".to_string(),
+                        value: b"three".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+                &paths.wal,
+            )
+            .expect("write gapped valid tail");
+            wal.sync_data().expect("sync gapped tail");
+        }
+
+        let recovered = DurableRaftKvNode::open(node_id, paths.clone()).expect("recover node");
+        assert_eq!(
+            recovered.store().get("/gap/one").expect("kept").value,
+            b"one"
+        );
+        assert!(
+            recovered.store().get("/gap/three").is_none(),
+            "gapped valid WAL tail must not be applied"
+        );
+        assert_eq!(recovered.hard_state().commit_index, 1);
+        drop(recovered);
+
+        let repaired = read_wal_entries(&paths.wal, None, 0).expect("read repaired wal");
+        assert_eq!(
+            repaired
+                .entries
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "WAL rewrite should keep only the contiguous safe prefix"
+        );
+        assert!(!repaired.truncated);
         std::fs::remove_dir_all(root).ok();
     }
 
