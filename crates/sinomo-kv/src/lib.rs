@@ -3173,7 +3173,7 @@ fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError
     })
 }
 
-fn write_wal_record(file: &mut File, entry: &KvLogEntry, path: &Path) -> Result<(), KvError> {
+fn encode_wal_record(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {
     let record = sinomo_object_serde::to_bytes(entry, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
         .map_err(|source| KvError::Serialization {
             detail: source.to_string(),
@@ -3181,17 +3181,50 @@ fn write_wal_record(file: &mut File, entry: &KvLogEntry, path: &Path) -> Result<
     let record_len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
         detail: format!("wal record for {} exceeds u32 length", path.display()),
     })?;
-    file.write_all(&record_len.to_be_bytes())
-        .and_then(|()| file.write_all(&record))
-        .map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
+    let mut encoded = Vec::with_capacity(record.len().saturating_add(4));
+    encoded.extend_from_slice(&record_len.to_be_bytes());
+    encoded.extend_from_slice(&record);
+    Ok(encoded)
+}
+
+fn write_wal_record(file: &mut File, entry: &KvLogEntry, path: &Path) -> Result<(), KvError> {
+    let record = encode_wal_record(entry, path)?;
+    file.write_all(&record).map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+fn wal_file_matches_entries(path: &Path, entries: &[KvLogEntry]) -> Result<bool, KvError> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(entries.is_empty());
+        }
+        Err(_) => return Ok(false),
+    };
+    if file.lock_shared().is_err() {
+        return Ok(false);
+    }
+
+    for entry in entries {
+        let expected = encode_wal_record(entry, path)?;
+        let mut existing = vec![0_u8; expected.len()];
+        if file.read_exact(&mut existing).is_err() || existing != expected {
+            return Ok(false);
+        }
+    }
+
+    let mut extra = [0_u8; 1];
+    Ok(matches!(file.read(&mut extra), Ok(0)))
 }
 
 fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
     // Callers hold the per-node raft lock. Stage through a temp file instead of
     // truncating the live WAL so a failed rewrite leaves the previous log intact.
+    if wal_file_matches_entries(path, entries)? {
+        return Ok(());
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| KvError::Io {
             path: parent.display().to_string(),
@@ -5724,6 +5757,42 @@ mod tests {
         assert_eq!(node.store().get("/config/a").expect("a").value, b"one");
         assert_eq!(node.store().get("/config/b").expect("b").value, b"two");
         assert_eq!(node.hard_state().commit_index, 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_save_snapshot_skips_identical_wal_tail_rewrite() {
+        let root = temp_raft_root("sinomo-kv-snapshot-no-wal-rewrite");
+        let node_id = NodeId::from_legacy_named("node_snapshot_no_wal_rewrite").expect("node");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/snapshot/no-rewrite".to_string(),
+                        value: b"value".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append");
+            node.commit_to(entry.index).expect("commit");
+            node.save_snapshot().expect("initial snapshot");
+
+            let before = fs::metadata(&paths.wal).expect("wal metadata before");
+            thread::sleep(Duration::from_millis(20));
+            node.save_snapshot().expect("unchanged snapshot");
+            let after = fs::metadata(&paths.wal).expect("wal metadata after");
+
+            assert_eq!(before.len(), after.len());
+            assert_eq!(file_ino(&before), file_ino(&after));
+            assert_eq!(
+                before.modified().ok(),
+                after.modified().ok(),
+                "unchanged snapshot compaction should not rewrite an identical WAL tail"
+            );
+        }
         std::fs::remove_dir_all(root).ok();
     }
 

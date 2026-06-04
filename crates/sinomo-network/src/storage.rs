@@ -1706,6 +1706,21 @@ pub fn append_cluster_raft_command_with_response(
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
     let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
+    if let KvCommand::Txn(txn) = &command
+        && txn.compares.is_empty()
+        && txn.success.is_empty()
+        && txn.failure.is_empty()
+    {
+        let snapshot = node.store().snapshot();
+        return Ok((
+            snapshot.clone(),
+            Some(KvTxnResponse {
+                succeeded: true,
+                revision: snapshot.revision,
+                responses: Vec::new(),
+            }),
+        ));
+    }
     let before_revision = node.store().revision();
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
@@ -4284,17 +4299,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    let mut success = vec![KvOp::DeletePrefix {
-        prefix: cluster_connectivity_source_prefix(source_node_id),
-    }];
-    for record in records {
-        let key = cluster_connectivity_key(
-            &record.source_node_id,
-            &record.target_node_id,
-            &record.endpoint_id,
-        );
-        success.push(KvOp::put_serde(key, &record, None)?);
-    }
+    let success = cluster_connectivity_full_sync_ops(paths, source_node_id, &records)?;
     append_cluster_raft_command(
         paths,
         &state.local_node_id,
@@ -4399,6 +4404,47 @@ pub fn cluster_connectivity_sync_ops(
     }
 
     let mut ops = Vec::new();
+    for (key, record) in incoming {
+        if existing.get(&key).is_some_and(|existing| {
+            cluster_connectivity_stable_eq(existing, record)
+                && !cluster_network_record_should_refresh(existing.expires_at, now)
+        }) {
+            continue;
+        }
+        ops.push(KvOp::put_serde(key, record, None)?);
+    }
+    Ok(ops)
+}
+
+fn cluster_connectivity_full_sync_ops(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<Vec<KvOp>, NetworkError> {
+    let store = read_cluster_kv_snapshot_store(paths)?;
+    let now = OffsetDateTime::now_utc();
+    let mut incoming = BTreeMap::new();
+    for record in records {
+        let key = cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        incoming.insert(key, record);
+    }
+
+    let mut existing = BTreeMap::new();
+    let mut ops = Vec::new();
+    for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
+        if !incoming.contains_key(&entry.key) {
+            ops.push(KvOp::Delete { key: entry.key });
+            continue;
+        }
+        if let Ok(record) = entry.decode::<ClusterConnectivityRecord>() {
+            existing.insert(entry.key, record);
+        }
+    }
+
     for (key, record) in incoming {
         if existing.get(&key).is_some_and(|existing| {
             cluster_connectivity_stable_eq(existing, record)

@@ -257,6 +257,29 @@ fn async_daemon_rpc_client_rejects_non_rpc_response() {
 }
 
 #[test]
+fn daemon_rpc_response_helper_rejects_framed_rpc_errors() {
+    let response = DaemonControlResponse::rpc(
+        String::new(),
+        ObjectRpcResponse::encode_error("/test/error", "proxy failed").expect("rpc error"),
+    );
+
+    let error = crate::roaming::daemon_rpc_response_from_control_response(response, "not rpc")
+        .expect_err("rpc error");
+    assert!(error.to_string().contains("proxy failed"));
+}
+
+#[test]
+fn daemon_rpc_deadline_remaining_shrinks_across_phases() {
+    let deadline = crate::roaming::DaemonRpcDeadline::new(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(20));
+
+    assert!(
+        deadline.remaining() < Duration::from_millis(80),
+        "daemon RPC deadline should be shared across connect/write/read phases"
+    );
+}
+
+#[test]
 fn lan_ip_filter_rejects_non_invitable_addresses() {
     assert!(!is_invitable_ip("127.0.0.1".parse().expect("loopback")));
     assert!(!is_invitable_ip("0.0.0.0".parse().expect("unspecified")));
@@ -703,6 +726,47 @@ fn iroh_daemon_proxy_byte_budget_releases_permits() {
 }
 
 #[test]
+fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
+    let request =
+        ObjectRpcRequest::encode_body("/test/proxy-error", "test", &()).expect("rpc request");
+    let control = DaemonControlRequest::rpc("RPC /test/proxy-error", request);
+    let mut payload = Vec::new();
+    write_object_frame_blocking(&mut payload, &control).expect("control frame");
+
+    let route = crate::roaming::iroh_proxy_route_hint(&payload);
+    assert_eq!(route, "/test/proxy-error");
+
+    let budget = crate::roaming::IrohProxyByteBudget::new(4096);
+    let (frame, permit) = crate::roaming::encode_iroh_proxy_error_response_frame(
+        &budget,
+        route,
+        "daemon forward failed",
+    )
+    .expect("error response frame");
+    assert_eq!(budget.in_flight_bytes(), frame.len());
+
+    let mut cursor = std::io::Cursor::new(frame);
+    let response: DaemonControlResponse =
+        read_object_frame_blocking(&mut cursor, IROH_DAEMON_COMMAND_MAX_BYTES)
+            .expect("decode control response");
+    let rpc = response.rpc.expect("rpc response");
+    assert_eq!(rpc.route, "/test/proxy-error");
+    let error = rpc.error_detail().expect_err("rpc error detail");
+    assert!(error.to_string().contains("daemon forward failed"));
+
+    drop(permit);
+    assert_eq!(budget.in_flight_bytes(), 0);
+}
+
+#[test]
+fn iroh_daemon_proxy_error_route_hint_falls_back_for_unreadable_payload() {
+    assert_eq!(
+        crate::roaming::iroh_proxy_route_hint(b"not-a-control-frame"),
+        crate::roaming::IROH_DAEMON_PROXY_ERROR_ROUTE
+    );
+}
+
+#[test]
 fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -986,6 +1050,15 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
         cluster_connectivity_sync_is_noop(&paths, &node_a, std::slice::from_ref(&healthy(later)))
             .expect("noop check"),
         "stable record should be a no-op"
+    );
+    let wal_path = cluster_raft_wal_paths(&paths, &node_a).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![healthy(later)])
+        .expect("sync stable connectivity");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "stable connectivity refreshes should not append no-op raft entries"
     );
 
     // A changed state is not a no-op.
@@ -2011,6 +2084,26 @@ fn public_ip_discovery_cache_reuses_recent_result() {
 }
 
 #[test]
+fn public_ip_dns_worker_limit_releases_permits() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    let permits = (0..crate::lan::MAX_PUBLIC_IP_DNS_WORKERS)
+        .map(|_| crate::lan::try_acquire_public_ip_dns_worker().expect("dns worker permit"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        crate::lan::try_acquire_public_ip_dns_worker().is_none(),
+        "public IP discovery should not spawn unbounded DNS timeout workers"
+    );
+
+    drop(permits);
+    let replacement =
+        crate::lan::try_acquire_public_ip_dns_worker().expect("released dns worker permit");
+    drop(replacement);
+}
+
+#[test]
 fn public_endpoint_reachability_cache_reuses_recent_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
@@ -2177,6 +2270,61 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
     assert_eq!(
         std::fs::read(&paths.kv_snapshot).expect("read snapshot"),
         b"sentinel snapshot"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-empty-txn-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_empty_txn_no_append").expect("node");
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed value");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: Vec::new(),
+            failure: Vec::new(),
+        }),
+    )
+    .expect("empty txn");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(
+        txn_response,
+        Some(KvTxnResponse {
+            succeeded: true,
+            revision: snapshot.revision,
+            responses: Vec::new(),
+        })
+    );
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "empty transactions should not consume WAL writes"
     );
     std::fs::remove_dir_all(root).ok();
 }

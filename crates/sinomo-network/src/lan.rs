@@ -2,17 +2,49 @@ use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::peer::{NetworkFrame, PeerEndpointCandidate};
 use crate::prelude::*;
-use std::sync::LazyLock;
+use std::sync::{
+    LazyLock,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Instant;
 
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
+pub(crate) const MAX_PUBLIC_IP_DNS_WORKERS: usize = 2;
 static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<PublicIpDiscoveryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
+static PUBLIC_IP_DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
 struct PublicIpDiscoveryCacheEntry {
     checked_at: Instant,
     candidates: Vec<IpAddr>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PublicIpDnsWorkerPermit;
+
+impl Drop for PublicIpDnsWorkerPermit {
+    fn drop(&mut self) {
+        PUBLIC_IP_DNS_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn try_acquire_public_ip_dns_worker() -> Option<PublicIpDnsWorkerPermit> {
+    let mut current = PUBLIC_IP_DNS_WORKERS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_PUBLIC_IP_DNS_WORKERS {
+            return None;
+        }
+        match PUBLIC_IP_DNS_WORKERS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(PublicIpDnsWorkerPermit),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -191,9 +223,11 @@ pub fn discover_public_ip_candidates_from_hosts(hosts: &[(&str, &str)]) -> Vec<I
 }
 
 fn resolve_public_ip_service_address(host: &str, timeout: Duration) -> Option<SocketAddr> {
+    let permit = try_acquire_public_ip_dns_worker()?;
     let host = host.to_string();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        let _permit = permit;
         let address = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 80))
             .ok()
             .and_then(|mut addresses| addresses.next());
