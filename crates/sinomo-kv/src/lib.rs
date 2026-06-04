@@ -28,6 +28,10 @@ const MAX_RETAINED_EVENTS: usize = 4096;
 const MAX_PENDING_EVENTS_PER_WATCH: usize = MAX_RETAINED_EVENTS;
 const MAX_ACTIVE_WATCHES: usize = 1024;
 const MAX_ACTIVE_LEASES: usize = 4096;
+const MAX_TXN_COMPARES: usize = 1024;
+const MAX_TXN_OPS_PER_BRANCH: usize = 4096;
+pub const MAX_KV_VALUE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_KV_COMMAND_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// Committed log entries kept in memory after a local snapshot compaction. A
 /// follower that has fallen at most this many entries behind can be caught up
 /// with small incremental appends instead of a full snapshot install. The tail is
@@ -275,6 +279,89 @@ impl KvOp {
             value: encode_kv_value(value)?,
             lease_id,
         })
+    }
+}
+
+fn validate_kv_value_len(actual_bytes: usize) -> Result<(), KvError> {
+    if actual_bytes > MAX_KV_VALUE_BYTES {
+        return Err(KvError::ValueTooLarge {
+            actual_bytes,
+            max_bytes: MAX_KV_VALUE_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_kv_op_payload(op: &KvOp) -> Result<(), KvError> {
+    if let KvOp::Put { value, .. } = op {
+        validate_kv_value_len(value.len())?;
+    }
+    Ok(())
+}
+
+fn kv_op_payload_bytes(op: &KvOp) -> usize {
+    match op {
+        KvOp::Put { key, value, .. } => key.len().saturating_add(value.len()),
+        KvOp::Delete { key } => key.len(),
+        KvOp::DeletePrefix { prefix } => prefix.len(),
+        KvOp::LeaseGrant { .. } | KvOp::LeaseKeepAlive { .. } | KvOp::LeaseRevoke { .. } => 0,
+    }
+}
+
+fn kv_compare_payload_bytes(compare: &KvCompare) -> usize {
+    match compare {
+        KvCompare::Exists { key }
+        | KvCompare::Missing { key }
+        | KvCompare::VersionEquals { key, .. }
+        | KvCompare::CreateRevisionEquals { key, .. }
+        | KvCompare::ModifyRevisionEquals { key, .. }
+        | KvCompare::LeaseEquals { key, .. } => key.len(),
+        KvCompare::ValueEquals { key, value } => key.len().saturating_add(value.len()),
+    }
+}
+
+fn validate_kv_compare_payload(compare: &KvCompare) -> Result<(), KvError> {
+    if let KvCompare::ValueEquals { value, .. } = compare {
+        validate_kv_value_len(value.len())?;
+    }
+    Ok(())
+}
+
+fn validate_kv_payload_total(actual_bytes: usize) -> Result<(), KvError> {
+    if actual_bytes > MAX_KV_COMMAND_PAYLOAD_BYTES {
+        return Err(KvError::CommandPayloadTooLarge {
+            actual_bytes,
+            max_bytes: MAX_KV_COMMAND_PAYLOAD_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_kv_txn_payload(txn: &KvTxn) -> Result<(), KvError> {
+    let mut payload_bytes = 0_usize;
+    for compare in &txn.compares {
+        validate_kv_compare_payload(compare)?;
+        payload_bytes = payload_bytes.saturating_add(kv_compare_payload_bytes(compare));
+    }
+    for op in txn.success.iter().chain(txn.failure.iter()) {
+        validate_kv_op_payload(op)?;
+        payload_bytes = payload_bytes.saturating_add(kv_op_payload_bytes(op));
+    }
+    validate_kv_payload_total(payload_bytes)
+}
+
+fn validate_kv_command_payload(command: &KvCommand) -> Result<(), KvError> {
+    match command {
+        KvCommand::Op(op) => {
+            validate_kv_op_payload(op)?;
+            validate_kv_payload_total(kv_op_payload_bytes(op))
+        }
+        KvCommand::Txn(txn) => validate_kv_txn_payload(txn),
+        KvCommand::PutClusterMember(member) => {
+            let op = KvOp::put_serde(cluster_member_key(&member.node_id), member, None)?;
+            validate_kv_op_payload(&op)?;
+            validate_kv_payload_total(kv_op_payload_bytes(&op))
+        }
     }
 }
 
@@ -804,6 +891,16 @@ impl KvLocalCache {
         Ok(self.current_store(node_id)?.range_prefix(prefix))
     }
 
+    pub fn current_range_prefix_limited(
+        &self,
+        node_id: NodeId,
+        prefix: &str,
+        max_entries: usize,
+    ) -> Result<Vec<KvEntry>, KvError> {
+        self.current_store(node_id)?
+            .range_prefix_limited(prefix, max_entries)
+    }
+
     pub fn current_range_prefix_serde<T: DeserializeOwned>(
         &self,
         node_id: NodeId,
@@ -937,11 +1034,35 @@ impl InProcessKvStore {
     }
 
     pub fn range_prefix(&self, prefix: &str) -> Vec<KvEntry> {
-        self.entries
-            .iter()
-            .filter(|(key, _)| key.starts_with(prefix))
-            .map(|(_, entry)| entry.clone())
-            .collect()
+        let mut entries = Vec::new();
+        for (key, entry) in self.entries.range(prefix.to_string()..) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            entries.push(entry.clone());
+        }
+        entries
+    }
+
+    pub fn range_prefix_limited(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+    ) -> Result<Vec<KvEntry>, KvError> {
+        let mut entries = Vec::new();
+        for (key, entry) in self.entries.range(prefix.to_string()..) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if entries.len() >= max_entries {
+                return Err(KvError::RangeLimit {
+                    prefix: prefix.to_string(),
+                    max_entries,
+                });
+            }
+            entries.push(entry.clone());
+        }
+        Ok(entries)
     }
 
     pub fn put(
@@ -987,20 +1108,19 @@ impl InProcessKvStore {
     }
 
     pub fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        self.validate_txn_shape(&txn)?;
+        validate_kv_txn_payload(&txn)?;
         let succeeded = txn.compares.iter().all(|compare| self.compare(compare));
         let ops = if succeeded { txn.success } else { txn.failure };
         self.validate_ops(&ops)?;
-        let mut staged = self.clone();
         let mut responses = Vec::with_capacity(ops.len());
-        let mut revision = staged.revision;
+        let mut revision = self.revision;
 
         for op in ops {
-            let response = staged.apply_op(op)?;
-            revision = staged.revision;
+            let response = self.apply_op(op)?;
+            revision = self.revision;
             responses.push(response);
         }
-
-        *self = staged;
         Ok(KvTxnResponse {
             succeeded,
             revision,
@@ -1017,6 +1137,7 @@ impl InProcessKvStore {
         &mut self,
         command: KvCommand,
     ) -> Result<(KvRevision, Option<KvTxnResponse>), KvError> {
+        validate_kv_command_payload(&command)?;
         match command {
             KvCommand::Op(op) => {
                 self.apply_op(op)?;
@@ -1238,10 +1359,68 @@ impl InProcessKvStore {
         }
     }
 
+    fn validate_txn_shape(&self, txn: &KvTxn) -> Result<(), KvError> {
+        if txn.compares.len() > MAX_TXN_COMPARES
+            || txn.success.len() > MAX_TXN_OPS_PER_BRANCH
+            || txn.failure.len() > MAX_TXN_OPS_PER_BRANCH
+        {
+            return Err(KvError::TxnLimit {
+                compares: txn.compares.len(),
+                success_ops: txn.success.len(),
+                failure_ops: txn.failure.len(),
+                max_compares: MAX_TXN_COMPARES,
+                max_ops_per_branch: MAX_TXN_OPS_PER_BRANCH,
+            });
+        }
+        Ok(())
+    }
+
     fn validate_ops(&self, ops: &[KvOp]) -> Result<(), KvError> {
-        let mut staged = self.clone();
+        let mut active_leases = self.leases.keys().copied().collect::<BTreeSet<_>>();
         for op in ops {
-            staged.apply_op(op.clone())?;
+            validate_kv_op_payload(op)?;
+            match op {
+                KvOp::Put {
+                    lease_id: Some(lease_id),
+                    ..
+                } => {
+                    if !active_leases.contains(lease_id) {
+                        return Err(KvError::UnknownLease {
+                            lease_id: *lease_id,
+                        });
+                    }
+                }
+                KvOp::Put { lease_id: None, .. }
+                | KvOp::Delete { .. }
+                | KvOp::DeletePrefix { .. } => {}
+                KvOp::LeaseGrant {
+                    lease_id,
+                    ttl_ticks,
+                } => {
+                    if *ttl_ticks == 0 {
+                        return Err(KvError::InvalidLeaseTtl {
+                            ttl_ticks: *ttl_ticks,
+                        });
+                    }
+                    if !active_leases.contains(lease_id) && active_leases.len() >= MAX_ACTIVE_LEASES
+                    {
+                        return Err(KvError::LeaseLimit {
+                            max: MAX_ACTIVE_LEASES,
+                        });
+                    }
+                    active_leases.insert(*lease_id);
+                }
+                KvOp::LeaseKeepAlive { lease_id } => {
+                    if !active_leases.contains(lease_id) {
+                        return Err(KvError::UnknownLease {
+                            lease_id: *lease_id,
+                        });
+                    }
+                }
+                KvOp::LeaseRevoke { lease_id } => {
+                    active_leases.remove(lease_id);
+                }
+            }
         }
         Ok(())
     }
@@ -1252,6 +1431,7 @@ impl InProcessKvStore {
         value: Vec<u8>,
         lease_id: Option<LeaseId>,
     ) -> Result<KvOpResponse, KvError> {
+        validate_kv_value_len(value.len())?;
         if let Some(lease_id) = lease_id {
             if !self.leases.contains_key(&lease_id) {
                 return Err(KvError::UnknownLease { lease_id });
@@ -1312,12 +1492,7 @@ impl InProcessKvStore {
     }
 
     fn apply_delete_prefix(&mut self, prefix: String) -> Result<KvOpResponse, KvError> {
-        let keys: Vec<String> = self
-            .entries
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .cloned()
-            .collect();
+        let keys = self.keys_with_prefix(&prefix);
         let deleted_count = keys.len();
         for key in keys {
             self.apply_delete(key)?;
@@ -1326,6 +1501,17 @@ impl InProcessKvStore {
             prefix,
             deleted_count,
         })
+    }
+
+    fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        for key in self.entries.range(prefix.to_string()..).map(|(key, _)| key) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            keys.push(key.clone());
+        }
+        keys
     }
 
     fn compare(&self, compare: &KvCompare) -> bool {
@@ -1576,7 +1762,7 @@ impl InProcessRaftKvCluster {
     }
 
     pub fn txn_response(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        let outcome = self.propose_command(KvCommand::Txn(txn.clone()))?;
+        let outcome = self.propose_command(KvCommand::Txn(txn))?;
         Ok(outcome.txn_response.unwrap_or_else(|| KvTxnResponse {
             succeeded: true,
             revision: outcome.revision,
@@ -1984,6 +2170,7 @@ impl ReplicatedKvNode {
     fn append_entries(&mut self, entries: Vec<KvLogEntry>) -> Result<Vec<KvLogEntry>, KvError> {
         let mut appended = Vec::new();
         for entry in entries {
+            validate_kv_command_payload(&entry.command)?;
             if entry.index <= self.applied_index {
                 continue;
             }
@@ -2971,12 +3158,34 @@ pub enum KvError {
     InvalidLeaseTtl { ttl_ticks: u64 },
     #[error("too many active leases: max {max}")]
     LeaseLimit { max: usize },
+    #[error(
+        "transaction is too large: {compares} compares, {success_ops} success ops, {failure_ops} failure ops; max is {max_compares} compares and {max_ops_per_branch} ops per branch"
+    )]
+    TxnLimit {
+        compares: usize,
+        success_ops: usize,
+        failure_ops: usize,
+        max_compares: usize,
+        max_ops_per_branch: usize,
+    },
     #[error("unknown watch: {watch_id:?}")]
     UnknownWatch { watch_id: WatchId },
     #[error("too many active watches: max {max}")]
     WatchLimit { max: usize },
     #[error("watch id space exhausted")]
     WatchIdExhausted,
+    #[error("range for prefix {prefix} exceeded max {max_entries} entries")]
+    RangeLimit { prefix: String, max_entries: usize },
+    #[error("kv value is {actual_bytes} bytes; max is {max_bytes}")]
+    ValueTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("kv command payload is {actual_bytes} bytes; max is {max_bytes}")]
+    CommandPayloadTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error("serialization error: {detail}")]
     Serialization { detail: String },
     #[error("filesystem error at {path}: {detail}")]
@@ -3124,6 +3333,211 @@ mod tests {
     }
 
     #[test]
+    fn range_prefix_uses_ordered_bounds_and_enforces_limit() {
+        let mut store = InProcessKvStore::new();
+        for key in [
+            "/apps/service/a",
+            "/apps/service/b",
+            "/apps/servicez/not-a-child",
+            "/apps/servicf/not-a-child",
+            "/other/service/c",
+        ] {
+            store.put(key, key.as_bytes().to_vec(), None).expect("put");
+        }
+
+        let entries = store.range_prefix("/apps/service/");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/apps/service/a", "/apps/service/b"]
+        );
+
+        let error = store
+            .range_prefix_limited("/apps/service/", 1)
+            .expect_err("range limit");
+        assert_eq!(
+            error,
+            KvError::RangeLimit {
+                prefix: "/apps/service/".to_string(),
+                max_entries: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn put_rejects_values_larger_than_metadata_limit() {
+        let mut store = InProcessKvStore::new();
+        let error = store
+            .put("/large/value", vec![0_u8; MAX_KV_VALUE_BYTES + 1], None)
+            .expect_err("value limit");
+
+        assert_eq!(
+            error,
+            KvError::ValueTooLarge {
+                actual_bytes: MAX_KV_VALUE_BYTES + 1,
+                max_bytes: MAX_KV_VALUE_BYTES,
+            }
+        );
+        assert!(store.get("/large/value").is_none());
+        assert_eq!(store.revision(), KvRevision::ZERO);
+    }
+
+    #[test]
+    fn txn_rejects_large_values_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: "/large/value".to_string(),
+                        value: vec![0_u8; MAX_KV_VALUE_BYTES + 1],
+                        lease_id: None,
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("value limit aborts txn");
+
+        assert_eq!(
+            error,
+            KvError::ValueTooLarge {
+                actual_bytes: MAX_KV_VALUE_BYTES + 1,
+                max_bytes: MAX_KV_VALUE_BYTES,
+            }
+        );
+        assert_eq!(
+            store.get("/config/a").expect("existing value").value,
+            b"old"
+        );
+        assert!(store.get("/large/value").is_none());
+        assert_eq!(store.revision(), KvRevision(1));
+    }
+
+    #[test]
+    fn txn_rejects_aggregate_payload_over_command_budget() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let first_value = vec![0_u8; MAX_KV_VALUE_BYTES];
+        let second_value = vec![0_u8; MAX_KV_VALUE_BYTES];
+        let expected_bytes =
+            first_value.len() + second_value.len() + "/payload/one".len() + "/payload/two".len();
+
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/payload/one".to_string(),
+                        value: first_value,
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: "/payload/two".to_string(),
+                        value: second_value,
+                        lease_id: None,
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("aggregate payload limit");
+
+        assert_eq!(
+            error,
+            KvError::CommandPayloadTooLarge {
+                actual_bytes: expected_bytes,
+                max_bytes: MAX_KV_COMMAND_PAYLOAD_BYTES,
+            }
+        );
+        assert!(store.get("/payload/one").is_none());
+        assert!(store.get("/payload/two").is_none());
+        assert_eq!(
+            store.get("/config/a").expect("existing value").value,
+            b"old"
+        );
+        assert_eq!(store.revision(), KvRevision(1));
+    }
+
+    #[test]
+    fn txn_rejects_large_compare_payloads() {
+        let mut store = InProcessKvStore::new();
+        let first_value = vec![0_u8; MAX_KV_VALUE_BYTES];
+        let second_value = vec![0_u8; MAX_KV_VALUE_BYTES];
+        let expected_bytes =
+            first_value.len() + second_value.len() + "/compare/one".len() + "/compare/two".len();
+
+        let error = store
+            .txn(KvTxn {
+                compares: vec![
+                    KvCompare::ValueEquals {
+                        key: "/compare/one".to_string(),
+                        value: first_value,
+                    },
+                    KvCompare::ValueEquals {
+                        key: "/compare/two".to_string(),
+                        value: second_value,
+                    },
+                ],
+                success: Vec::new(),
+                failure: Vec::new(),
+            })
+            .expect_err("compare payload limit");
+
+        assert_eq!(
+            error,
+            KvError::CommandPayloadTooLarge {
+                actual_bytes: expected_bytes,
+                max_bytes: MAX_KV_COMMAND_PAYLOAD_BYTES,
+            }
+        );
+        assert_eq!(store.revision(), KvRevision::ZERO);
+    }
+
+    #[test]
+    fn delete_prefix_uses_ordered_bounds() {
+        let mut store = InProcessKvStore::new();
+        for key in [
+            "/apps/service/a",
+            "/apps/service/b",
+            "/apps/servicez/not-a-child",
+            "/apps/servicf/not-a-child",
+        ] {
+            store.put(key, key.as_bytes().to_vec(), None).expect("put");
+        }
+
+        let response = store
+            .apply_op(KvOp::DeletePrefix {
+                prefix: "/apps/service/".to_string(),
+            })
+            .expect("delete prefix");
+
+        assert!(matches!(
+            response,
+            KvOpResponse::DeletePrefix {
+                deleted_count: 2,
+                ..
+            }
+        ));
+        assert!(store.get("/apps/service/a").is_none());
+        assert!(store.get("/apps/service/b").is_none());
+        assert!(store.get("/apps/servicez/not-a-child").is_some());
+        assert!(store.get("/apps/servicf/not-a-child").is_some());
+    }
+
+    #[test]
     fn put_and_compare_swap_txn_updates_revision_and_version() {
         let mut store = InProcessKvStore::new();
         let rev1 = store.put("/config/a", b"old".to_vec(), None).expect("put");
@@ -3193,6 +3607,129 @@ mod tests {
             b"old"
         );
         assert!(store.get("/config/b").is_none());
+    }
+
+    #[test]
+    fn txn_rejects_oversized_compares_and_branches() {
+        let mut store = InProcessKvStore::new();
+        let compares = (0..=MAX_TXN_COMPARES)
+            .map(|index| KvCompare::Missing {
+                key: format!("/compare/{index}"),
+            })
+            .collect::<Vec<_>>();
+
+        let error = store
+            .txn(KvTxn {
+                compares,
+                success: Vec::new(),
+                failure: Vec::new(),
+            })
+            .expect_err("compare limit");
+        assert_eq!(
+            error,
+            KvError::TxnLimit {
+                compares: MAX_TXN_COMPARES + 1,
+                success_ops: 0,
+                failure_ops: 0,
+                max_compares: MAX_TXN_COMPARES,
+                max_ops_per_branch: MAX_TXN_OPS_PER_BRANCH,
+            }
+        );
+
+        let failure = (0..=MAX_TXN_OPS_PER_BRANCH)
+            .map(|index| KvOp::Delete {
+                key: format!("/unused/failure/{index}"),
+            })
+            .collect::<Vec<_>>();
+        let error = store
+            .txn(KvTxn {
+                compares: vec![KvCompare::Missing {
+                    key: "/selected/success".to_string(),
+                }],
+                success: Vec::new(),
+                failure,
+            })
+            .expect_err("unselected branch still counts");
+        assert_eq!(
+            error,
+            KvError::TxnLimit {
+                compares: 1,
+                success_ops: 0,
+                failure_ops: MAX_TXN_OPS_PER_BRANCH + 1,
+                max_compares: MAX_TXN_COMPARES,
+                max_ops_per_branch: MAX_TXN_OPS_PER_BRANCH,
+            }
+        );
+    }
+
+    #[test]
+    fn txn_preflight_tracks_lease_state_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        for index in 1..=MAX_ACTIVE_LEASES {
+            store
+                .apply_op(KvOp::LeaseGrant {
+                    lease_id: LeaseId(index as u64),
+                    ttl_ticks: 10,
+                })
+                .expect("lease grant");
+        }
+
+        let replacement_lease = LeaseId((MAX_ACTIVE_LEASES + 1) as u64);
+        let response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::LeaseRevoke {
+                        lease_id: LeaseId(1),
+                    },
+                    KvOp::LeaseGrant {
+                        lease_id: replacement_lease,
+                        ttl_ticks: 20,
+                    },
+                    KvOp::Put {
+                        key: "/leased/replacement".to_string(),
+                        value: b"ok".to_vec(),
+                        lease_id: Some(replacement_lease),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect("revoke then grant");
+        assert!(response.succeeded);
+        assert!(!store.leases.contains_key(&LeaseId(1)));
+        assert!(store.leases.contains_key(&replacement_lease));
+        assert_eq!(
+            store
+                .get("/leased/replacement")
+                .expect("replacement entry")
+                .lease_id,
+            Some(replacement_lease)
+        );
+
+        let rejected_lease = LeaseId((MAX_ACTIVE_LEASES + 2) as u64);
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::LeaseGrant {
+                        lease_id: rejected_lease,
+                        ttl_ticks: 20,
+                    },
+                    KvOp::LeaseRevoke {
+                        lease_id: LeaseId(2),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("grant before revoke hits lease limit");
+        assert_eq!(
+            error,
+            KvError::LeaseLimit {
+                max: MAX_ACTIVE_LEASES
+            }
+        );
+        assert!(store.leases.contains_key(&LeaseId(2)));
+        assert!(!store.leases.contains_key(&rejected_lease));
     }
 
     #[test]
@@ -5017,6 +5554,39 @@ mod tests {
         assert!(
             recovered.store().get("/temp-only").is_none(),
             "leftover WAL rewrite temp files must not be replayed"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_rejects_oversized_command_before_wal_write() {
+        let root = temp_raft_root("sinomo-kv-oversized-command-before-wal");
+        let node_id = NodeId::from_legacy_named("node_oversized_command").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open node");
+
+        let error = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/large/value".to_string(),
+                    value: vec![0_u8; MAX_KV_VALUE_BYTES + 1],
+                    lease_id: None,
+                }),
+            )
+            .expect_err("value limit");
+
+        assert_eq!(
+            error,
+            KvError::ValueTooLarge {
+                actual_bytes: MAX_KV_VALUE_BYTES + 1,
+                max_bytes: MAX_KV_VALUE_BYTES,
+            }
+        );
+        assert_eq!(node.last_log_index(), 0);
+        assert!(
+            !paths.wal.exists(),
+            "oversized command should be rejected before WAL creation"
         );
         std::fs::remove_dir_all(root).ok();
     }

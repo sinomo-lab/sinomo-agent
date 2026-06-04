@@ -14,6 +14,8 @@ const IROH_DAEMON_PROXY_RESTART_BACKOFF: Duration = Duration::from_secs(5);
 pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 128;
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 512;
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -454,6 +456,162 @@ pub(crate) fn try_acquire_iroh_proxy_permit(
     }
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
+#[derive(Clone, Debug)]
+pub(crate) struct IrohProxyByteBudget {
+    inner: Arc<Mutex<IrohProxyByteBudgetState>>,
+    max_bytes: usize,
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+#[derive(Debug, Default)]
+struct IrohProxyByteBudgetState {
+    in_flight_bytes: usize,
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+#[derive(Debug)]
+pub(crate) struct IrohProxyByteBudgetPermit {
+    budget: IrohProxyByteBudget,
+    bytes: usize,
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+impl IrohProxyByteBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(IrohProxyByteBudgetState::default())),
+            max_bytes,
+        }
+    }
+
+    pub(crate) fn try_acquire(
+        &self,
+        frame_bytes: usize,
+    ) -> Result<IrohProxyByteBudgetPermit, NetworkError> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let would_use = state.in_flight_bytes.saturating_add(frame_bytes);
+        if frame_bytes > self.max_bytes || would_use > self.max_bytes {
+            return Err(NetworkError::IrohProxyFrameBudgetExceeded {
+                frame_bytes,
+                in_flight_bytes: state.in_flight_bytes,
+                max_in_flight_bytes: self.max_bytes,
+            });
+        }
+        state.in_flight_bytes = would_use;
+        Ok(IrohProxyByteBudgetPermit {
+            budget: self.clone(),
+            bytes: frame_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_bytes(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .in_flight_bytes
+    }
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+impl Drop for IrohProxyByteBudgetPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.in_flight_bytes = state.in_flight_bytes.saturating_sub(self.bytes);
+    }
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+fn reserve_iroh_proxy_frame(
+    len_bytes: [u8; 4],
+    body_bytes: usize,
+    budget: &IrohProxyByteBudget,
+) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
+    if body_bytes > IROH_DAEMON_COMMAND_MAX_BYTES {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: body_bytes,
+            max_bytes: IROH_DAEMON_COMMAND_MAX_BYTES,
+        });
+    }
+    let frame_bytes = body_bytes + len_bytes.len();
+    let permit = budget.try_acquire(frame_bytes)?;
+    let mut frame = vec![0_u8; frame_bytes];
+    frame[..len_bytes.len()].copy_from_slice(&len_bytes);
+    Ok((frame, permit))
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) async fn read_iroh_proxy_frame_async<R>(
+    reader: &mut R,
+    budget: &IrohProxyByteBudget,
+    scope: &str,
+) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut len_bytes = [0_u8; 4];
+    reader
+        .read_exact(&mut len_bytes)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: format!("read iroh daemon {scope} frame length"),
+            detail: source.to_string(),
+        })?;
+    let body_bytes = u32::from_be_bytes(len_bytes) as usize;
+    let (mut frame, permit) = reserve_iroh_proxy_frame(len_bytes, body_bytes, budget)?;
+    reader
+        .read_exact(&mut frame[len_bytes.len()..])
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: format!("read iroh daemon {scope} frame body"),
+            detail: source.to_string(),
+        })?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_recv(frame.len() as u64);
+    }
+    Ok((frame, permit))
+}
+
+#[cfg(feature = "iroh-transport")]
+fn read_iroh_proxy_frame_blocking<R>(
+    reader: &mut R,
+    budget: &IrohProxyByteBudget,
+    scope: &str,
+) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError>
+where
+    R: std::io::Read,
+{
+    let mut len_bytes = [0_u8; 4];
+    reader
+        .read_exact(&mut len_bytes)
+        .map_err(|source| NetworkError::Io {
+            operation: format!("read iroh daemon {scope} frame length"),
+            detail: source.to_string(),
+        })?;
+    let body_bytes = u32::from_be_bytes(len_bytes) as usize;
+    let (mut frame, permit) = reserve_iroh_proxy_frame(len_bytes, body_bytes, budget)?;
+    reader
+        .read_exact(&mut frame[len_bytes.len()..])
+        .map_err(|source| NetworkError::Io {
+            operation: format!("read iroh daemon {scope} frame body"),
+            detail: source.to_string(),
+        })?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_recv(frame.len() as u64);
+    }
+    Ok((frame, permit))
+}
+
 #[cfg(feature = "iroh-transport")]
 pub fn start_iroh_daemon_proxy(
     paths: ClusterPaths,
@@ -591,6 +749,7 @@ async fn run_iroh_daemon_proxy(
     let command_limiter = Arc::new(tokio::sync::Semaphore::new(
         IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS,
     ));
+    let command_byte_budget = IrohProxyByteBudget::new(IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES);
     while let Some(connecting) = endpoint.accept().await {
         let Some(connection_permit) = try_acquire_iroh_proxy_permit(
             &connection_limiter,
@@ -601,6 +760,7 @@ async fn run_iroh_daemon_proxy(
         };
         let daemon_address = daemon_address.clone();
         let command_limiter = command_limiter.clone();
+        let command_byte_budget = command_byte_budget.clone();
         tokio::spawn(async move {
             let _connection_permit = connection_permit;
             let Ok(connection) = connecting.await else {
@@ -618,14 +778,31 @@ async fn run_iroh_daemon_proxy(
                     continue;
                 };
                 let daemon_address = daemon_address.clone();
+                let command_byte_budget = command_byte_budget.clone();
                 tokio::spawn(async move {
                     let _command_permit = command_permit;
-                    let Ok(request) = recv.read_to_end(IROH_DAEMON_COMMAND_MAX_BYTES).await else {
-                        return;
+                    let (request, request_budget_permit) = match read_iroh_proxy_frame_async(
+                        &mut recv,
+                        &command_byte_budget,
+                        "command request",
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            eprintln!("sinomo iroh daemon proxy command request rejected: {error}");
+                            return;
+                        }
                     };
-                    let Ok(response) = tokio::task::spawn_blocking(move || {
+                    let forward_budget = command_byte_budget.clone();
+                    let response_result = tokio::task::spawn_blocking(move || {
                         let timeout = iroh_daemon_command_forward_timeout(&request);
-                        forward_daemon_control_payload(&daemon_address, &request, timeout)
+                        forward_daemon_control_payload(
+                            &daemon_address,
+                            &request,
+                            timeout,
+                            &forward_budget,
+                        )
                     })
                     .await
                     .unwrap_or_else(|source| {
@@ -633,12 +810,19 @@ async fn run_iroh_daemon_proxy(
                             operation: "forward iroh daemon command".to_string(),
                             detail: source.to_string(),
                         })
-                    }) else {
-                        return;
+                    });
+                    let (response, response_budget_permit) = match response_result {
+                        Ok(result) => result,
+                        Err(error) => {
+                            eprintln!("sinomo iroh daemon proxy command failed: {error}");
+                            return;
+                        }
                     };
+                    drop(request_budget_permit);
                     if send.write_all(&response).await.is_ok() {
                         let _ = send.finish();
                     }
+                    drop(response_budget_permit);
                 });
             }
         });
@@ -1090,7 +1274,8 @@ fn forward_daemon_control_payload(
     address: &str,
     payload: &[u8],
     timeout: Duration,
-) -> Result<Vec<u8>, NetworkError> {
+    budget: &IrohProxyByteBudget,
+) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
     let socket_address = address
         .to_socket_addrs()
         .map_err(|source| NetworkError::Io {
@@ -1127,16 +1312,7 @@ fn forward_daemon_control_payload(
             detail: source.to_string(),
         })?;
     let _ = stream.shutdown(Shutdown::Write);
-    let response: crate::DaemonControlResponse =
-        crate::read_object_frame_blocking(&mut stream, IROH_DAEMON_COMMAND_MAX_BYTES).map_err(
-            |source| NetworkError::Io {
-                operation: format!("read daemon control address {address}"),
-                detail: source.to_string(),
-            },
-        )?;
-    let mut response_bytes = Vec::new();
-    crate::write_object_frame_blocking(&mut response_bytes, &response)?;
-    Ok(response_bytes)
+    read_iroh_proxy_frame_blocking(&mut stream, budget, "command response")
 }
 
 #[cfg(any(test, feature = "iroh-transport"))]

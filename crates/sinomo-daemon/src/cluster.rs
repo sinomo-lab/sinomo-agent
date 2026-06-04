@@ -647,8 +647,12 @@ pub fn handle_daemon_cluster_kv_range_prefix(
     prefix: &str,
 ) -> Result<Vec<KvEntry>, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    let store = sinomo_network::read_cluster_kv_store(&cluster_paths)?;
-    Ok(store.range_prefix(prefix))
+    sinomo_network::read_cluster_kv_prefix_entries_limited(
+        &cluster_paths,
+        prefix,
+        sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )
+    .map_err(Into::into)
 }
 
 pub fn handle_daemon_cluster_kv_txn_request(

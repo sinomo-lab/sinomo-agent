@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
 pub(crate) const MAX_CLUSTER_KV_ACTIVE_WATCHES: usize = 1024;
+pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
@@ -601,6 +602,8 @@ pub struct ClusterConnectivityRecord {
 pub struct ClusterConnectivityGraph {
     source_node_id: NodeId,
     records: BTreeMap<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+    reachable_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
+    healthy_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
 }
 
 impl ClusterConnectivityGraph {
@@ -608,7 +611,7 @@ impl ClusterConnectivityGraph {
         source_node_id: NodeId,
         records: impl IntoIterator<Item = ClusterConnectivityRecord>,
     ) -> Self {
-        let records = records
+        let records: BTreeMap<_, _> = records
             .into_iter()
             .map(|record| {
                 (
@@ -621,9 +624,30 @@ impl ClusterConnectivityGraph {
                 )
             })
             .collect();
+        let mut reachable_targets_by_source = BTreeMap::<NodeId, BTreeSet<NodeId>>::new();
+        let mut healthy_targets_by_source = BTreeMap::<NodeId, BTreeSet<NodeId>>::new();
+        for record in records.values() {
+            if record.target_node_id == record.source_node_id {
+                continue;
+            }
+            if record.state != ClusterConnectivityState::Unreachable {
+                reachable_targets_by_source
+                    .entry(record.source_node_id.clone())
+                    .or_default()
+                    .insert(record.target_node_id.clone());
+            }
+            if record.state == ClusterConnectivityState::Healthy {
+                healthy_targets_by_source
+                    .entry(record.source_node_id.clone())
+                    .or_default()
+                    .insert(record.target_node_id.clone());
+            }
+        }
         Self {
             source_node_id,
             records,
+            reachable_targets_by_source,
+            healthy_targets_by_source,
         }
     }
 
@@ -679,15 +703,10 @@ impl ClusterConnectivityGraph {
     /// record (over any endpoint), excluding `source` itself. This is the adjacency the
     /// multi-hop route discovery in [`crate::route`] walks over the cluster-wide graph.
     pub fn reachable_targets(&self, source: &NodeId) -> std::collections::BTreeSet<NodeId> {
-        self.records
-            .values()
-            .filter(|record| {
-                &record.source_node_id == source
-                    && record.target_node_id != *source
-                    && record.state != ClusterConnectivityState::Unreachable
-            })
-            .map(|record| record.target_node_id.clone())
-            .collect()
+        self.reachable_targets_by_source
+            .get(source)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Node ids `source` has a CURRENTLY-HEALTHY connectivity record to (over any endpoint),
@@ -696,15 +715,20 @@ impl ClusterConnectivityGraph {
     /// merely mid-convergence (transiently `Degraded`) is not treated as a direct hop. This is
     /// the adjacency multi-hop route discovery in [`crate::route`] walks.
     pub fn healthy_targets(&self, source: &NodeId) -> std::collections::BTreeSet<NodeId> {
-        self.records
-            .values()
-            .filter(|record| {
-                &record.source_node_id == source
-                    && record.target_node_id != *source
-                    && record.state == ClusterConnectivityState::Healthy
-            })
-            .map(|record| record.target_node_id.clone())
-            .collect()
+        self.healthy_targets_by_source
+            .get(source)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn healthy_target_refs<'a>(
+        &'a self,
+        source: &NodeId,
+    ) -> impl Iterator<Item = &'a NodeId> + 'a {
+        self.healthy_targets_by_source
+            .get(source)
+            .into_iter()
+            .flat_map(|targets| targets.iter())
     }
 
     /// A dialable endpoint to reach `target` from `source` over a currently-healthy link, or
@@ -1286,6 +1310,17 @@ pub fn read_cluster_kv_prefix_entries(
     let node_id = read_cluster_kv_reader_node_id(paths)?;
     cluster_kv_local_cache(paths)
         .current_range_prefix(node_id, prefix)
+        .map_err(Into::into)
+}
+
+pub fn read_cluster_kv_prefix_entries_limited(
+    paths: &ClusterPaths,
+    prefix: &str,
+    max_entries: usize,
+) -> Result<Vec<KvEntry>, NetworkError> {
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
+    cluster_kv_local_cache(paths)
+        .current_range_prefix_limited(node_id, prefix, max_entries)
         .map_err(Into::into)
 }
 

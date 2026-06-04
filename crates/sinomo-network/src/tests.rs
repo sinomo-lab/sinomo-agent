@@ -653,6 +653,10 @@ fn iroh_daemon_proxy_admission_limit_releases_permits() {
         crate::roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS
             >= crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS
     );
+    assert!(
+        crate::roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES
+            >= (crate::IROH_DAEMON_COMMAND_MAX_BYTES * 2) + 8
+    );
     let limiter = Arc::new(tokio::sync::Semaphore::new(2));
     let first =
         crate::roaming::try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("first permit");
@@ -671,6 +675,82 @@ fn iroh_daemon_proxy_admission_limit_releases_permits() {
     drop(replacement);
 
     assert_eq!(limiter.available_permits(), 2);
+}
+
+#[test]
+fn iroh_daemon_proxy_byte_budget_releases_permits() {
+    let budget = crate::roaming::IrohProxyByteBudget::new(10);
+    let first = budget.try_acquire(6).expect("first frame budget");
+    let second = budget.try_acquire(4).expect("second frame budget");
+
+    assert_eq!(budget.in_flight_bytes(), 10);
+    assert!(matches!(
+        budget.try_acquire(1),
+        Err(NetworkError::IrohProxyFrameBudgetExceeded {
+            frame_bytes: 1,
+            in_flight_bytes: 10,
+            max_in_flight_bytes: 10,
+        })
+    ));
+
+    drop(first);
+    assert_eq!(budget.in_flight_bytes(), 4);
+    let replacement = budget.try_acquire(6).expect("replacement budget");
+    drop(second);
+    drop(replacement);
+
+    assert_eq!(budget.in_flight_bytes(), 0);
+}
+
+#[test]
+fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        use tokio::io::AsyncWriteExt;
+
+        let budget = crate::roaming::IrohProxyByteBudget::new(8);
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&4_u32.to_be_bytes())
+            .await
+            .expect("write length");
+        writer.write_all(&[1, 2, 3, 4]).await.expect("write body");
+
+        let (frame, permit) =
+            crate::roaming::read_iroh_proxy_frame_async(&mut reader, &budget, "test")
+                .await
+                .expect("read frame");
+        assert_eq!(frame, [0, 0, 0, 4, 1, 2, 3, 4]);
+        assert_eq!(budget.in_flight_bytes(), 8);
+        drop(permit);
+        assert_eq!(budget.in_flight_bytes(), 0);
+
+        let budget = crate::roaming::IrohProxyByteBudget::new(7);
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&4_u32.to_be_bytes())
+            .await
+            .expect("write length only");
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            crate::roaming::read_iroh_proxy_frame_async(&mut reader, &budget, "test"),
+        )
+        .await
+        .expect("budget rejection should not wait for body")
+        .expect_err("budget error");
+        assert!(matches!(
+            error,
+            NetworkError::IrohProxyFrameBudgetExceeded {
+                frame_bytes: 8,
+                in_flight_bytes: 0,
+                max_in_flight_bytes: 7,
+            }
+        ));
+        assert_eq!(budget.in_flight_bytes(), 0);
+    });
 }
 
 #[test]
@@ -2171,6 +2251,51 @@ fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
     let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
     assert!(store.get("/snapshot-only").is_some());
     assert!(!paths.kv_raft.exists());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_prefix_range_limited_rejects_large_external_ranges() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-range-limited-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let mut store = InProcessKvStore::new();
+    for key in [
+        "/external/range/a",
+        "/external/range/b",
+        "/external/rangez/not-a-child",
+    ] {
+        store.put(key, key.as_bytes().to_vec(), None).expect("put");
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let entries = read_cluster_kv_prefix_entries_limited(&paths, "/external/range/", 2)
+        .expect("within limit");
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/external/range/a", "/external/range/b"]
+    );
+
+    let error = read_cluster_kv_prefix_entries_limited(&paths, "/external/range/", 1)
+        .expect_err("range limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangeLimit {
+            ref prefix,
+            max_entries: 1,
+        }) if prefix == "/external/range/"
+    ));
     std::fs::remove_dir_all(root).ok();
 }
 
