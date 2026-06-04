@@ -3713,21 +3713,7 @@ fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError
     if entries.is_empty() {
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| KvError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(path)
-        .map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    let mut file = open_wal_file_for_append(path)?;
     file.lock_exclusive().map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -3739,6 +3725,37 @@ fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError
         path: path.display().to_string(),
         detail: source.to_string(),
     })
+}
+
+fn open_wal_file_for_append(path: &Path) -> Result<File, KvError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| KvError::Io {
+        path: parent.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => {
+            sync_directory(parent)?;
+            Ok(file)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(path)
+            .map_err(|source| KvError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }),
+        Err(source) => Err(KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
 }
 
 fn encode_wal_record(entry: &KvLogEntry, path: &Path) -> Result<Vec<u8>, KvError> {

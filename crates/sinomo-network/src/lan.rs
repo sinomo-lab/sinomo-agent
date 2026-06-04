@@ -2,17 +2,30 @@ use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::peer::{NetworkFrame, PeerEndpointCandidate};
 use crate::prelude::*;
+use std::collections::BTreeMap;
 use std::sync::{
     LazyLock,
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Instant;
 
+const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
+pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_PUBLIC_IP_DNS_WORKERS: usize = 2;
-static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<PublicIpDiscoveryCacheEntry>>> =
+static DEFAULT_LAN_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<LocalIpDiscoveryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
+static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<
+    Mutex<BTreeMap<Vec<IpAddr>, PublicIpDiscoveryCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static PUBLIC_IP_DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Debug)]
+struct LocalIpDiscoveryCacheEntry {
+    checked_at: Instant,
+    candidates: Vec<IpAddr>,
+}
 
 #[derive(Clone, Debug)]
 struct PublicIpDiscoveryCacheEntry {
@@ -107,6 +120,30 @@ impl LanQuicFrameCodec {
 }
 
 pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {
+    cached_default_lan_ip_candidates_with(discover_default_lan_ip_candidates_uncached)
+}
+
+pub(crate) fn cached_default_lan_ip_candidates_with(
+    discover: impl FnOnce() -> Vec<IpAddr>,
+) -> Vec<IpAddr> {
+    let now = Instant::now();
+    if let Ok(cache) = DEFAULT_LAN_IP_DISCOVERY_CACHE.lock()
+        && let Some(entry) = cache.as_ref()
+        && now.duration_since(entry.checked_at) < DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL
+    {
+        return entry.candidates.clone();
+    }
+    let candidates = discover();
+    if let Ok(mut cache) = DEFAULT_LAN_IP_DISCOVERY_CACHE.lock() {
+        *cache = Some(LocalIpDiscoveryCacheEntry {
+            checked_at: now,
+            candidates: candidates.clone(),
+        });
+    }
+    candidates
+}
+
+fn discover_default_lan_ip_candidates_uncached() -> Vec<IpAddr> {
     let targets = ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"]
         .into_iter()
         .filter_map(|target| target.parse::<SocketAddr>().ok());
@@ -117,6 +154,13 @@ pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {
         }
     }
     candidates
+}
+
+#[cfg(test)]
+pub(crate) fn clear_default_lan_ip_discovery_cache() {
+    if let Ok(mut cache) = DEFAULT_LAN_IP_DISCOVERY_CACHE.lock() {
+        *cache = None;
+    }
 }
 
 pub fn discover_interface_ip_candidates() -> Vec<IpAddr> {
@@ -147,7 +191,7 @@ pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
     {
         return Vec::new();
     }
-    cached_default_public_ip_candidates_with(|| {
+    cached_default_public_ip_candidates_for_key_with(Vec::new(), || {
         discover_public_ip_candidates_from_hosts_with_status(&[
             ("api.ipify.org", "/"),
             ("ifconfig.me", "/ip"),
@@ -155,12 +199,38 @@ pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
     })
 }
 
-pub(crate) fn cached_default_public_ip_candidates_with(
+pub(crate) fn discover_default_public_ip_candidates_for_local_ips(
+    local_ips: impl IntoIterator<Item = IpAddr>,
+) -> Vec<IpAddr> {
+    if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Vec::new();
+    }
+    cached_default_public_ip_candidates_for_local_ips_with(local_ips, || {
+        discover_public_ip_candidates_from_hosts_with_status(&[
+            ("api.ipify.org", "/"),
+            ("ifconfig.me", "/ip"),
+        ])
+    })
+}
+
+pub(crate) fn cached_default_public_ip_candidates_for_local_ips_with(
+    local_ips: impl IntoIterator<Item = IpAddr>,
+    discover: impl FnOnce() -> PublicIpDiscoveryResult,
+) -> Vec<IpAddr> {
+    cached_default_public_ip_candidates_for_key_with(local_network_cache_key(local_ips), discover)
+}
+
+fn cached_default_public_ip_candidates_for_key_with(
+    cache_key: Vec<IpAddr>,
     discover: impl FnOnce() -> PublicIpDiscoveryResult,
 ) -> Vec<IpAddr> {
     let now = Instant::now();
     if let Ok(cache) = PUBLIC_IP_DISCOVERY_CACHE.lock()
-        && let Some(entry) = cache.as_ref()
+        && let Some(entry) = cache.get(&cache_key)
         && now.duration_since(entry.checked_at) < PUBLIC_IP_DISCOVERY_CACHE_TTL
     {
         return entry.candidates.clone();
@@ -171,18 +241,45 @@ pub(crate) fn cached_default_public_ip_candidates_with(
         PublicIpDiscoveryResult::Deferred(candidates) => return candidates,
     };
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
-        *cache = Some(PublicIpDiscoveryCacheEntry {
-            checked_at: now,
-            candidates: candidates.clone(),
-        });
+        if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES {
+            cache.retain(|_, entry| {
+                now.duration_since(entry.checked_at) < PUBLIC_IP_DISCOVERY_CACHE_TTL
+            });
+        }
+        if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.checked_at)
+                .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            cache_key,
+            PublicIpDiscoveryCacheEntry {
+                checked_at: now,
+                candidates: candidates.clone(),
+            },
+        );
     }
     candidates
+}
+
+pub(crate) fn local_network_cache_key(local_ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let mut key = Vec::new();
+    for ip in local_ips {
+        if is_invitable_ip(ip) && !key.contains(&ip) {
+            key.push(ip);
+        }
+    }
+    key.sort();
+    key
 }
 
 #[cfg(test)]
 pub(crate) fn clear_public_ip_discovery_cache() {
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
-        *cache = None;
+        cache.clear();
     }
 }
 
@@ -225,10 +322,9 @@ pub(crate) fn discover_public_ip_candidates_from_hosts_with_status(
         if std::io::Write::write_all(&mut stream, request.as_bytes()).is_err() {
             continue;
         }
-        let mut response = String::new();
-        if std::io::Read::read_to_string(&mut stream, &mut response).is_err() {
+        let Ok(response) = read_public_ip_discovery_response(&mut stream) else {
             continue;
-        }
+        };
         let body = response.rsplit("\r\n\r\n").next().unwrap_or(&response);
         for token in body
             .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\''))
@@ -245,6 +341,15 @@ pub(crate) fn discover_public_ip_candidates_from_hosts_with_status(
         }
     }
     PublicIpDiscoveryResult::Complete(candidates)
+}
+
+pub(crate) fn read_public_ip_discovery_response(
+    reader: impl std::io::Read,
+) -> std::io::Result<String> {
+    let mut response = String::new();
+    let mut limited = std::io::Read::take(reader, MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES);
+    std::io::Read::read_to_string(&mut limited, &mut response)?;
+    Ok(response)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

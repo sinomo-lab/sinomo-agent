@@ -2517,20 +2517,51 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
 static PUBLIC_ENDPOINT_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn default_lan_ip_discovery_cache_reuses_recent_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_default_lan_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let first = crate::lan::cached_default_lan_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec!["10.0.0.11".parse().expect("ip")]
+    });
+    let second = crate::lan::cached_default_lan_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec!["10.0.0.12".parse().expect("ip")]
+    });
+
+    assert_eq!(first, vec!["10.0.0.11".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        second, first,
+        "bursty LAN IP discovery should reuse the short cache"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_default_lan_ip_discovery_cache();
+}
+
+#[test]
 fn public_ip_discovery_cache_reuses_recent_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
         .expect("cache mutex");
     crate::lan::clear_public_ip_discovery_cache();
     let calls = std::sync::atomic::AtomicU64::new(0);
-    let first = crate::lan::cached_default_public_ip_candidates_with(|| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.10".parse().expect("ip")])
-    });
-    let second = crate::lan::cached_default_public_ip_candidates_with(|| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.11".parse().expect("ip")])
-    });
+    let first = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.10".parse().expect("ip")])
+        },
+    );
+    let second = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.11".parse().expect("ip")])
+        },
+    );
 
     assert_eq!(first, vec!["203.0.113.10".parse::<IpAddr>().expect("ip")]);
     assert_eq!(
@@ -2542,24 +2573,76 @@ fn public_ip_discovery_cache_reuses_recent_result() {
 }
 
 #[test]
+fn public_ip_discovery_cache_refreshes_after_local_network_change() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let first = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        ["10.0.0.11".parse().expect("ip")],
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.10".parse().expect("ip")])
+        },
+    );
+    let cached = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        ["10.0.0.11".parse().expect("ip")],
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.11".parse().expect("ip")])
+        },
+    );
+    let refreshed = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        ["10.0.1.11".parse().expect("ip")],
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.12".parse().expect("ip")])
+        },
+    );
+
+    assert_eq!(first, vec!["203.0.113.10".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        cached, first,
+        "stable local network should reuse public IP discovery cache"
+    );
+    assert_eq!(
+        refreshed,
+        vec!["203.0.113.12".parse::<IpAddr>().expect("ip")],
+        "local network changes should force public IP rediscovery for roaming devices"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
 fn public_ip_discovery_cache_does_not_store_deferred_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
         .expect("cache mutex");
     crate::lan::clear_public_ip_discovery_cache();
     let calls = std::sync::atomic::AtomicU64::new(0);
-    let deferred = crate::lan::cached_default_public_ip_candidates_with(|| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::lan::PublicIpDiscoveryResult::Deferred(Vec::new())
-    });
-    let recovered = crate::lan::cached_default_public_ip_candidates_with(|| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.13".parse().expect("ip")])
-    });
-    let cached = crate::lan::cached_default_public_ip_candidates_with(|| {
-        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.14".parse().expect("ip")])
-    });
+    let deferred = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Deferred(Vec::new())
+        },
+    );
+    let recovered = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.13".parse().expect("ip")])
+        },
+    );
+    let cached = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.14".parse().expect("ip")])
+        },
+    );
 
     assert!(deferred.is_empty());
     assert_eq!(
@@ -2615,6 +2698,24 @@ fn public_ip_discovery_reports_deferred_when_dns_workers_saturated() {
 }
 
 #[test]
+fn public_ip_discovery_response_read_is_bounded() {
+    let mut response = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
+    response.extend(
+        std::iter::repeat(b'1')
+            .take(crate::lan::MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES as usize + 4096),
+    );
+
+    let read = crate::lan::read_public_ip_discovery_response(std::io::Cursor::new(response))
+        .expect("read capped response");
+
+    assert_eq!(
+        read.len(),
+        crate::lan::MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES as usize,
+        "public IP discovery must not read unbounded HTTP response bodies"
+    );
+}
+
+#[test]
 fn public_endpoint_reachability_cache_reuses_recent_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
@@ -2637,6 +2738,59 @@ fn public_endpoint_reachability_cache_reuses_recent_result() {
         "recent public endpoint reachability should be served from cache"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    clear_public_endpoint_reachability_cache();
+}
+
+#[test]
+fn public_endpoint_reachability_cache_refreshes_after_local_network_change() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    clear_public_endpoint_reachability_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let ip = "203.0.113.16".parse().expect("ip");
+    let start = Instant::now();
+    let first = public_endpoint_is_reachable_for_local_ips_with_probe_at(
+        ip,
+        21353,
+        start,
+        ["10.0.0.11".parse().expect("ip")],
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        },
+    );
+    let cached = public_endpoint_is_reachable_for_local_ips_with_probe_at(
+        ip,
+        21353,
+        start + Duration::from_millis(1),
+        ["10.0.0.11".parse().expect("ip")],
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        },
+    );
+    let refreshed = public_endpoint_is_reachable_for_local_ips_with_probe_at(
+        ip,
+        21353,
+        start + Duration::from_millis(2),
+        ["10.0.1.11".parse().expect("ip")],
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        },
+    );
+
+    assert!(first);
+    assert!(
+        cached,
+        "stable local network should reuse public endpoint reachability cache"
+    );
+    assert!(
+        !refreshed,
+        "local network changes should force a fresh public endpoint reachability probe"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     clear_public_endpoint_reachability_cache();
 }
 
@@ -6298,6 +6452,60 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         cluster_kv_watch_events(&paths).expect("read watch events"),
         vec![event]
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-large-direct-checkpoint-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    reset_cluster_kv_watch_event_log_write_bytes_for_test(&paths);
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/large-direct-checkpoint".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![7_u8; (1024 * 1024) + 1024],
+        },
+    };
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("append large watch event"),
+        1
+    );
+
+    let checkpoint_len = std::fs::metadata(&paths.kv_watch_events)
+        .expect("checkpoint metadata")
+        .len();
+    assert!(
+        checkpoint_len > 0,
+        "large batches should still persist the retained watch events"
+    );
+    let log_len = std::fs::metadata(&paths.kv_watch_events_log)
+        .expect("watch event log metadata")
+        .len();
+    assert_eq!(
+        log_len, 0,
+        "large batches should checkpoint directly instead of writing and truncating the append log"
+    );
+    assert_eq!(
+        cluster_kv_watch_event_log_write_bytes_for_test(&paths),
+        0,
+        "direct checkpoint should avoid the extra append-log write for large batches"
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read retained large event"),
+        vec![event]
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 

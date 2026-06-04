@@ -1,8 +1,9 @@
 use crate::error::NetworkError;
+use crate::lan::local_network_cache_key;
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
 use crate::{
-    discover_default_public_ip_candidates, discover_local_ip_candidates_for_targets,
+    discover_default_public_ip_candidates_for_local_ips, discover_local_ip_candidates_for_targets,
     format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
 use fs2::FileExt;
@@ -66,13 +67,16 @@ static CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST: LazyLock<Mutex<HashMap<PathBu
 static CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
+static CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
 static CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<
-    Mutex<HashMap<SocketAddr, PublicEndpointReachabilityCacheEntry>>,
+    Mutex<HashMap<PublicEndpointReachabilityCacheKey, PublicEndpointReachabilityCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +112,12 @@ struct ClusterKvReaderNodeIdCacheEntry {
 struct PublicEndpointReachabilityCacheEntry {
     checked_at: Instant,
     reachable: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PublicEndpointReachabilityCacheKey {
+    address: SocketAddr,
+    local_network: Vec<IpAddr>,
 }
 
 impl PublicEndpointReachabilityCacheEntry {
@@ -428,6 +438,15 @@ fn record_cluster_kv_watch_event_log_read_for_test(paths: &ClusterPaths, bytes: 
 }
 
 #[cfg(test)]
+fn record_cluster_kv_watch_event_log_write_for_test(paths: &ClusterPaths, bytes: u64) {
+    if let Ok(mut writes) = CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST.lock() {
+        *writes
+            .entry(cluster_kv_watch_notify_key(paths))
+            .or_default() += bytes;
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn reset_cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPaths) {
     if let Ok(mut reads) = CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST.lock() {
         reads.remove(&cluster_kv_watch_notify_key(paths));
@@ -440,6 +459,22 @@ pub(crate) fn cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPath
         .lock()
         .ok()
         .and_then(|reads| reads.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterPaths) {
+    if let Ok(mut writes) = CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST.lock() {
+        writes.remove(&cluster_kv_watch_notify_key(paths));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_event_log_write_bytes_for_test(paths: &ClusterPaths) -> u64 {
+    CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|writes| writes.get(&cluster_kv_watch_notify_key(paths)).copied())
         .unwrap_or(0)
 }
 
@@ -2455,19 +2490,21 @@ pub fn append_cluster_kv_watch_events(
         record_current_cluster_kv_watch_event_cache(paths, retained, log_records, true);
         return Ok(0);
     }
+    let encoded_appended = encode_cluster_kv_watch_event_log_batch(paths, &appended)?;
+    let log_len = log_file
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
     let should_checkpoint_without_append = incoming.len() > MAX_CLUSTER_KV_WATCH_EVENTS
         || log_records.saturating_add(appended.len()) >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
-        || log_file
-            .metadata()
-            .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
-            .unwrap_or(false);
+        || log_len.saturating_add(encoded_appended.bytes) >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES;
     let mut current_log_records = log_records;
     if should_checkpoint_without_append {
         write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
         truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
         current_log_records = 0;
     } else {
-        append_cluster_kv_watch_event_log_to_file(paths, &mut log_file, &appended)?;
+        append_cluster_kv_watch_event_log_to_file(paths, &mut log_file, &encoded_appended)?;
         current_log_records = current_log_records.saturating_add(appended.len());
         if log_file
             .metadata()
@@ -2518,16 +2555,18 @@ fn append_cluster_kv_watch_events_from_cached_view(
     }
 
     let mut current_log_records = cache.log_records;
+    let encoded_appended = encode_cluster_kv_watch_event_log_batch(paths, &appended)?;
     let should_checkpoint_without_append = incoming.len() > MAX_CLUSTER_KV_WATCH_EVENTS
         || current_log_records.saturating_add(appended.len())
             >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
-        || log_mark.len >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES;
+        || log_mark.len.saturating_add(encoded_appended.bytes)
+            >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES;
     if should_checkpoint_without_append {
         write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
         truncate_cluster_kv_watch_event_log_file(paths, log_file)?;
         current_log_records = 0;
     } else {
-        append_cluster_kv_watch_event_log_to_file(paths, log_file, &appended)?;
+        append_cluster_kv_watch_event_log_to_file(paths, log_file, &encoded_appended)?;
         current_log_records = current_log_records.saturating_add(appended.len());
         if log_file
             .metadata()
@@ -2542,6 +2581,31 @@ fn append_cluster_kv_watch_events_from_cached_view(
     record_current_cluster_kv_watch_event_cache(paths, retained, current_log_records, true);
     notify_cluster_kv_watchers(paths);
     Ok(Some(appended.len()))
+}
+
+struct EncodedClusterKvWatchEventLogBatch {
+    records: Vec<Vec<u8>>,
+    bytes: u64,
+}
+
+fn encode_cluster_kv_watch_event_log_batch(
+    paths: &ClusterPaths,
+    events: &[KvEvent],
+) -> Result<EncodedClusterKvWatchEventLogBatch, NetworkError> {
+    let mut records = Vec::with_capacity(events.len());
+    let mut bytes = 0_u64;
+    for event in events {
+        let record = SinomoObjectCodec::default().encode(event)?;
+        let len = u32::try_from(record.len()).map_err(|_| NetworkError::Serialization {
+            detail: format!(
+                "cluster kv watch-event log record for {} exceeds u32 length",
+                paths.kv_watch_events_log.display()
+            ),
+        })?;
+        bytes = bytes.saturating_add(4).saturating_add(u64::from(len));
+        records.push(record);
+    }
+    Ok(EncodedClusterKvWatchEventLogBatch { records, bytes })
 }
 
 pub(crate) fn cached_cluster_kv_watch_events_contain_all(
@@ -2803,28 +2867,40 @@ fn open_cluster_kv_watch_event_log_for_append(
         path: parent.display().to_string(),
         detail: source.to_string(),
     })?;
-    fs::OpenOptions::new()
-        .create(true)
+    match fs::OpenOptions::new()
+        .create_new(true)
         .read(true)
         .append(true)
         .open(&paths.kv_watch_events_log)
-        .map_err(|source| NetworkError::StorageIo {
+    {
+        Ok(file) => {
+            sync_directory(parent)?;
+            Ok(file)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&paths.kv_watch_events_log)
+            .map_err(|source| NetworkError::StorageIo {
+                path: paths.kv_watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            }),
+        Err(source) => Err(NetworkError::StorageIo {
             path: paths.kv_watch_events_log.display().to_string(),
             detail: source.to_string(),
-        })
+        }),
+    }
 }
 
 fn append_cluster_kv_watch_event_log_to_file(
     paths: &ClusterPaths,
     file: &mut fs::File,
-    events: &[KvEvent],
+    batch: &EncodedClusterKvWatchEventLogBatch,
 ) -> Result<(), NetworkError> {
-    if events.is_empty() {
+    if batch.records.is_empty() {
         return Ok(());
     }
-    let mut written = 0_u64;
-    for event in events {
-        let record = SinomoObjectCodec::default().encode(event)?;
+    for record in &batch.records {
         let len = u32::try_from(record.len()).map_err(|_| NetworkError::Serialization {
             detail: format!(
                 "cluster kv watch-event log record for {} exceeds u32 length",
@@ -2832,19 +2908,20 @@ fn append_cluster_kv_watch_event_log_to_file(
             ),
         })?;
         file.write_all(&len.to_be_bytes())
-            .and_then(|()| file.write_all(&record))
+            .and_then(|()| file.write_all(record))
             .map_err(|source| NetworkError::StorageIo {
                 path: paths.kv_watch_events_log.display().to_string(),
                 detail: source.to_string(),
             })?;
-        written = written.saturating_add(4 + record.len() as u64);
     }
     file.sync_data().map_err(|source| NetworkError::StorageIo {
         path: paths.kv_watch_events_log.display().to_string(),
         detail: source.to_string(),
     })?;
+    #[cfg(test)]
+    record_cluster_kv_watch_event_log_write_for_test(paths, batch.bytes);
     if let Some(observer) = io_observer() {
-        observer.on_disk_write(written);
+        observer.on_disk_write(batch.bytes);
     }
     invalidate_cluster_kv_watch_event_cache(paths);
     Ok(())
@@ -4485,12 +4562,23 @@ const PUBLIC_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 /// NAT hairpin). Only a verified public endpoint should be advertised; an unverified one (a
 /// NAT'd node with no forward) would publish an unreachable address that every peer then
 /// wastes connection attempts on. Manual endpoint configuration is future work.
-fn public_endpoint_is_reachable(ip: IpAddr, port: u16) -> bool {
-    public_endpoint_is_reachable_with_probe(ip, port, |address| {
-        std::net::TcpStream::connect_timeout(&address, PUBLIC_ENDPOINT_PROBE_TIMEOUT).is_ok()
-    })
+fn public_endpoint_is_reachable_for_local_ips(
+    ip: IpAddr,
+    port: u16,
+    local_ips: impl IntoIterator<Item = IpAddr>,
+) -> bool {
+    public_endpoint_is_reachable_for_local_ips_with_probe_at(
+        ip,
+        port,
+        Instant::now(),
+        local_ips,
+        |address| {
+            std::net::TcpStream::connect_timeout(&address, PUBLIC_ENDPOINT_PROBE_TIMEOUT).is_ok()
+        },
+    )
 }
 
+#[cfg(test)]
 pub(crate) fn public_endpoint_is_reachable_with_probe(
     ip: IpAddr,
     port: u16,
@@ -4499,15 +4587,36 @@ pub(crate) fn public_endpoint_is_reachable_with_probe(
     public_endpoint_is_reachable_with_probe_at(ip, port, Instant::now(), probe)
 }
 
+#[cfg(test)]
 pub(crate) fn public_endpoint_is_reachable_with_probe_at(
     ip: IpAddr,
     port: u16,
     now: Instant,
     probe: impl FnOnce(SocketAddr) -> bool,
 ) -> bool {
+    public_endpoint_is_reachable_for_local_ips_with_probe_at(
+        ip,
+        port,
+        now,
+        std::iter::empty(),
+        probe,
+    )
+}
+
+pub(crate) fn public_endpoint_is_reachable_for_local_ips_with_probe_at(
+    ip: IpAddr,
+    port: u16,
+    now: Instant,
+    local_ips: impl IntoIterator<Item = IpAddr>,
+    probe: impl FnOnce(SocketAddr) -> bool,
+) -> bool {
     let address = SocketAddr::new(ip, port);
+    let cache_key = PublicEndpointReachabilityCacheKey {
+        address,
+        local_network: local_network_cache_key(local_ips),
+    };
     if let Ok(cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock()
-        && let Some(entry) = cache.get(&address)
+        && let Some(entry) = cache.get(&cache_key)
         && entry.is_fresh_at(now)
     {
         return entry.reachable;
@@ -4521,12 +4630,12 @@ pub(crate) fn public_endpoint_is_reachable_with_probe_at(
             && let Some(oldest) = cache
                 .iter()
                 .min_by_key(|(_, entry)| entry.checked_at)
-                .map(|(address, _)| *address)
+                .map(|(key, _)| key.clone())
         {
             cache.remove(&oldest);
         }
         cache.insert(
-            address,
+            cache_key,
             PublicEndpointReachabilityCacheEntry {
                 checked_at: now,
                 reachable,
@@ -4573,12 +4682,20 @@ pub fn daemon_advertised_endpoints_from_addresses_with_public_discovery(
             .copied()
             .any(|ip| is_invitable_ip(ip) && !crate::is_private_or_link_local_ip(ip));
         if allow_public_ip_discovery && !has_public_candidate {
-            for ip in discover_default_public_ip_candidates() {
+            for ip in discover_default_public_ip_candidates_for_local_ips(
+                lan_ips.iter().chain(route_ips.iter()).copied(),
+            ) {
                 // Only advertise a discovered public IP when it is actually reachable on the
                 // daemon port -- i.e. the user has a port-forward (or NAT hairpin) back to
                 // this daemon. An unverified public IP would otherwise pollute every peer's
                 // connection-target list with an unreachable endpoint.
-                if is_invitable_ip(ip) && public_endpoint_is_reachable(ip, port) {
+                if is_invitable_ip(ip)
+                    && public_endpoint_is_reachable_for_local_ips(
+                        ip,
+                        port,
+                        lan_ips.iter().chain(route_ips.iter()).copied(),
+                    )
+                {
                     push_unique_address(&mut lan_addresses, format_ip_port(ip, port));
                 }
             }
