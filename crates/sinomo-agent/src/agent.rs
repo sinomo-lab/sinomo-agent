@@ -3187,6 +3187,175 @@ impl AgentToolPolicy {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentToolOrchestrationRecord {
+    pub policy_id: String,
+    pub policy_allowed: bool,
+    pub policy_reason: String,
+    pub descriptor_visible: bool,
+    pub executor_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls_per_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
+    pub run_context: AgentRunContext,
+}
+
+pub struct AgentToolOrchestrator<'a> {
+    policy: &'a AgentPolicyBundle,
+    max_tool_calls_per_step: Option<usize>,
+    run_context: &'a AgentRunContext,
+}
+
+impl<'a> AgentToolOrchestrator<'a> {
+    pub fn new(
+        policy: &'a AgentPolicyBundle,
+        max_tool_calls_per_step: Option<usize>,
+        run_context: &'a AgentRunContext,
+    ) -> Self {
+        Self {
+            policy,
+            max_tool_calls_per_step,
+            run_context,
+        }
+    }
+
+    pub fn execute(
+        &self,
+        registry: &AgentToolRegistry,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let descriptor = tool_plan.descriptor(&call.tool);
+        let descriptor_visible = descriptor.is_some();
+        let executor_available = tool_plan.is_executable(&call.tool);
+        let policy_decision = self.policy.evaluate_tool_call(descriptor, call);
+        let requested_timeout_ms = call
+            .input
+            .get("timeout_ms")
+            .and_then(serde_json::Value::as_u64);
+
+        let (mut outcome, blocked_reason) = if !policy_decision.allowed {
+            let reason = policy_decision.reason.clone();
+            (
+                AgentToolOutcome {
+                    call_id: TaskId::generate(),
+                    step_index,
+                    call_index,
+                    call: call.clone(),
+                    status: AgentToolStatus::Blocked,
+                    summary: reason.clone(),
+                    output: serde_json::json!({
+                        "error": "policy_denied",
+                        "policy_id": self.policy.policy_id.clone(),
+                        "tool": call.tool.clone(),
+                        "reason": reason,
+                    }),
+                    event_id: None,
+                    evidence: AgentToolEvidence::policy_only(false, policy_decision.reason.clone()),
+                },
+                Some("policy_denied".to_string()),
+            )
+        } else if self
+            .max_tool_calls_per_step
+            .is_some_and(|max_tool_calls| call_index >= max_tool_calls)
+        {
+            let max_tool_calls_per_step = self.max_tool_calls_per_step.unwrap_or(0);
+            (
+                AgentToolOutcome {
+                    call_id: TaskId::generate(),
+                    step_index,
+                    call_index,
+                    call: call.clone(),
+                    status: AgentToolStatus::Blocked,
+                    summary: format!(
+                        "tool call limit {} reached for step {step_index}",
+                        max_tool_calls_per_step
+                    ),
+                    output: serde_json::json!({
+                        "error": "tool_call_limit_reached",
+                        "max_tool_calls_per_step": max_tool_calls_per_step,
+                    }),
+                    event_id: None,
+                    evidence: AgentToolEvidence::policy_only(
+                        false,
+                        "blocked by per-step tool call limit",
+                    ),
+                },
+                Some("tool_call_limit_reached".to_string()),
+            )
+        } else if descriptor_visible && !executor_available {
+            (
+                AgentToolOutcome {
+                    call_id: TaskId::generate(),
+                    step_index,
+                    call_index,
+                    call: call.clone(),
+                    status: AgentToolStatus::Blocked,
+                    summary: format!(
+                        "tool `{}` is visible to the model but has no executor attached to this agent",
+                        call.tool
+                    ),
+                    output: serde_json::json!({
+                        "error": "missing_executor",
+                        "tool": call.tool.clone(),
+                    }),
+                    event_id: None,
+                    evidence: AgentToolEvidence::policy_only(
+                        false,
+                        "blocked because planned tool has no runtime executor",
+                    ),
+                },
+                Some("missing_executor".to_string()),
+            )
+        } else {
+            (
+                registry.execute(session, step_index, call_index, call),
+                None,
+            )
+        };
+
+        if policy_decision.allowed && outcome.evidence.policy.allowed {
+            outcome.evidence.policy = policy_decision.clone();
+        }
+        let record = AgentToolOrchestrationRecord {
+            policy_id: self.policy.policy_id.clone(),
+            policy_allowed: policy_decision.allowed,
+            policy_reason: policy_decision.reason,
+            descriptor_visible,
+            executor_available,
+            blocked_reason,
+            max_tool_calls_per_step: self.max_tool_calls_per_step,
+            requested_timeout_ms,
+            run_context: self.run_context.clone(),
+        };
+        outcome.evidence = with_tool_orchestration_record(outcome.evidence, &record);
+        outcome
+    }
+}
+
+fn with_tool_orchestration_record(
+    mut evidence: AgentToolEvidence,
+    record: &AgentToolOrchestrationRecord,
+) -> AgentToolEvidence {
+    let record_value =
+        serde_json::to_value(record).expect("tool orchestration record serializes to JSON");
+    let mut metadata = evidence
+        .metadata
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    metadata.insert("tool_orchestration".to_string(), record_value);
+    evidence.metadata = serde_json::Value::Object(metadata);
+    evidence
+}
+
 pub struct Agent<M> {
     model: M,
     config: AgentConfig,
@@ -4070,6 +4239,11 @@ impl<M: InteractionModel> Agent<M> {
 
             let mut step_results = Vec::new();
             let tool_plan = self.tool_plan(input);
+            let tool_orchestrator = AgentToolOrchestrator::new(
+                &self.policy,
+                self.config.max_tool_calls_per_step,
+                &self.config.run_context,
+            );
             for (call_index, call) in decision.tool_calls.iter().enumerate() {
                 let tool_call_item = AgentItem::ToolCall {
                     item_id: TaskId::generate(),
@@ -4084,82 +4258,14 @@ impl<M: InteractionModel> Agent<M> {
                     },
                 )?;
                 items.push(tool_call_item);
-                let descriptor = tool_plan.descriptor(&call.tool);
-                let policy_decision = self.policy.evaluate_tool_call(descriptor, call);
-                let mut outcome = if !policy_decision.allowed {
-                    AgentToolOutcome {
-                        call_id: TaskId::generate(),
-                        step_index,
-                        call_index,
-                        call: call.clone(),
-                        status: AgentToolStatus::Blocked,
-                        summary: policy_decision.reason.clone(),
-                        output: serde_json::json!({
-                            "error": "policy_denied",
-                            "policy_id": self.policy.policy_id.clone(),
-                            "tool": call.tool.clone(),
-                            "reason": policy_decision.reason.clone(),
-                        }),
-                        event_id: None,
-                        evidence: AgentToolEvidence::policy_only(
-                            false,
-                            policy_decision.reason.clone(),
-                        ),
-                    }
-                } else if self
-                    .config
-                    .max_tool_calls_per_step
-                    .is_some_and(|max_tool_calls| call_index >= max_tool_calls)
-                {
-                    let max_tool_calls_per_step = self.config.max_tool_calls_per_step.unwrap_or(0);
-                    AgentToolOutcome {
-                        call_id: TaskId::generate(),
-                        step_index,
-                        call_index,
-                        call: call.clone(),
-                        status: AgentToolStatus::Blocked,
-                        summary: format!(
-                            "tool call limit {} reached for step {step_index}",
-                            max_tool_calls_per_step
-                        ),
-                        output: serde_json::json!({
-                            "error": "tool_call_limit_reached",
-                            "max_tool_calls_per_step": max_tool_calls_per_step,
-                        }),
-                        event_id: None,
-                        evidence: AgentToolEvidence::policy_only(
-                            false,
-                            "blocked by per-step tool call limit",
-                        ),
-                    }
-                } else if descriptor.is_some() && !tool_plan.is_executable(&call.tool) {
-                    AgentToolOutcome {
-                        call_id: TaskId::generate(),
-                        step_index,
-                        call_index,
-                        call: call.clone(),
-                        status: AgentToolStatus::Blocked,
-                        summary: format!(
-                            "tool `{}` is visible to the model but has no executor attached to this agent",
-                            call.tool
-                        ),
-                        output: serde_json::json!({
-                            "error": "missing_executor",
-                            "tool": call.tool,
-                        }),
-                        event_id: None,
-                        evidence: AgentToolEvidence::policy_only(
-                            false,
-                            "blocked because planned tool has no runtime executor",
-                        ),
-                    }
-                } else {
-                    self.tools
-                        .execute(&input.session, step_index, call_index, call)
-                };
-                if policy_decision.allowed && outcome.evidence.policy.allowed {
-                    outcome.evidence.policy = policy_decision;
-                }
+                let mut outcome = tool_orchestrator.execute(
+                    &self.tools,
+                    &input.session,
+                    &tool_plan,
+                    step_index,
+                    call_index,
+                    call,
+                );
                 let event = caused_by_latest_event(
                     agent_event(
                         &input.session,
@@ -5944,13 +6050,15 @@ mod tests {
 
     #[test]
     fn agent_executes_tool_calls_and_continues_until_final_answer() {
+        let task = AgentTaskRef::new("coding", "inspect workspace")
+            .with_owner_role(AgentRole::Deliberation);
         let model = SequencedModel::new([
             r#"{
                 "response_mode": "defer",
                 "text": "I will inspect the file.",
                 "tool_calls": [{
                     "tool": "read_file",
-                    "input": {"path": "Cargo.toml"},
+                    "input": {"path": "Cargo.toml", "timeout_ms": 123},
                     "async": false,
                     "summary": "Inspect workspace metadata."
                 }],
@@ -5965,7 +6073,11 @@ mod tests {
                 "next_state": "listening"
             }"#,
         ]);
+        let config = AgentConfig::new("fake", "fake")
+            .with_task_ref(task.clone())
+            .with_placement(AgentPlacementMetadata::local_current_process());
         let agent = Agent::new(model, "fake", "fake")
+            .with_config(config)
             .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
 
         let run = agent.run(&agent_input("inspect the repo")).expect("run");
@@ -5978,6 +6090,37 @@ mod tests {
         assert_eq!(run.model_turns.len(), 2);
         assert_eq!(run.tool_results.len(), 1);
         assert_eq!(run.tool_results[0].status, AgentToolStatus::Succeeded);
+        let orchestration = run.tool_results[0]
+            .evidence
+            .metadata
+            .get("tool_orchestration")
+            .expect("tool orchestration metadata");
+        assert_eq!(
+            orchestration
+                .get("policy_id")
+                .and_then(serde_json::Value::as_str),
+            Some("deliberation-default")
+        );
+        assert_eq!(
+            orchestration
+                .get("executor_available")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            orchestration
+                .get("requested_timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            Some(123)
+        );
+        assert_eq!(
+            orchestration
+                .get("run_context")
+                .and_then(|context| context.get("task"))
+                .and_then(|task| task.get("task_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(task.task_id.as_str())
+        );
         assert!(
             agent.model.requests.lock().expect("requests")[1]
                 .messages
