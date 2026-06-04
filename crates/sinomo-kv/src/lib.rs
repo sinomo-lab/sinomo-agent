@@ -481,6 +481,108 @@ pub struct KvSnapshot {
     pub events: Vec<KvEvent>,
 }
 
+impl KvSnapshot {
+    /// Returns a snapshot with stable key/lease ordering and duplicate records
+    /// collapsed to the same last-record-wins state as `InProcessKvStore::restore`.
+    ///
+    /// Call this before using the snapshot point/range helpers on externally
+    /// supplied snapshots. Snapshots produced by `InProcessKvStore::snapshot`,
+    /// `KvMaterializedCache`, and `KvLocalCache` are already canonical.
+    pub fn canonicalized(mut self) -> Self {
+        self.canonicalize();
+        self
+    }
+
+    /// Canonicalizes this snapshot in place.
+    pub fn canonicalize(&mut self) {
+        self.entries.sort_by(|left, right| left.key.cmp(&right.key));
+        self.entries.reverse();
+        self.entries.dedup_by(|left, right| left.key == right.key);
+        self.entries.reverse();
+        self.leases
+            .sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+        self.leases.reverse();
+        self.leases
+            .dedup_by(|left, right| left.lease_id == right.lease_id);
+        self.leases.reverse();
+    }
+
+    /// Looks up a key in a canonical snapshot.
+    ///
+    /// This is intentionally `O(log n)` and does not validate ordering in release
+    /// builds; canonicalize externally supplied snapshots first.
+    pub fn get(&self, key: &str) -> Option<&KvEntry> {
+        debug_assert!(self.is_canonical());
+        self.entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(key))
+            .ok()
+            .and_then(|index| self.entries.get(index))
+    }
+
+    /// Returns all entries under `prefix` from a canonical snapshot.
+    pub fn range_prefix(&self, prefix: &str) -> Vec<KvEntry> {
+        self.prefix_entries(prefix).cloned().collect()
+    }
+
+    /// Iterates entries under `prefix` from a canonical snapshot without cloning.
+    pub fn prefix_entries<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a KvEntry> + 'a {
+        debug_assert!(self.is_canonical());
+        let start = self
+            .entries
+            .partition_point(|entry| entry.key.as_str() < prefix);
+        self.entries[start..]
+            .iter()
+            .take_while(move |entry| entry.key.starts_with(prefix))
+    }
+
+    /// Returns at most `max_entries` entries under `prefix` from a canonical snapshot.
+    pub fn range_prefix_limited(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+    ) -> Result<Vec<KvEntry>, KvError> {
+        self.range_prefix_limited_by_payload_bytes(prefix, max_entries, usize::MAX)
+    }
+
+    pub fn range_prefix_limited_by_payload_bytes(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, KvError> {
+        let mut entries = Vec::new();
+        let mut payload_bytes = 0_usize;
+        for entry in self.prefix_entries(prefix) {
+            if entries.len() >= max_entries {
+                return Err(KvError::RangeLimit {
+                    prefix: prefix.to_string(),
+                    max_entries,
+                });
+            }
+            payload_bytes = payload_bytes.saturating_add(kv_entry_payload_bytes(entry));
+            if payload_bytes > max_payload_bytes {
+                return Err(KvError::RangePayloadLimit {
+                    prefix: prefix.to_string(),
+                    observed_bytes: payload_bytes,
+                    max_bytes: max_payload_bytes,
+                });
+            }
+            entries.push(entry.clone());
+        }
+        Ok(entries)
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.entries
+            .windows(2)
+            .all(|window| window[0].key < window[1].key)
+            && self
+                .leases
+                .windows(2)
+                .all(|window| window[0].lease_id < window[1].lease_id)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvLogEntry {
     pub index: u64,
@@ -718,13 +820,16 @@ fn cache_store_snapshot(path: &Path, identity: FileIdentity, snapshot: Arc<KvSna
     }
 }
 
-fn cache_lookup_raft_view(paths: &KvWalPaths, identity: RaftViewIdentity) -> Option<KvSnapshot> {
+fn cache_lookup_raft_view(
+    paths: &KvWalPaths,
+    identity: RaftViewIdentity,
+) -> Option<Arc<KvSnapshot>> {
     let guard = raft_view_cache().lock().ok()?;
     let entry = guard.get(&paths.root)?;
     if entry.identity != identity {
         return None;
     }
-    let snapshot = (*entry.snapshot).clone();
+    let snapshot = entry.snapshot.clone();
     drop(guard);
     // Re-stat after cloning the cached view so a concurrent append/rewrite cannot
     // slip between the first identity read and the return. If the files change
@@ -732,17 +837,18 @@ fn cache_lookup_raft_view(paths: &KvWalPaths, identity: RaftViewIdentity) -> Opt
     (raft_view_identity(paths) == Some(identity)).then_some(snapshot)
 }
 
-fn cache_store_raft_view(paths: &KvWalPaths, identity: RaftViewIdentity, snapshot: KvSnapshot) {
+fn cache_store_raft_view(
+    paths: &KvWalPaths,
+    identity: RaftViewIdentity,
+    snapshot: Arc<KvSnapshot>,
+) {
     if let Ok(mut guard) = raft_view_cache().lock() {
         if guard.len() >= FILE_CACHE_CAPACITY && !guard.contains_key(&paths.root) {
             guard.clear();
         }
         guard.insert(
             paths.root.clone(),
-            RaftViewCacheEntry {
-                identity,
-                snapshot: Arc::new(snapshot),
-            },
+            RaftViewCacheEntry { identity, snapshot },
         );
     }
 }
@@ -779,17 +885,56 @@ impl KvMaterializedCache {
         self.path.exists()
     }
 
-    pub fn read_snapshot(&self) -> Result<KvSnapshot, KvError> {
+    pub fn read_snapshot_arc(&self) -> Result<Arc<KvSnapshot>, KvError> {
         let identity = file_identity(&self.path);
         if let Some(identity) = identity
             && let Some(cached) = cache_lookup_snapshot(&self.path, identity)
         {
-            return Ok((*cached).clone());
+            return Ok(cached);
         }
-        let snapshot = read_object_file::<KvSnapshot>(&self.path)?;
+        let snapshot = Arc::new(read_object_file::<KvSnapshot>(&self.path)?.canonicalized());
         if let Some(identity) = identity {
-            cache_store_snapshot(&self.path, identity, Arc::new(snapshot.clone()));
+            cache_store_snapshot(&self.path, identity, snapshot.clone());
         }
+        Ok(snapshot)
+    }
+
+    pub fn read_snapshot(&self) -> Result<KvSnapshot, KvError> {
+        let snapshot = self.read_snapshot_arc()?;
+        Ok((*snapshot).clone())
+    }
+
+    pub fn read_snapshot_with_raft_view(
+        &self,
+        node_id: NodeId,
+        paths: KvWalPaths,
+    ) -> Result<Arc<KvSnapshot>, KvError> {
+        if paths.root.exists() {
+            if let Some(identity) = raft_view_identity(&paths)
+                && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
+            {
+                return Ok(snapshot);
+            }
+            let node =
+                match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
+                    Ok(node) => node,
+                    Err(KvError::Busy { .. }) if self.exists() => {
+                        return self.read_snapshot_arc();
+                    }
+                    Err(error) => return Err(error),
+                };
+            let snapshot = node.store().snapshot().canonicalized();
+            self.write_snapshot_if_changed(&snapshot)?;
+            let snapshot = Arc::new(snapshot);
+            if let Some(identity) = raft_view_identity(&node.paths) {
+                cache_store_raft_view(&node.paths, identity, snapshot.clone());
+            }
+            return Ok(snapshot);
+        }
+        if self.exists() {
+            return self.read_snapshot_arc();
+        }
+        let snapshot = Arc::new(InProcessKvStore::new().snapshot().canonicalized());
         Ok(snapshot)
     }
 
@@ -800,14 +945,16 @@ impl KvMaterializedCache {
     /// Returns the snapshot that should actually be persisted: the input with its
     /// event history compacted to the configured materialized-event limit.
     fn materialized(&self, snapshot: &KvSnapshot) -> KvSnapshot {
-        match self.max_materialized_events {
+        let mut snapshot = match self.max_materialized_events {
             Some(max_events) if snapshot.events.len() > max_events => {
                 let mut snapshot = snapshot.clone();
                 compact_kv_snapshot_event_history(&mut snapshot, max_events);
                 snapshot
             }
             _ => snapshot.clone(),
-        }
+        };
+        snapshot.canonicalize();
+        snapshot
     }
 
     /// Persists `snapshot` and refreshes the process-wide read cache so subsequent
@@ -849,31 +996,8 @@ impl KvMaterializedCache {
         node_id: NodeId,
         paths: KvWalPaths,
     ) -> Result<InProcessKvStore, KvError> {
-        if paths.root.exists() {
-            if let Some(identity) = raft_view_identity(&paths)
-                && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
-            {
-                return Ok(InProcessKvStore::restore(snapshot));
-            }
-            let node =
-                match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
-                    Ok(node) => node,
-                    Err(KvError::Busy { .. }) if self.exists() => {
-                        return self.read_store();
-                    }
-                    Err(error) => return Err(error),
-                };
-            let store = node.store().clone();
-            self.write_snapshot_if_changed(&store.snapshot())?;
-            if let Some(identity) = raft_view_identity(&node.paths) {
-                cache_store_raft_view(&node.paths, identity, store.snapshot());
-            }
-            return Ok(store);
-        }
-        if self.exists() {
-            return self.read_store();
-        }
-        Ok(InProcessKvStore::new())
+        self.read_snapshot_with_raft_view(node_id, paths)
+            .map(|snapshot| InProcessKvStore::restore((*snapshot).clone()))
     }
 }
 
@@ -909,7 +1033,10 @@ impl KvLocalCache {
     }
 
     pub fn current_get(&self, node_id: NodeId, key: &str) -> Result<Option<KvEntry>, KvError> {
-        Ok(self.current_store(node_id)?.get(key).cloned())
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        Ok(snapshot.get(key).cloned())
     }
 
     pub fn current_get_serde<T: DeserializeOwned>(
@@ -927,7 +1054,10 @@ impl KvLocalCache {
         node_id: NodeId,
         prefix: &str,
     ) -> Result<Vec<KvEntry>, KvError> {
-        Ok(self.current_store(node_id)?.range_prefix(prefix))
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        Ok(snapshot.range_prefix(prefix))
     }
 
     pub fn current_range_prefix_limited(
@@ -936,8 +1066,10 @@ impl KvLocalCache {
         prefix: &str,
         max_entries: usize,
     ) -> Result<Vec<KvEntry>, KvError> {
-        self.current_store(node_id)?
-            .range_prefix_limited(prefix, max_entries)
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        snapshot.range_prefix_limited(prefix, max_entries)
     }
 
     pub fn current_range_prefix_limited_by_payload_bytes(
@@ -947,8 +1079,10 @@ impl KvLocalCache {
         max_entries: usize,
         max_payload_bytes: usize,
     ) -> Result<Vec<KvEntry>, KvError> {
-        self.current_store(node_id)?
-            .range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        snapshot.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
     }
 
     pub fn current_range_prefix_serde<T: DeserializeOwned>(
@@ -963,11 +1097,17 @@ impl KvLocalCache {
     }
 
     pub fn current_snapshot(&self, node_id: NodeId) -> Result<KvSnapshot, KvError> {
-        self.current_store(node_id).map(|store| store.snapshot())
+        self.materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))
+            .map(|snapshot| (*snapshot).clone())
     }
 
     pub fn cached_snapshot(&self) -> Result<KvSnapshot, KvError> {
         self.materialized.read_snapshot()
+    }
+
+    pub fn cached_snapshot_arc(&self) -> Result<Arc<KvSnapshot>, KvError> {
+        self.materialized.read_snapshot_arc()
     }
 
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
@@ -3837,6 +3977,91 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_point_and_prefix_reads_preserve_store_semantics() {
+        let entry = |key: &str, value: &[u8]| KvEntry {
+            key: key.to_string(),
+            value: value.to_vec(),
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(1),
+            version: KvVersion(1),
+            lease_id: None,
+        };
+        let sorted = KvSnapshot {
+            revision: KvRevision(3),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![
+                entry("/apps/service/a", b"a"),
+                entry("/apps/service/b", b"b"),
+                entry("/apps/servicez/not-child", b"z"),
+                entry("/other/service/c", b"c"),
+            ],
+            leases: Vec::new(),
+            events: Vec::new(),
+        };
+
+        assert_eq!(
+            sorted.get("/apps/service/b").expect("point read").value,
+            b"b"
+        );
+        assert!(sorted.get("/apps/service/missing").is_none());
+        assert_eq!(
+            sorted
+                .range_prefix("/apps/service/")
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec!["/apps/service/a", "/apps/service/b"]
+        );
+        assert_eq!(
+            sorted
+                .prefix_entries("/apps/service/")
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/apps/service/a", "/apps/service/b"]
+        );
+
+        let unsorted = KvSnapshot {
+            entries: vec![
+                entry("/apps/service/b", b"b"),
+                entry("/apps/service/a", b"stale-a"),
+                entry("/other/service/c", b"c"),
+                entry("/apps/service/a", b"a"),
+            ],
+            ..sorted
+        }
+        .canonicalized();
+        assert_eq!(
+            unsorted
+                .entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/apps/service/a", "/apps/service/b", "/other/service/c"]
+        );
+        assert_eq!(
+            unsorted.get("/apps/service/a").expect("point read").value,
+            b"a"
+        );
+        assert_eq!(
+            unsorted
+                .range_prefix("/apps/service/")
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec!["/apps/service/a", "/apps/service/b"]
+        );
+        assert_eq!(
+            unsorted
+                .range_prefix_limited("/apps/service/", 1)
+                .expect_err("range limit"),
+            KvError::RangeLimit {
+                prefix: "/apps/service/".to_string(),
+                max_entries: 1,
+            }
+        );
+    }
+
+    #[test]
     fn put_rejects_values_larger_than_metadata_limit() {
         let mut store = InProcessKvStore::new();
         let error = store
@@ -5098,6 +5323,64 @@ mod tests {
     }
 
     #[test]
+    fn materialized_cache_canonicalizes_external_snapshot_entries_on_read() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-materialized-canonical-read-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let entry = |key: &str, value: &[u8]| KvEntry {
+            key: key.to_string(),
+            value: value.to_vec(),
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(1),
+            version: KvVersion(1),
+            lease_id: None,
+        };
+        let snapshot = KvSnapshot {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![
+                entry("beta", b"two"),
+                entry("alpha", b"stale"),
+                entry("alpha", b"one"),
+            ],
+            leases: vec![
+                KvLease {
+                    lease_id: LeaseId(7),
+                    ttl_ticks: 10,
+                    remaining_ticks: 10,
+                    granted_at: OffsetDateTime::UNIX_EPOCH,
+                },
+                KvLease {
+                    lease_id: LeaseId(7),
+                    ttl_ticks: 20,
+                    remaining_ticks: 20,
+                    granted_at: OffsetDateTime::UNIX_EPOCH,
+                },
+            ],
+            events: Vec::new(),
+        };
+        write_object_file(cache.path(), &snapshot).expect("write external snapshot");
+
+        let read = cache.read_snapshot().expect("read canonical snapshot");
+        assert_eq!(
+            read.entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(read.get("alpha").expect("alpha").value, b"one");
+        assert_eq!(read.leases.len(), 1);
+        assert_eq!(read.leases[0].ttl_ticks, 20);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn materialized_cache_skips_rewrite_on_revision_only_changes() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-kv-durable-skip-{}",
@@ -5360,6 +5643,86 @@ mod tests {
         assert_eq!(
             cached.get("/raft-cached").expect("cached raft value").value,
             b"current"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_point_and_prefix_reads_use_cached_raft_view_when_lock_is_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-snapshot-read-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_local_cache_snapshot_read").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        {
+            let mut node = cache.open_raft_node(node_id.clone()).expect("open raft");
+            for (index, (key, value)) in [
+                ("/apps/service/a", b"a".as_slice()),
+                ("/apps/service/b", b"b".as_slice()),
+                ("/other/service/c", b"c".as_slice()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let entry = node
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: key.to_string(),
+                            value: value.to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append raft value");
+                node.commit_to(entry.index)
+                    .unwrap_or_else(|error| panic!("commit raft value {index}: {error}"));
+            }
+        }
+
+        let first = cache
+            .current_get(node_id.clone(), "/apps/service/a")
+            .expect("seed raft view cache")
+            .expect("raft value");
+        assert_eq!(first.value, b"a");
+
+        let mut stale_store = InProcessKvStore::new();
+        stale_store
+            .put("/apps/service/stale", b"stale".to_vec(), None)
+            .expect("seed stale cache");
+        cache
+            .write_snapshot(&stale_store.snapshot())
+            .expect("write stale materialized cache");
+        let _held_node = cache
+            .open_raft_node(node_id.clone())
+            .expect("hold raft lock");
+
+        assert_eq!(
+            cache
+                .current_get(node_id.clone(), "/apps/service/b")
+                .expect("cached point read")
+                .expect("raft value")
+                .value,
+            b"b"
+        );
+        assert!(
+            cache
+                .current_get(node_id.clone(), "/apps/service/stale")
+                .expect("cached point read")
+                .is_none(),
+            "point reads must not fall back to stale materialized snapshots when a valid raft view is cached"
+        );
+        assert_eq!(
+            cache
+                .current_range_prefix(node_id, "/apps/service/")
+                .expect("cached prefix read")
+                .into_iter()
+                .map(|entry| entry.key)
+                .collect::<Vec<_>>(),
+            vec!["/apps/service/a", "/apps/service/b"]
         );
         std::fs::remove_dir_all(root).ok();
     }

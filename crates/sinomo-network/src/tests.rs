@@ -1184,6 +1184,80 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
 }
 
 #[test]
+fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-noop-large-prefix-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_noop_large").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_noop_large_a").expect("node a");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity noop large prefix",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let mut store = InProcessKvStore::new();
+    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+        let target_node_id =
+            NodeId::from_legacy_named(format!("node_conn_noop_large_target_{index:05}"))
+                .expect("target");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(format!(
+                "endpoint_conn_noop_large_{index:05}"
+            ))
+            .expect("endpoint"),
+            node_id: target_node_id,
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("10.0.{}.{}:21353", index / 255, index % 255),
+            source: ClusterEndpointSource::Observed,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        let record = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            600,
+        );
+        store
+            .put_serde(
+                cluster_connectivity_key(
+                    &record.source_node_id,
+                    &record.target_node_id,
+                    &record.endpoint_id,
+                ),
+                &record,
+                None,
+            )
+            .expect("seed connectivity");
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    assert!(
+        !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
+        "large prefixes should be scanned completely so missing records are detected as deletes"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stable_connectivity_sync_does_not_open_raft_node() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-noop-no-raft-open-{}",
@@ -2769,11 +2843,78 @@ fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
         .expect("seed stale cache");
     write_cluster_kv_snapshot(&paths, &stale_store.snapshot()).expect("write stale snapshot");
 
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("read current snapshot");
+    assert!(
+        snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/raft-only"),
+        "current snapshots should prefer raft over stale materialized state"
+    );
+    assert!(
+        !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.key == "/stale-cache-only"),
+        "current snapshots must not include stale materialized-only entries"
+    );
+
     let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
     assert!(store.get("/raft-only").is_some());
     assert!(store.get("/stale-cache-only").is_none());
     let refreshed = read_cluster_kv_snapshot(&paths).expect("read refreshed cache");
     assert_eq!(refreshed.revision, store.revision());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-invite-read-raft-over-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_invite_read_raft").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_invite_read_raft").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "invite read raft",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_read_raft").expect("invite"),
+        cluster_id,
+        cluster_name: Some("invite read raft".to_string()),
+        cluster_public_key: "cluster-pk".to_string(),
+        invitation_secret: "secret".to_string(),
+        communication_channels: Vec::new(),
+        introducers: Vec::new(),
+        token_id: "token".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: node_id,
+        issuer_public_key: "issuer-pk".to_string(),
+        signature: String::new(),
+    };
+    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("overwrite stale materialized snapshot");
+
+    assert_eq!(
+        read_cluster_invitation_from_kv(&paths, &invite.invite_id).expect("read invitation"),
+        invite
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

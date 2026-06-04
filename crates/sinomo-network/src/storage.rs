@@ -1540,6 +1540,13 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
         .map_err(Into::into)
 }
 
+pub fn read_cluster_kv_current_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
+    let node_id = read_cluster_kv_reader_node_id(paths)?;
+    cluster_kv_local_cache(paths)
+        .current_snapshot(node_id)
+        .map_err(Into::into)
+}
+
 pub fn read_cluster_kv_entry(
     paths: &ClusterPaths,
     key: &str,
@@ -1616,6 +1623,20 @@ pub fn read_cluster_kv_snapshot_store(
     cluster_kv_local_cache(paths)
         .cached_store()
         .map_err(Into::into)
+}
+
+fn read_cluster_kv_cached_snapshot_entry(
+    paths: &ClusterPaths,
+    key: &str,
+) -> Result<Option<KvEntry>, NetworkError> {
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    Ok(snapshot.get(key).cloned())
+}
+
+fn read_cluster_kv_cached_snapshot(paths: &ClusterPaths) -> Result<Arc<KvSnapshot>, NetworkError> {
+    cluster_kv_local_cache(paths)
+        .cached_snapshot_arc()
+        .map_err(NetworkError::from)
 }
 
 fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
@@ -1958,7 +1979,7 @@ pub fn create_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchPrefixRequest,
 ) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let snapshot = read_cluster_kv_store(paths)?.snapshot();
+    let snapshot = read_cluster_kv_current_snapshot(paths)?;
     if request.start_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
@@ -2049,7 +2070,7 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
 
     let watch_path = cluster_kv_watch_path(paths, watch_id);
     let mut registration = read_cluster_kv_watch_registration(&watch_path, watch_id)?;
-    let snapshot = read_cluster_kv_store(paths)?.snapshot();
+    let snapshot = read_cluster_kv_current_snapshot(paths)?;
     if registration.next_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
@@ -4302,8 +4323,9 @@ pub fn stored_cluster_node_status_matches(
     paths: &ClusterPaths,
     status: &ClusterNodeStatusRecord,
 ) -> Result<bool, NetworkError> {
-    let store = read_cluster_kv_snapshot_store(paths)?;
-    let Some(entry) = store.get(&cluster_node_status_key(&status.node_id)) else {
+    let Some(entry) =
+        read_cluster_kv_cached_snapshot_entry(paths, &cluster_node_status_key(&status.node_id))?
+    else {
         return Ok(false);
     };
     let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
@@ -4315,7 +4337,8 @@ pub fn stored_cluster_node_status_matches(
     if !cluster_node_status_stable_eq(&existing, status) {
         return Ok(false);
     }
-    let rollout_entry = store.get(&cluster_rollout_node_key(&status.node_id));
+    let rollout_entry =
+        read_cluster_kv_cached_snapshot_entry(paths, &cluster_rollout_node_key(&status.node_id))?;
     Ok(match (&status.rollout, rollout_entry) {
         (Some(expected), Some(entry)) => entry
             .decode::<sinomo_core::ClusterNodeRolloutStatus>()
@@ -4348,8 +4371,9 @@ pub fn stored_cluster_network_info_matches(
     paths: &ClusterPaths,
     info: &ClusterNetworkInfoRecord,
 ) -> Result<bool, NetworkError> {
-    let store = read_cluster_kv_snapshot_store(paths)?;
-    let Some(entry) = store.get(&cluster_network_info_key(&info.node_id)) else {
+    let Some(entry) =
+        read_cluster_kv_cached_snapshot_entry(paths, &cluster_network_info_key(&info.node_id))?
+    else {
         return Ok(false);
     };
     let Ok(existing) = entry.decode::<ClusterNetworkInfoRecord>() else {
@@ -4376,13 +4400,14 @@ pub fn cluster_connectivity_sync_ops(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
-    let store = read_cluster_kv_snapshot_store(paths)?;
     let now = OffsetDateTime::now_utc();
     let mut existing = BTreeMap::new();
-    for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    let prefix = cluster_connectivity_source_prefix(source_node_id);
+    for entry in snapshot.prefix_entries(&prefix) {
         match entry.decode::<ClusterConnectivityRecord>() {
             Ok(record) => {
-                existing.insert(entry.key, record);
+                existing.insert(entry.key.clone(), record);
             }
             Err(_) => {
                 existing.remove(&entry.key);
@@ -4418,7 +4443,6 @@ fn cluster_connectivity_full_sync_ops(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
-    let store = read_cluster_kv_snapshot_store(paths)?;
     let now = OffsetDateTime::now_utc();
     let mut incoming = BTreeMap::new();
     for record in records {
@@ -4432,13 +4456,17 @@ fn cluster_connectivity_full_sync_ops(
 
     let mut existing = BTreeMap::new();
     let mut ops = Vec::new();
-    for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    let prefix = cluster_connectivity_source_prefix(source_node_id);
+    for entry in snapshot.prefix_entries(&prefix) {
         if !incoming.contains_key(&entry.key) {
-            ops.push(KvOp::Delete { key: entry.key });
+            ops.push(KvOp::Delete {
+                key: entry.key.clone(),
+            });
             continue;
         }
         if let Ok(record) = entry.decode::<ClusterConnectivityRecord>() {
-            existing.insert(entry.key, record);
+            existing.insert(entry.key.clone(), record);
         }
     }
 
@@ -4472,9 +4500,10 @@ pub fn cluster_connectivity_sync_is_noop(
             )
         })
         .collect();
-    let store = read_cluster_kv_snapshot_store(paths)?;
     // A stored record no longer present in `records` would need deletion.
-    for entry in store.range_prefix(&cluster_connectivity_source_prefix(source_node_id)) {
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    let prefix = cluster_connectivity_source_prefix(source_node_id);
+    for entry in snapshot.prefix_entries(&prefix) {
         if !incoming_keys.contains(&entry.key) {
             return Ok(false);
         }
@@ -4489,10 +4518,10 @@ pub fn expire_cluster_network_record_ops(
     state: &ClusterBootstrapState,
     now: OffsetDateTime,
 ) -> Result<(Vec<KvCompare>, Vec<KvOp>), NetworkError> {
-    let store = read_cluster_kv_snapshot_store(paths)?;
     let mut compares = Vec::new();
     let mut ops = Vec::new();
-    for entry in store.range_prefix("/cluster/network/info/") {
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    for entry in snapshot.prefix_entries("/cluster/network/info/") {
         let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
             continue;
         };
@@ -4502,12 +4531,14 @@ pub fn expire_cluster_network_record_ops(
         if cluster_network_record_expired(record.expires_at, now) {
             compares.push(KvCompare::ValueEquals {
                 key: entry.key.clone(),
-                value: entry.value,
+                value: entry.value.clone(),
             });
-            ops.push(KvOp::Delete { key: entry.key });
+            ops.push(KvOp::Delete {
+                key: entry.key.clone(),
+            });
         }
     }
-    for entry in store.range_prefix("/cluster/network/connectivity/") {
+    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
         let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
             continue;
         };
@@ -4517,9 +4548,11 @@ pub fn expire_cluster_network_record_ops(
         if cluster_network_record_expired(record.expires_at, now) {
             compares.push(KvCompare::ValueEquals {
                 key: entry.key.clone(),
-                value: entry.value,
+                value: entry.value.clone(),
             });
-            ops.push(KvOp::Delete { key: entry.key });
+            ops.push(KvOp::Delete {
+                key: entry.key.clone(),
+            });
         }
     }
     Ok((compares, ops))
@@ -4664,9 +4697,8 @@ pub fn expire_cluster_network_records(
     now: OffsetDateTime,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    let store = read_cluster_kv_store(paths)?;
     let mut success = Vec::new();
-    for entry in store.range_prefix("/cluster/network/info/") {
+    for entry in read_cluster_kv_prefix_entries(paths, "/cluster/network/info/")? {
         let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
             continue;
         };
@@ -4674,7 +4706,7 @@ pub fn expire_cluster_network_records(
             success.push(KvOp::Delete { key: entry.key });
         }
     }
-    for entry in store.range_prefix("/cluster/network/connectivity/") {
+    for entry in read_cluster_kv_prefix_entries(paths, "/cluster/network/connectivity/")? {
         let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
             continue;
         };
@@ -4803,12 +4835,7 @@ pub fn cluster_module_rollout_reconcile_key(
 pub fn read_cluster_rollout_desired_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Option<ClusterRolloutDesiredRecord>, NetworkError> {
-    let store = read_cluster_kv_store(paths)?;
-    let key = cluster_rollout_desired_key();
-    let Some(entry) = store.get(&key) else {
-        return Ok(None);
-    };
-    entry.decode().map(Some).map_err(Into::into)
+    read_cluster_kv_value(paths, &cluster_rollout_desired_key())
 }
 
 pub fn sync_cluster_rollout_desired_to_kv(
@@ -4828,9 +4855,8 @@ pub fn read_cluster_invitation_from_kv(
     paths: &ClusterPaths,
     invite_id: &ClusterInviteId,
 ) -> Result<sinomo_core::ClusterJoinInvite, NetworkError> {
-    let store = read_cluster_kv_store(paths)?;
     let key = cluster_invitation_key(invite_id);
-    let entry = store.get(&key).ok_or_else(|| NetworkError::StorageIo {
+    let entry = read_cluster_kv_entry(paths, &key)?.ok_or_else(|| NetworkError::StorageIo {
         path: key.clone(),
         detail: "cluster invitation is not published".to_string(),
     })?;
