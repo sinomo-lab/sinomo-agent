@@ -443,6 +443,13 @@ fn local_command_result_from_output(
         )
     } else {
         summary_override
+            .map(|summary| {
+                if succeeded {
+                    summary
+                } else {
+                    format!("{summary} failed with exit status {:?}", status)
+                }
+            })
             .unwrap_or_else(|| format!("{program} {} exited with {:?}", args.join(" "), status))
     };
     let payload = serde_json::json!({
@@ -622,12 +629,15 @@ fn resolve_existing_workspace_path(
 }
 
 fn display_workspace_path(config: &LocalWorkspaceAgentConfig, path: &Path) -> String {
-    canonical_workspace_root(config)
-        .ok()
-        .and_then(|root| path.strip_prefix(root).ok().map(Path::to_path_buf))
-        .unwrap_or_else(|| path.to_path_buf())
-        .display()
-        .to_string()
+    if let Ok(root) = canonical_workspace_root(config) {
+        if let Ok(relative) = path.strip_prefix(root) {
+            if relative.as_os_str().is_empty() {
+                return ".".to_string();
+            }
+            return relative.display().to_string();
+        }
+    }
+    path.display().to_string()
 }
 
 fn collect_workspace_search_matches(

@@ -86,9 +86,9 @@ impl AgentTool for ApplyPatchTool {
             return apply_structured_json_changes(&self.config, changes, patch_ref);
         }
 
-        let Some(patch) = input_raw_string(request.call, "patch") else {
+        let Some(patch) = input_patch_string(request.call) else {
             return AgentToolResult::failed(
-                "apply_patch requires a string patch or structured changes array",
+                "apply_patch requires a raw string patch, a patch string field, or a structured changes array",
                 serde_json::json!({ "error": "missing_patch" }),
             );
         };
@@ -110,6 +110,14 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
             APPLY_PATCH_LARK_GRAMMAR,
         )
         .with_raw_input_argument("patch")])
+}
+
+fn input_patch_string(call: &AgentToolCall) -> Option<String> {
+    call.input
+        .as_str()
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .or_else(|| input_raw_string(call, "patch"))
 }
 
 fn patch_too_large(bytes: usize, max_bytes: usize) -> AgentToolResult {

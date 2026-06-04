@@ -3847,7 +3847,71 @@ fn model_visible_tool_output(
     if looks_like_patch_output && let Some(diff) = object.get_mut("diff") {
         *diff = model_visible_patch_diff(diff);
     }
+    if looks_like_command_output(tool_name, object)
+        && let Some(diagnostics) = model_visible_command_output_diagnostics(object)
+    {
+        object.insert("command_output_diagnostics".to_string(), diagnostics);
+    }
     value
+}
+
+fn looks_like_command_output(
+    tool_name: Option<&str>,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    tool_name == Some("run_command")
+        || object.contains_key("program")
+            && object.contains_key("args")
+            && object.contains_key("status")
+            && object.contains_key("stdout")
+            && object.contains_key("stderr")
+}
+
+fn model_visible_command_output_diagnostics(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let success = object
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let timed_out = object
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if success && !timed_out {
+        return None;
+    }
+    let stderr = object
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let stdout = object
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if stderr.is_empty() && stdout.is_empty() && !timed_out {
+        return None;
+    }
+    Some(serde_json::json!({
+        "kind": if timed_out { "command_timed_out" } else { "command_failed" },
+        "status": object.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "timed_out": timed_out,
+        "stderr_excerpt": model_visible_text_excerpt(stderr, 4096),
+        "stdout_excerpt": model_visible_text_excerpt(stdout, 2048),
+        "stderr_truncated": object.get("stderr_truncated").cloned().unwrap_or(serde_json::Value::Bool(false)),
+        "stdout_truncated": object.get("stdout_truncated").cloned().unwrap_or(serde_json::Value::Bool(false)),
+    }))
+}
+
+fn model_visible_text_excerpt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}\n[truncated]", &text[..end])
 }
 
 fn model_visible_tool_evidence(evidence: &AgentToolEvidence) -> serde_json::Value {
@@ -5747,6 +5811,45 @@ mod tests {
     }
 
     #[test]
+    fn render_tool_results_surfaces_failed_command_stderr() {
+        let outcome = AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index: 4,
+            call_index: 0,
+            call: AgentToolCall {
+                tool: "run_command".to_string(),
+                input: serde_json::json!({ "command": "make check" }),
+                r#async: false,
+                summary: "run focused check".to_string(),
+            },
+            status: AgentToolStatus::Failed,
+            summary: "make check failed with exit status Some(2)".to_string(),
+            output: serde_json::json!({
+                "program": "bash",
+                "args": ["-lc", "make check"],
+                "cwd": ".",
+                "status": 2,
+                "success": false,
+                "timed_out": false,
+                "timeout_ms": null,
+                "stdout": "running checks\n",
+                "stderr": "checker reported the actual failure\n",
+                "stdout_truncated": false,
+                "stderr_truncated": false,
+                "changed_files": [],
+            }),
+            event_id: None,
+            evidence: AgentToolEvidence::policy_only(true, "allowed"),
+        };
+
+        let rendered = render_tool_results(4, &[outcome]).expect("render");
+
+        assert!(rendered.contains("\"command_output_diagnostics\""));
+        assert!(rendered.contains("\"kind\": \"command_failed\""));
+        assert!(rendered.contains("checker reported the actual failure"));
+    }
+
+    #[test]
     fn tool_planner_composes_runtime_and_session_descriptors() {
         let agent = Agent::new(
             SequencedModel::new(std::iter::empty::<String>()),
@@ -6363,6 +6466,13 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            outcome
+                .output
+                .get("cwd")
+                .and_then(serde_json::Value::as_str),
+            Some(".")
+        );
     }
 
     #[test]
@@ -6872,6 +6982,38 @@ mod tests {
                 .and_then(|diff| diff.get("files"))
                 .and_then(serde_json::Value::as_array)
                 .is_some_and(|files| !files.is_empty())
+        );
+    }
+
+    #[test]
+    fn local_workspace_registry_accepts_raw_string_apply_patch_input() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-raw-string-patch-{}",
+            TaskId::generate()
+        ));
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("hello.txt"), "old\n").expect("seed file");
+        let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+        let input = agent_input("raw string patch");
+        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "apply_patch".to_string(),
+                input: serde_json::Value::String(patch.to_string()),
+                r#async: false,
+                summary: "apply raw string patch".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("patched file"),
+            "new\n"
         );
     }
 

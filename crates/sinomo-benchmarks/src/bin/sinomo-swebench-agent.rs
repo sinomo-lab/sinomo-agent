@@ -499,7 +499,19 @@ Hints:
 {hints}
 
 Work only in regular source files. Do not edit tests or generated lock/config files unless the issue explicitly requires it.
-Use the workspace tools to inspect files, edit with apply_patch, and run focused checks when practical.
+Use the workspace tools to inspect files, edit with apply_patch, and run focused checks when practical. Workspace commands already start in the repository root; do not cd to /workspace, /home/user, benchmark artifact paths, or guessed checkout paths.
+Failed command stderr/stdout are returned in the next tool_result; use that output as the command diagnostic instead of repeating the same command blindly.
+For apply_patch, submit one minimal patch as raw tool input or as a patch string field. Patch format: `*** Begin Patch`, one or more `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` hunks, then `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` and lines prefixed with space, `-`, or `+`; do not use git unified range headers or dangling empty hunks.
+Example update hunk:
+*** Begin Patch
+*** Update File: path/to/file.py
+@@ nearby context
+ unchanged
+-old_value = old_call()
++old_value = new_call()
+ unchanged
+*** End Patch
+If a check fails because stderr/stdout show missing local dependencies, package installation policy, or incompatible local tooling, do not spend repeated turns installing dependencies. Use a narrower available check, inspect git diff, and finish if the source patch is minimal and directly addresses the issue.
 You have at most {max_steps} model turns. Spend the first turns locating the bug, but reserve enough budget to apply a minimal source patch. If the remaining budget is small, prefer making the highest-confidence patch over continuing to inspect. End with no tool calls once a patch is present or once no useful action remains.
 When you are done, return a concise summary and leave the final patch in the working tree."#,
         instance_id = &task.instance_id,
@@ -731,7 +743,7 @@ fn post_patch_repair_prompt(
     format!(
         r#"The patch currently in the working tree failed the post-patch check.
 
-Repair the existing patch with the smallest source change that makes the check pass. Focus on the changed files first, avoid broad refactors, and finish with no tool calls once the patch is repaired or no useful repair remains.
+Repair the existing patch with the smallest source change that makes the check pass. Focus on the changed files first, avoid broad refactors, and finish with no tool calls once the patch is repaired or no useful repair remains. If stderr/stdout show missing local dependencies, package installation policy, or incompatible local tooling, do not spend repair turns on environment setup; inspect the diff and finish if the patch is already the best source fix.
 
 You have at most {repair_steps} repair model turns.
 
@@ -767,7 +779,7 @@ fn empty_patch_repair_prompt(task: &SweBenchTask, repair_steps: usize) -> String
     format!(
         r#"The initial pass used its step budget without leaving a working-tree patch.
 
-Apply the smallest high-confidence source patch for this SWE-bench task now. Prefer editing the most relevant source file over more investigation. Run only focused checks if they are cheap. Finish with no tool calls once a patch is present, or if no useful patch is possible.
+Apply the smallest high-confidence source patch for this SWE-bench task now. Prefer editing the most relevant source file over more investigation. Workspace commands start in the repository root. apply_patch expects the patch format shown in the main task prompt, not a git unified diff. Run only focused checks if they are cheap. If checks are blocked by environment setup, inspect the diff and finish once a minimal patch is present.
 
 You have at most {repair_steps} repair model turns.
 

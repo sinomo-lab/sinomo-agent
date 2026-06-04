@@ -362,13 +362,13 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ApplyPatch,
             "apply_patch",
-            "Apply a scoped Codex patch to workspace files. Use `@@` or `@@ <exact context>` hunk headers, not git unified range headers.",
+            "Apply a scoped workspace patch. Format: `*** Begin Patch`, one or more file hunks (`*** Add File: path`, `*** Update File: path`, or `*** Delete File: path`), then `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` and lines prefixed with space, `-`, or `+`; do not use git unified range headers.",
             true,
         ),
         AgentToolSpec::new(
             AgentToolKind::RunShellCommand,
             "run_command",
-            "Run a bounded workspace command in the current sandbox. Omit cwd unless using a workspace subdirectory; do not use evidence artifact paths as cwd.",
+            "Run a bounded workspace command in the current sandbox. Commands start in the workspace root; omit cwd unless using a workspace subdirectory. If validation fails because dependencies are missing or package installation is blocked, do not loop on environment setup unless the task is dependency setup.",
             true,
         ),
         AgentToolSpec::new(
@@ -426,6 +426,25 @@ fn coding_agent_base_prompt() -> &'static str {
 You operate inside Sinomo's coding-agent loop. The agent owns tool execution,
 policy, event emission, and session state. Use tools when evidence or workspace
 changes are needed, then continue after tool_result messages arrive.
+
+Workspace commands start in the repository root. Do not cd to guessed paths such
+as /workspace or /home/user/project; pass a relative cwd only for a known
+workspace subdirectory. Failed command stderr/stdout are returned in the next
+tool_result; use that output as the command diagnostic instead of repeating the
+same command blindly. Prefer small, source-only patches. If a reasonable patch
+is already present and validation is blocked by environment setup, inspect the
+diff and finish instead of spending turns on dependency installation.
+
+apply_patch accepts either raw patch text or an object with a patch string.
+Patch format example:
+*** Begin Patch
+*** Update File: src/example.rs
+@@ fn example()
+ let before = true;
+-let value = old_value();
++let value = new_value();
+ keep_this_line();
+*** End Patch
 
 When the next step is clear and no more tools are needed, return an empty
 tool_calls array. If a tool fails or is blocked, recover from the model-visible
