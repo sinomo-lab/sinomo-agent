@@ -24,6 +24,8 @@ pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 512;
 pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -968,8 +970,21 @@ async fn run_iroh_daemon_proxy(
                 return;
             };
             loop {
-                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
-                    break;
+                let (mut send, mut recv) = match accept_iroh_proxy_command_stream_with_idle_timeout(
+                    connection.accept_bi(),
+                    IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,
+                )
+                .await
+                {
+                    Ok(Some(streams)) => streams,
+                    Ok(None) => {
+                        connection.close(0_u8.into(), b"idle timeout");
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("sinomo iroh daemon proxy command stream accept failed: {error}");
+                        break;
+                    }
                 };
                 let Some(command_permit) = try_acquire_iroh_proxy_permit(
                     &command_limiter,
@@ -1081,6 +1096,25 @@ async fn run_iroh_daemon_proxy(
         });
     }
     Ok(())
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) async fn accept_iroh_proxy_command_stream_with_idle_timeout<F, T, E>(
+    accept: F,
+    timeout: Duration,
+) -> Result<Option<T>, NetworkError>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    match tokio::time::timeout(timeout, accept).await {
+        Ok(Ok(streams)) => Ok(Some(streams)),
+        Ok(Err(source)) => Err(NetworkError::Io {
+            operation: "accept iroh daemon command stream".to_string(),
+            detail: source.to_string(),
+        }),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(feature = "iroh-transport")]

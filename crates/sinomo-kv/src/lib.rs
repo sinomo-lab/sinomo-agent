@@ -199,20 +199,33 @@ impl KvEntry {
 struct SimulatedKeyState {
     present: bool,
     lease_id: Option<LeaseId>,
+    value_hash: Option<blake3::Hash>,
 }
 
 impl SimulatedKeyState {
     const ABSENT: Self = Self {
         present: false,
         lease_id: None,
+        value_hash: None,
     };
 
-    fn present(lease_id: Option<LeaseId>) -> Self {
+    fn present_with_value(lease_id: Option<LeaseId>, value: &[u8]) -> Self {
         Self {
             present: true,
             lease_id,
+            value_hash: Some(blake3::hash(value)),
         }
     }
+}
+
+fn simulated_put_is_no_effect(
+    old_state: &SimulatedKeyState,
+    value: &[u8],
+    lease_id: Option<LeaseId>,
+) -> bool {
+    old_state.present
+        && old_state.lease_id == lease_id
+        && old_state.value_hash == Some(blake3::hash(value))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1724,8 +1737,8 @@ impl InProcessKvStore {
             match op {
                 KvOp::Put {
                     key,
+                    value,
                     lease_id: Some(lease_id),
-                    ..
                 } => {
                     if !active_leases.contains(lease_id) {
                         return Err(KvError::UnknownLease {
@@ -1753,16 +1766,32 @@ impl InProcessKvStore {
                             });
                         }
                     }
-                    record_kv_mutation_events(&mut mutation_events, 1)?;
-                    touched_keys.insert(key.clone(), SimulatedKeyState::present(Some(*lease_id)));
+                    if !simulated_put_is_no_effect(&old_state, value, Some(*lease_id)) {
+                        record_kv_mutation_events(&mut mutation_events, 1)?;
+                    }
+                    touched_keys.insert(
+                        key.clone(),
+                        SimulatedKeyState::present_with_value(Some(*lease_id), value),
+                    );
                 }
                 KvOp::Put {
                     key,
+                    value,
                     lease_id: None,
-                    ..
                 } => {
-                    record_kv_mutation_events(&mut mutation_events, 1)?;
-                    touched_keys.insert(key.clone(), SimulatedKeyState::present(None));
+                    let old_state = self.simulated_key_state(
+                        key,
+                        &touched_keys,
+                        &deleted_prefixes,
+                        &revoked_leases,
+                    );
+                    if !simulated_put_is_no_effect(&old_state, value, None) {
+                        record_kv_mutation_events(&mut mutation_events, 1)?;
+                    }
+                    touched_keys.insert(
+                        key.clone(),
+                        SimulatedKeyState::present_with_value(None, value),
+                    );
                 }
                 KvOp::Delete { key } => {
                     if self
@@ -2162,7 +2191,7 @@ impl InProcessKvStore {
         {
             return SimulatedKeyState::ABSENT;
         }
-        SimulatedKeyState::present(entry.lease_id)
+        SimulatedKeyState::present_with_value(entry.lease_id, &entry.value)
     }
 
     fn compare(&self, compare: &KvCompare) -> bool {
@@ -4830,6 +4859,54 @@ mod tests {
                 .get(&format!("/huge/{:05}", MAX_DELETE_PREFIX_KEYS - 1))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn txn_stable_put_does_not_consume_mutation_budget_before_delete_prefix() {
+        let mut store = InProcessKvStore::new();
+        put_test_prefix_keys(&mut store, "/huge/", MAX_DELETE_PREFIX_KEYS);
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        let response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"old".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::DeletePrefix {
+                        prefix: "/huge/".to_string(),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect("stable put should not consume mutation budget");
+
+        assert!(response.succeeded);
+        assert_eq!(
+            response.responses,
+            vec![
+                KvOpResponse::Put {
+                    key: "/config/a".to_string(),
+                    revision: revision_before,
+                },
+                KvOpResponse::DeletePrefix {
+                    prefix: "/huge/".to_string(),
+                    deleted_count: MAX_DELETE_PREFIX_KEYS,
+                },
+            ]
+        );
+        assert_eq!(
+            store.revision(),
+            KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64)
+        );
+        assert_eq!(store.get("/config/a").expect("stable entry").value, b"old");
+        assert!(store.range_prefix("/huge/").is_empty());
     }
 
     #[test]

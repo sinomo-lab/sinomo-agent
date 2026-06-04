@@ -933,7 +933,52 @@ fn iroh_daemon_response_reader_returns_after_complete_frame_without_eof() {
 }
 
 #[test]
+fn iroh_daemon_proxy_command_accept_times_out_idle_connections() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let started = Instant::now();
+        let accepted = crate::roaming::accept_iroh_proxy_command_stream_with_idle_timeout(
+            std::future::pending::<Result<(), std::io::Error>>(),
+            Duration::from_millis(5),
+        )
+        .await
+        .expect("idle accept timeout");
+
+        assert_eq!(accepted, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "idle proxy command accept should be bounded"
+        );
+    });
+}
+
+#[test]
+fn iroh_daemon_proxy_command_accept_returns_stream_before_idle_timeout() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let accepted = crate::roaming::accept_iroh_proxy_command_stream_with_idle_timeout(
+            async { Ok::<_, std::io::Error>(42_u8) },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("accepted command stream");
+
+        assert_eq!(accepted, Some(42));
+    });
+}
+
+#[test]
 fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
+    assert_eq!(
+        crate::roaming::IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT,
+        Duration::from_secs(120)
+    );
     assert_eq!(
         crate::roaming::IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT,
         Duration::from_secs(30)

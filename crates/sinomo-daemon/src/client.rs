@@ -117,8 +117,9 @@ pub fn send_daemon_rpc_to_endpoint(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
     let command = daemon_rpc_command(&request.route);
+    let deadline = DaemonRpcAttemptDeadline::new(timeout);
     if let Some(response) =
-        route_endpoint_request_via_local_daemon(endpoint, request, &signed, &command, timeout)
+        route_endpoint_request_via_local_daemon(endpoint, request, &signed, &command, &deadline)
     {
         return response;
     }
@@ -133,7 +134,7 @@ pub fn send_daemon_rpc_to_endpoint(
             &command,
             Some(&signed),
             request,
-            timeout,
+            deadline.remaining(),
         ) {
             Ok(response) => return Ok(response),
             Err(direct_error) => {
@@ -141,7 +142,11 @@ pub fn send_daemon_rpc_to_endpoint(
                 // target node through a reachable bridge, relay the (already signed) request one
                 // hop closer; otherwise surface the original error.
                 return match crate::cluster::relay_request_to_endpoint(
-                    endpoint, request, &signed, &command, timeout,
+                    endpoint,
+                    request,
+                    &signed,
+                    &command,
+                    deadline.remaining(),
                 ) {
                     Some(result) => result,
                     None => Err(DaemonError::from(direct_error)),
@@ -149,7 +154,13 @@ pub fn send_daemon_rpc_to_endpoint(
             }
         }
     }
-    match crate::cluster::relay_request_to_endpoint(endpoint, request, &signed, &command, timeout) {
+    match crate::cluster::relay_request_to_endpoint(
+        endpoint,
+        request,
+        &signed,
+        &command,
+        deadline.remaining(),
+    ) {
         Some(result) => result,
         None => Err(DaemonError::Network {
             address: endpoint.address.clone(),
@@ -161,17 +172,38 @@ pub fn send_daemon_rpc_to_endpoint(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DaemonRpcAttemptDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl DaemonRpcAttemptDeadline {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(1))
+    }
+}
+
 fn route_endpoint_request_via_local_daemon(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
     request_auth: &[u8],
     request_command: &str,
-    timeout: Duration,
+    deadline: &DaemonRpcAttemptDeadline,
 ) -> Option<Result<sinomo_network::ObjectRpcResponse, DaemonError>> {
     if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
         return None;
     }
-    let status = match crate::default_main_daemon_status(timeout) {
+    let status = match crate::default_main_daemon_status(deadline.remaining()) {
         Ok(Some(status)) => status,
         Ok(None) | Err(_) => return None,
     };
@@ -200,7 +232,7 @@ fn route_endpoint_request_via_local_daemon(
         Ok(outer) => outer,
         Err(error) => return Some(Err(DaemonError::from(error))),
     };
-    match send_daemon_rpc(&status.address, &outer, timeout) {
+    match send_daemon_rpc(&status.address, &outer, deadline.remaining()) {
         Ok(response) if is_relay_routing_error(&response) => None,
         Ok(response) => Some(Ok(response)),
         Err(_) => None,
@@ -761,8 +793,8 @@ pub fn send_daemon_rollout_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRpcAddressTransport, daemon_rpc_address_transport, is_relay_routing_error,
-        local_daemon_can_gateway_endpoint,
+        DaemonRpcAddressTransport, DaemonRpcAttemptDeadline, daemon_rpc_address_transport,
+        is_relay_routing_error, local_daemon_can_gateway_endpoint,
     };
     use crate::DaemonClusterStatus;
     use sinomo_core::{
@@ -772,6 +804,7 @@ mod tests {
     use sinomo_network::{ClusterId, ObjectRpcResponse};
     use sinomo_node::NodeId;
     use sinomo_rollout::ROLLOUT_BUILD_ROUTE;
+    use std::time::{Duration, Instant};
 
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -864,5 +897,34 @@ mod tests {
         let target_error = ObjectRpcResponse::encode_error(ROLLOUT_BUILD_ROUTE, "build failed")
             .expect("target error");
         assert!(!is_relay_routing_error(&target_error));
+    }
+
+    #[test]
+    fn daemon_rpc_attempt_deadline_shrinks_fallback_budget() {
+        let deadline = DaemonRpcAttemptDeadline {
+            started: Instant::now() - Duration::from_millis(40),
+            timeout: Duration::from_millis(100),
+        };
+
+        let remaining = deadline.remaining();
+
+        assert!(
+            remaining < Duration::from_millis(100),
+            "fallback attempts must not receive the original timeout"
+        );
+        assert!(
+            remaining <= Duration::from_millis(80),
+            "expected elapsed time to reduce the remaining budget, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_rpc_attempt_deadline_bounds_elapsed_budget_to_short_tail() {
+        let deadline = DaemonRpcAttemptDeadline {
+            started: Instant::now() - Duration::from_millis(100),
+            timeout: Duration::from_millis(10),
+        };
+
+        assert_eq!(deadline.remaining(), Duration::from_millis(1));
     }
 }

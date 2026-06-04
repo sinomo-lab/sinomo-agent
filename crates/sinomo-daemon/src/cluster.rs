@@ -3713,6 +3713,7 @@ pub(crate) fn relay_request_to_endpoint(
     if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
         return None;
     }
+    let deadline = crate::client::DaemonRpcAttemptDeadline::new(timeout);
     let data_dir = SinomoDataDir::from_env_or_home().ok()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths).ok()?;
@@ -3759,7 +3760,7 @@ pub(crate) fn relay_request_to_endpoint(
             &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
             Some(&outer_auth),
             &outer,
-            timeout,
+            deadline.remaining(),
         ) {
             Ok(response) if relay_response_is_routing_error(&response) => failures.push(format!(
                 "{} ({:?}) returned routing error",
