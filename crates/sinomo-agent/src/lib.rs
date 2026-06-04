@@ -75,6 +75,8 @@ pub enum AgentToolKind {
     ApplyPatch,
     ChangedFiles,
     GitDiff,
+    ReplaceExact,
+    ReplaceRange,
     ConfigSearch,
     ConfigGet,
     ConfigSet,
@@ -378,6 +380,18 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             "git_diff",
             "Return a bounded version-control diff summary for the workspace and an evidence ref for the full diff when it is large.",
             false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ReplaceExact,
+            "replace_exact",
+            "Replace an exact text snippet in one workspace file, requiring a unique match unless replace_all or occurrence is set.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ReplaceRange,
+            "replace_range",
+            "Replace an inclusive one-based line range in one workspace text file.",
+            true,
         ),
         AgentToolSpec::new(
             AgentToolKind::RunShellCommand,

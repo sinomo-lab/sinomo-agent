@@ -7941,6 +7941,8 @@ mod tests {
             "apply_patch",
             "changed_files",
             "git_diff",
+            "replace_exact",
+            "replace_range",
             "run_command",
             "start_command_session",
             "inspect_command_session",
@@ -8658,6 +8660,74 @@ mod tests {
             Some("file_writes_disabled")
         );
         assert!(!outcome.evidence.policy.allowed);
+    }
+
+    #[test]
+    fn local_workspace_registry_applies_exact_and_range_replacements() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-replace-tools-{}", TaskId::generate()));
+        let evidence_dir = root.join("evidence");
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("hello.txt"), "one\ntwo\nthree\n").expect("seed file");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root)
+                .allowing_file_writes(true)
+                .with_evidence_dir(&evidence_dir),
+        );
+        let input = agent_input("replace text");
+
+        let exact = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "replace_exact".to_string(),
+                input: serde_json::json!({
+                    "path": "hello.txt",
+                    "old": "two",
+                    "new": "TWO"
+                }),
+                r#async: false,
+                summary: "Replace exact text.".to_string(),
+            },
+        );
+        assert_eq!(exact.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("file"),
+            "one\nTWO\nthree\n"
+        );
+        assert_eq!(
+            coding_evidence(&exact.evidence).changed_files,
+            vec!["hello.txt".to_string()]
+        );
+
+        let range = registry.execute(
+            &input.session,
+            0,
+            1,
+            &AgentToolCall {
+                tool: "replace_range".to_string(),
+                input: serde_json::json!({
+                    "path": "hello.txt",
+                    "start_line": 3,
+                    "end_line": 3,
+                    "replacement": "THREE\n"
+                }),
+                r#async: false,
+                summary: "Replace line range.".to_string(),
+            },
+        );
+        assert_eq!(range.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(root.join("hello.txt")).expect("file"),
+            "one\nTWO\nTHREE\n"
+        );
+        let diff_ref = range
+            .output
+            .get("diff_ref")
+            .and_then(serde_json::Value::as_str)
+            .expect("diff ref");
+        assert!(Path::new(diff_ref).exists());
     }
 
     #[cfg(not(windows))]

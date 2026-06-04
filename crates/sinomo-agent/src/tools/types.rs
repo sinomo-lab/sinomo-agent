@@ -85,6 +85,8 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::ApplyPatch
         | AgentToolKind::ChangedFiles
         | AgentToolKind::GitDiff
+        | AgentToolKind::ReplaceExact
+        | AgentToolKind::ReplaceRange
         | AgentToolKind::RunShellCommand
         | AgentToolKind::StartCommandSession
         | AgentToolKind::InspectCommandSession
