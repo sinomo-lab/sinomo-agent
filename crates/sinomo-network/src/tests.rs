@@ -5279,6 +5279,57 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
 }
 
 #[test]
+fn cluster_kv_watch_events_append_log_uses_warm_cache_without_rescan() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-warm-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/warm-cache/first".to_string(),
+        kind: KvEventKind::Put {
+            value: b"first".to_vec(),
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/warm-cache/second".to_string(),
+        kind: KvEventKind::Put {
+            value: b"second".to_vec(),
+        },
+    };
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first))
+            .expect("append first watch event"),
+        1
+    );
+    reset_cluster_kv_watch_event_log_read_bytes_for_test(&paths);
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+            .expect("append second watch event"),
+        1
+    );
+    assert_eq!(
+        cluster_kv_watch_event_log_read_bytes_for_test(&paths),
+        0,
+        "a validated warm watch-event cache should let new appends avoid rescanning the existing log"
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read watch events"),
+        vec![first, second]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-events-compact-{}",
@@ -6010,6 +6061,50 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
 }
 
 #[test]
+fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-drain-dedup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let mut store = InProcessKvStore::new();
+    store
+        .put("/watch/dedup/one", b"one".to_vec(), None)
+        .expect("put watched value");
+    let snapshot = store.snapshot();
+    let duplicate = snapshot.events.first().expect("snapshot event").clone();
+    write_cluster_kv_snapshot(&paths, &snapshot).expect("write snapshot");
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&duplicate))
+        .expect("append duplicate fanout event");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/dedup/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain watch");
+
+    assert_eq!(drained.events, vec![duplicate]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-long-poll-empty-{}",
@@ -6045,8 +6140,8 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     assert!(drained.events.is_empty());
     assert_eq!(
         cluster_kv_watch_drain_once_calls_for_test(&paths),
-        2,
-        "empty long-poll timeout should drain once before waiting and once after timeout"
+        1,
+        "empty long-poll timeout should not reread snapshot/log state when no watch generation changed"
     );
     std::fs::remove_dir_all(root).ok();
 }

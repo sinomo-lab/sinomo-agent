@@ -972,21 +972,22 @@ impl KvMaterializedCache {
     }
 
     pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
-        let desired = self.materialized(snapshot);
         // Skip the rewrite when the durable key/value/lease state is unchanged, even
         // if the snapshot revision, per-entry revision metadata, or watch-event tail
         // advanced. Re-putting an identical value bumps modify_revision/version and
         // appends events, which would otherwise rewrite the whole (~25 KiB+)
         // materialized file for no durable change. The materialized snapshot is only
         // a fast-restore fallback for a cold node with an empty WAL (the WAL is the
-        // source of truth for revision/version/events), so persisting stale
-        // bookkeeping there is safe.
+        // source of truth for revision/version/events), so persisting stale bookkeeping
+        // there is safe. Check before materializing `snapshot` so the common no-op path
+        // avoids cloning the full entry set.
         if self
-            .read_snapshot()
-            .is_ok_and(|existing| kv_snapshot_durable_eq(&existing, &desired))
+            .read_snapshot_arc()
+            .is_ok_and(|existing| kv_snapshot_durable_eq(existing.as_ref(), snapshot))
         {
             return Ok(false);
         }
+        let desired = self.materialized(snapshot);
         self.write_and_cache(desired)?;
         Ok(true)
     }
@@ -1044,9 +1045,10 @@ impl KvLocalCache {
         node_id: NodeId,
         key: &str,
     ) -> Result<Option<T>, KvError> {
-        self.current_get(node_id, key)?
-            .map(|entry| entry.decode())
-            .transpose()
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        snapshot.get(key).map(|entry| entry.decode()).transpose()
     }
 
     pub fn current_range_prefix(
@@ -1090,16 +1092,23 @@ impl KvLocalCache {
         node_id: NodeId,
         prefix: &str,
     ) -> Result<Vec<T>, KvError> {
-        self.current_range_prefix(node_id, prefix)?
-            .into_iter()
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        snapshot
+            .prefix_entries(prefix)
             .map(|entry| entry.decode())
             .collect()
     }
 
     pub fn current_snapshot(&self, node_id: NodeId) -> Result<KvSnapshot, KvError> {
+        self.current_snapshot_arc(node_id)
+            .map(|snapshot| (*snapshot).clone())
+    }
+
+    pub fn current_snapshot_arc(&self, node_id: NodeId) -> Result<Arc<KvSnapshot>, KvError> {
         self.materialized
             .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))
-            .map(|snapshot| (*snapshot).clone())
     }
 
     pub fn cached_snapshot(&self) -> Result<KvSnapshot, KvError> {

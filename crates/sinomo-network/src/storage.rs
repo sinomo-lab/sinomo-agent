@@ -58,6 +58,9 @@ static CLUSTER_KV_READER_NODE_ID_CACHE: LazyLock<
 #[cfg(test)]
 static CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<
     Mutex<HashMap<SocketAddr, PublicEndpointReachabilityCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -75,6 +78,8 @@ struct ClusterKvWatchEventCacheEntry {
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
     events: Arc<Vec<KvEvent>>,
+    log_records: usize,
+    append_safe: bool,
 }
 
 #[derive(Clone)]
@@ -186,15 +191,23 @@ fn cluster_kv_watch_event_cache_marks(
     ))
 }
 
-fn cached_cluster_kv_watch_events(
+fn cached_cluster_kv_watch_events_arc(
     paths: &ClusterPaths,
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
-) -> Option<Vec<KvEvent>> {
+) -> Option<Arc<Vec<KvEvent>>> {
+    cached_cluster_kv_watch_event_cache_entry(paths, checkpoint, log).map(|entry| entry.events)
+}
+
+fn cached_cluster_kv_watch_event_cache_entry(
+    paths: &ClusterPaths,
+    checkpoint: ClusterFileMark,
+    log: ClusterFileMark,
+) -> Option<ClusterKvWatchEventCacheEntry> {
     let key = cluster_kv_watch_notify_key(paths);
     let cache = CLUSTER_KV_WATCH_EVENT_CACHE.lock().ok()?;
     let entry = cache.get(&key)?;
-    (entry.checkpoint == checkpoint && entry.log == log).then(|| entry.events.as_ref().clone())
+    (entry.checkpoint == checkpoint && entry.log == log).then(|| entry.clone())
 }
 
 fn record_cluster_kv_watch_event_cache(
@@ -202,6 +215,26 @@ fn record_cluster_kv_watch_event_cache(
     checkpoint: ClusterFileMark,
     log: ClusterFileMark,
     events: Vec<KvEvent>,
+    log_records: usize,
+    append_safe: bool,
+) {
+    record_cluster_kv_watch_event_cache_arc(
+        paths,
+        checkpoint,
+        log,
+        Arc::new(events),
+        log_records,
+        append_safe,
+    );
+}
+
+fn record_cluster_kv_watch_event_cache_arc(
+    paths: &ClusterPaths,
+    checkpoint: ClusterFileMark,
+    log: ClusterFileMark,
+    events: Arc<Vec<KvEvent>>,
+    log_records: usize,
+    append_safe: bool,
 ) {
     let key = cluster_kv_watch_notify_key(paths);
     if let Ok(mut cache) = CLUSTER_KV_WATCH_EVENT_CACHE.lock() {
@@ -213,15 +246,29 @@ fn record_cluster_kv_watch_event_cache(
             ClusterKvWatchEventCacheEntry {
                 checkpoint,
                 log,
-                events: Arc::new(events),
+                events,
+                log_records,
+                append_safe,
             },
         );
     }
 }
 
-fn record_current_cluster_kv_watch_event_cache(paths: &ClusterPaths, events: Vec<KvEvent>) {
+fn record_current_cluster_kv_watch_event_cache(
+    paths: &ClusterPaths,
+    events: Vec<KvEvent>,
+    log_records: usize,
+    append_safe: bool,
+) {
     if let Some((checkpoint, log)) = cluster_kv_watch_event_cache_marks(paths) {
-        record_cluster_kv_watch_event_cache(paths, checkpoint, log, events);
+        record_cluster_kv_watch_event_cache(
+            paths,
+            checkpoint,
+            log,
+            events,
+            log_records,
+            append_safe,
+        );
     }
 }
 
@@ -313,7 +360,7 @@ pub(crate) fn cached_cluster_kv_watch_events_for_test(
     paths: &ClusterPaths,
 ) -> Option<Vec<KvEvent>> {
     let (checkpoint, log) = cluster_kv_watch_event_cache_marks(paths)?;
-    cached_cluster_kv_watch_events(paths, checkpoint, log)
+    cached_cluster_kv_watch_events_arc(paths, checkpoint, log).map(|events| events.as_ref().clone())
 }
 
 #[cfg(test)]
@@ -346,6 +393,29 @@ pub(crate) fn cluster_kv_watch_drain_once_calls_for_test(paths: &ClusterPaths) -
         .lock()
         .ok()
         .and_then(|calls| calls.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_cluster_kv_watch_event_log_read_for_test(paths: &ClusterPaths, bytes: u64) {
+    if let Ok(mut reads) = CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST.lock() {
+        *reads.entry(cluster_kv_watch_notify_key(paths)).or_default() += bytes;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPaths) {
+    if let Ok(mut reads) = CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST.lock() {
+        reads.remove(&cluster_kv_watch_notify_key(paths));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPaths) -> u64 {
+    CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|reads| reads.get(&cluster_kv_watch_notify_key(paths)).copied())
         .unwrap_or(0)
 }
 
@@ -1493,9 +1563,8 @@ pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
-    let snapshot = compact_cluster_kv_snapshot_events(snapshot);
     cluster_kv_local_cache(paths)
-        .write_snapshot(&snapshot)
+        .write_snapshot(snapshot)
         .map_err(NetworkError::from)?;
     notify_cluster_kv_watchers(paths);
     Ok(())
@@ -1505,9 +1574,8 @@ pub fn write_cluster_kv_snapshot_if_changed(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    let snapshot = compact_cluster_kv_snapshot_events(snapshot);
     let wrote = cluster_kv_local_cache(paths)
-        .write_snapshot_if_changed(&snapshot)
+        .write_snapshot_if_changed(snapshot)
         .map_err(NetworkError::from)?;
     if let Some(observer) = io_observer() {
         if wrote {
@@ -1527,12 +1595,6 @@ pub fn write_cluster_kv_snapshot_if_changed(
     Ok(wrote)
 }
 
-fn compact_cluster_kv_snapshot_events(snapshot: &KvSnapshot) -> KvSnapshot {
-    let mut snapshot = snapshot.clone();
-    sinomo_kv::compact_kv_snapshot_event_history(&mut snapshot, MAX_CLUSTER_KV_MATERIALIZED_EVENTS);
-    snapshot
-}
-
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {
     let node_id = read_cluster_kv_reader_node_id(paths)?;
     cluster_kv_local_cache(paths)
@@ -1541,9 +1603,15 @@ pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, N
 }
 
 pub fn read_cluster_kv_current_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, NetworkError> {
+    read_cluster_kv_current_snapshot_arc(paths).map(|snapshot| (*snapshot).clone())
+}
+
+fn read_cluster_kv_current_snapshot_arc(
+    paths: &ClusterPaths,
+) -> Result<Arc<KvSnapshot>, NetworkError> {
     let node_id = read_cluster_kv_reader_node_id(paths)?;
     cluster_kv_local_cache(paths)
-        .current_snapshot(node_id)
+        .current_snapshot_arc(node_id)
         .map_err(Into::into)
 }
 
@@ -1979,7 +2047,7 @@ pub fn create_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchPrefixRequest,
 ) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let snapshot = read_cluster_kv_current_snapshot(paths)?;
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
     if request.start_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
@@ -2044,7 +2112,7 @@ pub fn drain_cluster_kv_watch(
             return Ok(response);
         }
         if !wait_for_cluster_kv_watch_change(paths, observed_generation, remaining) {
-            return drain_cluster_kv_watch_once(paths, request.watch_id);
+            return Ok(response);
         }
     }
 }
@@ -2070,7 +2138,7 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
 
     let watch_path = cluster_kv_watch_path(paths, watch_id);
     let mut registration = read_cluster_kv_watch_registration(&watch_path, watch_id)?;
-    let snapshot = read_cluster_kv_current_snapshot(paths)?;
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
     if registration.next_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
@@ -2080,22 +2148,13 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
             compacted: snapshot.compacted_revision,
         }));
     }
-    let mut events = cluster_kv_watch_events(paths)?;
-    events.extend(snapshot.events);
-    events.sort_by(|left, right| {
-        (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
-    });
-    events.dedup_by(|left, right| {
-        left.revision == right.revision && left.key == right.key && left.kind == right.kind
-    });
-    let events = events
-        .into_iter()
-        .filter(|event| {
-            event.revision >= registration.next_revision
-                && event.key.starts_with(&registration.prefix)
-        })
-        .collect::<Vec<_>>();
-    let events = limit_cluster_kv_watch_drain_events(events, max_payload_bytes);
+    let persisted_events = cluster_kv_watch_events_arc(paths)?;
+    let events = collect_cluster_kv_watch_drain_events(
+        persisted_events.as_ref(),
+        &snapshot,
+        &registration,
+        max_payload_bytes,
+    );
     if let Some(last) = events.last() {
         registration.next_revision = KvRevision(last.revision.0.saturating_add(1));
         write_object_file(&watch_path, &registration)?;
@@ -2108,8 +2167,31 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
     })
 }
 
+fn collect_cluster_kv_watch_drain_events(
+    persisted_events: &[KvEvent],
+    snapshot: &KvSnapshot,
+    registration: &ClusterKvWatchRegistration,
+    max_payload_bytes: usize,
+) -> Vec<KvEvent> {
+    let mut events = persisted_events
+        .iter()
+        .chain(snapshot.events.iter())
+        .filter(|event| {
+            event.revision >= registration.next_revision
+                && event.key.starts_with(&registration.prefix)
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
+    });
+    events.dedup_by(|left, right| {
+        left.revision == right.revision && left.key == right.key && left.kind == right.kind
+    });
+    limit_cluster_kv_watch_drain_events(events, max_payload_bytes)
+}
+
 fn limit_cluster_kv_watch_drain_events(
-    events: Vec<KvEvent>,
+    events: Vec<&KvEvent>,
     max_payload_bytes: usize,
 ) -> Vec<KvEvent> {
     let mut limited = Vec::new();
@@ -2121,7 +2203,7 @@ fn limit_cluster_kv_watch_drain_events(
             break;
         }
         payload_bytes = next_payload_bytes;
-        limited.push(event);
+        limited.push(event.clone());
         if payload_bytes >= max_payload_bytes {
             break;
         }
@@ -2175,14 +2257,15 @@ pub fn append_cluster_kv_watch_events(
             path: paths.kv_watch_events_log.display().to_string(),
             detail: source.to_string(),
         })?;
+    if let Some(appended) =
+        append_cluster_kv_watch_events_from_cached_view(paths, &mut log_file, incoming)?
+    {
+        return Ok(appended);
+    }
     let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
     let log = read_cluster_kv_watch_event_log_from_file(paths, &mut log_file)?;
     let log_was_truncated = log.truncated;
-    let log_records = if log_was_truncated {
-        0
-    } else {
-        log.events.len()
-    };
+    let log_records = if log_was_truncated { 0 } else { log.records };
     let existing =
         compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
     if log_was_truncated {
@@ -2196,7 +2279,7 @@ pub fn append_cluster_kv_watch_events(
         .cloned()
         .collect::<Vec<_>>();
     if appended.is_empty() {
-        record_current_cluster_kv_watch_event_cache(paths, retained);
+        record_current_cluster_kv_watch_event_cache(paths, retained, log_records, true);
         return Ok(0);
     }
     let should_checkpoint_without_append = incoming.len() > MAX_CLUSTER_KV_WATCH_EVENTS
@@ -2205,11 +2288,14 @@ pub fn append_cluster_kv_watch_events(
             .metadata()
             .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
             .unwrap_or(false);
+    let mut current_log_records = log_records;
     if should_checkpoint_without_append {
         write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
         truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+        current_log_records = 0;
     } else {
         append_cluster_kv_watch_event_log_to_file(paths, &mut log_file, &appended)?;
+        current_log_records = current_log_records.saturating_add(appended.len());
         if log_file
             .metadata()
             .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
@@ -2217,11 +2303,72 @@ pub fn append_cluster_kv_watch_events(
         {
             write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
             truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+            current_log_records = 0;
         }
     }
-    record_current_cluster_kv_watch_event_cache(paths, retained);
+    record_current_cluster_kv_watch_event_cache(paths, retained, current_log_records, true);
     notify_cluster_kv_watchers(paths);
     Ok(appended.len())
+}
+
+fn append_cluster_kv_watch_events_from_cached_view(
+    paths: &ClusterPaths,
+    log_file: &mut fs::File,
+    incoming: &[KvEvent],
+) -> Result<Option<usize>, NetworkError> {
+    let Some((checkpoint_mark, log_mark)) = cluster_kv_watch_event_cache_marks(paths) else {
+        return Ok(None);
+    };
+    let Some(cache) = cached_cluster_kv_watch_event_cache_entry(paths, checkpoint_mark, log_mark)
+    else {
+        return Ok(None);
+    };
+    if !cache.append_safe {
+        return Ok(None);
+    }
+
+    let existing = cache.events;
+    let retained = compact_cluster_kv_watch_events_incremental(existing.as_ref().clone(), incoming);
+    let appended = retained
+        .iter()
+        .filter(|event| !cluster_kv_events_contain(&existing, event))
+        .cloned()
+        .collect::<Vec<_>>();
+    if appended.is_empty() {
+        record_current_cluster_kv_watch_event_cache(
+            paths,
+            retained,
+            cache.log_records,
+            cache.append_safe,
+        );
+        return Ok(Some(0));
+    }
+
+    let mut current_log_records = cache.log_records;
+    let should_checkpoint_without_append = incoming.len() > MAX_CLUSTER_KV_WATCH_EVENTS
+        || current_log_records.saturating_add(appended.len())
+            >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
+        || log_mark.len >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES;
+    if should_checkpoint_without_append {
+        write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
+        truncate_cluster_kv_watch_event_log_file(paths, log_file)?;
+        current_log_records = 0;
+    } else {
+        append_cluster_kv_watch_event_log_to_file(paths, log_file, &appended)?;
+        current_log_records = current_log_records.saturating_add(appended.len());
+        if log_file
+            .metadata()
+            .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
+            truncate_cluster_kv_watch_event_log_file(paths, log_file)?;
+            current_log_records = 0;
+        }
+    }
+    record_current_cluster_kv_watch_event_cache(paths, retained, current_log_records, true);
+    notify_cluster_kv_watchers(paths);
+    Ok(Some(appended.len()))
 }
 
 pub(crate) fn cached_cluster_kv_watch_events_contain_all(
@@ -2231,27 +2378,41 @@ pub(crate) fn cached_cluster_kv_watch_events_contain_all(
     let Some((checkpoint, log)) = cluster_kv_watch_event_cache_marks(paths) else {
         return false;
     };
-    let Some(events) = cached_cluster_kv_watch_events(paths, checkpoint, log) else {
+    let Some(entry) = cached_cluster_kv_watch_event_cache_entry(paths, checkpoint, log) else {
         return false;
     };
     incoming
         .iter()
-        .all(|event| cluster_kv_events_contain(&events, event))
+        .all(|event| cluster_kv_events_contain(entry.events.as_ref(), event))
 }
 
 pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
+    cluster_kv_watch_events_arc(paths).map(|events| events.as_ref().clone())
+}
+
+fn cluster_kv_watch_events_arc(paths: &ClusterPaths) -> Result<Arc<Vec<KvEvent>>, NetworkError> {
     let cache_marks = cluster_kv_watch_event_cache_marks(paths);
     if let Some((checkpoint_mark, log_mark)) = cache_marks {
-        if let Some(events) = cached_cluster_kv_watch_events(paths, checkpoint_mark, log_mark) {
+        if let Some(events) = cached_cluster_kv_watch_events_arc(paths, checkpoint_mark, log_mark) {
             return Ok(events);
         }
     }
     let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
     let log = read_cluster_kv_watch_event_log(paths)?;
+    let log_records = log.records;
+    let append_safe = !log.truncated;
     let events =
         compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
+    let events = Arc::new(events);
     if let Some((checkpoint_mark, log_mark)) = cache_marks {
-        record_cluster_kv_watch_event_cache(paths, checkpoint_mark, log_mark, events.clone());
+        record_cluster_kv_watch_event_cache_arc(
+            paths,
+            checkpoint_mark,
+            log_mark,
+            events.clone(),
+            log_records,
+            append_safe,
+        );
     }
     Ok(events)
 }
@@ -2285,6 +2446,7 @@ fn write_cluster_kv_watch_event_checkpoint(
 #[derive(Default)]
 struct ClusterKvWatchEventLogRead {
     events: Vec<KvEvent>,
+    records: usize,
     truncated: bool,
 }
 
@@ -2336,6 +2498,7 @@ fn read_cluster_kv_watch_event_log_from_file(
                 );
                 return Ok(ClusterKvWatchEventLogRead {
                     events,
+                    records: record_number.saturating_sub(1),
                     truncated: true,
                 });
             }
@@ -2350,6 +2513,7 @@ fn read_cluster_kv_watch_event_log_from_file(
             );
             return Ok(ClusterKvWatchEventLogRead {
                 events,
+                records: record_number.saturating_sub(1),
                 truncated: true,
             });
         }
@@ -2364,6 +2528,7 @@ fn read_cluster_kv_watch_event_log_from_file(
             );
             return Ok(ClusterKvWatchEventLogRead {
                 events,
+                records: record_number.saturating_sub(1),
                 truncated: true,
             });
         }
@@ -2378,6 +2543,7 @@ fn read_cluster_kv_watch_event_log_from_file(
                 );
                 return Ok(ClusterKvWatchEventLogRead {
                     events,
+                    records: record_number.saturating_sub(1),
                     truncated: true,
                 });
             }
@@ -2401,6 +2567,7 @@ fn read_cluster_kv_watch_event_log_from_file(
     }
     Ok(ClusterKvWatchEventLogRead {
         events,
+        records: record_number.saturating_sub(1),
         truncated: needs_repair,
     })
 }
@@ -2424,6 +2591,8 @@ fn read_cluster_kv_watch_event_log_chunk(
             Ok(0) => return Ok(WatchEventLogReadChunk::Truncated),
             Ok(read) => {
                 offset += read;
+                #[cfg(test)]
+                record_cluster_kv_watch_event_log_read_for_test(paths, read as u64);
                 if let Some(observer) = io_observer() {
                     observer.on_disk_read(read as u64);
                 }
@@ -2781,13 +2950,13 @@ pub fn read_cluster_members_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut members: Vec<ClusterMemberRecord> = Vec::new();
-    for entry in store.range_prefix("/cluster/members/") {
+    for entry in snapshot.prefix_entries("/cluster/members/") {
         members.push(entry.decode()?);
     }
-    let endpoints = read_cluster_endpoints_from_store(&store)?;
-    let policies = read_cluster_capability_policies_from_store(&store)?;
+    let endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?;
+    let policies = read_cluster_capability_policies_from_snapshot(&snapshot)?;
     for member in &mut members {
         if let Some(policy) = policies.get(&member.node_id) {
             member.capabilities = policy.capabilities.clone();
@@ -2816,8 +2985,8 @@ pub fn read_cluster_endpoints_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
-    let mut endpoints = read_cluster_endpoints_from_store(&store)?
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    let mut endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?
         .into_values()
         .flatten()
         .collect::<Vec<_>>();
@@ -2836,11 +3005,11 @@ pub fn read_cluster_endpoints_from_kv(
     Ok(endpoints)
 }
 
-fn read_cluster_endpoints_from_store(
-    store: &InProcessKvStore,
+fn read_cluster_endpoints_from_snapshot(
+    snapshot: &KvSnapshot,
 ) -> Result<BTreeMap<NodeId, Vec<ClusterEndpointRecord>>, NetworkError> {
     let mut endpoints: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> = BTreeMap::new();
-    for entry in store.range_prefix("/cluster/endpoints/") {
+    for entry in snapshot.prefix_entries("/cluster/endpoints/") {
         let endpoint: ClusterEndpointRecord = entry.decode()?;
         endpoints
             .entry(endpoint.node_id.clone())
@@ -2850,11 +3019,11 @@ fn read_cluster_endpoints_from_store(
     Ok(endpoints)
 }
 
-fn read_cluster_capability_policies_from_store(
-    store: &InProcessKvStore,
+fn read_cluster_capability_policies_from_snapshot(
+    snapshot: &KvSnapshot,
 ) -> Result<BTreeMap<NodeId, ClusterCapabilityPolicyRecord>, NetworkError> {
     let mut policies = BTreeMap::new();
-    for entry in store.range_prefix("/cluster/policy/capabilities/") {
+    for entry in snapshot.prefix_entries("/cluster/policy/capabilities/") {
         let policy: ClusterCapabilityPolicyRecord = entry.decode()?;
         policies.insert(policy.node_id.clone(), policy);
     }
@@ -2867,9 +3036,9 @@ pub fn read_cluster_node_statuses_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
-    for entry in store.range_prefix("/cluster/node-status/") {
+    for entry in snapshot.prefix_entries("/cluster/node-status/") {
         statuses.push(entry.decode()?);
     }
     statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
@@ -2882,9 +3051,10 @@ pub fn read_cluster_module_rollout_statuses_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
-    for entry in store.range_prefix(&cluster_module_rollout_node_prefix()) {
+    let prefix = cluster_module_rollout_node_prefix();
+    for entry in snapshot.prefix_entries(&prefix) {
         statuses.push(entry.decode()?);
     }
     statuses.sort_by(|left, right| {
@@ -2902,9 +3072,10 @@ pub fn read_cluster_module_rollout_desired_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
-    for entry in store.range_prefix(&cluster_module_rollout_desired_prefix()) {
+    let prefix = cluster_module_rollout_desired_prefix();
+    for entry in snapshot.prefix_entries(&prefix) {
         desired.push(entry.decode()?);
     }
     desired.sort_by(|left, right| {
@@ -2926,9 +3097,10 @@ pub fn read_cluster_module_rollout_reconciliations_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
-    for entry in store.range_prefix(&cluster_module_rollout_reconcile_prefix()) {
+    let prefix = cluster_module_rollout_reconcile_prefix();
+    for entry in snapshot.prefix_entries(&prefix) {
         reconciliations.push(entry.decode()?);
     }
     reconciliations.sort_by(|left, right| {
@@ -2946,10 +3118,10 @@ pub fn read_cluster_network_info_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
-    for entry in store.range_prefix("/cluster/network/info/") {
+    for entry in snapshot.prefix_entries("/cluster/network/info/") {
         let record: ClusterNetworkInfoRecord = entry.decode()?;
         if cluster_network_record_live(record.expires_at, now) {
             records.push(record);
@@ -2965,10 +3137,10 @@ pub fn read_cluster_connectivity_graph_from_kv(
     if !paths.kv_snapshot.exists() {
         return Ok(Vec::new());
     }
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
-    for entry in store.range_prefix("/cluster/network/connectivity/") {
+    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
         let record: ClusterConnectivityRecord = entry.decode()?;
         if cluster_network_record_live(record.expires_at, now) {
             records.push(record);
@@ -3455,13 +3627,27 @@ pub fn cluster_sync_targets_with_connectivity(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints = cluster_sync_targets(state);
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let node_statuses = read_cluster_node_statuses_from_kv(paths)
+    let node_statuses = cluster_node_status_map_from_kv(paths);
+    cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses)
+}
+
+fn cluster_node_status_map_from_kv(
+    paths: &ClusterPaths,
+) -> BTreeMap<NodeId, ClusterNodeStatusRecord> {
+    read_cluster_node_statuses_from_kv(paths)
         .unwrap_or_default()
         .into_iter()
         .map(|status| (status.node_id.clone(), status))
-        .collect::<BTreeMap<_, _>>();
+        .collect()
+}
+
+fn cluster_sync_targets_with_connectivity_context(
+    state: &ClusterBootstrapState,
+    graph: &ClusterConnectivityGraph,
+    node_statuses: &BTreeMap<NodeId, ClusterNodeStatusRecord>,
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints = cluster_sync_targets(state);
     endpoints.sort_by_key(|endpoint| {
         let node_status_rank = cluster_node_status_route_rank(node_statuses.get(&endpoint.node_id));
         (
@@ -3481,13 +3667,9 @@ pub fn cluster_raft_command_targets(
     state: &ClusterBootstrapState,
 ) -> Vec<ClusterEndpointRecord> {
     let graph = ClusterConnectivityGraph::read_for_local(paths, state);
-    let node_statuses = read_cluster_node_statuses_from_kv(paths)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|status| (status.node_id.clone(), status))
-        .collect::<BTreeMap<_, _>>();
+    let node_statuses = cluster_node_status_map_from_kv(paths);
     let mut endpoints_by_node = BTreeMap::<NodeId, Vec<ClusterEndpointRecord>>::new();
-    for endpoint in cluster_sync_targets_with_connectivity(paths, state) {
+    for endpoint in cluster_sync_targets_with_connectivity_context(state, &graph, &node_statuses) {
         endpoints_by_node
             .entry(endpoint.node_id.clone())
             .or_default()
@@ -4624,7 +4806,7 @@ pub fn cluster_member_publish_matches_kv(
     paths: &ClusterPaths,
     members: &[ClusterMemberRecord],
 ) -> Result<bool, NetworkError> {
-    let store = read_cluster_kv_snapshot_store(paths)?;
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     for member in members {
         let mut member = member.clone();
         cleanup_member_iroh_endpoints(&mut member);
@@ -4632,7 +4814,7 @@ pub fn cluster_member_publish_matches_kv(
             .endpoints
             .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
 
-        let Some(entry) = store.get(&cluster_member_key(&member.node_id)) else {
+        let Some(entry) = snapshot.get(&cluster_member_key(&member.node_id)) else {
             return Ok(false);
         };
         let Ok(mut existing) = entry.decode::<ClusterMemberRecord>() else {
@@ -4646,9 +4828,9 @@ pub fn cluster_member_publish_matches_kv(
             return Ok(false);
         }
 
-        let mut existing_endpoints = store
-            .range_prefix(&cluster_endpoint_prefix(&member.node_id))
-            .into_iter()
+        let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
+        let mut existing_endpoints = snapshot
+            .prefix_entries(&endpoint_prefix)
             .filter_map(|entry| entry.decode::<ClusterEndpointRecord>().ok())
             .collect::<Vec<_>>();
         existing_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
