@@ -3537,6 +3537,87 @@ fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
 }
 
 #[test]
+fn cluster_invitation_sync_batches_invite_and_state_in_one_revision() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-invite-sync-batched-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_invite_sync_batched").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_invite_sync_batched").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "invite sync batched",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_sync_batched").expect("invite"),
+        cluster_id,
+        cluster_name: Some("invite sync batched".to_string()),
+        cluster_public_key: "cluster-pk".to_string(),
+        invitation_secret: "secret".to_string(),
+        communication_channels: Vec::new(),
+        introducers: Vec::new(),
+        token_id: "token".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: node_id,
+        issuer_public_key: "issuer-pk".to_string(),
+        signature: String::new(),
+    };
+
+    let snapshot = sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+
+    assert_eq!(
+        snapshot.revision,
+        KvRevision(2),
+        "the batched transaction still records both KV mutations"
+    );
+    let node =
+        open_cluster_raft_kv_node(&paths, &state.local_node_id).expect("open raft after invite");
+    assert_eq!(
+        node.last_log_index(),
+        1,
+        "invite and state publication should use one raft log entry"
+    );
+    assert_eq!(
+        node.hard_state().commit_index,
+        1,
+        "the single invitation publish entry should be committed"
+    );
+    let invite_entry = snapshot
+        .get(&cluster_invitation_key(&invite.invite_id))
+        .expect("invite entry");
+    let state_entry = snapshot
+        .get(&cluster_invitation_state_key(&invite.invite_id))
+        .expect("invite state entry");
+    assert_eq!(invite_entry.modify_revision, KvRevision(1));
+    assert_eq!(state_entry.modify_revision, KvRevision(2));
+    assert_eq!(
+        invite_entry.decode::<ClusterJoinInvite>().expect("invite"),
+        invite
+    );
+    let state = state_entry
+        .decode::<ClusterInvitationStateRecord>()
+        .expect("invite state");
+    assert_eq!(state.invite_id, invite.invite_id);
+    assert_eq!(state.state, "active");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stale_cluster_kv_restore_refreshes_materialized_cache_from_raft() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-kv-stale-restore-refresh-{}",
@@ -6504,6 +6585,104 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     assert_eq!(
         cluster_kv_watch_events(&paths).expect("read retained large event"),
         vec![event]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-duplicate-checkpoint-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/duplicate-checkpoint".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![9_u8; (1024 * 1024) + 1024],
+        },
+    };
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("append large watch event"),
+        1
+    );
+    assert!(
+        paths.kv_watch_events.exists(),
+        "large first append should persist the checkpoint"
+    );
+    let _ = std::fs::remove_file(&paths.kv_watch_events_log);
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("duplicate checkpoint watch event"),
+        0
+    );
+    assert!(
+        !paths.kv_watch_events_log.exists(),
+        "cold duplicate suppression should not create an empty append log"
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read retained large event"),
+        vec![event]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-duplicate-repair-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/duplicate-repair/1".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event)).expect("append first");
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .expect("open watch event log");
+    log.write_all(&16_u32.to_be_bytes())
+        .expect("write partial length");
+    log.write_all(b"partial").expect("write partial body");
+    log.sync_data().expect("sync partial tail");
+    drop(log);
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("append duplicate after partial tail"),
+        0
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        vec![event]
+    );
+    let log = std::fs::read(&paths.kv_watch_events_log).expect("read repaired log");
+    assert!(
+        !log.windows(b"partial".len())
+            .any(|window| window == b"partial"),
+        "duplicate append should still repair a damaged watch-event log tail"
     );
 
     std::fs::remove_dir_all(root).ok();

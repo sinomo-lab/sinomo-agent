@@ -2458,6 +2458,9 @@ pub fn append_cluster_kv_watch_events(
     if cached_cluster_kv_snapshot_events_contain_all(paths, incoming) {
         return Ok(0);
     }
+    if persisted_cluster_kv_watch_events_contain_all(paths, incoming)? {
+        return Ok(0);
+    }
     let mut log_file = open_cluster_kv_watch_event_log_for_append(paths)?;
     log_file
         .lock_exclusive()
@@ -2519,6 +2522,25 @@ pub fn append_cluster_kv_watch_events(
     record_current_cluster_kv_watch_event_cache(paths, retained, current_log_records, true);
     notify_cluster_kv_watchers(paths);
     Ok(appended.len())
+}
+
+fn persisted_cluster_kv_watch_events_contain_all(
+    paths: &ClusterPaths,
+    incoming: &[KvEvent],
+) -> Result<bool, NetworkError> {
+    let Some(log_mark) = cluster_file_mark(&paths.kv_watch_events_log) else {
+        return Ok(false);
+    };
+    if log_mark.exists {
+        return Ok(false);
+    }
+    let events = cluster_kv_watch_events_arc(paths)?;
+    let still_no_log =
+        cluster_file_mark(&paths.kv_watch_events_log).is_some_and(|mark| !mark.exists);
+    Ok(still_no_log
+        && incoming
+            .iter()
+            .all(|event| cluster_kv_events_contain(events.as_ref(), event)))
 }
 
 fn append_cluster_kv_watch_events_from_cached_view(
@@ -2618,6 +2640,9 @@ pub(crate) fn cached_cluster_kv_watch_events_contain_all(
     let Some(entry) = cached_cluster_kv_watch_event_cache_entry(paths, checkpoint, log) else {
         return false;
     };
+    if !entry.append_safe {
+        return false;
+    }
     incoming
         .iter()
         .all(|event| cluster_kv_events_contain(entry.events.as_ref(), event))
@@ -5607,24 +5632,10 @@ pub fn sync_cluster_invitation_to_kv(
     invite: &sinomo_core::ClusterJoinInvite,
 ) -> Result<KvSnapshot, NetworkError> {
     let state = read_cluster_state_without_kv(paths)?;
-    put_cluster_kv_value(
+    append_cluster_raft_command(
         paths,
         &state.local_node_id,
-        cluster_invitation_key(&invite.invite_id),
-        invite,
-    )?;
-    put_cluster_kv_value(
-        paths,
-        &state.local_node_id,
-        cluster_invitation_state_key(&invite.invite_id),
-        &ClusterInvitationStateRecord {
-            cluster_id: invite.cluster_id.clone(),
-            invite_id: invite.invite_id.clone(),
-            state: "active".to_string(),
-            issuer_node_id: invite.issuer_node_id.clone(),
-            expires_at: invite.expires_at,
-            updated_at: OffsetDateTime::now_utc(),
-        },
+        KvCommand::Txn(cluster_invitation_publish_txn(invite)?),
     )
 }
 

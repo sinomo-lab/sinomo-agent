@@ -49,7 +49,8 @@ pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
-const RAFT_NODE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const RAFT_NODE_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
+const RAFT_NODE_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Per-path record of the last content `write_object_file` wrote (or confirmed
@@ -4054,16 +4055,21 @@ fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
 
 fn lock_node_exclusive(lock: &File, path: &Path, wait: Duration) -> Result<(), KvError> {
     let deadline = Instant::now() + wait;
+    let mut attempts = 0_u32;
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => return Ok(()),
             Err(source) if file_lock_is_busy(&source) => {
-                if wait.is_zero() || Instant::now() >= deadline {
+                let now = Instant::now();
+                if wait.is_zero() || now >= deadline {
                     return Err(KvError::Busy {
                         path: path.display().to_string(),
                     });
                 }
-                thread::sleep(RAFT_NODE_LOCK_RETRY_INTERVAL);
+                let delay = raft_node_lock_retry_delay(attempts)
+                    .min(deadline.saturating_duration_since(now));
+                thread::sleep(delay);
+                attempts = attempts.saturating_add(1);
             }
             Err(source) => {
                 return Err(KvError::Io {
@@ -4073,6 +4079,13 @@ fn lock_node_exclusive(lock: &File, path: &Path, wait: Duration) -> Result<(), K
             }
         }
     }
+}
+
+fn raft_node_lock_retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.min(5);
+    RAFT_NODE_LOCK_RETRY_INITIAL
+        .saturating_mul(2_u32.saturating_pow(shift))
+        .min(RAFT_NODE_LOCK_RETRY_MAX)
 }
 
 fn file_lock_is_busy(source: &std::io::Error) -> bool {
@@ -6516,6 +6529,21 @@ mod tests {
         assert_eq!(node.last_log_index(), 0);
         holder.join().expect("join holder");
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn raft_node_lock_retry_delay_backs_off_and_caps() {
+        assert_eq!(raft_node_lock_retry_delay(0), RAFT_NODE_LOCK_RETRY_INITIAL);
+        assert_eq!(
+            raft_node_lock_retry_delay(1),
+            RAFT_NODE_LOCK_RETRY_INITIAL * 2
+        );
+        assert_eq!(
+            raft_node_lock_retry_delay(4),
+            RAFT_NODE_LOCK_RETRY_INITIAL * 16
+        );
+        assert_eq!(raft_node_lock_retry_delay(5), RAFT_NODE_LOCK_RETRY_MAX);
+        assert_eq!(raft_node_lock_retry_delay(32), RAFT_NODE_LOCK_RETRY_MAX);
     }
 
     #[test]
