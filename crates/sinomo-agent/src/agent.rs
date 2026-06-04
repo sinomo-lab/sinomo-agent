@@ -2273,6 +2273,8 @@ pub enum AgentStopReason {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentOp {
     pub op_id: TaskId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     pub action: AgentOpAction,
 }
 
@@ -2280,8 +2282,14 @@ impl AgentOp {
     pub fn new(action: AgentOpAction) -> Self {
         Self {
             op_id: TaskId::generate(),
+            timeout_ms: None,
             action,
         }
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
     }
 
     pub fn start_turn(input: AgentLoopInput) -> Self {
@@ -2316,6 +2324,12 @@ impl AgentOp {
         })
     }
 
+    pub fn cancel_active_turn(reason: impl Into<String>) -> Self {
+        Self::new(AgentOpAction::CancelActiveTurn {
+            reason: reason.into(),
+        })
+    }
+
     pub fn snapshot() -> Self {
         Self::new(AgentOpAction::Snapshot)
     }
@@ -2330,7 +2344,27 @@ pub enum AgentOpAction {
     FollowUp { message: String },
     Compact { reason: String },
     Abort { reason: String },
+    CancelActiveTurn { reason: String },
     Snapshot,
+}
+
+impl AgentOpAction {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::StartTurn { .. } => "start_turn",
+            Self::ContinueTurn { .. } => "continue_turn",
+            Self::Steer { .. } => "steer",
+            Self::FollowUp { .. } => "follow_up",
+            Self::Compact { .. } => "compact",
+            Self::Abort { .. } => "abort",
+            Self::CancelActiveTurn { .. } => "cancel_active_turn",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    pub fn is_turn(&self) -> bool {
+        matches!(self, Self::StartTurn { .. } | Self::ContinueTurn { .. })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2368,6 +2402,17 @@ impl AgentEvent {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEventPayload {
+    OperationQueued {
+        sequence: u64,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    OperationRejected {
+        sequence: u64,
+        action: String,
+        reason: String,
+    },
     TurnStarted {
         provider: String,
         model: String,
@@ -2405,12 +2450,484 @@ pub enum AgentEventPayload {
     Aborted {
         abort: AgentAbortRecord,
     },
+    CancellationRequested {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_op_id: Option<TaskId>,
+    },
+    TurnTimedOut {
+        sequence: u64,
+        active_op_id: TaskId,
+        timeout_ms: u64,
+        reason: String,
+    },
+    TaskStatusChanged {
+        snapshot: AgentTaskSnapshot,
+    },
     Snapshot {
         item_count: usize,
         steering_count: usize,
         follow_up_count: usize,
         aborted: bool,
     },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskLifecycleStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentTaskSnapshot {
+    pub task: AgentTaskRef,
+    pub status: AgentTaskLifecycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_op_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_ids: Vec<EventId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+}
+
+impl AgentTaskSnapshot {
+    pub fn new(task: AgentTaskRef, status: AgentTaskLifecycleStatus) -> Self {
+        Self {
+            task,
+            status,
+            progress_summary: None,
+            active_op_id: None,
+            result_ref: None,
+            event_ids: Vec::new(),
+            updated_at: time::OffsetDateTime::now_utc(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentActiveTurn {
+    pub op_id: TaskId,
+    pub sequence: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: time::OffsetDateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+}
+
+impl AgentActiveTurn {
+    pub fn new(
+        op_id: TaskId,
+        sequence: u64,
+        timeout_ms: Option<u64>,
+        task_id: Option<TaskId>,
+    ) -> Self {
+        Self {
+            op_id,
+            sequence,
+            started_at: time::OffsetDateTime::now_utc(),
+            timeout_ms,
+            task_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionControlSnapshot {
+    pub session_id: SessionId,
+    pub next_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_turn: Option<AgentActiveTurn>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<AgentTaskSnapshot>,
+    pub buffered_event_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionControlResult {
+    pub sequence: u64,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<AgentEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AgentOpOutcome>,
+    pub snapshot: AgentSessionControlSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentSessionControlPlane {
+    session: AgentSession,
+    next_sequence: u64,
+    active_turn: Option<AgentActiveTurn>,
+    tasks: Vec<AgentTaskSnapshot>,
+    events: Vec<AgentEvent>,
+}
+
+impl AgentSessionControlPlane {
+    pub fn new(session: AgentSession) -> Self {
+        Self {
+            session,
+            next_sequence: 0,
+            active_turn: None,
+            tasks: Vec::new(),
+            events: Vec::new(),
+        }
+    }
+
+    pub fn session(&self) -> &AgentSession {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut AgentSession {
+        &mut self.session
+    }
+
+    pub fn active_turn(&self) -> Option<&AgentActiveTurn> {
+        self.active_turn.as_ref()
+    }
+
+    pub fn events(&self) -> &[AgentEvent] {
+        &self.events
+    }
+
+    pub fn drain_events(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub fn snapshot(&self) -> AgentSessionControlSnapshot {
+        AgentSessionControlSnapshot {
+            session_id: self.session.session_id.clone(),
+            next_sequence: self.next_sequence,
+            active_turn: self.active_turn.clone(),
+            tasks: self.tasks.clone(),
+            buffered_event_count: self.events.len(),
+        }
+    }
+
+    pub fn submit_op<M: InteractionModel>(
+        &mut self,
+        agent: &Agent<M>,
+        op: AgentOp,
+    ) -> Result<AgentSessionControlResult, AgentError> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let op_id = op.op_id.clone();
+        let action = op.action.kind().to_string();
+        let is_turn = op.action.is_turn();
+        let timeout_ms = op.timeout_ms;
+        let mut events = vec![agent_session_event(
+            &op_id,
+            &self.session.session_id,
+            AgentEventPayload::OperationQueued {
+                sequence,
+                action: action.clone(),
+                timeout_ms,
+            },
+        )];
+
+        if matches!(&op.action, AgentOpAction::CancelActiveTurn { .. }) {
+            let AgentOpAction::CancelActiveTurn { reason } = op.action else {
+                unreachable!("cancel action already matched")
+            };
+            let result = self.cancel_active_turn(sequence, &op_id, &action, reason, events);
+            let mut result = result;
+            self.events.extend(result.events.iter().cloned());
+            result.snapshot = self.snapshot();
+            return Ok(result);
+        }
+
+        if is_turn && self.active_turn.is_some() {
+            events.push(agent_session_event(
+                &op_id,
+                &self.session.session_id,
+                AgentEventPayload::OperationRejected {
+                    sequence,
+                    action,
+                    reason: "session already has an active turn".to_string(),
+                },
+            ));
+            self.events.extend(events.iter().cloned());
+            return Ok(AgentSessionControlResult {
+                sequence,
+                accepted: false,
+                events,
+                outcome: None,
+                snapshot: self.snapshot(),
+            });
+        }
+
+        let task = if is_turn {
+            agent.config.run_context.task.clone()
+        } else {
+            None
+        };
+        if is_turn {
+            self.active_turn = Some(AgentActiveTurn::new(
+                op_id.clone(),
+                sequence,
+                timeout_ms,
+                task.as_ref().map(|task| task.task_id.clone()),
+            ));
+            if let Some(task) = task.clone() {
+                let event = self.set_task_status(
+                    &op_id,
+                    task,
+                    AgentTaskLifecycleStatus::Running,
+                    Some("turn running".to_string()),
+                    Some(op_id.clone()),
+                    None,
+                    Vec::new(),
+                );
+                events.push(event);
+            }
+        }
+
+        let started = std::time::Instant::now();
+        let outcome = agent.handle_op(&mut self.session, op)?;
+        events.extend(outcome.events.iter().cloned());
+
+        if is_turn {
+            self.active_turn = None;
+            if let Some(task) = task {
+                let timed_out = timeout_ms
+                    .map(|timeout_ms| {
+                        started.elapsed() >= std::time::Duration::from_millis(timeout_ms)
+                    })
+                    .unwrap_or(false);
+                if timed_out {
+                    if let Some(timeout_ms) = timeout_ms {
+                        events.push(agent_session_event(
+                            &op_id,
+                            &self.session.session_id,
+                            AgentEventPayload::TurnTimedOut {
+                                sequence,
+                                active_op_id: op_id.clone(),
+                                timeout_ms,
+                                reason: "turn exceeded configured timeout".to_string(),
+                            },
+                        ));
+                    }
+                }
+                let status = if timed_out {
+                    AgentTaskLifecycleStatus::TimedOut
+                } else {
+                    task_status_for_run(&outcome.run)
+                };
+                let progress_summary = outcome.run.as_ref().map(|run| {
+                    format!(
+                        "turn completed with {:?} after {} model turn(s) and {} tool result(s)",
+                        run.stop_reason,
+                        run.model_turns.len(),
+                        run.tool_results.len()
+                    )
+                });
+                let result_ref = outcome
+                    .run
+                    .as_ref()
+                    .and_then(|run| run.candidate_evidence_bundle.as_ref())
+                    .map(|bundle| bundle.bundle_id.as_str().to_string());
+                let event_ids = outcome
+                    .run
+                    .as_ref()
+                    .map(|run| {
+                        run.events
+                            .iter()
+                            .map(|event| event.event_id.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                events.push(self.set_task_status(
+                    &op_id,
+                    task,
+                    status,
+                    progress_summary,
+                    None,
+                    result_ref,
+                    event_ids,
+                ));
+            }
+        }
+
+        self.events.extend(events.iter().cloned());
+        let result = AgentSessionControlResult {
+            sequence,
+            accepted: true,
+            events,
+            outcome: Some(outcome),
+            snapshot: self.snapshot(),
+        };
+        Ok(result)
+    }
+
+    pub fn cleanup_timed_out_turn(
+        &mut self,
+        reason: impl Into<String>,
+    ) -> Option<AgentSessionControlResult> {
+        let active_turn = self.active_turn.clone()?;
+        let timeout_ms = active_turn.timeout_ms?;
+        let elapsed_ms = (time::OffsetDateTime::now_utc() - active_turn.started_at)
+            .whole_milliseconds()
+            .max(0) as u64;
+        if elapsed_ms < timeout_ms {
+            return None;
+        }
+        self.active_turn = None;
+        let op_id = active_turn.op_id.clone();
+        let reason = reason.into();
+        let mut events = vec![agent_session_event(
+            &op_id,
+            &self.session.session_id,
+            AgentEventPayload::TurnTimedOut {
+                sequence: active_turn.sequence,
+                active_op_id: active_turn.op_id.clone(),
+                timeout_ms,
+                reason: reason.clone(),
+            },
+        )];
+        if let Some(task_id) = active_turn.task_id
+            && let Some(task) = self
+                .tasks
+                .iter()
+                .find(|snapshot| snapshot.task.task_id == task_id)
+                .map(|snapshot| snapshot.task.clone())
+        {
+            events.push(self.set_task_status(
+                &op_id,
+                task,
+                AgentTaskLifecycleStatus::TimedOut,
+                Some(reason),
+                None,
+                None,
+                Vec::new(),
+            ));
+        }
+        self.events.extend(events.iter().cloned());
+        let result = AgentSessionControlResult {
+            sequence: active_turn.sequence,
+            accepted: true,
+            events,
+            outcome: None,
+            snapshot: self.snapshot(),
+        };
+        Some(result)
+    }
+
+    fn cancel_active_turn(
+        &mut self,
+        sequence: u64,
+        op_id: &TaskId,
+        action: &str,
+        reason: String,
+        mut events: Vec<AgentEvent>,
+    ) -> AgentSessionControlResult {
+        let Some(active_turn) = self.active_turn.take() else {
+            events.push(agent_session_event(
+                op_id,
+                &self.session.session_id,
+                AgentEventPayload::OperationRejected {
+                    sequence,
+                    action: action.to_string(),
+                    reason: "session has no active turn".to_string(),
+                },
+            ));
+            return AgentSessionControlResult {
+                sequence,
+                accepted: false,
+                events,
+                outcome: None,
+                snapshot: self.snapshot(),
+            };
+        };
+
+        events.push(agent_session_event(
+            op_id,
+            &self.session.session_id,
+            AgentEventPayload::CancellationRequested {
+                reason: reason.clone(),
+                active_op_id: Some(active_turn.op_id.clone()),
+            },
+        ));
+        if let Some(task_id) = active_turn.task_id
+            && let Some(task) = self
+                .tasks
+                .iter()
+                .find(|snapshot| snapshot.task.task_id == task_id)
+                .map(|snapshot| snapshot.task.clone())
+        {
+            events.push(self.set_task_status(
+                op_id,
+                task,
+                AgentTaskLifecycleStatus::Cancelled,
+                Some(reason),
+                None,
+                None,
+                Vec::new(),
+            ));
+        }
+        AgentSessionControlResult {
+            sequence,
+            accepted: true,
+            events,
+            outcome: None,
+            snapshot: self.snapshot(),
+        }
+    }
+
+    fn set_task_status(
+        &mut self,
+        op_id: &TaskId,
+        task: AgentTaskRef,
+        status: AgentTaskLifecycleStatus,
+        progress_summary: Option<String>,
+        active_op_id: Option<TaskId>,
+        result_ref: Option<String>,
+        event_ids: Vec<EventId>,
+    ) -> AgentEvent {
+        let snapshot = AgentTaskSnapshot {
+            task,
+            status,
+            progress_summary,
+            active_op_id,
+            result_ref,
+            event_ids,
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        if let Some(existing) = self
+            .tasks
+            .iter_mut()
+            .find(|existing| existing.task.task_id == snapshot.task.task_id)
+        {
+            *existing = snapshot.clone();
+        } else {
+            self.tasks.push(snapshot.clone());
+        }
+        agent_session_event(
+            op_id,
+            &self.session.session_id,
+            AgentEventPayload::TaskStatusChanged { snapshot },
+        )
+    }
+}
+
+fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleStatus {
+    match run.as_ref().map(|run| &run.stop_reason) {
+        Some(AgentStopReason::Aborted) => AgentTaskLifecycleStatus::Cancelled,
+        Some(AgentStopReason::MaxStepsReached) => AgentTaskLifecycleStatus::Failed,
+        Some(AgentStopReason::FinalDecision | AgentStopReason::SilentAsyncUpdate) => {
+            AgentTaskLifecycleStatus::Completed
+        }
+        None => AgentTaskLifecycleStatus::Failed,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2865,6 +3382,16 @@ impl<M: InteractionModel> Agent<M> {
                     &op_id,
                     &session_id,
                     AgentEventPayload::Aborted { abort },
+                ));
+            }
+            AgentOpAction::CancelActiveTurn { reason } => {
+                events.push(agent_session_event(
+                    &op_id,
+                    &session_id,
+                    AgentEventPayload::CancellationRequested {
+                        reason,
+                        active_op_id: None,
+                    },
                 ));
             }
             AgentOpAction::Snapshot => {
@@ -8491,6 +9018,160 @@ old
             AgentEventPayload::Aborted { abort } if abort.reason == "op abort"
         ));
         assert!(session.is_aborted());
+    }
+
+    #[test]
+    fn agent_session_control_plane_orders_ops_and_tracks_task_status() {
+        let task = AgentTaskRef::new("coding", "control-plane coding task")
+            .with_owner_role(AgentRole::Deliberation);
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Controlled turn done.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let config = AgentConfig::new("fake", "fake").with_task_ref(task.clone());
+        let agent = Agent::new(model, "fake", "fake").with_config(config);
+        let input = agent_input("run under control plane");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let mut control = AgentSessionControlPlane::new(session);
+
+        let result = control
+            .submit_op(&agent, AgentOp::start_turn(input))
+            .expect("submit op");
+
+        assert_eq!(result.sequence, 0);
+        assert!(result.accepted);
+        assert!(
+            result
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.run.as_ref())
+                .is_some()
+        );
+        assert!(control.active_turn().is_none());
+        assert_eq!(control.snapshot().next_sequence, 1);
+        assert!(matches!(
+            &result.events[0].payload,
+            AgentEventPayload::OperationQueued {
+                sequence: 0,
+                action,
+                ..
+            } if action == "start_turn"
+        ));
+        assert!(result.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::TaskStatusChanged { snapshot }
+                    if snapshot.task.task_id == task.task_id
+                        && snapshot.status == AgentTaskLifecycleStatus::Running
+                        && snapshot.active_op_id.is_some()
+            )
+        }));
+        assert!(result.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::TurnCompleted {
+                    stop_reason: AgentStopReason::FinalDecision,
+                    ..
+                }
+            )
+        }));
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].task.task_id, task.task_id);
+        assert_eq!(
+            snapshot.tasks[0].status,
+            AgentTaskLifecycleStatus::Completed
+        );
+        assert!(!snapshot.tasks[0].event_ids.is_empty());
+        assert_eq!(control.drain_events().len(), result.events.len());
+    }
+
+    #[test]
+    fn agent_session_control_plane_rejects_cancels_and_times_out_active_turns() {
+        let model = SequencedModel::new(Vec::<String>::new());
+        let task = AgentTaskRef::new("coding", "active turn guard")
+            .with_owner_role(AgentRole::Deliberation);
+        let config = AgentConfig::new("fake", "fake").with_task_ref(task.clone());
+        let agent = Agent::new(model, "fake", "fake").with_config(config);
+        let input = agent_input("should be rejected");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let mut control = AgentSessionControlPlane::new(session);
+        control.tasks.push(AgentTaskSnapshot::new(
+            task.clone(),
+            AgentTaskLifecycleStatus::Running,
+        ));
+        control.active_turn = Some(AgentActiveTurn::new(
+            TaskId::generate(),
+            99,
+            Some(1_000),
+            Some(task.task_id.clone()),
+        ));
+
+        let rejected = control
+            .submit_op(&agent, AgentOp::start_turn(input))
+            .expect("rejected op");
+        assert!(!rejected.accepted);
+        assert!(control.active_turn().is_some());
+        assert!(rejected.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::OperationRejected { reason, .. }
+                    if reason.contains("active turn")
+            )
+        }));
+
+        let cancelled = control
+            .submit_op(&agent, AgentOp::cancel_active_turn("user cancelled"))
+            .expect("cancel active");
+        assert!(cancelled.accepted);
+        assert!(control.active_turn().is_none());
+        assert!(cancelled.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::CancellationRequested { reason, active_op_id }
+                    if reason == "user cancelled" && active_op_id.is_some()
+            )
+        }));
+        assert_eq!(
+            control.snapshot().tasks[0].status,
+            AgentTaskLifecycleStatus::Cancelled
+        );
+
+        let timeout_task =
+            AgentTaskRef::new("coding", "timeout guard").with_owner_role(AgentRole::Deliberation);
+        control.tasks.clear();
+        control.tasks.push(AgentTaskSnapshot::new(
+            timeout_task.clone(),
+            AgentTaskLifecycleStatus::Running,
+        ));
+        let mut active_turn = AgentActiveTurn::new(
+            TaskId::generate(),
+            7,
+            Some(1),
+            Some(timeout_task.task_id.clone()),
+        );
+        active_turn.started_at -= time::Duration::milliseconds(10);
+        control.active_turn = Some(active_turn);
+
+        let timed_out = control
+            .cleanup_timed_out_turn("active turn exceeded timeout")
+            .expect("timed out");
+
+        assert!(control.active_turn().is_none());
+        assert!(timed_out.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::TurnTimedOut { timeout_ms: 1, reason, .. }
+                    if reason == "active turn exceeded timeout"
+            )
+        }));
+        assert_eq!(
+            control.snapshot().tasks[0].status,
+            AgentTaskLifecycleStatus::TimedOut
+        );
     }
 
     #[test]
