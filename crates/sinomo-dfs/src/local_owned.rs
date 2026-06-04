@@ -11,6 +11,8 @@ use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::fs;
 use std::io::{self, Write};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
@@ -655,12 +657,10 @@ fn write_expose_config_atomic(path: &Path, bytes: &[u8]) -> Result<(), DfsExpose
         path: path.to_owned(),
         source,
     })?;
-    fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))
-        .and_then(|dir| dir.sync_all())
-        .map_err(|source| DfsExposeStoreError::Io {
-            path: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
-            source,
-        })
+    sync_parent_dir(path).map_err(|source| DfsExposeStoreError::Io {
+        path: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
+        source,
+    })
 }
 
 fn write_local_owned_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), LocalOwnedDfsError> {
@@ -686,12 +686,35 @@ fn write_local_owned_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), LocalO
         path: path.to_owned(),
         source,
     })?;
-    fs::File::open(path.parent().unwrap_or_else(|| Path::new(".")))
+    sync_parent_dir(path).map_err(|source| LocalOwnedDfsError::Io {
+        path: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
+        source,
+    })
+}
+
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+#[cfg(not(windows))]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    fs::File::open(path).and_then(|dir| dir.sync_all())
+}
+
+#[cfg(windows)]
+fn sync_dir(path: &Path) -> io::Result<()> {
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
         .and_then(|dir| dir.sync_all())
-        .map_err(|source| LocalOwnedDfsError::Io {
-            path: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
-            source,
-        })
+    {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(source) => Err(source),
+    }
 }
 
 fn temporary_path_for(path: &Path) -> PathBuf {
