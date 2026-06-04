@@ -9714,6 +9714,82 @@ fn delivery_ledger_applies_latency_class_retry_backoff() {
 }
 
 #[test]
+fn delivery_ledger_spreads_background_retry_wakeups() {
+    let node_a = NodeId::from_legacy_named("node_retry_jitter_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_retry_jitter_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    for index in 1..=2 {
+        let event = fixture_event(&format!("evt_retry_jitter_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Background,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+    let now = Instant::now();
+
+    ledger
+        .mark_attempt_failed_at(RouteDeliveryId(1), now)
+        .expect("mark first failed");
+    ledger
+        .mark_attempt_failed_at(RouteDeliveryId(2), now)
+        .expect("mark second failed");
+
+    assert!(
+        ledger
+            .ready_delivery_ids_at(now + Duration::from_secs(1))
+            .is_empty(),
+        "background retry jitter should avoid a same-instant retry herd"
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_at(now + Duration::from_millis(1_050)),
+        vec![RouteDeliveryId(1)],
+        "deterministic jitter should spread otherwise identical background retries"
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_at(now + Duration::from_millis(1_100)),
+        vec![RouteDeliveryId(1), RouteDeliveryId(2)]
+    );
+}
+
+#[test]
+fn delivery_ledger_keeps_interactive_retry_without_jitter() {
+    let node_a = NodeId::from_legacy_named("node_retry_no_jitter_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_retry_no_jitter_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 1);
+    let event = fixture_event("evt_retry_no_jitter", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(99),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let now = Instant::now();
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger
+        .mark_attempt_failed_at(RouteDeliveryId(99), now)
+        .expect("mark failed");
+
+    assert!(
+        ledger
+            .ready_delivery_ids_at(now + Duration::from_millis(99))
+            .is_empty()
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_at(now + Duration::from_millis(100)),
+        vec![RouteDeliveryId(99)],
+        "interactive retries should keep the existing low-latency deadline"
+    );
+}
+
+#[test]
 fn delivery_ledger_outbound_wake_hint_tracks_immediate_and_waiting_work() {
     let node_a = NodeId::from_legacy_named("node_retry_wake_source").expect("node");
     let node_b = NodeId::from_legacy_named("node_retry_wake_target").expect("node");
@@ -9745,6 +9821,74 @@ fn delivery_ledger_outbound_wake_hint_tracks_immediate_and_waiting_work() {
         ledger.next_outbound_wake_at_at(now),
         Some(now),
         "deadline-free retries should wake immediately"
+    );
+}
+
+#[test]
+fn delivery_ledger_prioritizes_realtime_ready_work() {
+    let node_a = NodeId::from_legacy_named("node_ready_priority_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ready_priority_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 4);
+    let fixtures = [
+        (1, LatencyClass::Archive),
+        (2, LatencyClass::Background),
+        (3, LatencyClass::Interactive),
+        (4, LatencyClass::Reactive),
+    ];
+    for (index, latency_class) in fixtures {
+        let event = fixture_event(&format!("evt_ready_priority_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    assert_eq!(
+        ledger.ready_delivery_ids(),
+        vec![
+            RouteDeliveryId(4),
+            RouteDeliveryId(3),
+            RouteDeliveryId(2),
+            RouteDeliveryId(1),
+        ],
+        "ready work should be ordered for realtime latency before older bulk work"
+    );
+}
+
+#[test]
+fn delivery_ledger_limited_ready_batch_keeps_realtime_priority() {
+    let node_a = NodeId::from_legacy_named("node_ready_limited_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ready_limited_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 5);
+    let fixtures = [
+        (1, LatencyClass::Archive),
+        (2, LatencyClass::Background),
+        (3, LatencyClass::Background),
+        (4, LatencyClass::Interactive),
+        (5, LatencyClass::Reactive),
+    ];
+    for (index, latency_class) in fixtures {
+        let event = fixture_event(&format!("evt_ready_limited_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    assert_eq!(
+        ledger.ready_delivery_ids_limited(2),
+        vec![RouteDeliveryId(5), RouteDeliveryId(4)],
+        "bounded pump batches should not let older bulk work fill the batch ahead of realtime work"
     );
 }
 
@@ -10140,6 +10284,11 @@ async fn direct_target_offline_buffers_instead_of_sending() {
     let service = NetworkService::new(registry, transport_a).spawn(store);
     let delivery_id = service.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
+    assert_eq!(
+        service.next_outbound_wake_at().await.expect("wake hint"),
+        None,
+        "known-offline direct targets should not create an avoidable pump wake"
+    );
     assert_eq!(service.pump_outbound().await.expect("buffer offline"), 0);
     assert_eq!(transport_b.drain_incoming().expect("drain").len(), 0);
     assert_eq!(

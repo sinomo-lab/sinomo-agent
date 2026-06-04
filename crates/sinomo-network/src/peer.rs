@@ -840,7 +840,12 @@ impl<T: NetworkTransport> NetworkService<T> {
         let deliveries = self.router.route_event(stored_event)?;
         let mut accepted = Vec::new();
 
-        for delivery in deliveries {
+        for mut delivery in deliveries {
+            if delivery.target_node_id != *self.transport.local_node_id()
+                && !self.registry().is_routable(&delivery.target_node_id)
+            {
+                delivery.status = DeliveryStatus::WaitingForPeer;
+            }
             if self
                 .ledger
                 .enqueue(delivery.clone(), stored_event.event.clone())
@@ -861,9 +866,8 @@ impl<T: NetworkTransport> NetworkService<T> {
         let mut sent = 0;
         let delivery_ids = self
             .ledger
-            .ready_delivery_ids()
-            .into_iter()
-            .take(max_deliveries.max(1));
+            .ready_delivery_ids_limited(max_deliveries.max(1))
+            .into_iter();
 
         for delivery_id in delivery_ids {
             let Some(record) = self.ledger.record(&delivery_id).cloned() else {
@@ -1286,18 +1290,44 @@ impl DeliveryLedger {
     }
 
     pub(crate) fn ready_delivery_ids_at(&self, now: Instant) -> Vec<RouteDeliveryId> {
-        self.records
-            .iter()
-            .filter_map(|(delivery_id, record)| match record.delivery.status {
-                DeliveryStatus::Queued => Some(*delivery_id),
-                DeliveryStatus::Retrying => self
-                    .retry_not_before
-                    .get(delivery_id)
-                    .is_none_or(|deadline| *deadline <= now)
-                    .then_some(*delivery_id),
-                _ => None,
-            })
-            .collect()
+        self.ready_delivery_ids_limited_at(now, usize::MAX)
+    }
+
+    pub(crate) fn ready_delivery_ids_limited(&self, max_deliveries: usize) -> Vec<RouteDeliveryId> {
+        self.ready_delivery_ids_limited_at(Instant::now(), max_deliveries)
+    }
+
+    pub(crate) fn ready_delivery_ids_limited_at(
+        &self,
+        now: Instant,
+        max_deliveries: usize,
+    ) -> Vec<RouteDeliveryId> {
+        let max_deliveries = max_deliveries.max(1);
+        let mut ready_by_priority = [
+            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
+            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
+            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
+            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
+        ];
+        for (delivery_id, record) in &self.records {
+            if !delivery_is_ready(record, *delivery_id, &self.retry_not_before, now) {
+                continue;
+            }
+            let priority = latency_class_ready_priority(&record.delivery.latency_class) as usize;
+            if ready_by_priority[priority].len() < max_deliveries {
+                ready_by_priority[priority].push(*delivery_id);
+            }
+        }
+
+        let mut ready = Vec::with_capacity(max_deliveries.min(self.records.len()));
+        for bucket in ready_by_priority {
+            let remaining = max_deliveries.saturating_sub(ready.len());
+            if remaining == 0 {
+                break;
+            }
+            ready.extend(bucket.into_iter().take(remaining));
+        }
+        ready
     }
 
     pub fn next_outbound_wake_at(&self) -> Option<Instant> {
@@ -1364,6 +1394,14 @@ impl DeliveryLedger {
         &mut self,
         delivery_id: RouteDeliveryId,
     ) -> Result<(), NetworkError> {
+        self.mark_attempt_failed_at(delivery_id, Instant::now())
+    }
+
+    pub(crate) fn mark_attempt_failed_at(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+        now: Instant,
+    ) -> Result<(), NetworkError> {
         let record = self
             .records
             .get_mut(&delivery_id)
@@ -1375,8 +1413,7 @@ impl DeliveryLedger {
         } else {
             record.delivery.status = DeliveryStatus::Retrying;
             let delay = retry_delay_for_record(record);
-            self.retry_not_before
-                .insert(delivery_id, Instant::now() + delay);
+            self.retry_not_before.insert(delivery_id, now + delay);
         }
         self.prune_terminal_records_to_retention();
         Ok(())
@@ -1502,6 +1539,31 @@ impl DeliveryLedger {
 }
 
 const MAX_DELIVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_DELIVERY_RETRY_JITTER: Duration = Duration::from_secs(2);
+
+fn latency_class_ready_priority(latency_class: &LatencyClass) -> u8 {
+    match latency_class {
+        LatencyClass::Reactive => 0,
+        LatencyClass::Interactive => 1,
+        LatencyClass::Background => 2,
+        LatencyClass::Archive => 3,
+    }
+}
+
+fn delivery_is_ready(
+    record: &DeliveryRecord,
+    delivery_id: RouteDeliveryId,
+    retry_not_before: &BTreeMap<RouteDeliveryId, Instant>,
+    now: Instant,
+) -> bool {
+    match record.delivery.status {
+        DeliveryStatus::Queued => true,
+        DeliveryStatus::Retrying => retry_not_before
+            .get(&delivery_id)
+            .is_none_or(|deadline| *deadline <= now),
+        _ => false,
+    }
+}
 
 fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
     let base = match record.delivery.latency_class {
@@ -1511,8 +1573,27 @@ fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
         LatencyClass::Archive => Duration::from_secs(5),
     };
     let shift = record.attempts.saturating_sub(1).min(8) as u32;
-    base.saturating_mul(2_u32.saturating_pow(shift))
-        .min(MAX_DELIVERY_RETRY_BACKOFF)
+    let backoff = base
+        .saturating_mul(2_u32.saturating_pow(shift))
+        .min(MAX_DELIVERY_RETRY_BACKOFF);
+    backoff + retry_jitter_for_record(record, backoff)
+}
+
+fn retry_jitter_for_record(record: &DeliveryRecord, backoff: Duration) -> Duration {
+    if !matches!(
+        record.delivery.latency_class,
+        LatencyClass::Background | LatencyClass::Archive
+    ) {
+        return Duration::ZERO;
+    }
+
+    let jitter_window_ms =
+        ((backoff.as_millis() / 10) as u64).min(MAX_DELIVERY_RETRY_JITTER.as_millis() as u64);
+    if jitter_window_ms == 0 {
+        return Duration::ZERO;
+    }
+    let jitter_ms = record.delivery.delivery_id.0.wrapping_mul(37) % (jitter_window_ms + 1);
+    Duration::from_millis(jitter_ms)
 }
 
 impl Default for DeliveryLedger {

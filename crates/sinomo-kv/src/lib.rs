@@ -1454,6 +1454,28 @@ impl InProcessKvStore {
         }
     }
 
+    fn preflight_apply_command(&self, command: &KvCommand) -> Result<(), KvError> {
+        validate_kv_command_payload(command)?;
+        match command {
+            KvCommand::Op(op) => self.validate_ops(std::slice::from_ref(op)),
+            KvCommand::Txn(txn) => {
+                self.validate_txn_shape(txn)?;
+                validate_kv_txn_payload(txn)?;
+                let succeeded = txn.compares.iter().all(|compare| self.compare(compare));
+                let ops = if succeeded {
+                    txn.success.as_slice()
+                } else {
+                    txn.failure.as_slice()
+                };
+                self.validate_ops(ops)
+            }
+            KvCommand::PutClusterMember(member) => {
+                let op = KvOp::put_serde(cluster_member_key(&member.node_id), member, None)?;
+                self.validate_ops(std::slice::from_ref(&op))
+            }
+        }
+    }
+
     pub fn put_cluster_member(
         &mut self,
         member: ClusterMemberRecord,
@@ -2804,6 +2826,14 @@ impl ReplicatedKvNode {
         for entry in entries {
             validate_kv_command_payload(&entry.command)?;
             if entry.index <= self.applied_index {
+                if let Some(existing) = self
+                    .log
+                    .iter()
+                    .find(|candidate| candidate.index == entry.index)
+                    && (existing.term != entry.term || existing.command != entry.command)
+                {
+                    return Err(KvError::ConflictingLogEntry { index: entry.index });
+                }
                 continue;
             }
             if let Some(existing_position) = self
@@ -2815,6 +2845,8 @@ impl ReplicatedKvNode {
                     self.log.truncate(existing_position);
                     self.log.push(entry.clone());
                     appended.push(entry);
+                } else if self.log[existing_position].command != entry.command {
+                    return Err(KvError::ConflictingLogEntry { index: entry.index });
                 }
             } else {
                 let expected = self.last_log_index().saturating_add(1);
@@ -2840,18 +2872,19 @@ impl ReplicatedKvNode {
         old_log_len != self.log.len() || old_response_len != self.txn_responses.len()
     }
 
-    fn handle_append_entries(
+    fn prepare_append_entries(
         &mut self,
         request: RaftAppendEntriesRequest,
-    ) -> Result<RaftAppendEntriesOutcome, KvError> {
+    ) -> Result<RaftAppendEntriesPreparation, KvError> {
         if request.term < self.hard_state.current_term {
-            return Ok(RaftAppendEntriesOutcome {
+            return Ok(RaftAppendEntriesPreparation {
                 response: RaftAppendEntriesResponse {
                     term: self.hard_state.current_term,
                     success: false,
                     match_index: self.last_log_index(),
                 },
                 appended_entries: Vec::new(),
+                commit_index: None,
             });
         }
         if request.term > self.hard_state.current_term {
@@ -2860,25 +2893,39 @@ impl ReplicatedKvNode {
         self.hard_state.current_term = request.term;
         self.hard_state.leader_id = Some(request.leader_id.clone());
         if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
-            return Ok(RaftAppendEntriesOutcome {
+            return Ok(RaftAppendEntriesPreparation {
                 response: RaftAppendEntriesResponse {
                     term: self.hard_state.current_term,
                     success: false,
                     match_index: self.last_log_index(),
                 },
                 appended_entries: Vec::new(),
+                commit_index: None,
             });
         }
         let appended_entries = self.append_entries(request.entries)?;
         let commit_index = request.leader_commit.min(self.last_log_index());
-        self.commit_to(commit_index)?;
-        Ok(RaftAppendEntriesOutcome {
+        Ok(RaftAppendEntriesPreparation {
             response: RaftAppendEntriesResponse {
                 term: self.hard_state.current_term,
                 success: true,
                 match_index: self.last_log_index(),
             },
             appended_entries,
+            commit_index: Some(commit_index),
+        })
+    }
+
+    fn handle_append_entries(
+        &mut self,
+        request: RaftAppendEntriesRequest,
+    ) -> Result<RaftAppendEntriesOutcome, KvError> {
+        let preparation = self.prepare_append_entries(request)?;
+        if let Some(commit_index) = preparation.commit_index {
+            self.commit_to(commit_index)?;
+        }
+        Ok(RaftAppendEntriesOutcome {
+            response: preparation.response,
         })
     }
 
@@ -2926,15 +2973,21 @@ impl ReplicatedKvNode {
     }
 
     fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
+        if commit_index <= self.applied_index {
+            self.hard_state.commit_index = self.hard_state.commit_index.max(commit_index);
+            return Ok(());
+        }
+        let entries = self.entries_to_commit(commit_index)?;
+        self.preflight_commit_entries(&entries)?;
+        self.apply_preflighted_commit(entries, commit_index)
+    }
+
+    fn entries_to_commit(&self, commit_index: u64) -> Result<Vec<KvLogEntry>, KvError> {
         let last_log_index = self.last_log_index();
         if commit_index > last_log_index {
             return Err(KvError::MissingCommittedEntry {
                 index: last_log_index.saturating_add(1),
             });
-        }
-        if commit_index <= self.applied_index {
-            self.hard_state.commit_index = self.hard_state.commit_index.max(commit_index);
-            return Ok(());
         }
         let entries = self
             .log
@@ -2956,6 +3009,28 @@ impl ReplicatedKvNode {
                 index: expected_index,
             });
         }
+        Ok(entries)
+    }
+
+    fn preflight_commit_entries(&self, entries: &[KvLogEntry]) -> Result<(), KvError> {
+        match entries {
+            [] => Ok(()),
+            [entry] => self.store.preflight_apply_command(&entry.command),
+            _ => {
+                let mut store = self.store.clone();
+                for entry in entries {
+                    store.apply_command_with_response(entry.command.clone())?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn apply_preflighted_commit(
+        &mut self,
+        entries: Vec<KvLogEntry>,
+        commit_index: u64,
+    ) -> Result<(), KvError> {
         for entry in entries {
             let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
             if let Some(log_entry) = self
@@ -3007,9 +3082,15 @@ struct RaftCommitOutcome {
 }
 
 #[derive(Clone, Debug)]
-struct RaftAppendEntriesOutcome {
+struct RaftAppendEntriesPreparation {
     response: RaftAppendEntriesResponse,
     appended_entries: Vec<KvLogEntry>,
+    commit_index: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct RaftAppendEntriesOutcome {
+    response: RaftAppendEntriesResponse,
 }
 
 #[derive(Debug)]
@@ -3237,12 +3318,88 @@ impl DurableRaftKvNode {
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesResponse, KvError> {
         let hard_state_before = self.node.hard_state.clone();
-        let outcome = self.node.handle_append_entries(request)?;
-        if outcome.response.success {
-            append_wal_entries(&self.paths.wal, &outcome.appended_entries)?;
+        let log_before = self.node.log.clone();
+        let txn_responses_before = self.node.txn_responses.clone();
+        let applied_index_before = self.node.applied_index;
+        let preparation = match self.node.prepare_append_entries(request) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                self.restore_after_append_entries_persist_failure(
+                    None,
+                    hard_state_before,
+                    log_before,
+                    txn_responses_before,
+                    applied_index_before,
+                );
+                return Err(error);
+            }
+        };
+
+        let entries_to_apply = match preparation.commit_index {
+            Some(commit_index) if commit_index > self.node.applied_index => {
+                match self.node.entries_to_commit(commit_index) {
+                    Ok(entries) => {
+                        if let Err(error) = self.node.preflight_commit_entries(&entries) {
+                            self.restore_after_append_entries_persist_failure(
+                                None,
+                                hard_state_before,
+                                log_before,
+                                txn_responses_before,
+                                applied_index_before,
+                            );
+                            return Err(error);
+                        }
+                        Some((commit_index, entries))
+                    }
+                    Err(error) => {
+                        self.restore_after_append_entries_persist_failure(
+                            None,
+                            hard_state_before,
+                            log_before,
+                            txn_responses_before,
+                            applied_index_before,
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+            Some(commit_index) => {
+                self.node.hard_state.commit_index =
+                    self.node.hard_state.commit_index.max(commit_index);
+                None
+            }
+            None => None,
+        };
+
+        if preparation.response.success {
+            if let Err(error) = append_wal_entries(&self.paths.wal, &preparation.appended_entries) {
+                self.restore_after_append_entries_persist_failure(
+                    None,
+                    hard_state_before,
+                    log_before,
+                    txn_responses_before,
+                    applied_index_before,
+                );
+                return Err(error);
+            }
         }
-        self.persist_hard_state_if_changed(&hard_state_before)?;
-        Ok(outcome.response)
+        if let Some((commit_index, _)) = &entries_to_apply {
+            self.node.hard_state.commit_index = *commit_index;
+        }
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.restore_after_append_entries_persist_failure(
+                None,
+                hard_state_before,
+                log_before,
+                txn_responses_before,
+                applied_index_before,
+            );
+            return Err(error);
+        }
+        if let Some((commit_index, entries)) = entries_to_apply {
+            self.node.apply_preflighted_commit(entries, commit_index)?;
+        }
+        Ok(preparation.response)
     }
 
     pub fn request_vote(
@@ -3250,16 +3407,29 @@ impl DurableRaftKvNode {
         request: RaftRequestVoteRequest,
     ) -> Result<RaftRequestVoteResponse, KvError> {
         let hard_state_before = self.node.hard_state.clone();
-        let response = self.node.handle_request_vote(request)?;
-        self.persist_hard_state_if_changed(&hard_state_before)?;
+        let response = match self.node.handle_request_vote(request) {
+            Ok(response) => response,
+            Err(error) => {
+                self.node.hard_state = hard_state_before;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node.hard_state = hard_state_before;
+            return Err(error);
+        }
         Ok(response)
     }
 
     pub fn observe_term(&mut self, term: u64) -> Result<bool, KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         if !self.node.observe_term(term) {
             return Ok(false);
         }
-        self.persist_hard_state()?;
+        if let Err(error) = self.persist_hard_state() {
+            self.node.hard_state = hard_state_before;
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -3268,13 +3438,21 @@ impl DurableRaftKvNode {
         self.node.hard_state.current_term = term.max(self.node.hard_state.current_term);
         self.node.hard_state.voted_for = Some(self.node_id.clone());
         self.node.hard_state.leader_id = Some(self.node_id.clone());
-        self.persist_hard_state_if_changed(&hard_state_before)
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node.hard_state = hard_state_before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn clear_known_leader(&mut self) -> Result<(), KvError> {
         let hard_state_before = self.node.hard_state.clone();
         self.node.hard_state.leader_id = None;
-        self.persist_hard_state_if_changed(&hard_state_before)
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node.hard_state = hard_state_before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn append_local_command(
@@ -3283,6 +3461,7 @@ impl DurableRaftKvNode {
         command: KvCommand,
     ) -> Result<KvLogEntry, KvError> {
         let hard_state_before = self.node.hard_state.clone();
+        let log_before = self.node.log.clone();
         let entry = KvLogEntry {
             index: self.node.last_log_index().saturating_add(1),
             term,
@@ -3291,19 +3470,43 @@ impl DurableRaftKvNode {
         };
         self.node.hard_state.current_term = term;
         self.node.hard_state.leader_id = Some(self.node_id.clone());
-        self.node.append_entries(vec![entry.clone()])?;
-        append_wal_entries(&self.paths.wal, std::slice::from_ref(&entry))?;
-        self.persist_hard_state_if_changed(&hard_state_before)?;
+        if let Err(error) = self.node.append_entries(vec![entry.clone()]) {
+            self.node.hard_state = hard_state_before;
+            self.node.log = log_before;
+            return Err(error);
+        }
+        if let Err(error) = append_wal_entries(&self.paths.wal, std::slice::from_ref(&entry)) {
+            self.node.hard_state = hard_state_before;
+            self.node.log = log_before;
+            return Err(error);
+        }
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node.hard_state = hard_state_before;
+            self.node.log = log_before;
+            return Err(error);
+        }
         Ok(entry)
     }
 
     pub fn discard_uncommitted_tail(&mut self) -> Result<bool, KvError> {
         let hard_state_before = self.node.hard_state.clone();
+        let log_before = self.node.log.clone();
+        let txn_responses_before = self.node.txn_responses.clone();
         if !self.node.discard_uncommitted_tail() {
             return Ok(false);
         }
-        rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
-        self.persist_hard_state_if_changed(&hard_state_before)?;
+        if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
+            self.node.hard_state = hard_state_before;
+            self.node.log = log_before;
+            self.node.txn_responses = txn_responses_before;
+            return Err(error);
+        }
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node.hard_state = hard_state_before;
+            self.node.log = log_before;
+            self.node.txn_responses = txn_responses_before;
+            return Err(error);
+        }
         Ok(true)
     }
 
@@ -3313,12 +3516,31 @@ impl DurableRaftKvNode {
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
         let hard_state_before = self.node.hard_state.clone();
-        self.node.commit_to(commit_index)?;
-        self.persist_hard_state_if_changed(&hard_state_before)
+        if commit_index <= self.node.applied_index {
+            if let Err(error) = self.node.commit_to(commit_index) {
+                self.node.hard_state = hard_state_before;
+                return Err(error);
+            }
+            if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+                self.node.hard_state = hard_state_before;
+                return Err(error);
+            }
+            return Ok(());
+        }
+
+        let entries = self.node.entries_to_commit(commit_index)?;
+        self.node.preflight_commit_entries(&entries)?;
+        self.node.hard_state.commit_index = commit_index;
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node.hard_state = hard_state_before;
+            return Err(error);
+        }
+        self.node.apply_preflighted_commit(entries, commit_index)
     }
 
     pub fn save_snapshot(&mut self) -> Result<RaftSnapshot, KvError> {
-        let hard_state_before = self.node.hard_state.clone();
+        let node_before = self.node.clone();
+        let hard_state_before = node_before.hard_state.clone();
         let snapshot = RaftSnapshot {
             last_included_index: self.node.applied_index,
             last_included_term: self
@@ -3332,17 +3554,31 @@ impl DurableRaftKvNode {
         // incremental replication; the snapshot file still records the full state at
         // applied_index for cold recovery.
         self.node.local_compact(RAFT_COMPACTION_RETAINED_ENTRIES);
-        rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
-        self.persist_hard_state_if_changed(&hard_state_before)?;
+        if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
+            self.node = node_before;
+            return Err(error);
+        }
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node = node_before;
+            return Err(error);
+        }
         Ok(snapshot)
     }
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
-        let hard_state_before = self.node.hard_state.clone();
+        let node_before = self.node.clone();
+        let hard_state_before = node_before.hard_state.clone();
         write_object_file(&self.paths.snapshot, &snapshot)?;
         self.node.install_snapshot(snapshot);
-        rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
-        self.persist_hard_state_if_changed(&hard_state_before)
+        if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
+            self.node = node_before;
+            return Err(error);
+        }
+        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
+            self.node = node_before;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
@@ -3354,6 +3590,24 @@ impl DurableRaftKvNode {
             return Ok(());
         }
         self.persist_hard_state()
+    }
+
+    fn restore_after_append_entries_persist_failure(
+        &mut self,
+        node_before: Option<ReplicatedKvNode>,
+        hard_state_before: RaftHardState,
+        log_before: Vec<KvLogEntry>,
+        txn_responses_before: BTreeMap<u64, KvTxnResponse>,
+        applied_index_before: u64,
+    ) {
+        if let Some(node_before) = node_before {
+            self.node = node_before;
+            return;
+        }
+        self.node.hard_state = hard_state_before;
+        self.node.log = log_before;
+        self.node.txn_responses = txn_responses_before;
+        self.node.applied_index = applied_index_before;
     }
 }
 
@@ -3954,6 +4208,8 @@ pub enum KvError {
     QuorumUnavailable { online_voters: usize, quorum: usize },
     #[error("raft log gap: expected index {expected}, got {actual}")]
     LogGap { expected: u64, actual: u64 },
+    #[error("conflicting raft log entry at index {index}")]
+    ConflictingLogEntry { index: u64 },
     #[error("missing committed raft entry at index {index}")]
     MissingCommittedEntry { index: u64 },
 }
@@ -6770,6 +7026,203 @@ mod tests {
     }
 
     #[test]
+    fn durable_raft_append_local_command_rolls_back_after_wal_failure() {
+        let root = temp_raft_root("sinomo-kv-local-append-rollback");
+        let node_id = NodeId::from_legacy_named("node_local_append_rollback").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open");
+        std::fs::create_dir(&paths.wal).expect("block WAL appends");
+
+        let error = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/rollback/local".to_string(),
+                    value: b"not-durable".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect_err("WAL append should fail");
+
+        assert!(
+            error.to_string().contains("wal.sobjlog"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            node.last_log_index(),
+            0,
+            "failed WAL append must not leave an in-memory log entry"
+        );
+        assert_eq!(node.hard_state(), &RaftHardState::default());
+        assert!(node.store().get("/rollback/local").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_append_entries_rolls_back_after_wal_failure() {
+        let leader_root = temp_raft_root("sinomo-kv-follower-append-rollback-leader");
+        let follower_root = temp_raft_root("sinomo-kv-follower-append-rollback");
+        let leader_id = NodeId::from_legacy_named("node_append_rollback_leader").expect("leader");
+        let follower_id =
+            NodeId::from_legacy_named("node_append_rollback_follower").expect("follower");
+        let leader_paths = KvWalPaths::new(&leader_root);
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let entry = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), leader_paths).expect("open leader");
+            let entry = leader
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/rollback/follower".to_string(),
+                        value: b"not-durable".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append leader");
+            leader.commit_to(entry.index).expect("commit leader");
+            entry
+        };
+        let mut follower =
+            DurableRaftKvNode::open(follower_id, follower_paths.clone()).expect("open follower");
+        std::fs::create_dir(&follower_paths.wal).expect("block follower WAL appends");
+
+        let error = follower
+            .append_entries(RaftAppendEntriesRequest {
+                term: 1,
+                leader_id,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![entry],
+                leader_commit: 1,
+            })
+            .expect_err("WAL append should fail");
+
+        assert!(
+            error.to_string().contains("wal.sobjlog"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            follower.last_log_index(),
+            0,
+            "failed follower append must not leave an in-memory log entry"
+        );
+        assert_eq!(follower.hard_state(), &RaftHardState::default());
+        assert!(follower.store().get("/rollback/follower").is_none());
+        std::fs::remove_dir_all(leader_root).ok();
+        std::fs::remove_dir_all(follower_root).ok();
+    }
+
+    #[test]
+    fn durable_raft_append_entries_rolls_back_after_hard_state_failure() {
+        let leader_root = temp_raft_root("sinomo-kv-follower-hard-state-rollback-leader");
+        let follower_root = temp_raft_root("sinomo-kv-follower-hard-state-rollback");
+        let leader_id =
+            NodeId::from_legacy_named("node_append_hard_state_rollback_leader").expect("leader");
+        let follower_id = NodeId::from_legacy_named("node_append_hard_state_rollback_follower")
+            .expect("follower");
+        let leader_paths = KvWalPaths::new(&leader_root);
+        let follower_paths = KvWalPaths::new(&follower_root);
+        let entry = {
+            let mut leader =
+                DurableRaftKvNode::open(leader_id.clone(), leader_paths).expect("open leader");
+            let entry = leader
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/rollback/follower-hard-state".to_string(),
+                        value: b"not-committed".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append leader");
+            leader.commit_to(entry.index).expect("commit leader");
+            entry
+        };
+        let mut follower =
+            DurableRaftKvNode::open(follower_id, follower_paths.clone()).expect("open follower");
+        std::fs::remove_file(&follower_paths.hard_state).ok();
+        std::fs::create_dir(&follower_paths.hard_state).expect("block hard-state writes");
+
+        let error = follower
+            .append_entries(RaftAppendEntriesRequest {
+                term: 1,
+                leader_id,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![entry],
+                leader_commit: 1,
+            })
+            .expect_err("hard-state persist should fail");
+
+        assert!(
+            error.to_string().contains("hard-state.sobj"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            follower.hard_state().commit_index,
+            0,
+            "failed hard-state persistence must roll back in-memory commit index"
+        );
+        assert_eq!(follower.last_log_index(), 0);
+        assert_eq!(follower.applied_index(), 0);
+        assert!(
+            follower
+                .store()
+                .get("/rollback/follower-hard-state")
+                .is_none(),
+            "failed hard-state persistence must not expose the committed value"
+        );
+        std::fs::remove_dir_all(leader_root).ok();
+        std::fs::remove_dir_all(follower_root).ok();
+    }
+
+    #[test]
+    fn durable_raft_commit_rolls_back_after_hard_state_failure() {
+        let root = temp_raft_root("sinomo-kv-commit-rollback");
+        let node_id = NodeId::from_legacy_named("node_commit_rollback").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open");
+        let entry = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/rollback/commit".to_string(),
+                    value: b"not-committed".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append");
+        std::fs::remove_file(&paths.hard_state).expect("remove hard state file");
+        std::fs::create_dir(&paths.hard_state).expect("block hard-state writes");
+
+        let error = node
+            .commit_to(entry.index)
+            .expect_err("hard-state persist should fail");
+
+        assert!(
+            error.to_string().contains("hard-state.sobj"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            node.hard_state().commit_index,
+            0,
+            "failed commit persistence must roll back in-memory hard state"
+        );
+        assert_eq!(node.applied_index(), 0);
+        assert!(
+            node.store().get("/rollback/commit").is_none(),
+            "failed commit persistence must not expose the applied value"
+        );
+        assert_eq!(
+            node.last_log_index(),
+            entry.index,
+            "the durable uncommitted WAL entry should remain available in memory"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn durable_raft_rejects_commit_beyond_local_log() {
         let root = temp_raft_root("sinomo-kv-commit-beyond-log");
         let node_id = NodeId::from_legacy_named("node_commit_beyond_log").expect("node");
@@ -6870,6 +7323,52 @@ mod tests {
         assert_eq!(node.store.revision(), KvRevision::ZERO);
         assert!(node.store.get("/gap/one").is_none());
         assert!(node.store.get("/gap/three").is_none());
+    }
+
+    #[test]
+    fn replicated_node_rejects_same_term_conflicting_log_entry() {
+        let mut node = ReplicatedKvNode {
+            store: InProcessKvStore::new(),
+            log: vec![KvLogEntry {
+                index: 1,
+                term: 1,
+                command: KvCommand::Op(KvOp::Put {
+                    key: "/conflict/original".to_string(),
+                    value: b"original".to_vec(),
+                    lease_id: None,
+                }),
+                revision: KvRevision::ZERO,
+            }],
+            hard_state: RaftHardState::default(),
+            applied_index: 0,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            txn_responses: BTreeMap::new(),
+        };
+
+        let error = node
+            .append_entries(vec![KvLogEntry {
+                index: 1,
+                term: 1,
+                command: KvCommand::Op(KvOp::Put {
+                    key: "/conflict/replacement".to_string(),
+                    value: b"replacement".to_vec(),
+                    lease_id: None,
+                }),
+                revision: KvRevision::ZERO,
+            }])
+            .expect_err("same-term command conflict");
+
+        assert_eq!(error, KvError::ConflictingLogEntry { index: 1 });
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(
+            node.log[0].command,
+            KvCommand::Op(KvOp::Put {
+                key: "/conflict/original".to_string(),
+                value: b"original".to_vec(),
+                lease_id: None,
+            })
+        );
     }
 
     #[test]
@@ -7536,6 +8035,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1],
             "WAL rewrite should keep only the contiguous safe prefix"
+        );
+        assert!(!repaired.truncated);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_open_repairs_same_term_conflicting_wal_tail() {
+        let root = temp_raft_root("sinomo-kv-conflicting-valid-wal");
+        let node_id = NodeId::from_legacy_named("node_conflicting_valid_wal").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/conflict/original".to_string(),
+                    value: b"original".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append original");
+        }
+        {
+            let mut wal = OpenOptions::new()
+                .append(true)
+                .open(&paths.wal)
+                .expect("open wal");
+            write_wal_record(
+                &mut wal,
+                &KvLogEntry {
+                    index: 1,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/conflict/replacement".to_string(),
+                        value: b"replacement".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+                &paths.wal,
+            )
+            .expect("write conflicting valid tail");
+            wal.sync_data().expect("sync conflicting tail");
+        }
+
+        let recovered = DurableRaftKvNode::open(node_id, paths.clone()).expect("recover node");
+        assert_eq!(recovered.last_log_index(), 1);
+        assert_eq!(
+            recovered.log()[0].command,
+            KvCommand::Op(KvOp::Put {
+                key: "/conflict/original".to_string(),
+                value: b"original".to_vec(),
+                lease_id: None,
+            })
+        );
+        drop(recovered);
+
+        let repaired = read_wal_entries(&paths.wal, None, 0).expect("read repaired wal");
+        assert_eq!(repaired.entries.len(), 1);
+        assert_eq!(
+            repaired.entries[0].command,
+            KvCommand::Op(KvOp::Put {
+                key: "/conflict/original".to_string(),
+                value: b"original".to_vec(),
+                lease_id: None,
+            })
         );
         assert!(!repaired.truncated);
         std::fs::remove_dir_all(root).ok();
