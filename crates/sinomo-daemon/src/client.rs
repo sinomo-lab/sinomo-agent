@@ -1,8 +1,8 @@
 use crate::auth::CLUSTER_INVITE_CHALLENGE_PROTOCOL;
 use crate::{
-    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, DaemonDfsInspectionRequest,
-    DaemonDfsInspectionResponse, DaemonDfsSmokeReport, DaemonError, DaemonStatus,
-    daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
+    ClusterHealthRow, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DaemonDfsSmokeReport, DaemonError,
+    DaemonStatus, daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
     verify_cluster_invite_challenge_proof,
 };
 use sinomo_core::{ClusterEndpointRecord, ClusterTransportKind};
@@ -20,9 +20,12 @@ use sinomo_network::{
     ObjectRpcRequest, random_url_secret,
 };
 use sinomo_rollout::{
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
-    ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_RPC_CATEGORY,
+    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
+    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
+    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest, ROLLOUT_BINARY_ROUTE,
+    ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
+    ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
+    ROLLOUT_RPC_CATEGORY,
 };
 use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -211,7 +214,10 @@ fn local_daemon_can_gateway_endpoint(
     current_pid: u32,
 ) -> bool {
     daemon_pid != current_pid
-        && daemon_cluster.is_some_and(|cluster| cluster.node_id != endpoint.node_id)
+        && daemon_cluster.is_some_and(|cluster| {
+            endpoint.node_id != cluster.node_id
+                && endpoint.node_id != sinomo_node::shadow_daemon_node_id(&cluster.node_id)
+        })
 }
 
 fn is_relay_routing_error(response: &sinomo_network::ObjectRpcResponse) -> bool {
@@ -345,6 +351,19 @@ pub fn fetch_cluster_kv_snapshot(
 ) -> Result<KvSnapshot, DaemonError> {
     let request = ObjectRpcRequest::encode_body(
         sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE,
+        sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+        &(),
+    )?;
+    let response = send_daemon_rpc(address, &request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn fetch_cluster_health_rows(
+    address: &str,
+    timeout: Duration,
+) -> Result<Vec<ClusterHealthRow>, DaemonError> {
+    let request = ObjectRpcRequest::encode_body(
+        sinomo_network::CLUSTER_HEALTH_ROUTE,
         sinomo_network::CLUSTER_KV_RPC_CATEGORY,
         &(),
     )?;
@@ -631,6 +650,62 @@ pub fn send_daemon_rollout_binary_to_endpoint(
     response.decode_body().map_err(DaemonError::from)
 }
 
+pub fn send_daemon_rollout_binary_upload_chunk(
+    address: &str,
+    request: &ClusterRolloutBinaryUploadChunkRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterRolloutBinaryUploadChunkRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_daemon_rollout_binary_upload_finalize(
+    address: &str,
+    request: &ClusterRolloutBinaryUploadFinalizeRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
+pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterRolloutBinaryUploadFinalizeRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let rpc_request = ObjectRpcRequest::encode_body(
+        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    response.decode_body().map_err(DaemonError::from)
+}
+
 pub fn send_daemon_rollout_build(
     address: &str,
     request: &ClusterRolloutBuildRequest,
@@ -744,6 +819,7 @@ mod tests {
     #[test]
     fn local_daemon_gateway_only_handles_remote_endpoints_from_client_processes() {
         let local = node_id("node_gateway_local");
+        let local_shadow = sinomo_node::shadow_daemon_node_id(&local);
         let remote = node_id("node_gateway_remote");
         let cluster = cluster_status(local.clone());
         assert!(local_daemon_can_gateway_endpoint(
@@ -756,6 +832,12 @@ mod tests {
             42,
             Some(&cluster),
             &endpoint(local),
+            7
+        ));
+        assert!(!local_daemon_can_gateway_endpoint(
+            42,
+            Some(&cluster),
+            &endpoint(local_shadow),
             7
         ));
         assert!(!local_daemon_can_gateway_endpoint(

@@ -875,7 +875,7 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
-    let rows = cluster_health_rows(&paths, &state)?;
+    let rows = cluster_health_rows_for_cli(&paths, &state)?;
     if rows.is_empty() {
         println!(
             "node\tprocess\trole\tmember\thealth\tversion\tcommit\tplatform\tpid\taddress\tlast-seen\trollout"
@@ -955,7 +955,7 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
-    let rows = cluster_health_rows(&paths, &state)?;
+    let rows = cluster_health_rows_for_cli(&paths, &state)?;
     let graph = daemon_read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
     let mut findings = cluster_doctor_findings(&state, &graph, &rows);
     if let Some(data_dir) = paths.root.parent() {
@@ -980,6 +980,19 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
         }
     }
     Ok(())
+}
+
+fn cluster_health_rows_for_cli(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterHealthRow>, CliError> {
+    if let Some(status) = default_main_daemon_status()?
+        && let Ok(rows) =
+            daemon_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
+    {
+        return Ok(rows);
+    }
+    cluster_health_rows(paths, state).map_err(Into::into)
 }
 
 pub(crate) fn cluster_peers() -> Result<(), CliError> {

@@ -15,14 +15,14 @@
 # (node2,3->node1; node4->node3; node5,6->node4).
 #
 # IROH IS DISABLED here on purpose (SINOMO_DISABLE_IROH=1) so the cluster runs on direct
-# LAN-TCP only -- there is no relay to paper over the segmentation. Native multi-hop
-# routing through the bridge nodes is NOT yet implemented, so cross-segment cohesion is
-# EXPECTED TO BE BROKEN: {1,2,3} form a cluster; {4,5,6} cannot integrate until routing
-# lands. restart "no" so a node that fails to start stays down and visible.
+# LAN-TCP only -- there is no external relay to paper over the segmentation. Cross-segment
+# cohesion depends on native multi-hop routing through node3/node4. The restart policy lets
+# Docker bring a node back when rollout intentionally replaces the shadow supervisor running
+# as PID 1; logical rollout failures still remain visible through `sinomo cluster health`.
 
 x-node-defaults: &node-defaults
   image: sinomo-dev-node
-  restart: "no"
+  restart: unless-stopped
 
 services:
   node1:

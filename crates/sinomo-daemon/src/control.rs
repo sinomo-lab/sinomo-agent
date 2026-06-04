@@ -1,9 +1,10 @@
 use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
     DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonDfsEndpointTransport, DaemonError,
-    DaemonLock, DaemonPaths, authenticate_daemon_control_request,
-    create_cluster_invite_challenge_proof, daemon_paths_are_shadow, daemon_rpc_command,
-    ensure_daemon_status_cluster, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
+    DaemonLock, DaemonPaths, authenticate_daemon_control_request, cluster_health_rows,
+    cluster_paths_from_daemon_paths, create_cluster_invite_challenge_proof,
+    daemon_paths_are_shadow, daemon_rpc_command, ensure_daemon_status_cluster,
+    ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     forward_cluster_invite_challenge_to_voter, handle_daemon_clear_rollout_status,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
@@ -542,6 +543,23 @@ pub fn handle_daemon_connection(
                 let envelope = sinomo_network::RelayEnvelope::from_request(&request)
                     .map_err(DaemonError::from)?;
                 let response = handle_daemon_cluster_relay_request(paths, envelope)?;
+                write_daemon_rpc_response_frame(stream, response)?;
+                Ok(false)
+            }
+            command if command == daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE) => {
+                require_daemon_rpc_request(
+                    rpc_request,
+                    sinomo_network::CLUSTER_HEALTH_ROUTE,
+                    sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+                )?;
+                let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+                let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+                let rows = cluster_health_rows(&cluster_paths, &state)?;
+                let response = sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_network::CLUSTER_HEALTH_ROUTE,
+                    &rows,
+                )
+                .map_err(DaemonError::from)?;
                 write_daemon_rpc_response_frame(stream, response)?;
                 Ok(false)
             }

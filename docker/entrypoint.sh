@@ -3,9 +3,9 @@
 #
 # Forms (or rejoins) the cluster best-effort, then runs the shadow supervisor as PID 1.
 # This cluster is partitioned into network segments with only node3<->node4 bridging them,
-# and iroh is disabled -- so cross-segment joins are EXPECTED TO FAIL until native routing
-# exists. Every node therefore joins best-effort (a failed/timed-out join is logged, not
-# fatal) and always ends up running its daemon, so all nodes stay up and LAN-discoverable.
+# and iroh is disabled -- so cross-segment joins depend on native multi-hop routing through
+# the bridge nodes. Every node joins best-effort (a failed/timed-out join is logged, not
+# fatal) and always ends up running its daemon, so route convergence stays observable.
 #
 # Per-node env (set in docker-compose.yml):
 #   ROLE                seed | joiner
@@ -18,7 +18,7 @@
 #   SINOMO_DISABLE_IROH "1" => run on direct LAN transports only (default here)
 set -uo pipefail   # NOTE: not -e; cross-segment join failures are expected and handled.
 
-BIN=/usr/local/bin/sinomo
+BOOTSTRAP_BIN=/usr/local/bin/sinomo
 DATA=/data
 SRC=/sinomo-src
 ROLE="${ROLE:-joiner}"
@@ -34,6 +34,27 @@ export SINOMO_DATA_DIR="$DATA"
 export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
 
 log() { echo "[entrypoint $(hostname)] $*"; }
+
+# If Docker restarts the container after a rollout stops shadow-as-PID1, finish the
+# file-install part of shadow finalization before launching the next supervisor.
+if [ -f "$DATA/rollout/pending-shadow-rollout.sobj" ] && [ -x "$DATA/rollout/staged/sinomo-shadow" ] && [ ! -x "$DATA/bin/sinomo-shadow" ]; then
+  log "installing staged shadow binary before supervisor restart"
+  mkdir -p "$DATA/bin"
+  cp -f "$DATA/rollout/staged/sinomo-shadow" "$DATA/bin/sinomo-shadow.next"
+  chmod +x "$DATA/bin/sinomo-shadow.next"
+  mv -f "$DATA/bin/sinomo-shadow.next" "$DATA/bin/sinomo-shadow"
+fi
+
+# After a rollout, the stable binaries live in /data/bin. Prefer them on container
+# restart so a shadow-supervisor replacement can complete even though shadow is PID 1.
+BIN="$BOOTSTRAP_BIN"
+if [ -x "$DATA/bin/sinomo" ]; then
+  BIN="$DATA/bin/sinomo"
+fi
+SHADOW_BIN="$BIN"
+if [ -x "$DATA/bin/sinomo-shadow" ]; then
+  SHADOW_BIN="$DATA/bin/sinomo-shadow"
+fi
 
 # Wait up to $2 seconds for a file to appear; returns 1 on timeout.
 wait_for_file() {
@@ -131,5 +152,5 @@ export SINOMO_SHADOW_MAIN_BINARY="$BIN"
 export SINOMO_SHADOW_MAIN_HOST=0.0.0.0
 export SINOMO_SHADOW_MAIN_PORT=21353
 export SINOMO_SHADOW_START_DELAY_MS=0
-log "starting shadow supervisor on 0.0.0.0:21354 (main on 0.0.0.0:21353, iroh disabled=$SINOMO_DISABLE_IROH)"
-exec "$BIN" daemon shadow run --host 0.0.0.0 --port 21354
+log "starting shadow supervisor $SHADOW_BIN on 0.0.0.0:21354 (main $BIN on 0.0.0.0:21353, iroh disabled=$SINOMO_DISABLE_IROH)"
+exec "$SHADOW_BIN" daemon shadow run --host 0.0.0.0 --port 21354

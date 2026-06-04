@@ -1105,10 +1105,21 @@ pub(crate) fn iroh_daemon_command_forward_timeout(payload: &[u8]) -> Duration {
     match request {
         Ok(request)
             if request.rpc.as_ref().is_some_and(|rpc| {
-                rpc.route == crate::ROLLOUT_BUILD_ROUTE || rpc.route == crate::ROLLOUT_BINARY_ROUTE
+                matches!(
+                    rpc.route.as_str(),
+                    crate::ROLLOUT_BUILD_ROUTE
+                        | crate::ROLLOUT_BINARY_ROUTE
+                        | crate::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
+                        | crate::ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
+                )
             }) || matches!(
                 request.command.strip_prefix("RPC "),
-                Some(crate::ROLLOUT_BUILD_ROUTE | crate::ROLLOUT_BINARY_ROUTE)
+                Some(
+                    crate::ROLLOUT_BUILD_ROUTE
+                        | crate::ROLLOUT_BINARY_ROUTE
+                        | crate::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
+                        | crate::ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
+                )
             ) =>
         {
             Duration::from_secs(600)

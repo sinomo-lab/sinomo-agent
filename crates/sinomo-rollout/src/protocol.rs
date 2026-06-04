@@ -32,6 +32,63 @@ pub struct ClusterRolloutNativeDylibModuleArtifact {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutUploadArtifactSpec {
+    pub artifact_id: String,
+    pub total_bytes: u64,
+    #[serde(with = "serde_bytes")]
+    pub blake3: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutNativeDylibModuleUploadSpec {
+    pub module_id: String,
+    pub interface_version: String,
+    pub cache_key: String,
+    pub library_name: String,
+    pub source: String,
+    pub artifact: ClusterRolloutUploadArtifactSpec,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutBinaryUploadManifest {
+    pub upload_id: String,
+    pub source: String,
+    #[serde(default)]
+    pub target_os: String,
+    #[serde(default)]
+    pub target_arch: String,
+    pub host: String,
+    pub port: u16,
+    pub shadow_port: u16,
+    pub requested_at: String,
+    pub binary: ClusterRolloutUploadArtifactSpec,
+    #[serde(default)]
+    pub native_dylib_modules: Vec<ClusterRolloutNativeDylibModuleUploadSpec>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutBinaryUploadChunkRequest {
+    pub upload_id: String,
+    pub artifact_id: String,
+    pub offset: u64,
+    pub total_bytes: u64,
+    #[serde(with = "serde_bytes")]
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutBinaryUploadChunkResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub received_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutBinaryUploadFinalizeRequest {
+    pub manifest: ClusterRolloutBinaryUploadManifest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRolloutBuildRequest {
     pub source: String,
     #[serde(default)]
