@@ -3117,22 +3117,10 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
         .entries
         .iter()
         .any(|entry| entry.key == cluster_rollout_desired_key());
-    put_cluster_kv_value(
-        paths,
-        &state.local_node_id,
-        cluster_identity_key(),
-        &ClusterIdentityRecord::from(state),
-    )?;
-    let mut snapshot = put_cluster_kv_value(
-        paths,
-        &state.local_node_id,
-        cluster_raft_config_key(),
-        &ClusterRaftConfigRecord::from(state),
-    )?;
+    let store = InProcessKvStore::restore(initial_snapshot.clone());
+    let mut txn = cluster_state_sync_txn_from_store(&store, state, false)?;
     if !rollout_desired_exists {
-        snapshot = put_cluster_kv_value(
-            paths,
-            &state.local_node_id,
+        txn.success.push(KvOp::put_serde(
             cluster_rollout_desired_key(),
             &ClusterRolloutDesiredRecord {
                 cluster_id: state.cluster_id.clone(),
@@ -3148,36 +3136,13 @@ pub fn sync_cluster_state_to_local_raft_unchecked(
                 requested_at: None,
                 updated_at: state.updated_at,
             },
-        )?;
+            None,
+        )?);
     }
-    for member in &state.members {
-        let mut member = member.clone();
-        cleanup_member_iroh_endpoints(&mut member);
-        let command = KvCommand::PutClusterMember(member.clone());
-        append_cluster_raft_command(paths, &state.local_node_id, command)?;
-        let _ = put_cluster_kv_value(
-            paths,
-            &state.local_node_id,
-            cluster_capability_policy_key(&member.node_id),
-            &ClusterCapabilityPolicyRecord::from(&member),
-        )?;
-        snapshot = append_cluster_raft_command(
-            paths,
-            &state.local_node_id,
-            KvCommand::Op(KvOp::DeletePrefix {
-                prefix: cluster_endpoint_prefix(&member.node_id),
-            }),
-        )?;
-        for endpoint in &member.endpoints {
-            snapshot = put_cluster_kv_value(
-                paths,
-                &state.local_node_id,
-                cluster_endpoint_key(&member.node_id, endpoint),
-                endpoint,
-            )?;
-        }
+    if txn.success.is_empty() {
+        return Ok(initial_snapshot);
     }
-    Ok(snapshot)
+    append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
 }
 
 /// Compares two cluster identity records ignoring volatile bookkeeping fields
@@ -3212,15 +3177,25 @@ pub fn cluster_state_sync_txn(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvTxn, NetworkError> {
+    let store = read_cluster_kv_store(paths)?;
+    cluster_state_sync_txn_from_store(&store, state, true)
+}
+
+fn cluster_state_sync_txn_from_store(
+    store: &InProcessKvStore,
+    state: &ClusterBootstrapState,
+    validate_config_transition: bool,
+) -> Result<KvTxn, NetworkError> {
     let mut state = state.clone();
     cleanup_cluster_iroh_endpoints(&mut state);
-    let store = read_cluster_kv_store(paths)?;
     let new_config = ClusterRaftConfigRecord::from(&state);
     let current_config_entry = store.get(&cluster_raft_config_key()).cloned();
     let mut compares = Vec::new();
     if let Some(current_config_entry) = &current_config_entry {
         let current_config: ClusterRaftConfigRecord = current_config_entry.decode()?;
-        validate_raft_config_transition(&current_config, &new_config)?;
+        if validate_config_transition {
+            validate_raft_config_transition(&current_config, &new_config)?;
+        }
         compares.push(KvCompare::ValueEquals {
             key: cluster_raft_config_key(),
             value: current_config_entry.value.clone(),
@@ -4258,6 +4233,9 @@ pub fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<KvSnapshot, NetworkError> {
+    if stored_cluster_node_status_matches(paths, &status)? {
+        return read_cluster_kv_snapshot(paths);
+    }
     let state = read_cluster_state_without_kv(paths)?;
     let key = cluster_node_status_key(&status.node_id);
     let node_id = status.node_id.clone();
@@ -4284,6 +4262,9 @@ pub fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: ClusterNetworkInfoRecord,
 ) -> Result<KvSnapshot, NetworkError> {
+    if stored_cluster_network_info_matches(paths, &info)? {
+        return read_cluster_kv_snapshot(paths);
+    }
     let state = read_cluster_state_without_kv(paths)?;
     let key = cluster_network_info_key(&info.node_id);
     append_cluster_raft_command(
@@ -4298,8 +4279,11 @@ pub fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, NetworkError> {
-    let state = read_cluster_state_without_kv(paths)?;
     let success = cluster_connectivity_full_sync_ops(paths, source_node_id, &records)?;
+    if success.is_empty() {
+        return read_cluster_kv_snapshot(paths);
+    }
+    let state = read_cluster_state_without_kv(paths)?;
     append_cluster_raft_command(
         paths,
         &state.local_node_id,
@@ -4325,7 +4309,17 @@ pub fn stored_cluster_node_status_matches(
     // Match on stable content only: node status is not periodically refreshed (no
     // observed_at heartbeat). A live node's status is republished when its content
     // changes; crash detection is handled by the active connectivity probes.
-    Ok(cluster_node_status_stable_eq(&existing, status))
+    if !cluster_node_status_stable_eq(&existing, status) {
+        return Ok(false);
+    }
+    let rollout_entry = store.get(&cluster_rollout_node_key(&status.node_id));
+    Ok(match (&status.rollout, rollout_entry) {
+        (Some(expected), Some(entry)) => entry
+            .decode::<sinomo_core::ClusterNodeRolloutStatus>()
+            .is_ok_and(|existing| existing == *expected),
+        (None, None) => true,
+        _ => false,
+    })
 }
 
 pub fn cluster_node_status_stable_eq(

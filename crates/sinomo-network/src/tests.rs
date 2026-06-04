@@ -280,6 +280,77 @@ fn daemon_rpc_deadline_remaining_shrinks_across_phases() {
 }
 
 #[test]
+fn daemon_rpc_blocking_wrapper_works_inside_current_thread_runtime() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+
+    let value = runtime
+        .block_on(async {
+            crate::roaming::block_on_daemon_rpc(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok::<_, NetworkError>(42_u64)
+            })
+        })
+        .expect("blocking wrapper");
+
+    assert_eq!(value, 42);
+}
+
+#[test]
+fn daemon_control_stream_deadline_refreshes_blocking_timeouts() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let stream = std::net::TcpStream::connect(listener.local_addr().expect("local addr"))
+        .expect("client stream");
+    let deadline = crate::roaming::DaemonRpcDeadline::new(Duration::from_millis(500));
+
+    crate::roaming::configure_daemon_control_stream_deadline(
+        &stream,
+        "127.0.0.1",
+        &deadline,
+        true,
+        true,
+    )
+    .expect("initial timeout configuration");
+    let initial_read_timeout = stream
+        .read_timeout()
+        .expect("read timeout")
+        .expect("read timeout set");
+    let initial_write_timeout = stream
+        .write_timeout()
+        .expect("write timeout")
+        .expect("write timeout set");
+
+    std::thread::sleep(Duration::from_millis(100));
+    crate::roaming::configure_daemon_control_stream_deadline(
+        &stream,
+        "127.0.0.1",
+        &deadline,
+        true,
+        false,
+    )
+    .expect("refreshed read timeout");
+    let refreshed_read_timeout = stream
+        .read_timeout()
+        .expect("read timeout")
+        .expect("read timeout set");
+
+    assert!(
+        refreshed_read_timeout < initial_read_timeout,
+        "blocking daemon proxy reads should use remaining route budget, not the original timeout"
+    );
+    assert_eq!(
+        stream
+            .write_timeout()
+            .expect("write timeout")
+            .expect("write timeout set"),
+        initial_write_timeout,
+        "refreshing the read phase should not lengthen the write timeout"
+    );
+}
+
+#[test]
 fn lan_ip_filter_rejects_non_invitable_addresses() {
     assert!(!is_invitable_ip("127.0.0.1".parse().expect("loopback")));
     assert!(!is_invitable_ip("0.0.0.0".parse().expect("unspecified")));
@@ -1084,6 +1155,67 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
         !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
         "removed record should not be a no-op"
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stable_connectivity_sync_does_not_open_raft_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-noop-no-raft-open-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_noop_no_raft").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_noop_no_raft_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_noop_no_raft_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity noop no raft",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.52:21353".to_string(), 10);
+    let mut member_b = ClusterMemberRecord::local_voter(cluster_id, node_b, "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![endpoint_b.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let healthy = |observed_at| {
+        cluster_connectivity_record(
+            &state,
+            &endpoint_b,
+            ClusterConnectivityState::Healthy,
+            Some(5),
+            0,
+            Some("ok".to_string()),
+            None,
+            observed_at,
+            600,
+        )
+    };
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![healthy(now)])
+        .expect("initial connectivity sync");
+
+    let wal_paths = cluster_raft_wal_paths(&paths, &node_a);
+    std::fs::write(&wal_paths.hard_state, b"\0\0\0").expect("corrupt hard state");
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_a,
+        vec![healthy(now + time::Duration::seconds(5))],
+    )
+    .expect("stable connectivity sync should not open raft");
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -3413,6 +3545,78 @@ fn cluster_state_sync_txn_is_empty_when_kv_already_matches() {
 }
 
 #[test]
+fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-unchecked-sync-noop-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_unchecked_sync_noop").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_unchecked_sync_noop").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "unchecked sync noop",
+        node_id.clone(),
+        "node",
+        "pk",
+        now,
+    );
+    let member = state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == node_id)
+        .expect("local member");
+    member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_unchecked_sync_noop")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.1:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    }];
+    write_cluster_state(&paths, &state).expect("write state");
+
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("initial unchecked sync");
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("cluster kv store")
+            .get(&cluster_rollout_desired_key())
+            .is_some(),
+        "initial unchecked sync should still seed rollout desired state"
+    );
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_after_first = std::fs::metadata(&wal_path)
+        .expect("wal after first sync")
+        .len();
+
+    let mut bumped = state;
+    bumped.updated_at = now + time::Duration::seconds(120);
+    bumped.kv_revision = bumped.kv_revision + 5;
+    sync_cluster_state_to_local_raft_unchecked(&paths, &bumped).expect("stable unchecked sync");
+    assert_eq!(
+        wal_len_after_first,
+        std::fs::metadata(&wal_path)
+            .expect("wal after stable sync")
+            .len(),
+        "stable unchecked cluster-state sync should not append no-op raft entries"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-storage-{}",
@@ -3562,6 +3766,135 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         ))
         .expect("async open");
     assert_eq!(async_node.node_id(), &state.local_node_id);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-stable-status-network-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_stable_status_network_noop").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_stable_status_network_noop").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "stable status network noop",
+        node_id.clone(),
+        "stable node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+
+    let status = ClusterNodeStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        process: "daemon-main".to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    sync_cluster_node_status_to_kv(&paths, status.clone()).expect("sync status");
+    let wal_len_after_status = std::fs::metadata(&wal_path)
+        .expect("wal after status")
+        .len();
+    sync_cluster_node_status_to_kv(&paths, status.clone()).expect("sync stable status");
+    assert_eq!(
+        wal_len_after_status,
+        std::fs::metadata(&wal_path)
+            .expect("wal after stable status")
+            .len(),
+        "stable node-status publishes should not append no-op raft entries"
+    );
+    let stale_rollout = ClusterNodeRolloutStatus {
+        status: "stale".to_string(),
+        mode: None,
+        detail: None,
+        phase: None,
+        progress_current: None,
+        progress_total: None,
+        progress_message: None,
+        source: None,
+        requested_at: None,
+        staged_at: None,
+        updated_at: Some("2026-05-04T00:00:00Z".to_string()),
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(
+            KvOp::put_serde(cluster_rollout_node_key(&node_id), &stale_rollout, None)
+                .expect("stale rollout put"),
+        ),
+    )
+    .expect("inject stale rollout sidecar");
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("store with stale rollout")
+            .get(&cluster_rollout_node_key(&node_id))
+            .is_some()
+    );
+    sync_cluster_node_status_to_kv(&paths, status).expect("clean stale rollout sidecar");
+    assert!(
+        read_cluster_kv_store(&paths)
+            .expect("store after stale rollout cleanup")
+            .get(&cluster_rollout_node_key(&node_id))
+            .is_none(),
+        "node-status no-op guard must not skip stale rollout sidecar cleanup"
+    );
+
+    let info = ClusterNetworkInfoRecord {
+        cluster_id,
+        node_id,
+        environment_id: "env_stable_network_noop".to_string(),
+        observed_addresses: vec!["192.0.2.10".to_string()],
+        endpoints: Vec::new(),
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(300),
+    };
+    sync_cluster_network_info_to_kv(&paths, info.clone()).expect("sync network info");
+    let wal_len_after_info = std::fs::metadata(&wal_path)
+        .expect("wal after network info")
+        .len();
+    let mut refreshed_info = info;
+    refreshed_info.observed_at = now + time::Duration::seconds(5);
+    refreshed_info.expires_at = now + time::Duration::seconds(305);
+    sync_cluster_network_info_to_kv(&paths, refreshed_info).expect("sync stable network info");
+    assert_eq!(
+        wal_len_after_info,
+        std::fs::metadata(&wal_path)
+            .expect("wal after stable network info")
+            .len(),
+        "stable fresh network-info publishes should not append no-op raft entries"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

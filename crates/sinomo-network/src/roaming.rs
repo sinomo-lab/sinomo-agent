@@ -1269,16 +1269,42 @@ pub fn send_daemon_rpc_to_cluster_endpoint(
 /// ambient runtime (e.g. the CLI) and from within one: the daemon's service-seam adapter
 /// drives handlers via `block_on`, and a handler may then make a synchronous
 /// daemon-to-daemon RPC. Building a fresh runtime and calling `block_on` inline panics
-/// ("cannot start a runtime from within a runtime") when nested. So when an ambient
-/// runtime exists we drive the future on it via `block_in_place` (the daemon adapter's
-/// runtime is multi-threaded); otherwise we spin up a short-lived current-thread runtime.
-fn block_on_daemon_rpc<F, T>(future: F) -> Result<T, NetworkError>
+/// ("cannot start a runtime from within a runtime") when nested. On multi-threaded
+/// runtimes we can re-enter via `block_in_place`; on current-thread runtimes we run
+/// the short-lived control future on a scoped helper thread so mobile/current-thread
+/// callers do not panic.
+pub(crate) fn block_on_daemon_rpc<F, T>(future: F) -> Result<T, NetworkError>
+where
+    F: std::future::Future<Output = Result<T, NetworkError>> + Send,
+    T: Send,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        } else {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| block_on_daemon_rpc_without_ambient_runtime(future))
+                    .join()
+                    .unwrap_or_else(|_| {
+                        Err(NetworkError::Io {
+                            operation: "drive daemon control runtime".to_string(),
+                            detail: "daemon control runtime thread panicked".to_string(),
+                        })
+                    })
+            })
+        };
+    }
+    block_on_daemon_rpc_without_ambient_runtime(future)
+}
+
+fn block_on_daemon_rpc_without_ambient_runtime<F, T>(future: F) -> Result<T, NetworkError>
 where
     F: std::future::Future<Output = Result<T, NetworkError>>,
 {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return tokio::task::block_in_place(|| handle.block_on(future));
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1359,6 +1385,34 @@ impl DaemonRpcDeadline {
     }
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn configure_daemon_control_stream_deadline(
+    stream: &std::net::TcpStream,
+    address: &str,
+    deadline: &DaemonRpcDeadline,
+    read: bool,
+    write: bool,
+) -> Result<(), NetworkError> {
+    let timeout = deadline.remaining();
+    if read {
+        stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|source| NetworkError::Io {
+                operation: format!("configure daemon control address {address}"),
+                detail: source.to_string(),
+            })?;
+    }
+    if write {
+        stream
+            .set_write_timeout(Some(timeout))
+            .map_err(|source| NetworkError::Io {
+                operation: format!("configure daemon control address {address}"),
+                detail: source.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
 async fn send_daemon_control_request_async(
     address: &str,
     request: &crate::DaemonControlRequest,
@@ -1423,6 +1477,7 @@ fn forward_daemon_control_payload(
     timeout: Duration,
     budget: &IrohProxyByteBudget,
 ) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
+    let deadline = DaemonRpcDeadline::new(timeout);
     let socket_address = address
         .to_socket_addrs()
         .map_err(|source| NetworkError::Io {
@@ -1434,24 +1489,14 @@ fn forward_daemon_control_payload(
             operation: format!("resolve daemon control address {address}"),
             detail: "no socket addresses resolved".to_string(),
         })?;
-    let mut stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
-        NetworkError::Io {
-            operation: format!("connect daemon control address {address}"),
-            detail: source.to_string(),
-        }
-    })?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|source| NetworkError::Io {
-            operation: format!("configure daemon control address {address}"),
-            detail: source.to_string(),
+    let mut stream =
+        TcpStream::connect_timeout(&socket_address, deadline.remaining()).map_err(|source| {
+            NetworkError::Io {
+                operation: format!("connect daemon control address {address}"),
+                detail: source.to_string(),
+            }
         })?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|source| NetworkError::Io {
-            operation: format!("configure daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
+    configure_daemon_control_stream_deadline(&stream, address, &deadline, false, true)?;
     stream
         .write_all(payload)
         .map_err(|source| NetworkError::Io {
@@ -1459,6 +1504,7 @@ fn forward_daemon_control_payload(
             detail: source.to_string(),
         })?;
     let _ = stream.shutdown(Shutdown::Write);
+    configure_daemon_control_stream_deadline(&stream, address, &deadline, true, false)?;
     read_iroh_proxy_frame_blocking(&mut stream, budget, "command response")
 }
 
