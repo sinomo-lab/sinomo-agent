@@ -134,6 +134,33 @@ fn wasix_native_module_is_not_a_default_workspace_build_member() {
     );
 }
 
+#[test]
+fn wasix_native_module_runtime_feature_is_default_off() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let manifest_text = fs::read_to_string(
+        workspace_root
+            .join("modules")
+            .join("sandbox")
+            .join("wasix")
+            .join("Cargo.toml"),
+    )
+    .expect("read WASIX module manifest");
+
+    assert_eq!(
+        parse_feature_value(&manifest_text, "default").as_deref(),
+        Some("[]"),
+        "WASIX native module runtime must stay opt-in"
+    );
+    assert_eq!(
+        parse_feature_value(&manifest_text, "wasix-runtime").as_deref(),
+        Some("["),
+        "WASIX native module must expose the explicit runtime feature"
+    );
+}
+
 fn read_workspace_packages() -> BTreeMap<String, PackageManifest> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -294,4 +321,24 @@ fn parse_string_value(line: &str, key: &str) -> Option<String> {
     }
     let value = raw_value.trim().trim_matches('"');
     Some(value.to_string())
+}
+
+fn parse_feature_value(manifest_text: &str, key: &str) -> Option<String> {
+    let mut in_features = false;
+    for line in manifest_text.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[features]" {
+            in_features = true;
+            continue;
+        }
+        if in_features && trimmed.starts_with('[') {
+            return None;
+        }
+        if in_features && let Some((actual_key, raw_value)) = trimmed.split_once('=') {
+            if actual_key.trim() == key {
+                return Some(raw_value.trim().to_string());
+            }
+        }
+    }
+    None
 }

@@ -1,5 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex};
+#[cfg(feature = "wasix-runtime")]
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use sinomo_sandbox_wasix_api::{
     NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
@@ -9,20 +11,26 @@ use sinomo_sandbox_wasix_api::{
     SINOMO_WASIX_STATUS_INVALID_ARGUMENT, SINOMO_WASIX_STATUS_OK,
     SINOMO_WASIX_STATUS_RUNTIME_ERROR, SINOMO_WASIX_STATUS_UNSUPPORTED_ABI,
     SandboxWasixCapabilitiesResponse, SandboxWasixNativeErrorResponse, SandboxWasixNativeRequest,
-    SandboxWasixNativeResponse, SandboxWasixRunModuleOptions, SandboxWasixRunModuleRequest,
-    SandboxWasixRunModuleResponse, SandboxWasixRunReplayFixtureRequest,
-    SandboxWasixRunReplayFixtureResponse, SandboxWasixRunToolchainCommandRequest,
-    SandboxWasixValidateComponentRequest, SandboxWasixValidateComponentResponse,
-    SinomoWasixByteBuffer, SinomoWasixByteSlice, SinomoWasixHostApiV1, SinomoWasixStatusCode,
-    decode_sobj, encode_output_chunk, encode_sobj,
+    SandboxWasixNativeResponse, SandboxWasixRequestKind, SandboxWasixRunModuleRequest,
+    SandboxWasixRunReplayFixtureRequest, SandboxWasixRunToolchainCommandRequest,
+    SandboxWasixValidateComponentRequest, SinomoWasixByteBuffer, SinomoWasixByteSlice,
+    SinomoWasixHostApiV1, SinomoWasixStatusCode, decode_sobj, encode_sobj,
 };
 
+#[cfg(feature = "wasix-runtime")]
+use sinomo_sandbox_wasix_api::{
+    SandboxWasixRunModuleResponse, SandboxWasixRunReplayFixtureResponse,
+    SandboxWasixValidateComponentResponse, encode_output_chunk,
+};
+
+#[cfg(feature = "wasix-runtime")]
 use crate::{
     SandboxLocalCommandOutcome, SandboxOutputChunk, SandboxOutputSink, SandboxWasiAbi,
     SandboxWasiPreopen, SandboxWasiRunOptions, SandboxWasixCommandOverride,
 };
 
 #[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "wasix-runtime"), allow(dead_code))]
 struct StoredHostApi(SinomoWasixHostApiV1);
 
 unsafe impl Send for StoredHostApi {}
@@ -174,6 +182,7 @@ fn invoke_wasix_operation_response(
     }
 }
 
+#[cfg(feature = "wasix-runtime")]
 fn run_module_response(request: SandboxWasixRunModuleRequest) -> SandboxWasixNativeResponse {
     match run_resolved_module(
         request.target_abi,
@@ -188,6 +197,12 @@ fn run_module_response(request: SandboxWasixRunModuleRequest) -> SandboxWasixNat
     }
 }
 
+#[cfg(not(feature = "wasix-runtime"))]
+fn run_module_response(_request: SandboxWasixRunModuleRequest) -> SandboxWasixNativeResponse {
+    runtime_disabled_response("run-module")
+}
+
+#[cfg(feature = "wasix-runtime")]
 fn run_toolchain_command_response(
     request: SandboxWasixRunToolchainCommandRequest,
 ) -> SandboxWasixNativeResponse {
@@ -206,6 +221,14 @@ fn run_toolchain_command_response(
     }
 }
 
+#[cfg(not(feature = "wasix-runtime"))]
+fn run_toolchain_command_response(
+    _request: SandboxWasixRunToolchainCommandRequest,
+) -> SandboxWasixNativeResponse {
+    runtime_disabled_response("run-toolchain")
+}
+
+#[cfg(feature = "wasix-runtime")]
 fn run_replay_fixture_response(
     request: SandboxWasixRunReplayFixtureRequest,
 ) -> SandboxWasixNativeResponse {
@@ -219,6 +242,14 @@ fn run_replay_fixture_response(
     }
 }
 
+#[cfg(not(feature = "wasix-runtime"))]
+fn run_replay_fixture_response(
+    _request: SandboxWasixRunReplayFixtureRequest,
+) -> SandboxWasixNativeResponse {
+    runtime_disabled_response("run-replay")
+}
+
+#[cfg(feature = "wasix-runtime")]
 fn validate_component_response(
     request: SandboxWasixValidateComponentRequest,
 ) -> SandboxWasixNativeResponse {
@@ -232,11 +263,27 @@ fn validate_component_response(
     }
 }
 
+#[cfg(not(feature = "wasix-runtime"))]
+fn validate_component_response(
+    _request: SandboxWasixValidateComponentRequest,
+) -> SandboxWasixNativeResponse {
+    runtime_disabled_response("validate-component")
+}
+
+#[cfg(not(feature = "wasix-runtime"))]
+fn runtime_disabled_response(operation: &str) -> SandboxWasixNativeResponse {
+    SandboxWasixNativeResponse::Error(error_response(
+        operation,
+        "WASIX native module was built without the `wasix-runtime` feature",
+    ))
+}
+
+#[cfg(feature = "wasix-runtime")]
 fn run_resolved_module(
     target_abi: SandboxWasiAbi,
     wasm: Vec<u8>,
     command: crate::SandboxCommandRequest,
-    options: SandboxWasixRunModuleOptions,
+    options: sinomo_sandbox_wasix_api::SandboxWasixRunModuleOptions,
 ) -> Result<SandboxLocalCommandOutcome, String> {
     let runner =
         crate::LocalStagedSandboxCommandRunner::new().map_err(|error| error.to_string())?;
@@ -245,7 +292,10 @@ fn run_resolved_module(
         .map_err(|error| error.to_string())
 }
 
-fn convert_run_options(options: SandboxWasixRunModuleOptions) -> SandboxWasiRunOptions {
+#[cfg(feature = "wasix-runtime")]
+fn convert_run_options(
+    options: sinomo_sandbox_wasix_api::SandboxWasixRunModuleOptions,
+) -> SandboxWasiRunOptions {
     let default_options = SandboxWasiRunOptions::default();
     SandboxWasiRunOptions {
         preopened_dirs: options
@@ -303,6 +353,7 @@ fn convert_run_options(options: SandboxWasixRunModuleOptions) -> SandboxWasiRunO
     }
 }
 
+#[cfg(feature = "wasix-runtime")]
 fn host_output_sink() -> Option<Arc<dyn SandboxOutputSink>> {
     let api = HOST_API.lock().ok().and_then(|api| *api)?;
     api.0
@@ -310,13 +361,17 @@ fn host_output_sink() -> Option<Arc<dyn SandboxOutputSink>> {
         .map(|_| Arc::new(HostOutputSink { api }) as Arc<dyn SandboxOutputSink>)
 }
 
+#[cfg(feature = "wasix-runtime")]
 struct HostOutputSink {
     api: StoredHostApi,
 }
 
+#[cfg(feature = "wasix-runtime")]
 unsafe impl Send for HostOutputSink {}
+#[cfg(feature = "wasix-runtime")]
 unsafe impl Sync for HostOutputSink {}
 
+#[cfg(feature = "wasix-runtime")]
 impl SandboxOutputSink for HostOutputSink {
     fn output_chunk(&self, chunk: SandboxOutputChunk) {
         let Some(output_chunk) = self.api.0.output_chunk else {
@@ -347,14 +402,7 @@ fn descriptor() -> NativeModuleDescriptor {
         interface_version: SINOMO_SANDBOX_WASIX_INTERFACE_VERSION.to_string(),
         platform_triple: platform_triple(),
         supported_operations: vec![SINOMO_SANDBOX_WASIX_OPERATION.to_string()],
-        capabilities: vec![
-            "preview1".to_string(),
-            "wasix".to_string(),
-            "wasix.virtual-fs".to_string(),
-            "wasix.metering".to_string(),
-            "wasix.memory-limits".to_string(),
-            "wasix.output-streaming".to_string(),
-        ],
+        capabilities: runtime_capabilities(),
     }
 }
 
@@ -365,15 +413,37 @@ fn legacy_wasix_descriptor() -> sinomo_sandbox_wasix_api::SandboxWasixNativeDesc
         native_abi_version: SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION,
         interface_version: SINOMO_SANDBOX_WASIX_INTERFACE_VERSION.to_string(),
         platform_triple: platform_triple(),
-        supported_requests: vec![
-            sinomo_sandbox_wasix_api::SandboxWasixRequestKind::ProbeCapabilities,
-            sinomo_sandbox_wasix_api::SandboxWasixRequestKind::RunModule,
-            sinomo_sandbox_wasix_api::SandboxWasixRequestKind::RunToolchainCommand,
-            sinomo_sandbox_wasix_api::SandboxWasixRequestKind::RunReplayFixture,
-            sinomo_sandbox_wasix_api::SandboxWasixRequestKind::ValidateComponent,
-        ],
+        supported_requests: supported_wasix_requests(),
         capabilities: descriptor().capabilities,
     }
+}
+
+fn runtime_capabilities() -> Vec<String> {
+    if cfg!(feature = "wasix-runtime") {
+        vec![
+            "preview1".to_string(),
+            "wasix".to_string(),
+            "wasix.virtual-fs".to_string(),
+            "wasix.metering".to_string(),
+            "wasix.memory-limits".to_string(),
+            "wasix.output-streaming".to_string(),
+        ]
+    } else {
+        vec!["runtime.disabled".to_string()]
+    }
+}
+
+fn supported_wasix_requests() -> Vec<SandboxWasixRequestKind> {
+    let mut requests = vec![SandboxWasixRequestKind::ProbeCapabilities];
+    if cfg!(feature = "wasix-runtime") {
+        requests.extend([
+            SandboxWasixRequestKind::RunModule,
+            SandboxWasixRequestKind::RunToolchainCommand,
+            SandboxWasixRequestKind::RunReplayFixture,
+            SandboxWasixRequestKind::ValidateComponent,
+        ]);
+    }
+    requests
 }
 
 fn platform_triple() -> String {
@@ -449,6 +519,7 @@ fn native_error_response(
     }
 }
 
+#[cfg(feature = "wasix-runtime")]
 fn usize_or_default(value: u64, default: usize) -> usize {
     if value == 0 {
         default

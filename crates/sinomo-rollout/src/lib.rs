@@ -63,10 +63,12 @@ pub use native_install::{
     native_dylib_module_install_request,
 };
 pub use paths::{
-    SANDBOX_WASIX_MODULE_PACKAGE, SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY,
-    SANDBOX_WASIX_NATIVE_MODULE_SOURCE, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
-    SelfRolloutPlan, default_native_dylib_module_builds, ensure_rollout_layout, executable_name,
-    native_dylib_library_name, sandbox_wasix_native_module_library_name,
+    SANDBOX_WASIX_MODULE_PACKAGE, SANDBOX_WASIX_MODULE_RUNTIME_FEATURE,
+    SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY, SANDBOX_WASIX_NATIVE_MODULE_SOURCE,
+    SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths, SelfRolloutPlan,
+    append_native_dylib_module_build_args, default_native_dylib_module_builds,
+    ensure_rollout_layout, executable_name, native_dylib_library_name,
+    sandbox_wasix_native_module_library_name,
 };
 pub use process::{MainExitKind, MainExitObservation, classify_main_exit};
 pub use progress::{

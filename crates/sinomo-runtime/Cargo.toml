@@ -10,15 +10,16 @@ rust-version.workspace = true
 ring = "r0-r1-boundary"
 
 [features]
+default = []
 # Enable sandbox execution through the native-module host loader. This does not
 # link the build-heavy WASIX engine.
-sandbox = ["sinomo-daemon/sandbox"]
+sandbox = ["dep:sinomo-sandbox-wasix-host", "sinomo-daemon/sandbox"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
-sinomo-daemon = { path = "../sinomo-daemon" }
+sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-eval = { path = "../sinomo-eval" }
@@ -35,7 +36,7 @@ sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
-sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host" }
+sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
 sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 sinomo-supervision = { path = "../sinomo-supervision" }

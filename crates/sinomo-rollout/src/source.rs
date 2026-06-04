@@ -1,7 +1,8 @@
 use crate::{
     RolloutError, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
-    default_native_dylib_module_builds, ensure_rollout_layout, rollout_staged_main_binary,
-    rollout_staged_shadow_binary, stage_rollout_file,
+    append_native_dylib_module_build_args, default_native_dylib_module_builds,
+    ensure_rollout_layout, rollout_staged_main_binary, rollout_staged_shadow_binary,
+    stage_rollout_file,
 };
 use std::env;
 use std::fs;
@@ -205,19 +206,13 @@ fn rollout_build_dev_native_dylib_modules(
 
 fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
     let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
-    for module in modules {
-        args.push("-p".to_string());
-        args.push(module.package.clone());
-    }
+    append_native_dylib_module_build_args(&mut args, modules);
     args
 }
 
 fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
     let mut args = vec!["build".to_string()];
-    for module in modules {
-        args.push("-p".to_string());
-        args.push(module.package.clone());
-    }
+    append_native_dylib_module_build_args(&mut args, modules);
     args
 }
 

@@ -12,7 +12,7 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [features]
-default = ["sandbox"]
+default = []
 # Enable sandbox execution through the native-module host loader. The heavy
 # WASIX engine is loaded from an active native-dylib module, not linked here.
 sandbox = ["dep:sinomo-sandbox-wasix-host"]

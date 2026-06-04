@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub const SANDBOX_WASIX_MODULE_PACKAGE: &str = "sinomo-sandbox-wasix-module";
+pub const SANDBOX_WASIX_MODULE_RUNTIME_FEATURE: &str = "sinomo-sandbox-wasix-module/wasix-runtime";
 pub const SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY: &str = "module/sandbox/wasix";
 pub const SANDBOX_WASIX_NATIVE_MODULE_SOURCE: &str = "rollout:modules/sandbox/wasix";
 
@@ -36,10 +37,7 @@ impl SelfRolloutPaths {
     pub fn plan(&self) -> SelfRolloutPlan {
         let native_dylib_modules = default_native_dylib_module_builds(&self.source_repo);
         let mut build_args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
-        for module in &native_dylib_modules {
-            build_args.push("-p".to_string());
-            build_args.push(module.package.clone());
-        }
+        append_native_dylib_module_build_args(&mut build_args, &native_dylib_modules);
         SelfRolloutPlan {
             build_program: "cargo".to_string(),
             build_args,
@@ -74,6 +72,7 @@ pub struct SelfRolloutPlan {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SelfRolloutNativeDylibModuleBuild {
     pub package: String,
+    pub features: Vec<String>,
     pub module_id: String,
     pub interface_version: String,
     pub cache_key: String,
@@ -110,6 +109,7 @@ pub fn default_native_dylib_module_builds(
     let library_name = sandbox_wasix_native_module_library_name();
     vec![SelfRolloutNativeDylibModuleBuild {
         package: SANDBOX_WASIX_MODULE_PACKAGE.to_string(),
+        features: vec![SANDBOX_WASIX_MODULE_RUNTIME_FEATURE.to_string()],
         module_id: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID.to_string(),
         interface_version: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION
             .to_string(),
@@ -118,6 +118,24 @@ pub fn default_native_dylib_module_builds(
         built_library: build_dir.join("target").join("debug").join(library_name),
         source: SANDBOX_WASIX_NATIVE_MODULE_SOURCE.to_string(),
     }]
+}
+
+pub fn append_native_dylib_module_build_args(
+    args: &mut Vec<String>,
+    modules: &[SelfRolloutNativeDylibModuleBuild],
+) {
+    for module in modules {
+        args.push("-p".to_string());
+        args.push(module.package.clone());
+    }
+    let features = modules
+        .iter()
+        .flat_map(|module| module.features.iter().cloned())
+        .collect::<Vec<_>>();
+    if !features.is_empty() {
+        args.push("--features".to_string());
+        args.push(features.join(","));
+    }
 }
 
 pub fn ensure_rollout_layout(paths: &SelfRolloutPaths) -> Result<(), RolloutError> {
@@ -173,7 +191,9 @@ mod tests {
                 "-p".to_string(),
                 "sinomo".to_string(),
                 "-p".to_string(),
-                SANDBOX_WASIX_MODULE_PACKAGE.to_string()
+                SANDBOX_WASIX_MODULE_PACKAGE.to_string(),
+                "--features".to_string(),
+                SANDBOX_WASIX_MODULE_RUNTIME_FEATURE.to_string(),
             ]
         );
         assert_eq!(plan.build_dir, paths.source_repo);

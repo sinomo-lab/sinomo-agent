@@ -37,5 +37,5 @@ crossterm = "0.28"
 libc = "0.2"
 
 [dev-dependencies]
-sinomo-sandbox-wasix-module = { path = "../../modules/sandbox/wasix" }
+sinomo-sandbox-wasix-module = { path = "../../modules/sandbox/wasix", features = ["wasix-runtime"] }
 wat = "1.248.0"

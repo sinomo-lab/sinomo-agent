@@ -45,6 +45,7 @@ pub mod r1 {
     // native-dylib module from content-addressed module cache.
     pub use sinomo_sandbox as sandbox;
     pub use sinomo_sandbox_wasix_api as sandbox_wasix_api;
+    #[cfg(feature = "sandbox")]
     pub use sinomo_sandbox_wasix_host as sandbox_wasix_host;
     pub use sinomo_service as service;
     pub use sinomo_supervision as supervision;
@@ -181,10 +182,12 @@ pub mod r1 {
 }
 
 pub use r0::{core, object};
+#[cfg(feature = "sandbox")]
+pub use r1::sandbox_wasix_host;
 pub use r1::{
     api, config, daemon, device, dfs, eval, events, kv, local, module, module_api, modules,
-    network, node, policy, registry, rollout, sandbox, sandbox_wasix_api, sandbox_wasix_host,
-    service, storage, supervision,
+    network, node, policy, registry, rollout, sandbox, sandbox_wasix_api, service, storage,
+    supervision,
 };
 
 #[cfg(test)]
