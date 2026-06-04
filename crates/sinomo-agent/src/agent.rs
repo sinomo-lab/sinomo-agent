@@ -655,6 +655,11 @@ pub enum AgentItem {
         status: AgentVerificationState,
         summary: String,
     },
+    CodingRunState {
+        item_id: TaskId,
+        step_index: usize,
+        state: CodingRunState,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -669,6 +674,119 @@ pub enum AgentVerificationState {
 impl Default for AgentVerificationState {
     fn default() -> Self {
         Self::NotRun
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingPatchStatus {
+    NotStarted,
+    Applied,
+    Failed,
+    Blocked,
+}
+
+impl Default for CodingPatchStatus {
+    fn default() -> Self {
+        Self::NotStarted
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingValidationStatus {
+    NotRun,
+    Passed,
+    FailedPatchRelevant,
+    FailedEnvironment,
+    FailedCommandSetup,
+    TimedOut,
+    Inconclusive,
+}
+
+impl Default for CodingValidationStatus {
+    fn default() -> Self {
+        Self::NotRun
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingBlockedReason {
+    PolicyDenied,
+    ToolUnavailable,
+    Environment,
+    CommandSetup,
+    NeedsUserInput,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CodingStopDecision {
+    Continue,
+    FinishWithPatch,
+    FinishBlocked,
+    RequestUserInput,
+    Abort,
+}
+
+impl Default for CodingStopDecision {
+    fn default() -> Self {
+        Self::Continue
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CodingValidationAttempt {
+    pub step_index: usize,
+    pub call_id: TaskId,
+    pub command: String,
+    pub status: CodingValidationStatus,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CodingRunState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objective: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_diff_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_diff_summary: Option<String>,
+    #[serde(default)]
+    pub patch_status: CodingPatchStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_attempts: Vec<CodingValidationAttempt>,
+    #[serde(default)]
+    pub validation_status: CodingValidationStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<CodingBlockedReason>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outstanding_evidence: Vec<String>,
+    #[serde(default)]
+    pub stop_recommendation: CodingStopDecision,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_risks: Vec<String>,
+}
+
+impl CodingRunState {
+    pub fn is_empty(&self) -> bool {
+        self.changed_files.is_empty()
+            && self.current_diff_summary.is_none()
+            && self.patch_status == CodingPatchStatus::NotStarted
+            && self.validation_attempts.is_empty()
+            && self.validation_status == CodingValidationStatus::NotRun
+            && self.blocked_reason.is_none()
+            && self.open_risks.is_empty()
     }
 }
 
@@ -2013,6 +2131,21 @@ fn working_state_from_items(
                     );
                 }
             }
+            AgentItem::CodingRunState {
+                state: coding_state,
+                ..
+            } => {
+                for changed_file in &coding_state.changed_files {
+                    push_unique(&mut state.files_modified, changed_file.clone());
+                }
+                if let Some(blocked_reason) = &coding_state.blocked_reason {
+                    push_unique(
+                        &mut state.blockers,
+                        format!("coding run blocked: {blocked_reason:?}"),
+                    );
+                }
+                state.open_risks.extend(coding_state.open_risks.clone());
+            }
             AgentItem::Error { detail, .. } => {
                 push_unique(&mut state.blockers, compact_multiline(detail, 500));
             }
@@ -2082,6 +2215,344 @@ fn merge_verification_state(
     }
 }
 
+fn coding_state_from_items(items: &[AgentItem]) -> CodingRunState {
+    let mut state = CodingRunState::default();
+    for item in items {
+        match item {
+            AgentItem::UserMessage { content, .. } => {
+                if !content.contains("\"kind\": \"agent_queued_turn_context\"")
+                    && state.objective.is_none()
+                {
+                    state.objective = Some(compact_multiline(content, 1000));
+                }
+            }
+            AgentItem::PatchSnapshot {
+                status,
+                summary,
+                changed_files,
+                ..
+            } => {
+                match status {
+                    AgentToolStatus::Succeeded => state.patch_status = CodingPatchStatus::Applied,
+                    AgentToolStatus::Blocked => state.patch_status = CodingPatchStatus::Blocked,
+                    AgentToolStatus::Failed | AgentToolStatus::Cancelled => {
+                        state.patch_status = CodingPatchStatus::Failed
+                    }
+                }
+                for changed_file in changed_files {
+                    push_unique(&mut state.changed_files, changed_file.clone());
+                }
+                if !changed_files.is_empty() {
+                    state.current_diff_summary = Some(compact_multiline(summary, 1000));
+                }
+                if matches!(status, AgentToolStatus::Failed | AgentToolStatus::Blocked) {
+                    push_unique(&mut state.open_risks, compact_multiline(summary, 500));
+                }
+            }
+            AgentItem::ToolResult {
+                step_index,
+                call_id,
+                status,
+                summary,
+                output,
+                evidence,
+                ..
+            } => {
+                if let Some(reason) = coding_blocked_reason_from_tool_result(status, output) {
+                    state.blocked_reason = Some(reason);
+                    push_unique(&mut state.open_risks, compact_multiline(summary, 500));
+                }
+                let coding = evidence
+                    .record::<AgentCodingToolEvidence>(AGENT_CODING_EVIDENCE_KIND)
+                    .unwrap_or_default();
+                for changed_file in coding.changed_files {
+                    push_unique(&mut state.changed_files, changed_file);
+                }
+                if let Some(attempt) = coding_validation_attempt_from_tool_result(
+                    *step_index,
+                    call_id,
+                    status,
+                    summary,
+                    output,
+                ) {
+                    state.validation_status =
+                        merge_coding_validation_status(&state.validation_status, &attempt.status);
+                    state.validation_attempts.push(attempt);
+                }
+            }
+            AgentItem::VerificationResult {
+                step_index,
+                call_id,
+                command,
+                status,
+                summary,
+                ..
+            } => {
+                let status = coding_validation_status_from_agent_verification(status);
+                state.validation_status =
+                    merge_coding_validation_status(&state.validation_status, &status);
+                state.validation_attempts.push(CodingValidationAttempt {
+                    step_index: *step_index,
+                    call_id: call_id.clone(),
+                    command: command.clone(),
+                    status,
+                    summary: summary.clone(),
+                    exit_code: None,
+                    timed_out: false,
+                });
+            }
+            AgentItem::CodingRunState { .. }
+            | AgentItem::AssistantText { .. }
+            | AgentItem::AssistantReasoningSummary { .. }
+            | AgentItem::ToolCall { .. }
+            | AgentItem::AsyncTaskUpdate { .. }
+            | AgentItem::ContextInjection { .. }
+            | AgentItem::CompactionSummary { .. }
+            | AgentItem::ModelUsage { .. }
+            | AgentItem::Error { .. } => {}
+        }
+    }
+    finalize_coding_state(state)
+}
+
+fn finalize_coding_state(mut state: CodingRunState) -> CodingRunState {
+    if state.patch_status == CodingPatchStatus::Applied
+        && state.validation_status == CodingValidationStatus::NotRun
+    {
+        push_unique(
+            &mut state.outstanding_evidence,
+            "validation has not run for the current patch".to_string(),
+        );
+    }
+    if state.patch_status == CodingPatchStatus::NotStarted && state.blocked_reason.is_none() {
+        push_unique(
+            &mut state.outstanding_evidence,
+            "no patch has been produced yet".to_string(),
+        );
+    }
+    state.stop_recommendation = match (&state.patch_status, &state.validation_status) {
+        (CodingPatchStatus::Applied, CodingValidationStatus::Passed)
+        | (CodingPatchStatus::Applied, CodingValidationStatus::FailedEnvironment)
+            if is_narrow_coding_patch(&state) =>
+        {
+            CodingStopDecision::FinishWithPatch
+        }
+        _ if state.blocked_reason == Some(CodingBlockedReason::NeedsUserInput) => {
+            CodingStopDecision::RequestUserInput
+        }
+        _ if state.blocked_reason.is_some() && state.patch_status != CodingPatchStatus::Applied => {
+            CodingStopDecision::FinishBlocked
+        }
+        _ => CodingStopDecision::Continue,
+    };
+    state
+}
+
+fn is_narrow_coding_patch(state: &CodingRunState) -> bool {
+    !state.changed_files.is_empty() && state.changed_files.len() <= 3
+}
+
+fn coding_final_decision_from_state(state: &CodingRunState) -> AgentLoopDecision {
+    let files = if state.changed_files.is_empty() {
+        "no files recorded".to_string()
+    } else {
+        state.changed_files.join(", ")
+    };
+    let validation = match state.validation_status {
+        CodingValidationStatus::Passed => "validation passed".to_string(),
+        CodingValidationStatus::FailedEnvironment => {
+            "validation was blocked by the local environment".to_string()
+        }
+        _ => format!("validation status: {:?}", state.validation_status),
+    };
+    let summary = state
+        .current_diff_summary
+        .as_deref()
+        .map(|summary| format!(" Summary: {summary}"))
+        .unwrap_or_default();
+    AgentLoopDecision {
+        response_mode: crate::AgentLoopResponseMode::Answer,
+        text: format!("Patch is ready. Changed files: {files}. {validation}.{summary}"),
+        tool_calls: Vec::new(),
+        background_handoff: None,
+        next_state: crate::AgentInteractionState::Listening,
+    }
+}
+
+fn merge_coding_validation_status(
+    current: &CodingValidationStatus,
+    next: &CodingValidationStatus,
+) -> CodingValidationStatus {
+    use CodingValidationStatus::{
+        FailedCommandSetup, FailedEnvironment, FailedPatchRelevant, Inconclusive, NotRun, Passed,
+        TimedOut,
+    };
+    match (current, next) {
+        (FailedPatchRelevant, _) | (_, FailedPatchRelevant) => FailedPatchRelevant,
+        (TimedOut, _) | (_, TimedOut) => TimedOut,
+        (FailedCommandSetup, _) | (_, FailedCommandSetup) => FailedCommandSetup,
+        (FailedEnvironment, _) | (_, FailedEnvironment) => FailedEnvironment,
+        (Inconclusive, _) | (_, Inconclusive) => Inconclusive,
+        (Passed, _) | (_, Passed) => Passed,
+        _ => NotRun,
+    }
+}
+
+fn coding_validation_status_from_agent_verification(
+    status: &AgentVerificationState,
+) -> CodingValidationStatus {
+    match status {
+        AgentVerificationState::NotRun => CodingValidationStatus::NotRun,
+        AgentVerificationState::Passed => CodingValidationStatus::Passed,
+        AgentVerificationState::Failed => CodingValidationStatus::FailedPatchRelevant,
+        AgentVerificationState::Blocked => CodingValidationStatus::FailedEnvironment,
+    }
+}
+
+fn coding_validation_attempt_from_tool_result(
+    step_index: usize,
+    call_id: &TaskId,
+    status: &AgentToolStatus,
+    summary: &str,
+    output: &serde_json::Value,
+) -> Option<CodingValidationAttempt> {
+    if !looks_like_command_result(output) {
+        return None;
+    }
+    let command = verification_command_from_tool_output(output).unwrap_or_else(|| "command".into());
+    let timed_out = output
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let exit_code = output
+        .get("status")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let validation_status = classify_command_validation(status, summary, output);
+    Some(CodingValidationAttempt {
+        step_index,
+        call_id: call_id.clone(),
+        command,
+        status: validation_status,
+        summary: compact_multiline(summary, 1000),
+        exit_code,
+        timed_out,
+    })
+}
+
+fn looks_like_command_result(output: &serde_json::Value) -> bool {
+    output.get("program").is_some()
+        && output.get("args").is_some()
+        && output.get("status").is_some()
+        && output.get("stdout").is_some()
+        && output.get("stderr").is_some()
+}
+
+fn classify_command_validation(
+    status: &AgentToolStatus,
+    summary: &str,
+    output: &serde_json::Value,
+) -> CodingValidationStatus {
+    if output
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return CodingValidationStatus::Passed;
+    }
+    if output
+        .get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return CodingValidationStatus::TimedOut;
+    }
+    if matches!(status, AgentToolStatus::Blocked) {
+        return CodingValidationStatus::FailedEnvironment;
+    }
+    let combined = command_failure_text(summary, output);
+    if command_setup_failure(&combined) {
+        return CodingValidationStatus::FailedCommandSetup;
+    }
+    if environment_failure(&combined) {
+        return CodingValidationStatus::FailedEnvironment;
+    }
+    CodingValidationStatus::FailedPatchRelevant
+}
+
+fn command_failure_text(summary: &str, output: &serde_json::Value) -> String {
+    let mut parts = vec![summary.to_string()];
+    for key in ["stderr", "stdout", "aggregated_output", "error", "detail"] {
+        if let Some(value) = output.get(key).and_then(serde_json::Value::as_str) {
+            parts.push(value.to_string());
+        }
+    }
+    if let Some(command_output) = output.get("command_output") {
+        for key in ["stderr", "stdout", "aggregated_output"] {
+            if let Some(value) = command_output.get(key).and_then(serde_json::Value::as_str) {
+                parts.push(value.to_string());
+            }
+        }
+    }
+    parts.join("\n").to_ascii_lowercase()
+}
+
+fn command_setup_failure(text: &str) -> bool {
+    [
+        "missing_command",
+        "requires a string command",
+        "invalid option",
+        "usage:",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn environment_failure(text: &str) -> bool {
+    [
+        "command not found",
+        "no such file or directory",
+        "permission denied",
+        "missing dependency",
+        "module not found",
+        "no module named",
+        "cannot find module",
+        "failed to download",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "connection refused",
+        "could not resolve",
+        "unable to locate package",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn coding_blocked_reason_from_tool_result(
+    status: &AgentToolStatus,
+    output: &serde_json::Value,
+) -> Option<CodingBlockedReason> {
+    if !matches!(status, AgentToolStatus::Blocked) {
+        return None;
+    }
+    let error = output
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    match error {
+        "policy_denied" => Some(CodingBlockedReason::PolicyDenied),
+        "tool_not_visible" | "missing_executor" | "unknown_tool" => {
+            Some(CodingBlockedReason::ToolUnavailable)
+        }
+        "missing_command" => Some(CodingBlockedReason::CommandSetup),
+        "request_user_input_unavailable" => Some(CodingBlockedReason::NeedsUserInput),
+        "command_execution_disabled" | "workspace_root_not_allowed" => {
+            Some(CodingBlockedReason::Environment)
+        }
+        _ => Some(CodingBlockedReason::Unknown),
+    }
+}
+
 pub(crate) fn agent_item_id(item: &AgentItem) -> TaskId {
     match item {
         AgentItem::UserMessage { item_id, .. }
@@ -2095,7 +2566,8 @@ pub(crate) fn agent_item_id(item: &AgentItem) -> TaskId {
         | AgentItem::ModelUsage { item_id, .. }
         | AgentItem::Error { item_id, .. }
         | AgentItem::PatchSnapshot { item_id, .. }
-        | AgentItem::VerificationResult { item_id, .. } => item_id.clone(),
+        | AgentItem::VerificationResult { item_id, .. }
+        | AgentItem::CodingRunState { item_id, .. } => item_id.clone(),
     }
 }
 
@@ -2269,6 +2741,8 @@ pub struct AgentRun {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EventEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coding_state: Option<CodingRunState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_evidence_bundle: Option<AgentCandidateEvidenceBundle>,
 }
 
@@ -2277,6 +2751,7 @@ pub struct AgentRun {
 pub enum AgentStopReason {
     FinalDecision,
     SilentAsyncUpdate,
+    CodingStopRecommended,
     MaxStepsReached,
     Aborted,
 }
@@ -2934,9 +3409,11 @@ fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleStatus {
     match run.as_ref().map(|run| &run.stop_reason) {
         Some(AgentStopReason::Aborted) => AgentTaskLifecycleStatus::Cancelled,
         Some(AgentStopReason::MaxStepsReached) => AgentTaskLifecycleStatus::Failed,
-        Some(AgentStopReason::FinalDecision | AgentStopReason::SilentAsyncUpdate) => {
-            AgentTaskLifecycleStatus::Completed
-        }
+        Some(
+            AgentStopReason::FinalDecision
+            | AgentStopReason::SilentAsyncUpdate
+            | AgentStopReason::CodingStopRecommended,
+        ) => AgentTaskLifecycleStatus::Completed,
         None => AgentTaskLifecycleStatus::Failed,
     }
 }
@@ -3695,6 +4172,7 @@ impl<M: InteractionModel> Agent<M> {
                 }],
                 compactions: Vec::new(),
                 events: Vec::new(),
+                coding_state: None,
                 candidate_evidence_bundle: None,
             });
         }
@@ -3906,6 +4384,7 @@ impl<M: InteractionModel> Agent<M> {
                 model_events: Vec::new(),
                 compactions: Vec::new(),
                 events: vec![event],
+                coding_state: None,
                 candidate_evidence_bundle: None,
             });
         }
@@ -3989,6 +4468,7 @@ impl<M: InteractionModel> Agent<M> {
         let mut final_decision = AgentLoopDecision::silent();
         let mut stop_reason = AgentStopReason::MaxStepsReached;
         let mut step_index = 0usize;
+        let mut latest_coding_state: Option<CodingRunState> = None;
 
         loop {
             if self
@@ -4380,6 +4860,52 @@ impl<M: InteractionModel> Agent<M> {
                 tool_message_id,
                 render_tool_results(step_index, &step_results)?,
             ));
+            let coding_state = coding_state_from_items(&items);
+            if !coding_state.is_empty() {
+                let coding_state_item = AgentItem::CodingRunState {
+                    item_id: TaskId::generate(),
+                    step_index,
+                    state: coding_state.clone(),
+                };
+                self.trace(
+                    &input.session.session_id,
+                    AgentTraceRecordKind::Item {
+                        item: coding_state_item.clone(),
+                    },
+                )?;
+                if let Some(transcript_item) =
+                    project_agent_item_to_transcript_item(coding_state_item.clone()).transpose()?
+                {
+                    transcript.push(transcript_item);
+                }
+                items.push(coding_state_item);
+                let coding_state_event = caused_by_latest_event(
+                    agent_event(
+                        &input.session,
+                        "agent.coding.state.updated",
+                        0.59,
+                        serde_json::json!({
+                            "step_index": step_index,
+                            "state": coding_state.clone(),
+                        }),
+                    ),
+                    input,
+                );
+                self.trace(
+                    &input.session.session_id,
+                    AgentTraceRecordKind::Event {
+                        event: coding_state_event.clone(),
+                    },
+                )?;
+                events.push(coding_state_event);
+                if coding_state.stop_recommendation == CodingStopDecision::FinishWithPatch {
+                    final_decision = coding_final_decision_from_state(&coding_state);
+                    stop_reason = AgentStopReason::CodingStopRecommended;
+                    latest_coding_state = Some(coding_state);
+                    break;
+                }
+                latest_coding_state = Some(coding_state);
+            }
             step_index = step_index.saturating_add(1);
         }
 
@@ -4394,6 +4920,7 @@ impl<M: InteractionModel> Agent<M> {
                     "tool_result_count": tool_results.len(),
                     "final_response_mode": final_decision.response_mode,
                     "run_context": &self.config.run_context,
+                    "coding_state": &latest_coding_state,
                 }),
             ),
             input,
@@ -4428,6 +4955,7 @@ impl<M: InteractionModel> Agent<M> {
             model_events,
             compactions,
             events,
+            coding_state: latest_coding_state,
             candidate_evidence_bundle,
         })
     }
@@ -4906,6 +5434,18 @@ fn project_agent_item_to_transcript_item(
                 "command": command,
                 "status": status,
                 "summary": summary,
+            }))
+            .map(|content| AgentTranscriptItem::user(step_index, content))
+            .map_err(|source| AgentError::ModelRequest {
+                detail: source.to_string(),
+            }),
+        ),
+        AgentItem::CodingRunState {
+            step_index, state, ..
+        } => Some(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "kind": "coding_run_state",
+                "state": state,
             }))
             .map(|content| AgentTranscriptItem::user(step_index, content))
             .map_err(|source| AgentError::ModelRequest {
@@ -5443,15 +5983,15 @@ fn verification_command_from_tool_outcome(outcome: &AgentToolOutcome) -> String 
     {
         return command.to_string();
     }
-    let Some(program) = outcome
-        .output
-        .get("program")
-        .and_then(serde_json::Value::as_str)
-    else {
-        return outcome.call.tool.clone();
+    verification_command_from_tool_output(&outcome.output)
+        .unwrap_or_else(|| outcome.call.tool.clone())
+}
+
+fn verification_command_from_tool_output(output: &serde_json::Value) -> Option<String> {
+    let Some(program) = output.get("program").and_then(serde_json::Value::as_str) else {
+        return None;
     };
-    let args = outcome
-        .output
+    let args = output
         .get("args")
         .and_then(serde_json::Value::as_array)
         .map(|values| {
@@ -5461,10 +6001,19 @@ fn verification_command_from_tool_outcome(outcome: &AgentToolOutcome) -> String 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    if matches!(program, "bash" | "sh" | "cmd") {
+        for (index, arg) in args.iter().enumerate() {
+            if matches!(*arg, "-lc" | "-c" | "/C")
+                && let Some(command) = args.get(index + 1)
+            {
+                return Some(command.to_string());
+            }
+        }
+    }
     if args.is_empty() {
-        program.to_string()
+        Some(program.to_string())
     } else {
-        format!("{program} {}", args.join(" "))
+        Some(format!("{program} {}", args.join(" ")))
     }
 }
 
@@ -9027,6 +9576,77 @@ old
             fs::read_to_string(patch_ref)
                 .expect("patch evidence")
                 .contains("+new")
+        );
+    }
+
+    #[test]
+    fn coding_state_stops_after_patch_with_environment_blocked_validation() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-coding-stop-env-{}",
+            TaskId::generate()
+        ));
+        let evidence_dir = root.join("evidence");
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("hello.txt"), "old\n").expect("seed file");
+        let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
+        let patch_turn = serde_json::json!({
+            "response_mode": "defer",
+            "text": "I will patch the file.",
+            "tool_calls": [{
+                "tool": "apply_patch",
+                "input": {"patch": patch},
+                "async": false,
+                "summary": "Patch hello.txt."
+            }],
+            "background_handoff": null,
+            "next_state": "waiting"
+        })
+        .to_string();
+        let validation_turn = serde_json::json!({
+            "response_mode": "defer",
+            "text": "I will validate the patch.",
+            "tool_calls": [{
+                "tool": "run_command",
+                "input": {"command": "missing-sinomo-test-validator"},
+                "async": false,
+                "summary": "Run validation."
+            }],
+            "background_handoff": null,
+            "next_state": "waiting"
+        })
+        .to_string();
+        let model = SequencedModel::new([patch_turn, validation_turn]);
+        let config = LocalWorkspaceAgentConfig::new(&root)
+            .allowing_file_writes(true)
+            .allowing_shell_commands(true)
+            .with_evidence_dir(&evidence_dir);
+        let agent = Agent::new(model, "fake", "fake")
+            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(config));
+
+        let run = agent.run(&agent_input("patch and validate")).expect("run");
+        let coding_state = run.coding_state.as_ref().expect("coding state");
+
+        assert_eq!(run.stop_reason, AgentStopReason::CodingStopRecommended);
+        assert_eq!(run.model_turns.len(), 2);
+        assert_eq!(
+            run.final_decision.response_mode,
+            crate::AgentLoopResponseMode::Answer
+        );
+        assert!(run.final_decision.text.contains("Patch is ready"));
+        assert_eq!(coding_state.patch_status, CodingPatchStatus::Applied);
+        assert_eq!(
+            coding_state.validation_status,
+            CodingValidationStatus::FailedEnvironment
+        );
+        assert_eq!(
+            coding_state.stop_recommendation,
+            CodingStopDecision::FinishWithPatch
+        );
+        assert_eq!(coding_state.changed_files, vec!["hello.txt".to_string()]);
+        assert!(
+            run.items
+                .iter()
+                .any(|item| matches!(item, AgentItem::CodingRunState { .. }))
         );
     }
 
