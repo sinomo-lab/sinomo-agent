@@ -124,7 +124,7 @@ pub(crate) mod prelude {
     pub(crate) use std::io::{self, Write};
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+    pub(crate) use std::net::{Shutdown, TcpStream};
     pub(crate) use std::path::PathBuf;
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::sync::mpsc;

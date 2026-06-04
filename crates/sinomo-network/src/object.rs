@@ -156,11 +156,29 @@ impl DaemonControlStream {
             })
     }
 
+    pub fn read_timeout(&self) -> Result<Option<Duration>, NetworkError> {
+        self.stream
+            .read_timeout()
+            .map_err(|source| NetworkError::Io {
+                operation: "read daemon control read timeout".to_string(),
+                detail: source.to_string(),
+            })
+    }
+
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), NetworkError> {
         self.stream
             .set_write_timeout(timeout)
             .map_err(|source| NetworkError::Io {
                 operation: "configure daemon control write timeout".to_string(),
+                detail: source.to_string(),
+            })
+    }
+
+    pub fn write_timeout(&self) -> Result<Option<Duration>, NetworkError> {
+        self.stream
+            .write_timeout()
+            .map_err(|source| NetworkError::Io {
+                operation: "read daemon control write timeout".to_string(),
                 detail: source.to_string(),
             })
     }

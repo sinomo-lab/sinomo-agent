@@ -1933,7 +1933,12 @@ pub fn append_cluster_raft_command_with_response(
                 return Ok((node.store().snapshot(), Some(response)));
             }
         }
-        KvCommand::PutClusterMember(_) => {}
+        KvCommand::PutClusterMember(member) => {
+            let op = cluster_member_put_op(member)?;
+            if node.store().op_response_if_no_effect(&op)?.is_some() {
+                return Ok((node.store().snapshot(), None));
+            }
+        }
     }
     let before_revision = node.store().revision();
     let term = node.hard_state().current_term.max(1);
@@ -1991,7 +1996,15 @@ pub fn append_cluster_raft_command_uncommitted_or_no_effect(
                 });
             }
         }
-        KvCommand::PutClusterMember(_) => {}
+        KvCommand::PutClusterMember(member) => {
+            let op = cluster_member_put_op(member)?;
+            if node.store().op_response_if_no_effect(&op)?.is_some() {
+                return Ok(ClusterRaftUncommittedAppend::NoEffect {
+                    snapshot: node.store().snapshot(),
+                    txn_response: None,
+                });
+            }
+        }
     }
     let entry = append_cluster_raft_command_to_open_node(paths, &mut node, command)?;
     Ok(ClusterRaftUncommittedAppend::Appended(entry))
@@ -2015,6 +2028,10 @@ fn append_cluster_raft_command_to_open_node(
     let entry = node.append_local_command(term, command)?;
     compact_cluster_raft_node_if_needed(paths, node)?;
     Ok(entry)
+}
+
+fn cluster_member_put_op(member: &ClusterMemberRecord) -> Result<KvOp, NetworkError> {
+    KvOp::put_serde(cluster_member_key(&member.node_id), member, None).map_err(NetworkError::from)
 }
 
 pub fn discard_cluster_raft_uncommitted_tail(

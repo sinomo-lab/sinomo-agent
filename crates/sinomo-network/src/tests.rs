@@ -352,6 +352,54 @@ fn daemon_control_stream_deadline_refreshes_blocking_timeouts() {
 }
 
 #[test]
+fn daemon_control_resolver_uses_socket_addresses_and_bounds_dns_workers() {
+    let resolved = crate::roaming::resolve_daemon_control_socket_address_with_timeout(
+        "127.0.0.1:21353",
+        Duration::from_millis(1),
+    )
+    .expect("socket address resolves without DNS");
+
+    assert_eq!(
+        resolved,
+        "127.0.0.1:21353"
+            .parse::<std::net::SocketAddr>()
+            .expect("socket address")
+    );
+    assert_eq!(
+        crate::roaming::daemon_control_dns_worker_count_for_test(),
+        0,
+        "already-normalized daemon control addresses must not consume DNS workers"
+    );
+
+    let mut permits = Vec::new();
+    for _ in 0..crate::roaming::MAX_DAEMON_CONTROL_DNS_WORKERS {
+        permits.push(
+            crate::roaming::try_acquire_daemon_control_dns_worker()
+                .expect("reserve daemon control dns worker"),
+        );
+    }
+
+    let error = crate::roaming::resolve_daemon_control_socket_address_with_timeout(
+        "localhost:21353",
+        Duration::from_millis(1),
+    )
+    .expect_err("dns worker saturation");
+
+    assert_eq!(
+        error,
+        NetworkError::Io {
+            operation: "resolve daemon control address localhost:21353".to_string(),
+            detail: format!(
+                "daemon control DNS worker limit reached ({})",
+                crate::roaming::MAX_DAEMON_CONTROL_DNS_WORKERS
+            ),
+        }
+    );
+
+    drop(permits);
+}
+
+#[test]
 fn lan_ip_filter_rejects_non_invitable_addresses() {
     assert!(!is_invitable_ip("127.0.0.1".parse().expect("loopback")));
     assert!(!is_invitable_ip("0.0.0.0".parse().expect("unspecified")));
@@ -3348,6 +3396,81 @@ fn stable_put_does_not_append_raft_log_entry() {
         wal_len_changed > wal_len_after,
         "changed puts must still append to the WAL"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stable_cluster_member_put_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-stable-member-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_stable_member_no_append").expect("node");
+    let member_node_id =
+        NodeId::from_legacy_named("node_stable_member_record").expect("member node");
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_stable_member_no_append").expect("cluster");
+    let member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        member_node_id.clone(),
+        "stable member",
+        "pk_stable_member",
+        OffsetDateTime::UNIX_EPOCH,
+    );
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::PutClusterMember(member.clone()),
+    )
+    .expect("seed member");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::PutClusterMember(member.clone()),
+    )
+    .expect("stable member put");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(txn_response, None);
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "stable cluster member puts should not consume WAL writes"
+    );
+    assert!(
+        no_op_snapshot
+            .get(&cluster_member_key(&member_node_id))
+            .is_some(),
+        "member record should remain materialized"
+    );
+
+    let mut changed_member = member;
+    changed_member.display_name = "changed member".to_string();
+    let changed = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::PutClusterMember(changed_member),
+    )
+    .expect("changed member put");
+    assert_eq!(changed.revision, snapshot.revision.next());
+    assert!(
+        std::fs::metadata(&wal_path)
+            .expect("wal after changed member")
+            .len()
+            > wal_len_after,
+        "changed cluster member records must still append durable raft entries"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 

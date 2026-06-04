@@ -26,6 +26,11 @@ pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize = 512 * 1024 * 10
 pub(crate) const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const MAX_DAEMON_CONTROL_DNS_WORKERS: usize = 8;
+#[cfg(any(feature = "iroh-transport", test))]
+static DAEMON_CONTROL_DNS_WORKERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -1271,6 +1276,8 @@ async fn send_iroh_daemon_control_request_async(
     timeout: Duration,
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
     let remote_addr = iroh_endpoint_addr_from_record(&record)?;
+    let mut request_bytes = Vec::new();
+    crate::write_object_frame_blocking(&mut request_bytes, request)?;
     let started = std::time::Instant::now();
     let remaining = || {
         timeout
@@ -1332,8 +1339,6 @@ async fn send_iroh_daemon_control_request_async(
             return Err(iroh_daemon_command_timeout_error(timeout));
         }
     };
-    let mut request_bytes = Vec::new();
-    crate::write_object_frame_blocking(&mut request_bytes, request)?;
     match tokio::time::timeout(remaining(), send.write_all(&request_bytes)).await {
         Ok(Ok(())) => {}
         Ok(Err(source)) => {
@@ -1350,10 +1355,14 @@ async fn send_iroh_daemon_control_request_async(
             return Err(iroh_daemon_command_timeout_error(timeout));
         }
     }
-    send.finish().map_err(|source| NetworkError::Io {
-        operation: "finish iroh daemon command".to_string(),
-        detail: source.to_string(),
-    })?;
+    if let Err(source) = send.finish() {
+        connection.close(0_u8.into(), b"finish failed");
+        close_iroh_endpoint(&endpoint).await;
+        return Err(NetworkError::Io {
+            operation: "finish iroh daemon command".to_string(),
+            detail: source.to_string(),
+        });
+    }
     let response = match read_iroh_daemon_control_response_async(&mut recv, remaining()).await {
         Ok(response) => response,
         Err(error) => {
@@ -1611,6 +1620,89 @@ impl DaemonRpcDeadline {
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
+pub(crate) struct DaemonControlDnsWorkerPermit;
+
+#[cfg(any(feature = "iroh-transport", test))]
+impl Drop for DaemonControlDnsWorkerPermit {
+    fn drop(&mut self) {
+        DAEMON_CONTROL_DNS_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn try_acquire_daemon_control_dns_worker() -> Option<DaemonControlDnsWorkerPermit> {
+    let mut current = DAEMON_CONTROL_DNS_WORKERS.load(std::sync::atomic::Ordering::Acquire);
+    loop {
+        if current >= MAX_DAEMON_CONTROL_DNS_WORKERS {
+            return None;
+        }
+        match DAEMON_CONTROL_DNS_WORKERS.compare_exchange_weak(
+            current,
+            current + 1,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(DaemonControlDnsWorkerPermit),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn daemon_control_dns_worker_count_for_test() -> usize {
+    DAEMON_CONTROL_DNS_WORKERS.load(std::sync::atomic::Ordering::Acquire)
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn resolve_daemon_control_socket_address_with_timeout(
+    address: &str,
+    timeout: Duration,
+) -> Result<SocketAddr, NetworkError> {
+    if let Ok(socket_address) = address.parse::<SocketAddr>() {
+        return Ok(socket_address);
+    }
+    let Some(permit) = try_acquire_daemon_control_dns_worker() else {
+        return Err(NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: format!(
+                "daemon control DNS worker limit reached ({MAX_DAEMON_CONTROL_DNS_WORKERS})"
+            ),
+        });
+    };
+
+    let address = address.to_string();
+    let worker_address = address.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _permit = permit;
+        let resolved = std::net::ToSocketAddrs::to_socket_addrs(&worker_address)
+            .map_err(|source| source.to_string())
+            .and_then(|mut addresses| {
+                addresses
+                    .next()
+                    .ok_or_else(|| "no socket addresses resolved".to_string())
+            });
+        let _ = sender.send(resolved);
+    });
+
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(socket_address)) => Ok(socket_address),
+        Ok(Err(detail)) => Err(NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail,
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: format!("timed out after {}ms", timeout.as_millis()),
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(NetworkError::Io {
+            operation: format!("resolve daemon control address {address}"),
+            detail: "resolver worker disconnected before returning an address".to_string(),
+        }),
+    }
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
 pub(crate) fn configure_daemon_control_stream_deadline(
     stream: &std::net::TcpStream,
     address: &str,
@@ -1703,17 +1795,8 @@ fn forward_daemon_control_payload(
     budget: &IrohProxyByteBudget,
 ) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
     let deadline = DaemonRpcDeadline::new(timeout);
-    let socket_address = address
-        .to_socket_addrs()
-        .map_err(|source| NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: source.to_string(),
-        })?
-        .next()
-        .ok_or_else(|| NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: "no socket addresses resolved".to_string(),
-        })?;
+    let socket_address =
+        resolve_daemon_control_socket_address_with_timeout(address, deadline.remaining())?;
     let mut stream =
         TcpStream::connect_timeout(&socket_address, deadline.remaining()).map_err(|source| {
             NetworkError::Io {
