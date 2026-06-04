@@ -28,8 +28,8 @@ const MAX_RETAINED_EVENTS: usize = 4096;
 const MAX_PENDING_EVENTS_PER_WATCH: usize = MAX_RETAINED_EVENTS;
 const MAX_ACTIVE_WATCHES: usize = 1024;
 const MAX_ACTIVE_LEASES: usize = 4096;
-const MAX_TXN_COMPARES: usize = 1024;
-const MAX_TXN_OPS_PER_BRANCH: usize = 4096;
+pub const MAX_KV_TXN_COMPARES: usize = 1024;
+pub const MAX_KV_TXN_OPS_PER_BRANCH: usize = 4096;
 pub const MAX_KV_MUTATION_EVENTS_PER_COMMAND: usize = 4096;
 pub const MAX_DELETE_PREFIX_KEYS: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
 pub const MAX_KEYS_PER_LEASE: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
@@ -1609,16 +1609,16 @@ impl InProcessKvStore {
     }
 
     fn validate_txn_shape(&self, txn: &KvTxn) -> Result<(), KvError> {
-        if txn.compares.len() > MAX_TXN_COMPARES
-            || txn.success.len() > MAX_TXN_OPS_PER_BRANCH
-            || txn.failure.len() > MAX_TXN_OPS_PER_BRANCH
+        if txn.compares.len() > MAX_KV_TXN_COMPARES
+            || txn.success.len() > MAX_KV_TXN_OPS_PER_BRANCH
+            || txn.failure.len() > MAX_KV_TXN_OPS_PER_BRANCH
         {
             return Err(KvError::TxnLimit {
                 compares: txn.compares.len(),
                 success_ops: txn.success.len(),
                 failure_ops: txn.failure.len(),
-                max_compares: MAX_TXN_COMPARES,
-                max_ops_per_branch: MAX_TXN_OPS_PER_BRANCH,
+                max_compares: MAX_KV_TXN_COMPARES,
+                max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
             });
         }
         Ok(())
@@ -4490,7 +4490,7 @@ mod tests {
     #[test]
     fn txn_rejects_oversized_compares_and_branches() {
         let mut store = InProcessKvStore::new();
-        let compares = (0..=MAX_TXN_COMPARES)
+        let compares = (0..=MAX_KV_TXN_COMPARES)
             .map(|index| KvCompare::Missing {
                 key: format!("/compare/{index}"),
             })
@@ -4506,15 +4506,15 @@ mod tests {
         assert_eq!(
             error,
             KvError::TxnLimit {
-                compares: MAX_TXN_COMPARES + 1,
+                compares: MAX_KV_TXN_COMPARES + 1,
                 success_ops: 0,
                 failure_ops: 0,
-                max_compares: MAX_TXN_COMPARES,
-                max_ops_per_branch: MAX_TXN_OPS_PER_BRANCH,
+                max_compares: MAX_KV_TXN_COMPARES,
+                max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
             }
         );
 
-        let failure = (0..=MAX_TXN_OPS_PER_BRANCH)
+        let failure = (0..=MAX_KV_TXN_OPS_PER_BRANCH)
             .map(|index| KvOp::Delete {
                 key: format!("/unused/failure/{index}"),
             })
@@ -4533,9 +4533,9 @@ mod tests {
             KvError::TxnLimit {
                 compares: 1,
                 success_ops: 0,
-                failure_ops: MAX_TXN_OPS_PER_BRANCH + 1,
-                max_compares: MAX_TXN_COMPARES,
-                max_ops_per_branch: MAX_TXN_OPS_PER_BRANCH,
+                failure_ops: MAX_KV_TXN_OPS_PER_BRANCH + 1,
+                max_compares: MAX_KV_TXN_COMPARES,
+                max_ops_per_branch: MAX_KV_TXN_OPS_PER_BRANCH,
             }
         );
     }

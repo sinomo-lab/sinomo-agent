@@ -61,6 +61,12 @@ static CLUSTER_KV_WATCH_DRAIN_ONCE_CALLS_FOR_TEST: LazyLock<Mutex<HashMap<PathBu
 #[cfg(test)]
 static CLUSTER_KV_WATCH_EVENT_LOG_READ_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<
     Mutex<HashMap<SocketAddr, PublicEndpointReachabilityCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -416,6 +422,52 @@ pub(crate) fn cluster_kv_watch_event_log_read_bytes_for_test(paths: &ClusterPath
         .lock()
         .ok()
         .and_then(|reads| reads.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_cluster_kv_watch_dir_scan_for_test(paths: &ClusterPaths) {
+    if let Ok(mut scans) = CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST.lock() {
+        *scans.entry(cluster_kv_watch_notify_key(paths)).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) {
+    if let Ok(mut scans) = CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST.lock() {
+        scans.remove(&cluster_kv_watch_notify_key(paths));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) -> u64 {
+    CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|scans| scans.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn record_cluster_kv_cached_snapshot_read_for_test(paths: &ClusterPaths) {
+    if let Ok(mut reads) = CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST.lock() {
+        *reads.entry(paths.kv_snapshot.clone()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cluster_kv_cached_snapshot_reads_for_test(paths: &ClusterPaths) {
+    if let Ok(mut reads) = CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST.lock() {
+        reads.remove(&paths.kv_snapshot);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_cached_snapshot_reads_for_test(paths: &ClusterPaths) -> u64 {
+    CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|reads| reads.get(&paths.kv_snapshot).copied())
         .unwrap_or(0)
 }
 
@@ -1702,6 +1754,8 @@ fn read_cluster_kv_cached_snapshot_entry(
 }
 
 fn read_cluster_kv_cached_snapshot(paths: &ClusterPaths) -> Result<Arc<KvSnapshot>, NetworkError> {
+    #[cfg(test)]
+    record_cluster_kv_cached_snapshot_read_for_test(paths);
     cluster_kv_local_cache(paths)
         .cached_snapshot_arc()
         .map_err(NetworkError::from)
@@ -2061,13 +2115,14 @@ pub fn create_cluster_kv_watch(
         detail: source.to_string(),
     })?;
     let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
-    let mut watch_id = next_cluster_kv_watch_id(paths)?;
-    let prune = prune_cluster_kv_watches(paths, snapshot.compacted_revision)?;
-    if prune.retained >= MAX_CLUSTER_KV_ACTIVE_WATCHES {
+    let cursor_id = read_cluster_kv_watch_allocator_cursor(paths)?;
+    let scan = scan_cluster_kv_watches(paths, snapshot.compacted_revision)?;
+    if scan.retained >= MAX_CLUSTER_KV_ACTIVE_WATCHES {
         return Err(NetworkError::Kv(KvError::WatchLimit {
             max: MAX_CLUSTER_KV_ACTIVE_WATCHES,
         }));
     }
+    let mut watch_id = WatchId(cursor_id.max(scan.max_seen_id.saturating_add(1)).max(1));
     loop {
         let registration = ClusterKvWatchRegistration {
             watch_id,
@@ -2824,19 +2879,23 @@ fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, Networ
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ClusterKvWatchPruneResult {
+struct ClusterKvWatchScanResult {
     removed: usize,
     retained: usize,
+    max_seen_id: u64,
 }
 
-fn prune_cluster_kv_watches(
+fn scan_cluster_kv_watches(
     paths: &ClusterPaths,
     compacted_revision: KvRevision,
-) -> Result<ClusterKvWatchPruneResult, NetworkError> {
+) -> Result<ClusterKvWatchScanResult, NetworkError> {
     if !paths.kv_watches.exists() {
-        return Ok(ClusterKvWatchPruneResult::default());
+        return Ok(ClusterKvWatchScanResult::default());
     }
-    let mut result = ClusterKvWatchPruneResult::default();
+    #[cfg(test)]
+    record_cluster_kv_watch_dir_scan_for_test(paths);
+
+    let mut result = ClusterKvWatchScanResult::default();
     for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
         path: paths.kv_watches.display().to_string(),
         detail: source.to_string(),
@@ -2851,6 +2910,7 @@ fn prune_cluster_kv_watches(
         let Some(file_watch_id) = cluster_kv_watch_id_from_file_name(&name) else {
             continue;
         };
+        result.max_seen_id = result.max_seen_id.max(file_watch_id);
         let path = entry.path();
         let watch_id = WatchId(file_watch_id);
         match read_cluster_kv_watch_registration(&path, watch_id) {
@@ -2891,38 +2951,14 @@ fn cluster_kv_watch_id_from_file_name(name: &str) -> Option<u64> {
         .and_then(|id| id.parse::<u64>().ok())
 }
 
-fn max_cluster_kv_watch_file_id(paths: &ClusterPaths) -> Result<u64, NetworkError> {
-    let mut max_id = 0_u64;
-    if !paths.kv_watches.exists() {
-        return Ok(max_id);
-    }
-    for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
-        path: paths.kv_watches.display().to_string(),
-        detail: source.to_string(),
-    })? {
-        let entry = entry.map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watches.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if let Some(id) = cluster_kv_watch_id_from_file_name(&name) {
-            max_id = max_id.max(id);
-        }
-    }
-    Ok(max_id)
-}
-
-fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkError> {
-    let max_file_id = max_cluster_kv_watch_file_id(paths)?;
+fn read_cluster_kv_watch_allocator_cursor(paths: &ClusterPaths) -> Result<u64, NetworkError> {
     let cursor_id = if paths.kv_watches_next_id.exists() {
         read_object_file::<ClusterKvWatchAllocatorState>(&paths.kv_watches_next_id)
             .map(|state| state.next_watch_id)?
     } else {
         1
     };
-    Ok(WatchId(cursor_id.max(max_file_id.saturating_add(1)).max(1)))
+    Ok(cursor_id.max(1))
 }
 
 fn persist_next_cluster_kv_watch_id(
@@ -3448,7 +3484,8 @@ fn cluster_state_sync_txn_from_store(
             success.push(policy_op);
         }
 
-        // Endpoints use delete-prefix + re-put; only do so when the stored set differs.
+        // Endpoint records are keyed individually. Diff them so a single endpoint
+        // change does not delete and re-put the whole member endpoint set.
         let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
         let stored_endpoints: BTreeMap<String, Vec<u8>> = store
             .range_prefix(&endpoint_prefix)
@@ -3461,15 +3498,20 @@ fn cluster_state_sync_txn_from_store(
             desired_endpoints.insert(key, SinomoObjectCodec::default().encode(endpoint)?);
         }
         if stored_endpoints != desired_endpoints {
-            success.push(KvOp::DeletePrefix {
-                prefix: endpoint_prefix,
-            });
+            for key in stored_endpoints
+                .keys()
+                .filter(|key| !desired_endpoints.contains_key(*key))
+            {
+                success.push(KvOp::Delete { key: key.clone() });
+            }
             for (key, value) in desired_endpoints {
-                success.push(KvOp::Put {
-                    key,
-                    value,
-                    lease_id: None,
-                });
+                if stored_endpoints.get(&key) != Some(&value) {
+                    success.push(KvOp::Put {
+                        key,
+                        value,
+                        lease_id: None,
+                    });
+                }
             }
         }
     }
@@ -4490,15 +4532,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
         return read_cluster_kv_snapshot(paths);
     }
     let state = read_cluster_state_without_kv(paths)?;
-    append_cluster_raft_command(
-        paths,
-        &state.local_node_id,
-        KvCommand::Txn(KvTxn {
-            compares: Vec::new(),
-            success,
-            failure: Vec::new(),
-        }),
-    )
+    append_cluster_raft_ops_in_batches(paths, &state.local_node_id, success)
 }
 
 pub fn stored_cluster_node_status_matches(
@@ -4583,8 +4617,17 @@ pub fn cluster_connectivity_sync_ops(
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
     let now = OffsetDateTime::now_utc();
-    let mut existing = BTreeMap::new();
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    cluster_connectivity_sync_ops_from_snapshot(snapshot.as_ref(), source_node_id, records, now)
+}
+
+fn cluster_connectivity_sync_ops_from_snapshot(
+    snapshot: &KvSnapshot,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    now: OffsetDateTime,
+) -> Result<Vec<KvOp>, NetworkError> {
+    let mut existing = BTreeMap::new();
     let prefix = cluster_connectivity_source_prefix(source_node_id);
     for entry in snapshot.prefix_entries(&prefix) {
         match entry.decode::<ClusterConnectivityRecord>() {
@@ -4672,6 +4715,7 @@ pub fn cluster_connectivity_sync_is_noop(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<bool, NetworkError> {
+    let now = OffsetDateTime::now_utc();
     let incoming_keys: BTreeSet<String> = records
         .iter()
         .map(|record| {
@@ -4692,7 +4736,13 @@ pub fn cluster_connectivity_sync_is_noop(
     }
     // Any incoming record that differs from what is stored (or is due for a TTL
     // refresh) would need a put.
-    Ok(cluster_connectivity_sync_ops(paths, source_node_id, records)?.is_empty())
+    Ok(cluster_connectivity_sync_ops_from_snapshot(
+        snapshot.as_ref(),
+        source_node_id,
+        records,
+        now,
+    )?
+    .is_empty())
 }
 
 pub fn expire_cluster_network_record_ops(
@@ -4702,6 +4752,7 @@ pub fn expire_cluster_network_record_ops(
 ) -> Result<(Vec<KvCompare>, Vec<KvOp>), NetworkError> {
     let mut compares = Vec::new();
     let mut ops = Vec::new();
+    let max_records = sinomo_kv::MAX_KV_TXN_COMPARES.min(sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH);
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     for entry in snapshot.prefix_entries("/cluster/network/info/") {
         let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
@@ -4718,6 +4769,9 @@ pub fn expire_cluster_network_record_ops(
             ops.push(KvOp::Delete {
                 key: entry.key.clone(),
             });
+            if ops.len() >= max_records {
+                return Ok((compares, ops));
+            }
         }
     }
     for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
@@ -4735,6 +4789,9 @@ pub fn expire_cluster_network_record_ops(
             ops.push(KvOp::Delete {
                 key: entry.key.clone(),
             });
+            if ops.len() >= max_records {
+                return Ok((compares, ops));
+            }
         }
     }
     Ok((compares, ops))
@@ -4878,36 +4935,70 @@ pub fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,
 ) -> Result<KvSnapshot, NetworkError> {
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let success = cluster_network_expiry_delete_ops(snapshot.as_ref(), now);
+    if success.is_empty() {
+        return Ok(snapshot.as_ref().clone());
+    }
+
     let state = read_cluster_state_without_kv(paths)?;
+    append_cluster_raft_ops_in_batches(paths, &state.local_node_id, success)
+}
+
+fn cluster_network_expiry_delete_ops(snapshot: &KvSnapshot, now: OffsetDateTime) -> Vec<KvOp> {
     let mut success = Vec::new();
-    for entry in read_cluster_kv_prefix_entries(paths, "/cluster/network/info/")? {
+    for entry in snapshot.prefix_entries("/cluster/network/info/") {
         let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
             continue;
         };
         if record.expires_at <= now {
-            success.push(KvOp::Delete { key: entry.key });
+            success.push(KvOp::Delete {
+                key: entry.key.clone(),
+            });
         }
     }
-    for entry in read_cluster_kv_prefix_entries(paths, "/cluster/network/connectivity/")? {
+    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
         let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
             continue;
         };
         if record.expires_at <= now {
-            success.push(KvOp::Delete { key: entry.key });
+            success.push(KvOp::Delete {
+                key: entry.key.clone(),
+            });
         }
     }
-    if success.is_empty() {
-        return read_cluster_kv_snapshot(paths);
+    success
+}
+
+fn append_cluster_raft_ops_in_batches(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    ops: Vec<KvOp>,
+) -> Result<KvSnapshot, NetworkError> {
+    let mut ops = ops.into_iter();
+    let mut latest = None;
+    loop {
+        let chunk = ops
+            .by_ref()
+            .take(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            break;
+        }
+        latest = Some(append_cluster_raft_command(
+            paths,
+            node_id,
+            KvCommand::Txn(KvTxn {
+                compares: Vec::new(),
+                success: chunk,
+                failure: Vec::new(),
+            }),
+        )?);
     }
-    append_cluster_raft_command(
-        paths,
-        &state.local_node_id,
-        KvCommand::Txn(KvTxn {
-            compares: Vec::new(),
-            success,
-            failure: Vec::new(),
-        }),
-    )
+    latest.ok_or_else(|| NetworkError::StorageIo {
+        path: paths.kv_snapshot.display().to_string(),
+        detail: "cannot append an empty batch of cluster kv operations".to_string(),
+    })
 }
 
 pub fn cluster_node_status_key(node_id: &NodeId) -> String {

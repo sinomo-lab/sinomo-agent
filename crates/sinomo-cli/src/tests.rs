@@ -6890,7 +6890,7 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
         "public-key",
         OffsetDateTime::now_utc(),
     );
-    state.members[0].endpoints.push(ClusterEndpointRecord {
+    let current_endpoint = ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_cleanup_current")
             .expect("endpoint"),
         node_id: node_id.clone(),
@@ -6900,23 +6900,50 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
         privacy: ClusterEndpointPrivacy::Lan,
         priority: 20,
         last_observed_latency_ms: None,
-    });
+    };
+    let stale_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_cleanup_stale")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "192.0.2.12:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 30,
+        last_observed_latency_ms: None,
+    };
+    state.members[0].endpoints = vec![current_endpoint.clone()];
+
+    let stale_key = sinomo_runtime::network::cluster_endpoint_key(&node_id, &stale_endpoint);
+    let current_key = sinomo_runtime::network::cluster_endpoint_key(&node_id, &current_endpoint);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(stale_key.clone(), &stale_endpoint, None)
+        .expect("stale endpoint");
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+        .expect("cluster kv snapshot");
 
     let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
     let endpoint_prefix = format!("/cluster/endpoints/{node_id}/");
-    let delete_prefix_index = txn
-        .success
-        .iter()
-        .position(|op| matches!(op, KvOp::DeletePrefix { prefix } if prefix == &endpoint_prefix));
-    let first_endpoint_put_index = txn
-        .success
-        .iter()
-        .position(|op| matches!(op, KvOp::Put { key, .. } if key.starts_with(&endpoint_prefix)));
-
-    assert!(delete_prefix_index.is_some());
     assert!(
-        delete_prefix_index < first_endpoint_put_index,
-        "endpoint prefix must be deleted before canonical endpoints are put"
+        txn.success
+            .iter()
+            .all(|op| !matches!(op, KvOp::DeletePrefix { prefix } if prefix == &endpoint_prefix)),
+        "endpoint sync should avoid broad prefix deletes"
+    );
+    let stale_delete_index = txn
+        .success
+        .iter()
+        .position(|op| matches!(op, KvOp::Delete { key } if key == &stale_key));
+    let current_put_index = txn
+        .success
+        .iter()
+        .position(|op| matches!(op, KvOp::Put { key, .. } if key == &current_key));
+
+    assert!(stale_delete_index.is_some());
+    assert!(
+        stale_delete_index < current_put_index,
+        "stale endpoint must be deleted before canonical endpoints are put"
     );
 
     std::fs::remove_dir_all(root).ok();

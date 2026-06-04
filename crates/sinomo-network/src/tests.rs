@@ -1141,10 +1141,16 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
 
     // Re-publishing the same record (fresh observed_at, far from expiry) is a no-op.
     let later = now + time::Duration::seconds(5);
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
     assert!(
         cluster_connectivity_sync_is_noop(&paths, &node_a, std::slice::from_ref(&healthy(later)))
             .expect("noop check"),
         "stable record should be a no-op"
+    );
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        1,
+        "connectivity no-op check should reuse its cached snapshot view"
     );
     let wal_path = cluster_raft_wal_paths(&paths, &node_a).wal;
     let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
@@ -3780,6 +3786,105 @@ fn cluster_state_sync_txn_is_empty_when_kv_already_matches() {
 }
 
 #[test]
+fn cluster_state_sync_txn_diffs_member_endpoint_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-sync-endpoint-diff-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_endpoint_diff").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_endpoint_diff").expect("node");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "endpoint diff",
+        node_id.clone(),
+        "node",
+        "pk",
+        now,
+    );
+    let unchanged = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_diff_unchanged")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.1:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let stale = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_diff_stale").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.2:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 1,
+        last_observed_latency_ms: None,
+    };
+    let added = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_diff_added").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.3:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 2,
+        last_observed_latency_ms: None,
+    };
+    state.members[0].endpoints = vec![unchanged.clone(), added.clone()];
+
+    let unchanged_key = cluster_endpoint_key(&node_id, &unchanged);
+    let stale_key = cluster_endpoint_key(&node_id, &stale);
+    let added_key = cluster_endpoint_key(&node_id, &added);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(unchanged_key.clone(), &unchanged, None)
+        .expect("unchanged endpoint");
+    store
+        .put_serde(stale_key.clone(), &stale, None)
+        .expect("stale endpoint");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed endpoint snapshot");
+
+    let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
+    assert!(
+        txn.success.iter().all(|op| !matches!(
+            op,
+            KvOp::DeletePrefix { prefix } if prefix == &cluster_endpoint_prefix(&node_id)
+        )),
+        "endpoint sync should avoid broad prefix deletes"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_key)),
+        "stale endpoint should be deleted explicitly"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &added_key)),
+        "missing endpoint should be put"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &unchanged_key)),
+        "unchanged endpoint should not be re-put"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-unchecked-sync-noop-{}",
@@ -5027,6 +5132,268 @@ fn cluster_network_records_publish_overwrite_and_expire() {
         read_cluster_connectivity_graph_from_kv(&paths)
             .expect("read expired graph")
             .is_empty()
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-expire-large-prefix-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_network_expire_large").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_network_expire_large_source").expect("source");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network expire large",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+
+    let mut store = InProcessKvStore::new();
+    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+        let target_node =
+            NodeId::from_legacy_named(format!("node_network_expire_large_target_{index}"))
+                .expect("target");
+        let endpoint_id =
+            ClusterEndpointId::from_legacy_named(format!("endpoint_network_expire_large_{index}"))
+                .expect("endpoint");
+        let record = ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source_node.clone(),
+            target_node_id: target_node,
+            endpoint_id: endpoint_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("10.42.{}.{}:21353", index / 256, index % 256),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(5),
+            consecutive_failures: 0,
+            last_success_at: Some("expired".to_string()),
+            last_failure_at: None,
+            observed_at: now - time::Duration::seconds(120),
+            expires_at: now - time::Duration::seconds(1),
+        };
+        match KvOp::put_serde(
+            cluster_connectivity_key(&source_node, &record.target_node_id, &endpoint_id),
+            &record,
+            None,
+        )
+        .expect("connectivity put op")
+        {
+            KvOp::Put {
+                key,
+                value,
+                lease_id,
+            } => {
+                store.put(key, value, lease_id).expect("seed connectivity");
+            }
+            _ => unreachable!("put_serde creates put op"),
+        }
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
+
+    read_cluster_kv_prefix_entries(&paths, "/cluster/network/connectivity/")
+        .expect_err("public range reader should reject the oversized prefix");
+
+    expire_cluster_network_records(&paths, now).expect("expire oversized prefix");
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("read current snapshot");
+    assert!(
+        snapshot
+            .prefix_entries("/cluster/network/connectivity/")
+            .next()
+            .is_none(),
+        "expiration should clear all records even when the prefix exceeds the public range limit"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-expire-bounded-ops-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_network_expire_bounded").expect("cluster");
+    let local_node = NodeId::from_legacy_named("node_network_expire_bounded_local").expect("local");
+    let remote_node =
+        NodeId::from_legacy_named("node_network_expire_bounded_remote").expect("remote");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "network expire bounded",
+        local_node.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+
+    let mut store = InProcessKvStore::new();
+    for index in 0..=sinomo_kv::MAX_KV_TXN_COMPARES {
+        let target_node =
+            NodeId::from_legacy_named(format!("node_network_expire_bounded_target_{index}"))
+                .expect("target");
+        let endpoint_id = ClusterEndpointId::from_legacy_named(format!(
+            "endpoint_network_expire_bounded_{index}"
+        ))
+        .expect("endpoint");
+        let record = ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: remote_node.clone(),
+            target_node_id: target_node,
+            endpoint_id: endpoint_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("10.44.{}.{}:21353", index / 256, index % 256),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(13),
+            consecutive_failures: 0,
+            last_success_at: Some("expired".to_string()),
+            last_failure_at: None,
+            observed_at: now - time::Duration::seconds(7200),
+            expires_at: now - time::Duration::seconds(7200),
+        };
+        match KvOp::put_serde(
+            cluster_connectivity_key(&remote_node, &record.target_node_id, &endpoint_id),
+            &record,
+            None,
+        )
+        .expect("connectivity put op")
+        {
+            KvOp::Put {
+                key,
+                value,
+                lease_id,
+            } => {
+                store.put(key, value, lease_id).expect("seed connectivity");
+            }
+            _ => unreachable!("put_serde creates put op"),
+        }
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
+
+    let (compares, success) =
+        expire_cluster_network_record_ops(&paths, &state, now).expect("expire ops");
+    assert_eq!(compares.len(), sinomo_kv::MAX_KV_TXN_COMPARES);
+    assert_eq!(success.len(), sinomo_kv::MAX_KV_TXN_COMPARES);
+
+    append_cluster_raft_command(
+        &paths,
+        &local_node,
+        KvCommand::Txn(KvTxn {
+            compares,
+            success,
+            failure: Vec::new(),
+        }),
+    )
+    .expect("commit bounded expire batch");
+
+    let (remaining_compares, remaining_success) =
+        expire_cluster_network_record_ops(&paths, &state, now).expect("remaining expire ops");
+    assert_eq!(remaining_compares.len(), 1);
+    assert_eq!(remaining_success.len(), 1);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_full_sync_batches_large_stale_deletions() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-large-delete-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_large_delete").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_large_delete_source").expect("source");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity large delete",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+
+    let mut store = InProcessKvStore::new();
+    for index in 0..=sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND {
+        let target_node =
+            NodeId::from_legacy_named(format!("node_connectivity_large_delete_target_{index}"))
+                .expect("target");
+        let endpoint_id = ClusterEndpointId::from_legacy_named(format!(
+            "endpoint_connectivity_large_delete_{index}"
+        ))
+        .expect("endpoint");
+        let record = ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source_node.clone(),
+            target_node_id: target_node,
+            endpoint_id: endpoint_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: format!("10.43.{}.{}:21353", index / 256, index % 256),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(9),
+            consecutive_failures: 0,
+            last_success_at: Some("stale".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(600),
+        };
+        match KvOp::put_serde(
+            cluster_connectivity_key(&source_node, &record.target_node_id, &endpoint_id),
+            &record,
+            None,
+        )
+        .expect("connectivity put op")
+        {
+            KvOp::Put {
+                key,
+                value,
+                lease_id,
+            } => {
+                store.put(key, value, lease_id).expect("seed connectivity");
+            }
+            _ => unreachable!("put_serde creates put op"),
+        }
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
+
+    sync_cluster_connectivity_records_to_kv(&paths, &source_node, Vec::new())
+        .expect("batch stale connectivity deletes");
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("read current snapshot");
+    assert!(
+        snapshot
+            .prefix_entries(&cluster_connectivity_source_prefix(&source_node))
+            .next()
+            .is_none(),
+        "full sync should delete stale source records in bounded batches"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -6851,6 +7218,83 @@ fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
     assert!(
         watch.watch_id.0 > 99,
         "watch ids must not be reused after pruning a mismatched high-id registration"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-create-scan-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    std::fs::create_dir_all(&paths.kv_watches).expect("watch dir");
+
+    write_object_file(
+        &paths.kv_watches.join("watch-7.sobj"),
+        &ClusterKvWatchRegistration {
+            watch_id: WatchId(7),
+            prefix: "/watch/scan/stale/".to_string(),
+            next_revision: KvRevision(1),
+        },
+    )
+    .expect("write stale watch registration");
+    write_object_file(
+        &paths.kv_watches.join("watch-9.sobj"),
+        &ClusterKvWatchRegistration {
+            watch_id: WatchId(9),
+            prefix: "/watch/scan/live/".to_string(),
+            next_revision: KvRevision(2),
+        },
+    )
+    .expect("write live watch registration");
+    let corrupt_path = paths.kv_watches.join("watch-11.sobj");
+    std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
+
+    let mut compacted = InProcessKvStore::new();
+    compacted
+        .put("/watch/scan/old", b"old".to_vec(), None)
+        .expect("put compacted value");
+    compacted.compact(KvRevision(1)).expect("compact store");
+    write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
+
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/scan/new/".to_string(),
+            start_revision: KvRevision(2),
+        },
+    )
+    .expect("create watch after pruning");
+
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        1,
+        "watch creation should combine stale-pruning and max-id allocation in one directory scan"
+    );
+    assert!(
+        !paths.kv_watches.join("watch-7.sobj").exists(),
+        "compacted registrations should be pruned"
+    );
+    assert!(
+        paths.kv_watches.join("watch-9.sobj").exists(),
+        "live registrations should be retained"
+    );
+    assert!(
+        !corrupt_path.exists(),
+        "corrupt registrations should be pruned"
+    );
+    assert!(
+        watch.watch_id.0 > 11,
+        "watch ids must not be reused after pruning the highest seen registration"
     );
 
     std::fs::remove_dir_all(root).ok();
