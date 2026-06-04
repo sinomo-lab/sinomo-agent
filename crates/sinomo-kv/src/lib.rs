@@ -53,9 +53,9 @@ struct ObjectFileWriteMark {
 
 /// Cache of last-written object files. The cluster directory holding these WAL /
 /// snapshot files can be shared by the main and shadow daemons, so the fast-path
-/// skip is guarded by a `stat`: an entry is trusted only when the file's length
-/// and mtime still match what we wrote, so a write by another process is detected
-/// and falls back to a real read + compare.
+/// skip is guarded by a `stat`: an entry is trusted only when the file's length,
+/// mtime, and inode still match what we wrote, so a write by another process is
+/// detected and falls back to a real read + compare.
 static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -2397,33 +2397,31 @@ fn read_wal_entries(path: &Path, max_index: Option<u64>) -> Result<WalRead, KvEr
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
     let mut entries = Vec::new();
     let mut truncated = false;
-    let mut offset = 0;
     let mut record_number = 0;
-    while offset < bytes.len() {
+    loop {
+        let mut len_buf = [0_u8; 4];
+        match read_wal_chunk(&mut file, &mut len_buf, path)? {
+            WalReadChunk::Complete => {}
+            WalReadChunk::CleanEof => break,
+            WalReadChunk::Truncated => {
+                truncated = true;
+                break;
+            }
+        }
         record_number += 1;
-        if bytes.len().saturating_sub(offset) < 4 {
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_WAL_RECORD_BYTES {
             truncated = true;
             break;
         }
-        let len = u32::from_be_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if len == 0 || len > MAX_WAL_RECORD_BYTES || bytes.len().saturating_sub(offset) < len {
+        let mut record = vec![0_u8; len];
+        if read_wal_chunk(&mut file, &mut record, path)? != WalReadChunk::Complete {
             truncated = true;
             break;
         }
-        match sinomo_object_serde::from_bytes(&bytes[offset..offset + len]) {
+        match sinomo_object_serde::from_bytes(&record) {
             Ok(entry) => {
                 let entry: KvLogEntry = entry;
                 if max_index.is_some_and(|limit| entry.index > limit) {
@@ -2442,9 +2440,33 @@ fn read_wal_entries(path: &Path, max_index: Option<u64>) -> Result<WalRead, KvEr
                 break;
             }
         }
-        offset += len;
     }
     Ok(WalRead { entries, truncated })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalReadChunk {
+    Complete,
+    CleanEof,
+    Truncated,
+}
+
+fn read_wal_chunk(file: &mut File, buf: &mut [u8], path: &Path) -> Result<WalReadChunk, KvError> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match file.read(&mut buf[offset..]) {
+            Ok(0) if offset == 0 => return Ok(WalReadChunk::CleanEof),
+            Ok(0) => return Ok(WalReadChunk::Truncated),
+            Ok(read) => offset += read,
+            Err(source) => {
+                return Err(KvError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(WalReadChunk::Complete)
 }
 
 fn append_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
@@ -2496,33 +2518,47 @@ fn write_wal_record(file: &mut File, entry: &KvLogEntry, path: &Path) -> Result<
 }
 
 fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvError> {
+    // Callers hold the per-node raft lock. Stage through a temp file instead of
+    // truncating the live WAL so a failed rewrite leaves the previous log intact.
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| KvError::Io {
             path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .map_err(|source| KvError::Io {
-            path: path.display().to_string(),
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wal.sobjlog");
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|source| KvError::Io {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        for entry in entries {
+            write_wal_record(&mut file, entry, &temp_path)?;
+        }
+        file.sync_all().map_err(|source| KvError::Io {
+            path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
-    file.lock_exclusive().map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    for entry in entries {
-        write_wal_record(&mut file, entry, path)?;
     }
-    file.sync_data().map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
+    let result = replace_file(&temp_path, path).and_then(|()| sync_directory(parent));
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn read_optional_object<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, KvError> {
@@ -2550,7 +2586,8 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
     let content_hash = blake3::hash(&content);
 
     // Fast path: if we last wrote this exact content and the file is unchanged
-    // since (length + mtime still match our record), skip without reading it back.
+    // since (length + mtime + inode still match our record), skip without
+    // reading it back.
     if let Some(mark) = cached_object_file_mark(path)
         && mark.hash == content_hash
         && let Ok(metadata) = fs::metadata(path)
@@ -2561,9 +2598,13 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         return Ok(());
     }
 
-    // Slow path: read the file back and compare. Handles a cold cache and files
-    // changed by another writer (e.g. a shadow daemon sharing the cluster dir).
-    if fs::read(path).is_ok_and(|existing| existing == content) {
+    // Slow path: read the file back and compare only when the length could match.
+    // Handles a cold cache and files changed by another writer (e.g. a shadow
+    // daemon sharing the cluster dir) without reading sparse/corrupt oversized
+    // files that are already known to differ.
+    if fs::metadata(path).is_ok_and(|metadata| metadata.len() == content.len() as u64)
+        && fs::read(path).is_ok_and(|existing| existing == content)
+    {
         // Already current: record the mark so subsequent calls take the fast path.
         let (modified, ino) = file_modified_and_ino(path);
         record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
@@ -2605,14 +2646,43 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
             detail: source.to_string(),
         })?;
     }
-    fs::rename(&temp_path, path).map_err(|source| KvError::Io {
-        path: format!("{} -> {}", temp_path.display(), path.display()),
-        detail: source.to_string(),
-    })?;
+    replace_file(&temp_path, path)?;
     sync_directory(parent)?;
     let (modified, ino) = file_modified_and_ino(path);
     record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
     Ok(())
+}
+
+fn replace_file(temp_path: &Path, path: &Path) -> Result<(), KvError> {
+    match fs::rename(temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(source)
+            if path.exists()
+                && matches!(
+                    source.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+        {
+            fs::remove_file(path).map_err(|remove_source| KvError::Io {
+                path: path.display().to_string(),
+                detail: format!(
+                    "replace failed with {}; additionally failed to remove existing file: {}",
+                    source, remove_source
+                ),
+            })?;
+            fs::rename(temp_path, path).map_err(|rename_source| KvError::Io {
+                path: format!("{} -> {}", temp_path.display(), path.display()),
+                detail: format!(
+                    "replace after removing existing file failed: {}",
+                    rename_source
+                ),
+            })
+        }
+        Err(source) => Err(KvError::Io {
+            path: format!("{} -> {}", temp_path.display(), path.display()),
+            detail: source.to_string(),
+        }),
+    }
 }
 
 fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
@@ -2794,10 +2864,13 @@ mod tests {
             "an identical re-write must be skipped without rewriting the file"
         );
 
-        // Another writer replaces the content behind our back. The different
-        // length trips the stat guard regardless of mtime resolution.
-        std::fs::write(&path, b"externally written content of a different length")
-            .expect("external write");
+        // Another writer replaces the content behind our back with the same byte
+        // length. This must be detected by the file-identity guard, not just length.
+        let original_len = std::fs::metadata(&path).expect("metadata").len() as usize;
+        let replacement = vec![b'x'; original_len];
+        let replacement_path = root.join("replacement.sobj");
+        std::fs::write(&replacement_path, replacement).expect("external write");
+        std::fs::rename(&replacement_path, &path).expect("external replace");
 
         // Writing our content again must detect the change via the stat guard, fall
         // back to read + compare, and actually rewrite -- never falsely skip.
@@ -4335,6 +4408,126 @@ mod tests {
             !rewritten
                 .windows(b"broken".len())
                 .any(|window| window == b"broken")
+        );
+        assert!(
+            fs::read_dir(&paths.root)
+                .expect("raft dir")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                .all(|name| !name.starts_with(".wal.sobjlog.tmp-")),
+            "WAL repair must not leave rewrite temp files behind"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_ignores_leftover_wal_rewrite_temp_file() {
+        let root = temp_raft_root("sinomo-kv-leftover-wal-temp");
+        let node_id = NodeId::from_legacy_named("node_leftover_wal_temp").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+            let committed = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/committed".to_string(),
+                        value: b"kept".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append committed");
+            node.commit_to(committed.index).expect("commit");
+        }
+
+        let temp_path = paths.root.join(".wal.sobjlog.tmp-leftover");
+        {
+            let mut temp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_path)
+                .expect("open leftover temp");
+            write_wal_record(
+                &mut temp,
+                &KvLogEntry {
+                    index: 2,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/temp-only".to_string(),
+                        value: b"ignored".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+                &temp_path,
+            )
+            .expect("write temp entry");
+            temp.sync_all().expect("sync temp");
+        }
+
+        let recovered = DurableRaftKvNode::open(node_id, paths.clone()).expect("recover node");
+        assert_eq!(
+            recovered
+                .store()
+                .get("/committed")
+                .expect("committed value")
+                .value,
+            b"kept"
+        );
+        assert!(
+            recovered.store().get("/temp-only").is_none(),
+            "leftover WAL rewrite temp files must not be replayed"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_rejects_oversized_wal_record_before_allocation() {
+        let root = temp_raft_root("sinomo-kv-oversized-wal-record");
+        let node_id = NodeId::from_legacy_named("node_oversized_wal").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+            let committed = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/before-oversized".to_string(),
+                        value: b"kept".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append committed");
+            node.commit_to(committed.index).expect("commit");
+        }
+
+        let mut wal = OpenOptions::new()
+            .append(true)
+            .open(&paths.wal)
+            .expect("open wal");
+        wal.write_all(&((MAX_WAL_RECORD_BYTES as u32 + 1).to_be_bytes()))
+            .expect("write oversized length");
+        wal.write_all(b"ignored").expect("write tail");
+        drop(wal);
+
+        let recovered = DurableRaftKvNode::open(node_id, paths.clone()).expect("recover node");
+        assert_eq!(
+            recovered
+                .store()
+                .get("/before-oversized")
+                .expect("valid entry before oversized record")
+                .value,
+            b"kept"
+        );
+        let rewritten = std::fs::read(&paths.wal).expect("rewritten wal");
+        assert!(
+            !rewritten
+                .windows(b"ignored".len())
+                .any(|window| window == b"ignored"),
+            "oversized WAL tail should be truncated without allocating its advertised size"
         );
         std::fs::remove_dir_all(root).ok();
     }

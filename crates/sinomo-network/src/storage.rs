@@ -18,7 +18,7 @@ pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES: u64 = 1024 * 1024;
-const MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLUSTER_KV_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(30);
 const MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES: usize = 128;
 const PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL: Duration = Duration::from_secs(60);
@@ -26,6 +26,8 @@ const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
+pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
+const FILE_CACHE_CAPACITY: usize = 4096;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
     Mutex<HashMap<PathBuf, Vec<ClusterConnectivityRecord>>>,
@@ -49,12 +51,14 @@ struct ObjectFileWriteMark {
     hash: blake3::Hash,
     len: u64,
     modified: Option<SystemTime>,
+    ino: u64,
 }
 
 /// Cache of last-written object files. The cluster directory can be shared by the
 /// main and shadow daemons, so the fast-path skip is guarded by a `stat`: an entry
-/// is trusted only when the file's length and mtime still match what we wrote, so
-/// a write by another process is detected and falls back to a real read + compare.
+/// is trusted only when the file's length, mtime, and inode still match what we
+/// wrote, so a write by another process is detected and falls back to a real read
+/// + compare.
 static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -67,16 +71,40 @@ fn record_object_file_mark(
     hash: blake3::Hash,
     len: u64,
     modified: Option<SystemTime>,
+    ino: u64,
 ) {
     if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(path) {
+            cache.clear();
+        }
         cache.insert(
             path.clone(),
             ObjectFileWriteMark {
                 hash,
                 len,
                 modified,
+                ino,
             },
         );
+    }
+}
+
+fn file_ino(metadata: &fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::ino(metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        0
+    }
+}
+
+fn file_modified_and_ino(path: &PathBuf) -> (Option<SystemTime>, u64) {
+    match fs::metadata(path) {
+        Ok(metadata) => (metadata.modified().ok(), file_ino(&metadata)),
+        Err(_) => (None, 0),
     }
 }
 
@@ -1838,23 +1866,30 @@ fn read_cluster_kv_watch_event_log_from_file(
             path: paths.kv_watch_events_log.display().to_string(),
             detail: source.to_string(),
         })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events_log.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    if let Some(observer) = io_observer() {
-        observer.on_disk_read(bytes.len() as u64);
-    }
     let mut events = Vec::new();
-    let mut offset = 0;
     let mut record_number = 0;
-    while offset < bytes.len() {
+    loop {
         record_number += 1;
-        if bytes.len().saturating_sub(offset) < 4 {
+        let mut len_buf = [0_u8; 4];
+        match read_cluster_kv_watch_event_log_chunk(paths, file, &mut len_buf)? {
+            WatchEventLogReadChunk::Complete => {}
+            WatchEventLogReadChunk::CleanEof => break,
+            WatchEventLogReadChunk::Truncated => {
+                eprintln!(
+                    "warning: ignoring partial cluster kv watch-event log record {} in {}",
+                    record_number,
+                    paths.kv_watch_events_log.display()
+                );
+                return Ok(ClusterKvWatchEventLogRead {
+                    events,
+                    truncated: true,
+                });
+            }
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES {
             eprintln!(
-                "warning: ignoring partial cluster kv watch-event log record {} in {}",
+                "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
                 record_number,
                 paths.kv_watch_events_log.display()
             );
@@ -1863,16 +1898,9 @@ fn read_cluster_kv_watch_event_log_from_file(
                 truncated: true,
             });
         }
-        let len = u32::from_be_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if len == 0
-            || len > MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES
-            || bytes.len().saturating_sub(offset) < len
+        let mut record = vec![0_u8; len];
+        if read_cluster_kv_watch_event_log_chunk(paths, file, &mut record)?
+            != WatchEventLogReadChunk::Complete
         {
             eprintln!(
                 "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
@@ -1884,14 +1912,60 @@ fn read_cluster_kv_watch_event_log_from_file(
                 truncated: true,
             });
         }
-        let event = SinomoObjectCodec::default().decode(&bytes[offset..offset + len])?;
-        events.push(event);
-        offset += len;
+        match SinomoObjectCodec::default().decode(&record) {
+            Ok(event) => events.push(event),
+            Err(source) => {
+                eprintln!(
+                    "warning: ignoring unreadable cluster kv watch-event log record {} in {}: {}",
+                    record_number,
+                    paths.kv_watch_events_log.display(),
+                    source
+                );
+                return Ok(ClusterKvWatchEventLogRead {
+                    events,
+                    truncated: true,
+                });
+            }
+        }
     }
     Ok(ClusterKvWatchEventLogRead {
         events,
         truncated: false,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchEventLogReadChunk {
+    Complete,
+    CleanEof,
+    Truncated,
+}
+
+fn read_cluster_kv_watch_event_log_chunk(
+    paths: &ClusterPaths,
+    file: &mut fs::File,
+    buf: &mut [u8],
+) -> Result<WatchEventLogReadChunk, NetworkError> {
+    let mut offset = 0;
+    while offset < buf.len() {
+        match file.read(&mut buf[offset..]) {
+            Ok(0) if offset == 0 => return Ok(WatchEventLogReadChunk::CleanEof),
+            Ok(0) => return Ok(WatchEventLogReadChunk::Truncated),
+            Ok(read) => {
+                offset += read;
+                if let Some(observer) = io_observer() {
+                    observer.on_disk_read(read as u64);
+                }
+            }
+            Err(source) => {
+                return Err(NetworkError::StorageIo {
+                    path: paths.kv_watch_events_log.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(WatchEventLogReadChunk::Complete)
 }
 
 fn open_cluster_kv_watch_event_log_for_append(
@@ -4586,6 +4660,18 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
 pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
     path: &PathBuf,
 ) -> Result<T, NetworkError> {
+    let len = fs::metadata(path)
+        .map_err(|source| NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .len();
+    if len > MAX_OBJECT_FILE_READ_BYTES {
+        return Err(NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: format!("object file is {len} bytes; max is {MAX_OBJECT_FILE_READ_BYTES}"),
+        });
+    }
     let bytes = fs::read(path).map_err(|source| NetworkError::StorageIo {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -4604,12 +4690,14 @@ pub(crate) fn write_object_file<T: Serialize>(
     let desired_hash = blake3::hash(&desired);
 
     // Fast path: if we last wrote this exact content and the file is unchanged
-    // since (length + mtime still match our record), skip without reading it back.
+    // since (length + mtime + inode still match our record), skip without
+    // reading it back.
     if let Some(mark) = cached_object_file_mark(path)
         && mark.hash == desired_hash
         && let Ok(metadata) = fs::metadata(path)
         && metadata.len() == mark.len
         && metadata.modified().ok() == mark.modified
+        && file_ino(&metadata) == mark.ino
     {
         if let Some(observer) = io_observer() {
             observer.on_object_file_skipped_write();
@@ -4617,18 +4705,21 @@ pub(crate) fn write_object_file<T: Serialize>(
         return Ok(());
     }
 
-    // Slow path: read the file back and compare. Handles a cold cache and files
-    // changed by another writer (e.g. a shadow daemon sharing the cluster dir).
-    let existing = fs::read(path).ok();
+    // Slow path: read the file back and compare only when the length could match.
+    // Handles a cold cache and files changed by another writer (e.g. a shadow
+    // daemon sharing the cluster dir) without reading sparse/corrupt oversized
+    // files that are already known to differ.
+    let existing = fs::metadata(path)
+        .ok()
+        .filter(|metadata| metadata.len() == desired.len() as u64)
+        .and_then(|_| fs::read(path).ok());
     if let (Some(observer), Some(existing)) = (io_observer(), existing.as_ref()) {
         observer.on_disk_read(existing.len() as u64);
     }
     if existing.as_deref() == Some(desired.as_slice()) {
         // Already current: record the mark so subsequent calls take the fast path.
-        let modified = fs::metadata(path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
-        record_object_file_mark(path, desired_hash, desired.len() as u64, modified);
+        let (modified, ino) = file_modified_and_ino(path);
+        record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);
         if let Some(observer) = io_observer() {
             observer.on_object_file_skipped_write();
         }
@@ -4673,10 +4764,8 @@ pub(crate) fn write_object_file<T: Serialize>(
     }
     replace_file(&temp_path, path)?;
     sync_directory(parent)?;
-    let modified = fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok());
-    record_object_file_mark(path, desired_hash, desired.len() as u64, modified);
+    let (modified, ino) = file_modified_and_ino(path);
+    record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);
     if let Some(observer) = io_observer() {
         observer.on_object_file_actual_write();
         observer.on_disk_write(desired.len() as u64);
@@ -4721,10 +4810,8 @@ fn write_object_file_create_new<T: Serialize>(
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     sync_directory(parent)?;
     let desired_hash = blake3::hash(&desired);
-    let modified = fs::metadata(path)
-        .ok()
-        .and_then(|metadata| metadata.modified().ok());
-    record_object_file_mark(path, desired_hash, desired.len() as u64, modified);
+    let (modified, ino) = file_modified_and_ino(path);
+    record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);
     if let Some(observer) = io_observer() {
         observer.on_object_file_actual_write();
         observer.on_disk_write(desired.len() as u64);

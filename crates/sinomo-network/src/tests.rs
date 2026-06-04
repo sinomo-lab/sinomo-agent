@@ -3556,6 +3556,35 @@ fn cluster_state_read_rejects_prefixed_or_truncated_file_bytes() {
 }
 
 #[test]
+fn cluster_state_read_rejects_oversized_object_file_before_reading() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-state-oversized-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.state)
+        .expect("open oversized state")
+        .set_len(MAX_OBJECT_FILE_READ_BYTES + 1)
+        .expect("make sparse oversized state");
+
+    let error = read_cluster_state(&paths).expect_err("oversized object file should be rejected");
+    assert!(
+        matches!(error, NetworkError::StorageIo { ref detail, .. } if detail.contains("max is")),
+        "unexpected error for oversized state: {error}"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_state_load_preserves_newer_local_member_records() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-state-merge-{}",
@@ -4335,6 +4364,112 @@ fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
     assert_eq!(
         append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
             .expect("append after partial tail"),
+        1
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        vec![first, second]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-oversized-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/oversized/1".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/oversized/2".to_string(),
+        kind: KvEventKind::Put {
+            value: b"two".to_vec(),
+        },
+    };
+
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .expect("open watch event log");
+    log.write_all(&((MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES as u32 + 1).to_be_bytes()))
+        .expect("write oversized length");
+    log.write_all(b"ignored").expect("write oversized tail");
+    log.sync_data().expect("sync oversized tail");
+    drop(log);
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+            .expect("append after oversized tail"),
+        1
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        vec![first, second]
+    );
+    let log = std::fs::read(&paths.kv_watch_events_log).expect("read repaired log");
+    assert!(
+        !log.windows(b"ignored".len())
+            .any(|window| window == b"ignored"),
+        "oversized watch-event tail should be truncated before appending"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-unreadable-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/unreadable/1".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/unreadable/2".to_string(),
+        kind: KvEventKind::Put {
+            value: b"two".to_vec(),
+        },
+    };
+
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .expect("open watch event log");
+    log.write_all(&4_u32.to_be_bytes())
+        .expect("write unreadable length");
+    log.write_all(b"junk").expect("write unreadable body");
+    log.sync_data().expect("sync unreadable tail");
+    drop(log);
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+            .expect("append after unreadable tail"),
         1
     );
     assert_eq!(
@@ -6661,6 +6796,58 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
 }
 
 #[test]
+fn write_object_file_skips_compare_read_when_length_differs() {
+    let _guard = IO_OBSERVER_TEST_MUTEX.lock().expect("test mutex");
+
+    let observer = Arc::new(CountingIoObserver::default());
+    let previous: Option<Arc<dyn IoObserver>> =
+        set_io_observer(Some(observer.clone() as Arc<dyn IoObserver>));
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-sparse-objfile-rewrite-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&paths.state)
+        .expect("open sparse state")
+        .set_len(MAX_OBJECT_FILE_READ_BYTES + 1)
+        .expect("make sparse oversized state");
+
+    let cluster_id = ClusterId::from_legacy_named("cluster_sparse_rewrite").expect("cluster id");
+    let node = NodeId::from_legacy_named("node_sparse_rewrite").expect("node id");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "sparse rewrite test",
+        node,
+        "node",
+        "pk",
+        OffsetDateTime::now_utc(),
+    );
+
+    write_cluster_state(&paths, &state).expect("rewrite sparse state");
+
+    let read_bytes = observer
+        .disk_read_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        read_bytes < MAX_OBJECT_FILE_READ_BYTES,
+        "length-mismatched object files should not be read back before rewrite; observed {read_bytes} bytes"
+    );
+
+    let _ = set_io_observer(previous);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn write_object_file_skips_identical_and_rewrites_after_external_change() {
     // Unique path so this test is independent of the process-wide I/O observer.
     let root = std::env::temp_dir().join(format!(
@@ -6691,10 +6878,13 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
         "an identical re-write must be skipped without rewriting the file"
     );
 
-    // Another writer replaces the content behind our back. The different length
-    // trips the stat guard regardless of mtime resolution.
-    std::fs::write(&path, b"externally written content of a different length")
-        .expect("external write");
+    // Another writer replaces the content behind our back with the same byte
+    // length. This must be detected by the file-identity guard, not just length.
+    let original_len = std::fs::metadata(&path).expect("metadata").len() as usize;
+    let replacement = vec![b'x'; original_len];
+    let replacement_path = root.join("replacement.sobj");
+    std::fs::write(&replacement_path, replacement).expect("external write");
+    std::fs::rename(&replacement_path, &path).expect("external replace");
 
     // Writing our content again must detect the change via the stat guard, fall
     // back to read + compare, and actually rewrite -- never falsely skip.
