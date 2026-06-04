@@ -30,12 +30,13 @@ use sinomo_local::SinomoDataDir;
 use sinomo_network::{
     ClusterConnectivityRecord, ClusterId, ClusterInviteId, ClusterInvitePublishRequest,
     ClusterInvitePublishResponse, ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse,
-    ClusterKvWatchDrainRequest, ClusterKvWatchDrainResponse, ClusterKvWatchEventsRequest,
-    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
-    ClusterMemberPublishRequest, ClusterMemberPublishResponse, ClusterNetworkInfoRecord,
-    ClusterPaths, ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
-    ClusterRaftVoteResponse, IrohEndpointRecord, MdnsDiscoveryAdvertisement, MdnsDiscoveryCache,
-    MdnsDiscoverySocket, invite_channels_for_join_registration,
+    ClusterKvWatchCancelRequest, ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest,
+    ClusterKvWatchDrainResponse, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
+    ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration, ClusterMemberPublishRequest,
+    ClusterMemberPublishResponse, ClusterNetworkInfoRecord, ClusterPaths, ClusterRaftAppendRequest,
+    ClusterRaftAppendResponse, ClusterRaftVoteRequest, ClusterRaftVoteResponse, IrohEndpointRecord,
+    MdnsDiscoveryAdvertisement, MdnsDiscoveryCache, MdnsDiscoverySocket,
+    invite_channels_for_join_registration,
 };
 use sinomo_node::NodeId;
 use sinomo_node::shadow_daemon_node_id;
@@ -1817,6 +1818,14 @@ pub fn handle_daemon_cluster_kv_watch_drain_request(
 ) -> Result<ClusterKvWatchDrainResponse, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     sinomo_network::drain_cluster_kv_watch(&cluster_paths, request).map_err(Into::into)
+}
+
+pub fn handle_daemon_cluster_kv_watch_cancel_request(
+    paths: &DaemonPaths,
+    request: ClusterKvWatchCancelRequest,
+) -> Result<ClusterKvWatchCancelResponse, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
+    sinomo_network::cancel_cluster_kv_watch(&cluster_paths, request).map_err(Into::into)
 }
 
 pub fn handle_daemon_cluster_kv_watch_events_request(

@@ -4648,6 +4648,98 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
 }
 
 #[test]
+fn cluster_kv_watch_cancel_wakes_waiting_drain() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-cancel-wake-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/cancel/wake/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let expected_watch_id = watch.watch_id;
+    let (started_tx, started_rx) = mpsc::channel();
+    let drain_paths = paths.clone();
+    let handle = thread::spawn(move || {
+        started_tx.send(()).expect("signal drain start");
+        let started = Instant::now();
+        let result = drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id: expected_watch_id,
+                wait_timeout_millis: 5_000,
+            },
+        );
+        (started.elapsed(), result)
+    });
+    started_rx.recv().expect("drain thread started");
+    thread::sleep(Duration::from_millis(50));
+
+    let cancelled = cancel_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchCancelRequest {
+            watch_id: expected_watch_id,
+        },
+    )
+    .expect("cancel watch");
+    assert!(cancelled.cancelled);
+
+    let (elapsed, result) = handle.join().expect("wait drain thread");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "waiting drain should be notified by cancel after {elapsed:?}"
+    );
+    assert!(matches!(
+        result,
+        Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }))
+            if watch_id == expected_watch_id
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-missing-drain-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch_id = WatchId(42);
+    let error = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect_err("missing watch");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::UnknownWatch { watch_id: returned }) if returned == watch_id
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-wait-raft-{}",
@@ -4773,6 +4865,10 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
         paths.kv_watches_lock.exists(),
         "concurrent watch allocation should use a durable lock file"
     );
+    assert!(
+        paths.kv_watches_next_id.exists(),
+        "concurrent watch allocation should persist a durable next-id cursor"
+    );
     for registration in registrations {
         let watch_path = paths
             .kv_watches
@@ -4781,6 +4877,83 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
             read_object_file(&watch_path).expect("read watch registration");
         assert_eq!(stored, registration);
     }
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-cancel-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    let first = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/cancel/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create first watch");
+    let first_path = paths
+        .kv_watches
+        .join(format!("watch-{}.sobj", first.watch_id.0));
+    assert!(first_path.exists(), "first watch registration should exist");
+
+    let cancelled = cancel_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchCancelRequest {
+            watch_id: first.watch_id,
+        },
+    )
+    .expect("cancel watch");
+    assert_eq!(
+        cancelled,
+        ClusterKvWatchCancelResponse {
+            watch_id: first.watch_id,
+            cancelled: true,
+        }
+    );
+    assert!(
+        !first_path.exists(),
+        "cancelled watch registration should be removed"
+    );
+    let cancelled_again = cancel_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchCancelRequest {
+            watch_id: first.watch_id,
+        },
+    )
+    .expect("cancel missing watch");
+    assert!(!cancelled_again.cancelled);
+
+    let second = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/cancel/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create second watch");
+    assert!(
+        second.watch_id > first.watch_id,
+        "watch ids must not be reused after cancellation"
+    );
+    let allocator: ClusterKvWatchAllocatorState =
+        read_object_file(&paths.kv_watches_next_id).expect("read watch allocator");
+    assert!(
+        allocator.next_watch_id > second.watch_id.0,
+        "watch allocator should advance past the newest watch id"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -4911,6 +5084,90 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
         newest.watch_id > live.watch_id,
         "new watch ids should continue after retained registrations"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_prunes_unreadable_registration_without_reusing_id() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-unreadable-create-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    std::fs::create_dir_all(&paths.kv_watches).expect("watch dir");
+    let corrupt_path = paths.kv_watches.join("watch-99.sobj");
+    std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/unreadable/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch after unreadable registration");
+    assert!(
+        !corrupt_path.exists(),
+        "unreadable watch registrations should be pruned"
+    );
+    assert!(
+        watch.watch_id.0 > 99,
+        "watch ids must not be reused after pruning an unreadable high-id registration"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-mismatched-create-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    std::fs::create_dir_all(&paths.kv_watches).expect("watch dir");
+    let mismatched_path = paths.kv_watches.join("watch-99.sobj");
+    write_object_file(
+        &mismatched_path,
+        &ClusterKvWatchRegistration {
+            watch_id: WatchId(1),
+            prefix: "/watch/mismatched/".to_string(),
+            next_revision: KvRevision(1),
+        },
+    )
+    .expect("write mismatched watch registration");
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/mismatched/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch after mismatched registration");
+    assert!(
+        !mismatched_path.exists(),
+        "mismatched watch registration should be pruned"
+    );
+    assert!(
+        watch.watch_id.0 > 99,
+        "watch ids must not be reused after pruning a mismatched high-id registration"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 

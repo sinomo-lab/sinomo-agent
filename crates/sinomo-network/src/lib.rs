@@ -61,6 +61,16 @@ pub fn register_storage_paths(
     layout.register_sinomo_object(
         "sinomo-network",
         StorageRing::R1,
+        "cluster/watches-next.sobj",
+        ObjectSchema::new(
+            "ClusterKvWatchAllocatorState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("next_watch_id", "u64"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-network",
+        StorageRing::R1,
         "cluster/connectivity-local.sobj",
         ObjectSchema::new(
             "Vec<ClusterConnectivityRecord>",

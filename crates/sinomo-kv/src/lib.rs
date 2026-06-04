@@ -37,6 +37,7 @@ const MAX_RETAINED_EVENTS: usize = 4096;
 /// tail every time (a busy-idle loop). See `compact_cluster_raft_node_if_needed`.
 pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const RAFT_NODE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2274,11 +2275,12 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesResponse, KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         let outcome = self.node.handle_append_entries(request)?;
         if outcome.response.success {
             append_wal_entries(&self.paths.wal, &outcome.appended_entries)?;
         }
-        self.persist_hard_state()?;
+        self.persist_hard_state_if_changed(&hard_state_before)?;
         Ok(outcome.response)
     }
 
@@ -2286,8 +2288,9 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftRequestVoteRequest,
     ) -> Result<RaftRequestVoteResponse, KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         let response = self.node.handle_request_vote(request)?;
-        self.persist_hard_state()?;
+        self.persist_hard_state_if_changed(&hard_state_before)?;
         Ok(response)
     }
 
@@ -2300,15 +2303,17 @@ impl DurableRaftKvNode {
     }
 
     pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         self.node.hard_state.current_term = term.max(self.node.hard_state.current_term);
         self.node.hard_state.voted_for = Some(self.node_id.clone());
         self.node.hard_state.leader_id = Some(self.node_id.clone());
-        self.persist_hard_state()
+        self.persist_hard_state_if_changed(&hard_state_before)
     }
 
     pub fn clear_known_leader(&mut self) -> Result<(), KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         self.node.hard_state.leader_id = None;
-        self.persist_hard_state()
+        self.persist_hard_state_if_changed(&hard_state_before)
     }
 
     pub fn append_local_command(
@@ -2316,6 +2321,7 @@ impl DurableRaftKvNode {
         term: u64,
         command: KvCommand,
     ) -> Result<KvLogEntry, KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         let entry = KvLogEntry {
             index: self.node.last_log_index().saturating_add(1),
             term,
@@ -2326,16 +2332,17 @@ impl DurableRaftKvNode {
         self.node.hard_state.leader_id = Some(self.node_id.clone());
         self.node.append_entries(vec![entry.clone()])?;
         append_wal_entries(&self.paths.wal, std::slice::from_ref(&entry))?;
-        self.persist_hard_state()?;
+        self.persist_hard_state_if_changed(&hard_state_before)?;
         Ok(entry)
     }
 
     pub fn discard_uncommitted_tail(&mut self) -> Result<bool, KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         if !self.node.discard_uncommitted_tail() {
             return Ok(false);
         }
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
-        self.persist_hard_state()?;
+        self.persist_hard_state_if_changed(&hard_state_before)?;
         Ok(true)
     }
 
@@ -2344,11 +2351,13 @@ impl DurableRaftKvNode {
     }
 
     pub fn commit_to(&mut self, commit_index: u64) -> Result<(), KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         self.node.commit_to(commit_index)?;
-        self.persist_hard_state()
+        self.persist_hard_state_if_changed(&hard_state_before)
     }
 
     pub fn save_snapshot(&mut self) -> Result<RaftSnapshot, KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         let snapshot = RaftSnapshot {
             last_included_index: self.node.applied_index,
             last_included_term: self
@@ -2363,19 +2372,27 @@ impl DurableRaftKvNode {
         // applied_index for cold recovery.
         self.node.local_compact(RAFT_COMPACTION_RETAINED_ENTRIES);
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
-        self.persist_hard_state()?;
+        self.persist_hard_state_if_changed(&hard_state_before)?;
         Ok(snapshot)
     }
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
+        let hard_state_before = self.node.hard_state.clone();
         write_object_file(&self.paths.snapshot, &snapshot)?;
         self.node.install_snapshot(snapshot);
         rewrite_wal_entries(&self.paths.wal, &self.node.log)?;
-        self.persist_hard_state()
+        self.persist_hard_state_if_changed(&hard_state_before)
     }
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
         write_object_file(&self.paths.hard_state, &self.node.hard_state)
+    }
+
+    fn persist_hard_state_if_changed(&self, before: &RaftHardState) -> Result<(), KvError> {
+        if self.node.hard_state == *before {
+            return Ok(());
+        }
+        self.persist_hard_state()
     }
 }
 
@@ -2569,13 +2586,57 @@ fn read_optional_object<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opt
 }
 
 fn read_object_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, KvError> {
-    let bytes = fs::read(path).map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    let bytes = read_object_file_bytes(path)?;
     sinomo_object_serde::from_bytes(&bytes).map_err(|source| KvError::Serialization {
         detail: format!("{}: {source}", path.display()),
     })
+}
+
+fn read_object_file_bytes(path: &Path) -> Result<Vec<u8>, KvError> {
+    let file = File::open(path).map_err(|source| KvError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let len = file
+        .metadata()
+        .map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .len();
+    if len > MAX_OBJECT_FILE_READ_BYTES {
+        return Err(KvError::Io {
+            path: path.display().to_string(),
+            detail: format!("object file is {len} bytes; max is {MAX_OBJECT_FILE_READ_BYTES}"),
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(len as usize);
+    let mut limited = file.take(MAX_OBJECT_FILE_READ_BYTES.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|source| KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if bytes.len() as u64 > MAX_OBJECT_FILE_READ_BYTES {
+        return Err(KvError::Io {
+            path: path.display().to_string(),
+            detail: format!("object file read exceeded max of {MAX_OBJECT_FILE_READ_BYTES} bytes"),
+        });
+    }
+    Ok(bytes)
+}
+
+fn read_existing_object_file_for_compare(path: &Path, expected_len: u64) -> Option<Vec<u8>> {
+    let file = File::open(path).ok()?;
+    if file.metadata().ok()?.len() != expected_len {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(expected_len as usize);
+    let mut limited = file.take(expected_len.saturating_add(1));
+    limited.read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 == expected_len).then_some(bytes)
 }
 
 fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
@@ -2602,8 +2663,8 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
     // Handles a cold cache and files changed by another writer (e.g. a shadow
     // daemon sharing the cluster dir) without reading sparse/corrupt oversized
     // files that are already known to differ.
-    if fs::metadata(path).is_ok_and(|metadata| metadata.len() == content.len() as u64)
-        && fs::read(path).is_ok_and(|existing| existing == content)
+    if read_existing_object_file_for_compare(path, content.len() as u64)
+        .is_some_and(|existing| existing == content)
     {
         // Already current: record the mark so subsequent calls take the fast path.
         let (modified, ino) = file_modified_and_ino(path);
@@ -2879,6 +2940,42 @@ mod tests {
         assert_eq!(
             restored, record,
             "a file changed since our last write must be rewritten, not skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_object_file_rejects_oversized_object_before_reading() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-objfile-oversized-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("snapshot.sobj");
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("create sparse object")
+            .set_len(MAX_OBJECT_FILE_READ_BYTES + 1)
+            .expect("make sparse object oversized");
+
+        let error = read_object_file::<KvSnapshot>(&path).expect_err("oversized object");
+        let expected_path = path.display().to_string();
+        assert!(
+            matches!(
+                &error,
+                KvError::Io { path: error_path, detail }
+                    if error_path == &expected_path
+                        && detail.contains("object file is")
+                        && detail.contains("max is")
+            ),
+            "unexpected error for oversized object: {error:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -4174,6 +4271,53 @@ mod tests {
             .expect("hard state modified after");
 
         assert_eq!(before, after);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_noop_requests_do_not_create_hard_state_file() {
+        let root = temp_raft_root("sinomo-kv-noop-hard-state");
+        let node_id = NodeId::from_legacy_named("node_noop_hard_state").expect("node");
+        let candidate_id = NodeId::from_legacy_named("node_noop_candidate").expect("candidate");
+        let leader_id = NodeId::from_legacy_named("node_noop_leader").expect("leader");
+        let paths = KvWalPaths::new(&root);
+
+        {
+            let mut node = DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open");
+            let vote = node
+                .request_vote(RaftRequestVoteRequest {
+                    term: 0,
+                    candidate_id,
+                    last_log_index: 0,
+                    last_log_term: 0,
+                })
+                .expect("stale vote");
+            assert!(!vote.vote_granted);
+            let append = node
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 0,
+                    leader_id,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                })
+                .expect("stale append");
+            assert!(!append.success);
+        }
+        assert!(
+            !paths.hard_state.exists(),
+            "rejected requests that do not change hard state should not create a hard-state file"
+        );
+
+        {
+            let mut node = DurableRaftKvNode::open(node_id, paths.clone()).expect("reopen");
+            assert!(node.observe_term(2).expect("observe higher term"));
+        }
+        assert!(
+            paths.hard_state.exists(),
+            "real hard-state changes must still be persisted"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

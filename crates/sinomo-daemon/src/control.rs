@@ -8,11 +8,11 @@ use crate::{
     forward_cluster_invite_challenge_to_voter, handle_daemon_clear_rollout_status,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
-    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_member_publish_request,
-    handle_daemon_cluster_relay_request, handle_daemon_finalize_shadow_rollout,
-    prune_local_cluster_raft_uncommitted_tail, read_daemon_status, run_daemon_dfs_maintenance_tick,
-    start_daemon_iroh_proxy_if_clustered,
+    handle_daemon_cluster_kv_watch_cancel_request, handle_daemon_cluster_kv_watch_drain_request,
+    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
+    handle_daemon_cluster_member_publish_request, handle_daemon_cluster_relay_request,
+    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
+    read_daemon_status, run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_node::NodeId;
@@ -487,6 +487,24 @@ pub fn handle_daemon_connection(
                 let result = handle_daemon_cluster_kv_watch_drain_request(paths, request)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
                     sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE,
+                    &result,
+                )
+                .map_err(DaemonError::from)?;
+                write_daemon_rpc_response_frame(stream, response)?;
+                Ok(false)
+            }
+            command
+                if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE) =>
+            {
+                let request = require_daemon_rpc_request(
+                    rpc_request,
+                    sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE,
+                    sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+                )?;
+                let request = request.decode_body().map_err(DaemonError::from)?;
+                let result = handle_daemon_cluster_kv_watch_cancel_request(paths, request)?;
+                let response = sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE,
                     &result,
                 )
                 .map_err(DaemonError::from)?;

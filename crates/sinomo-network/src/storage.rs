@@ -153,6 +153,7 @@ pub struct ClusterPaths {
     pub kv_raft: PathBuf,
     pub kv_watches: PathBuf,
     pub kv_watches_lock: PathBuf,
+    pub kv_watches_next_id: PathBuf,
     pub kv_watch_events: PathBuf,
     pub kv_watch_events_log: PathBuf,
 }
@@ -168,6 +169,7 @@ impl ClusterPaths {
             kv_raft: root.join("kv-raft"),
             kv_watches: root.join("watches"),
             kv_watches_lock: root.join("watches.lock"),
+            kv_watches_next_id: root.join("watches-next.sobj"),
             kv_watch_events: root.join("watch-events.sobj"),
             kv_watch_events_log: root.join("watch-events.sobjlog"),
             root,
@@ -364,6 +366,11 @@ pub struct ClusterKvWatchRegistration {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchAllocatorState {
+    pub next_watch_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterKvWatchDrainRequest {
     pub watch_id: WatchId,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -376,6 +383,17 @@ pub struct ClusterKvWatchDrainResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<KvEvent>,
     pub next_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchCancelRequest {
+    pub watch_id: WatchId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchCancelResponse {
+    pub watch_id: WatchId,
+    pub cancelled: bool,
 }
 
 impl ClusterKvWatchDrainRequest {
@@ -1641,8 +1659,8 @@ pub fn create_cluster_kv_watch(
         detail: source.to_string(),
     })?;
     let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
-    prune_compacted_cluster_kv_watches(paths, snapshot.compacted_revision)?;
     let mut watch_id = next_cluster_kv_watch_id(paths)?;
+    prune_cluster_kv_watches(paths, snapshot.compacted_revision)?;
     loop {
         let registration = ClusterKvWatchRegistration {
             watch_id,
@@ -1650,6 +1668,7 @@ pub fn create_cluster_kv_watch(
             next_revision: request.start_revision,
         };
         if write_object_file_create_new(&cluster_kv_watch_path(paths, watch_id), &registration)? {
+            persist_next_cluster_kv_watch_id(paths, watch_id.0.saturating_add(1).max(1))?;
             return Ok(registration);
         }
         if watch_id.0 == u64::MAX {
@@ -1695,7 +1714,7 @@ fn drain_cluster_kv_watch_once(
     watch_id: WatchId,
 ) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
     let watch_path = cluster_kv_watch_path(paths, watch_id);
-    let mut registration: ClusterKvWatchRegistration = read_object_file(&watch_path)?;
+    let mut registration = read_cluster_kv_watch_registration(&watch_path, watch_id)?;
     let snapshot = read_cluster_kv_store(paths)?.snapshot();
     if registration.next_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
@@ -1729,6 +1748,21 @@ fn drain_cluster_kv_watch_once(
         watch_id: registration.watch_id,
         events,
         next_revision: registration.next_revision,
+    })
+}
+
+pub fn cancel_cluster_kv_watch(
+    paths: &ClusterPaths,
+    request: ClusterKvWatchCancelRequest,
+) -> Result<ClusterKvWatchCancelResponse, NetworkError> {
+    let watch_path = cluster_kv_watch_path(paths, request.watch_id);
+    let cancelled = remove_cluster_kv_watch_file_if_exists(&watch_path)?;
+    if cancelled {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(ClusterKvWatchCancelResponse {
+        watch_id: request.watch_id,
+        cancelled,
     })
 }
 
@@ -2068,6 +2102,27 @@ fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
     paths.kv_watches.join(format!("watch-{}.sobj", watch_id.0))
 }
 
+fn read_cluster_kv_watch_registration(
+    path: &PathBuf,
+    watch_id: WatchId,
+) -> Result<ClusterKvWatchRegistration, NetworkError> {
+    if !path.exists() {
+        return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
+    }
+    let registration: ClusterKvWatchRegistration = match read_object_file(path) {
+        Ok(registration) => registration,
+        Err(NetworkError::StorageIo { .. }) if !path.exists() => {
+            return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
+        }
+        Err(error) => return Err(error),
+    };
+    if registration.watch_id != watch_id {
+        remove_cluster_kv_watch_file(path);
+        return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
+    }
+    Ok(registration)
+}
+
 fn lock_cluster_kv_watch_allocator(paths: &ClusterPaths) -> Result<fs::File, NetworkError> {
     fs::create_dir_all(&paths.root).map_err(|source| NetworkError::StorageIo {
         path: paths.root.display().to_string(),
@@ -2091,22 +2146,31 @@ fn lock_cluster_kv_watch_allocator(paths: &ClusterPaths) -> Result<fs::File, Net
 }
 
 fn remove_cluster_kv_watch_file(path: &PathBuf) {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => eprintln!(
+    if let Err(error) = remove_cluster_kv_watch_file_if_exists(path) {
+        eprintln!(
             "warning: could not remove stale cluster kv watch registration {}: {}",
             path.display(),
-            source
-        ),
+            error
+        );
     }
 }
 
-fn prune_compacted_cluster_kv_watches(
+fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, NetworkError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+fn prune_cluster_kv_watches(
     paths: &ClusterPaths,
     compacted_revision: KvRevision,
 ) -> Result<usize, NetworkError> {
-    if compacted_revision == KvRevision::ZERO || !paths.kv_watches.exists() {
+    if !paths.kv_watches.exists() {
         return Ok(0);
     }
     let mut removed = 0usize;
@@ -2121,21 +2185,40 @@ fn prune_compacted_cluster_kv_watches(
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if cluster_kv_watch_id_from_file_name(&name).is_none() {
+        let Some(file_watch_id) = cluster_kv_watch_id_from_file_name(&name) else {
             continue;
-        }
+        };
         let path = entry.path();
         match read_object_file::<ClusterKvWatchRegistration>(&path) {
-            Ok(registration) if registration.next_revision <= compacted_revision => {
+            Ok(registration) if registration.watch_id.0 != file_watch_id => {
+                eprintln!(
+                    "warning: removing mismatched cluster kv watch registration {}: file id {}, object id {}",
+                    path.display(),
+                    file_watch_id,
+                    registration.watch_id.0
+                );
+                if remove_cluster_kv_watch_file_if_exists(&path)? {
+                    removed = removed.saturating_add(1);
+                }
+            }
+            Ok(registration)
+                if compacted_revision != KvRevision::ZERO
+                    && registration.next_revision <= compacted_revision =>
+            {
                 remove_cluster_kv_watch_file(&path);
                 removed = removed.saturating_add(1);
             }
             Ok(_) => {}
-            Err(error) => eprintln!(
-                "warning: ignoring unreadable cluster kv watch registration {}: {}",
-                path.display(),
-                error
-            ),
+            Err(error) => {
+                eprintln!(
+                    "warning: removing unreadable cluster kv watch registration {}: {}",
+                    path.display(),
+                    error
+                );
+                if remove_cluster_kv_watch_file_if_exists(&path)? {
+                    removed = removed.saturating_add(1);
+                }
+            }
         }
     }
     Ok(removed)
@@ -2147,26 +2230,48 @@ fn cluster_kv_watch_id_from_file_name(name: &str) -> Option<u64> {
         .and_then(|id| id.parse::<u64>().ok())
 }
 
-fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkError> {
+fn max_cluster_kv_watch_file_id(paths: &ClusterPaths) -> Result<u64, NetworkError> {
     let mut max_id = 0_u64;
-    if paths.kv_watches.exists() {
-        for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
+    if !paths.kv_watches.exists() {
+        return Ok(max_id);
+    }
+    for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watches.display().to_string(),
+        detail: source.to_string(),
+    })? {
+        let entry = entry.map_err(|source| NetworkError::StorageIo {
             path: paths.kv_watches.display().to_string(),
             detail: source.to_string(),
-        })? {
-            let entry = entry.map_err(|source| NetworkError::StorageIo {
-                path: paths.kv_watches.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            if let Some(id) = cluster_kv_watch_id_from_file_name(&name) {
-                max_id = max_id.max(id);
-            }
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if let Some(id) = cluster_kv_watch_id_from_file_name(&name) {
+            max_id = max_id.max(id);
         }
     }
-    Ok(WatchId(max_id.saturating_add(1).max(1)))
+    Ok(max_id)
+}
+
+fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkError> {
+    let max_file_id = max_cluster_kv_watch_file_id(paths)?;
+    let cursor_id = if paths.kv_watches_next_id.exists() {
+        read_object_file::<ClusterKvWatchAllocatorState>(&paths.kv_watches_next_id)
+            .map(|state| state.next_watch_id)?
+    } else {
+        1
+    };
+    Ok(WatchId(cursor_id.max(max_file_id.saturating_add(1)).max(1)))
+}
+
+fn persist_next_cluster_kv_watch_id(
+    paths: &ClusterPaths,
+    next_watch_id: u64,
+) -> Result<(), NetworkError> {
+    write_object_file(
+        &paths.kv_watches_next_id,
+        &ClusterKvWatchAllocatorState { next_watch_id },
+    )
 }
 
 pub fn read_cluster_state_without_kv(
@@ -4660,7 +4765,20 @@ pub fn cluster_sync_targets(state: &ClusterBootstrapState) -> Vec<ClusterEndpoin
 pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
     path: &PathBuf,
 ) -> Result<T, NetworkError> {
-    let len = fs::metadata(path)
+    let bytes = read_object_file_bytes(path)?;
+    if let Some(observer) = io_observer() {
+        observer.on_disk_read(bytes.len() as u64);
+    }
+    SinomoObjectCodec::default().decode(&bytes)
+}
+
+fn read_object_file_bytes(path: &PathBuf) -> Result<Vec<u8>, NetworkError> {
+    let file = fs::File::open(path).map_err(|source| NetworkError::StorageIo {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let len = file
+        .metadata()
         .map_err(|source| NetworkError::StorageIo {
             path: path.display().to_string(),
             detail: source.to_string(),
@@ -4672,14 +4790,33 @@ pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
             detail: format!("object file is {len} bytes; max is {MAX_OBJECT_FILE_READ_BYTES}"),
         });
     }
-    let bytes = fs::read(path).map_err(|source| NetworkError::StorageIo {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if let Some(observer) = io_observer() {
-        observer.on_disk_read(bytes.len() as u64);
+
+    let mut bytes = Vec::with_capacity(len as usize);
+    let mut limited = file.take(MAX_OBJECT_FILE_READ_BYTES.saturating_add(1));
+    limited
+        .read_to_end(&mut bytes)
+        .map_err(|source| NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if bytes.len() as u64 > MAX_OBJECT_FILE_READ_BYTES {
+        return Err(NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: format!("object file read exceeded max of {MAX_OBJECT_FILE_READ_BYTES} bytes"),
+        });
     }
-    SinomoObjectCodec::default().decode(&bytes)
+    Ok(bytes)
+}
+
+fn read_existing_object_file_for_compare(path: &PathBuf, expected_len: u64) -> Option<Vec<u8>> {
+    let file = fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() != expected_len {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(expected_len as usize);
+    let mut limited = file.take(expected_len.saturating_add(1));
+    limited.read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 == expected_len).then_some(bytes)
 }
 
 pub(crate) fn write_object_file<T: Serialize>(
@@ -4709,10 +4846,7 @@ pub(crate) fn write_object_file<T: Serialize>(
     // Handles a cold cache and files changed by another writer (e.g. a shadow
     // daemon sharing the cluster dir) without reading sparse/corrupt oversized
     // files that are already known to differ.
-    let existing = fs::metadata(path)
-        .ok()
-        .filter(|metadata| metadata.len() == desired.len() as u64)
-        .and_then(|_| fs::read(path).ok());
+    let existing = read_existing_object_file_for_compare(path, desired.len() as u64);
     if let (Some(observer), Some(existing)) = (io_observer(), existing.as_ref()) {
         observer.on_disk_read(existing.len() as u64);
     }
