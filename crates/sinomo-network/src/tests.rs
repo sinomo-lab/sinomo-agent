@@ -909,7 +909,35 @@ fn iroh_daemon_response_decode_rejects_trailing_bytes() {
 }
 
 #[test]
+fn iroh_daemon_response_reader_returns_after_complete_frame_without_eof() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let response = DaemonControlResponse::new("ok");
+        write_object_frame_async(&mut writer, &response)
+            .await
+            .expect("write response frame");
+
+        let decoded = crate::roaming::read_iroh_daemon_control_response_async(
+            &mut reader,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("complete response frame should not wait for EOF");
+
+        assert_eq!(decoded.body, "ok");
+    });
+}
+
+#[test]
 fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
+    assert_eq!(
+        crate::roaming::IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT,
+        Duration::from_secs(30)
+    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -979,6 +1007,50 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
             budget.in_flight_bytes(),
             0,
             "aborted frame reads must release the reserved proxy budget"
+        );
+
+        let budget = crate::roaming::IrohProxyByteBudget::new(16);
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&4_u32.to_be_bytes())
+            .await
+            .expect("write length for timeout");
+        let error = crate::roaming::read_iroh_proxy_frame_async_with_timeout(
+            &mut reader,
+            &budget,
+            "test",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("slow body should time out");
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "read iroh daemon test frame".to_string(),
+                detail: "timed out after 10ms".to_string(),
+            }
+        );
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "timed-out frame reads must release the reserved proxy budget"
+        );
+
+        let (mut writer, _reader) = tokio::io::duplex(1);
+        let error = crate::roaming::write_iroh_proxy_frame_async_with_timeout(
+            &mut writer,
+            &[7_u8; 1024],
+            "test response",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("slow response consumer should time out");
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "write iroh daemon test response frame".to_string(),
+                detail: "timed out after 10ms".to_string(),
+            }
         );
     });
 }
@@ -10594,6 +10666,276 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
         DeliveryStatus::Retrying
     );
     service_a.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_event_origin_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_event_origin_receiver").expect("node");
+    let node_c = NodeId::from_legacy_named("node_event_origin_spoof").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    network.add_node(node_c.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_event_origin_sender"));
+    registry.register_node(node("node_event_origin_receiver"));
+    registry.register_node(node("node_event_origin_spoof"));
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+
+    let spoofed_event =
+        fixture_event("evt_inner_origin_spoof", node_c.clone()).with_target_node(node_b.clone());
+    let spoofed_event_id = spoofed_event.event_id.clone();
+    let valid_event =
+        fixture_event("evt_inner_origin_valid", node_a.clone()).with_target_node(node_b.clone());
+    let valid_event_id = valid_event.event_id.clone();
+    for (delivery_id, event) in [
+        (RouteDeliveryId(1), spoofed_event),
+        (RouteDeliveryId(2), valid_event),
+    ] {
+        transport_a
+            .send(
+                &node_b,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(delivery_id.0),
+                    source_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(delivery_id.0),
+                        origin_node_id: node_a.clone(),
+                        target_node_id: node_b.clone(),
+                        body: MeshMessageBody::Event {
+                            delivery_id,
+                            event: Box::new(event),
+                        },
+                    },
+                },
+            )
+            .expect("send event");
+    }
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("origin mismatch should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::EventIgnored {
+                delivery_id: RouteDeliveryId(1),
+                event_id,
+                origin_node_id,
+                source_node_id,
+                target_node_id: Some(target_node_id),
+                local_node_id,
+            },
+            InboundOutcome::EventAccepted {
+                delivery_id: RouteDeliveryId(2),
+                event_id: accepted_event_id,
+            }
+        ] if event_id == &spoofed_event_id
+            && origin_node_id == &node_c
+            && source_node_id == &node_a
+            && target_node_id == &node_b
+            && local_node_id == &node_b
+            && accepted_event_id == &valid_event_id
+    ));
+
+    let ack_frames = transport_a.drain_incoming().expect("ack frames");
+    assert_eq!(ack_frames.len(), 1);
+    assert!(matches!(
+        &ack_frames[0].frame.message.body,
+        MeshMessageBody::Ack(ack)
+            if ack.delivery_id == RouteDeliveryId(2)
+                && ack.event_id == valid_event_id
+                && ack.target_node_id == node_b
+    ));
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_event_target_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_event_target_receiver").expect("node");
+    let node_c = NodeId::from_legacy_named("node_event_target_other").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    network.add_node(node_c.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_event_target_sender"));
+    registry.register_node(node("node_event_target_receiver"));
+    registry.register_node(node("node_event_target_other"));
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+
+    let mistargeted_event =
+        fixture_event("evt_inner_target_mismatch", node_a.clone()).with_target_node(node_c.clone());
+    let mistargeted_event_id = mistargeted_event.event_id.clone();
+    let valid_event =
+        fixture_event("evt_inner_target_valid", node_a.clone()).with_target_node(node_b.clone());
+    let valid_event_id = valid_event.event_id.clone();
+    for (delivery_id, event) in [
+        (RouteDeliveryId(3), mistargeted_event),
+        (RouteDeliveryId(4), valid_event),
+    ] {
+        transport_a
+            .send(
+                &node_b,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(delivery_id.0),
+                    source_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(delivery_id.0),
+                        origin_node_id: node_a.clone(),
+                        target_node_id: node_b.clone(),
+                        body: MeshMessageBody::Event {
+                            delivery_id,
+                            event: Box::new(event),
+                        },
+                    },
+                },
+            )
+            .expect("send event");
+    }
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("target mismatch should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::EventIgnored {
+                delivery_id: RouteDeliveryId(3),
+                event_id,
+                origin_node_id,
+                source_node_id,
+                target_node_id: Some(target_node_id),
+                local_node_id,
+            },
+            InboundOutcome::EventAccepted {
+                delivery_id: RouteDeliveryId(4),
+                event_id: accepted_event_id,
+            }
+        ] if event_id == &mistargeted_event_id
+            && origin_node_id == &node_a
+            && source_node_id == &node_a
+            && target_node_id == &node_c
+            && local_node_id == &node_b
+            && accepted_event_id == &valid_event_id
+    ));
+
+    let ack_frames = transport_a.drain_incoming().expect("ack frames");
+    assert_eq!(ack_frames.len(), 1);
+    assert!(matches!(
+        &ack_frames[0].frame.message.body,
+        MeshMessageBody::Ack(ack)
+            if ack.delivery_id == RouteDeliveryId(4)
+                && ack.event_id == valid_event_id
+                && ack.target_node_id == node_b
+    ));
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_targetless_origin_only_events_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_targetless_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_targetless_receiver").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_targetless_sender"));
+    registry.register_node(node("node_targetless_receiver"));
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+
+    let session_without_id = fixture_event("evt_targetless_session_no_id", node_a.clone());
+    let session_without_id_event_id = session_without_id.event_id.clone();
+    let mut local_only = fixture_event("evt_targetless_local_only", node_a.clone());
+    local_only.routing.scope = RoutingScope::Local;
+    let local_only_event_id = local_only.event_id.clone();
+    let mut trusted_network = fixture_event("evt_targetless_trusted", node_a.clone());
+    trusted_network.routing.scope = RoutingScope::TrustedNetwork;
+    let trusted_network_event_id = trusted_network.event_id.clone();
+
+    for (delivery_id, event) in [
+        (RouteDeliveryId(5), session_without_id),
+        (RouteDeliveryId(6), local_only),
+        (RouteDeliveryId(7), trusted_network),
+    ] {
+        transport_a
+            .send(
+                &node_b,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(delivery_id.0),
+                    source_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(delivery_id.0),
+                        origin_node_id: node_a.clone(),
+                        target_node_id: node_b.clone(),
+                        body: MeshMessageBody::Event {
+                            delivery_id,
+                            event: Box::new(event),
+                        },
+                    },
+                },
+            )
+            .expect("send event");
+    }
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("origin-only route mismatch should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::EventIgnored {
+                delivery_id: RouteDeliveryId(5),
+                event_id: session_event_id,
+                origin_node_id: session_origin_node_id,
+                source_node_id: session_source_node_id,
+                target_node_id: None,
+                local_node_id: session_local_node_id,
+            },
+            InboundOutcome::EventIgnored {
+                delivery_id: RouteDeliveryId(6),
+                event_id: local_event_id,
+                origin_node_id: local_origin_node_id,
+                source_node_id: local_source_node_id,
+                target_node_id: None,
+                local_node_id: local_local_node_id,
+            },
+            InboundOutcome::EventAccepted {
+                delivery_id: RouteDeliveryId(7),
+                event_id: accepted_event_id,
+            }
+        ] if session_event_id == &session_without_id_event_id
+            && session_origin_node_id == &node_a
+            && session_source_node_id == &node_a
+            && session_local_node_id == &node_b
+            && local_event_id == &local_only_event_id
+            && local_origin_node_id == &node_a
+            && local_source_node_id == &node_a
+            && local_local_node_id == &node_b
+            && accepted_event_id == &trusted_network_event_id
+    ));
+
+    let ack_frames = transport_a.drain_incoming().expect("ack frames");
+    assert_eq!(ack_frames.len(), 1);
+    assert!(matches!(
+        &ack_frames[0].frame.message.body,
+        MeshMessageBody::Ack(ack)
+            if ack.delivery_id == RouteDeliveryId(7)
+                && ack.event_id == trusted_network_event_id
+                && ack.target_node_id == node_b
+    ));
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
 }
 
 #[tokio::test]

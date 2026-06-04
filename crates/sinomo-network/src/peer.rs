@@ -578,6 +578,20 @@ impl SeenEventCache {
 /// Core event-ingest step used by the [`NetworkService`] actor's inbound dispatch:
 /// dedups on `(origin_node_id, event_id)` and, for a new event, appends it to `store`.
 /// A store-level `DuplicateEventId` is folded into the same idempotent dedup result.
+fn event_addresses_local_node(event: &EventEnvelope, local_node_id: &NodeId) -> bool {
+    if let Some(target_node_id) = &event.target_node_id {
+        return target_node_id == local_node_id;
+    }
+
+    match &event.routing.scope {
+        RoutingScope::Local => &event.origin_node_id == local_node_id,
+        RoutingScope::Session => {
+            event.session_id.is_some() || &event.origin_node_id == local_node_id
+        }
+        RoutingScope::TrustedNetwork | RoutingScope::DurableGlobal => true,
+    }
+}
+
 fn ingest_event<S: EventStore>(
     seen_events: &mut SeenEventCache,
     store: &mut S,
@@ -935,6 +949,22 @@ impl<T: NetworkTransport> NetworkService<T> {
             }
             match inbound.frame.message.body {
                 MeshMessageBody::Event { delivery_id, event } => {
+                    let event_origin_node_id = event.origin_node_id.clone();
+                    let event_target_node_id = event.target_node_id.clone();
+                    if event_origin_node_id != inbound.frame.source_node_id
+                        || !event_addresses_local_node(&event, &local_node_id)
+                    {
+                        outcomes.push(InboundOutcome::EventIgnored {
+                            delivery_id,
+                            event_id: event.event_id.clone(),
+                            origin_node_id: event_origin_node_id,
+                            source_node_id: inbound.frame.source_node_id,
+                            target_node_id: event_target_node_id,
+                            local_node_id: local_node_id.clone(),
+                        });
+                        continue;
+                    }
+
                     let outcome = ingest_event(&mut self.seen_events, store, delivery_id, &event)?;
                     outcomes.push(outcome);
 
@@ -1256,6 +1286,14 @@ pub enum InboundOutcome {
     EventDuplicate {
         delivery_id: RouteDeliveryId,
         event_id: EventId,
+    },
+    EventIgnored {
+        delivery_id: RouteDeliveryId,
+        event_id: EventId,
+        origin_node_id: NodeId,
+        source_node_id: NodeId,
+        target_node_id: Option<NodeId>,
+        local_node_id: NodeId,
     },
     FrameIgnored {
         source_node_id: NodeId,

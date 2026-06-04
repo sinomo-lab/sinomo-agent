@@ -1362,6 +1362,10 @@ impl InProcessKvStore {
         let mut revision = self.revision;
 
         for op in ops {
+            if let Some(response) = self.no_effect_response_for_op(&op) {
+                responses.push(response);
+                continue;
+            }
             let response = self.apply_op(op)?;
             revision = self.revision;
             responses.push(response);
@@ -5180,6 +5184,74 @@ mod tests {
                 actual_bytes: MAX_KV_VALUE_BYTES + 1,
                 max_bytes: MAX_KV_VALUE_BYTES,
             }
+        );
+    }
+
+    #[test]
+    fn txn_skips_no_effect_ops_inside_mixed_selected_branch() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/stable", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+        let watch_id = store
+            .watch_prefix("/config/", revision_before.next())
+            .expect("watch future config changes");
+
+        let response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/stable".to_string(),
+                        value: b"old".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: "/config/changed".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect("mixed txn");
+
+        assert_eq!(
+            response,
+            KvTxnResponse {
+                succeeded: true,
+                revision: revision_before.next(),
+                responses: vec![
+                    KvOpResponse::Put {
+                        key: "/config/stable".to_string(),
+                        revision: revision_before,
+                    },
+                    KvOpResponse::Put {
+                        key: "/config/changed".to_string(),
+                        revision: revision_before.next(),
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            store.revision(),
+            revision_before.next(),
+            "mixed txns should not allocate a revision for stable no-effect ops"
+        );
+        assert_eq!(
+            store.get("/config/stable").expect("stable entry").version,
+            KvVersion(1),
+            "stable no-effect put should not rewrite entry metadata"
+        );
+        let events = store.drain_watch(watch_id).expect("watch events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/config/changed"],
+            "stable no-effect ops inside mixed txns should not emit watch events"
         );
     }
 
