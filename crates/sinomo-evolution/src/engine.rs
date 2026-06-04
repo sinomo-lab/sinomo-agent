@@ -114,6 +114,8 @@ pub enum BenchmarkGateKind {
         summary_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         results_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        progress_path: Option<String>,
     },
 }
 
@@ -135,6 +137,14 @@ pub struct BenchmarkGateReport {
     pub command_log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metrics: Vec<EvaluationMetric>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_event_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_last_event: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -828,6 +838,7 @@ fn parse_benchmark_gate_spec(
                 command: command.to_string(),
                 summary_path: None,
                 results_dir: None,
+                progress_path: None,
             },
         });
     }
@@ -3524,25 +3535,34 @@ impl GitWorkspaceAdapter {
     }
 }
 
+fn absolute_workspace_path(path: &Path) -> Result<PathBuf, WorkspaceError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|source| WorkspaceError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
 impl WorkspaceAdapter for GitWorkspaceAdapter {
     fn root(&self) -> &Path {
         &self.source_root
     }
 
     fn prepare_candidate(&self, job: &EvolutionJob) -> Result<CandidateWorkspace, WorkspaceError> {
-        fs::create_dir_all(&self.worktrees_root).map_err(|source| WorkspaceError::Io {
-            path: self.worktrees_root.display().to_string(),
+        let source_root = absolute_workspace_path(&self.source_root)?;
+        let worktrees_root = absolute_workspace_path(&self.worktrees_root)?;
+        fs::create_dir_all(&worktrees_root).map_err(|source| WorkspaceError::Io {
+            path: worktrees_root.display().to_string(),
             detail: source.to_string(),
         })?;
-        let source_revision = self.run_git(
-            &["rev-parse".to_string(), "HEAD".to_string()],
-            &self.source_root,
-        )?;
+        let source_revision =
+            self.run_git(&["rev-parse".to_string(), "HEAD".to_string()], &source_root)?;
         let branch_name = format!("codex/evolve/{}", job.job_id.as_str());
-        let path = self
-            .worktrees_root
-            .join(job.job_id.as_str())
-            .join("worktree");
+        let path = worktrees_root.join(job.job_id.as_str()).join("worktree");
         if !path.exists() {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|source| WorkspaceError::Io {
@@ -3559,7 +3579,7 @@ impl WorkspaceAdapter for GitWorkspaceAdapter {
                     path.display().to_string(),
                     source_revision.clone(),
                 ],
-                &self.source_root,
+                &source_root,
             )?;
         }
 
@@ -3864,6 +3884,7 @@ impl CandidateBundleStore for LocalCandidateBundleStore {
             scorecard_path: None,
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         };
         self.write_manifest(&manifest)?;
@@ -5309,6 +5330,7 @@ fn build_candidate_bundle_attestation(
 
 fn candidate_bundle_artifact_refs(bundle: &CandidateBundleManifest) -> Vec<String> {
     let mut refs = vec![bundle.mutation_packet_path.clone()];
+    refs.extend(bundle.artifact_refs.iter().cloned());
     refs.extend(bundle.job_path.iter().cloned());
     refs.extend(bundle.model_output_path.iter().cloned());
     refs.extend(bundle.agent_run_path.iter().cloned());
@@ -5997,7 +6019,7 @@ fn prepare_benchmark_gate_execution(
         gate.name.clone()
     };
     let safe_name = bundle_safe_file_stem(&name);
-    let (command, summary_path, results_dir) = match &gate.kind {
+    let (command, summary_path, results_dir, progress_path) = match &gate.kind {
         BenchmarkGateKind::SweBench {
             instance_id,
             limit,
@@ -6010,8 +6032,9 @@ fn prepare_benchmark_gate_execution(
                 .join("benchmarks")
                 .join(&safe_name);
             let summary_path = results_dir.join("summary.json");
+            let progress_path = results_dir.join("progress.jsonl");
             let mut args = vec![
-                "python3".to_string(),
+                swebench_python_command(),
                 "crates/sinomo-benchmarks/swebench/run_swebench_verified.py".to_string(),
                 "--mode".to_string(),
                 "sinomo".to_string(),
@@ -6025,6 +6048,8 @@ fn prepare_benchmark_gate_execution(
                 results_dir.display().to_string(),
                 "--summary-out".to_string(),
                 summary_path.display().to_string(),
+                "--progress-out".to_string(),
+                progress_path.display().to_string(),
                 "--run-id".to_string(),
                 safe_name.clone(),
             ];
@@ -6041,13 +6066,20 @@ fn prepare_benchmark_gate_execution(
                 shell_join(&args),
                 Some(summary_path.display().to_string()),
                 Some(results_dir.display().to_string()),
+                Some(progress_path.display().to_string()),
             )
         }
         BenchmarkGateKind::Command {
             command,
             summary_path,
             results_dir,
-        } => (command.clone(), summary_path.clone(), results_dir.clone()),
+            progress_path,
+        } => (
+            command.clone(),
+            summary_path.clone(),
+            results_dir.clone(),
+            progress_path.clone(),
+        ),
     };
     BenchmarkGateExecution {
         command: VerificationCommand {
@@ -6067,11 +6099,30 @@ fn prepare_benchmark_gate_execution(
             results_dir,
             command_log_path: None,
             metrics: Vec::new(),
+            progress_path,
+            progress_event_count: None,
+            progress_last_event: None,
+            progress_error: None,
             summary: None,
             summary_error: None,
             summary_verdict: None,
         },
     }
+}
+
+fn swebench_python_command() -> String {
+    std::env::var("SINOMO_SWEBENCH_PYTHON")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            let repo_local = Path::new("target/tmp/swebench-venv/bin/python");
+            if repo_local.exists() {
+                repo_local.display().to_string()
+            } else {
+                "python3".to_string()
+            }
+        })
 }
 
 fn finalize_benchmark_gate_reports(
@@ -6101,6 +6152,7 @@ fn finalize_benchmark_gate_reports(
                     .map(|log| log.log_path.clone());
             }
             enrich_benchmark_report_from_summary(&mut report);
+            enrich_benchmark_report_from_progress(&mut report);
             report
         })
         .collect()
@@ -6154,6 +6206,62 @@ fn enrich_benchmark_report_from_summary(report: &mut BenchmarkGateReport) {
     report.summary = Some(summary);
 }
 
+fn enrich_benchmark_report_from_progress(report: &mut BenchmarkGateReport) {
+    let Some(progress_path) = report.progress_path.clone() else {
+        return;
+    };
+    let path = PathBuf::from(&progress_path);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(source) => {
+            report.progress_error = Some(format!(
+                "could not read benchmark progress `{}`: {source}",
+                path.display()
+            ));
+            if report.outcome == EvaluationOutcome::Passed {
+                report.outcome = EvaluationOutcome::Inconclusive;
+            }
+            return;
+        }
+    };
+    let mut event_count = 0usize;
+    let mut last_event = None;
+    for (index, line) in content.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(event) => event,
+            Err(source) => {
+                report.progress_error = Some(format!(
+                    "could not parse benchmark progress `{}` line {}: {source}",
+                    path.display(),
+                    index + 1
+                ));
+                if report.outcome == EvaluationOutcome::Passed {
+                    report.outcome = EvaluationOutcome::Inconclusive;
+                }
+                return;
+            }
+        };
+        event_count += 1;
+        last_event = Some(event);
+    }
+    if event_count == 0 {
+        report.progress_error = Some(format!(
+            "benchmark progress `{}` did not contain any events",
+            path.display()
+        ));
+        if report.outcome == EvaluationOutcome::Passed {
+            report.outcome = EvaluationOutcome::Inconclusive;
+        }
+        return;
+    }
+    report.progress_event_count = Some(event_count);
+    report.progress_last_event = last_event;
+}
+
 fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<EvaluationMetric> {
     let mut metrics = Vec::new();
     push_summary_integer_metric(
@@ -6194,6 +6302,26 @@ fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<Evaluation
     );
     push_summary_integer_metric(
         &mut metrics,
+        "swebench_official_completed_instances",
+        summary,
+        &[
+            &["official_completed_instances"],
+            &["sinomo", "official_completed_instances"],
+            &["official_evaluation", "completed_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_official_empty_patch_instances",
+        summary,
+        &[
+            &["official_empty_patch_instances"],
+            &["sinomo", "official_empty_patch_instances"],
+            &["official_evaluation", "empty_patch_instances"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
         "agent_model_turns",
         summary,
         &[&["agent_model_turns"], &["sinomo", "agent_model_turns"]],
@@ -6215,6 +6343,90 @@ fn benchmark_metrics_from_summary(summary: &serde_json::Value) -> Vec<Evaluation
         "agent_output_tokens",
         summary,
         &[&["agent_output_tokens"], &["sinomo", "agent_output_tokens"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_patch_bytes",
+        summary,
+        &[&["patch_bytes"], &["sinomo", "patch_bytes"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_changed_files",
+        summary,
+        &[&["changed_files"], &["sinomo", "changed_files"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_post_patch_check_failures",
+        summary,
+        &[
+            &["post_patch_check_failures"],
+            &["sinomo", "post_patch_check_failures"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_initial_post_patch_check_failures",
+        summary,
+        &[
+            &["initial_post_patch_check_failures"],
+            &["sinomo", "initial_post_patch_check_failures"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_repair_attempts",
+        summary,
+        &[&["repair_attempts"], &["sinomo", "repair_attempts"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_post_patch_repair_attempts",
+        summary,
+        &[
+            &["post_patch_repair_attempts"],
+            &["sinomo", "post_patch_repair_attempts"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_empty_patch_repair_attempts",
+        summary,
+        &[
+            &["empty_patch_repair_attempts"],
+            &["sinomo", "empty_patch_repair_attempts"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_repair_model_turns",
+        summary,
+        &[&["repair_model_turns"], &["sinomo", "repair_model_turns"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_repair_tool_results",
+        summary,
+        &[&["repair_tool_results"], &["sinomo", "repair_tool_results"]],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_deterministic_repair_attempts",
+        summary,
+        &[
+            &["deterministic_repair_attempts"],
+            &["sinomo", "deterministic_repair_attempts"],
+        ],
+    );
+    push_summary_integer_metric(
+        &mut metrics,
+        "swebench_deterministic_repair_changed_files",
+        summary,
+        &[
+            &["deterministic_repair_changed_files"],
+            &["sinomo", "deterministic_repair_changed_files"],
+        ],
     );
     metrics
 }
@@ -6239,6 +6451,10 @@ fn benchmark_summary_verdict(summary: &serde_json::Value) -> Option<BenchmarkSum
     .flatten()
     .max()
     .unwrap_or(0);
+    let post_patch_check_failures =
+        summary_integer_at(summary, &["sinomo", "post_patch_check_failures"])
+            .or_else(|| summary_integer_at(summary, &["post_patch_check_failures"]))
+            .unwrap_or(0);
 
     let Some(total) = total else {
         return Some(BenchmarkSummaryVerdict {
@@ -6262,6 +6478,14 @@ fn benchmark_summary_verdict(summary: &serde_json::Value) -> Option<BenchmarkSum
         return Some(BenchmarkSummaryVerdict {
             outcome: EvaluationOutcome::Failed,
             summary: format!("SWE-bench reported {errors} error instance(s)"),
+        });
+    }
+    if post_patch_check_failures > 0 {
+        return Some(BenchmarkSummaryVerdict {
+            outcome: EvaluationOutcome::Failed,
+            summary: format!(
+                "SWE-bench reported {post_patch_check_failures} post-patch check failure(s)"
+            ),
         });
     }
     if resolved < total {
@@ -6326,6 +6550,21 @@ fn apply_benchmark_reports_to_scorecard(
                     outcome: EvaluationOutcome::Inconclusive,
                     summary: format!(
                         "benchmark `{}` summary evidence is incomplete: {summary_error}",
+                        report.name
+                    ),
+                });
+            if scorecard.outcome == EvaluationOutcome::Passed {
+                scorecard.outcome = EvaluationOutcome::Inconclusive;
+            }
+        }
+        if let Some(progress_error) = &report.progress_error {
+            scorecard
+                .gates
+                .push(sinomo_runtime::core::EvaluationGateResult {
+                    gate: EvaluationGate::PrivateRegressionEvals,
+                    outcome: EvaluationOutcome::Inconclusive,
+                    summary: format!(
+                        "benchmark `{}` progress evidence is incomplete: {progress_error}",
                         report.name
                     ),
                 });

@@ -204,6 +204,7 @@ pub(crate) struct ProposeOptions {
     pub(crate) module_replay_report: Vec<String>,
     pub(crate) target_ring: TrustRing,
     pub(crate) dry_run: bool,
+    pub(crate) no_model: bool,
     pub(crate) horizon: Option<String>,
     pub(crate) budget_policy: Option<String>,
     pub(crate) reserve_floors: Vec<String>,
@@ -224,6 +225,7 @@ pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, C
     let mut module_replay_report = Vec::new();
     let mut target_ring = TrustRing::R1TrustedRuntime;
     let mut dry_run = false;
+    let mut no_model = false;
     let mut horizon = None;
     let mut budget_policy = None;
     let mut reserve_floors = Vec::new();
@@ -308,8 +310,11 @@ pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, C
             "--approve" => {
                 approve_campaign = true;
             }
-            "--dry-run" | "--no-model" => {
+            "--dry-run" => {
                 dry_run = true;
+            }
+            "--no-model" => {
+                no_model = true;
             }
             value if value.starts_with("--") => return Err(CliError::Usage),
             value => {
@@ -329,6 +334,7 @@ pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, C
         module_replay_report,
         target_ring,
         dry_run,
+        no_model,
         horizon,
         budget_policy,
         reserve_floors,
@@ -1267,7 +1273,7 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         model: options.model,
         default_provider: Some(default_model.provider),
         default_model: Some(default_model.configured_model),
-        dry_run: options.dry_run,
+        dry_run: options.no_model,
     })?;
     let request = prepared.request;
 
@@ -1282,11 +1288,14 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
         data_dir: data_dir.clone(),
         max_steps: None,
     };
-    let report = if request.dry_run {
+    let mut report = if request.dry_run {
         orchestrator.propose(request, None)?
     } else {
         orchestrator.propose(request, Some(&model_runner))?
     };
+    if let Some(sifs_root) = configured_sifs_artifact_root(config.as_ref()) {
+        mirror_evolution_report_bundle_to_sifs(&data_dir, &mut report, &sifs_root)?;
+    }
 
     write_report_record(&paths, &report)?;
     println_report(&report);
@@ -1428,7 +1437,10 @@ fn execute_campaign_iteration_plan(
         data_dir: data_dir.clone(),
         max_steps: None,
     };
-    let report = orchestrator.propose(plan.evolution_request.clone(), Some(&model_runner))?;
+    let mut report = orchestrator.propose(plan.evolution_request.clone(), Some(&model_runner))?;
+    if let Some(sifs_root) = configured_sifs_artifact_root(config) {
+        mirror_evolution_report_bundle_to_sifs(data_dir, &mut report, &sifs_root)?;
+    }
     write_report_record(&paths, &report)?;
     let resource_usage =
         candidate_resource_usage_estimates_for_report(&campaign, &plan.task.task_id, &report)?;

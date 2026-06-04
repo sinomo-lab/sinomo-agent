@@ -4314,6 +4314,7 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
         scorecard_path: None,
         candidate_summary_path: None,
         decision_path: None,
+        artifact_refs: Vec::new(),
         command_logs: Vec::new(),
     };
     std::fs::write(
@@ -14643,6 +14644,26 @@ fn evolve_propose_parser_accepts_common_flags() {
     );
     assert_eq!(options.target_ring, TrustRing::R1TrustedRuntime);
     assert!(options.dry_run);
+    assert!(!options.no_model);
+}
+
+#[test]
+fn evolve_propose_parser_accepts_no_model_candidate_smoke() {
+    let options = parse_propose_options(&[
+        "smoke candidate gates".to_string(),
+        "--no-model".to_string(),
+        "--verify".to_string(),
+        "cargo check -p sinomo-evolution".to_string(),
+        "--benchmark".to_string(),
+        "command:printf ok".to_string(),
+    ])
+    .expect("options");
+
+    assert_eq!(options.objective, "smoke candidate gates");
+    assert!(options.no_model);
+    assert!(!options.dry_run);
+    assert_eq!(options.verify, vec!["cargo check -p sinomo-evolution"]);
+    assert_eq!(options.benchmark, vec!["command:printf ok"]);
 }
 
 #[test]
@@ -14678,6 +14699,7 @@ fn evolve_propose_parser_accepts_campaign_phase_zero_flags() {
     assert_eq!(options.max_wall_time.as_deref(), Some("10m"));
     assert!(options.pause_after_proposal);
     assert!(options.dry_run);
+    assert!(!options.no_model);
 }
 
 #[test]
@@ -15224,6 +15246,7 @@ fn campaign_iteration_execution_overrides_preserve_memory_derived_gates() {
             command: "cargo test -p sinomo-evolution memory_gate".to_string(),
             summary_path: None,
             results_dir: None,
+            progress_path: None,
         },
     }];
     let duplicate_memory_benchmark = benchmark_gates[0].clone();

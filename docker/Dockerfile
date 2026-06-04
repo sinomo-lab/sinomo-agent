@@ -34,7 +34,8 @@ RUN cargo build -p sinomo \
     && install -Dm755 target/debug/sinomo /usr/local/bin/sinomo
 
 COPY docker/entrypoint.sh /usr/local/bin/sinomo-node-entrypoint
-RUN chmod +x /usr/local/bin/sinomo-node-entrypoint
+COPY docker/single-node-entrypoint.sh /usr/local/bin/sinomo-single-node-entrypoint
+RUN chmod +x /usr/local/bin/sinomo-node-entrypoint /usr/local/bin/sinomo-single-node-entrypoint
 
 ENV SINOMO_DATA_DIR=/data
 ENTRYPOINT ["/usr/local/bin/sinomo-node-entrypoint"]

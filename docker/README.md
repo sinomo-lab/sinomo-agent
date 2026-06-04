@@ -3,6 +3,19 @@
 A disposable **6-node** Sinomo cluster partitioned into three network segments, with
 **iroh disabled**, used to develop native (non-iroh) peer **discovery and routing**.
 
+For a minimal one-node cluster used to validate local DFS and self-evolution without
+the incomplete sandbox path, use the separate compose file:
+
+```bash
+docker compose -f docker-compose.single-node.yml up --build -d sinomo-single
+docker compose -f docker-compose.single-node.yml run --rm sinomo-single-smoke
+docker compose -f docker-compose.single-node.yml down -v
+```
+
+`sinomo-single` keeps state in the persistent `single-node-data` volume. The smoke
+service uses container-local data and is discarded after each run so repeated
+smoke tests remain a true one-node cluster.
+
 ## Topology
 
 ```

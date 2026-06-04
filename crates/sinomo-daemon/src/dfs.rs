@@ -24,7 +24,7 @@ use sinomo_dfs::{
     fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
     sifs_node_files_path,
 };
-use sinomo_kv::{KvEntry, KvError, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
@@ -76,10 +76,10 @@ impl DaemonDfsControlPlaneKvClient {
         }
     }
 
-    fn read_only_error(&self) -> KvError {
+    fn daemon_error(&self, source: DaemonError) -> KvError {
         KvError::Io {
             path: self.cluster_paths.kv_snapshot.display().to_string(),
-            detail: "daemon DFS control-plane client is read-only; update cluster DFS control records through cluster KV".to_string(),
+            detail: source.to_string(),
         }
     }
 }
@@ -95,12 +95,33 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
             .map_err(|source| self.network_error(source))
     }
 
-    fn put(&mut self, _key: String, _value: Vec<u8>) -> Result<KvRevision, KvError> {
-        Err(self.read_only_error())
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+        let response = self.txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key,
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })?;
+        Ok(response.revision)
     }
 
-    fn txn(&mut self, _txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        Err(self.read_only_error())
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        let mut state = sinomo_network::read_cluster_state(&self.cluster_paths)
+            .map_err(|source| self.network_error(source))?;
+        let (snapshot, response) = crate::cluster::commit_cluster_kv_txn_with_quorum_response(
+            &self.cluster_paths,
+            &mut state,
+            txn,
+        )
+        .map_err(|source| self.daemon_error(source))?;
+        Ok(response.unwrap_or(KvTxnResponse {
+            succeeded: true,
+            revision: snapshot.revision,
+            responses: Vec::new(),
+        }))
     }
 }
 
@@ -1899,6 +1920,7 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
     if !cluster_paths.state.exists() {
         return Err(DaemonError::ClusterOrphan);
     }
+    ensure_default_distributed_dfs(paths, &DaemonRunOptions::default(), true)?;
     let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
     let mut content_nodes =
         sinomo_network::read_cluster_kv_prefix_entries(&cluster_paths, content_services_prefix())?
@@ -1920,12 +1942,14 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
         .filter(|node_id| node_id != &state.local_node_id)
         .filter(|node_id| endpoint_node_ids.contains(node_id))
         .collect::<Vec<_>>();
-    if remote_candidates.is_empty() {
-        return Err(DaemonError::Parse {
-            detail: "DFS smoke requires an advertised remote content node with a daemon endpoint"
-                .to_string(),
-        });
-    }
+    let replica_candidate_sets = if remote_candidates.is_empty() {
+        vec![vec![state.local_node_id.clone()]]
+    } else {
+        remote_candidates
+            .into_iter()
+            .map(|remote_node_id| vec![state.local_node_id.clone(), remote_node_id])
+            .collect()
+    };
 
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
     let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
@@ -1943,15 +1967,20 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
     let nonce = OffsetDateTime::now_utc().unix_timestamp_nanos();
     let mut attempts = Vec::new();
     let mut successful = None;
-    for remote_node_id in remote_candidates {
-        let replica_candidates = vec![state.local_node_id.clone(), remote_node_id.clone()];
-        let path = format!("/services/dfs-smoke/{nonce}-{remote_node_id}.txt");
-        let body = format!("sinomo dfs smoke {nonce} {remote_node_id}\n");
+    for replica_candidates in replica_candidate_sets {
+        let target_label = replica_candidates
+            .iter()
+            .map(|node_id| node_id.to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+        let replica_count = replica_candidates.len();
+        let path = format!("/services/dfs-smoke/{nonce}-{target_label}.txt");
+        let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
         match service.posix_write_file(
             &path,
             body.as_bytes(),
             DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(2, 2)?,
+                policy: DfsReplicationPolicy::new(replica_count, replica_count)?,
                 replica_candidates: replica_candidates.clone(),
                 wait_for_commit: true,
             },
@@ -1985,10 +2014,19 @@ pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport,
     let Some((stat, replica_candidates)) = successful else {
         return Err(DaemonError::Parse {
             detail: format!(
-                "DFS smoke did not commit on any remote content node: {}",
+                "DFS smoke did not commit on any candidate replica set: {}",
                 attempts
                     .iter()
-                    .map(|attempt| format!("{} => {}", attempt.replica_node_ids[1], attempt.detail))
+                    .map(|attempt| format!(
+                        "{} => {}",
+                        attempt
+                            .replica_node_ids
+                            .iter()
+                            .map(|node_id| node_id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        attempt.detail
+                    ))
                     .collect::<Vec<_>>()
                     .join("; ")
             ),
@@ -4998,6 +5036,58 @@ mod tests {
                 .expect("metadata journal")
                 .is_empty(),
             "non-primary bootstrap must not create root-shard journal entries"
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn daemon_dfs_smoke_commits_single_node_cluster_locally() {
+        let root = temp_root("daemon_dfs_smoke_single_node");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let data_dir = SinomoDataDir::new(&data_root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let local = NodeId::from_legacy_named("node_dfs_smoke_single").expect("local node");
+        let cluster_id = sinomo_network::ClusterId::from_legacy_named("cluster_dfs_smoke_single")
+            .expect("cluster");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "dfs smoke single",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0].capabilities =
+            sinomo_node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("sync raft");
+        ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), true)
+            .expect("bootstrap dfs");
+
+        let report = run_daemon_dfs_smoke(&paths).expect("dfs smoke");
+
+        assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
+        assert_eq!(report.committed_replica_node_ids, vec![local]);
+        assert_eq!(report.attempts.len(), 1);
+        assert!(report.attempts[0].committed);
+        assert_eq!(
+            report.attempts[0].replica_node_ids,
+            report.requested_replica_node_ids
+        );
+        assert!(report.path.starts_with("/services/dfs-smoke/"));
+        assert!(
+            !report
+                .metadata_replication
+                .outcomes
+                .iter()
+                .any(|outcome| matches!(
+                    outcome,
+                    DaemonDfsMetadataReplicationOutcome::MissingShard { .. }
+                ))
         );
 
         cleanup(&root);

@@ -369,6 +369,9 @@ impl From<sinomo_evolution::EvolutionPersistenceError> for CliError {
             sinomo_evolution::EvolutionPersistenceError::Config { key, detail } => Self::Parse {
                 detail: format!("evolution config `{key}`: {detail}"),
             },
+            sinomo_evolution::EvolutionPersistenceError::Sifs { path, detail } => Self::Parse {
+                detail: format!("evolution SIFS artifact mirror error at {path}: {detail}"),
+            },
             sinomo_evolution::EvolutionPersistenceError::MissingArtifact { artifact } => {
                 Self::MissingArtifact { artifact }
             }

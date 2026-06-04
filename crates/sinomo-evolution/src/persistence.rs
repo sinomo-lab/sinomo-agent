@@ -4,9 +4,10 @@ use crate::{
     BackgroundSchedulingPlan, CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH,
     CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH, CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH,
     CampaignDecision, CampaignDecisionKind, CampaignScheduleDecision,
-    CandidateApprovalPreflightReport, CandidateBundleManifest, CandidateDecision,
-    CandidateDecisionOutcome, CandidateEvolutionLessonRecord, CandidateRegressionEvidenceSummary,
-    EvolutionCampaign, EvolutionCampaignStatus, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
+    CandidateApprovalPreflightReport, CandidateBundleManifest, CandidateBundleSifsMirrorFile,
+    CandidateBundleSifsMirrorReport, CandidateDecision, CandidateDecisionOutcome,
+    CandidateEvolutionLessonRecord, CandidateRegressionEvidenceSummary, EvolutionCampaign,
+    EvolutionCampaignStatus, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
     EvolutionLessonMemoryRecord, EvolutionRegressionGateMemoryRecord, EvolutionReport,
     ResourceSchedulerDryRun, ScheduledIterationPlan, StageEvaluationUpdate,
 };
@@ -17,17 +18,27 @@ use sinomo_runtime::config::{
     ConfigStore, ConfigValueType, ConfigWriteTarget,
 };
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
+use sinomo_runtime::daemon::{DaemonDfsEndpointTransport, DaemonPaths};
+use sinomo_runtime::dfs::{
+    DfsMetadataShardConfig, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
+    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    sifs_file_system_id,
+};
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{self, ClusterPaths};
 use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const EVOLUTION_CONFIG_KEY: &str = "evolution.config";
+pub const DEFAULT_EVOLUTION_SIFS_ARTIFACT_ROOT: &str = "/services/evolution/artifacts";
+pub const CANDIDATE_SIFS_MIRROR_RELATIVE_PATH: &str = "sifs-mirror.json";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionConfig {
@@ -36,6 +47,12 @@ pub struct EvolutionConfig {
     pub default_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(default = "default_evolution_sifs_artifact_root")]
+    pub sifs_artifact_root: String,
+}
+
+pub fn default_evolution_sifs_artifact_root() -> String {
+    DEFAULT_EVOLUTION_SIFS_ARTIFACT_ROOT.to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -271,6 +288,112 @@ pub fn write_report_record(
     }
     write_candidate_evolution_memory(paths, report)?;
     Ok(())
+}
+
+pub fn configured_sifs_artifact_root(config: Option<&EvolutionConfig>) -> Option<String> {
+    let root = config
+        .map(|config| config.sifs_artifact_root.clone())
+        .unwrap_or_else(default_evolution_sifs_artifact_root);
+    let root = root.trim();
+    if root.is_empty() {
+        None
+    } else {
+        Some(root.to_string())
+    }
+}
+
+pub fn mirror_evolution_report_bundle_to_sifs(
+    data_dir: &SinomoDataDir,
+    report: &mut EvolutionReport,
+    sifs_root: &str,
+) -> Result<CandidateBundleSifsMirrorReport, EvolutionPersistenceError> {
+    mirror_candidate_bundle_to_sifs(data_dir, &mut report.bundle, sifs_root)
+}
+
+pub fn mirror_candidate_bundle_to_sifs(
+    data_dir: &SinomoDataDir,
+    bundle: &mut CandidateBundleManifest,
+    sifs_root: &str,
+) -> Result<CandidateBundleSifsMirrorReport, EvolutionPersistenceError> {
+    let bundle_root = PathBuf::from(&bundle.bundle_path);
+    let sifs_root = normalize_sifs_path(sifs_root)?;
+    let sifs_bundle_path = join_sifs_path(&sifs_root, bundle.job_id.as_str())?;
+    let mut service = open_evolution_sifs_service(data_dir)?;
+    service
+        .posix_mkdir_all(&sifs_bundle_path)
+        .map_err(|source| EvolutionPersistenceError::Sifs {
+            path: sifs_bundle_path.clone(),
+            detail: source.to_string(),
+        })?;
+
+    let mut local_files = Vec::new();
+    let mut skipped_paths = Vec::new();
+    collect_bundle_sifs_mirror_files(
+        &bundle_root,
+        &bundle_root,
+        &mut local_files,
+        &mut skipped_paths,
+    )?;
+
+    let mut mirrored_files = Vec::new();
+    for local_path in local_files {
+        let relative = bundle_relative_path(&bundle_root, &local_path);
+        let sifs_path = join_sifs_path(&sifs_bundle_path, &relative)?;
+        let file = fs::File::open(&local_path).map_err(|source| EvolutionPersistenceError::Io {
+            path: local_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mirrored = write_reader_to_sifs(&mut service, &sifs_path, file)?;
+        mirrored_files.push(CandidateBundleSifsMirrorFile {
+            relative_path: relative,
+            sifs_path,
+            bytes: mirrored.bytes,
+            digest: mirrored.digest,
+        });
+    }
+
+    let sifs_report_path = join_sifs_path(&sifs_bundle_path, CANDIDATE_SIFS_MIRROR_RELATIVE_PATH)?;
+    let mut report = CandidateBundleSifsMirrorReport {
+        bundle_path: bundle.bundle_path.clone(),
+        sifs_bundle_path: sifs_bundle_path.clone(),
+        sifs_report_path: sifs_report_path.clone(),
+        generated_at: current_rfc3339(),
+        mirrored_files,
+        skipped_paths,
+        metadata_publish_error: None,
+    };
+
+    match sinomo_runtime::daemon::publish_default_dfs_metadata_journal(&DaemonPaths::new(data_dir))
+    {
+        Ok(_) => {}
+        Err(error) => report.metadata_publish_error = Some(error.to_string()),
+    }
+    let local_report_path = bundle_root.join(CANDIDATE_SIFS_MIRROR_RELATIVE_PATH);
+    write_json(&local_report_path, &report)?;
+    let report_bytes =
+        serde_json::to_vec_pretty(&report).map_err(|source| EvolutionPersistenceError::Json {
+            path: local_report_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    write_bytes_to_sifs(&mut service, &sifs_report_path, &report_bytes)?;
+
+    bundle
+        .artifact_refs
+        .push(format!("sifs://{}", report.sifs_bundle_path));
+    bundle
+        .artifact_refs
+        .push(format!("sifs://{}", report.sifs_report_path));
+    bundle.artifact_refs.extend(
+        report
+            .mirrored_files
+            .iter()
+            .map(|file| format!("sifs://{}", file.sifs_path)),
+    );
+    bundle.artifact_refs.sort();
+    bundle.artifact_refs.dedup();
+    write_json(&bundle_root.join("manifest.json"), bundle)?;
+
+    Ok(report)
 }
 
 pub fn write_candidate_evolution_memory(
@@ -1380,6 +1503,7 @@ mod tests {
             repo: root.join("source").display().to_string(),
             default_provider: Some("openai".to_string()),
             default_model: Some("gpt-5.5".to_string()),
+            sifs_artifact_root: default_evolution_sifs_artifact_root(),
         };
 
         write_config(&paths, &config).expect("write config");
@@ -1410,6 +1534,7 @@ mod tests {
             repo: root.join("source").display().to_string(),
             default_provider: Some("codex".to_string()),
             default_model: Some("gpt-5.5".to_string()),
+            sifs_artifact_root: default_evolution_sifs_artifact_root(),
         };
         write_json(&paths.legacy_config, &config).expect("legacy config");
 
@@ -1421,6 +1546,114 @@ mod tests {
         )
         .expect("config document");
         assert_eq!(document.key.as_str(), EVOLUTION_CONFIG_KEY);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mirror_candidate_bundle_to_sifs_persists_local_artifacts_and_skips_workspaces() {
+        let root = temp_dir("sifs-mirror");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let mut record = stored_record_fixture(&root, EvolutionJobStatus::AwaitingApproval);
+        let bundle_dir = PathBuf::from(&record.bundle.bundle_path);
+        fs::create_dir_all(&bundle_dir).expect("bundle dir");
+        fs::write(&record.bundle.mutation_packet_path, r#"{"task":"smoke"}"#)
+            .expect("mutation packet");
+        let benchmark_summary = bundle_dir
+            .join("benchmarks")
+            .join("swebench")
+            .join("summary.json");
+        fs::create_dir_all(benchmark_summary.parent().expect("summary parent"))
+            .expect("benchmark dir");
+        fs::write(&benchmark_summary, r#"{"resolved":0}"#).expect("summary");
+        let workspace_file = bundle_dir
+            .join("benchmarks")
+            .join("swebench")
+            .join("sinomo")
+            .join("workspaces")
+            .join("instance")
+            .join("README.md");
+        fs::create_dir_all(workspace_file.parent().expect("workspace parent"))
+            .expect("workspace dir");
+        fs::write(&workspace_file, "large checkout").expect("workspace file");
+        let worktree_file = bundle_dir.join("worktree").join("README.md");
+        fs::create_dir_all(worktree_file.parent().expect("worktree parent")).expect("worktree dir");
+        fs::write(&worktree_file, "candidate checkout").expect("worktree file");
+
+        let report = mirror_candidate_bundle_to_sifs(
+            &data_dir,
+            &mut record.bundle,
+            DEFAULT_EVOLUTION_SIFS_ARTIFACT_ROOT,
+        )
+        .expect("mirror bundle");
+
+        assert_eq!(
+            report.sifs_bundle_path,
+            format!(
+                "{}/{}",
+                DEFAULT_EVOLUTION_SIFS_ARTIFACT_ROOT,
+                record.bundle.job_id.as_str()
+            )
+        );
+        assert_eq!(
+            report.sifs_report_path,
+            format!(
+                "{}/{}",
+                report.sifs_bundle_path, CANDIDATE_SIFS_MIRROR_RELATIVE_PATH
+            )
+        );
+        assert!(
+            report
+                .mirrored_files
+                .iter()
+                .any(|file| file.relative_path == "mutation-packet.json")
+        );
+        assert!(
+            report
+                .mirrored_files
+                .iter()
+                .any(|file| file.relative_path == "benchmarks/swebench/summary.json")
+        );
+        assert!(
+            report
+                .skipped_paths
+                .iter()
+                .any(|path| path == "benchmarks/swebench/sinomo/workspaces")
+        );
+        assert!(report.skipped_paths.iter().any(|path| path == "worktree"));
+        assert!(
+            !report
+                .mirrored_files
+                .iter()
+                .any(|file| file.relative_path.contains("/workspaces/"))
+        );
+        assert!(
+            !report
+                .mirrored_files
+                .iter()
+                .any(|file| file.relative_path.starts_with("worktree/"))
+        );
+        assert!(
+            record
+                .bundle
+                .artifact_refs
+                .iter()
+                .any(|artifact| artifact == &format!("sifs://{}", report.sifs_report_path))
+        );
+        let stored_manifest: CandidateBundleManifest =
+            read_json_file(&bundle_dir.join("manifest.json")).expect("stored manifest");
+        assert_eq!(stored_manifest.artifact_refs, record.bundle.artifact_refs);
+
+        let service = open_evolution_sifs_service(&data_dir).expect("open sifs");
+        assert_eq!(
+            service
+                .posix_read_file(&format!("{}/mutation-packet.json", report.sifs_bundle_path))
+                .expect("read mirrored packet"),
+            br#"{"task":"smoke"}"#
+        );
+        let local_report: CandidateBundleSifsMirrorReport =
+            read_json_file(&bundle_dir.join(CANDIDATE_SIFS_MIRROR_RELATIVE_PATH))
+                .expect("local mirror report");
+        assert_eq!(local_report, report);
         fs::remove_dir_all(root).ok();
     }
 
@@ -1490,6 +1723,7 @@ mod tests {
                 scorecard_path: None,
                 candidate_summary_path: None,
                 decision_path: None,
+                artifact_refs: Vec::new(),
                 command_logs: Vec::new(),
             },
             verification_outcome: Some(EvaluationOutcome::Passed),
@@ -1591,6 +1825,7 @@ mod tests {
                 scorecard_path: None,
                 candidate_summary_path: None,
                 decision_path: None,
+                artifact_refs: Vec::new(),
                 command_logs: Vec::new(),
             },
             verification_outcome: None,
@@ -1698,6 +1933,7 @@ mod tests {
                 scorecard_path: None,
                 candidate_summary_path: None,
                 decision_path: None,
+                artifact_refs: Vec::new(),
                 command_logs: Vec::new(),
             },
             verification_outcome: None,
@@ -2303,6 +2539,7 @@ mod tests {
                 scorecard_path: None,
                 candidate_summary_path: None,
                 decision_path: None,
+                artifact_refs: Vec::new(),
                 command_logs: Vec::new(),
             },
             verification_outcome: None,
@@ -2310,6 +2547,273 @@ mod tests {
             decision: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct SifsWriteDigest {
+    bytes: u64,
+    digest: String,
+}
+
+fn open_evolution_sifs_service(
+    data_dir: &SinomoDataDir,
+) -> Result<NetworkedDfsService<DaemonDfsEndpointTransport>, EvolutionPersistenceError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| EvolutionPersistenceError::Io {
+            path: data_dir.root().display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let (local_node_id, endpoints) = if cluster_paths.state.exists() {
+        let state = network::read_cluster_state_without_kv(&cluster_paths).map_err(|source| {
+            EvolutionPersistenceError::Sifs {
+                path: cluster_paths.state.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+        let endpoints = network::cluster_dfs_protocol_targets(&cluster_paths, &state);
+        (state.local_node_id, endpoints)
+    } else {
+        (fallback_dfs_node_id(), Vec::new())
+    };
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(|source| {
+        EvolutionPersistenceError::Sifs {
+            path: data_dir.dfs_dir().join("content").display().to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    let service = NetworkedDfsService::new(
+        DaemonDfsEndpointTransport::new(local_node_id, endpoints),
+        content,
+    );
+    let service = if let Some(metadata) =
+        open_evolution_sifs_sharded_metadata_backend(data_dir, &cluster_paths)?
+    {
+        service.with_metadata_backend(metadata).map_err(|source| {
+            EvolutionPersistenceError::Sifs {
+                path: default_dfs_metadata_shards_root(data_dir)
+                    .display()
+                    .to_string(),
+                detail: source.to_string(),
+            }
+        })?
+    } else {
+        let metadata = open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
+            .map_err(|source| EvolutionPersistenceError::Sifs {
+                path: default_dfs_metadata_root(data_dir).display().to_string(),
+                detail: source.to_string(),
+            })?;
+        service.with_metadata_backend(metadata).map_err(|source| {
+            EvolutionPersistenceError::Sifs {
+                path: default_dfs_metadata_root(data_dir).display().to_string(),
+                detail: source.to_string(),
+            }
+        })?
+    };
+    let mut service = service;
+    service
+        .bootstrap_distributed_sifs()
+        .map_err(|source| EvolutionPersistenceError::Sifs {
+            path: "/".to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(service)
+}
+
+fn open_evolution_sifs_sharded_metadata_backend(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Option<sinomo_runtime::dfs::LocalShardedMetadataBackend>, EvolutionPersistenceError> {
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let file_system_id = sifs_file_system_id();
+    let entries = network::read_cluster_kv_prefix_entries(
+        cluster_paths,
+        &format!("{}/", metadata_shards_prefix(&file_system_id)),
+    )
+    .map_err(|source| EvolutionPersistenceError::Sifs {
+        path: metadata_shards_prefix(&file_system_id),
+        detail: source.to_string(),
+    })?;
+    let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
+    for entry in entries {
+        shards.push(
+            entry
+                .decode()
+                .map_err(|source| EvolutionPersistenceError::Sifs {
+                    path: entry.key.clone(),
+                    detail: source.to_string(),
+                })?,
+        );
+    }
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    if shards.is_empty() {
+        return Ok(None);
+    }
+    open_local_sharded_metadata_backend(default_dfs_metadata_shards_root(data_dir), shards)
+        .map(Some)
+        .map_err(|source| EvolutionPersistenceError::Sifs {
+            path: default_dfs_metadata_shards_root(data_dir)
+                .display()
+                .to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn collect_bundle_sifs_mirror_files(
+    bundle_root: &Path,
+    path: &Path,
+    files: &mut Vec<PathBuf>,
+    skipped_paths: &mut Vec<String>,
+) -> Result<(), EvolutionPersistenceError> {
+    let entries = fs::read_dir(path).map_err(|source| EvolutionPersistenceError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| EvolutionPersistenceError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let entry_path = entry.path();
+        let relative = bundle_relative_path(bundle_root, &entry_path);
+        if should_skip_sifs_bundle_mirror_path(&relative) {
+            skipped_paths.push(relative);
+            continue;
+        }
+        if entry_path.is_dir() {
+            collect_bundle_sifs_mirror_files(bundle_root, &entry_path, files, skipped_paths)?;
+        } else if entry_path.is_file() {
+            files.push(entry_path);
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_sifs_bundle_mirror_path(relative: &str) -> bool {
+    relative == CANDIDATE_SIFS_MIRROR_RELATIVE_PATH
+        || relative == "worktree"
+        || relative.starts_with("worktree/")
+        || relative.split('/').any(|part| part == ".git")
+        || relative
+            .split('/')
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|window| {
+                window == ["sinomo", "workspaces"] || window == ["mini-swe-agent", "workspaces"]
+            })
+}
+
+fn write_reader_to_sifs<R: Read>(
+    service: &mut NetworkedDfsService<DaemonDfsEndpointTransport>,
+    sifs_path: &str,
+    mut reader: R,
+) -> Result<SifsWriteDigest, EvolutionPersistenceError> {
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .map_err(|source| EvolutionPersistenceError::Io {
+            path: sifs_path.to_string(),
+            detail: source.to_string(),
+        })?;
+    write_bytes_to_sifs(service, sifs_path, &bytes)
+}
+
+fn write_bytes_to_sifs(
+    service: &mut NetworkedDfsService<DaemonDfsEndpointTransport>,
+    sifs_path: &str,
+    bytes: &[u8],
+) -> Result<SifsWriteDigest, EvolutionPersistenceError> {
+    let parent = parent_sifs_path(sifs_path)?;
+    service
+        .posix_mkdir_all(&parent)
+        .map_err(|source| EvolutionPersistenceError::Sifs {
+            path: parent.clone(),
+            detail: source.to_string(),
+        })?;
+    let options = DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()]);
+    service
+        .posix_write_file(sifs_path, bytes, options)
+        .map_err(|source| EvolutionPersistenceError::Sifs {
+            path: sifs_path.to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(SifsWriteDigest {
+        bytes: bytes.len() as u64,
+        digest: format!("blake3:{}", blake3::hash(bytes).to_hex()),
+    })
+}
+
+fn normalize_sifs_path(path: &str) -> Result<String, EvolutionPersistenceError> {
+    let path = path.trim();
+    if path.bytes().any(|byte| byte == 0) {
+        return Err(EvolutionPersistenceError::Sifs {
+            path: path.to_string(),
+            detail: "path contains an embedded NUL byte".to_string(),
+        });
+    }
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            value => parts.push(value),
+        }
+    }
+    Ok(format!("/{}", parts.join("/")))
+}
+
+fn join_sifs_path(parent: &str, child: &str) -> Result<String, EvolutionPersistenceError> {
+    let mut path = normalize_sifs_path(parent)?;
+    for part in child.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                return Err(EvolutionPersistenceError::Sifs {
+                    path: child.to_string(),
+                    detail: "relative SIFS child path cannot contain `..`".to_string(),
+                });
+            }
+            value => {
+                if path != "/" {
+                    path.push('/');
+                }
+                path.push_str(value);
+            }
+        }
+    }
+    normalize_sifs_path(&path)
+}
+
+fn parent_sifs_path(path: &str) -> Result<String, EvolutionPersistenceError> {
+    let path = normalize_sifs_path(path)?;
+    let Some((parent, _)) = path.rsplit_once('/') else {
+        return Ok("/".to_string());
+    };
+    if parent.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(parent.to_string())
+    }
+}
+
+fn bundle_relative_path(bundle_root: &Path, path: &Path) -> String {
+    path.strip_prefix(bundle_root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn current_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown-time".to_string())
 }
 
 pub fn safe_file_stem(value: &str) -> String {
@@ -2339,6 +2843,8 @@ pub enum EvolutionPersistenceError {
     Json { path: String, detail: String },
     #[error("evolution config error for {key}: {detail}")]
     Config { key: String, detail: String },
+    #[error("evolution SIFS artifact mirror error at {path}: {detail}")]
+    Sifs { path: String, detail: String },
     #[error("missing evolution artifact: {artifact}")]
     MissingArtifact { artifact: String },
 }

@@ -13,6 +13,14 @@ sinomo --local providers test deepseek
 ```
 
 Docker is required for official SWE-bench evaluation and for the mini-SWE-agent baseline.
+When the system Python is newer than the SWE-bench package supports, use a repo-local Python 3.11 environment:
+
+```sh
+uv venv --python python3.11 target/tmp/swebench-venv
+uv pip install --python target/tmp/swebench-venv/bin/python swebench
+```
+
+Evolution benchmark gates use `SINOMO_SWEBENCH_PYTHON` when it is set. If it is not set, they automatically prefer `target/tmp/swebench-venv/bin/python` when that file exists, then fall back to `python3`.
 
 ## Plan
 
@@ -28,12 +36,16 @@ python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py \
   --provider deepseek \
   --model deepseek-v4-flash \
   --limit 1 \
-  --max-steps 20
+  --max-steps 20 \
+  --summary-out benchmark-results/swebench/summary.json \
+  --progress-out benchmark-results/swebench/progress.jsonl
 ```
 
-The Sinomo path prepares local Git checkouts, runs `sinomo-swebench-agent` inside each checkout with local workspace tools, writes per-instance reports and full `*.run.json` traces under `benchmark-results/swebench/sinomo`, and writes `predictions.jsonl` in SWE-bench prediction format.
+The Sinomo path prepares local Git checkouts, runs `sinomo-swebench-agent` inside each checkout with local workspace tools, writes per-instance reports, full `*.run.json` traces, live agent `*.trace.jsonl` records, post-patch syntax-check results, and bounded repair-pass counters under `benchmark-results/swebench/sinomo`, and writes `predictions.jsonl` in SWE-bench prediction format. The repair pass is used when a patch fails the post-patch syntax check or when the initial pass exhausts its step budget without leaving a patch. For Python indentation syntax failures, the harness also runs a narrow deterministic cleanup that restores base-file indentation on changed lines before rerunning the syntax check.
 
 Use `--limit 1` for a first smoke run or `--instance-id <id>` to rerun a specific checked-in instance.
+Use `--progress-out` to write newline-delimited JSON progress events while the run is active.
+Use `--repair-steps 0` to disable the bounded repair turn when a post-patch syntax check fails.
 
 ## mini-SWE-agent Baseline
 
@@ -59,4 +71,4 @@ python -m swebench.harness.run_evaluation \
 ```
 
 The Python runner can run this command after the Sinomo pass with `--evaluate`.
-When `--evaluate` is used, SWE-bench summary files and per-instance logs are written under `<results-dir>/evaluation`.
+When `--evaluate` is used, SWE-bench summary files and per-instance logs are written under `<results-dir>/evaluation`; run the Python runner through the repo-local venv if SWE-bench is installed there.

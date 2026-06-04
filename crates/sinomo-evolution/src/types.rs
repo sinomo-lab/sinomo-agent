@@ -209,6 +209,8 @@ pub struct CandidateBundleManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command_logs: Vec<CommandLogRef>,
 }
 
@@ -266,6 +268,28 @@ pub struct CandidateBundlePredicate {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_refs: Vec<String>,
     pub generated_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateBundleSifsMirrorReport {
+    pub bundle_path: String,
+    pub sifs_bundle_path: String,
+    pub sifs_report_path: String,
+    pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mirrored_files: Vec<CandidateBundleSifsMirrorFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_publish_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CandidateBundleSifsMirrorFile {
+    pub relative_path: String,
+    pub sifs_path: String,
+    pub bytes: u64,
+    pub digest: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

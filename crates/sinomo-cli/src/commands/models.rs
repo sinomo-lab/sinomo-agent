@@ -1392,6 +1392,29 @@ pub(crate) fn println_report(report: &EvolutionReport) {
     println!("status: {}", job_status_label(&report.job.status));
     println!("worktree: {}", report.candidate_workspace.path.display());
     println!("bundle: {}", report.bundle.bundle_path);
+    if let Some(benchmark_results_path) = &report.bundle.benchmark_results_path {
+        println!("benchmark results: {benchmark_results_path}");
+    }
+    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
+        println!("resource usage: {resource_usage_path}");
+    }
+    if let Some(sifs_mirror_ref) = report
+        .bundle
+        .artifact_refs
+        .iter()
+        .find(|artifact_ref| artifact_ref.ends_with("/sifs-mirror.json"))
+    {
+        println!("sifs mirror: {sifs_mirror_ref}");
+    }
+    for artifact_ref in report
+        .bundle
+        .artifact_refs
+        .iter()
+        .filter(|artifact_ref| artifact_ref.starts_with("sifs://"))
+        .take(3)
+    {
+        println!("artifact: {artifact_ref}");
+    }
     println!("verification: {verification}");
 }
 

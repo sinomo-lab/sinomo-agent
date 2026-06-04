@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import shlex
@@ -20,6 +21,32 @@ HF_ROWS_URL = (
     "https://datasets-server.huggingface.co/rows?"
     "dataset=princeton-nlp%2FSWE-bench_Verified&config=default&split=test"
 )
+
+
+def utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+class ProgressWriter:
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+
+    def emit(self, event: str, **fields: object) -> None:
+        if not self.path:
+            return
+        payload = {
+            "time": utc_now(),
+            "event": event,
+            **fields,
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        details = " ".join(
+            f"{key}={value}" for key, value in payload.items() if key not in {"time", "event"}
+        )
+        suffix = f" {details}" if details else ""
+        print(f"progress: {event}{suffix}", flush=True)
 
 
 def load_suite(path: Path) -> dict:
@@ -60,17 +87,67 @@ def suite_filter_regex(instance_ids: list[str]) -> str:
     return "^(" + "|".join(re.escape(instance_id) for instance_id in instance_ids) + ")$"
 
 
-def run_command(command: list[str], *, cwd: Path | None = None, dry_run: bool = False) -> None:
+def run_command(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    dry_run: bool = False,
+    progress: ProgressWriter | None = None,
+    phase: str | None = None,
+    **progress_fields: object,
+) -> None:
     print("$ " + shlex.join(command), flush=True)
+    command_text = shlex.join(command)
+    if progress:
+        progress.emit(
+            "command-start",
+            phase=phase,
+            command=command_text,
+            cwd=str(cwd) if cwd else str(REPO_ROOT),
+            dry_run=dry_run,
+            **progress_fields,
+        )
     if dry_run:
+        if progress:
+            progress.emit(
+                "command-complete",
+                phase=phase,
+                command=command_text,
+                exit_code=0,
+                dry_run=True,
+                **progress_fields,
+            )
         return
-    subprocess.run(command, cwd=cwd, check=True)
+    try:
+        subprocess.run(command, cwd=cwd, check=True)
+    except subprocess.CalledProcessError as source:
+        if progress:
+            progress.emit(
+                "command-failed",
+                phase=phase,
+                command=command_text,
+                exit_code=source.returncode,
+                **progress_fields,
+            )
+        raise
+    if progress:
+        progress.emit(
+            "command-complete",
+            phase=phase,
+            command=command_text,
+            exit_code=0,
+            **progress_fields,
+        )
 
 
-def fetch_suite_rows(instance_ids: list[str]) -> dict[str, dict]:
+def fetch_suite_rows(instance_ids: list[str], progress: ProgressWriter | None = None) -> dict[str, dict]:
     wanted = set(instance_ids)
     found: dict[str, dict] = {}
+    if progress:
+        progress.emit("fetch-suite-start", requested_instances=len(instance_ids))
     for offset in range(0, 500, 100):
+        if progress:
+            progress.emit("fetch-suite-page-start", offset=offset, length=100)
         with urllib.request.urlopen(f"{HF_ROWS_URL}&offset={offset}&length=100", timeout=60) as response:
             payload = json.load(response)
         for row in payload.get("rows", []):
@@ -78,42 +155,89 @@ def fetch_suite_rows(instance_ids: list[str]) -> dict[str, dict]:
             instance_id = task["instance_id"]
             if instance_id in wanted:
                 found[instance_id] = task
+        if progress:
+            progress.emit(
+                "fetch-suite-page-complete",
+                offset=offset,
+                found_instances=len(found),
+                requested_instances=len(instance_ids),
+            )
         if wanted.issubset(found):
+            if progress:
+                progress.emit("fetch-suite-complete", found_instances=len(found))
             return found
     missing = sorted(wanted.difference(found))
     raise SystemExit(f"could not fetch SWE-bench rows for: {', '.join(missing)}")
 
 
-def prepare_workspace(task: dict, workspaces_dir: Path, *, dry_run: bool) -> Path:
+def prepare_workspace(
+    task: dict,
+    workspaces_dir: Path,
+    *,
+    dry_run: bool,
+    progress: ProgressWriter | None,
+) -> Path:
     instance_id = task["instance_id"]
     repo = task["repo"]
     base_commit = task["base_commit"]
     workspace = workspaces_dir / instance_id
     repo_url = f"https://github.com/{repo}.git"
     if not workspace.exists():
-        run_command(["git", "clone", repo_url, str(workspace)], dry_run=dry_run)
+        run_command(
+            ["git", "clone", repo_url, str(workspace)],
+            dry_run=dry_run,
+            progress=progress,
+            phase="workspace-clone",
+            instance_id=instance_id,
+        )
     if dry_run:
         print("$ " + " ".join(["git", "checkout", "-f", base_commit]) + f"  # cwd={workspace}")
         print("$ " + " ".join(["git", "clean", "-fdx"]) + f"  # cwd={workspace}")
         return workspace
-    run_command(["git", "fetch", "--tags", "--force", "origin"], cwd=workspace)
-    run_command(["git", "checkout", "-f", base_commit], cwd=workspace)
-    run_command(["git", "clean", "-fdx"], cwd=workspace)
+    run_command(
+        ["git", "fetch", "--tags", "--force", "origin"],
+        cwd=workspace,
+        progress=progress,
+        phase="workspace-fetch",
+        instance_id=instance_id,
+    )
+    run_command(
+        ["git", "checkout", "-f", base_commit],
+        cwd=workspace,
+        progress=progress,
+        phase="workspace-checkout",
+        instance_id=instance_id,
+    )
+    run_command(
+        ["git", "clean", "-fdx"],
+        cwd=workspace,
+        progress=progress,
+        phase="workspace-clean",
+        instance_id=instance_id,
+    )
     return workspace
 
 
-def ensure_sinomo_agent_binary(binary: Path, *, dry_run: bool) -> None:
+def ensure_sinomo_agent_binary(
+    binary: Path,
+    *,
+    dry_run: bool,
+    progress: ProgressWriter | None,
+) -> None:
     if binary.exists() or dry_run:
         return
     run_command(
         ["cargo", "build", "-p", "sinomo-benchmarks", "--bin", "sinomo-swebench-agent"],
         cwd=REPO_ROOT,
+        progress=progress,
+        phase="build-agent",
     )
 
 
-def run_sinomo(args: argparse.Namespace, suite: dict) -> Path:
+def run_sinomo(args: argparse.Namespace, suite: dict, progress: ProgressWriter) -> Path:
     instance_ids = [item["instance_id"] for item in suite["instances"]]
-    tasks = fetch_suite_rows(instance_ids)
+    progress.emit("sinomo-start", total_instances=len(instance_ids))
+    tasks = fetch_suite_rows(instance_ids, progress)
     output_dir = args.results_dir / "sinomo"
     reports_dir = output_dir / "reports"
     task_dir = output_dir / "tasks"
@@ -122,17 +246,36 @@ def run_sinomo(args: argparse.Namespace, suite: dict) -> Path:
         if not args.dry_run:
             directory.mkdir(parents=True, exist_ok=True)
     agent_bin = args.sinomo_agent_bin
-    ensure_sinomo_agent_binary(agent_bin, dry_run=args.dry_run)
+    ensure_sinomo_agent_binary(agent_bin, dry_run=args.dry_run, progress=progress)
     predictions_path = output_dir / "predictions.jsonl"
     if not args.dry_run:
         predictions_path.parent.mkdir(parents=True, exist_ok=True)
         predictions_path.write_text("", encoding="utf-8")
-    for instance_id in instance_ids:
+    for index, instance_id in enumerate(instance_ids, start=1):
+        progress.emit(
+            "sinomo-instance-start",
+            instance_id=instance_id,
+            current=index,
+            total=len(instance_ids),
+        )
         task = tasks[instance_id]
-        workspace = prepare_workspace(task, workspaces_dir, dry_run=args.dry_run)
+        workspace = prepare_workspace(
+            task,
+            workspaces_dir,
+            dry_run=args.dry_run,
+            progress=progress,
+        )
+        progress.emit(
+            "sinomo-workspace-ready",
+            instance_id=instance_id,
+            workspace=str(workspace),
+            current=index,
+            total=len(instance_ids),
+        )
         task_path = task_dir / f"{instance_id}.json"
         report_path = reports_dir / f"{instance_id}.json"
         prediction_path = reports_dir / f"{instance_id}.prediction.json"
+        agent_trace_path = reports_dir / f"{instance_id}.trace.jsonl"
         if not args.dry_run:
             task_path.write_text(json.dumps(task, indent=2), encoding="utf-8")
         command = [
@@ -145,27 +288,50 @@ def run_sinomo(args: argparse.Namespace, suite: dict) -> Path:
             str(prediction_path),
             "--report-out",
             str(report_path),
+            "--agent-trace-out",
+            str(agent_trace_path),
             "--provider",
             args.provider,
             "--model",
             args.model,
             "--max-steps",
             str(args.max_steps),
+            "--repair-steps",
+            str(args.repair_steps),
         ]
         if args.account:
             command.extend(["--account", args.account])
-        run_command(command, cwd=REPO_ROOT, dry_run=args.dry_run)
+        run_command(
+            command,
+            cwd=REPO_ROOT,
+            dry_run=args.dry_run,
+            progress=progress,
+            phase="agent-run",
+            instance_id=instance_id,
+            current=index,
+            total=len(instance_ids),
+        )
         if not args.dry_run:
             prediction = json.loads(prediction_path.read_text(encoding="utf-8"))
             with predictions_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(prediction, separators=(",", ":")) + "\n")
+        progress.emit(
+            "sinomo-instance-complete",
+            instance_id=instance_id,
+            current=index,
+            total=len(instance_ids),
+            report_path=str(report_path),
+            prediction_path=str(prediction_path),
+        )
     print(f"Sinomo predictions: {predictions_path}")
+    progress.emit("sinomo-complete", predictions_path=str(predictions_path))
     return predictions_path
 
 
-def run_mini(args: argparse.Namespace, suite: dict) -> Path:
+def run_mini(args: argparse.Namespace, suite: dict, progress: ProgressWriter) -> Path:
     instance_ids = [item["instance_id"] for item in suite["instances"]]
     output_dir = args.results_dir / "mini-swe-agent"
+    progress.emit("mini-swe-agent-start", total_instances=len(instance_ids))
     command = [
         "mini-extra",
         "swebench",
@@ -184,16 +350,33 @@ def run_mini(args: argparse.Namespace, suite: dict) -> Path:
     ]
     if args.environment_class:
         command.extend(["--environment-class", args.environment_class])
-    run_command(command, cwd=REPO_ROOT, dry_run=args.dry_run)
+    run_command(
+        command,
+        cwd=REPO_ROOT,
+        dry_run=args.dry_run,
+        progress=progress,
+        phase="mini-swe-agent-run",
+    )
     print(f"mini-SWE-agent output: {output_dir}")
+    progress.emit("mini-swe-agent-complete", predictions_path=str(output_dir / "preds.json"))
     return output_dir / "preds.json"
 
 
-def evaluate_predictions(args: argparse.Namespace, predictions_path: Path, suite: dict) -> None:
+def evaluate_predictions(
+    args: argparse.Namespace,
+    predictions_path: Path,
+    suite: dict,
+    progress: ProgressWriter,
+) -> None:
     evaluation_dir = args.results_dir / "evaluation"
     if not args.dry_run:
         evaluation_dir.mkdir(parents=True, exist_ok=True)
     instance_ids = [item["instance_id"] for item in suite["instances"]]
+    progress.emit(
+        "evaluation-start",
+        predictions_path=str(predictions_path),
+        total_instances=len(instance_ids),
+    )
     command = [
         sys.executable,
         "-m",
@@ -210,8 +393,17 @@ def evaluate_predictions(args: argparse.Namespace, predictions_path: Path, suite
         str(args.workers),
         "--run_id",
         args.run_id,
+        "--report_dir",
+        str(evaluation_dir),
     ]
-    run_command(command, cwd=evaluation_dir, dry_run=args.dry_run)
+    run_command(
+        command,
+        cwd=evaluation_dir,
+        dry_run=args.dry_run,
+        progress=progress,
+        phase="official-evaluation",
+    )
+    progress.emit("evaluation-complete", results_dir=str(evaluation_dir))
 
 
 def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -> dict:
@@ -224,6 +416,8 @@ def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -
         "resolved_instances": None,
         "unresolved_instances": None,
         "error_instances": None,
+        "completed_instances": None,
+        "empty_patch_instances": None,
         "summary_path": None,
     }
     if not args.evaluate:
@@ -245,6 +439,8 @@ def parse_official_evaluation_results(evaluation_dir: Path, instance_ids: list[s
     resolved: set[str] = set()
     unresolved: set[str] = set()
     errors: set[str] = set()
+    completed_instances: int | None = None
+    empty_patch_instances: int | None = None
     summary_path: Path | None = None
     for path in sorted(evaluation_dir.rglob("*.json")):
         try:
@@ -252,6 +448,9 @@ def parse_official_evaluation_results(evaluation_dir: Path, instance_ids: list[s
         except (OSError, json.JSONDecodeError):
             continue
         before = (len(resolved), len(unresolved), len(errors))
+        if isinstance(payload, dict):
+            completed_instances = integer_field(payload, "completed_instances", completed_instances)
+            empty_patch_instances = integer_field(payload, "empty_patch_instances", empty_patch_instances)
         resolved.update(extract_id_list(payload, wanted, {"resolved_ids", "resolved"}))
         unresolved.update(extract_id_list(payload, wanted, {"unresolved_ids", "unresolved"}))
         errors.update(extract_id_list(payload, wanted, {"error_ids", "errored_ids", "failed_ids"}))
@@ -274,6 +473,8 @@ def parse_official_evaluation_results(evaluation_dir: Path, instance_ids: list[s
             "resolved_instances": len(resolved),
             "unresolved_instances": len(unresolved),
             "error_instances": len(errors),
+            "completed_instances": completed_instances,
+            "empty_patch_instances": empty_patch_instances,
             "summary_path": str(summary_path) if summary_path else None,
         }
     return {
@@ -281,8 +482,17 @@ def parse_official_evaluation_results(evaluation_dir: Path, instance_ids: list[s
         "resolved_instances": None,
         "unresolved_instances": None,
         "error_instances": None,
+        "completed_instances": completed_instances,
+        "empty_patch_instances": empty_patch_instances,
         "summary_path": None,
     }
+
+
+def integer_field(payload: dict, key: str, fallback: int | None) -> int | None:
+    value = payload.get(key)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return fallback
 
 
 def extract_id_list(payload: object, wanted: set[str], keys: set[str]) -> set[str]:
@@ -345,6 +555,7 @@ def write_summary(
     *,
     predictions_path: Path | None,
     mini_predictions_path: Path | None,
+    progress: ProgressWriter,
 ) -> None:
     if not args.summary_out:
         return
@@ -355,14 +566,54 @@ def write_summary(
         report_path = reports_dir / f"{instance_id}.json"
         if report_path.exists():
             reports.append(json.loads(report_path.read_text(encoding="utf-8")))
+    agent_trace_paths = [
+        report["agent_trace_path"]
+        for report in reports
+        if isinstance(report.get("agent_trace_path"), str)
+    ]
+    post_patch_check_failures = sum(
+        1
+        for report in reports
+        if isinstance(report.get("post_patch_check"), dict)
+        and report["post_patch_check"].get("passed") is False
+    )
+    initial_post_patch_check_failures = sum(
+        1
+        for report in reports
+        if isinstance(report.get("initial_post_patch_check"), dict)
+        and report["initial_post_patch_check"].get("passed") is False
+    )
     official_evaluation = collect_official_evaluation_summary(args, suite)
     sinomo_summary = {
         "prediction_path": str(predictions_path) if predictions_path else None,
         "report_dir": str(reports_dir),
         "report_count": len(reports),
+        "agent_trace_paths": agent_trace_paths,
+        "agent_trace_records": sum(int(report.get("agent_trace_records", 0)) for report in reports),
+        "patch_bytes": sum(int(report.get("patch_bytes", 0)) for report in reports),
+        "changed_files": sum(len(report.get("changed_files", [])) for report in reports),
+        "initial_post_patch_check_failures": initial_post_patch_check_failures,
+        "post_patch_check_failures": post_patch_check_failures,
+        "repair_attempts": sum(1 for report in reports if report.get("repair_attempted")),
+        "post_patch_repair_attempts": sum(
+            1 for report in reports if report.get("repair_reason") == "post-patch-check-failure"
+        ),
+        "empty_patch_repair_attempts": sum(
+            1 for report in reports if report.get("repair_reason") == "empty-patch"
+        ),
+        "repair_model_turns": sum(int(report.get("repair_model_turns", 0)) for report in reports),
+        "repair_tool_results": sum(int(report.get("repair_tool_results", 0)) for report in reports),
+        "deterministic_repair_attempts": sum(
+            1 for report in reports if report.get("deterministic_repair_attempted")
+        ),
+        "deterministic_repair_changed_files": sum(
+            len(report.get("deterministic_repair_changed_files", [])) for report in reports
+        ),
         "error_instances": len(instance_ids) - len(reports),
         "resolved_instances": official_evaluation.get("resolved_instances"),
         "unresolved_instances": official_evaluation.get("unresolved_instances"),
+        "official_completed_instances": official_evaluation.get("completed_instances"),
+        "official_empty_patch_instances": official_evaluation.get("empty_patch_instances"),
         "agent_model_turns": sum(int(report.get("model_turns", 0)) for report in reports),
         "agent_tool_results": sum(int(report.get("tool_results", 0)) for report in reports),
         "agent_input_tokens": sum(int(report.get("agent_input_tokens", 0)) for report in reports),
@@ -377,16 +628,17 @@ def write_summary(
         "total_instances": len(instance_ids),
         "mode": args.mode,
         "results_dir": str(args.results_dir),
+        "progress_path": str(args.progress_out) if args.progress_out else None,
         "sinomo": sinomo_summary,
         "mini_swe_agent": {
             "prediction_path": str(mini_predictions_path) if mini_predictions_path else None,
         },
         "official_evaluation": official_evaluation,
     }
-    if not args.dry_run:
-        args.summary_out.parent.mkdir(parents=True, exist_ok=True)
-        args.summary_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    args.summary_out.parent.mkdir(parents=True, exist_ok=True)
+    args.summary_out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"summary: {args.summary_out}")
+    progress.emit("summary-written", summary_path=str(args.summary_out), dry_run=args.dry_run)
 
 
 def print_plan(args: argparse.Namespace, suite: dict) -> None:
@@ -400,6 +652,7 @@ def print_plan(args: argparse.Namespace, suite: dict) -> None:
             "provider": args.provider,
             "model": args.model,
             "max_steps": args.max_steps,
+            "repair_steps": args.repair_steps,
         },
         "mini_swe_agent": {
             "model": args.baseline_model,
@@ -423,42 +676,67 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-model", default="deepseek/deepseek-v4-flash")
     parser.add_argument("--sinomo-agent-bin", type=Path, default=REPO_ROOT / "target" / "debug" / "sinomo-swebench-agent")
     parser.add_argument("--max-steps", type=int, default=20)
+    parser.add_argument("--repair-steps", type=int, default=6)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--environment-class", choices=["docker", "singularity", "bubblewrap", "local"], default=None)
     parser.add_argument("--evaluate", action="store_true")
     parser.add_argument("--run-id", default="sinomo-deepseek-v4-flash-verified-10")
     parser.add_argument("--summary-out", type=Path, help="write a machine-readable benchmark summary JSON")
+    parser.add_argument("--progress-out", type=Path, help="write machine-readable progress JSONL")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     args.results_dir = args.results_dir.resolve()
     args.sinomo_agent_bin = args.sinomo_agent_bin.resolve()
     if args.summary_out:
         args.summary_out = args.summary_out.resolve()
+    if args.progress_out:
+        args.progress_out = args.progress_out.resolve()
     return args
 
 
 def main() -> int:
     args = parse_args()
-    suite = load_suite(args.suite)
-    suite = select_suite_instances(suite, instance_id=args.instance_id, limit=args.limit)
-    print_plan(args, suite)
-    predictions_path: Path | None = None
-    mini_predictions_path: Path | None = None
-    if args.mode in {"sinomo", "both"}:
-        predictions_path = run_sinomo(args, suite)
-    if args.mode in {"mini", "both"}:
-        mini_predictions_path = run_mini(args, suite)
-    if args.evaluate:
-        if predictions_path is None:
-            predictions_path = args.results_dir / "sinomo" / "predictions.jsonl"
-        evaluate_predictions(args, predictions_path, suite)
-    write_summary(
-        args,
-        suite,
-        predictions_path=predictions_path,
-        mini_predictions_path=mini_predictions_path,
-    )
-    return 0
+    progress = ProgressWriter(args.progress_out)
+    try:
+        suite = load_suite(args.suite)
+        suite = select_suite_instances(suite, instance_id=args.instance_id, limit=args.limit)
+        progress.emit(
+            "suite-selected",
+            suite=suite["name"],
+            mode=args.mode,
+            total_instances=len(suite["instances"]),
+            dry_run=args.dry_run,
+        )
+        print_plan(args, suite)
+        predictions_path: Path | None = None
+        mini_predictions_path: Path | None = None
+        if args.mode in {"sinomo", "both"}:
+            predictions_path = run_sinomo(args, suite, progress)
+        if args.mode in {"mini", "both"}:
+            mini_predictions_path = run_mini(args, suite, progress)
+        if args.evaluate:
+            if predictions_path is None:
+                predictions_path = args.results_dir / "sinomo" / "predictions.jsonl"
+            evaluate_predictions(args, predictions_path, suite, progress)
+        write_summary(
+            args,
+            suite,
+            predictions_path=predictions_path,
+            mini_predictions_path=mini_predictions_path,
+            progress=progress,
+        )
+        progress.emit("benchmark-complete", summary_path=str(args.summary_out) if args.summary_out else None)
+        return 0
+    except KeyboardInterrupt:
+        progress.emit("benchmark-failed", error="keyboard-interrupt")
+        raise
+    except SystemExit as source:
+        if source.code not in (0, None):
+            progress.emit("benchmark-failed", error=str(source))
+        raise
+    except Exception as source:
+        progress.emit("benchmark-failed", error=str(source))
+        raise
 
 
 if __name__ == "__main__":

@@ -1,0 +1,43 @@
+# Single-node Sinomo cluster for DFS and self-evolution smoke testing.
+#
+#   docker compose -f docker-compose.single-node.yml up --build -d sinomo-single
+#   docker compose -f docker-compose.single-node.yml run --rm sinomo-single-smoke
+#   docker compose -f docker-compose.single-node.yml down -v
+
+x-single-node: &single-node
+  image: sinomo-dev-single-node
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+  entrypoint: ["/usr/local/bin/sinomo-single-node-entrypoint"]
+  environment:
+    CLUSTER_NAME: single-node-evolution
+    SINOMO_SINGLE_NODE_ID: "01hxy6qa9k0t9vr4g9n8d3q5bf"
+    SINOMO_DISABLE_IROH: "1"
+
+services:
+  sinomo-single:
+    <<: *single-node
+    hostname: sinomo-single
+    environment:
+      CLUSTER_NAME: single-node-evolution
+      SINOMO_SINGLE_NODE_ID: "01hxy6qa9k0t9vr4g9n8d3q5bf"
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_SINGLE_NODE_MODE: run
+    ports:
+      - "21353:21353"
+      - "21354:21354"
+    volumes:
+      - single-node-data:/data
+
+  sinomo-single-smoke:
+    <<: *single-node
+    hostname: sinomo-single-smoke
+    environment:
+      CLUSTER_NAME: single-node-evolution-smoke
+      SINOMO_SINGLE_NODE_ID: "01hxy6qa9k0t9vr4g9n8d3q5bg"
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_SINGLE_NODE_MODE: smoke
+
+volumes:
+  single-node-data:

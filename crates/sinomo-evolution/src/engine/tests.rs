@@ -270,6 +270,51 @@ fn evolution_request_preparation_selects_model_defaults_and_verification() {
 }
 
 #[test]
+fn swebench_benchmark_gate_records_progress_path() {
+    let root = temp_dir("swebench-benchmark-progress-path");
+    let request = EvolutionRequest {
+        objective: "measure one SWE-bench task".to_string(),
+        target_ring: TrustRing::R1TrustedRuntime,
+        intended_paths: vec!["crates/sinomo-agent/**".to_string()],
+        verification_commands: Vec::new(),
+        benchmark_gates: parse_benchmark_gate_specs(
+            &["swebench:psf__requests-1142".to_string()],
+            "deepseek",
+            "deepseek-v4-pro",
+        )
+        .expect("benchmark spec"),
+        module_replay_reports: Vec::new(),
+        model_provider: None,
+        model: None,
+        dry_run: false,
+    };
+    let job = create_bootstrap_job(&request, &root);
+    let store = LocalCandidateBundleStore::new(root.join("jobs"));
+    let bundle = store.create(&job).expect("bundle");
+    let executions = prepare_benchmark_gate_executions(&request, &bundle);
+
+    assert_eq!(executions.len(), 1);
+    let execution = &executions[0];
+    assert!(execution.command.command.contains("--summary-out"));
+    assert!(execution.command.command.contains("--progress-out"));
+    assert!(
+        execution
+            .report
+            .progress_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("progress.jsonl"))
+    );
+    assert!(
+        execution
+            .report
+            .progress_path
+            .as_ref()
+            .is_some_and(|path| execution.command.command.contains(path))
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn module_replay_report_specs_accept_named_and_default_refs() {
     let refs = parse_module_replay_report_specs(&[
         "trigger=reports/trigger.json".to_string(),
@@ -1289,6 +1334,7 @@ fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
             scorecard_path: Some("/tmp/sinomo-candidate-bundle/scorecard.json".to_string()),
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         scorecard: Some(EvaluationScorecard {
@@ -2150,6 +2196,7 @@ fn sample_iteration_report(
             scorecard_path: Some("/tmp/sinomo-candidate-bundle/scorecard.json".to_string()),
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         scorecard: Some(EvaluationScorecard {
@@ -3477,12 +3524,31 @@ fn orchestrator_records_benchmark_summary_metrics() {
     let candidate = root.join("candidate");
     fs::create_dir_all(&candidate).expect("candidate dir");
     let summary_path = candidate.join("benchmark-summary.json");
+    let progress_path = candidate.join("benchmark-progress.jsonl");
+    fs::write(
+        &progress_path,
+        "{\"event\":\"suite-selected\"}\n{\"event\":\"benchmark-complete\"}\n",
+    )
+    .expect("progress");
     let summary_json = serde_json::json!({
         "benchmark": "swebench",
         "total_instances": 1,
         "sinomo": {
             "resolved_instances": 1,
             "error_instances": 0,
+            "official_completed_instances": 1,
+            "official_empty_patch_instances": 0,
+            "patch_bytes": 591,
+            "changed_files": 1,
+            "initial_post_patch_check_failures": 1,
+            "post_patch_check_failures": 0,
+            "repair_attempts": 1,
+            "post_patch_repair_attempts": 1,
+            "empty_patch_repair_attempts": 0,
+            "repair_model_turns": 2,
+            "repair_tool_results": 1,
+            "deterministic_repair_attempts": 1,
+            "deterministic_repair_changed_files": 1,
             "agent_model_turns": 3,
             "agent_tool_results": 5,
             "agent_input_tokens": 11,
@@ -3524,6 +3590,7 @@ fn orchestrator_records_benchmark_summary_metrics() {
                         command: benchmark_command,
                         summary_path: Some(summary_path.display().to_string()),
                         results_dir: Some(candidate.display().to_string()),
+                        progress_path: Some(progress_path.display().to_string()),
                     },
                 }],
                 module_replay_reports: Vec::new(),
@@ -3553,12 +3620,65 @@ fn orchestrator_records_benchmark_summary_metrics() {
         benchmark_reports[0].summary_verdict.as_deref(),
         Some("SWE-bench resolved 1/1 instance(s)")
     );
+    assert_eq!(benchmark_reports[0].progress_event_count, Some(2));
+    assert_eq!(
+        benchmark_reports[0]
+            .progress_last_event
+            .as_ref()
+            .and_then(|event| event.get("event"))
+            .and_then(|event| event.as_str()),
+        Some("benchmark-complete")
+    );
     assert!(benchmark_reports[0].command_log_path.is_some());
     assert!(scorecard.metrics.iter().any(|metric| {
         metric.name == "swebench_total_instances" && metric.value == MetricValue::Integer(1)
     }));
     assert!(scorecard.metrics.iter().any(|metric| {
         metric.name == "agent_input_tokens" && metric.value == MetricValue::Integer(11)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_official_completed_instances"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_official_empty_patch_instances"
+            && metric.value == MetricValue::Integer(0)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_patch_bytes" && metric.value == MetricValue::Integer(591)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_post_patch_check_failures"
+            && metric.value == MetricValue::Integer(0)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_initial_post_patch_check_failures"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_repair_attempts" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_post_patch_repair_attempts"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_empty_patch_repair_attempts"
+            && metric.value == MetricValue::Integer(0)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_repair_model_turns" && metric.value == MetricValue::Integer(2)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_repair_tool_results" && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_deterministic_repair_attempts"
+            && metric.value == MetricValue::Integer(1)
+    }));
+    assert!(scorecard.metrics.iter().any(|metric| {
+        metric.name == "swebench_deterministic_repair_changed_files"
+            && metric.value == MetricValue::Integer(1)
     }));
     assert!(benchmark_results_path.exists());
     let _ = fs::remove_dir_all(root);
@@ -3613,6 +3733,7 @@ fn orchestrator_fails_unresolved_swebench_summary() {
                         command: benchmark_command,
                         summary_path: Some(summary_path.display().to_string()),
                         results_dir: Some(candidate.display().to_string()),
+                        progress_path: None,
                     },
                 }],
                 module_replay_reports: Vec::new(),
@@ -3648,6 +3769,24 @@ fn orchestrator_fails_unresolved_swebench_summary() {
             && gate.summary.contains("resolved 0/1")
     }));
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn swebench_summary_verdict_fails_post_patch_check_failures() {
+    let summary = serde_json::json!({
+        "benchmark": "swebench",
+        "total_instances": 1,
+        "sinomo": {
+            "resolved_instances": 1,
+            "error_instances": 0,
+            "post_patch_check_failures": 1
+        }
+    });
+
+    let verdict = benchmark_summary_verdict(&summary).expect("verdict");
+
+    assert_eq!(verdict.outcome, EvaluationOutcome::Failed);
+    assert!(verdict.summary.contains("1 post-patch check failure"));
 }
 
 #[test]
@@ -3790,6 +3929,7 @@ fn regression_evidence_summary_preserves_trace_fixture_refs_for_future_gates() {
         scorecard_path: Some("/tmp/bundle/scorecard.json".to_string()),
         candidate_summary_path: None,
         decision_path: None,
+        artifact_refs: Vec::new(),
         command_logs: Vec::new(),
     };
     let request = EvolutionRequest {
@@ -3894,6 +4034,7 @@ fn regression_evidence_summary_turns_rollout_telemetry_windows_into_trace_fixtur
         scorecard_path: Some("/tmp/bundle/scorecard.json".to_string()),
         candidate_summary_path: None,
         decision_path: None,
+        artifact_refs: Vec::new(),
         command_logs: Vec::new(),
     };
     let telemetry_window = "rollout-telemetry://window?after=0&through=42&limit=1000";
@@ -4008,6 +4149,7 @@ fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtu
         scorecard_path: Some("/tmp/bundle/scorecard.json".to_string()),
         candidate_summary_path: None,
         decision_path: None,
+        artifact_refs: Vec::new(),
         command_logs: Vec::new(),
     };
     let module_ref = "module-telemetry://timeout-window";
@@ -4128,6 +4270,7 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
         scorecard_path: None,
         candidate_summary_path: None,
         decision_path: None,
+        artifact_refs: Vec::new(),
         command_logs: Vec::new(),
     };
     let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
@@ -4218,6 +4361,57 @@ fn git_workspace_adapter_places_worktree_inside_job_folder() {
 }
 
 #[test]
+fn git_workspace_adapter_absolutizes_relative_worktree_root() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    let root = PathBuf::from("target")
+        .join("tmp")
+        .join(format!("sinomo-evolution-relative-worktree-{stamp}"));
+    let source = root.join("source");
+    let jobs_root = root.join("data").join("evolution").join("jobs");
+    fs::create_dir_all(&source).expect("source dir");
+    run_in(&source, "git init").expect("git init");
+    run_in(&source, "git config user.email sinomo@example.test").expect("git email");
+    run_in(&source, "git config user.name Sinomo").expect("git name");
+    fs::write(source.join("README.md"), "# source\n").expect("readme");
+    run_in(&source, "git add README.md").expect("git add");
+    run_in(&source, "git commit -m init").expect("git commit");
+    let job = create_bootstrap_job(
+        &EvolutionRequest {
+            objective: "layout".to_string(),
+            target_ring: TrustRing::R1TrustedRuntime,
+            intended_paths: vec!["README.md".to_string()],
+            verification_commands: Vec::new(),
+            benchmark_gates: Vec::new(),
+            module_replay_reports: Vec::new(),
+            model_provider: None,
+            model: None,
+            dry_run: true,
+        },
+        &source,
+    );
+    let adapter = GitWorkspaceAdapter::new(&source, &jobs_root);
+
+    let workspace = adapter.prepare_candidate(&job).expect("candidate");
+
+    assert!(workspace.path.is_absolute());
+    assert!(
+        workspace
+            .path
+            .ends_with(jobs_root.join(job.job_id.as_str()).join("worktree"))
+    );
+    assert!(workspace.path.exists());
+    assert!(!source.join(&jobs_root).exists());
+    let _ = run_in(
+        &source,
+        &format!("git worktree remove --force {}", workspace.path.display()),
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn verify_stored_evolution_job_runs_plan_and_records_scorecard() {
     let source = git_repo("verify-stored-job-source");
     fs::write(source.join("README.md"), "# source\n").expect("readme");
@@ -4275,6 +4469,7 @@ fn verify_stored_evolution_job_runs_plan_and_records_scorecard() {
             scorecard_path: None,
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         verification_outcome: None,
@@ -4357,6 +4552,7 @@ fn decide_stored_evolution_job_records_rejected_decision() {
             scorecard_path: None,
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         verification_outcome: None,
@@ -4745,6 +4941,7 @@ fn approved_candidate_commit_fast_forwards_source_checkout() {
             scorecard_path: None,
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         verification_outcome: None,
@@ -4826,6 +5023,7 @@ fn cleanup_stored_evolution_job_removes_worktree_job_and_bundle_dirs() {
             scorecard_path: None,
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         verification_outcome: None,
@@ -5424,6 +5622,7 @@ fn approval_record_fixture(
             scorecard_path: None,
             candidate_summary_path: None,
             decision_path: None,
+            artifact_refs: Vec::new(),
             command_logs: Vec::new(),
         },
         verification_outcome: Some(verification_outcome.clone()),

@@ -461,10 +461,13 @@ pub(super) fn print_evolve_help() {
     println!("  sinomo evolve");
     println!("      Show evolution commands.");
     println!(
-        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"] [--benchmark swebench:<instance_id>] [--module-replay-report [name=]<path>]"
+        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"] [--benchmark swebench:<instance_id>] [--module-replay-report [name=]<path>] [--no-model]"
     );
     println!(
         "      With --dry-run or --pause-after-proposal, write a phase-0 campaign bundle under $SINOMO_DATA_DIR/evolution/campaigns/."
+    );
+    println!(
+        "      With --no-model, skip model mutation but still materialize a candidate bundle and run verification/benchmark gates."
     );
     println!(
         "      Campaign flags: --objective <text> --horizon <duration> --budget-policy <policy> --reserve <resource:percent%> --approval <policy> --max-wall-time <duration> [--approve]"
