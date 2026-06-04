@@ -1005,7 +1005,7 @@ pub struct InProcessKvStore {
     revision: KvRevision,
     compacted_revision: KvRevision,
     entries: BTreeMap<String, KvEntry>,
-    events: Vec<KvEvent>,
+    events: Vec<Arc<KvEvent>>,
     leases: BTreeMap<LeaseId, KvLease>,
     lease_keys: BTreeMap<LeaseId, BTreeSet<String>>,
     watches: BTreeMap<WatchId, KvWatchState>,
@@ -1231,7 +1231,11 @@ impl InProcessKvStore {
             .watches
             .get_mut(&watch_id)
             .ok_or(KvError::UnknownWatch { watch_id })?;
-        Ok(watch.pending.drain(..).collect())
+        Ok(watch
+            .pending
+            .drain(..)
+            .map(|event| event.as_ref().clone())
+            .collect())
     }
 
     pub fn cancel_watch(&mut self, watch_id: WatchId) -> Result<bool, KvError> {
@@ -1244,7 +1248,11 @@ impl InProcessKvStore {
             compacted_revision: self.compacted_revision,
             entries: self.entries.values().cloned().collect(),
             leases: self.leases.values().cloned().collect(),
-            events: self.events.clone(),
+            events: self
+                .events
+                .iter()
+                .map(|event| event.as_ref().clone())
+                .collect(),
         }
     }
 
@@ -1259,7 +1267,7 @@ impl InProcessKvStore {
             revision: snapshot.revision,
             compacted_revision: snapshot.compacted_revision,
             entries,
-            events: snapshot.events,
+            events: snapshot.events.into_iter().map(Arc::new).collect(),
             leases: snapshot
                 .leases
                 .into_iter()
@@ -1286,7 +1294,7 @@ impl InProcessKvStore {
     }
 
     pub fn compact_event_history_to(&mut self, max_events: usize) {
-        compact_snapshot_event_history(&mut self.events, &mut self.compacted_revision, max_events);
+        compact_shared_event_history(&mut self.events, &mut self.compacted_revision, max_events);
     }
 
     pub fn tick_leases(&mut self, ticks: u64) -> Result<Vec<LeaseId>, KvError> {
@@ -1547,11 +1555,12 @@ impl InProcessKvStore {
     }
 
     fn record_event(&mut self, event: KvEvent) {
+        let event = Arc::new(event);
         for watch in self.watches.values_mut() {
             if event.revision >= watch.watch.start_revision
                 && event.key.starts_with(&watch.watch.prefix)
             {
-                watch.pending.push_back(event.clone());
+                watch.pending.push_back(Arc::clone(&event));
                 compact_watch_pending(watch);
             }
         }
@@ -1632,6 +1641,20 @@ fn compact_snapshot_event_history(
     *compacted_revision = (*compacted_revision).max(compacted);
 }
 
+fn compact_shared_event_history(
+    events: &mut Vec<Arc<KvEvent>>,
+    compacted_revision: &mut KvRevision,
+    max_events: usize,
+) {
+    let excess = events.len().saturating_sub(max_events);
+    if excess == 0 {
+        return;
+    }
+    let compacted = events[excess - 1].revision;
+    events.drain(..excess);
+    *compacted_revision = (*compacted_revision).max(compacted);
+}
+
 fn build_lease_key_index(
     entries: &BTreeMap<String, KvEntry>,
 ) -> BTreeMap<LeaseId, BTreeSet<String>> {
@@ -1647,7 +1670,7 @@ fn build_lease_key_index(
 #[derive(Clone, Debug)]
 struct KvWatchState {
     watch: KvWatch,
-    pending: VecDeque<KvEvent>,
+    pending: VecDeque<Arc<KvEvent>>,
     compacted_revision: Option<KvRevision>,
 }
 
@@ -3753,6 +3776,59 @@ mod tests {
         let future = store.drain_watch(watch_id).expect("future");
         assert_eq!(future.len(), 1);
         assert_eq!(future[0].key, "/services/b");
+    }
+
+    #[test]
+    fn matching_watch_queues_share_event_payloads() {
+        let mut store = InProcessKvStore::new();
+        let first = store
+            .watch_prefix("/services/", KvRevision(1))
+            .expect("first watch");
+        let second = store
+            .watch_prefix("/services/", KvRevision(1))
+            .expect("second watch");
+        let value = vec![7_u8; 128 * 1024];
+
+        store
+            .put("/services/shared", value.clone(), None)
+            .expect("put shared event");
+
+        {
+            let first_event = store
+                .watches
+                .get(&first)
+                .expect("first watch state")
+                .pending
+                .front()
+                .expect("first pending event");
+            let second_event = store
+                .watches
+                .get(&second)
+                .expect("second watch state")
+                .pending
+                .front()
+                .expect("second pending event");
+            let history_event = store.events.last().expect("history event");
+
+            assert!(
+                Arc::ptr_eq(first_event, second_event),
+                "matching watch queues should share the same event allocation"
+            );
+            assert!(
+                Arc::ptr_eq(first_event, history_event),
+                "watch queues and event history should share the same event allocation"
+            );
+            assert_eq!(
+                Arc::strong_count(history_event),
+                3,
+                "one history entry plus two pending watch entries should reference one event"
+            );
+        }
+
+        let drained = store.drain_watch(first).expect("drain first watch");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].key, "/services/shared");
+        assert_eq!(drained[0].kind, KvEventKind::Put { value });
     }
 
     #[test]

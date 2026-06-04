@@ -4881,6 +4881,69 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
 }
 
 #[test]
+fn cluster_kv_reader_node_id_cache_tracks_state_rewrites_and_removal() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-reader-node-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_kv_reader_cache").expect("cluster");
+    let first_node = NodeId::from_legacy_named("node_kv_reader_cache_first").expect("first node");
+    let second_node =
+        NodeId::from_legacy_named("node_kv_reader_cache_second").expect("second node");
+    let first = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "reader cache",
+        first_node.clone(),
+        "first",
+        "public-key-1",
+        now,
+    );
+    let second = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "reader cache",
+        second_node.clone(),
+        "second",
+        "public-key-2",
+        now,
+    );
+
+    write_cluster_state(&paths, &first).expect("write first state");
+    assert_eq!(
+        cached_cluster_kv_reader_node_id_for_test(&paths),
+        Some(first_node.clone()),
+        "state writes should seed the KV reader node cache"
+    );
+    let current = read_cluster_kv_store(&paths).expect("read current store");
+    assert_eq!(current.revision(), KvRevision::ZERO);
+    assert_eq!(
+        cached_cluster_kv_reader_node_id_for_test(&paths),
+        Some(first_node),
+        "KV reads should keep using the cached reader node id while state is unchanged"
+    );
+
+    write_cluster_state(&paths, &second).expect("write second state");
+    assert_eq!(
+        cached_cluster_kv_reader_node_id_for_test(&paths),
+        Some(second_node),
+        "state rewrites should refresh the cached reader node id"
+    );
+
+    remove_local_cluster_state(&paths).expect("remove state");
+    assert!(
+        cached_cluster_kv_reader_node_id_for_test(&paths).is_none(),
+        "state removal should invalidate the cached reader node id"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-wait-fanout-{}",
@@ -4936,6 +4999,48 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         "waiting drain should be notified instead of timing out after {elapsed:?}"
     );
     assert_eq!(drained.events, vec![event]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-long-poll-empty-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/empty-long-poll/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 10,
+        },
+    )
+    .expect("empty long poll");
+
+    assert!(drained.events.is_empty());
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        2,
+        "empty long-poll timeout should drain once before waiting and once after timeout"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -5244,6 +5349,78 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
     assert!(
         allocator.next_watch_id > second.watch_id.0,
         "watch allocator should advance past the newest watch id"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-registration-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/cache-registration/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    assert_eq!(
+        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id),
+        Some(watch.clone()),
+        "watch creation should seed the registration cache"
+    );
+
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/cache-registration/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        .expect("append watch event");
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain watch");
+    assert_eq!(drained.events, vec![event]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+
+    let cached = cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id)
+        .expect("cached registration after drain");
+    assert_eq!(
+        cached.next_revision,
+        KvRevision(2),
+        "cursor advancement should refresh the cached registration"
+    );
+
+    cancel_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchCancelRequest {
+            watch_id: watch.watch_id,
+        },
+    )
+    .expect("cancel watch");
+    assert!(
+        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id).is_none(),
+        "cancel should invalidate the cached registration"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -7648,6 +7825,81 @@ impl IoObserver for CountingIoObserver {
 }
 
 static IO_OBSERVER_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn cluster_kv_watch_events_cache_reuses_unchanged_event_view() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-event-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/cache/first".to_string(),
+        kind: KvEventKind::Put {
+            value: b"first".to_vec(),
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/cache/second".to_string(),
+        kind: KvEventKind::Put {
+            value: b"second".to_vec(),
+        },
+    };
+    let record = SinomoObjectCodec::default()
+        .encode(&first)
+        .expect("encode watch event");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .expect("open watch event log");
+    log.write_all(&(record.len() as u32).to_be_bytes())
+        .expect("write record length");
+    log.write_all(&record).expect("write record");
+    log.sync_data().expect("sync watch event log");
+    drop(log);
+
+    assert!(
+        cached_cluster_kv_watch_events_for_test(&paths).is_none(),
+        "cold watch-event reads should start without a cache entry"
+    );
+
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("first read"),
+        vec![first.clone()]
+    );
+    assert_eq!(
+        cached_cluster_kv_watch_events_for_test(&paths),
+        Some(vec![first.clone()]),
+        "first read should cache the compacted watch-event view"
+    );
+
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("cached read"),
+        vec![first.clone()]
+    );
+
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+        .expect("append second event");
+    assert_eq!(
+        cached_cluster_kv_watch_events_for_test(&paths),
+        Some(vec![first.clone(), second.clone()]),
+        "append should refresh the cache for the next drain"
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("cached read after append"),
+        vec![first, second]
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
 
 #[test]
 fn write_cluster_state_observer_counts_actual_then_skipped() {
