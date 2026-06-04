@@ -586,6 +586,18 @@ impl KvSnapshot {
         Ok(entries)
     }
 
+    pub fn range_prefix_serde_limited_by_payload_bytes<T: DeserializeOwned>(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<T>, KvError> {
+        self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?
+            .iter()
+            .map(KvEntry::decode)
+            .collect()
+    }
+
     fn is_canonical(&self) -> bool {
         self.entries
             .windows(2)
@@ -1134,6 +1146,19 @@ impl KvLocalCache {
             .collect()
     }
 
+    pub fn current_range_prefix_serde_limited_by_payload_bytes<T: DeserializeOwned>(
+        &self,
+        node_id: NodeId,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<T>, KvError> {
+        let snapshot = self
+            .materialized
+            .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))?;
+        snapshot.range_prefix_serde_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+    }
+
     pub fn current_snapshot(&self, node_id: NodeId) -> Result<KvSnapshot, KvError> {
         self.current_snapshot_arc(node_id)
             .map(|snapshot| (*snapshot).clone())
@@ -1274,14 +1299,13 @@ impl InProcessKvStore {
     }
 
     pub fn range_prefix(&self, prefix: &str) -> Vec<KvEntry> {
-        let mut entries = Vec::new();
-        for (key, entry) in self.entries.range(prefix.to_string()..) {
-            if !key.starts_with(prefix) {
-                break;
-            }
-            entries.push(entry.clone());
-        }
-        entries
+        self.prefix_entries(prefix).cloned().collect()
+    }
+
+    pub fn prefix_entries<'a>(&'a self, prefix: &'a str) -> impl Iterator<Item = &'a KvEntry> + 'a {
+        self.entries
+            .range(prefix.to_string()..)
+            .map_while(move |(key, entry)| key.starts_with(prefix).then_some(entry))
     }
 
     pub fn range_prefix_limited(
@@ -1300,10 +1324,7 @@ impl InProcessKvStore {
     ) -> Result<Vec<KvEntry>, KvError> {
         let mut entries = Vec::new();
         let mut payload_bytes = 0_usize;
-        for (key, entry) in self.entries.range(prefix.to_string()..) {
-            if !key.starts_with(prefix) {
-                break;
-            }
+        for entry in self.prefix_entries(prefix) {
             if entries.len() >= max_entries {
                 return Err(KvError::RangeLimit {
                     prefix: prefix.to_string(),
@@ -1353,6 +1374,18 @@ impl InProcessKvStore {
 
     pub fn range_prefix_serde<T: DeserializeOwned>(&self, prefix: &str) -> Result<Vec<T>, KvError> {
         self.range_prefix(prefix)
+            .iter()
+            .map(KvEntry::decode)
+            .collect()
+    }
+
+    pub fn range_prefix_serde_limited_by_payload_bytes<T: DeserializeOwned>(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<T>, KvError> {
+        self.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)?
             .iter()
             .map(KvEntry::decode)
             .collect()
@@ -4527,6 +4560,48 @@ mod tests {
     }
 
     #[test]
+    fn typed_range_prefix_reads_enforce_entry_and_payload_limits() {
+        let mut store = InProcessKvStore::new();
+        for key in ["/apps/typed/a", "/apps/typed/b"] {
+            store.put_serde(key, &key.to_string(), None).expect("put");
+        }
+
+        let values = store
+            .range_prefix_serde_limited_by_payload_bytes::<String>("/apps/typed/", 2, usize::MAX)
+            .expect("typed range");
+        assert_eq!(
+            values,
+            vec!["/apps/typed/a".to_string(), "/apps/typed/b".to_string()]
+        );
+
+        assert_eq!(
+            store
+                .range_prefix_serde_limited_by_payload_bytes::<String>(
+                    "/apps/typed/",
+                    1,
+                    usize::MAX,
+                )
+                .expect_err("entry limit"),
+            KvError::RangeLimit {
+                prefix: "/apps/typed/".to_string(),
+                max_entries: 1,
+            }
+        );
+
+        let error = store
+            .range_prefix_serde_limited_by_payload_bytes::<String>("/apps/typed/", 2, 1)
+            .expect_err("payload limit");
+        assert!(matches!(
+            error,
+            KvError::RangePayloadLimit {
+                ref prefix,
+                max_bytes: 1,
+                ..
+            } if prefix == "/apps/typed/"
+        ));
+    }
+
+    #[test]
     fn snapshot_point_and_prefix_reads_preserve_store_semantics() {
         let entry = |key: &str, value: &[u8]| KvEntry {
             key: key.to_string(),
@@ -6891,6 +6966,66 @@ mod tests {
                 .expect("range values"),
             vec!["node-a".to_string(), "node-b".to_string()]
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_typed_prefix_reads_are_bounded() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-typed-range-limit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id =
+            NodeId::from_legacy_named("node_local_cache_typed_range_limit").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        let mut store = InProcessKvStore::new();
+        for key in [
+            "/dfs/services/content/a",
+            "/dfs/services/content/b",
+            "/dfs/services/content/c",
+        ] {
+            store.put_serde(key, &key.to_string(), None).expect("put");
+        }
+        cache
+            .write_snapshot(&store.snapshot())
+            .expect("write cache snapshot");
+
+        let error = cache
+            .current_range_prefix_serde_limited_by_payload_bytes::<String>(
+                node_id.clone(),
+                "/dfs/services/content/",
+                2,
+                usize::MAX,
+            )
+            .expect_err("entry limit");
+        assert_eq!(
+            error,
+            KvError::RangeLimit {
+                prefix: "/dfs/services/content/".to_string(),
+                max_entries: 2,
+            }
+        );
+
+        let error = cache
+            .current_range_prefix_serde_limited_by_payload_bytes::<String>(
+                node_id,
+                "/dfs/services/content/",
+                3,
+                1,
+            )
+            .expect_err("payload limit");
+        assert!(matches!(
+            error,
+            KvError::RangePayloadLimit {
+                ref prefix,
+                max_bytes: 1,
+                ..
+            } if prefix == "/dfs/services/content/"
+        ));
+
         std::fs::remove_dir_all(root).ok();
     }
 

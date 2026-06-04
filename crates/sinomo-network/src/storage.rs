@@ -25,6 +25,7 @@ pub const CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize =
     sinomo_kv::MAX_KV_COMMAND_PAYLOAD_BYTES;
+pub(crate) const MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS: usize = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
@@ -1903,7 +1904,12 @@ where
 {
     let node_id = read_cluster_kv_reader_node_id(paths)?;
     cluster_kv_local_cache(paths)
-        .current_range_prefix_serde(node_id, prefix)
+        .current_range_prefix_serde_limited_by_payload_bytes(
+            node_id,
+            prefix,
+            CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+            CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+        )
         .map_err(Into::into)
 }
 
@@ -3410,7 +3416,9 @@ pub fn read_cluster_members_from_kv(
     }
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut members: Vec<ClusterMemberRecord> = Vec::new();
-    for entry in snapshot.prefix_entries("/cluster/members/") {
+    for entry in
+        snapshot.range_prefix_limited("/cluster/members/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
+    {
         members.push(entry.decode()?);
     }
     let endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?;
@@ -3467,7 +3475,9 @@ fn read_cluster_endpoints_from_snapshot(
     snapshot: &KvSnapshot,
 ) -> Result<BTreeMap<NodeId, Vec<ClusterEndpointRecord>>, NetworkError> {
     let mut endpoints: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> = BTreeMap::new();
-    for entry in snapshot.prefix_entries("/cluster/endpoints/") {
+    for entry in
+        snapshot.range_prefix_limited("/cluster/endpoints/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
+    {
         let endpoint: ClusterEndpointRecord = entry.decode()?;
         endpoints
             .entry(endpoint.node_id.clone())
@@ -3481,7 +3491,10 @@ fn read_cluster_capability_policies_from_snapshot(
     snapshot: &KvSnapshot,
 ) -> Result<BTreeMap<NodeId, ClusterCapabilityPolicyRecord>, NetworkError> {
     let mut policies = BTreeMap::new();
-    for entry in snapshot.prefix_entries("/cluster/policy/capabilities/") {
+    for entry in snapshot.range_prefix_limited(
+        "/cluster/policy/capabilities/",
+        CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
         let policy: ClusterCapabilityPolicyRecord = entry.decode()?;
         policies.insert(policy.node_id.clone(), policy);
     }
@@ -3496,7 +3509,9 @@ pub fn read_cluster_node_statuses_from_kv(
     }
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
-    for entry in snapshot.prefix_entries("/cluster/node-status/") {
+    for entry in snapshot
+        .range_prefix_limited("/cluster/node-status/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
+    {
         statuses.push(entry.decode()?);
     }
     statuses.sort_by(|left, right| left.node_id.cmp(&right.node_id));
@@ -3512,7 +3527,7 @@ pub fn read_cluster_module_rollout_statuses_from_kv(
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
     let prefix = cluster_module_rollout_node_prefix();
-    for entry in snapshot.prefix_entries(&prefix) {
+    for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
         statuses.push(entry.decode()?);
     }
     statuses.sort_by(|left, right| {
@@ -3533,7 +3548,7 @@ pub fn read_cluster_module_rollout_desired_from_kv(
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
     let prefix = cluster_module_rollout_desired_prefix();
-    for entry in snapshot.prefix_entries(&prefix) {
+    for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
         desired.push(entry.decode()?);
     }
     desired.sort_by(|left, right| {
@@ -3558,7 +3573,7 @@ pub fn read_cluster_module_rollout_reconciliations_from_kv(
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
     let prefix = cluster_module_rollout_reconcile_prefix();
-    for entry in snapshot.prefix_entries(&prefix) {
+    for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
         reconciliations.push(entry.decode()?);
     }
     reconciliations.sort_by(|left, right| {
@@ -3579,7 +3594,10 @@ pub fn read_cluster_network_info_from_kv(
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
-    for entry in snapshot.prefix_entries("/cluster/network/info/") {
+    for entry in snapshot.range_prefix_limited(
+        "/cluster/network/info/",
+        CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
         let record: ClusterNetworkInfoRecord = entry.decode()?;
         if cluster_network_record_live(record.expires_at, now) {
             records.push(record);
@@ -3598,7 +3616,10 @@ pub fn read_cluster_connectivity_graph_from_kv(
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
-    for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
+    for entry in snapshot.range_prefix_limited(
+        "/cluster/network/connectivity/",
+        CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
         let record: ClusterConnectivityRecord = entry.decode()?;
         if cluster_network_record_live(record.expires_at, now) {
             records.push(record);
@@ -3944,7 +3965,7 @@ fn cluster_state_sync_txn_from_store(
         // change does not delete and re-put the whole member endpoint set.
         let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
         let stored_endpoints: BTreeMap<String, Vec<u8>> = store
-            .range_prefix(&endpoint_prefix)
+            .range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
             .into_iter()
             .map(|entry| (entry.key, entry.value))
             .collect();
@@ -5131,19 +5152,6 @@ fn cluster_connectivity_sync_ops_from_snapshot(
     records: &[ClusterConnectivityRecord],
     now: OffsetDateTime,
 ) -> Result<Vec<KvOp>, NetworkError> {
-    let mut existing = BTreeMap::new();
-    let prefix = cluster_connectivity_source_prefix(source_node_id);
-    for entry in snapshot.prefix_entries(&prefix) {
-        match entry.decode::<ClusterConnectivityRecord>() {
-            Ok(record) => {
-                existing.insert(entry.key.clone(), record);
-            }
-            Err(_) => {
-                existing.remove(&entry.key);
-            }
-        }
-    }
-
     let mut incoming = BTreeMap::new();
     for record in records {
         let key = cluster_connectivity_key(
@@ -5154,14 +5162,23 @@ fn cluster_connectivity_sync_ops_from_snapshot(
         incoming.insert(key, record);
     }
 
+    let prefix = cluster_connectivity_source_prefix(source_node_id);
+    for entry in snapshot.prefix_entries(&prefix) {
+        let stable = incoming.get(&entry.key).is_some_and(|record| {
+            entry
+                .decode::<ClusterConnectivityRecord>()
+                .is_ok_and(|existing| {
+                    cluster_connectivity_stable_eq(&existing, record)
+                        && !cluster_network_record_should_refresh(existing.expires_at, now)
+                })
+        });
+        if stable {
+            incoming.remove(&entry.key);
+        }
+    }
+
     let mut ops = Vec::new();
     for (key, record) in incoming {
-        if existing.get(&key).is_some_and(|existing| {
-            cluster_connectivity_stable_eq(existing, record)
-                && !cluster_network_record_should_refresh(existing.expires_at, now)
-        }) {
-            continue;
-        }
         ops.push(KvOp::put_serde(key, record, None)?);
     }
     Ok(ops)
@@ -5420,7 +5437,8 @@ pub fn cluster_member_publish_matches_kv(
 
         let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
         let mut existing_endpoints = snapshot
-            .prefix_entries(&endpoint_prefix)
+            .range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
+            .into_iter()
             .filter_map(|entry| entry.decode::<ClusterEndpointRecord>().ok())
             .collect::<Vec<_>>();
         existing_endpoints.sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
@@ -5536,7 +5554,9 @@ fn push_cluster_member_endpoint_diff_ops(
         desired_endpoints.insert(key, value);
     }
 
-    for entry in snapshot.prefix_entries(&endpoint_prefix) {
+    for entry in
+        snapshot.range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
+    {
         if !desired_endpoints.contains_key(&entry.key) {
             ops.push(KvOp::Delete {
                 key: entry.key.clone(),

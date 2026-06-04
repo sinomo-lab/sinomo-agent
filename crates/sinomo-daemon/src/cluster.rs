@@ -45,7 +45,7 @@ use sinomo_rollout::{
     ClusterRolloutBuildRequest, SelfRolloutPaths, managed_source_status, read_rollout_status,
     source_heads_match,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -2545,7 +2545,10 @@ fn push_cluster_member_endpoint_diff_ops(
         desired_endpoints.insert(key, value);
     }
 
-    for entry in store.range_prefix(&endpoint_prefix) {
+    for entry in store.range_prefix_limited(
+        &endpoint_prefix,
+        sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
         if !desired_endpoints.contains_key(&entry.key) {
             ops.push(KvOp::Delete { key: entry.key });
         }
@@ -2576,7 +2579,10 @@ fn cluster_raft_config_from_store(
     let mut voters = Vec::new();
     let mut learners = Vec::new();
     let mut non_voting = Vec::new();
-    for entry in store.range_prefix("/cluster/members/") {
+    for entry in store.range_prefix_limited(
+        "/cluster/members/",
+        sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+    )? {
         let mut member: ClusterMemberRecord = entry.decode()?;
         if member.node_id == updated_member.node_id {
             member = updated_member.clone();
@@ -2684,22 +2690,28 @@ fn cluster_member_removal_txns(
         sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH.min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);
     for member in members {
         let endpoint_prefix = sinomo_network::cluster_endpoint_prefix(&member.node_id);
-        let endpoint_keys = store
-            .range_prefix(&endpoint_prefix)
-            .into_iter()
-            .map(|entry| entry.key)
-            .collect::<Vec<_>>();
-        let explicit_delete_count = endpoint_keys
-            .len()
-            .saturating_sub(final_endpoint_prefix_delete_limit);
-        for chunk in endpoint_keys[..explicit_delete_count].chunks(explicit_delete_batch_limit) {
+        let mut residual_endpoint_keys = VecDeque::new();
+        let mut explicit_delete_ops = Vec::new();
+        for entry in store.prefix_entries(&endpoint_prefix) {
+            residual_endpoint_keys.push_back(entry.key.clone());
+            if residual_endpoint_keys.len() <= final_endpoint_prefix_delete_limit {
+                continue;
+            }
+            if let Some(key) = residual_endpoint_keys.pop_front() {
+                explicit_delete_ops.push(KvOp::Delete { key });
+            }
+            if explicit_delete_ops.len() >= explicit_delete_batch_limit {
+                txns.push(KvTxn {
+                    compares: Vec::new(),
+                    success: std::mem::take(&mut explicit_delete_ops),
+                    failure: Vec::new(),
+                });
+            }
+        }
+        if !explicit_delete_ops.is_empty() {
             txns.push(KvTxn {
                 compares: Vec::new(),
-                success: chunk
-                    .iter()
-                    .cloned()
-                    .map(|key| KvOp::Delete { key })
-                    .collect(),
+                success: explicit_delete_ops,
                 failure: Vec::new(),
             });
         }
@@ -4433,6 +4445,19 @@ mod tests {
         ))
     }
 
+    fn assert_daemon_range_limit(error: DaemonError, prefix: &str) {
+        let detail = match error {
+            DaemonError::Parse { detail } => detail,
+            other => panic!("expected range limit for {prefix}, got {other:?}"),
+        };
+        assert!(
+            detail.contains(&format!("range for prefix {prefix} exceeded max"))
+                && detail
+                    .contains(&sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES.to_string()),
+            "expected range limit for {prefix}, got {detail}"
+        );
+    }
+
     #[test]
     fn cluster_member_update_ops_diff_endpoint_records() {
         let now = OffsetDateTime::now_utc();
@@ -4524,6 +4549,73 @@ mod tests {
                 .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &unchanged_key)),
             "unchanged endpoint should not be re-put"
         );
+    }
+
+    #[test]
+    fn cluster_member_update_ops_rejects_oversized_endpoint_prefix() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_endpoint_update_limit").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_endpoint_update_limit").expect("node");
+        let member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            node_id.clone(),
+            "endpoint update limit",
+            "pk-endpoint-update-limit",
+            now,
+        );
+        let endpoint_prefix = sinomo_network::cluster_endpoint_prefix(&node_id);
+        let mut store = InProcessKvStore::new();
+        for index in 0..=sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+            store
+                .put(
+                    format!("{endpoint_prefix}endpoint_{index:05}"),
+                    Vec::new(),
+                    None,
+                )
+                .expect("endpoint");
+        }
+
+        let error = cluster_member_update_ops(&store, &member).expect_err("range limit");
+        assert_daemon_range_limit(error, &endpoint_prefix);
+    }
+
+    #[test]
+    fn cluster_raft_config_from_store_rejects_oversized_member_prefix() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_member_config_limit").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_member_config_limit").expect("node");
+        let member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            node_id,
+            "member config limit",
+            "pk-member-config-limit",
+            now,
+        );
+        let current_config = sinomo_network::ClusterRaftConfigRecord {
+            cluster_id,
+            term: 1,
+            kv_revision: 1,
+            voters: Vec::new(),
+            learners: Vec::new(),
+            non_voting: Vec::new(),
+            updated_at: now,
+        };
+        let mut store = InProcessKvStore::new();
+        for index in 0..=sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+            store
+                .put(
+                    format!("/cluster/members/node_{index:05}"),
+                    Vec::new(),
+                    None,
+                )
+                .expect("member");
+        }
+
+        let error = cluster_raft_config_from_store(&store, &member, &current_config, now)
+            .expect_err("range limit");
+        assert_daemon_range_limit(error, "/cluster/members/");
     }
 
     #[test]

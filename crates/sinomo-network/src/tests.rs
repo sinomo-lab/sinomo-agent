@@ -1,5 +1,5 @@
 use crate::prelude::*;
-use crate::storage::MAX_CLUSTER_KV_ACTIVE_WATCHES;
+use crate::storage::{MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS};
 use crate::*;
 
 use sinomo_core::{
@@ -1494,6 +1494,85 @@ fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
     assert!(
         !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
         "large prefixes should be scanned completely so missing records are detected as deletes"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_partial_sync_ignores_unrelated_malformed_large_prefix() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-partial-large-prefix-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_partial_large").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_partial_large_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_partial_large_b").expect("node b");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity partial large prefix",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.52:21353".to_string(), 10);
+    let stable = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    let stable_key = cluster_connectivity_key(
+        &stable.source_node_id,
+        &stable.target_node_id,
+        &stable.endpoint_id,
+    );
+    let prefix = cluster_connectivity_source_prefix(&node_a);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(stable_key, &stable, None)
+        .expect("stable connectivity");
+    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+        store
+            .put(
+                format!("{prefix}malformed-target-{index:05}/endpoint"),
+                b"not a connectivity record".to_vec(),
+                None,
+            )
+            .expect("malformed connectivity");
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let later = now + time::Duration::seconds(5);
+    let stable_later = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(5),
+        0,
+        Some("ok".to_string()),
+        None,
+        later,
+        600,
+    );
+    let ops = cluster_connectivity_sync_ops(&paths, &node_a, &[stable_later])
+        .expect("partial connectivity sync");
+    assert!(
+        ops.is_empty(),
+        "stable incoming connectivity should remain a no-op without retaining unrelated prefix records"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -3939,6 +4018,120 @@ fn cluster_kv_prefix_range_default_reader_is_bounded() {
     std::fs::remove_dir_all(root).ok();
 }
 
+fn seed_raw_prefix_over_default_limit(store: &mut InProcessKvStore, prefix: &str) {
+    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+        store
+            .put(format!("{prefix}{index:05}"), Vec::new(), None)
+            .expect("put");
+    }
+}
+
+fn assert_default_range_limit(error: NetworkError, expected_prefix: &str) {
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangeLimit {
+            ref prefix,
+            max_entries: CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        }) if prefix == expected_prefix
+    ));
+}
+
+#[test]
+fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-internal-read-bounded-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let rollout_node_prefix = cluster_module_rollout_node_prefix();
+    let rollout_desired_prefix = cluster_module_rollout_desired_prefix();
+    let rollout_reconcile_prefix = cluster_module_rollout_reconcile_prefix();
+    let mut store = InProcessKvStore::new();
+    for prefix in [
+        "/cluster/members/",
+        "/cluster/endpoints/",
+        "/cluster/policy/capabilities/",
+        "/cluster/node-status/",
+        "/cluster/network/info/",
+        "/cluster/network/connectivity/",
+        rollout_node_prefix.as_str(),
+        rollout_desired_prefix.as_str(),
+        rollout_reconcile_prefix.as_str(),
+    ] {
+        seed_raw_prefix_over_default_limit(&mut store, prefix);
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    assert_default_range_limit(
+        read_cluster_members_from_kv(&paths).expect_err("member range limit"),
+        "/cluster/members/",
+    );
+    assert_default_range_limit(
+        read_cluster_endpoints_from_kv(&paths).expect_err("endpoint range limit"),
+        "/cluster/endpoints/",
+    );
+    assert_default_range_limit(
+        read_cluster_node_statuses_from_kv(&paths).expect_err("status range limit"),
+        "/cluster/node-status/",
+    );
+    assert_default_range_limit(
+        read_cluster_module_rollout_statuses_from_kv(&paths)
+            .expect_err("rollout status range limit"),
+        &rollout_node_prefix,
+    );
+    assert_default_range_limit(
+        read_cluster_module_rollout_desired_from_kv(&paths)
+            .expect_err("rollout desired range limit"),
+        &rollout_desired_prefix,
+    );
+    assert_default_range_limit(
+        read_cluster_module_rollout_reconciliations_from_kv(&paths)
+            .expect_err("rollout reconciliation range limit"),
+        &rollout_reconcile_prefix,
+    );
+    assert_default_range_limit(
+        read_cluster_network_info_from_kv(&paths).expect_err("network info range limit"),
+        "/cluster/network/info/",
+    );
+    assert_default_range_limit(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .expect_err("connectivity graph range limit"),
+        "/cluster/network/connectivity/",
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_prefix_values_reader_is_bounded() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-prefix-values-bounded-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let mut store = InProcessKvStore::new();
+    seed_raw_prefix_over_default_limit(&mut store, "/typed/default/");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let error = read_cluster_kv_prefix_values::<String>(&paths, "/typed/default/")
+        .expect_err("typed range limit");
+    assert_default_range_limit(error, "/typed/default/");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
     let root = std::env::temp_dir().join(format!(
@@ -5182,6 +5375,78 @@ fn cluster_state_sync_txn_diffs_member_endpoint_records() {
     std::fs::remove_dir_all(root).ok();
 }
 
+fn endpoint_limit_fixture(node_id: &NodeId, label: &str, index: usize) -> ClusterEndpointRecord {
+    ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named(format!("endpoint_{label}_{index:05}"))
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: format!(
+            "10.{}.{}.{}:21353",
+            (index / 65_536) % 256,
+            (index / 256) % 256,
+            index % 256
+        ),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: (index % (u16::MAX as usize)) as u16,
+        last_observed_latency_ms: None,
+    }
+}
+
+fn seed_member_endpoint_prefix_over_limit(
+    store: &mut InProcessKvStore,
+    node_id: &NodeId,
+    label: &str,
+) {
+    for index in 0..=MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS {
+        let endpoint = endpoint_limit_fixture(node_id, label, index);
+        store
+            .put_serde(cluster_endpoint_key(node_id, &endpoint), &endpoint, None)
+            .expect("seed endpoint");
+    }
+}
+
+#[test]
+fn cluster_state_sync_txn_rejects_oversized_member_endpoint_prefix() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-sync-endpoint-limit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_endpoint_limit").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_endpoint_limit").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "endpoint limit",
+        node_id.clone(),
+        "node",
+        "pk",
+        now,
+    );
+    let mut store = InProcessKvStore::new();
+    seed_member_endpoint_prefix_over_limit(&mut store, &node_id, "sync_limit");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed endpoint snapshot");
+
+    let error = cluster_state_sync_txn(&paths, &state).expect_err("endpoint prefix range limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangeLimit {
+            ref prefix,
+            max_entries: MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
+        }) if prefix == &cluster_endpoint_prefix(&node_id)
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
     let now = OffsetDateTime::now_utc();
@@ -5269,6 +5534,77 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
             .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &unchanged_key)),
         "unchanged endpoint should not be re-put"
     );
+}
+
+#[test]
+fn cluster_member_publish_matches_kv_rejects_oversized_member_endpoint_prefix() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-member-publish-match-endpoint-limit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_match_limit").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_match_limit").expect("node");
+    let member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish match endpoint limit",
+        "pk-member-publish-match-limit",
+        now,
+    );
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(cluster_member_key(&node_id), &member, None)
+        .expect("seed member");
+    seed_member_endpoint_prefix_over_limit(&mut store, &node_id, "publish_match_limit");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed endpoint snapshot");
+
+    let error = cluster_member_publish_matches_kv(&paths, &[member])
+        .expect_err("endpoint prefix range limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangeLimit {
+            ref prefix,
+            max_entries: MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
+        }) if prefix == &cluster_endpoint_prefix(&node_id)
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_member_publish_txn_from_snapshot_rejects_oversized_member_endpoint_prefix() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_txn_limit").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_txn_limit").expect("node");
+    let member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish txn endpoint limit",
+        "pk-member-publish-txn-limit",
+        now,
+    );
+    let mut store = InProcessKvStore::new();
+    seed_member_endpoint_prefix_over_limit(&mut store, &node_id, "publish_txn_limit");
+
+    let error = cluster_member_publish_txn_from_snapshot(&store.snapshot(), &[member])
+        .expect_err("endpoint prefix range limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangeLimit {
+            ref prefix,
+            max_entries: MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
+        }) if prefix == &cluster_endpoint_prefix(&node_id)
+    ));
 }
 
 #[test]
