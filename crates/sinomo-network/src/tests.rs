@@ -5408,6 +5408,103 @@ fn seed_member_endpoint_prefix_over_limit(
 }
 
 #[test]
+fn read_cluster_members_from_kv_allows_large_aggregate_endpoint_sets() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-member-endpoint-aggregate-limit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_endpoint_aggregate_limit").expect("cluster");
+    let member_count = 65;
+    let endpoints_per_member = 64;
+    let mut store = InProcessKvStore::new();
+    for member_index in 0..member_count {
+        let node_id =
+            NodeId::from_legacy_named(format!("node_endpoint_aggregate_{member_index:03}"))
+                .expect("node");
+        let member = ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            node_id.clone(),
+            format!("endpoint aggregate {member_index}"),
+            format!("pk-endpoint-aggregate-{member_index}"),
+            now,
+        );
+        store
+            .put_serde(cluster_member_key(&node_id), &member, None)
+            .expect("seed member");
+        for endpoint_index in 0..endpoints_per_member {
+            let endpoint = endpoint_limit_fixture(
+                &node_id,
+                &format!("aggregate_{member_index:03}"),
+                endpoint_index,
+            );
+            store
+                .put_serde(cluster_endpoint_key(&node_id, &endpoint), &endpoint, None)
+                .expect("seed endpoint");
+        }
+    }
+    assert!(
+        member_count * endpoints_per_member > CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        "fixture should exceed the aggregate endpoint range cap"
+    );
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let members = read_cluster_members_from_kv(&paths).expect("read members");
+    assert_eq!(members.len(), member_count);
+    assert_eq!(
+        members
+            .iter()
+            .map(|member| member.endpoints.len())
+            .sum::<usize>(),
+        member_count * endpoints_per_member
+    );
+    assert_default_range_limit(
+        read_cluster_endpoints_from_kv(&paths).expect_err("aggregate endpoint range limit"),
+        "/cluster/endpoints/",
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_member_publish_txn_rejects_oversized_no_snapshot_endpoint_set() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_no_snapshot_limit").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_no_snapshot_limit").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish no snapshot limit",
+        "pk-member-publish-no-snapshot-limit",
+        now,
+    );
+    member.endpoints = (0..=sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH)
+        .map(|index| endpoint_limit_fixture(&node_id, "publish_no_snapshot_limit", index))
+        .collect();
+
+    let error = cluster_member_publish_txn(&[member]).expect_err("txn branch limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::TxnLimit {
+            compares: 0,
+            success_ops,
+            failure_ops: 0,
+            max_compares: sinomo_kv::MAX_KV_TXN_COMPARES,
+            max_ops_per_branch: sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH,
+        }) if success_ops == sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH.saturating_add(1)
+    ));
+}
+
+#[test]
 fn cluster_state_sync_txn_rejects_oversized_member_endpoint_prefix() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-cluster-sync-endpoint-limit-{}",
@@ -7143,6 +7240,223 @@ fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
         expire_cluster_network_record_ops(&paths, &state, now).expect("remaining expire ops");
     assert_eq!(remaining_compares.len(), 1);
     assert_eq!(remaining_success.len(), 1);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_full_sync_batch_skips_exact_expired_noop() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-expired-noop-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_expired_noop").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_expired_noop_source").expect("source");
+    let target_node =
+        NodeId::from_legacy_named("node_connectivity_expired_noop_target").expect("target");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity expired noop",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    let endpoint = daemon_lan_endpoint(&target_node, "10.53.0.1:21353".to_string(), 10);
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(8),
+        0,
+        Some("expired".to_string()),
+        None,
+        now - time::Duration::seconds(120),
+        30,
+    );
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(
+            cluster_connectivity_key(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
+            ),
+            &record,
+            None,
+        )
+        .expect("seed expired connectivity");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let ops = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node,
+        std::slice::from_ref(&record),
+        3,
+    )
+    .expect("batch ops");
+    assert!(
+        ops.is_empty(),
+        "exact expired records should not loop by planning no-effect puts"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn connectivity_full_sync_plans_bounded_batches() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-bounded-planner-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_bounded_planner").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_bounded_planner_source").expect("source");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity bounded planner",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+
+    let mut store = InProcessKvStore::new();
+    let mut stale_keys = Vec::new();
+    for index in 0..5 {
+        let target_node =
+            NodeId::from_legacy_named(format!("node_connectivity_bounded_target_{index}"))
+                .expect("target");
+        let endpoint = daemon_lan_endpoint(&target_node, format!("10.52.0.{index}:21353"), 10);
+        let record = cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(9),
+            0,
+            Some("stale".to_string()),
+            None,
+            now,
+            600,
+        );
+        let key = cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        store
+            .put_serde(key.clone(), &record, None)
+            .expect("seed stale connectivity");
+        stale_keys.push(key);
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let incoming_target =
+        NodeId::from_legacy_named("node_connectivity_bounded_target_incoming").expect("target");
+    let incoming_endpoint =
+        daemon_lan_endpoint(&incoming_target, "10.52.0.99:21353".to_string(), 10);
+    let incoming = cluster_connectivity_record(
+        &state,
+        &incoming_endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(7),
+        0,
+        Some("current".to_string()),
+        None,
+        now,
+        600,
+    );
+    let incoming_key = cluster_connectivity_key(
+        &incoming.source_node_id,
+        &incoming.target_node_id,
+        &incoming.endpoint_id,
+    );
+
+    let first = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node,
+        std::slice::from_ref(&incoming),
+        3,
+    )
+    .expect("first batch");
+    assert_eq!(first.len(), 3);
+    assert!(first.iter().all(|op| matches!(op, KvOp::Delete { .. })));
+    append_cluster_raft_command(
+        &paths,
+        &source_node,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: first,
+            failure: Vec::new(),
+        }),
+    )
+    .expect("append first batch");
+
+    let second = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node,
+        std::slice::from_ref(&incoming),
+        3,
+    )
+    .expect("second batch");
+    assert!(second.len() <= 3);
+    assert_eq!(
+        second
+            .iter()
+            .filter(|op| matches!(op, KvOp::Delete { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        second
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &incoming_key))
+    );
+    append_cluster_raft_command(
+        &paths,
+        &source_node,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: second,
+            failure: Vec::new(),
+        }),
+    )
+    .expect("append second batch");
+
+    let final_ops = cluster_connectivity_full_sync_batch_ops(
+        &paths,
+        &source_node,
+        std::slice::from_ref(&incoming),
+        3,
+    )
+    .expect("final batch");
+    assert!(final_ops.is_empty());
+
+    let snapshot = read_cluster_kv_current_snapshot(&paths).expect("read snapshot");
+    assert!(snapshot.get(&incoming_key).is_some());
+    assert!(
+        stale_keys
+            .iter()
+            .all(|key| snapshot.get(key.as_str()).is_none())
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

@@ -1224,7 +1224,6 @@ impl ClusterNetworkMaintenance {
         if !(publish_due || probe_due || discovery_due) {
             return Ok(());
         }
-        self.idle_stats.incr_ticks_with_work();
 
         let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
             path: paths.root.display().to_string(),
@@ -1232,9 +1231,19 @@ impl ClusterNetworkMaintenance {
         })?;
         let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
         if !cluster_paths.state.exists() {
+            if publish_due {
+                self.last_publish = now;
+            }
+            if probe_due {
+                self.last_probe = now;
+            }
+            if discovery_due {
+                self.last_discovery = now;
+            }
             return Ok(());
         }
 
+        self.idle_stats.incr_ticks_with_work();
         self.idle_stats.incr_disk_reads_cluster_state();
         let mut state = if publish_due || probe_due {
             sinomo_network::read_cluster_state(&cluster_paths)?
@@ -2996,27 +3005,34 @@ pub fn sync_cluster_connectivity_records_to_kv(
     if cached_connectivity_record_set_matches(paths, source_node_id, &records) {
         return Ok(None);
     }
-    let success =
-        sinomo_network::cluster_connectivity_full_sync_ops(paths, source_node_id, &records)?;
-    if success.is_empty() {
-        remember_connectivity_record_set(paths, source_node_id, &records);
-        return Ok(None);
+    let mut state = None;
+    let mut latest = None;
+    loop {
+        let success = sinomo_network::cluster_connectivity_full_sync_batch_ops(
+            paths,
+            source_node_id,
+            &records,
+            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        )?;
+        if success.is_empty() {
+            remember_connectivity_record_set(paths, source_node_id, &records);
+            return Ok(latest);
+        }
+        if state.is_none() {
+            state = Some(sinomo_network::read_cluster_state(paths)?);
+        }
+        latest = Some(commit_cluster_kv_txn_with_quorum(
+            paths,
+            state
+                .as_mut()
+                .expect("cluster state is initialized before connectivity append"),
+            KvTxn {
+                compares: Vec::new(),
+                success,
+                failure: Vec::new(),
+            },
+        )?);
     }
-    let mut state = sinomo_network::read_cluster_state(paths)?;
-    let result = commit_cluster_kv_txn_with_quorum(
-        paths,
-        &mut state,
-        KvTxn {
-            compares: Vec::new(),
-            success,
-            failure: Vec::new(),
-        },
-    )
-    .map(Some);
-    if result.is_ok() {
-        remember_connectivity_record_set(paths, source_node_id, &records);
-    }
-    result
 }
 
 pub fn expire_cluster_network_records_in_kv(
@@ -5163,6 +5179,73 @@ mod tests {
     }
 
     #[test]
+    fn cluster_network_maintenance_throttles_unclustered_ticks() {
+        let root = unique_cluster_test_root("sinomo-daemon-unclustered-maintenance-idle");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let idle_stats = Arc::new(IdleStatsAtomics::new());
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
+            environment_id: None,
+            last_desired_rollout_attempt: None,
+            tick: 0,
+            last_publish: maintenance_now
+                .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
+                .unwrap_or(maintenance_now),
+            last_discovery: maintenance_now
+                .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
+                .unwrap_or(maintenance_now),
+            last_probe: maintenance_now
+                .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
+                .unwrap_or(maintenance_now),
+            idle_stats: idle_stats.clone(),
+        };
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+
+        maintenance
+            .tick(&daemon_paths, &DaemonRunOptions::default())
+            .expect("first unclustered tick");
+        maintenance
+            .tick(&daemon_paths, &DaemonRunOptions::default())
+            .expect("second unclustered tick");
+
+        let snapshot = idle_stats.snapshot();
+        assert_eq!(snapshot.ticks_total, 2);
+        assert_eq!(
+            snapshot.ticks_with_work, 0,
+            "unclustered maintenance should not count timer checks as work"
+        );
+        assert_eq!(
+            snapshot.disk_reads_cluster_state, 0,
+            "unclustered maintenance should not try to read absent cluster state"
+        );
+        let after_ticks = Instant::now();
+        assert!(
+            !maintenance_interval_due(
+                after_ticks,
+                maintenance.last_publish,
+                DAEMON_CLUSTER_PUBLISH_INTERVAL,
+            ),
+            "absent cluster state should advance publish timer"
+        );
+        assert!(
+            !maintenance_interval_due(
+                after_ticks,
+                maintenance.last_probe,
+                DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL,
+            ),
+            "absent cluster state should advance probe timer"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn cluster_network_discovery_replay_does_not_mark_state_changed() {
         let now = OffsetDateTime::now_utc();
         let cluster_id =
@@ -5900,6 +5983,80 @@ mod tests {
         assert!(
             snapshot.get(&stale_key).is_none(),
             "stale connectivity should be deleted even when current records are cached"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn connectivity_sync_batches_large_stale_kv_deletions() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-large-delete");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_connectivity_large_delete")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_daemon_connectivity_large_delete_local")
+            .expect("local node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "connectivity large delete",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0].capabilities =
+            sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        sinomo_network::write_cluster_state(&paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state");
+
+        let mut stale_records = Vec::new();
+        for index in 0..=sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND {
+            let target_node = NodeId::from_legacy_named(format!(
+                "node_daemon_connectivity_large_delete_target_{index}"
+            ))
+            .expect("target node");
+            let endpoint = sinomo_network::daemon_lan_endpoint(
+                &target_node,
+                format!("10.64.{}.{}:21353", index / 256, index % 256),
+                10,
+            );
+            stale_records.push(sinomo_network::cluster_connectivity_record(
+                &state,
+                &endpoint,
+                sinomo_network::ClusterConnectivityState::Healthy,
+                Some(11),
+                0,
+                Some("stale".to_string()),
+                None,
+                now,
+                600,
+            ));
+        }
+        sinomo_network::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node,
+            stale_records.clone(),
+        )
+        .expect("seed stale connectivity");
+        remember_connectivity_record_set(&paths, &local_node, &stale_records);
+
+        sync_cluster_connectivity_records_to_kv(&paths, &local_node, Vec::new())
+            .expect("delete stale connectivity in batches");
+
+        let snapshot = sinomo_network::read_cluster_kv_current_snapshot(&paths).expect("snapshot");
+        assert!(
+            snapshot
+                .prefix_entries(&sinomo_network::cluster_connectivity_source_prefix(
+                    &local_node
+                ))
+                .next()
+                .is_none(),
+            "daemon connectivity sync should delete large stale prefixes in bounded batches"
         );
         std::fs::remove_dir_all(root).ok();
     }

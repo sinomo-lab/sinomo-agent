@@ -3421,22 +3421,19 @@ pub fn read_cluster_members_from_kv(
     {
         members.push(entry.decode()?);
     }
-    let endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?;
     let policies = read_cluster_capability_policies_from_snapshot(&snapshot)?;
     for member in &mut members {
         if let Some(policy) = policies.get(&member.node_id) {
             member.capabilities = policy.capabilities.clone();
             member.allowed_capabilities = policy.allowed_capabilities.clone();
         }
-        if let Some(member_endpoints) = endpoints.get(&member.node_id) {
-            for endpoint in member_endpoints {
-                if !member
-                    .endpoints
-                    .iter()
-                    .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-                {
-                    member.endpoints.push(endpoint.clone());
-                }
+        for endpoint in read_cluster_member_endpoints_from_snapshot(&snapshot, &member.node_id)? {
+            if !member
+                .endpoints
+                .iter()
+                .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
+            {
+                member.endpoints.push(endpoint);
             }
         }
         cleanup_member_iroh_endpoints(member);
@@ -3468,6 +3465,20 @@ pub fn read_cluster_endpoints_from_kv(
                 right.endpoint_id.as_str(),
             ))
     });
+    Ok(endpoints)
+}
+
+fn read_cluster_member_endpoints_from_snapshot(
+    snapshot: &KvSnapshot,
+    node_id: &NodeId,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let endpoint_prefix = cluster_endpoint_prefix(node_id);
+    let mut endpoints = Vec::new();
+    for entry in
+        snapshot.range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
+    {
+        endpoints.push(entry.decode()?);
+    }
     Ok(endpoints)
 }
 
@@ -5051,13 +5062,37 @@ pub fn sync_cluster_connectivity_records_to_kv(
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, NetworkError> {
     write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
-    let success =
-        cluster_connectivity_full_sync_ops_from_cached_snapshot(paths, source_node_id, &records)?;
-    if success.is_empty() {
-        return read_cluster_kv_snapshot(paths);
+    let now = OffsetDateTime::now_utc();
+    let mut snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    let mut local_node_id = None;
+    let mut appended = false;
+    loop {
+        let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
+            snapshot.as_ref(),
+            source_node_id,
+            &records,
+            now,
+            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        )?;
+        if success.is_empty() {
+            return if appended {
+                Ok(snapshot.as_ref().clone())
+            } else {
+                read_cluster_kv_snapshot(paths)
+            };
+        }
+        if local_node_id.is_none() {
+            local_node_id = Some(read_cluster_state_without_kv(paths)?.local_node_id);
+        }
+        snapshot = Arc::new(append_cluster_raft_ops_in_batches(
+            paths,
+            local_node_id
+                .as_ref()
+                .expect("local node id is initialized before append"),
+            success,
+        )?);
+        appended = true;
     }
-    let state = read_cluster_state_without_kv(paths)?;
-    append_cluster_raft_ops_in_batches(paths, &state.local_node_id, success)
 }
 
 pub fn stored_cluster_node_status_matches(
@@ -5168,8 +5203,9 @@ fn cluster_connectivity_sync_ops_from_snapshot(
             entry
                 .decode::<ClusterConnectivityRecord>()
                 .is_ok_and(|existing| {
-                    cluster_connectivity_stable_eq(&existing, record)
-                        && !cluster_network_record_should_refresh(existing.expires_at, now)
+                    existing == **record
+                        || (cluster_connectivity_stable_eq(&existing, record)
+                            && !cluster_network_record_should_refresh(existing.expires_at, now))
                 })
         });
         if stable {
@@ -5199,18 +5235,20 @@ pub fn cluster_connectivity_full_sync_ops(
     )
 }
 
-fn cluster_connectivity_full_sync_ops_from_cached_snapshot(
+pub fn cluster_connectivity_full_sync_batch_ops(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
+    max_ops: usize,
 ) -> Result<Vec<KvOp>, NetworkError> {
     let now = OffsetDateTime::now_utc();
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
-    cluster_connectivity_full_sync_ops_from_snapshot(
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    cluster_connectivity_full_sync_batch_ops_from_snapshot(
         snapshot.as_ref(),
         source_node_id,
         records,
         now,
+        max_ops,
     )
 }
 
@@ -5247,12 +5285,73 @@ fn cluster_connectivity_full_sync_ops_from_snapshot(
 
     for (key, record) in incoming {
         if existing.get(&key).is_some_and(|existing| {
-            cluster_connectivity_stable_eq(existing, record)
-                && !cluster_network_record_should_refresh(existing.expires_at, now)
+            existing == record
+                || (cluster_connectivity_stable_eq(existing, record)
+                    && !cluster_network_record_should_refresh(existing.expires_at, now))
         }) {
             continue;
         }
         ops.push(KvOp::put_serde(key, record, None)?);
+    }
+    Ok(ops)
+}
+
+fn cluster_connectivity_full_sync_batch_ops_from_snapshot(
+    snapshot: &KvSnapshot,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    now: OffsetDateTime,
+    max_ops: usize,
+) -> Result<Vec<KvOp>, NetworkError> {
+    let max_ops = max_ops
+        .min(sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH)
+        .min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);
+    if max_ops == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut incoming = BTreeMap::new();
+    for record in records {
+        let key = cluster_connectivity_key(
+            &record.source_node_id,
+            &record.target_node_id,
+            &record.endpoint_id,
+        );
+        incoming.insert(key, record);
+    }
+
+    let mut ops = Vec::new();
+    let prefix = cluster_connectivity_source_prefix(source_node_id);
+    for entry in snapshot.prefix_entries(&prefix) {
+        let stable = incoming.get(&entry.key).is_some_and(|record| {
+            entry
+                .decode::<ClusterConnectivityRecord>()
+                .is_ok_and(|existing| {
+                    existing == **record
+                        || (cluster_connectivity_stable_eq(&existing, record)
+                            && !cluster_network_record_should_refresh(existing.expires_at, now))
+                })
+        });
+        if stable {
+            incoming.remove(&entry.key);
+            continue;
+        }
+        if incoming.contains_key(&entry.key) {
+            continue;
+        }
+        ops.push(KvOp::Delete {
+            key: entry.key.clone(),
+        });
+        if ops.len() >= max_ops {
+            return Ok(ops);
+        }
+    }
+
+    for (key, record) in incoming {
+        ops.push(KvOp::put_serde(key, record, None)?);
+        if ops.len() >= max_ops {
+            break;
+        }
     }
     Ok(ops)
 }
@@ -5491,15 +5590,21 @@ fn cluster_member_publish_txn_with_snapshot(
         if let Some(snapshot) = snapshot {
             push_cluster_member_endpoint_diff_ops(snapshot, &member, &mut success)?;
         } else {
-            success.push(KvOp::DeletePrefix {
-                prefix: cluster_endpoint_prefix(&member.node_id),
-            });
+            push_bounded_txn_success_op(
+                &mut success,
+                KvOp::DeletePrefix {
+                    prefix: cluster_endpoint_prefix(&member.node_id),
+                },
+            )?;
             for endpoint in &member.endpoints {
-                success.push(KvOp::put_serde(
-                    cluster_endpoint_key(&member.node_id, endpoint),
-                    endpoint,
-                    None,
-                )?);
+                push_bounded_txn_success_op(
+                    &mut success,
+                    KvOp::put_serde(
+                        cluster_endpoint_key(&member.node_id, endpoint),
+                        endpoint,
+                        None,
+                    )?,
+                )?;
             }
         }
     }
@@ -5508,6 +5613,20 @@ fn cluster_member_publish_txn_with_snapshot(
         success,
         failure: Vec::new(),
     })
+}
+
+fn push_bounded_txn_success_op(ops: &mut Vec<KvOp>, op: KvOp) -> Result<(), NetworkError> {
+    if ops.len() >= sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH {
+        return Err(NetworkError::Kv(KvError::TxnLimit {
+            compares: 0,
+            success_ops: ops.len().saturating_add(1),
+            failure_ops: 0,
+            max_compares: sinomo_kv::MAX_KV_TXN_COMPARES,
+            max_ops_per_branch: sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH,
+        }));
+    }
+    ops.push(op);
+    Ok(())
 }
 
 fn push_snapshot_diff_put_op<T: Serialize + ?Sized>(
@@ -5520,7 +5639,7 @@ fn push_snapshot_diff_put_op<T: Serialize + ?Sized>(
     if snapshot.is_some_and(|snapshot| kv_put_op_matches_snapshot(snapshot, &op)) {
         return Ok(());
     }
-    ops.push(op);
+    push_bounded_txn_success_op(ops, op)?;
     Ok(())
 }
 
@@ -5558,9 +5677,12 @@ fn push_cluster_member_endpoint_diff_ops(
         snapshot.range_prefix_limited(&endpoint_prefix, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS)?
     {
         if !desired_endpoints.contains_key(&entry.key) {
-            ops.push(KvOp::Delete {
-                key: entry.key.clone(),
-            });
+            push_bounded_txn_success_op(
+                ops,
+                KvOp::Delete {
+                    key: entry.key.clone(),
+                },
+            )?;
         }
     }
 
@@ -5569,11 +5691,14 @@ fn push_cluster_member_endpoint_diff_ops(
             .get(&key)
             .is_none_or(|entry| entry.value != value || entry.lease_id.is_some())
         {
-            ops.push(KvOp::Put {
-                key,
-                value,
-                lease_id: None,
-            });
+            push_bounded_txn_success_op(
+                ops,
+                KvOp::Put {
+                    key,
+                    value,
+                    lease_id: None,
+                },
+            )?;
         }
     }
 
