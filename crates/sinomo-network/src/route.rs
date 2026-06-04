@@ -38,10 +38,20 @@ pub fn cluster_route_next_hop(
     local: &NodeId,
     target: &NodeId,
 ) -> Option<ClusterRoute> {
+    cluster_route_next_hop_excluding(graph, local, target, &[])
+}
+
+fn cluster_route_next_hop_excluding(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+    excluded: &[NodeId],
+) -> Option<ClusterRoute> {
     if local == target {
         return None;
     }
     let mut seen: BTreeSet<NodeId> = BTreeSet::new();
+    seen.extend(excluded.iter().cloned());
     seen.insert(local.clone());
     let mut queue: VecDeque<Vec<NodeId>> = VecDeque::new();
     queue.push_back(vec![local.clone()]);
@@ -86,12 +96,62 @@ pub fn cluster_route_first_hop_best_effort(
     target: &NodeId,
     excluded: &[NodeId],
 ) -> Option<NodeId> {
-    if let Some(route) = cluster_route_next_hop(graph, local, target) {
-        return Some(route.next_hop);
+    cluster_route_next_hops_best_effort(graph, local, target, excluded)
+        .into_iter()
+        .next()
+}
+
+/// Ordered next-hop candidates for best-effort relay forwarding.
+///
+/// A fully-known route is always returned as the only candidate. When the local
+/// graph only knows directly-reachable neighbors, return all usable neighbors so
+/// the daemon relay layer can retry another bridge if the first one reports a
+/// loop or dead end.
+pub fn cluster_route_next_hops_best_effort(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+    excluded: &[NodeId],
+) -> Vec<NodeId> {
+    if let Some(route) = cluster_route_next_hop_excluding(graph, local, target, excluded) {
+        return vec![route.next_hop];
     }
-    graph.healthy_targets(local).into_iter().find(|candidate| {
-        candidate != target && candidate != local && !excluded.contains(candidate)
-    })
+    let excluded = excluded.iter().collect::<BTreeSet<_>>();
+    let mut candidates = graph
+        .healthy_targets(local)
+        .into_iter()
+        .filter(|candidate| {
+            candidate != target && candidate != local && !excluded.contains(candidate)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        best_effort_candidate_rank(graph, local, target, &excluded, left)
+            .cmp(&best_effort_candidate_rank(
+                graph, local, target, &excluded, right,
+            ))
+            .then_with(|| left.cmp(right))
+    });
+    candidates
+}
+
+fn best_effort_candidate_rank(
+    graph: &ClusterConnectivityGraph,
+    local: &NodeId,
+    target: &NodeId,
+    excluded: &BTreeSet<&NodeId>,
+    candidate: &NodeId,
+) -> (u8, usize) {
+    let healthy_targets = graph.healthy_targets(candidate);
+    let target_hint = if healthy_targets.contains(target) {
+        0
+    } else {
+        1
+    };
+    let forward_frontier = healthy_targets
+        .iter()
+        .filter(|next| *next != local && *next != candidate && !excluded.contains(next))
+        .count();
+    (target_hint, usize::MAX - forward_frontier)
 }
 
 /// An inner cluster RPC wrapped for hop-by-hop delivery toward `target_node_id`.
@@ -315,6 +375,68 @@ mod tests {
         assert_eq!(
             cluster_route_first_hop_best_effort(&g, &a, &c, std::slice::from_ref(&b)),
             None
+        );
+    }
+
+    #[test]
+    fn best_effort_excludes_visited_nodes_from_full_routes() {
+        let (a, b, c) = (nid("node_a"), nid("node_b"), nid("node_c"));
+        let g = graph(vec![
+            edge(&a, &b, ClusterConnectivityState::Healthy),
+            edge(&b, &c, ClusterConnectivityState::Healthy),
+        ]);
+
+        assert_eq!(
+            cluster_route_first_hop_best_effort(&g, &a, &c, &[]),
+            Some(b.clone())
+        );
+        assert_eq!(
+            cluster_route_first_hop_best_effort(&g, &a, &c, std::slice::from_ref(&b)),
+            None
+        );
+    }
+
+    #[test]
+    fn best_effort_candidates_include_alternate_neighbors() {
+        let (a, b, c, target) = (
+            nid("node_a"),
+            nid("node_b"),
+            nid("node_c"),
+            nid("node_target"),
+        );
+        let g = graph(vec![
+            edge(&a, &b, ClusterConnectivityState::Healthy),
+            edge(&a, &c, ClusterConnectivityState::Healthy),
+        ]);
+
+        assert_eq!(
+            cluster_route_next_hops_best_effort(&g, &a, &target, &[]),
+            vec![b.clone(), c.clone()]
+        );
+        assert_eq!(
+            cluster_route_next_hops_best_effort(&g, &a, &target, std::slice::from_ref(&b)),
+            vec![c]
+        );
+    }
+
+    #[test]
+    fn best_effort_prefers_neighbor_with_forward_frontier() {
+        let (a, leaf, bridge, onward, target) = (
+            nid("node_a"),
+            nid("node_leaf"),
+            nid("node_bridge"),
+            nid("node_onward"),
+            nid("node_target"),
+        );
+        let g = graph(vec![
+            edge(&a, &leaf, ClusterConnectivityState::Healthy),
+            edge(&a, &bridge, ClusterConnectivityState::Healthy),
+            edge(&bridge, &onward, ClusterConnectivityState::Healthy),
+        ]);
+
+        assert_eq!(
+            cluster_route_next_hops_best_effort(&g, &a, &target, &[]),
+            vec![bridge, leaf]
         );
     }
 

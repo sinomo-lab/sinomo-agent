@@ -115,12 +115,13 @@ use sinomo_runtime::daemon::{
     refresh_daemon_node_status_in_kv, sign_daemon_rpc_request_from_data_dir, write_daemon_status,
 };
 use sinomo_runtime::daemon::{
-    ClusterDoctorFinding, DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus,
-    DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
-    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, IdleStatsSnapshot, InstallLayout,
-    InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
-    RolloutActivationStrategy, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
-    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    ClusterDoctorFinding, ClusterHealthRow, DaemonClusterProcess, DaemonClusterRegistration,
+    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    DaemonStopBeforeInstallStart, DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus,
+    IdleStatsSnapshot, InstallLayout, InstalledDaemonInstallPlanRequest,
+    InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus, RolloutActivationStrategy,
+    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SINOMO_DAEMON_DEFAULT_HOST,
+    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
     activate_boot_entries as daemon_activate_boot_entries,
     build_cluster_join_invite as daemon_build_cluster_join_invite, cluster_doctor_findings,
     cluster_has_local_quorum, cluster_health_rows,
@@ -137,6 +138,7 @@ use sinomo_runtime::daemon::{
     default_main_daemon_status as daemon_default_main_daemon_status,
     ensure_install_layout_dirs as daemon_ensure_install_layout_dirs,
     ensure_rollout_target_platform_matches_local as daemon_ensure_rollout_target_platform_matches_local,
+    fetch_cluster_health_rows as daemon_fetch_cluster_health_rows,
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_dfs_inspection_from_address as daemon_fetch_dfs_inspection_from_address,
@@ -173,6 +175,10 @@ use sinomo_runtime::daemon::{
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
+    send_daemon_rollout_binary_upload_chunk as daemon_send_daemon_rollout_binary_upload_chunk,
+    send_daemon_rollout_binary_upload_chunk_to_endpoint as daemon_send_daemon_rollout_binary_upload_chunk_to_endpoint,
+    send_daemon_rollout_binary_upload_finalize as daemon_send_daemon_rollout_binary_upload_finalize,
+    send_daemon_rollout_binary_upload_finalize_to_endpoint as daemon_send_daemon_rollout_binary_upload_finalize_to_endpoint,
     send_daemon_rollout_build as daemon_send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint as daemon_send_daemon_rollout_build_to_endpoint,
     send_daemon_rollout_clear_status as daemon_send_daemon_rollout_clear_status,
@@ -274,7 +280,10 @@ use sinomo_runtime::rollout::rollout_main_activation_path;
 use sinomo_runtime::rollout::write_rollout_status;
 use sinomo_runtime::rollout::{
     AppliedRolloutTransition, ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
-    ClusterRolloutBuildRequest, DEFAULT_SHADOW_TELEMETRY_LIMIT, ManagedSourceStatus,
+    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadFinalizeRequest,
+    ClusterRolloutBinaryUploadManifest, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutUploadArtifactSpec,
+    DEFAULT_SHADOW_TELEMETRY_LIMIT, LocalRolloutNativeDylibModuleArtifact, ManagedSourceStatus,
     RolloutController, RolloutError, RolloutMainActivation, RolloutObservation,
     RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths, clear_rollout_status,
     ensure_rollout_layout, ensure_rollout_source_repo, install_current_executable,
@@ -1369,6 +1378,7 @@ const DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(15);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const CLUSTER_HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;

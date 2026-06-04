@@ -985,7 +985,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
         options.shadow_port,
         requested_at.clone(),
     );
-    let mut binary_request: Option<ClusterRolloutBinaryRequest> = None;
+    let mut binary_request: Option<PreparedClusterBinaryRollout> = None;
     let mut source_bundle: Option<(Vec<u8>, String)> = None;
     let mut desired_source_head = None;
     if options.targets.is_empty() && options.remote_build && options.remote_repo.is_none() {
@@ -1088,7 +1088,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             for module in &artifacts.native_dylib_modules {
                 println!("cluster rollout module: {}", module.built_library.display());
             }
-            binary_request = Some(prepare_cluster_rollout_binary_request(
+            binary_request = Some(prepare_cluster_binary_rollout(
                 source.clone(),
                 &artifacts.built_binary,
                 &artifacts.native_dylib_modules,
@@ -1099,7 +1099,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
             )?);
         }
         let request = binary_request.as_ref().expect("binary rollout request");
-        match send_daemon_rollout_binary(&target, request) {
+        match send_prepared_daemon_rollout_binary(&target, request) {
             Ok(response) => {
                 println!("{}: {}", target.label(), response.status);
                 if response.status == "accepted"
@@ -1641,6 +1641,25 @@ pub(crate) fn read_rollout_target_status(target: &RolloutTarget) -> Result<Daemo
     }
 }
 
+const ROLLOUT_INLINE_BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const ROLLOUT_UPLOAD_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) enum PreparedClusterBinaryRollout {
+    Inline(ClusterRolloutBinaryRequest),
+    Chunked {
+        finalize: ClusterRolloutBinaryUploadFinalizeRequest,
+        artifacts: Vec<RolloutUploadSource>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RolloutUploadSource {
+    artifact_id: String,
+    path: PathBuf,
+    total_bytes: u64,
+}
+
 pub(crate) fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
     daemon_rollout_target_platform_matches_local(status)
 }
@@ -1650,6 +1669,125 @@ pub(crate) fn ensure_rollout_target_platform_from_status(
     status: &DaemonStatus,
 ) -> Result<(), CliError> {
     daemon_ensure_rollout_target_platform_matches_local(address, status).map_err(Into::into)
+}
+
+pub(crate) fn prepare_cluster_binary_rollout(
+    source: String,
+    binary: &Path,
+    native_dylib_modules: &[LocalRolloutNativeDylibModuleArtifact],
+    host: String,
+    port: u16,
+    shadow_port: u16,
+    requested_at: String,
+) -> Result<PreparedClusterBinaryRollout, CliError> {
+    let total_bytes = rollout_artifact_size(binary)?
+        + native_dylib_modules
+            .iter()
+            .map(|module| rollout_artifact_size(&module.built_library))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum::<u64>();
+    if total_bytes <= ROLLOUT_INLINE_BINARY_MAX_BYTES {
+        return Ok(PreparedClusterBinaryRollout::Inline(
+            prepare_cluster_rollout_binary_request(
+                source,
+                binary,
+                native_dylib_modules,
+                host,
+                port,
+                shadow_port,
+                requested_at,
+            )?,
+        ));
+    }
+
+    let upload_id = format!(
+        "rollout-{}-{}",
+        std::process::id(),
+        OffsetDateTime::now_utc().unix_timestamp_nanos()
+    );
+    let binary_spec = rollout_upload_artifact_spec("binary", binary)?;
+    let mut artifacts = vec![RolloutUploadSource {
+        artifact_id: binary_spec.artifact_id.clone(),
+        path: binary.to_path_buf(),
+        total_bytes: binary_spec.total_bytes,
+    }];
+    let mut module_specs = Vec::new();
+    for (index, module) in native_dylib_modules.iter().enumerate() {
+        let artifact_id = format!("module-{index}");
+        let artifact = rollout_upload_artifact_spec(&artifact_id, &module.built_library)?;
+        artifacts.push(RolloutUploadSource {
+            artifact_id: artifact.artifact_id.clone(),
+            path: module.built_library.clone(),
+            total_bytes: artifact.total_bytes,
+        });
+        module_specs.push(ClusterRolloutNativeDylibModuleUploadSpec {
+            module_id: module.module_id.clone(),
+            interface_version: module.interface_version.clone(),
+            cache_key: module.cache_key.clone(),
+            library_name: module.library_name.clone(),
+            source: module.source.clone(),
+            artifact,
+        });
+    }
+
+    Ok(PreparedClusterBinaryRollout::Chunked {
+        finalize: ClusterRolloutBinaryUploadFinalizeRequest {
+            manifest: ClusterRolloutBinaryUploadManifest {
+                upload_id,
+                source,
+                target_os: std::env::consts::OS.to_string(),
+                target_arch: std::env::consts::ARCH.to_string(),
+                host,
+                port,
+                shadow_port,
+                requested_at,
+                binary: binary_spec,
+                native_dylib_modules: module_specs,
+            },
+        },
+        artifacts,
+    })
+}
+
+fn rollout_artifact_size(path: &Path) -> Result<u64, CliError> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn rollout_upload_artifact_spec(
+    artifact_id: &str,
+    path: &Path,
+) -> Result<ClusterRolloutUploadArtifactSpec, CliError> {
+    Ok(ClusterRolloutUploadArtifactSpec {
+        artifact_id: artifact_id.to_string(),
+        total_bytes: rollout_artifact_size(path)?,
+        blake3: rollout_file_blake3(path)?,
+    })
+}
+
+fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, CliError> {
+    let mut file = fs::File::open(path).map_err(|source| CliError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 pub(crate) fn send_daemon_rollout_binary(
@@ -1667,6 +1805,122 @@ pub(crate) fn send_daemon_rollout_binary(
     })
 }
 
+pub(crate) fn send_prepared_daemon_rollout_binary(
+    target: &RolloutTarget,
+    request: &PreparedClusterBinaryRollout,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    match request {
+        PreparedClusterBinaryRollout::Inline(request) => {
+            send_daemon_rollout_binary(target, request)
+        }
+        PreparedClusterBinaryRollout::Chunked {
+            finalize,
+            artifacts,
+        } => send_daemon_rollout_binary_chunked(target, finalize, artifacts),
+    }
+}
+
+fn send_daemon_rollout_binary_chunked(
+    target: &RolloutTarget,
+    finalize: &ClusterRolloutBinaryUploadFinalizeRequest,
+    artifacts: &[RolloutUploadSource],
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    for artifact in artifacts {
+        upload_rollout_artifact_chunks(target, &finalize.manifest.upload_id, artifact)?;
+    }
+    let finalize = finalize.clone();
+    let expectation = RolloutProgressExpectation {
+        source: finalize.manifest.source.clone(),
+        requested_at: finalize.manifest.requested_at.clone(),
+        source_head: None,
+    };
+    send_rollout_request_with_progress(target, "binary rollout", expectation, move |target| {
+        send_daemon_rollout_binary_finalize_direct(&target, &finalize)
+    })
+}
+
+fn upload_rollout_artifact_chunks(
+    target: &RolloutTarget,
+    upload_id: &str,
+    artifact: &RolloutUploadSource,
+) -> Result<(), CliError> {
+    let mut file = fs::File::open(&artifact.path).map_err(|source| CliError::Io {
+        path: artifact.path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut offset = 0_u64;
+    let mut last_len = 0usize;
+    let mut drew_progress = false;
+    let mut buffer = vec![0_u8; ROLLOUT_UPLOAD_CHUNK_BYTES];
+    while offset < artifact.total_bytes {
+        let read = file.read(&mut buffer).map_err(|source| CliError::Io {
+            path: artifact.path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if read == 0 {
+            return Err(CliError::Io {
+                path: artifact.path.display().to_string(),
+                detail: format!(
+                    "unexpected EOF at byte {offset}, expected {}",
+                    artifact.total_bytes
+                ),
+            });
+        }
+        let chunk = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: upload_id.to_string(),
+            artifact_id: artifact.artifact_id.clone(),
+            offset,
+            total_bytes: artifact.total_bytes,
+            bytes: buffer[..read].to_vec(),
+        };
+        let response = if let Some(endpoint) = &target.endpoint {
+            daemon_send_daemon_rollout_binary_upload_chunk_to_endpoint(
+                endpoint,
+                &chunk,
+                DAEMON_ROLLOUT_TIMEOUT,
+            )
+        } else {
+            daemon_send_daemon_rollout_binary_upload_chunk(
+                &target.address,
+                &chunk,
+                DAEMON_ROLLOUT_TIMEOUT,
+            )
+        }?;
+        let expected_received =
+            offset + u64::try_from(read).expect("chunk length should fit in u64");
+        if !response.accepted || response.received_bytes != expected_received {
+            return Err(CliError::Network {
+                address: target.label().to_string(),
+                detail: format!(
+                    "rollout upload for {} stopped at {}, expected {}: {}",
+                    artifact.artifact_id,
+                    response.received_bytes,
+                    expected_received,
+                    response.detail
+                ),
+            });
+        }
+        offset = expected_received;
+        let percent = if artifact.total_bytes == 0 {
+            100
+        } else {
+            ((offset.saturating_mul(100)) / artifact.total_bytes).min(100)
+        };
+        let line = format!(
+            "{}: uploading {} {percent}% ({offset}/{} bytes)",
+            target.label(),
+            artifact.artifact_id,
+            artifact.total_bytes
+        );
+        write_rollout_progress_line(&line, &mut last_len)?;
+        drew_progress = true;
+    }
+    if drew_progress {
+        println!();
+    }
+    Ok(())
+}
+
 fn send_daemon_rollout_binary_direct(
     target: &RolloutTarget,
     request: &ClusterRolloutBinaryRequest,
@@ -1677,6 +1931,27 @@ fn send_daemon_rollout_binary_direct(
     } else {
         daemon_send_daemon_rollout_binary(&target.address, request, DAEMON_ROLLOUT_TIMEOUT)
             .map_err(Into::into)
+    }
+}
+
+fn send_daemon_rollout_binary_finalize_direct(
+    target: &RolloutTarget,
+    request: &ClusterRolloutBinaryUploadFinalizeRequest,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    if let Some(endpoint) = &target.endpoint {
+        daemon_send_daemon_rollout_binary_upload_finalize_to_endpoint(
+            endpoint,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+        .map_err(Into::into)
+    } else {
+        daemon_send_daemon_rollout_binary_upload_finalize(
+            &target.address,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+        .map_err(Into::into)
     }
 }
 

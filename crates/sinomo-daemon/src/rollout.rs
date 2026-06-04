@@ -9,8 +9,11 @@ use crate::{
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
     CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL, CLUSTER_ROLLOUT_PROGRESS_TOTAL,
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    ClusterRolloutProgressUpdate, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
+    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
+    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
+    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutProgressUpdate,
+    ClusterRolloutUploadArtifactSpec, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
     MainExitObservation, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
     RolloutFailureDiagnostics, RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV,
     SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, classify_main_exit,
@@ -29,6 +32,7 @@ use sinomo_rollout::{
 use std::env;
 use std::fmt::Display;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -38,6 +42,7 @@ const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAIN_ACTIVATION_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 const STABLE_BINARY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
+const CLUSTER_ROLLOUT_UPLOAD_MAX_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
@@ -1001,6 +1006,361 @@ pub fn handle_daemon_rollout_binary_request(
         shadow_binary,
         source_head: None,
     })
+}
+
+pub fn handle_daemon_rollout_binary_upload_chunk_request(
+    paths: &DaemonPaths,
+    request: ClusterRolloutBinaryUploadChunkRequest,
+) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
+    if request.bytes.len() > CLUSTER_ROLLOUT_UPLOAD_MAX_CHUNK_BYTES {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "rollout upload chunk is {} bytes; max is {}",
+                request.bytes.len(),
+                CLUSTER_ROLLOUT_UPLOAD_MAX_CHUNK_BYTES
+            ),
+        });
+    }
+    validate_rollout_upload_component("upload id", &request.upload_id)?;
+    validate_rollout_upload_component("artifact id", &request.artifact_id)?;
+    let chunk_len = u64::try_from(request.bytes.len()).map_err(|_| DaemonError::Parse {
+        detail: "rollout upload chunk length does not fit in u64".to_string(),
+    })?;
+    let received_bytes =
+        request
+            .offset
+            .checked_add(chunk_len)
+            .ok_or_else(|| DaemonError::Parse {
+                detail: "rollout upload chunk offset overflow".to_string(),
+            })?;
+    if received_bytes > request.total_bytes {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "rollout upload chunk ends at {received_bytes}, beyond artifact size {}",
+                request.total_bytes
+            ),
+        });
+    }
+
+    let data_dir = daemon_data_dir(paths)?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    ensure_rollout_layout(&rollout_paths)?;
+    let path =
+        rollout_upload_artifact_path(&rollout_paths, &request.upload_id, &request.artifact_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let current_len = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    if request.offset != 0 && current_len != request.offset {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "rollout upload artifact {} expected offset {}, current size is {current_len}",
+                request.artifact_id, request.offset
+            ),
+        });
+    }
+    let mut file = if request.offset == 0 {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+    } else {
+        fs::OpenOptions::new().create(true).append(true).open(&path)
+    }
+    .map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    file.write_all(&request.bytes)
+        .map_err(|source| DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(ClusterRolloutBinaryUploadChunkResponse {
+        accepted: true,
+        detail: format!(
+            "stored {} bytes for {}",
+            request.bytes.len(),
+            request.artifact_id
+        ),
+        received_bytes,
+    })
+}
+
+pub fn handle_daemon_rollout_binary_upload_finalize_request(
+    paths: &DaemonPaths,
+    request: ClusterRolloutBinaryUploadFinalizeRequest,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let manifest = request.manifest;
+    validate_rollout_upload_component("upload id", &manifest.upload_id)?;
+    validate_rollout_upload_component("artifact id", &manifest.binary.artifact_id)?;
+    let data_dir = daemon_data_dir(paths)?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    ensure_rollout_layout(&rollout_paths)?;
+    let source = manifest.source.clone();
+    let requested_at = manifest.requested_at.clone();
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-binary-push",
+        Some("verifying uploaded artifacts".to_string()),
+        &source,
+        &requested_at,
+        "verifying-upload",
+        1,
+        "verifying uploaded artifacts",
+    )?;
+    if (!manifest.target_os.is_empty() && manifest.target_os != env::consts::OS)
+        || (!manifest.target_arch.is_empty() && manifest.target_arch != env::consts::ARCH)
+    {
+        let detail = format!(
+            "artifact platform {}/{} does not match target platform {}/{}",
+            manifest.target_os,
+            manifest.target_arch,
+            env::consts::OS,
+            env::consts::ARCH
+        );
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "rejected",
+            "cluster-binary-push",
+            Some(detail.clone()),
+            &source,
+            &requested_at,
+            "rejected",
+            CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+            "platform rejected",
+        )?;
+        return Ok(ClusterRolloutBinaryResponse {
+            status: "rejected".to_string(),
+            detail,
+            main_binary: PathBuf::new(),
+            shadow_binary: PathBuf::new(),
+            source_head: None,
+        });
+    }
+
+    let uploaded_binary =
+        verify_rollout_uploaded_artifact(&rollout_paths, &manifest.upload_id, &manifest.binary)?;
+    let mut uploaded_modules = Vec::new();
+    for module in &manifest.native_dylib_modules {
+        uploaded_modules.push(verify_rollout_uploaded_module(
+            &rollout_paths,
+            &manifest.upload_id,
+            module,
+        )?);
+    }
+
+    let main_binary = rollout_paths.main_binary.clone();
+    let shadow_binary = rollout_paths.shadow_binary.clone();
+    let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
+    let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-binary-push",
+        Some("staging uploaded candidate binaries".to_string()),
+        &source,
+        &requested_at,
+        "staging-binaries",
+        2,
+        "staging uploaded candidate binaries",
+    )?;
+    stage_rollout_file(&uploaded_binary, &staged_main_binary)?;
+    stage_rollout_file(&uploaded_binary, &staged_shadow_binary)?;
+    if !uploaded_modules.is_empty() {
+        write_cluster_rollout_progress(
+            paths,
+            &rollout_paths,
+            "in-progress",
+            "cluster-binary-push",
+            Some(format!(
+                "installing {} native module artifact(s)",
+                uploaded_modules.len()
+            )),
+            &source,
+            &requested_at,
+            "staging-modules",
+            3,
+            "installing native module artifacts",
+        )?;
+        if let Err(error) = install_local_rollout_native_dylib_modules(data_dir, &uploaded_modules)
+        {
+            let detail = format!("install native module artifacts failed: {error}");
+            let _ = write_cluster_rollout_progress(
+                paths,
+                &rollout_paths,
+                "rejected",
+                "cluster-binary-push",
+                Some(detail.clone()),
+                &source,
+                &requested_at,
+                "module-install-failed",
+                CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+                "module install failed",
+            );
+            return Ok(ClusterRolloutBinaryResponse {
+                status: "rejected".to_string(),
+                detail,
+                main_binary: PathBuf::new(),
+                shadow_binary: PathBuf::new(),
+                source_head: None,
+            });
+        }
+    }
+
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-binary-push",
+        Some("preparing activation".to_string()),
+        &source,
+        &requested_at,
+        "preparing-activation",
+        4,
+        "preparing activation",
+    )?;
+    let plan = prepare_cluster_rollout_main_activation(
+        paths,
+        data_dir,
+        source,
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        manifest.host,
+        manifest.port,
+        manifest.shadow_port,
+        requested_at,
+        "cluster-binary-push",
+    )?;
+    let activation_strategy =
+        stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    let _ = fs::remove_dir_all(rollout_upload_dir(&rollout_paths, &manifest.upload_id)?);
+    publish_rollout_progress_to_cluster(paths);
+    Ok(ClusterRolloutBinaryResponse {
+        status: "accepted".to_string(),
+        detail: rollout_staged_detail(
+            "uploaded candidate main staged",
+            plan.current_main_pid,
+            activation_strategy,
+        ),
+        main_binary,
+        shadow_binary,
+        source_head: None,
+    })
+}
+
+fn rollout_upload_dir(
+    rollout_paths: &SelfRolloutPaths,
+    upload_id: &str,
+) -> Result<PathBuf, DaemonError> {
+    validate_rollout_upload_component("upload id", upload_id)?;
+    Ok(rollout_paths
+        .root
+        .join("staged")
+        .join("uploads")
+        .join(upload_id))
+}
+
+fn rollout_upload_artifact_path(
+    rollout_paths: &SelfRolloutPaths,
+    upload_id: &str,
+    artifact_id: &str,
+) -> Result<PathBuf, DaemonError> {
+    validate_rollout_upload_component("artifact id", artifact_id)?;
+    Ok(rollout_upload_dir(rollout_paths, upload_id)?.join(format!("{artifact_id}.part")))
+}
+
+fn validate_rollout_upload_component(label: &str, value: &str) -> Result<(), DaemonError> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(DaemonError::Parse {
+            detail: format!("invalid rollout upload {label}: `{value}`"),
+        });
+    }
+    Ok(())
+}
+
+fn verify_rollout_uploaded_module(
+    rollout_paths: &SelfRolloutPaths,
+    upload_id: &str,
+    module: &ClusterRolloutNativeDylibModuleUploadSpec,
+) -> Result<LocalRolloutNativeDylibModuleArtifact, DaemonError> {
+    let built_library =
+        verify_rollout_uploaded_artifact(rollout_paths, upload_id, &module.artifact)?;
+    Ok(LocalRolloutNativeDylibModuleArtifact {
+        module_id: module.module_id.clone(),
+        interface_version: module.interface_version.clone(),
+        cache_key: module.cache_key.clone(),
+        library_name: module.library_name.clone(),
+        built_library,
+        source: module.source.clone(),
+    })
+}
+
+fn verify_rollout_uploaded_artifact(
+    rollout_paths: &SelfRolloutPaths,
+    upload_id: &str,
+    spec: &ClusterRolloutUploadArtifactSpec,
+) -> Result<PathBuf, DaemonError> {
+    validate_rollout_upload_component("artifact id", &spec.artifact_id)?;
+    let path = rollout_upload_artifact_path(rollout_paths, upload_id, &spec.artifact_id)?;
+    let metadata = path.metadata().map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if metadata.len() != spec.total_bytes {
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "rollout upload artifact {} is {} bytes, expected {}",
+                spec.artifact_id,
+                metadata.len(),
+                spec.total_bytes
+            ),
+        });
+    }
+    let actual = rollout_file_blake3(&path)?;
+    if actual != spec.blake3 {
+        return Err(DaemonError::Parse {
+            detail: format!("rollout upload artifact {} hash mismatch", spec.artifact_id),
+        });
+    }
+    Ok(path)
+}
+
+fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, DaemonError> {
+    let mut file = fs::File::open(path).map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 pub fn stage_rollout_main_activation(
@@ -2170,6 +2530,40 @@ mod tests {
             true,
             Some(true)
         ));
+    }
+
+    #[test]
+    fn rollout_binary_upload_chunks_append_at_expected_offsets() {
+        let root = temp_rollout_test_root("binary-upload-chunks");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).expect("daemon root");
+        let first = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: "upload-test".to_string(),
+            artifact_id: "binary".to_string(),
+            offset: 0,
+            total_bytes: 11,
+            bytes: b"hello ".to_vec(),
+        };
+        let second = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: "upload-test".to_string(),
+            artifact_id: "binary".to_string(),
+            offset: 6,
+            total_bytes: 11,
+            bytes: b"world".to_vec(),
+        };
+
+        let response =
+            handle_daemon_rollout_binary_upload_chunk_request(&paths, first).expect("first chunk");
+        assert_eq!(response.received_bytes, 6);
+        let response = handle_daemon_rollout_binary_upload_chunk_request(&paths, second)
+            .expect("second chunk");
+        assert_eq!(response.received_bytes, 11);
+
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
+            .expect("upload path");
+        assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello world");
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

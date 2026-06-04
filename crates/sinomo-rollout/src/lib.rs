@@ -25,6 +25,8 @@ pub const ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND: &str = "rollout.transition.co
 pub const ROLLOUT_RPC_CATEGORY: &str = "rollout";
 pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
 pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
+pub const ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE: &str = "/rollout/binary-upload-chunk";
+pub const ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE: &str = "/rollout/binary-upload-finalize";
 pub const ROLLOUT_BUILD_ROUTE: &str = "/rollout/build";
 pub const ROLLOUT_FINALIZE_SHADOW_ROUTE: &str = "/rollout/finalize-shadow";
 pub const ROLLOUT_CLEAR_STATUS_ROUTE: &str = "/rollout/clear-status";
@@ -35,6 +37,8 @@ pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 pub const ROLLOUT_OBJECT_RPC_ROUTES: &[&str] = &[
     ROLLOUT_DIAGNOSTICS_ROUTE,
     ROLLOUT_BINARY_ROUTE,
+    ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+    ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
     ROLLOUT_BUILD_ROUTE,
     ROLLOUT_FINALIZE_SHADOW_ROUTE,
     ROLLOUT_CLEAR_STATUS_ROUTE,
@@ -74,10 +78,13 @@ pub use progress::{
     ClusterRolloutProgressUpdate, cluster_rollout_progress_status, rollout_timestamp_now,
 };
 pub use protocol::{
-    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    ClusterRolloutNativeDylibModuleArtifact, cluster_rollout_targets_from_state,
-    prepare_cluster_rollout_binary_request, prepare_cluster_rollout_build_request,
-    prepare_rollout_cluster_targets, unique_rollout_targets,
+    ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
+    ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
+    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBinaryUploadManifest,
+    ClusterRolloutBuildRequest, ClusterRolloutNativeDylibModuleArtifact,
+    ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutUploadArtifactSpec,
+    cluster_rollout_targets_from_state, prepare_cluster_rollout_binary_request,
+    prepare_cluster_rollout_build_request, prepare_rollout_cluster_targets, unique_rollout_targets,
 };
 pub use service::{RolloutService, register_services};
 pub use source::{
@@ -398,6 +405,14 @@ mod module_registration_tests {
             sinomo_network::ROLLOUT_DIAGNOSTICS_ROUTE
         );
         assert_eq!(ROLLOUT_BINARY_ROUTE, sinomo_network::ROLLOUT_BINARY_ROUTE);
+        assert_eq!(
+            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            sinomo_network::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
+        );
+        assert_eq!(
+            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            sinomo_network::ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
+        );
         assert_eq!(ROLLOUT_BUILD_ROUTE, sinomo_network::ROLLOUT_BUILD_ROUTE);
         assert_eq!(
             ROLLOUT_FINALIZE_SHADOW_ROUTE,

@@ -34,7 +34,8 @@ use sinomo_network::{
     read_cluster_kv_entry, read_cluster_kv_prefix_entries,
 };
 use sinomo_rollout::{
-    ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
+    ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+    ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
     register_services as register_rollout_services,
 };
 use sinomo_sandbox::{
@@ -81,7 +82,10 @@ use crate::control::{
 use crate::dfs::{handle_daemon_dfs_protocol_frame, run_daemon_dfs_smoke};
 use crate::error::DaemonError;
 use crate::paths::DaemonPaths;
-use crate::rollout::{handle_daemon_rollout_binary_request, handle_daemon_rollout_build_request};
+use crate::rollout::{
+    handle_daemon_rollout_binary_request, handle_daemon_rollout_binary_upload_chunk_request,
+    handle_daemon_rollout_binary_upload_finalize_request, handle_daemon_rollout_build_request,
+};
 
 /// Shared executor for driving service futures from connection threads. A multi-thread
 /// runtime so concurrent connection threads can `block_on` it. `enable_all` is required:
@@ -304,7 +308,12 @@ impl Service for RolloutBinaryService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE]
+        &[
+            ROLLOUT_BINARY_ROUTE,
+            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            ROLLOUT_BUILD_ROUTE,
+        ]
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -317,6 +326,27 @@ impl Service for RolloutBinaryService {
                         &paths,
                         ROLLOUT_BINARY_ROUTE,
                         handle_daemon_rollout_binary_request(&paths, payload),
+                    )?
+                }
+                ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let response =
+                        handle_daemon_rollout_binary_upload_chunk_request(&paths, payload)
+                            .map_err(daemon_error)?;
+                    (
+                        ObjectRpcResponse::encode_body(
+                            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+                            &response,
+                        )?,
+                        ServiceDisposition::Continue,
+                    )
+                }
+                ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE => {
+                    let payload = request.decode_body()?;
+                    Self::finish(
+                        &paths,
+                        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+                        handle_daemon_rollout_binary_upload_finalize_request(&paths, payload),
                     )?
                 }
                 ROLLOUT_BUILD_ROUTE => {

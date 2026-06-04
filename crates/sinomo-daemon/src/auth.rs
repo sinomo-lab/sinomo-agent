@@ -11,8 +11,9 @@ use sinomo_node::{
     load_or_create_node_identity,
 };
 use sinomo_rollout::{
-    ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
-    ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
+    ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+    ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
+    ROLLOUT_FINALIZE_SHADOW_ROUTE,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -443,6 +444,14 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
+        command if command == daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE) => {
+            matches!(
+                authenticated.signer,
+                DaemonSignerAuthority::Local
+                    | DaemonSignerAuthority::Voter
+                    | DaemonSignerAuthority::Member
+            )
+        }
         command
             if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE)
                 || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE)
@@ -457,6 +466,8 @@ pub fn authorize_authenticated_daemon_command(
         }
         command
             if command == daemon_rpc_command(ROLLOUT_BINARY_ROUTE)
+                || command == daemon_rpc_command(ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE)
+                || command == daemon_rpc_command(ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE)
                 || command == daemon_rpc_command(ROLLOUT_BUILD_ROUTE) =>
         {
             authenticated.signer.can_run_admin_command()
@@ -964,6 +975,22 @@ mod tests {
     }
 
     #[test]
+    fn cluster_health_authorizes_cluster_members_for_routed_inspection() {
+        let command = daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE);
+        for signer in [
+            DaemonSignerAuthority::Local,
+            DaemonSignerAuthority::Voter,
+            DaemonSignerAuthority::Member,
+        ] {
+            let authenticated = authenticated_command(command.clone(), signer);
+            authorize_authenticated_daemon_command(&authenticated)
+                .expect("cluster members must be able to read routed health");
+        }
+        let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+        assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+    }
+
+    #[test]
     fn rollout_clear_status_authorizes_admin_signers() {
         let command = daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE);
         for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
@@ -977,6 +1004,28 @@ mod tests {
         ] {
             let authenticated = authenticated_command(command.clone(), signer);
             assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
+    }
+
+    #[test]
+    fn rollout_upload_routes_authorize_admin_signers() {
+        for route in [
+            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+        ] {
+            let command = daemon_rpc_command(route);
+            for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
+                let authenticated = authenticated_command(command.clone(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("rollout upload routes require admin signers");
+            }
+            for signer in [
+                DaemonSignerAuthority::Member,
+                DaemonSignerAuthority::JoinCandidate,
+            ] {
+                let authenticated = authenticated_command(command.clone(), signer);
+                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+            }
         }
     }
 
