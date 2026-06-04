@@ -2115,6 +2115,8 @@ pub struct AgentConfig {
     pub workspace_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "AgentRunContext::is_empty")]
     pub run_context: AgentRunContext,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_toolsets: Vec<String>,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2145,6 +2147,7 @@ impl AgentConfig {
             max_model_repair_attempts: None,
             workspace_root: None,
             run_context: AgentRunContext::default(),
+            visible_toolsets: Vec::new(),
             workspace_instruction_files: default_workspace_instruction_files(),
             prompt_reference_max_bytes: None,
             prompt_reference_max_entries: None,
@@ -2205,6 +2208,14 @@ impl AgentConfig {
 
     pub fn with_workspace_ref(mut self, workspace: WorkspaceRef) -> Self {
         self.run_context.workspace = Some(workspace);
+        self
+    }
+
+    pub fn with_visible_toolsets(
+        mut self,
+        toolsets: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.visible_toolsets = toolsets.into_iter().map(Into::into).collect();
         self
     }
 
@@ -3233,9 +3244,10 @@ impl<'a> AgentToolOrchestrator<'a> {
         call: &AgentToolCall,
     ) -> AgentToolOutcome {
         let descriptor = tool_plan.descriptor(&call.tool);
-        let descriptor_visible = descriptor.is_some();
+        let descriptor_visible = tool_plan.is_model_visible(&call.tool);
         let executor_available = tool_plan.is_executable(&call.tool);
-        let policy_decision = self.policy.evaluate_tool_call(descriptor, call);
+        let policy_descriptor = descriptor.filter(|_| descriptor_visible);
+        let policy_decision = self.policy.evaluate_tool_call(policy_descriptor, call);
         let requested_timeout_ms = call
             .input
             .get("timeout_ms")
@@ -3289,6 +3301,31 @@ impl<'a> AgentToolOrchestrator<'a> {
                     ),
                 },
                 Some("tool_call_limit_reached".to_string()),
+            )
+        } else if descriptor.is_some() && !descriptor_visible {
+            (
+                AgentToolOutcome {
+                    call_id: TaskId::generate(),
+                    step_index,
+                    call_index,
+                    call: call.clone(),
+                    status: AgentToolStatus::Blocked,
+                    summary: format!(
+                        "tool `{}` is not visible in the current agent tool projection",
+                        call.tool
+                    ),
+                    output: serde_json::json!({
+                        "error": "tool_not_visible",
+                        "tool": call.tool.clone(),
+                        "visible_toolsets": &tool_plan.visible_toolsets,
+                    }),
+                    event_id: None,
+                    evidence: AgentToolEvidence::policy_only(
+                        false,
+                        "blocked because tool is outside the current model-visible projection",
+                    ),
+                },
+                Some("tool_not_visible".to_string()),
             )
         } else if descriptor_visible && !executor_available {
             (
@@ -4421,7 +4458,8 @@ impl<M: InteractionModel> Agent<M> {
         session_projection: Option<&AgentSessionProjection>,
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
-        let all_tool_descriptors = self.tool_plan(input).descriptors();
+        let tool_plan = self.tool_plan(input);
+        let all_tool_descriptors = tool_plan.model_visible_descriptors();
         let (tool_descriptors, policy_omissions) =
             self.policy.filter_tool_descriptors(all_tool_descriptors);
         let mut context = self.context_assembler.assemble(
@@ -4542,6 +4580,8 @@ impl<M: InteractionModel> Agent<M> {
             input.tool_specs.clone(),
             self.config.definition.tools.clone(),
             input.tool_specs.is_empty(),
+            self.config.visible_toolsets.clone(),
+            self.tools.generation(),
         )
     }
 }
@@ -6968,7 +7008,9 @@ mod tests {
         };
 
         assert!(registry.is_empty());
+        assert_eq!(registry.generation(), 0);
         assert!(registry.register(EchoTool).is_none());
+        assert_eq!(registry.generation(), 1);
         assert!(registry.contains("read_file"));
         assert_eq!(registry.len(), 1);
         let first = registry.execute(&input.session, 0, 0, &call);
@@ -6983,6 +7025,7 @@ mod tests {
         let replaced = registry
             .register(ReplacementReadTool)
             .expect("replaced descriptor");
+        assert_eq!(registry.generation(), 2);
         assert_eq!(replaced.spec.name, "read_file");
         assert_eq!(registry.len(), 1);
         let second = registry.execute(&input.session, 0, 0, &call);
@@ -6995,6 +7038,7 @@ mod tests {
         );
 
         let removed = registry.remove("read_file").expect("removed descriptor");
+        assert_eq!(registry.generation(), 3);
         assert_eq!(removed.spec.name, "read_file");
         assert!(!registry.contains("read_file"));
         let missing = registry.execute(&input.session, 0, 0, &call);
@@ -7006,6 +7050,45 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("unknown_tool")
         );
+    }
+
+    #[test]
+    fn tool_plan_tracks_generation_and_scopes_model_visible_descriptors() {
+        let runtime_descriptors = vec![
+            AgentToolDescriptor::new(AgentToolSpec::new(
+                AgentToolKind::ReadFile,
+                "read_file",
+                "read a fake file",
+                false,
+            )),
+            AgentToolDescriptor::new(AgentToolSpec::new(
+                AgentToolKind::ConfigGet,
+                "config_get",
+                "read config",
+                false,
+            )),
+        ];
+
+        let plan = AgentToolPlanner::plan(
+            runtime_descriptors,
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["config"],
+            42,
+        );
+        let visible_tools: Vec<_> = plan
+            .model_visible_descriptors()
+            .into_iter()
+            .map(|descriptor| descriptor.spec.name)
+            .collect();
+
+        assert_eq!(plan.registry_generation, 42);
+        assert_eq!(plan.visible_toolsets, vec!["config"]);
+        assert!(plan.is_executable("read_file"));
+        assert!(!plan.is_model_visible("read_file"));
+        assert!(plan.is_model_visible("config_get"));
+        assert_eq!(visible_tools, vec!["config_get"]);
     }
 
     #[test]
@@ -7225,6 +7308,63 @@ mod tests {
                 .get("error")
                 .and_then(serde_json::Value::as_str),
             Some("missing_executor")
+        );
+    }
+
+    #[test]
+    fn hidden_runtime_tool_is_blocked_if_model_guesses_it() {
+        let model = SequencedModel::new([
+            r#"{
+                "response_mode": "defer",
+                "text": "I will try a hidden tool.",
+                "tool_calls": [{
+                    "tool": "read_file",
+                    "input": {"path": "Cargo.toml"},
+                    "async": false,
+                    "summary": "Read the workspace."
+                }],
+                "background_handoff": null,
+                "next_state": "waiting"
+            }"#,
+            r#"{
+                "response_mode": "answer",
+                "text": "The tool is outside the current projection.",
+                "tool_calls": [],
+                "background_handoff": null,
+                "next_state": "listening"
+            }"#,
+        ]);
+        let config = AgentConfig::new("fake", "fake").with_visible_toolsets(["config"]);
+        let agent = Agent::new(model, "fake", "fake")
+            .with_config(config)
+            .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
+
+        let run = agent.run(&agent_input("try hidden tool")).expect("run");
+        let orchestration = run.tool_results[0]
+            .evidence
+            .metadata
+            .get("tool_orchestration")
+            .expect("tool orchestration metadata");
+
+        assert_eq!(run.tool_results[0].status, AgentToolStatus::Blocked);
+        assert_eq!(
+            run.tool_results[0]
+                .output
+                .get("error")
+                .and_then(serde_json::Value::as_str),
+            Some("tool_not_visible")
+        );
+        assert_eq!(
+            orchestration
+                .get("descriptor_visible")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            orchestration
+                .get("executor_available")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
         );
     }
 

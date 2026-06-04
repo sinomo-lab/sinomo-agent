@@ -758,8 +758,13 @@ impl<M: InteractionModel> MainAgentLoop<M> {
                 input.tool_specs.clone(),
                 self.definition.tools.clone(),
                 input.tool_specs.is_empty(),
+                Vec::<String>::new(),
+                self.tools.generation(),
             );
-            render_agent_system_prompt_with_descriptors(&self.definition, &tool_plan.descriptors())
+            render_agent_system_prompt_with_descriptors(
+                &self.definition,
+                &tool_plan.model_visible_descriptors(),
+            )
         };
         Ok(LanguageModelRequest {
             provider: self.provider.clone(),

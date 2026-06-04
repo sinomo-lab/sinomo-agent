@@ -3,11 +3,15 @@ use super::{
     AgentToolResult, AgentToolStatus,
 };
 use crate::{AgentToolCall, InteractionSession, TaskId};
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 #[derive(Clone, Default)]
 pub struct AgentToolRegistry {
     tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl AgentToolRegistry {
@@ -61,9 +65,11 @@ impl AgentToolRegistry {
             .position(|existing| existing.descriptor().spec.name == name)
         {
             let replaced = std::mem::replace(&mut tools[index], tool);
+            self.bump_generation();
             return Some(replaced.descriptor());
         }
         tools.push(tool);
+        self.bump_generation();
         None
     }
 
@@ -75,7 +81,9 @@ impl AgentToolRegistry {
         let index = tools
             .iter()
             .position(|tool| tool.descriptor().spec.name == tool_name)?;
-        Some(tools.remove(index).descriptor())
+        let descriptor = tools.remove(index).descriptor();
+        self.bump_generation();
+        Some(descriptor)
     }
 
     pub fn clear(&self) {
@@ -83,6 +91,7 @@ impl AgentToolRegistry {
             .write()
             .expect("agent tool registry lock poisoned")
             .clear();
+        self.bump_generation();
     }
 
     pub fn contains(&self, tool_name: &str) -> bool {
@@ -111,6 +120,10 @@ impl AgentToolRegistry {
             .iter()
             .map(|tool| tool.descriptor())
             .collect()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
     }
 
     pub fn execute(
@@ -171,6 +184,10 @@ impl AgentToolRegistry {
             event_id: None,
             evidence,
         }
+    }
+
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 }
 

@@ -10,6 +10,8 @@ pub struct AgentToolDescriptor {
     #[serde(default)]
     pub output_schema: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<AgentToolCapability>,
     pub supports_parallel: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -18,10 +20,15 @@ pub struct AgentToolDescriptor {
 
 impl AgentToolDescriptor {
     pub fn new(spec: AgentToolSpec) -> Self {
+        let toolsets = default_toolsets_for_kind(&spec.kind)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         Self {
             spec,
             input_schema: serde_json::Value::Null,
             output_schema: serde_json::Value::Null,
+            toolsets,
             capabilities: Vec::new(),
             supports_parallel: false,
             provider_specs: Vec::new(),
@@ -35,6 +42,11 @@ impl AgentToolDescriptor {
 
     pub fn with_output_schema(mut self, output_schema: serde_json::Value) -> Self {
         self.output_schema = output_schema;
+        self
+    }
+
+    pub fn with_toolsets(mut self, toolsets: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.toolsets = toolsets.into_iter().map(Into::into).collect();
         self
     }
 
@@ -61,6 +73,34 @@ impl AgentToolDescriptor {
 
     pub(crate) fn from_spec(spec: AgentToolSpec) -> Self {
         Self::new(spec)
+    }
+}
+
+fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
+    use crate::AgentToolKind;
+    match kind {
+        AgentToolKind::ReadFile
+        | AgentToolKind::SearchFiles
+        | AgentToolKind::WriteFile
+        | AgentToolKind::ApplyPatch
+        | AgentToolKind::RunShellCommand
+        | AgentToolKind::StartCommandSession
+        | AgentToolKind::InspectCommandSession
+        | AgentToolKind::WriteCommandStdin
+        | AgentToolKind::CancelCommandSession => vec!["core", "coding", "local"],
+        AgentToolKind::RequestUserInput => vec!["core", "interactive"],
+        AgentToolKind::ConfigSearch | AgentToolKind::ConfigGet | AgentToolKind::ConfigSet => {
+            vec!["config", "local"]
+        }
+        AgentToolKind::ReadSifs | AgentToolKind::WriteSifs | AgentToolKind::ListSifs => {
+            vec!["sifs", "cluster"]
+        }
+        AgentToolKind::ClusterStatus => vec!["cluster"],
+        AgentToolKind::StartAsyncTask
+        | AgentToolKind::InspectAsyncTask
+        | AgentToolKind::CancelAsyncTask => vec!["async_task"],
+        AgentToolKind::HandoffToBackground => vec!["delegation"],
+        AgentToolKind::ObserveVision => vec!["perception"],
     }
 }
 
@@ -129,6 +169,10 @@ pub struct AgentToolPlanEntry {
 pub struct AgentToolPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<AgentToolPlanEntry>,
+    #[serde(default)]
+    pub registry_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_toolsets: Vec<String>,
 }
 
 impl AgentToolPlan {
@@ -159,6 +203,12 @@ impl AgentToolPlan {
             .unwrap_or(false)
     }
 
+    pub fn is_model_visible(&self, tool_name: &str) -> bool {
+        self.entry(tool_name)
+            .map(|entry| descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets))
+            .unwrap_or(false)
+    }
+
     pub fn push_or_replace(
         &mut self,
         descriptor: AgentToolDescriptor,
@@ -181,6 +231,14 @@ impl AgentToolPlan {
             self.entries.push(entry);
         }
     }
+
+    pub fn model_visible_descriptors(&self) -> Vec<AgentToolDescriptor> {
+        self.entries
+            .iter()
+            .filter(|entry| descriptor_matches_toolsets(&entry.descriptor, &self.visible_toolsets))
+            .map(|entry| entry.descriptor.clone())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -192,8 +250,12 @@ impl AgentToolPlanner {
         session_specs: impl IntoIterator<Item = AgentToolSpec>,
         default_specs: impl IntoIterator<Item = AgentToolSpec>,
         use_default_specs: bool,
+        visible_toolsets: impl IntoIterator<Item = impl Into<String>>,
+        registry_generation: u64,
     ) -> AgentToolPlan {
         let mut plan = AgentToolPlan::new();
+        plan.visible_toolsets = visible_toolsets.into_iter().map(Into::into).collect();
+        plan.registry_generation = registry_generation;
         if use_default_specs {
             for spec in default_specs {
                 plan.push_or_replace(
@@ -215,6 +277,17 @@ impl AgentToolPlanner {
         }
         plan
     }
+}
+
+fn descriptor_matches_toolsets(
+    descriptor: &AgentToolDescriptor,
+    visible_toolsets: &[String],
+) -> bool {
+    visible_toolsets.is_empty()
+        || descriptor
+            .toolsets
+            .iter()
+            .any(|toolset| visible_toolsets.iter().any(|visible| visible == toolset))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
