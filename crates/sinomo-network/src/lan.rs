@@ -313,6 +313,7 @@ impl MdnsDiscoveryCache {
 
     pub fn upsert(&mut self, record: MdnsDiscoveryRecord) {
         self.records.insert(record.record_id.clone(), record);
+        self.prune_to_capacity();
     }
 
     pub fn expire_after_tick(&mut self, tick: u64) -> usize {
@@ -337,12 +338,39 @@ impl MdnsDiscoveryCache {
             .map(|record| record.endpoint.clone())
             .collect()
     }
+
+    fn prune_to_capacity(&mut self) {
+        while self.records.len() > MAX_MDNS_DISCOVERY_RECORDS {
+            let Some(oldest) = self
+                .records
+                .iter()
+                .min_by(|(left_id, left), (right_id, right)| {
+                    (
+                        left.expires_after_tick,
+                        left.advertised_tick,
+                        left_id.as_str(),
+                    )
+                        .cmp(&(
+                            right.expires_after_tick,
+                            right.advertised_tick,
+                            right_id.as_str(),
+                        ))
+                })
+                .map(|(record_id, _)| record_id.clone())
+            else {
+                return;
+            };
+            self.records.remove(&oldest);
+        }
+    }
 }
 
 pub const SINOMO_LAN_DISCOVERY_PROTOCOL: &str = "sinomo.lan-discovery.v1";
 pub const SINOMO_LAN_DISCOVERY_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 pub const SINOMO_LAN_DISCOVERY_PORT: u16 = 21_359;
 pub const SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = 10;
+pub(crate) const MAX_MDNS_DISCOVERY_RECORDS: usize = 4096;
+pub(crate) const MAX_MDNS_DISCOVERY_DRAIN_DATAGRAMS: usize = 256;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct MdnsDiscoveryAdvertisement {
@@ -470,12 +498,11 @@ impl MdnsDiscoverySocket {
     pub fn drain(&self) -> Result<Vec<MdnsDiscoveryAdvertisement>, NetworkError> {
         let mut advertisements = Vec::new();
         let mut buffer = [0_u8; 64 * 1024];
-        loop {
+        for _ in 0..MAX_MDNS_DISCOVERY_DRAIN_DATAGRAMS {
             match self.socket.recv_from(&mut buffer) {
                 Ok((received, _source)) => {
-                    let advertisement: MdnsDiscoveryAdvertisement =
-                        SinomoObjectCodec::default().decode(&buffer[..received])?;
-                    if advertisement.protocol == SINOMO_LAN_DISCOVERY_PROTOCOL {
+                    if let Some(advertisement) = decode_lan_discovery_datagram(&buffer[..received])
+                    {
                         advertisements.push(advertisement);
                     }
                 }
@@ -490,6 +517,12 @@ impl MdnsDiscoverySocket {
         }
         Ok(advertisements)
     }
+}
+
+pub(crate) fn decode_lan_discovery_datagram(bytes: &[u8]) -> Option<MdnsDiscoveryAdvertisement> {
+    let advertisement: MdnsDiscoveryAdvertisement =
+        SinomoObjectCodec::default().decode(bytes).ok()?;
+    (advertisement.protocol == SINOMO_LAN_DISCOVERY_PROTOCOL).then_some(advertisement)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

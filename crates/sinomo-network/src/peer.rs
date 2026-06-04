@@ -1,5 +1,6 @@
 use crate::error::NetworkError;
 use crate::prelude::*;
+use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
 pub struct PeerRegistry {
@@ -1175,6 +1176,7 @@ pub struct DeliveryLedger {
     capacity: usize,
     records: BTreeMap<RouteDeliveryId, DeliveryRecord>,
     active_by_event_target: BTreeMap<(EventId, NodeId), RouteDeliveryId>,
+    retry_not_before: BTreeMap<RouteDeliveryId, Instant>,
 }
 
 impl DeliveryLedger {
@@ -1188,6 +1190,7 @@ impl DeliveryLedger {
             capacity: capacity.max(1),
             records: BTreeMap::new(),
             active_by_event_target: BTreeMap::new(),
+            retry_not_before: BTreeMap::new(),
         }
     }
 
@@ -1229,14 +1232,20 @@ impl DeliveryLedger {
     }
 
     pub fn ready_delivery_ids(&self) -> Vec<RouteDeliveryId> {
+        self.ready_delivery_ids_at(Instant::now())
+    }
+
+    pub(crate) fn ready_delivery_ids_at(&self, now: Instant) -> Vec<RouteDeliveryId> {
         self.records
             .iter()
-            .filter_map(|(delivery_id, record)| {
-                matches!(
-                    record.delivery.status,
-                    DeliveryStatus::Queued | DeliveryStatus::Retrying
-                )
-                .then_some(*delivery_id)
+            .filter_map(|(delivery_id, record)| match record.delivery.status {
+                DeliveryStatus::Queued => Some(*delivery_id),
+                DeliveryStatus::Retrying => self
+                    .retry_not_before
+                    .get(delivery_id)
+                    .is_none_or(|deadline| *deadline <= now)
+                    .then_some(*delivery_id),
+                _ => None,
             })
             .collect()
     }
@@ -1248,6 +1257,7 @@ impl DeliveryLedger {
             .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
         record.attempts += 1;
         record.delivery.status = DeliveryStatus::Sent;
+        self.retry_not_before.remove(&delivery_id);
         Ok(())
     }
 
@@ -1258,6 +1268,7 @@ impl DeliveryLedger {
             .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
         if record.delivery.status != DeliveryStatus::Delivered {
             record.delivery.status = DeliveryStatus::Retrying;
+            self.retry_not_before.remove(&delivery_id);
         }
         Ok(())
     }
@@ -1272,6 +1283,7 @@ impl DeliveryLedger {
             .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
         if !record.delivery.status.is_terminal() {
             record.delivery.status = DeliveryStatus::WaitingForPeer;
+            self.retry_not_before.remove(&delivery_id);
         }
         Ok(())
     }
@@ -1287,8 +1299,12 @@ impl DeliveryLedger {
         record.attempts += 1;
         if record.attempts >= self.retry_policy.max_attempts {
             record.delivery.status = DeliveryStatus::Failed;
+            self.retry_not_before.remove(&delivery_id);
         } else {
             record.delivery.status = DeliveryStatus::Retrying;
+            let delay = retry_delay_for_record(record);
+            self.retry_not_before
+                .insert(delivery_id, Instant::now() + delay);
         }
         self.prune_terminal_records_to_retention();
         Ok(())
@@ -1308,7 +1324,7 @@ impl DeliveryLedger {
         include_in_flight: bool,
     ) -> usize {
         let mut requeued = 0;
-        for record in self.records.values_mut() {
+        for (delivery_id, record) in self.records.iter_mut() {
             if &record.delivery.target_node_id != target_node_id {
                 continue;
             }
@@ -1320,6 +1336,7 @@ impl DeliveryLedger {
             if should_requeue {
                 record.delivery.status = DeliveryStatus::Retrying;
                 record.attempts = 0;
+                self.retry_not_before.remove(delivery_id);
                 requeued += 1;
             }
         }
@@ -1328,12 +1345,13 @@ impl DeliveryLedger {
 
     pub fn mark_target_waiting_for_peer(&mut self, target_node_id: &NodeId) -> usize {
         let mut waiting = 0;
-        for record in self.records.values_mut() {
+        for (delivery_id, record) in self.records.iter_mut() {
             if &record.delivery.target_node_id == target_node_id
                 && !record.delivery.status.is_terminal()
                 && record.delivery.status != DeliveryStatus::WaitingForPeer
             {
                 record.delivery.status = DeliveryStatus::WaitingForPeer;
+                self.retry_not_before.remove(delivery_id);
                 waiting += 1;
             }
         }
@@ -1358,6 +1376,7 @@ impl DeliveryLedger {
         }
 
         record.delivery.status = DeliveryStatus::Delivered;
+        self.retry_not_before.remove(&delivery_id);
         self.prune_terminal_records_to_retention();
         Ok(())
     }
@@ -1401,12 +1420,27 @@ impl DeliveryLedger {
 
     fn remove_record(&mut self, delivery_id: RouteDeliveryId) -> Option<DeliveryRecord> {
         let record = self.records.remove(&delivery_id)?;
+        self.retry_not_before.remove(&delivery_id);
         self.active_by_event_target.remove(&(
             record.delivery.event_id.clone(),
             record.delivery.target_node_id.clone(),
         ));
         Some(record)
     }
+}
+
+const MAX_DELIVERY_RETRY_BACKOFF: Duration = Duration::from_secs(30);
+
+fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {
+    let base = match record.delivery.latency_class {
+        LatencyClass::Reactive => Duration::from_millis(25),
+        LatencyClass::Interactive => Duration::from_millis(100),
+        LatencyClass::Background => Duration::from_secs(1),
+        LatencyClass::Archive => Duration::from_secs(5),
+    };
+    let shift = record.attempts.saturating_sub(1).min(8) as u32;
+    base.saturating_mul(2_u32.saturating_pow(shift))
+        .min(MAX_DELIVERY_RETRY_BACKOFF)
 }
 
 impl Default for DeliveryLedger {

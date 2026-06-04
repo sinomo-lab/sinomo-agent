@@ -1615,10 +1615,13 @@ pub fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), NetworkError> {
-    cluster_kv_local_cache(paths)
-        .write_snapshot(snapshot)
+    let wrote = cluster_kv_local_cache(paths)
+        .write_snapshot_if_materialized_changed(snapshot)
         .map_err(NetworkError::from)?;
-    notify_cluster_kv_watchers(paths);
+    observe_cluster_kv_snapshot_write(paths, wrote);
+    if wrote {
+        notify_cluster_kv_watchers(paths);
+    }
     Ok(())
 }
 
@@ -1629,6 +1632,14 @@ pub fn write_cluster_kv_snapshot_if_changed(
     let wrote = cluster_kv_local_cache(paths)
         .write_snapshot_if_changed(snapshot)
         .map_err(NetworkError::from)?;
+    observe_cluster_kv_snapshot_write(paths, wrote);
+    if wrote {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(wrote)
+}
+
+fn observe_cluster_kv_snapshot_write(paths: &ClusterPaths, wrote: bool) {
     if let Some(observer) = io_observer() {
         if wrote {
             observer.on_kv_snapshot_actual_write();
@@ -1641,10 +1652,6 @@ pub fn write_cluster_kv_snapshot_if_changed(
             observer.on_kv_snapshot_skipped_write();
         }
     }
-    if wrote {
-        notify_cluster_kv_watchers(paths);
-    }
-    Ok(wrote)
 }
 
 pub fn read_cluster_kv_store(paths: &ClusterPaths) -> Result<InProcessKvStore, NetworkError> {

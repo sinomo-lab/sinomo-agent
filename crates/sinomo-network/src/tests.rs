@@ -742,6 +742,26 @@ fn iroh_daemon_proxy_keeps_short_timeout_for_regular_commands() {
 }
 
 #[test]
+fn iroh_daemon_proxy_restart_backoff_grows_and_caps() {
+    assert_eq!(
+        crate::roaming::iroh_daemon_proxy_restart_backoff(0),
+        crate::roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_proxy_restart_backoff(1),
+        crate::roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_proxy_restart_backoff(2),
+        crate::roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN * 2
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_proxy_restart_backoff(32),
+        crate::roaming::IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX
+    );
+}
+
+#[test]
 fn iroh_daemon_proxy_admission_limit_releases_permits() {
     assert!(crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS >= 2);
     assert!(
@@ -7003,6 +7023,66 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
 }
 
 #[test]
+fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-identical-snapshot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let snapshot = InProcessKvStore::new().snapshot();
+    write_cluster_kv_snapshot(&paths, &snapshot).expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/identical-snapshot/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    let drain_paths = paths.clone();
+    let handle = thread::spawn(move || {
+        drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id: watch.watch_id,
+                wait_timeout_millis: 150,
+            },
+        )
+        .expect("quiet long poll")
+    });
+
+    let started = Instant::now();
+    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+        && started.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "watch drain should have completed its initial read pass"
+    );
+
+    write_cluster_kv_snapshot(&paths, &snapshot).expect("write identical snapshot");
+    let drained = handle.join().expect("wait drain thread");
+
+    assert!(drained.events.is_empty());
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "identical snapshot materialization should not wake quiet watchers"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-cancel-wake-{}",
@@ -8170,6 +8250,79 @@ fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
 }
 
 #[test]
+fn mdns_discovery_cache_evicts_oldest_records_at_capacity() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_mdns_capacity").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mdns_capacity").expect("node");
+    let mut cache = MdnsDiscoveryCache::new();
+    for index in 0..=crate::lan::MAX_MDNS_DISCOVERY_RECORDS {
+        cache.upsert(MdnsDiscoveryRecord::lan_quic(
+            cluster_id.clone(),
+            node_id.clone(),
+            format!("192.168.42.{index}:21355"),
+            index as u64,
+            10,
+        ));
+    }
+
+    let endpoints = cache.endpoints_for_cluster(&cluster_id);
+    assert_eq!(
+        endpoints.len(),
+        crate::lan::MAX_MDNS_DISCOVERY_RECORDS,
+        "discovery cache should stay bounded under noisy LAN advertisements"
+    );
+    assert!(
+        endpoints
+            .iter()
+            .all(|endpoint| endpoint.address != "192.168.42.0:21355"),
+        "oldest mDNS record should be evicted first"
+    );
+    assert!(
+        endpoints
+            .iter()
+            .any(|endpoint| endpoint.address == "192.168.42.4096:21355"),
+        "newest mDNS record should be retained"
+    );
+}
+
+#[test]
+fn lan_discovery_datagram_decoder_ignores_malformed_and_wrong_protocol() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_mdns_decode").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mdns_decode").expect("node");
+    let valid = MdnsDiscoveryAdvertisement::new(
+        cluster_id.clone(),
+        node_id.clone(),
+        vec![
+            MdnsDiscoveryRecord::lan_quic(cluster_id, node_id, "192.168.50.20:21355", 10, 5)
+                .endpoint,
+        ],
+        10,
+    );
+    let valid_bytes = SinomoObjectCodec::default()
+        .encode(&valid)
+        .expect("valid advertisement");
+    assert_eq!(
+        crate::lan::decode_lan_discovery_datagram(&valid_bytes),
+        Some(valid)
+    );
+
+    assert!(crate::lan::decode_lan_discovery_datagram(b"not-a-sinomo-object").is_none());
+
+    let wrong_protocol = MdnsDiscoveryAdvertisement {
+        protocol: "other.discovery.v1".to_string(),
+        ..MdnsDiscoveryAdvertisement::new(
+            ClusterId::from_legacy_named("cluster_mdns_wrong_proto").expect("cluster"),
+            NodeId::from_legacy_named("node_mdns_wrong_proto").expect("node"),
+            Vec::new(),
+            11,
+        )
+    };
+    let wrong_protocol_bytes = SinomoObjectCodec::default()
+        .encode(&wrong_protocol)
+        .expect("wrong protocol advertisement");
+    assert!(crate::lan::decode_lan_discovery_datagram(&wrong_protocol_bytes).is_none());
+}
+
+#[test]
 fn cluster_auth_verifier_establishes_mutual_session_for_authorized_members() {
     let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
@@ -9135,6 +9288,15 @@ async fn retry_policy_marks_delivery_failed_after_max_attempts() {
         delivery_status(&service, delivery.delivery_id).await,
         DeliveryStatus::Retrying
     );
+    assert_eq!(
+        service
+            .pump_outbound()
+            .await
+            .expect("backoff suppresses retry"),
+        0,
+        "failed sends should not retry again in the same pump loop"
+    );
+    tokio::time::sleep(Duration::from_millis(120)).await;
     let error = service
         .pump_outbound()
         .await
@@ -9145,6 +9307,42 @@ async fn retry_policy_marks_delivery_failed_after_max_attempts() {
         DeliveryStatus::Failed
     );
     service.shutdown().await;
+}
+
+#[test]
+fn delivery_ledger_applies_latency_class_retry_backoff() {
+    let node_a = NodeId::from_legacy_named("node_retry_backoff_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_retry_backoff_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_retry_backoff", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Background,
+        status: DeliveryStatus::Queued,
+    };
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    assert_eq!(ledger.ready_delivery_ids(), vec![RouteDeliveryId(1)]);
+
+    let before_failure = Instant::now();
+    ledger
+        .mark_attempt_failed(RouteDeliveryId(1))
+        .expect("mark failed");
+    assert!(ledger.ready_delivery_ids().is_empty());
+    assert!(
+        ledger
+            .ready_delivery_ids_at(before_failure + Duration::from_millis(500))
+            .is_empty(),
+        "background delivery retries should not become ready before backoff"
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_at(before_failure + Duration::from_millis(1_200)),
+        vec![RouteDeliveryId(1)],
+        "background delivery retries should become ready after backoff"
+    );
 }
 
 #[test]
@@ -9436,6 +9634,7 @@ async fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("first attempt"), 0);
+    tokio::time::sleep(Duration::from_millis(120)).await;
     assert!(service_a.pump_outbound().await.is_err());
     assert_eq!(
         delivery_status(&service_a, delivery_id).await,

@@ -8,8 +8,12 @@ pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
 pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
 #[cfg(feature = "iroh-transport")]
-const IROH_DAEMON_PROXY_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+const IROH_DAEMON_PROXY_STABLE_RUNTIME: Duration = Duration::from_secs(60);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_ERROR_ROUTE: &str = "/iroh-daemon-proxy/error";
 #[cfg(any(feature = "iroh-transport", test))]
@@ -480,6 +484,14 @@ pub(crate) fn iroh_proxy_route_hint(payload: &[u8]) -> String {
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn iroh_daemon_proxy_restart_backoff(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(8);
+    IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
+        .saturating_mul(2_u32.saturating_pow(shift))
+        .min(IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX)
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
 #[derive(Clone, Debug)]
 pub(crate) struct IrohProxyByteBudget {
     inner: Arc<Mutex<IrohProxyByteBudgetState>>,
@@ -760,6 +772,7 @@ pub fn start_iroh_daemon_proxy(
         .name(format!("sinomo-iroh-{}", node_id.as_str()))
         .spawn(move || {
             let mut first_ready = Some(tx);
+            let mut restart_failures = 0_u32;
             loop {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
@@ -777,7 +790,8 @@ pub fn start_iroh_daemon_proxy(
                             return;
                         }
                         eprintln!("sinomo iroh daemon proxy restart failed: {error}");
-                        thread::sleep(IROH_DAEMON_PROXY_RESTART_BACKOFF);
+                        restart_failures = restart_failures.saturating_add(1);
+                        thread::sleep(iroh_daemon_proxy_restart_backoff(restart_failures));
                         continue;
                     }
                 };
@@ -790,10 +804,12 @@ pub fn start_iroh_daemon_proxy(
                         }
                         eprintln!("sinomo iroh daemon proxy restart failed: {error}");
                         runtime.shutdown_timeout(Duration::from_millis(250));
-                        thread::sleep(IROH_DAEMON_PROXY_RESTART_BACKOFF);
+                        restart_failures = restart_failures.saturating_add(1);
+                        thread::sleep(iroh_daemon_proxy_restart_backoff(restart_failures));
                         continue;
                     }
                 };
+                let run_started = std::time::Instant::now();
                 let result = runtime.block_on(run_iroh_daemon_proxy(
                     paths.clone(),
                     cluster_id.clone(),
@@ -808,7 +824,12 @@ pub fn start_iroh_daemon_proxy(
                 } else {
                     eprintln!("sinomo iroh daemon proxy stopped");
                 }
-                thread::sleep(IROH_DAEMON_PROXY_RESTART_BACKOFF);
+                if run_started.elapsed() >= IROH_DAEMON_PROXY_STABLE_RUNTIME {
+                    restart_failures = 0;
+                } else {
+                    restart_failures = restart_failures.saturating_add(1);
+                }
+                thread::sleep(iroh_daemon_proxy_restart_backoff(restart_failures));
             }
         })
         .map_err(|source| NetworkError::Io {

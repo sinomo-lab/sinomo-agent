@@ -960,15 +960,34 @@ impl KvMaterializedCache {
     /// Persists `snapshot` and refreshes the process-wide read cache so subsequent
     /// reads hit memory rather than re-reading the file.
     fn write_and_cache(&self, snapshot: KvSnapshot) -> Result<(), KvError> {
-        write_object_file(&self.path, &snapshot)?;
+        self.write_and_cache_if_materialized_changed(snapshot)
+            .map(|_| ())
+    }
+
+    /// Persists `snapshot` exactly as materialized and reports whether the object
+    /// file changed. Unlike `write_snapshot_if_changed`, this treats revision and
+    /// watch-event history as meaningful so callers that publish snapshot-backed
+    /// events can suppress only truly redundant notifications.
+    fn write_and_cache_if_materialized_changed(
+        &self,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        let wrote = write_object_file_if_changed(&self.path, &snapshot)?;
         if let Some(identity) = file_identity(&self.path) {
             cache_store_snapshot(&self.path, identity, Arc::new(snapshot));
         }
-        Ok(())
+        Ok(wrote)
     }
 
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
         self.write_and_cache(self.materialized(snapshot))
+    }
+
+    pub fn write_snapshot_if_materialized_changed(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.write_and_cache_if_materialized_changed(self.materialized(snapshot))
     }
 
     pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
@@ -1121,6 +1140,14 @@ impl KvLocalCache {
 
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
         self.materialized.write_snapshot(snapshot)
+    }
+
+    pub fn write_snapshot_if_materialized_changed(
+        &self,
+        snapshot: &KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.materialized
+            .write_snapshot_if_materialized_changed(snapshot)
     }
 
     pub fn write_snapshot_if_changed(&self, snapshot: &KvSnapshot) -> Result<bool, KvError> {
@@ -3574,11 +3601,19 @@ fn read_existing_object_file_for_compare(path: &Path, expected_len: u64) -> Opti
 }
 
 fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
+    write_object_file_if_changed(path, value).map(|_| ())
+}
+
+fn write_object_file_if_changed<T: Serialize>(path: &Path, value: &T) -> Result<bool, KvError> {
     let content = sinomo_object_serde::to_bytes(value, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
         .map_err(|source| KvError::Serialization {
         detail: source.to_string(),
     })?;
-    let content_hash = blake3::hash(&content);
+    write_object_file_bytes_if_changed(path, &content)
+}
+
+fn write_object_file_bytes_if_changed(path: &Path, content: &[u8]) -> Result<bool, KvError> {
+    let content_hash = blake3::hash(content);
 
     // Fast path: if we last wrote this exact content and the file is unchanged
     // since (length + mtime + inode still match our record), skip without
@@ -3590,7 +3625,7 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         && metadata.modified().ok() == mark.modified
         && file_ino(&metadata) == mark.ino
     {
-        return Ok(());
+        return Ok(false);
     }
 
     // Slow path: read the file back and compare only when the length could match.
@@ -3603,7 +3638,7 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         // Already current: record the mark so subsequent calls take the fast path.
         let (modified, ino) = file_modified_and_ino(path);
         record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
-        return Ok(());
+        return Ok(false);
     }
 
     if let Some(parent) = path.parent() {
@@ -3632,7 +3667,7 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.write_all(&content).map_err(|source| KvError::Io {
+        file.write_all(content).map_err(|source| KvError::Io {
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -3653,7 +3688,7 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
     sync_directory(parent)?;
     let (modified, ino) = file_modified_and_ino(path);
     record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
-    Ok(())
+    Ok(true)
 }
 
 fn replace_file(temp_path: &Path, path: &Path) -> Result<(), KvError> {
@@ -5736,6 +5771,51 @@ mod tests {
                 .value,
             b"two"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_reports_exact_materialized_snapshot_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-materialized-exact-change-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let mut store = InProcessKvStore::new();
+        store.put("alpha", b"one".to_vec(), None).expect("seed");
+        let initial = store.snapshot();
+
+        assert!(
+            cache
+                .write_snapshot_if_materialized_changed(&initial)
+                .expect("initial write")
+        );
+        assert!(
+            !cache
+                .write_snapshot_if_materialized_changed(&initial)
+                .expect("skip exact match"),
+            "identical materialized snapshots should be skipped"
+        );
+
+        store.put("alpha", b"one".to_vec(), None).expect("re-put");
+        let event_only_change = store.snapshot();
+        assert!(
+            kv_snapshot_durable_eq(&initial, &event_only_change),
+            "test setup should differ only in revision/event metadata"
+        );
+        assert!(
+            cache
+                .write_snapshot_if_materialized_changed(&event_only_change)
+                .expect("event-only materialized write"),
+            "revision/event changes must be reported when callers publish snapshot-backed events"
+        );
+
+        let persisted = cache.read_snapshot().expect("read exact snapshot");
+        assert_eq!(persisted.revision, event_only_change.revision);
+        assert_eq!(persisted.events, event_only_change.events);
         std::fs::remove_dir_all(root).ok();
     }
 
