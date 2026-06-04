@@ -47,6 +47,12 @@ pub enum NetworkError {
         expected_target_node_id: NodeId,
         acking_node_id: NodeId,
     },
+    #[error("delivery {delivery_id:?} acked event {acking_event_id}, expected {expected_event_id}")]
+    AckEventMismatch {
+        delivery_id: RouteDeliveryId,
+        expected_event_id: EventId,
+        acking_event_id: EventId,
+    },
     #[error("cluster mismatch: expected {expected}, got {actual}")]
     ClusterMismatch {
         expected: ClusterId,

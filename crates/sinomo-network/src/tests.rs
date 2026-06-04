@@ -10101,6 +10101,502 @@ async fn process_incoming_ignores_stale_ack_and_continues_batch() {
 }
 
 #[tokio::test]
+async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() {
+    let node_a = NodeId::from_legacy_named("node_ack_event_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_event_receiver").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut ack_injector_b = transport_b.clone();
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_ack_event_sender"));
+    registry.register_node(node("node_ack_event_receiver"));
+
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_ack_event_expected", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store_a);
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
+    ack_injector_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(99),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(99),
+                    origin_node_id: node_b.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Ack(DeliveryAck {
+                        delivery_id,
+                        event_id: EventId::from_legacy_named("evt_ack_event_wrong").expect("event"),
+                        target_node_id: node_b.clone(),
+                    }),
+                },
+            },
+        )
+        .expect("inject wrong ack");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("wrong ack should not abort");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::AckIgnored {
+            delivery_id: ignored_delivery_id,
+            target_node_id,
+        }] if *ignored_delivery_id == delivery_id && target_node_id == &node_b
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("receiver processes original event");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::EventAccepted { .. }]
+    ));
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("sender processes real ack");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::AckAccepted {
+            delivery_id: accepted_delivery_id,
+            target_node_id,
+        }] if *accepted_delivery_id == delivery_id && target_node_id == &node_b
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Delivered
+    );
+
+    service_a.shutdown().await;
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_ack_target_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_target_receiver").expect("node");
+    let node_c = NodeId::from_legacy_named("node_ack_target_wrong").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    network.add_node(node_b.clone());
+    let mut transport_c = network.add_node(node_c.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_ack_target_sender"));
+    registry.register_node(node("node_ack_target_receiver"));
+    registry.register_node(node("node_ack_target_wrong"));
+
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_ack_target_expected", node_a.clone()).with_target_node(node_b.clone());
+    let expected_event_id = event.event_id.clone();
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
+    transport_c
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_c.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_c.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Ack(DeliveryAck {
+                        delivery_id,
+                        event_id: expected_event_id,
+                        target_node_id: node_c.clone(),
+                    }),
+                },
+            },
+        )
+        .expect("send wrong-source ack");
+    transport_c
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(2),
+                source_node_id: node_c.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(2),
+                    origin_node_id: node_c.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_c.clone(),
+                        tick: 9,
+                    }),
+                },
+            },
+        )
+        .expect("send heartbeat after wrong-source ack");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("wrong-source ack should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::AckIgnored {
+                delivery_id: ignored_delivery_id,
+                target_node_id,
+            },
+            InboundOutcome::HeartbeatReceived {
+                node_id,
+                status: PeerStatus::Healthy,
+                ..
+            }
+        ] if *ignored_delivery_id == delivery_id && target_node_id == &node_c && node_id == &node_c
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+    service_a.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_heartbeat_guard_local").expect("node");
+    let node_b = NodeId::from_legacy_named("node_heartbeat_guard_offline").expect("node");
+    let node_c = NodeId::from_legacy_named("node_heartbeat_guard_source").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    network.add_node(node_b.clone());
+    let mut transport_c = network.add_node(node_c.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_heartbeat_guard_local"));
+    registry.register_node(node("node_heartbeat_guard_offline"));
+    registry.register_node(node("node_heartbeat_guard_source"));
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("mark peer offline");
+    }
+
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_heartbeat_guard", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("park offline"), 0);
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::WaitingForPeer
+    );
+    transport_c
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_c.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_c.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 11,
+                    }),
+                },
+            },
+        )
+        .expect("send mismatched heartbeat");
+    transport_c
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(2),
+                source_node_id: node_c.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(2),
+                    origin_node_id: node_c.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_c.clone(),
+                        tick: 12,
+                    }),
+                },
+            },
+        )
+        .expect("send valid heartbeat");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("mismatched heartbeat should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::HeartbeatIgnored {
+                node_id,
+                source_node_id,
+            },
+            InboundOutcome::HeartbeatReceived {
+                node_id: received_node_id,
+                status: PeerStatus::Healthy,
+                requeued: 0,
+            }
+        ] if node_id == &node_b && source_node_id == &node_c && received_node_id == &node_c
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::WaitingForPeer,
+        "mismatched heartbeat must not requeue work for the offline peer"
+    );
+    assert_eq!(
+        service_a.next_outbound_wake_at().await.expect("wake hint"),
+        None,
+        "parked offline work should remain idle after a mismatched heartbeat"
+    );
+    service_a.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_message_target_local").expect("node");
+    let node_b = NodeId::from_legacy_named("node_message_target_remote").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_message_target_local"));
+    registry.register_node(node("node_message_target_remote"));
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("mark peer offline");
+    }
+
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_message_target_guard", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("park offline"), 0);
+    transport_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_b.clone(),
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 21,
+                    }),
+                },
+            },
+        )
+        .expect("send message-target mismatch");
+    transport_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(2),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(2),
+                    origin_node_id: node_b.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 22,
+                    }),
+                },
+            },
+        )
+        .expect("send valid heartbeat");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("target mismatch should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::FrameIgnored {
+                source_node_id,
+                message_origin_node_id,
+                received_by,
+                frame_target_node_id,
+                message_target_node_id,
+            },
+            InboundOutcome::HeartbeatReceived {
+                node_id,
+                status: PeerStatus::Healthy,
+                requeued: 1,
+            }
+        ] if source_node_id == &node_b
+            && message_origin_node_id == &node_b
+            && received_by == &node_a
+            && frame_target_node_id == &node_a
+            && message_target_node_id == &node_b
+            && node_id == &node_b
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Retrying
+    );
+    service_a.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_message_origin_local").expect("node");
+    let node_b = NodeId::from_legacy_named("node_message_origin_remote").expect("node");
+    let node_c = NodeId::from_legacy_named("node_message_origin_spoof").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    network.add_node(node_c.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_message_origin_local"));
+    registry.register_node(node("node_message_origin_remote"));
+    registry.register_node(node("node_message_origin_spoof"));
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("mark peer offline");
+    }
+
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_message_origin_guard", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("park offline"), 0);
+    transport_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_c.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 31,
+                    }),
+                },
+            },
+        )
+        .expect("send message-origin mismatch");
+    transport_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(2),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(2),
+                    origin_node_id: node_b.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 32,
+                    }),
+                },
+            },
+        )
+        .expect("send valid heartbeat");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("origin mismatch should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::FrameIgnored {
+                source_node_id,
+                message_origin_node_id,
+                received_by,
+                frame_target_node_id,
+                message_target_node_id,
+            },
+            InboundOutcome::HeartbeatReceived {
+                node_id,
+                status: PeerStatus::Healthy,
+                requeued: 1,
+            }
+        ] if source_node_id == &node_b
+            && message_origin_node_id == &node_c
+            && received_by == &node_a
+            && frame_target_node_id == &node_a
+            && message_target_node_id == &node_a
+            && node_id == &node_b
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Retrying
+    );
+    service_a.shutdown().await;
+}
+
+#[tokio::test]
 async fn network_service_pump_outbound_batches_large_ready_backlogs() {
     let node_a = NodeId::from_legacy_named("node_batch_sender").expect("node");
     let session_id = SessionId::from_legacy_named("sess_batch_delivery").expect("session");
@@ -10751,11 +11247,57 @@ fn delivery_ledger_sent_ack_deadline_retries_stale_in_flight_work() {
 }
 
 #[test]
+fn delivery_ledger_reconciles_sent_records_missing_ack_deadlines() {
+    let node_a = NodeId::from_legacy_named("node_orphan_ack_deadline_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_orphan_ack_deadline_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_orphan_ack_deadline", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let now = Instant::now();
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger
+        .mark_sent_at(RouteDeliveryId(1), now)
+        .expect("mark sent");
+    ledger.clear_ack_deadline_for_test(RouteDeliveryId(1));
+
+    assert_eq!(
+        ledger.next_outbound_wake_at_at(now),
+        Some(now),
+        "orphaned sent state should request reconciliation instead of sleeping forever"
+    );
+    assert_eq!(
+        ledger.expire_ack_deadlines_at(now),
+        1,
+        "orphaned sent state should be handled as an ack timeout"
+    );
+    let record = ledger.record(&RouteDeliveryId(1)).expect("record");
+    assert_eq!(record.delivery.status, DeliveryStatus::Retrying);
+    assert_eq!(record.attempts, 1);
+    assert!(
+        ledger.ready_delivery_ids_at(now).is_empty(),
+        "reconciled work should use normal retry backoff rather than spin immediately"
+    );
+    assert!(
+        ledger.next_outbound_wake_at_at(now).expect("retry wake") > now,
+        "scheduler should sleep until the retry backoff expires"
+    );
+}
+
+#[test]
 fn delivery_ledger_ack_clears_sent_deadline() {
     let node_a = NodeId::from_legacy_named("node_ack_deadline_source").expect("node");
     let node_b = NodeId::from_legacy_named("node_ack_deadline_target").expect("node");
     let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
     let event = fixture_event("evt_ack_deadline_clear", node_a);
+    let event_id = event.event_id.clone();
     let delivery = RouteDelivery {
         delivery_id: RouteDeliveryId(1),
         event_sequence: EventSequence(1),
@@ -10771,7 +11313,9 @@ fn delivery_ledger_ack_clears_sent_deadline() {
     ledger
         .mark_sent_at(RouteDeliveryId(1), now)
         .expect("mark sent");
-    ledger.ack(RouteDeliveryId(1), &node_b).expect("ack");
+    ledger
+        .ack(RouteDeliveryId(1), &event_id, &node_b)
+        .expect("ack");
 
     assert_eq!(ledger.next_outbound_wake_at_at(now), None);
     assert_eq!(ledger.expire_ack_deadlines_at(deadline), 0);
@@ -10910,6 +11454,7 @@ fn ack_rejects_wrong_target_node() {
     let node_c = NodeId::from_legacy_named("node_c").expect("node");
     let mut ledger = DeliveryLedger::new(RetryPolicy::default());
     let event = fixture_event("evt_wrong_ack", node_a);
+    let event_id = event.event_id.clone();
     let delivery = RouteDelivery {
         delivery_id: RouteDeliveryId(1),
         event_sequence: EventSequence(1),
@@ -10921,7 +11466,7 @@ fn ack_rejects_wrong_target_node() {
     ledger.enqueue(delivery, event).expect("enqueue");
 
     let error = ledger
-        .ack(RouteDeliveryId(1), &node_c)
+        .ack(RouteDeliveryId(1), &event_id, &node_c)
         .expect_err("wrong target should fail");
     assert!(matches!(error, NetworkError::AckTargetMismatch { .. }));
     assert_eq!(
@@ -10931,6 +11476,34 @@ fn ack_rejects_wrong_target_node() {
             .delivery
             .target_node_id,
         node_b
+    );
+}
+
+#[test]
+fn ack_rejects_wrong_event_id() {
+    let node_a = NodeId::from_legacy_named("node_wrong_event_ack_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_wrong_event_ack_target").expect("node");
+    let mut ledger = DeliveryLedger::new(RetryPolicy::default());
+    let event = fixture_event("evt_expected_ack", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let wrong_event_id = EventId::from_legacy_named("evt_wrong_ack").expect("event");
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger.mark_sent(RouteDeliveryId(1)).expect("mark sent");
+
+    let error = ledger
+        .ack(RouteDeliveryId(1), &wrong_event_id, &node_b)
+        .expect_err("wrong event should fail");
+    assert!(matches!(error, NetworkError::AckEventMismatch { .. }));
+    assert_eq!(
+        ledger.record(&RouteDeliveryId(1)).unwrap().delivery.status,
+        DeliveryStatus::Sent
     );
 }
 
@@ -10989,8 +11562,14 @@ fn delivery_ledger_prunes_terminal_records_under_pressure() {
             Some(RouteDeliveryId(index))
         );
     }
+    let event_id = ledger
+        .record(&RouteDeliveryId(1))
+        .expect("record")
+        .delivery
+        .event_id
+        .clone();
     ledger
-        .ack(RouteDeliveryId(1), &node_b)
+        .ack(RouteDeliveryId(1), &event_id, &node_b)
         .expect("mark first delivered");
 
     let event = fixture_event("evt_ledger_prune_3", node_a);
@@ -11037,8 +11616,14 @@ fn delivery_ledger_prunes_terminal_records_without_enqueue_pressure() {
     }
 
     for index in 1..=4 {
+        let event_id = ledger
+            .record(&RouteDeliveryId(index))
+            .expect("record")
+            .delivery
+            .event_id
+            .clone();
         ledger
-            .ack(RouteDeliveryId(index), &node_b)
+            .ack(RouteDeliveryId(index), &event_id, &node_b)
             .expect("mark delivered");
     }
 

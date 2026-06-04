@@ -912,8 +912,27 @@ impl<T: NetworkTransport> NetworkService<T> {
             .transport
             .drain_incoming_limited(NETWORK_SERVICE_INBOUND_BATCH_LIMIT)?;
         let mut outcomes = Vec::with_capacity(inbound_frames.len());
+        let local_node_id = self.transport.local_node_id().clone();
 
         for inbound in inbound_frames {
+            let source_node_id = inbound.frame.source_node_id.clone();
+            let message_origin_node_id = inbound.frame.message.origin_node_id.clone();
+            let frame_target_node_id = inbound.frame.target_node_id.clone();
+            let message_target_node_id = inbound.frame.message.target_node_id.clone();
+            if source_node_id != message_origin_node_id
+                || inbound.received_by != local_node_id
+                || frame_target_node_id != local_node_id
+                || message_target_node_id != local_node_id
+            {
+                outcomes.push(InboundOutcome::FrameIgnored {
+                    source_node_id,
+                    message_origin_node_id,
+                    received_by: inbound.received_by,
+                    frame_target_node_id,
+                    message_target_node_id,
+                });
+                continue;
+            }
             match inbound.frame.message.body {
                 MeshMessageBody::Event { delivery_id, event } => {
                     let outcome = ingest_event(&mut self.seen_events, store, delivery_id, &event)?;
@@ -937,24 +956,45 @@ impl<T: NetworkTransport> NetworkService<T> {
                     }
                 }
                 MeshMessageBody::Ack(ack) => {
+                    let acking_node_id = inbound.frame.source_node_id;
                     match self
                         .ledger
-                        .ack(ack.delivery_id, &inbound.frame.source_node_id)
+                        .ack(ack.delivery_id, &ack.event_id, &acking_node_id)
                     {
                         Ok(()) => outcomes.push(InboundOutcome::AckAccepted {
                             delivery_id: ack.delivery_id,
-                            target_node_id: ack.target_node_id,
+                            target_node_id: acking_node_id,
                         }),
                         Err(NetworkError::UnknownDelivery { delivery_id }) => {
                             outcomes.push(InboundOutcome::AckIgnored {
                                 delivery_id,
-                                target_node_id: ack.target_node_id,
+                                target_node_id: acking_node_id,
+                            });
+                        }
+                        Err(NetworkError::AckEventMismatch { delivery_id, .. }) => {
+                            outcomes.push(InboundOutcome::AckIgnored {
+                                delivery_id,
+                                target_node_id: acking_node_id,
+                            });
+                        }
+                        Err(NetworkError::AckTargetMismatch { delivery_id, .. }) => {
+                            outcomes.push(InboundOutcome::AckIgnored {
+                                delivery_id,
+                                target_node_id: acking_node_id,
                             });
                         }
                         Err(error) => return Err(error),
                     }
                 }
                 MeshMessageBody::Heartbeat(heartbeat) => {
+                    let source_node_id = inbound.frame.source_node_id;
+                    if heartbeat.node_id != source_node_id {
+                        outcomes.push(InboundOutcome::HeartbeatIgnored {
+                            node_id: heartbeat.node_id,
+                            source_node_id,
+                        });
+                        continue;
+                    }
                     let was_routable = self.registry().is_routable(&heartbeat.node_id);
                     let status = self
                         .router
@@ -1217,6 +1257,13 @@ pub enum InboundOutcome {
         delivery_id: RouteDeliveryId,
         event_id: EventId,
     },
+    FrameIgnored {
+        source_node_id: NodeId,
+        message_origin_node_id: NodeId,
+        received_by: NodeId,
+        frame_target_node_id: NodeId,
+        message_target_node_id: NodeId,
+    },
     AckAccepted {
         delivery_id: RouteDeliveryId,
         target_node_id: NodeId,
@@ -1235,6 +1282,10 @@ pub enum InboundOutcome {
         node_id: NodeId,
         status: PeerStatus,
         requeued: usize,
+    },
+    HeartbeatIgnored {
+        node_id: NodeId,
+        source_node_id: NodeId,
     },
     ProtocolIgnored {
         protocol: String,
@@ -1472,11 +1523,17 @@ impl DeliveryLedger {
     }
 
     pub(crate) fn expire_ack_deadlines_at(&mut self, now: Instant) -> usize {
-        let expired = self
+        let mut expired = self
             .ack_deadline
             .iter()
             .filter_map(|(delivery_id, deadline)| (*deadline <= now).then_some(*delivery_id))
             .collect::<Vec<_>>();
+        expired.extend(self.records.iter().filter_map(|(delivery_id, record)| {
+            (record.delivery.status == DeliveryStatus::Sent
+                && !self.ack_deadline.contains_key(delivery_id))
+            .then_some(*delivery_id)
+        }));
+
         let mut expired_count = 0;
         for delivery_id in expired {
             let Some(record) = self.records.get_mut(&delivery_id) else {
@@ -1502,6 +1559,11 @@ impl DeliveryLedger {
             self.prune_terminal_records_to_retention();
         }
         expired_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_ack_deadline_for_test(&mut self, delivery_id: RouteDeliveryId) {
+        self.ack_deadline.remove(&delivery_id);
     }
 
     pub fn requeue_target(&mut self, target_node_id: &NodeId) -> usize {
@@ -1557,6 +1619,7 @@ impl DeliveryLedger {
     pub fn ack(
         &mut self,
         delivery_id: RouteDeliveryId,
+        event_id: &EventId,
         acking_node_id: &NodeId,
     ) -> Result<(), NetworkError> {
         let record = self
@@ -1568,6 +1631,13 @@ impl DeliveryLedger {
                 delivery_id,
                 expected_target_node_id: record.delivery.target_node_id.clone(),
                 acking_node_id: acking_node_id.clone(),
+            });
+        }
+        if &record.delivery.event_id != event_id {
+            return Err(NetworkError::AckEventMismatch {
+                delivery_id,
+                expected_event_id: record.delivery.event_id.clone(),
+                acking_event_id: event_id.clone(),
             });
         }
 
