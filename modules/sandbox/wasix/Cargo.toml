@@ -22,7 +22,6 @@ wasix-runtime = [
     "dep:virtual-fs",
     "dep:virtual-mio",
     "dep:wasmtime",
-    "dep:wasmtime-wasi",
     "dep:wasmer",
     "dep:wasmer-types",
     "dep:wasmer-vm",
@@ -51,7 +50,6 @@ sinomo-object = { path = "../../../crates/sinomo-object", features = ["serde"] }
 sinomo-sandbox-wasix-api = { path = "../../../crates/sinomo-sandbox-wasix-api" }
 sinomo-storage = { path = "../../../crates/sinomo-storage" }
 wasmtime = { version = "41.0.4", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"], optional = true }
-wasmtime-wasi = { version = "41.0.4", default-features = false, features = ["p1"], optional = true }
 tokio = { version = "1.44", features = ["rt-multi-thread", "time"], optional = true }
 virtual-fs = { version = "0.700.0-alpha.2", default-features = false, features = ["host-fs"], optional = true }
 virtual-mio = { version = "0.700.0-alpha.2", default-features = false, optional = true }

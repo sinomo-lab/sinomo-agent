@@ -1593,7 +1593,7 @@ pub fn handle_daemon_sandbox_toolchain_add_artifact(
             sinomo_sandbox::SandboxToolchainManifest::new(
                 request.toolchain_id.clone(),
                 request.version,
-                sinomo_sandbox::SandboxWasiAbi::Preview1,
+                sinomo_sandbox::SandboxWasiAbi::Wasix,
                 request.provenance,
                 OffsetDateTime::now_utc(),
             )?

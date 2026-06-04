@@ -10,7 +10,6 @@ pub(crate) use sinomo_sandbox::*;
 
 pub(crate) use crate::execution::*;
 pub(crate) use crate::runtime;
-pub(crate) use crate::runtime::LocalWasiCommandRunner;
 
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use sinomo_core::{
@@ -37,12 +36,3 @@ pub(crate) use std::sync::{
 pub(crate) use thiserror::Error;
 pub(crate) use time::OffsetDateTime;
 pub(crate) use time::format_description::well_known::Rfc3339;
-
-/// Maps a wasmtime error into the sandbox WASI runtime error contract. This lives
-/// in the runtime crate (not as a method on `SandboxWasiError`) because the
-/// sinomo-sandbox contracts crate must not depend on wasmtime.
-pub(crate) fn sandbox_wasi_error_from_wasmtime(error: wasmtime::Error) -> SandboxWasiError {
-    SandboxWasiError::Runtime {
-        detail: format!("{error:?}"),
-    }
-}

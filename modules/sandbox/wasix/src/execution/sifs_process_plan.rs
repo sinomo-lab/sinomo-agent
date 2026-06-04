@@ -230,10 +230,6 @@ impl SifsStagedSandboxCommandRunner {
                 timeout_ms,
                 limits,
                 module,
-                allow_preview1_pinned_subprocesses: command
-                    .required_capabilities
-                    .iter()
-                    .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY),
                 wasix_pinned_child_exec_only: !command
                     .required_capabilities
                     .iter()
@@ -303,8 +299,6 @@ impl SifsStagedSandboxCommandRunner {
                     file_count_limit: prepared.limits.max_file_count,
                     ..SandboxWasiRunOptions::default()
                 };
-                wasi_options.allow_preview1_pinned_subprocesses =
-                    prepared.allow_preview1_pinned_subprocesses;
                 wasi_options.wasix_pinned_child_exec_only = prepared.wasix_pinned_child_exec_only;
                 wasi_options.wasix_instruction_metering = false;
                 wasi_options.wasix_command_overrides = wasix_command_overrides;
@@ -525,7 +519,6 @@ struct SifsWasixProcessPlanPreparedStep {
     timeout_ms: u64,
     limits: SandboxResourceLimits,
     module: Vec<u8>,
-    allow_preview1_pinned_subprocesses: bool,
     wasix_pinned_child_exec_only: bool,
 }
 

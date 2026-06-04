@@ -52,7 +52,6 @@ pub const SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY: &str = "child-process-exec";
 pub const SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY: &str = "wasix.asyncified-fork";
 pub const SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY: &str = "wasix.unpinned-child-exec";
 pub const SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY: &str = "pinned-child-exec-containment";
-pub const SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY: &str = "preview1.pinned-subprocess";
 pub const SANDBOX_MVP_VIRTUAL_DEVICES: &[&str] = &[
     "/dev/null",
     "/dev/zero",
@@ -73,12 +72,6 @@ pub const SANDBOX_MVP_VIRTUAL_DEVICES: &[&str] = &[
     "/dev/shm",
 ];
 pub const SANDBOX_WASI_ZERO_DEVICE_BYTES: usize = 1024 * 1024;
-pub const SINOMO_SANDBOX_WASI_EXT_MODULE: &str = "sinomo_sandbox_preview1";
-pub const SINOMO_SANDBOX_WASI_PATH_CHMOD: &str = "path_chmod";
-pub const SINOMO_SANDBOX_WASI_PATH_MODE: &str = "path_mode";
-pub const SINOMO_SANDBOX_WASI_PROC_SPAWN_WAIT: &str = "proc_spawn_wait";
-pub const SINOMO_SANDBOX_WASI_PROC_SPAWN_WAIT_AT: &str = "proc_spawn_wait_at";
-pub const SINOMO_SANDBOX_WASI_PROC_SPAWN_WAIT_AT_IO: &str = "proc_spawn_wait_at_io";
 
 pub const SANDBOX_RICH_TOOLCHAIN_TARGETS: &[SandboxRichToolchainTarget] = &[
     SandboxRichToolchainTarget {

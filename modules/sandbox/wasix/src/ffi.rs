@@ -309,7 +309,6 @@ fn convert_run_options(
             .collect(),
         #[cfg(feature = "wasix-runtime")]
         virtual_preopened_dirs: Vec::new(),
-        working_directory_host_path: options.working_directory_host_path,
         #[cfg(feature = "wasix-runtime")]
         wasix_stdin_pipe: None,
         #[cfg(feature = "wasix-runtime")]
@@ -336,7 +335,6 @@ fn convert_run_options(
         file_count_limit: options.file_count_limit,
         cancellation: default_options.cancellation,
         output_sink: host_output_sink(),
-        allow_preview1_pinned_subprocesses: options.allow_preview1_pinned_subprocesses,
         wasix_pinned_child_exec_only: options.wasix_pinned_child_exec_only,
         wasix_instruction_metering: options.wasix_instruction_metering,
         wasix_auto_asyncify: options.wasix_auto_asyncify,
@@ -421,7 +419,6 @@ fn legacy_wasix_descriptor() -> sinomo_sandbox_wasix_api::SandboxWasixNativeDesc
 fn runtime_capabilities() -> Vec<String> {
     if cfg!(feature = "wasix-runtime") {
         vec![
-            "preview1".to_string(),
             "wasix".to_string(),
             "wasix.virtual-fs".to_string(),
             "wasix.metering".to_string(),

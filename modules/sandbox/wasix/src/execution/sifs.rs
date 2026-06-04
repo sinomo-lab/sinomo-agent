@@ -174,7 +174,6 @@ impl SifsStagedSandboxCommandRunner {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
-            false,
             true,
             true,
             true,
@@ -203,7 +202,6 @@ impl SifsStagedSandboxCommandRunner {
         default_env: BTreeMap<String, String>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
-        allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
         wasix_auto_asyncify: bool,
@@ -234,7 +232,6 @@ impl SifsStagedSandboxCommandRunner {
             default_env,
             cwd_override,
             env_override,
-            allow_preview1_pinned_subprocesses,
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
             wasix_auto_asyncify,
@@ -261,7 +258,6 @@ impl SifsStagedSandboxCommandRunner {
         default_env: BTreeMap<String, String>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
-        allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
         wasix_auto_asyncify: bool,
@@ -319,7 +315,6 @@ impl SifsStagedSandboxCommandRunner {
             file_count_limit: limits.max_file_count,
             ..SandboxWasiRunOptions::default()
         };
-        wasi_options.allow_preview1_pinned_subprocesses = allow_preview1_pinned_subprocesses;
         wasi_options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         wasi_options.wasix_instruction_metering = wasix_instruction_metering;
         wasi_options.wasix_auto_asyncify = wasix_auto_asyncify;
@@ -490,7 +485,6 @@ impl SifsStagedSandboxCommandRunner {
         _default_env: BTreeMap<String, String>,
         _cwd_override: Option<SandboxPath>,
         _env_override: BTreeMap<String, String>,
-        _allow_preview1_pinned_subprocesses: bool,
         _wasix_pinned_child_exec_only: bool,
         _wasix_instruction_metering: bool,
         _wasix_auto_asyncify: bool,
@@ -651,10 +645,6 @@ impl SifsStagedSandboxCommandRunner {
             command.default_env.clone(),
             cwd_override,
             env_override,
-            command
-                .required_capabilities
-                .iter()
-                .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY),
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
             wasix_auto_asyncify,

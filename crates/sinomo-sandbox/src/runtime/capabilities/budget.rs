@@ -9,39 +9,8 @@ pub fn sandbox_runtime_budget_capabilities_for_abi(
     target_abi: &SandboxWasiAbi,
 ) -> Vec<SandboxRuntimeBudgetCapability> {
     match target_abi {
-        SandboxWasiAbi::Preview1 => sandbox_runtime_preview1_budget_capabilities(),
         SandboxWasiAbi::Wasix => sandbox_runtime_wasix_budget_capabilities(),
     }
-}
-
-fn sandbox_runtime_preview1_budget_capabilities() -> Vec<SandboxRuntimeBudgetCapability> {
-    vec![
-        SandboxRuntimeBudgetCapability {
-            capability: "wall-timeout",
-            supported: true,
-            detail: "the Wasmtime preview1 runner uses epoch interruption to stop commands after the requested wall-clock timeout",
-        },
-        SandboxRuntimeBudgetCapability {
-            capability: "cancellation",
-            supported: true,
-            detail: "the Wasmtime preview1 runner watches the Sinomo cancellation token and interrupts the store when cancellation is requested",
-        },
-        SandboxRuntimeBudgetCapability {
-            capability: "output-limit",
-            supported: true,
-            detail: "the preview1 runner bounds captured stdout and stderr before returning command output",
-        },
-        SandboxRuntimeBudgetCapability {
-            capability: "input-limit",
-            supported: true,
-            detail: "the preview1 runner rejects direct stdin payloads above the effective sandbox input limit before command startup",
-        },
-        SandboxRuntimeBudgetCapability {
-            capability: "memory-limit",
-            supported: true,
-            detail: "the Wasmtime preview1 runner installs StoreLimits from the effective sandbox memory budget",
-        },
-    ]
 }
 
 #[cfg(feature = "wasix-runtime")]

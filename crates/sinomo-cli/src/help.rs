@@ -278,7 +278,7 @@ pub(super) fn print_sandbox_help() {
         "      Run the pinned real `sh` command with stdin or the provided script; --daemon uses SIFS through the local daemon."
     );
     println!(
-        "  sinomo sandbox toolchain add-command [--daemon] [--toolchain <toolchain-id>] [--version <version>] [--target-abi preview1|wasix] [--provenance <text>] [--capability <name>] [--memory-mb <n>] [--wall-time-ms <n>] [--max-input-bytes <n>] [--max-output-bytes <n>] [--max-workspace-bytes <n>] [--max-written-bytes-per-command <n>] [--max-file-count <n>] <command> <module.wasm>"
+        "  sinomo sandbox toolchain add-command [--daemon] [--toolchain <toolchain-id>] [--version <version>] [--target-abi wasix] [--provenance <text>] [--capability <name>] [--memory-mb <n>] [--wall-time-ms <n>] [--max-input-bytes <n>] [--max-output-bytes <n>] [--max-workspace-bytes <n>] [--max-written-bytes-per-command <n>] [--max-file-count <n>] <command> <module.wasm>"
     );
     println!(
         "      Add a real WASI command module to a toolchain; WASIX is the default target ABI; --daemon stores it in SIFS."
@@ -294,7 +294,7 @@ pub(super) fn print_sandbox_help() {
         "      Import a real Sinomo-maintained BusyBox WASIX module as the default toolchain applets; --daemon stores it in SIFS."
     );
     println!(
-        "  sinomo sandbox module-artifact register --artifact <artifact-id> [--interface <version>] [--component-model] [--abi preview1|wasix] [--sandbox <sandbox-id>] [--argv <arg>] [--cwd <path>] [--env NAME=VALUE] [--timeout-ms <ms>] [--candidate-bundle <bundle-dir> --module <module-id> --active-artifact <artifact-id>] <module.wasm>"
+        "  sinomo sandbox module-artifact register --artifact <artifact-id> [--interface <version>] [--component-model] [--abi wasix] [--sandbox <sandbox-id>] [--argv <arg>] [--cwd <path>] [--env NAME=VALUE] [--timeout-ms <ms>] [--candidate-bundle <bundle-dir> --module <module-id> --active-artifact <artifact-id>] <module.wasm>"
     );
     println!(
         "      Register a sandbox-backed module artifact in the local data dir; with candidate-bundle flags, also write release-material.json for approval."

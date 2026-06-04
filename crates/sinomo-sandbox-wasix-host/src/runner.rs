@@ -98,7 +98,6 @@ impl SandboxWasixModuleCommandRunner {
                         BTreeMap::new(),
                         None,
                         BTreeMap::new(),
-                        false,
                         true,
                         true,
                         true,
@@ -127,7 +126,6 @@ impl SandboxWasixModuleCommandRunner {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
-            false,
             true,
             true,
             true,
@@ -266,10 +264,6 @@ impl SandboxWasixModuleCommandRunner {
         let limits = effective_sandbox_command_limits(&manifest.limits, &command.default_limits);
         let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
         let argv = command.effective_argv(argv);
-        let allow_preview1_pinned_subprocesses = command
-            .required_capabilities
-            .iter()
-            .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY);
         let wasix_pinned_child_exec_only = !command
             .required_capabilities
             .iter()
@@ -294,7 +288,6 @@ impl SandboxWasixModuleCommandRunner {
             command.default_env.clone(),
             cwd_override,
             env_override,
-            allow_preview1_pinned_subprocesses,
             wasix_pinned_child_exec_only,
             false,
             wasix_auto_asyncify,
@@ -319,7 +312,6 @@ impl SandboxWasixModuleCommandRunner {
         default_env: BTreeMap<String, String>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
-        allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
         wasix_auto_asyncify: bool,
@@ -332,21 +324,14 @@ impl SandboxWasixModuleCommandRunner {
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         sandbox_fs.validate_resource_limits(&limits)?;
         validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
-        let working_directory_host_path = if target_abi == SandboxWasiAbi::Preview1 {
-            Some(sandbox_fs.host_path(&effective_cwd)?)
-        } else {
-            None
-        };
         let before = sandbox_fs.snapshot()?;
         let rollback_checkpoint = store.create_checkpoint(sandbox_id, OffsetDateTime::now_utc())?;
         let started_at = OffsetDateTime::now_utc();
         let mut options = local_staged_sandbox_wasix_options(&layout, &limits, extra_preopens);
-        options.working_directory_host_path = working_directory_host_path;
-        options.allow_preview1_pinned_subprocesses = allow_preview1_pinned_subprocesses;
         options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         options.wasix_instruction_metering = wasix_instruction_metering;
-        options.wasix_auto_asyncify = target_abi == SandboxWasiAbi::Wasix && wasix_auto_asyncify;
-        options.wasix_fpcast_emu = target_abi == SandboxWasiAbi::Wasix && wasix_fpcast_emu;
+        options.wasix_auto_asyncify = wasix_auto_asyncify;
+        options.wasix_fpcast_emu = wasix_fpcast_emu;
         options.wasix_command_overrides = wasix_command_overrides;
 
         let mut env = default_env;

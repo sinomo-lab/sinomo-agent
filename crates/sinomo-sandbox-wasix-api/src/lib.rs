@@ -120,8 +120,6 @@ pub struct SandboxWasixResolvedCommandModule {
 pub struct SandboxWasixRunModuleOptions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub preopened_dirs: Vec<SandboxWasixHostPreopen>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_directory_host_path: Option<PathBuf>,
     #[serde(default)]
     pub enable_virtual_devices: bool,
     #[serde(default)]
@@ -138,8 +136,6 @@ pub struct SandboxWasixRunModuleOptions {
     pub workspace_limit_bytes: u64,
     #[serde(default)]
     pub file_count_limit: u64,
-    #[serde(default)]
-    pub allow_preview1_pinned_subprocesses: bool,
     #[serde(default = "default_true")]
     pub wasix_pinned_child_exec_only: bool,
     #[serde(default = "default_true")]
@@ -157,7 +153,6 @@ impl Default for SandboxWasixRunModuleOptions {
         let limits = SandboxResourceLimits::default();
         Self {
             preopened_dirs: Vec::new(),
-            working_directory_host_path: None,
             enable_virtual_devices: false,
             zero_device_bytes: 0,
             memory_limit_bytes: limits.memory_mb.saturating_mul(1024 * 1024),
@@ -166,7 +161,6 @@ impl Default for SandboxWasixRunModuleOptions {
             output_limit_bytes: limits.max_output_bytes,
             workspace_limit_bytes: limits.max_workspace_bytes,
             file_count_limit: limits.max_file_count,
-            allow_preview1_pinned_subprocesses: false,
             wasix_pinned_child_exec_only: true,
             wasix_instruction_metering: true,
             wasix_auto_asyncify: true,

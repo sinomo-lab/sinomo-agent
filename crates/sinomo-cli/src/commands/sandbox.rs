@@ -2022,10 +2022,10 @@ fn parse_sandbox_wasi_abi(
     value: Option<&String>,
 ) -> Result<sinomo_runtime::sandbox::SandboxWasiAbi, CliError> {
     match value.map(String::as_str) {
-        Some("preview1") | Some("wasi-preview1") | Some("wasi") => {
-            Ok(sinomo_runtime::sandbox::SandboxWasiAbi::Preview1)
-        }
         Some("wasix") => Ok(sinomo_runtime::sandbox::SandboxWasiAbi::Wasix),
+        Some("preview1") | Some("wasi-preview1") | Some("wasi") => Err(CliError::Parse {
+            detail: "WASI Preview1 sandbox execution has been removed; use --abi wasix".to_string(),
+        }),
         Some(value) => Err(CliError::Parse {
             detail: format!("unsupported sandbox WASI target ABI `{value}`"),
         }),
@@ -2738,10 +2738,7 @@ fn append_sandbox_doctor_runtime_capability_findings(findings: &mut Vec<SandboxD
             "WASI command execution has no ambient TCP, UDP, or name-lookup access; use mediated sandbox fetch for network egress",
         ));
     }
-    for abi in [
-        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
-    ] {
+    for abi in [sinomo_runtime::sandbox::SandboxWasiAbi::Wasix] {
         for capability in
             sinomo_runtime::sandbox::sandbox_runtime_process_capabilities_for_abi(&abi)
         {
@@ -4583,7 +4580,10 @@ pub(crate) fn sandbox_toolchain_verify_python(
             sandbox_toolchain_verify_command_cases_with_stores(
                 &options.sandbox_id,
                 options.allow_unsigned,
-                &[sinomo_runtime::sandbox::SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY],
+                &[
+                    sinomo_runtime::sandbox::SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY,
+                    sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
+                ],
                 &sandbox_store_from_data_dir(&data_dir),
                 &sandbox_toolchain_store_from_data_dir(&data_dir),
                 sinomo_runtime::sandbox::PYTHON_TOOLCHAIN_FIDELITY_CASES,
@@ -4592,7 +4592,10 @@ pub(crate) fn sandbox_toolchain_verify_python(
             sandbox_toolchain_verify_command_cases_with_stores(
                 &options.sandbox_id,
                 options.allow_unsigned,
-                &[sinomo_runtime::sandbox::SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY],
+                &[
+                    sinomo_runtime::sandbox::SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY,
+                    sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
+                ],
                 &sandbox_store_from_data_dir(&data_dir),
                 &sandbox_toolchain_store_from_data_dir(&data_dir),
                 sinomo_runtime::sandbox::PIP_TOOLCHAIN_FIDELITY_CASES,
@@ -5386,7 +5389,7 @@ pub(crate) fn sandbox_toolchain_add_artifact_with_store(
             sinomo_runtime::sandbox::SandboxToolchainManifest::new(
                 options.toolchain_id.clone(),
                 options.version.clone(),
-                sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+                sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
                 options.provenance.clone(),
                 OffsetDateTime::now_utc(),
             )?

@@ -335,7 +335,6 @@ impl SandboxPolicy {
     ) -> Result<(), SandboxPolicyDenial> {
         if sandbox_command_requires_child_process_substrate(&command.name)
             && !sandbox_runtime_supports_child_processes_for_abi(target_abi)
-            && !command_satisfies_preview1_pinned_subprocess_mode(command, target_abi)
         {
             return Err(SandboxPolicyDenial::new(
                 "command-capability-unsupported",
@@ -648,17 +647,6 @@ impl SandboxPolicy {
         }
         Ok(parts)
     }
-}
-
-fn command_satisfies_preview1_pinned_subprocess_mode(
-    command: &SandboxToolchainCommand,
-    target_abi: &SandboxWasiAbi,
-) -> bool {
-    matches!(target_abi, SandboxWasiAbi::Preview1)
-        && command
-            .required_capabilities
-            .iter()
-            .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

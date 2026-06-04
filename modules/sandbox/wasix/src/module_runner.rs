@@ -234,7 +234,6 @@ fn run_sandbox_wasm_module_artifact(
             BTreeMap::new(),
             artifact.cwd.clone(),
             env,
-            false,
             true,
             true,
             true,

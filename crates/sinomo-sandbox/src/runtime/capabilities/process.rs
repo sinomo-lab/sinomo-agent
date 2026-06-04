@@ -2,34 +2,17 @@ use super::SandboxRuntimeProcessCapability;
 use crate::runtime::{SandboxWasiAbi, default_sandbox_wasi_abi};
 use crate::{
     SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY, SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY,
-    SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY, SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY,
-    SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
+    SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY, SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY,
 };
 
 pub fn sandbox_runtime_process_capabilities() -> Vec<SandboxRuntimeProcessCapability> {
     sandbox_runtime_process_capabilities_for_abi(&default_sandbox_wasi_abi())
 }
 
-fn sandbox_runtime_preview1_process_capabilities() -> Vec<SandboxRuntimeProcessCapability> {
-    vec![
-        SandboxRuntimeProcessCapability {
-            capability: SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY,
-            supported: true,
-            detail: "the preview1 runner supports a bounded synchronous subprocess bridge that resolves child executables only from the read-only pinned /bin toolchain mount; this is for language-runtime helpers and is not POSIX fork/exec parity",
-        },
-        SandboxRuntimeProcessCapability {
-            capability: SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY,
-            supported: false,
-            detail: "the current WASI preview1 runner still lacks POSIX fork/exec/wait, pipes, job control, and general child-process parity; command toolchains must not patch shell semantics around this runtime gap",
-        },
-    ]
-}
-
 pub fn sandbox_runtime_process_capabilities_for_abi(
     target_abi: &SandboxWasiAbi,
 ) -> Vec<SandboxRuntimeProcessCapability> {
     match target_abi {
-        SandboxWasiAbi::Preview1 => sandbox_runtime_preview1_process_capabilities(),
         SandboxWasiAbi::Wasix => sandbox_runtime_wasix_process_capabilities(),
     }
 }
@@ -107,9 +90,6 @@ pub fn sandbox_runtime_supports_command_capability_for_abi(
     target_abi: &SandboxWasiAbi,
 ) -> bool {
     match capability_name {
-        SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY => {
-            matches!(target_abi, SandboxWasiAbi::Preview1)
-        }
         SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY => {
             sandbox_runtime_supports_child_processes_for_abi(target_abi)
         }

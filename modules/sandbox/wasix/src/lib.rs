@@ -31,13 +31,5 @@ pub use module_runner::{
     SandboxModuleComponentContractError, SandboxModuleReplayError, SandboxWasmModuleArtifactRunner,
     run_sandbox_wasm_module_replay_fixture, validate_sinomo_module_v1_component_contract,
 };
-#[cfg(feature = "wasix-runtime")]
-pub use runtime::LocalWasiCommandRunner;
-
-// Lift a couple of preview1-internal items to the crate root so the in-crate
-// test suite can import them via `crate::` the same way it did before the split.
-#[cfg(all(test, feature = "wasix-runtime"))]
-pub(crate) use runtime::preview1::{SINOMO_WASI_ERRNO_ROFS, sandbox_wasi_extension_read_host_path};
-
 #[cfg(all(test, feature = "wasix-runtime"))]
 mod tests;

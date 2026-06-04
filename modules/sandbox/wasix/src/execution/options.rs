@@ -73,7 +73,6 @@ pub struct SandboxWasiRunOptions {
     pub preopened_dirs: Vec<SandboxWasiPreopen>,
     #[cfg(feature = "wasix-runtime")]
     pub virtual_preopened_dirs: Vec<SandboxWasiVirtualPreopen>,
-    pub working_directory_host_path: Option<PathBuf>,
     #[cfg(feature = "wasix-runtime")]
     pub wasix_stdin_pipe: Option<virtual_fs::ArcFile<virtual_fs::Pipe>>,
     #[cfg(feature = "wasix-runtime")]
@@ -88,7 +87,6 @@ pub struct SandboxWasiRunOptions {
     pub file_count_limit: u64,
     pub cancellation: SandboxCancellation,
     pub output_sink: Option<Arc<dyn SandboxOutputSink>>,
-    pub allow_preview1_pinned_subprocesses: bool,
     pub wasix_pinned_child_exec_only: bool,
     pub wasix_instruction_metering: bool,
     pub wasix_auto_asyncify: bool,
@@ -107,10 +105,6 @@ impl fmt::Debug for SandboxWasiRunOptions {
                 &self.virtual_preopened_dirs,
                 #[cfg(not(feature = "wasix-runtime"))]
                 &Vec::<()>::new(),
-            )
-            .field(
-                "working_directory_host_path",
-                &self.working_directory_host_path,
             )
             .field(
                 "wasix_stdin_pipe",
@@ -137,10 +131,6 @@ impl fmt::Debug for SandboxWasiRunOptions {
             .field("cancellation", &self.cancellation)
             .field("output_sink", &self.output_sink.as_ref().map(|_| "<sink>"))
             .field(
-                "allow_preview1_pinned_subprocesses",
-                &self.allow_preview1_pinned_subprocesses,
-            )
-            .field(
                 "wasix_pinned_child_exec_only",
                 &self.wasix_pinned_child_exec_only,
             )
@@ -162,7 +152,6 @@ impl Default for SandboxWasiRunOptions {
             preopened_dirs: Vec::new(),
             #[cfg(feature = "wasix-runtime")]
             virtual_preopened_dirs: Vec::new(),
-            working_directory_host_path: None,
             #[cfg(feature = "wasix-runtime")]
             wasix_stdin_pipe: None,
             #[cfg(feature = "wasix-runtime")]
@@ -177,7 +166,6 @@ impl Default for SandboxWasiRunOptions {
             file_count_limit: limits.max_file_count,
             cancellation: SandboxCancellation::new(),
             output_sink: None,
-            allow_preview1_pinned_subprocesses: false,
             wasix_pinned_child_exec_only: true,
             wasix_instruction_metering: true,
             wasix_auto_asyncify: true,

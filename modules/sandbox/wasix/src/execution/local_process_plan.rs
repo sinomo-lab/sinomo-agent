@@ -202,10 +202,6 @@ impl LocalStagedSandboxCommandRunner {
                 timeout_ms,
                 limits,
                 module,
-                allow_preview1_pinned_subprocesses: command
-                    .required_capabilities
-                    .iter()
-                    .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY),
                 wasix_pinned_child_exec_only: !command
                     .required_capabilities
                     .iter()
@@ -250,8 +246,6 @@ impl LocalStagedSandboxCommandRunner {
                     &prepared.limits,
                     artifact_preopens,
                 );
-                wasi_options.allow_preview1_pinned_subprocesses =
-                    prepared.allow_preview1_pinned_subprocesses;
                 wasi_options.wasix_pinned_child_exec_only = prepared.wasix_pinned_child_exec_only;
                 wasi_options.wasix_instruction_metering = false;
                 wasi_options.wasix_command_overrides = wasix_command_overrides;
@@ -493,7 +487,6 @@ struct PreparedWasixProcessPlanStep {
     timeout_ms: u64,
     limits: SandboxResourceLimits,
     module: Vec<u8>,
-    allow_preview1_pinned_subprocesses: bool,
     wasix_pinned_child_exec_only: bool,
 }
 

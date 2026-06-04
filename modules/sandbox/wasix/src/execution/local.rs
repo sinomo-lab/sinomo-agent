@@ -3,15 +3,11 @@ use crate::internal::*;
 use super::staging::*;
 
 #[derive(Clone)]
-pub struct LocalStagedSandboxCommandRunner {
-    runner: LocalWasiCommandRunner,
-}
+pub struct LocalStagedSandboxCommandRunner {}
 
 impl LocalStagedSandboxCommandRunner {
     pub fn new() -> Result<Self, SandboxWasiError> {
-        Ok(Self {
-            runner: LocalWasiCommandRunner::new()?,
-        })
+        Ok(Self {})
     }
 
     pub fn run_module(
@@ -111,7 +107,6 @@ impl LocalStagedSandboxCommandRunner {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
-            false,
             true,
             true,
             true,
@@ -171,7 +166,6 @@ impl LocalStagedSandboxCommandRunner {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
-            false,
             true,
             true,
             true,
@@ -208,7 +202,6 @@ impl LocalStagedSandboxCommandRunner {
             BTreeMap::new(),
             None,
             BTreeMap::new(),
-            false,
             true,
             true,
             true,
@@ -233,7 +226,6 @@ impl LocalStagedSandboxCommandRunner {
         default_env: BTreeMap<String, String>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
-        allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
         wasix_auto_asyncify: bool,
@@ -254,7 +246,6 @@ impl LocalStagedSandboxCommandRunner {
             default_env,
             cwd_override,
             env_override,
-            allow_preview1_pinned_subprocesses,
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
             wasix_auto_asyncify,
@@ -281,7 +272,6 @@ impl LocalStagedSandboxCommandRunner {
         default_env: BTreeMap<String, String>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
-        allow_preview1_pinned_subprocesses: bool,
         wasix_pinned_child_exec_only: bool,
         wasix_instruction_metering: bool,
         wasix_auto_asyncify: bool,
@@ -295,11 +285,6 @@ impl LocalStagedSandboxCommandRunner {
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());
         sandbox_fs.validate_resource_limits(&limits)?;
         validate_sandbox_working_directory(&sandbox_fs, &effective_cwd)?;
-        let working_directory_host_path = if target_abi == SandboxWasiAbi::Preview1 {
-            Some(sandbox_fs.host_path(&effective_cwd)?)
-        } else {
-            None
-        };
         let before = sandbox_fs.snapshot()?;
         let rollback_checkpoint = store.create_checkpoint(sandbox_id, OffsetDateTime::now_utc())?;
         let started_at = OffsetDateTime::now_utc();
@@ -315,7 +300,7 @@ impl LocalStagedSandboxCommandRunner {
         // "WASIX cwd `/work` is invalid: io error". Bind it here so it outlives the
         // run below.
         #[cfg(feature = "wasix-runtime")]
-        let _wasix_workspace_fs = if target_abi == SandboxWasiAbi::Wasix {
+        let _wasix_workspace_fs = {
             wasi_options.preopened_dirs.retain(|preopen| {
                 !matches!(
                     preopen.guest_path.as_str(),
@@ -332,22 +317,17 @@ impl LocalStagedSandboxCommandRunner {
                 ),
             );
             Some(workspace_fs)
-        } else {
-            None
         };
-        wasi_options.allow_preview1_pinned_subprocesses = allow_preview1_pinned_subprocesses;
         wasi_options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
         wasi_options.wasix_instruction_metering = wasix_instruction_metering;
-        wasi_options.wasix_auto_asyncify =
-            target_abi == SandboxWasiAbi::Wasix && wasix_auto_asyncify;
-        wasi_options.wasix_fpcast_emu = target_abi == SandboxWasiAbi::Wasix && wasix_fpcast_emu;
+        wasi_options.wasix_auto_asyncify = wasix_auto_asyncify;
+        wasi_options.wasix_fpcast_emu = wasix_fpcast_emu;
         wasi_options.wasix_command_overrides = wasix_command_overrides;
         #[cfg(feature = "wasix-runtime")]
         {
             wasi_options.wasix_stdin_pipe = wasix_pipes.stdin_pipe;
             wasi_options.wasix_stdout_pipe = wasix_pipes.stdout_pipe;
         }
-        wasi_options.working_directory_host_path = working_directory_host_path;
         let mut env = default_env;
         env.extend(manifest.env.clone());
         env.extend(env_override);
@@ -509,15 +489,12 @@ impl LocalStagedSandboxCommandRunner {
 
     pub(crate) fn run_module_for_abi(
         &self,
-        target_abi: SandboxWasiAbi,
+        _target_abi: SandboxWasiAbi,
         wasm: &[u8],
         request: SandboxCommandRequest,
         options: SandboxWasiRunOptions,
     ) -> Result<SandboxLocalCommandOutcome, SandboxWasiError> {
-        match target_abi {
-            SandboxWasiAbi::Preview1 => self.runner.run_module(wasm, request, options),
-            SandboxWasiAbi::Wasix => runtime::run_wasix_module(wasm, request, options),
-        }
+        runtime::run_wasix_module(wasm, request, options)
     }
 
     pub fn run_toolchain_command_with_stdin_and_policy(
@@ -641,10 +618,6 @@ impl LocalStagedSandboxCommandRunner {
         let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
         let wasm = toolchain_store.load_command_module(&toolchain, command_name)?;
         let argv = command.effective_argv(argv);
-        let allow_preview1_pinned_subprocesses = command
-            .required_capabilities
-            .iter()
-            .any(|capability| capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY);
         let wasix_pinned_child_exec_only = !command
             .required_capabilities
             .iter()
@@ -674,7 +647,6 @@ impl LocalStagedSandboxCommandRunner {
             command.default_env.clone(),
             cwd_override,
             env_override,
-            allow_preview1_pinned_subprocesses,
             wasix_pinned_child_exec_only,
             wasix_instruction_metering,
             wasix_auto_asyncify,

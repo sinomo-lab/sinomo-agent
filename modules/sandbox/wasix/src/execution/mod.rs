@@ -9,9 +9,9 @@ mod options;
 mod sifs;
 mod sifs_process_plan;
 mod staging;
-mod wasi;
+mod system_mounts;
 
 pub use local::*;
 pub use options::*;
 pub use sifs::*;
-pub(crate) use wasi::*;
+pub(crate) use system_mounts::{WasiVirtualSystemMounts, validate_wasi_request};

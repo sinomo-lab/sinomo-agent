@@ -8,7 +8,7 @@ The primary workload is coding tasks. The foundation is still a real POSIX users
 
 ## Current Direction
 
-- Runtime focus: WASIX first. WASI Preview1 remains a compatibility runner for simple single-process modules.
+- Runtime focus: WASIX only. WASI Preview1 support has been removed instead of remaining as a compatibility runner.
 - Filesystem focus: all sandbox filesystem behavior goes through the sandbox virtual filesystem layer, with production state backed by SIFS under `/services/sandbox`.
 - Userspace focus: a real POSIX userspace foundation plus `pacman` or a pacman-compatible package manager that installs user-needed tools from a Sinomo-maintained `wasm32-wasix` package repository.
 - Policy focus: cluster policy controls mounts, toolchains, network fetch, resources, and command capabilities before state changes or command runs.
@@ -28,7 +28,7 @@ Keep the sandbox model, IDs, manifests, resource limits, policy contracts, mount
 
 Status: partially implemented.
 
-Maintain WASIX as the default command runtime and Preview1 as a compatibility path. Continue expanding real POSIX process, thread, descriptor, signal, TTY, filesystem, dynamic-linking, and Linux compatibility behavior in the runtime, VFS, compiler, sysroot, or system-library layer. Avoid program-specific runtime shims except as temporary compatibility debt documented in the crate status.
+Maintain WASIX as the command runtime. Continue expanding real POSIX process, thread, descriptor, signal, TTY, filesystem, dynamic-linking, and Linux compatibility behavior in the runtime, VFS, compiler, sysroot, or system-library layer. Avoid program-specific runtime shims except as temporary compatibility debt documented in the crate status.
 
 ### Phase 2: SIFS-Backed Workspace
 

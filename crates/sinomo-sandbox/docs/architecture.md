@@ -8,7 +8,7 @@ agent or CLI request
   -> cluster sandbox policy
   -> sandbox instance manifest
   -> pinned toolchain package
-  -> WASIX or Preview1 runtime
+  -> WASIX runtime
   -> sandbox virtual filesystem
   -> local development backend or SIFS
 ```
@@ -68,7 +68,7 @@ The runtime sees a virtual Unix tree. Typical mounts include:
 
 All sandbox filesystem operations should go through the virtual filesystem layer. The local host-backed filesystem is a development backend and staging implementation detail. Runtime code should not assume host paths are available or stable, because production state is expected to be SIFS-backed.
 
-SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not copy SIFS state into host directories for the actual command run. Toolchain artifacts are provided through read-only virtual preopens built from the SIFS toolchain objects. WASI Preview1 remains a local-only compatibility runner and must not be used for cluster-backed SIFS execution.
+SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not copy SIFS state into host directories for the actual command run. Toolchain artifacts are provided through read-only virtual preopens built from the SIFS toolchain objects.
 
 The virtual filesystem layer owns:
 
@@ -81,12 +81,11 @@ The virtual filesystem layer owns:
 
 ## Runtime Model
 
-WASIX is the default runtime and primary development target. It is required for real shell, Python, compiler, package manager, subprocess, pipe, and threading workloads. WASI Preview1 remains as a compatibility adapter for simple single-process modules.
+WASIX is the only maintained sandbox runtime. It is required for real shell, Python, compiler, package manager, subprocess, pipe, and threading workloads. WASI Preview1 support has been removed rather than kept as a compatibility path.
 
 Runtime target code is split under `src/runtime/`:
 
 - `src/runtime/wasix/` owns Wasmer/WASIX setup, budget guards, process-tree signaling, virtual preopens, output streaming, memory checks, and metering.
-- `src/runtime/preview1/` owns the Wasmtime/WASI Preview1 runner and bounded compatibility imports.
 - `src/runtime/capabilities/` describes runtime capability reporting used by diagnostics.
 
 WASIX execution denies ambient HTTP imports. Network access should go through Sinomo-mediated fetch APIs so policy, audit, and cluster routing stay visible.
