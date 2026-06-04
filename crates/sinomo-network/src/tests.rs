@@ -4104,7 +4104,10 @@ fn cluster_kv_watch_event_log_is_bounded() {
         })
         .collect::<Vec<_>>();
 
-    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        MAX_CLUSTER_KV_WATCH_EVENTS
+    );
 
     let retained = cluster_kv_watch_events(&paths).expect("read watch events");
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
@@ -4199,7 +4202,7 @@ fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
 
     assert_eq!(
         append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
-        events.len()
+        MAX_CLUSTER_KV_WATCH_EVENTS
     );
 
     let retained = cluster_kv_watch_events(&paths).expect("read compacted watch events");
@@ -4218,6 +4221,80 @@ fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
             .len(),
         0,
         "compaction should clear the append log after checkpointing"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_repairs_overgrown_valid_log_before_append() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-overgrown-valid-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let events = (1..=(MAX_CLUSTER_KV_WATCH_EVENTS as u64 * 3))
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/overgrown/{revision:03}"),
+            kind: KvEventKind::Put {
+                value: revision.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .expect("open overgrown watch event log");
+    for event in &events {
+        let record = SinomoObjectCodec::default()
+            .encode(event)
+            .expect("encode watch event");
+        log.write_all(&(record.len() as u32).to_be_bytes())
+            .expect("write record length");
+        log.write_all(&record).expect("write record");
+    }
+    log.sync_data().expect("sync overgrown log");
+    drop(log);
+    let overgrown_len = std::fs::metadata(&paths.kv_watch_events_log)
+        .expect("overgrown log metadata")
+        .len();
+    let next_revision = MAX_CLUSTER_KV_WATCH_EVENTS as u64 * 3 + 1;
+    let new_event = KvEvent {
+        revision: KvRevision(next_revision),
+        key: format!("/watch/overgrown/{next_revision:03}"),
+        kind: KvEventKind::Put {
+            value: next_revision.to_string().into_bytes(),
+        },
+    };
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&new_event))
+            .expect("append after overgrown log"),
+        1
+    );
+
+    let retained = cluster_kv_watch_events(&paths).expect("read repaired events");
+    assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
+    assert_eq!(
+        retained.last().expect("last retained").revision,
+        new_event.revision
+    );
+    assert!(
+        paths.kv_watch_events.exists(),
+        "overgrown valid log should be checkpointed"
+    );
+    assert!(
+        std::fs::metadata(&paths.kv_watch_events_log)
+            .expect("repaired log metadata")
+            .len()
+            < overgrown_len,
+        "repaired log should not keep the overgrown valid tail"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -4251,7 +4328,10 @@ fn cluster_kv_watch_event_log_keeps_complete_boundary_revision() {
         },
     });
 
-    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        MAX_CLUSTER_KV_WATCH_EVENTS + 1
+    );
 
     let retained = cluster_kv_watch_events(&paths).expect("read retained events");
     assert_eq!(
@@ -4319,6 +4399,65 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
         !cluster_kv_watch_events(&paths)
             .expect("read watch events")
             .contains(&stale)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-drop-stale-batch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let events = (1..=(MAX_CLUSTER_KV_WATCH_EVENTS as u64 * 2))
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/drop-stale-batch/{revision:03}"),
+            kind: KvEventKind::Put {
+                value: revision.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    let checkpoint_len = std::fs::metadata(&paths.kv_watch_events)
+        .expect("watch event checkpoint metadata")
+        .len();
+    let log_len = std::fs::metadata(&paths.kv_watch_events_log)
+        .expect("watch event log metadata")
+        .len();
+    let stale = (1..=(MAX_CLUSTER_KV_WATCH_EVENTS as u64))
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/drop-stale-batch/{revision:03}"),
+            kind: KvEventKind::Put {
+                value: b"stale".to_vec(),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, &stale).expect("append stale watch events"),
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(&paths.kv_watch_events)
+            .expect("watch event checkpoint metadata after stale")
+            .len(),
+        checkpoint_len,
+        "stale delayed batches should not rewrite the checkpoint"
+    );
+    assert_eq!(
+        std::fs::metadata(&paths.kv_watch_events_log)
+            .expect("watch event log metadata after stale")
+            .len(),
+        log_len,
+        "stale delayed batches should not append log records"
     );
     std::fs::remove_dir_all(root).ok();
 }

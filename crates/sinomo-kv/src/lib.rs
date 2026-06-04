@@ -25,6 +25,8 @@ use time::OffsetDateTime;
 pub const KV_OBJECT_VERSION_ID: u16 = 1;
 pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
+const MAX_PENDING_EVENTS_PER_WATCH: usize = MAX_RETAINED_EVENTS;
+const MAX_ACTIVE_WATCHES: usize = 1024;
 /// Committed log entries kept in memory after a local snapshot compaction. A
 /// follower that has fallen at most this many entries behind can be caught up
 /// with small incremental appends instead of a full snapshot install. The tail is
@@ -1054,6 +1056,14 @@ impl InProcessKvStore {
                 compacted: self.compacted_revision,
             });
         }
+        if self.watches.len() >= MAX_ACTIVE_WATCHES {
+            return Err(KvError::WatchLimit {
+                max: MAX_ACTIVE_WATCHES,
+            });
+        }
+        if self.next_watch_id == u64::MAX {
+            return Err(KvError::WatchIdExhausted);
+        }
 
         let watch_id = WatchId(self.next_watch_id.max(1));
         self.next_watch_id = watch_id.0.saturating_add(1);
@@ -1064,26 +1074,45 @@ impl InProcessKvStore {
             .filter(|event| event.revision >= start_revision && event.key.starts_with(&prefix))
             .cloned()
             .collect();
-        self.watches.insert(
-            watch_id,
-            KvWatchState {
-                watch: KvWatch {
-                    watch_id,
-                    prefix,
-                    start_revision,
-                },
-                pending: backlog,
+        let mut watch = KvWatchState {
+            watch: KvWatch {
+                watch_id,
+                prefix,
+                start_revision,
             },
-        );
+            pending: backlog,
+            compacted_revision: None,
+        };
+        compact_watch_pending(&mut watch);
+        self.watches.insert(watch_id, watch);
         Ok(watch_id)
     }
 
     pub fn drain_watch(&mut self, watch_id: WatchId) -> Result<Vec<KvEvent>, KvError> {
+        if let Some(compacted) = self
+            .watches
+            .get(&watch_id)
+            .and_then(|watch| watch.compacted_revision)
+        {
+            let requested = self
+                .watches
+                .remove(&watch_id)
+                .map(|watch| watch.watch.start_revision)
+                .unwrap_or(KvRevision::ZERO);
+            return Err(KvError::Compacted {
+                requested,
+                compacted,
+            });
+        }
         let watch = self
             .watches
             .get_mut(&watch_id)
             .ok_or(KvError::UnknownWatch { watch_id })?;
         Ok(watch.pending.drain(..).collect())
+    }
+
+    pub fn cancel_watch(&mut self, watch_id: WatchId) -> Result<bool, KvError> {
+        Ok(self.watches.remove(&watch_id).is_some())
     }
 
     pub fn snapshot(&self) -> KvSnapshot {
@@ -1318,6 +1347,7 @@ impl InProcessKvStore {
                 && event.key.starts_with(&watch.watch.prefix)
             {
                 watch.pending.push_back(event.clone());
+                compact_watch_pending(watch);
             }
         }
         self.events.push(event);
@@ -1386,6 +1416,29 @@ fn compact_snapshot_event_history(
 struct KvWatchState {
     watch: KvWatch,
     pending: VecDeque<KvEvent>,
+    compacted_revision: Option<KvRevision>,
+}
+
+fn compact_watch_pending(watch: &mut KvWatchState) {
+    let excess = watch
+        .pending
+        .len()
+        .saturating_sub(MAX_PENDING_EVENTS_PER_WATCH);
+    if excess == 0 {
+        return;
+    }
+    let compacted = watch
+        .pending
+        .get(excess - 1)
+        .map(|event| event.revision)
+        .unwrap_or(watch.watch.start_revision);
+    watch.pending.drain(..excess);
+    watch.compacted_revision = Some(
+        watch
+            .compacted_revision
+            .unwrap_or(KvRevision::ZERO)
+            .max(compacted),
+    );
 }
 
 impl Default for KvRevision {
@@ -1641,6 +1694,10 @@ impl InProcessRaftKvCluster {
         watch_id: WatchId,
     ) -> Result<Vec<KvEvent>, KvError> {
         self.node_mut(node_id)?.store.drain_watch(watch_id)
+    }
+
+    pub fn cancel_watch(&mut self, node_id: &NodeId, watch_id: WatchId) -> Result<bool, KvError> {
+        self.node_mut(node_id)?.store.cancel_watch(watch_id)
     }
 
     pub fn transfer_leader(&mut self, new_leader_id: NodeId) -> Result<(), KvError> {
@@ -2856,6 +2913,10 @@ pub enum KvError {
     InvalidLeaseTtl { ttl_ticks: u64 },
     #[error("unknown watch: {watch_id:?}")]
     UnknownWatch { watch_id: WatchId },
+    #[error("too many active watches: max {max}")]
+    WatchLimit { max: usize },
+    #[error("watch id space exhausted")]
+    WatchIdExhausted,
     #[error("serialization error: {detail}")]
     Serialization { detail: String },
     #[error("filesystem error at {path}: {detail}")]
@@ -3095,6 +3156,86 @@ mod tests {
         let future = store.drain_watch(watch_id).expect("future");
         assert_eq!(future.len(), 1);
         assert_eq!(future[0].key, "/services/b");
+    }
+
+    #[test]
+    fn slow_watch_queue_is_bounded_and_reports_compaction() {
+        let mut store = InProcessKvStore::new();
+        let watch_id = store
+            .watch_prefix("/events/", KvRevision(1))
+            .expect("watch");
+
+        for index in 0..=MAX_PENDING_EVENTS_PER_WATCH {
+            store
+                .put(
+                    format!("/events/{index}"),
+                    index.to_string().into_bytes(),
+                    None,
+                )
+                .expect("put event");
+        }
+
+        let error = store
+            .drain_watch(watch_id)
+            .expect_err("lagged watch must fail instead of silently dropping events");
+        assert_eq!(
+            error,
+            KvError::Compacted {
+                requested: KvRevision(1),
+                compacted: KvRevision(1),
+            }
+        );
+        assert_eq!(
+            store.drain_watch(watch_id),
+            Err(KvError::UnknownWatch { watch_id })
+        );
+    }
+
+    #[test]
+    fn cancelled_watch_releases_registration() {
+        let mut store = InProcessKvStore::new();
+        let watch_id = store
+            .watch_prefix("/services/", KvRevision(1))
+            .expect("watch");
+        store
+            .put("/services/a", b"one".to_vec(), None)
+            .expect("put");
+
+        assert_eq!(store.cancel_watch(watch_id), Ok(true));
+        assert_eq!(store.cancel_watch(watch_id), Ok(false));
+        assert_eq!(
+            store.drain_watch(watch_id),
+            Err(KvError::UnknownWatch { watch_id })
+        );
+        store
+            .put("/services/b", b"two".to_vec(), None)
+            .expect("put after cancel");
+    }
+
+    #[test]
+    fn active_watch_count_is_bounded_and_cancel_frees_slot() {
+        let mut store = InProcessKvStore::new();
+        let mut watch_ids = Vec::new();
+        for index in 0..MAX_ACTIVE_WATCHES {
+            watch_ids.push(
+                store
+                    .watch_prefix(format!("/watch/{index}/"), KvRevision(1))
+                    .expect("watch within limit"),
+            );
+        }
+
+        assert_eq!(
+            store.watch_prefix("/watch/overflow/", KvRevision(1)),
+            Err(KvError::WatchLimit {
+                max: MAX_ACTIVE_WATCHES,
+            })
+        );
+        assert_eq!(store.cancel_watch(watch_ids[0]), Ok(true));
+
+        let replacement = store
+            .watch_prefix("/watch/replacement/", KvRevision(1))
+            .expect("watch after cancel");
+        assert_eq!(replacement, WatchId(MAX_ACTIVE_WATCHES as u64 + 1));
     }
 
     #[test]

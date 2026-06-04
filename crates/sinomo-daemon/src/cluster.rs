@@ -82,6 +82,7 @@ const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 32;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 const CLUSTER_RAFT_ELECTION_TERM_BUMP: u64 = 64;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInfoRecord>>> =
     OnceLock::new();
@@ -299,14 +300,6 @@ fn remember_cluster_endpoint_command_connectivity(
     .is_ok()
     {
         remember_connectivity_records(paths, &[record]);
-    }
-}
-
-struct ClusterRaftFanoutGuard;
-
-impl Drop for ClusterRaftFanoutGuard {
-    fn drop(&mut self) {
-        CLUSTER_RAFT_FANOUT_ACTIVE.store(false, Ordering::Release);
     }
 }
 
@@ -1854,6 +1847,17 @@ pub fn handle_daemon_cluster_kv_watch_events_request(
             stored_events: 0,
         });
     }
+    if request.events.len() > sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: format!(
+                "watch event fan-out batch has {} events; max is {}",
+                request.events.len(),
+                sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS
+            ),
+            stored_events: 0,
+        });
+    }
     let stored_events =
         sinomo_network::append_cluster_kv_watch_events(&cluster_paths, &request.events)?;
     Ok(ClusterKvWatchEventsResponse {
@@ -3024,19 +3028,53 @@ fn fan_out_committed_cluster_raft_command(
     state: ClusterBootstrapState,
     events: Vec<KvEvent>,
 ) {
+    CLUSTER_RAFT_FANOUT_PENDING.store(true, Ordering::Release);
     if CLUSTER_RAFT_FANOUT_ACTIVE.swap(true, Ordering::AcqRel) {
         return;
     }
     if thread::Builder::new()
         .name("sinomo-cluster-raft-fanout".to_string())
-        .spawn(move || {
-            let _guard = ClusterRaftFanoutGuard;
-            fan_out_committed_cluster_raft_command_blocking(&paths, &state, events);
-        })
+        .spawn(move || run_cluster_raft_fanout_worker(paths, state, events))
         .is_err()
     {
+        CLUSTER_RAFT_FANOUT_PENDING.store(true, Ordering::Release);
         CLUSTER_RAFT_FANOUT_ACTIVE.store(false, Ordering::Release);
     }
+}
+
+fn run_cluster_raft_fanout_worker(
+    paths: ClusterPaths,
+    mut state: ClusterBootstrapState,
+    mut events: Vec<KvEvent>,
+) {
+    loop {
+        while CLUSTER_RAFT_FANOUT_PENDING.swap(false, Ordering::AcqRel) {
+            fan_out_committed_cluster_raft_command_blocking(&paths, &state, events);
+            if let Ok(latest_state) = sinomo_network::read_cluster_state(&paths) {
+                state = latest_state;
+                events = sinomo_network::read_cluster_kv_snapshot(&paths)
+                    .map(|snapshot| snapshot.events)
+                    .unwrap_or_default();
+            } else {
+                events = Vec::new();
+            }
+        }
+
+        if !claim_next_cluster_raft_fanout_pass(
+            &CLUSTER_RAFT_FANOUT_ACTIVE,
+            &CLUSTER_RAFT_FANOUT_PENDING,
+        ) {
+            break;
+        }
+    }
+}
+
+fn claim_next_cluster_raft_fanout_pass(active: &AtomicBool, pending: &AtomicBool) -> bool {
+    active.store(false, Ordering::Release);
+    if !pending.load(Ordering::Acquire) {
+        return false;
+    }
+    !active.swap(true, Ordering::AcqRel)
 }
 
 fn fan_out_committed_cluster_raft_command_blocking(
@@ -3053,19 +3091,28 @@ fn fan_out_committed_cluster_raft_command_blocking(
             if response.accepted {
                 replicated_nodes.insert(endpoint.node_id.clone());
                 if !events.is_empty() {
-                    let _ = send_cluster_kv_watch_events(
-                        &endpoint,
-                        &ClusterKvWatchEventsRequest {
-                            state: state.clone(),
-                            leader_id: state.local_node_id.clone(),
-                            events: events.clone(),
-                        },
-                        DAEMON_CLUSTER_RPC_TIMEOUT,
-                    );
+                    for event_batch in cluster_kv_watch_event_fanout_batches(&events) {
+                        let response = send_cluster_kv_watch_events(
+                            &endpoint,
+                            &ClusterKvWatchEventsRequest {
+                                state: state.clone(),
+                                leader_id: state.local_node_id.clone(),
+                                events: event_batch.to_vec(),
+                            },
+                            DAEMON_CLUSTER_RPC_TIMEOUT,
+                        );
+                        if !response.is_ok_and(|response| response.accepted) {
+                            break;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+fn cluster_kv_watch_event_fanout_batches(events: &[KvEvent]) -> impl Iterator<Item = &[KvEvent]> {
+    events.chunks(sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS)
 }
 
 pub fn commit_cluster_kv_txn_with_quorum(
@@ -4104,6 +4151,113 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_fanout_batches_are_bounded_and_ordered() {
+        let events = (0..(sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS * 2 + 3))
+            .map(|index| KvEvent {
+                revision: sinomo_kv::KvRevision(index as u64 + 1),
+                key: format!("/watch/fanout/{index}"),
+                kind: sinomo_kv::KvEventKind::Put {
+                    value: index.to_string().into_bytes(),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let batches = cluster_kv_watch_event_fanout_batches(&events).collect::<Vec<_>>();
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|batch| {
+            !batch.is_empty()
+                && batch.len() <= sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS
+        }));
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.iter().map(|event| event.revision))
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_fanout_rejects_oversized_batches_before_storage() {
+        let root = unique_cluster_test_root("sinomo-daemon-watch-fanout-oversized");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_watch_fanout_oversized").expect("cluster");
+        let leader_id =
+            NodeId::from_legacy_named("node_watch_fanout_oversized_leader").expect("leader");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "watch fanout oversized",
+            leader_id.clone(),
+            "leader",
+            "pk-leader",
+            now,
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let events = (0..=sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS)
+            .map(|index| KvEvent {
+                revision: sinomo_kv::KvRevision(index as u64 + 1),
+                key: format!("/watch/fanout/oversized/{index}"),
+                kind: sinomo_kv::KvEventKind::Put {
+                    value: index.to_string().into_bytes(),
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let response = handle_daemon_cluster_kv_watch_events_request(
+            &daemon_paths,
+            ClusterKvWatchEventsRequest {
+                state,
+                leader_id,
+                events,
+            },
+        )
+        .expect("watch event fanout response");
+
+        assert!(!response.accepted);
+        assert_eq!(response.stored_events, 0);
+        assert!(
+            response.detail.contains("max is"),
+            "unexpected detail: {}",
+            response.detail
+        );
+        assert!(
+            !cluster_paths.kv_watch_events.exists(),
+            "oversized batch must not checkpoint watch events"
+        );
+        assert!(
+            !cluster_paths.kv_watch_events_log.exists(),
+            "oversized batch must not append watch events"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cluster_raft_fanout_handoff_claims_pending_pass_after_clearing_active() {
+        let active = AtomicBool::new(true);
+        let pending = AtomicBool::new(false);
+        assert!(!claim_next_cluster_raft_fanout_pass(&active, &pending));
+        assert!(!active.load(Ordering::Acquire));
+
+        active.store(true, Ordering::Release);
+        pending.store(true, Ordering::Release);
+        assert!(claim_next_cluster_raft_fanout_pass(&active, &pending));
+        assert!(active.load(Ordering::Acquire));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
+pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
@@ -1788,48 +1789,43 @@ pub fn append_cluster_kv_watch_events(
     } else {
         log.events.len()
     };
-    let mut existing =
+    let existing =
         compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
     if log_was_truncated {
         write_cluster_kv_watch_event_checkpoint(paths, &existing)?;
         truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
     }
-    let mut appended = Vec::new();
-    let mut stored = 0;
-    for event in incoming {
-        if existing.first().is_some_and(|first| {
-            existing.len() >= MAX_CLUSTER_KV_WATCH_EVENTS && event.revision < first.revision
-        }) {
-            continue;
-        }
-        if existing.iter().any(|candidate| {
-            candidate.revision == event.revision
-                && candidate.key == event.key
-                && candidate.kind == event.kind
-        }) {
-            continue;
-        }
-        existing.push(event.clone());
-        appended.push(event.clone());
-        stored += 1;
-    }
+    let retained = compact_cluster_kv_watch_events_incremental(existing.clone(), incoming);
+    let appended = retained
+        .iter()
+        .filter(|event| !cluster_kv_events_contain(&existing, event))
+        .cloned()
+        .collect::<Vec<_>>();
     if appended.is_empty() {
         return Ok(0);
     }
-    append_cluster_kv_watch_event_log_to_file(paths, &mut log_file, &appended)?;
-    let should_compact = log_records.saturating_add(appended.len())
-        >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
+    let should_checkpoint_without_append = incoming.len() > MAX_CLUSTER_KV_WATCH_EVENTS
+        || log_records.saturating_add(appended.len()) >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
         || log_file
             .metadata()
             .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
             .unwrap_or(false);
-    if should_compact {
-        let retained = compact_cluster_kv_watch_events(existing);
+    if should_checkpoint_without_append {
         write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
         truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+    } else {
+        append_cluster_kv_watch_event_log_to_file(paths, &mut log_file, &appended)?;
+        if log_file
+            .metadata()
+            .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
+            truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+        }
     }
     notify_cluster_kv_watchers(paths);
-    Ok(stored)
+    Ok(appended.len())
 }
 
 pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
@@ -1901,7 +1897,9 @@ fn read_cluster_kv_watch_event_log_from_file(
             detail: source.to_string(),
         })?;
     let mut events = Vec::new();
-    let mut record_number = 0;
+    let mut record_number = 0_usize;
+    let mut read_bytes = 0_u64;
+    let mut needs_repair = false;
     loop {
         record_number += 1;
         let mut len_buf = [0_u8; 4];
@@ -1921,6 +1919,7 @@ fn read_cluster_kv_watch_event_log_from_file(
             }
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        read_bytes = read_bytes.saturating_add(4).saturating_add(len as u64);
         if len == 0 || len > MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES {
             eprintln!(
                 "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
@@ -1961,10 +1960,26 @@ fn read_cluster_kv_watch_event_log_from_file(
                 });
             }
         }
+        if record_number >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
+            || read_bytes >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES
+        {
+            needs_repair = true;
+        }
+        if events.len() > MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS {
+            events = compact_cluster_kv_watch_events(events);
+        }
+    }
+    if needs_repair {
+        eprintln!(
+            "warning: repairing overgrown cluster kv watch-event log {} after reading {} records / {} bytes",
+            paths.kv_watch_events_log.display(),
+            record_number.saturating_sub(1),
+            read_bytes
+        );
     }
     Ok(ClusterKvWatchEventLogRead {
         events,
-        truncated: false,
+        truncated: needs_repair,
     })
 }
 
@@ -2096,6 +2111,30 @@ fn compact_cluster_kv_watch_events(mut events: Vec<KvEvent>) -> Vec<KvEvent> {
     } else {
         events
     }
+}
+
+fn compact_cluster_kv_watch_events_incremental(
+    mut retained: Vec<KvEvent>,
+    incoming: &[KvEvent],
+) -> Vec<KvEvent> {
+    for event in incoming {
+        if cluster_kv_events_contain(&retained, event) {
+            continue;
+        }
+        retained.push(event.clone());
+        if retained.len() > MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS {
+            retained = compact_cluster_kv_watch_events(retained);
+        }
+    }
+    compact_cluster_kv_watch_events(retained)
+}
+
+fn cluster_kv_events_contain(events: &[KvEvent], event: &KvEvent) -> bool {
+    events.iter().any(|candidate| {
+        candidate.revision == event.revision
+            && candidate.key == event.key
+            && candidate.kind == event.kind
+    })
 }
 
 fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
