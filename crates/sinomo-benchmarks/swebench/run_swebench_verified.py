@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import re
 import shlex
@@ -17,6 +18,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SUITE = Path(__file__).with_name("verified_10.json")
 DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmark-results" / "swebench"
+DEFAULT_AGENT_BIN = REPO_ROOT / "target" / "debug" / "sinomo-swebench-agent"
 HF_ROWS_URL = (
     "https://datasets-server.huggingface.co/rows?"
     "dataset=princeton-nlp%2FSWE-bench_Verified&config=default&split=test"
@@ -140,6 +142,68 @@ def run_command(
         )
 
 
+def command_output(command: list[str], *, cwd: Path) -> str | None:
+    try:
+        output = subprocess.run(
+            command,
+            cwd=cwd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    value = output.stdout.strip()
+    return value if value else None
+
+
+def repo_source_provenance() -> dict[str, object]:
+    revision = command_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT)
+    status = command_output(["git", "status", "--short"], cwd=REPO_ROOT)
+    return {
+        "repo_root": str(REPO_ROOT),
+        "git_revision": revision,
+        "git_dirty": bool(status),
+    }
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def agent_binary_provenance(
+    binary: Path,
+    *,
+    explicit: bool,
+    rebuild_policy: str,
+    dry_run: bool,
+) -> dict[str, object]:
+    exists = binary.exists()
+    provenance: dict[str, object] = {
+        "path": str(binary),
+        "explicit": explicit,
+        "rebuild_policy": rebuild_policy,
+        "dry_run": dry_run,
+        "exists": exists,
+        "source": repo_source_provenance(),
+    }
+    if exists:
+        stat = binary.stat()
+        provenance.update(
+            {
+                "size_bytes": stat.st_size,
+                "modified_time_ns": stat.st_mtime_ns,
+                "sha256": file_sha256(binary) if not dry_run else None,
+            }
+        )
+    return provenance
+
+
 def fetch_suite_rows(instance_ids: list[str], progress: ProgressWriter | None = None) -> dict[str, dict]:
     wanted = set(instance_ids)
     found: dict[str, dict] = {}
@@ -221,22 +285,76 @@ def prepare_workspace(
 def ensure_sinomo_agent_binary(
     binary: Path,
     *,
+    explicit: bool,
     dry_run: bool,
     progress: ProgressWriter | None,
-) -> None:
-    if binary.exists() or dry_run:
-        return
+) -> dict[str, object]:
+    if explicit:
+        if not binary.exists() and not dry_run:
+            raise SystemExit(
+                f"explicit --sinomo-agent-bin does not exist: {binary}; "
+                "omit --sinomo-agent-bin to rebuild the default benchmark agent"
+            )
+        provenance = agent_binary_provenance(
+            binary,
+            explicit=True,
+            rebuild_policy="explicit-binary-no-build",
+            dry_run=dry_run,
+        )
+        if progress:
+            progress.emit(
+                "agent-binary-ready",
+                binary_path=str(binary),
+                explicit=True,
+                rebuild_policy=provenance["rebuild_policy"],
+                exists=provenance["exists"],
+                sha256=provenance.get("sha256"),
+            )
+        return provenance
+
     run_command(
         ["cargo", "build", "-p", "sinomo-benchmarks", "--bin", "sinomo-swebench-agent"],
         cwd=REPO_ROOT,
+        dry_run=dry_run,
         progress=progress,
         phase="build-agent",
     )
+    if not binary.exists() and not dry_run:
+        raise SystemExit(
+            f"cargo build completed but benchmark agent binary was not found at {binary}"
+        )
+    provenance = agent_binary_provenance(
+        binary,
+        explicit=False,
+        rebuild_policy="rebuilt-default-before-run",
+        dry_run=dry_run,
+    )
+    if progress:
+        progress.emit(
+            "agent-binary-ready",
+            binary_path=str(binary),
+            explicit=False,
+            rebuild_policy=provenance["rebuild_policy"],
+            exists=provenance["exists"],
+            sha256=provenance.get("sha256"),
+        )
+    return provenance
 
 
-def run_sinomo(args: argparse.Namespace, suite: dict, progress: ProgressWriter) -> Path:
+def run_sinomo(
+    args: argparse.Namespace,
+    suite: dict,
+    progress: ProgressWriter,
+) -> tuple[Path, dict[str, object]]:
     instance_ids = [item["instance_id"] for item in suite["instances"]]
     progress.emit("sinomo-start", total_instances=len(instance_ids))
+    agent_bin = args.sinomo_agent_bin
+    agent_binary = ensure_sinomo_agent_binary(
+        agent_bin,
+        explicit=args.sinomo_agent_bin_explicit,
+        dry_run=args.dry_run,
+        progress=progress,
+    )
     tasks = fetch_suite_rows(instance_ids, progress)
     output_dir = args.results_dir / "sinomo"
     reports_dir = output_dir / "reports"
@@ -245,8 +363,6 @@ def run_sinomo(args: argparse.Namespace, suite: dict, progress: ProgressWriter) 
     for directory in (reports_dir, task_dir, workspaces_dir):
         if not args.dry_run:
             directory.mkdir(parents=True, exist_ok=True)
-    agent_bin = args.sinomo_agent_bin
-    ensure_sinomo_agent_binary(agent_bin, dry_run=args.dry_run, progress=progress)
     predictions_path = output_dir / "predictions.jsonl"
     if not args.dry_run:
         predictions_path.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +441,7 @@ def run_sinomo(args: argparse.Namespace, suite: dict, progress: ProgressWriter) 
         )
     print(f"Sinomo predictions: {predictions_path}")
     progress.emit("sinomo-complete", predictions_path=str(predictions_path))
-    return predictions_path
+    return predictions_path, agent_binary
 
 
 def run_mini(args: argparse.Namespace, suite: dict, progress: ProgressWriter) -> Path:
@@ -554,6 +670,7 @@ def write_summary(
     suite: dict,
     *,
     predictions_path: Path | None,
+    sinomo_agent_binary: dict[str, object] | None,
     mini_predictions_path: Path | None,
     progress: ProgressWriter,
 ) -> None:
@@ -586,6 +703,7 @@ def write_summary(
     official_evaluation = collect_official_evaluation_summary(args, suite)
     sinomo_summary = {
         "prediction_path": str(predictions_path) if predictions_path else None,
+        "agent_binary": sinomo_agent_binary,
         "report_dir": str(reports_dir),
         "report_count": len(reports),
         "agent_trace_paths": agent_trace_paths,
@@ -654,6 +772,15 @@ def print_plan(args: argparse.Namespace, suite: dict) -> None:
             "max_steps": args.max_steps,
             "repair_steps": args.repair_steps,
         },
+        "sinomo_agent_binary": {
+            "path": str(args.sinomo_agent_bin),
+            "explicit": args.sinomo_agent_bin_explicit,
+            "freshness": (
+                "explicit binary; runner records provenance but does not rebuild"
+                if args.sinomo_agent_bin_explicit
+                else "default binary rebuilt before every Sinomo run"
+            ),
+        },
         "mini_swe_agent": {
             "model": args.baseline_model,
             "filter": suite_filter_regex(instance_ids),
@@ -674,7 +801,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="deepseek-v4-flash")
     parser.add_argument("--account")
     parser.add_argument("--baseline-model", default="deepseek/deepseek-v4-flash")
-    parser.add_argument("--sinomo-agent-bin", type=Path, default=REPO_ROOT / "target" / "debug" / "sinomo-swebench-agent")
+    parser.add_argument("--sinomo-agent-bin", type=Path)
     parser.add_argument("--max-steps", type=int, default=20)
     parser.add_argument("--repair-steps", type=int, default=6)
     parser.add_argument("--workers", type=int, default=1)
@@ -686,6 +813,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     args.results_dir = args.results_dir.resolve()
+    args.sinomo_agent_bin_explicit = args.sinomo_agent_bin is not None
+    if args.sinomo_agent_bin is None:
+        args.sinomo_agent_bin = DEFAULT_AGENT_BIN
     args.sinomo_agent_bin = args.sinomo_agent_bin.resolve()
     if args.summary_out:
         args.summary_out = args.summary_out.resolve()
@@ -709,9 +839,10 @@ def main() -> int:
         )
         print_plan(args, suite)
         predictions_path: Path | None = None
+        sinomo_agent_binary: dict[str, object] | None = None
         mini_predictions_path: Path | None = None
         if args.mode in {"sinomo", "both"}:
-            predictions_path = run_sinomo(args, suite, progress)
+            predictions_path, sinomo_agent_binary = run_sinomo(args, suite, progress)
         if args.mode in {"mini", "both"}:
             mini_predictions_path = run_mini(args, suite, progress)
         if args.evaluate:
@@ -722,6 +853,7 @@ def main() -> int:
             args,
             suite,
             predictions_path=predictions_path,
+            sinomo_agent_binary=sinomo_agent_binary,
             mini_predictions_path=mini_predictions_path,
             progress=progress,
         )

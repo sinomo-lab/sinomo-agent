@@ -8,7 +8,6 @@ The checked-in `verified_10.json` suite selects 10 tasks from SWE-bench Verified
 
 ```sh
 python3 -m pip install mini-swe-agent swebench
-cargo build -p sinomo-benchmarks --bin sinomo-swebench-agent
 sinomo --local providers test deepseek
 ```
 
@@ -42,6 +41,8 @@ python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py \
 ```
 
 The Sinomo path prepares local Git checkouts, runs `sinomo-swebench-agent` inside each checkout with local workspace tools, writes per-instance reports, full `*.run.json` traces, live agent `*.trace.jsonl` records, post-patch syntax-check results, and bounded repair-pass counters under `benchmark-results/swebench/sinomo`, and writes `predictions.jsonl` in SWE-bench prediction format. The repair pass is used when a patch fails the post-patch syntax check or when the initial pass exhausts its step budget without leaving a patch. For Python indentation syntax failures, the harness also runs a narrow deterministic cleanup that restores base-file indentation on changed lines before rerunning the syntax check.
+
+By default, the runner rebuilds `target/debug/sinomo-swebench-agent` with `cargo build -p sinomo-benchmarks --bin sinomo-swebench-agent` before every Sinomo benchmark run so retries cannot silently use a stale agent binary. If `--sinomo-agent-bin <path>` is supplied, that explicit binary is used without rebuilding and its path, size, mtime, and SHA-256 are recorded in the benchmark summary.
 
 Use `--limit 1` for a first smoke run or `--instance-id <id>` to rerun a specific checked-in instance.
 Use `--progress-out` to write newline-delimited JSON progress events while the run is active.

@@ -529,6 +529,18 @@ mod tests {
     }
 
     #[test]
+    fn swebench_runner_rebuilds_default_agent_and_records_binary_provenance() {
+        let runner = include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py");
+        assert!(runner.contains("DEFAULT_AGENT_BIN"));
+        assert!(runner.contains("sinomo_agent_bin_explicit"));
+        assert!(runner.contains("rebuilt-default-before-run"));
+        assert!(runner.contains("explicit-binary-no-build"));
+        assert!(runner.contains("agent_binary"));
+        assert!(runner.contains("sha256"));
+        assert!(runner.contains("\"cargo\", \"build\""));
+    }
+
+    #[test]
     fn minestudio_plan_keeps_vision_path_explicit() {
         let plan = minestudio_plan();
         assert!(plan.required_tools.contains(&AgentToolKind::ObserveVision));
