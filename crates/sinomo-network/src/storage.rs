@@ -57,6 +57,9 @@ static CLUSTER_KV_WATCH_EVENT_CACHE: LazyLock<
 static CLUSTER_KV_WATCH_REGISTRATION_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchRegistrationCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLUSTER_KV_WATCH_ALLOCATOR_TRUST: LazyLock<
+    Mutex<HashMap<PathBuf, ClusterKvWatchAllocatorTrustEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static CLUSTER_KV_READER_NODE_ID_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvReaderNodeIdCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -72,6 +75,10 @@ static CLUSTER_KV_WATCH_EVENT_LOG_WRITE_BYTES_FOR_TEST: LazyLock<Mutex<HashMap<P
 #[cfg(test)]
 static CLUSTER_KV_WATCH_DIR_SCANS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST: LazyLock<
+    Mutex<HashMap<PathBuf, u64>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -100,6 +107,12 @@ struct ClusterKvWatchEventCacheEntry {
 struct ClusterKvWatchRegistrationCacheEntry {
     mark: ClusterFileMark,
     registration: ClusterKvWatchRegistration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClusterKvWatchAllocatorTrustEntry {
+    allocator_mark: ClusterFileMark,
+    watch_dir_mark: ClusterFileMark,
 }
 
 #[derive(Clone)]
@@ -357,6 +370,55 @@ fn invalidate_cluster_kv_watch_registration_cache(path: &PathBuf) {
     }
 }
 
+fn cluster_kv_watch_allocator_trusted(paths: &ClusterPaths) -> bool {
+    let Some(allocator_mark) = cluster_file_mark(&paths.kv_watches_next_id) else {
+        return false;
+    };
+    if !allocator_mark.exists {
+        return false;
+    }
+    let Some(watch_dir_mark) = cluster_file_mark(&paths.kv_watches) else {
+        return false;
+    };
+    if !watch_dir_mark.exists {
+        return false;
+    }
+    CLUSTER_KV_WATCH_ALLOCATOR_TRUST
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&paths.kv_watches_next_id).copied())
+        .is_some_and(|entry| {
+            entry.allocator_mark == allocator_mark && entry.watch_dir_mark == watch_dir_mark
+        })
+}
+
+fn record_current_cluster_kv_watch_allocator_trust(paths: &ClusterPaths) {
+    let Some(allocator_mark) = cluster_file_mark(&paths.kv_watches_next_id) else {
+        return;
+    };
+    if !allocator_mark.exists {
+        return;
+    }
+    let Some(watch_dir_mark) = cluster_file_mark(&paths.kv_watches) else {
+        return;
+    };
+    if !watch_dir_mark.exists {
+        return;
+    }
+    if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
+        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(&paths.kv_watches_next_id) {
+            cache.clear();
+        }
+        cache.insert(
+            paths.kv_watches_next_id.clone(),
+            ClusterKvWatchAllocatorTrustEntry {
+                allocator_mark,
+                watch_dir_mark,
+            },
+        );
+    }
+}
+
 fn cached_cluster_kv_reader_node_id(path: &PathBuf, mark: ClusterFileMark) -> Option<NodeId> {
     let cache = CLUSTER_KV_READER_NODE_ID_CACHE.lock().ok()?;
     let entry = cache.get(path)?;
@@ -499,6 +561,30 @@ pub(crate) fn cluster_kv_watch_dir_scans_for_test(paths: &ClusterPaths) -> u64 {
         .ok()
         .and_then(|scans| scans.get(&cluster_kv_watch_notify_key(paths)).copied())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_cluster_kv_watch_allocator_persist_for_test(paths: &ClusterPaths) {
+    if let Ok(mut failures) = CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST.lock() {
+        *failures
+            .entry(paths.kv_watches_next_id.clone())
+            .or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+fn consume_cluster_kv_watch_allocator_persist_failure_for_test(paths: &ClusterPaths) -> bool {
+    let Ok(mut failures) = CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST.lock() else {
+        return false;
+    };
+    let Some(remaining) = failures.get_mut(&paths.kv_watches_next_id) else {
+        return false;
+    };
+    *remaining = remaining.saturating_sub(1);
+    if *remaining == 0 {
+        failures.remove(&paths.kv_watches_next_id);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -801,6 +887,20 @@ pub struct ClusterKvWatchRegistration {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterKvWatchAllocatorState {
     pub next_watch_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_watch_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned_compacted_revision: Option<KvRevision>,
+}
+
+impl ClusterKvWatchAllocatorState {
+    fn legacy(next_watch_id: u64) -> Self {
+        Self {
+            next_watch_id: next_watch_id.max(1),
+            active_watch_count: None,
+            pruned_compacted_revision: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2269,14 +2369,28 @@ pub fn create_cluster_kv_watch(
         detail: source.to_string(),
     })?;
     let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
-    let cursor_id = read_cluster_kv_watch_allocator_cursor(paths)?;
-    let scan = scan_cluster_kv_watches(paths, snapshot.compacted_revision)?;
-    if scan.retained >= MAX_CLUSTER_KV_ACTIVE_WATCHES {
+    let mut allocator = read_cluster_kv_watch_allocator_state(paths)?;
+    let mut scanned = false;
+    if cluster_kv_watch_allocator_needs_scan(paths, &allocator, snapshot.compacted_revision) {
+        let scan = scan_cluster_kv_watches(paths, snapshot.compacted_revision)?;
+        allocator.next_watch_id = allocator
+            .next_watch_id
+            .max(scan.max_seen_id.saturating_add(1))
+            .max(1);
+        allocator.active_watch_count = Some(scan.retained);
+        allocator.pruned_compacted_revision = Some(snapshot.compacted_revision);
+        scanned = true;
+    }
+    let active_watch_count = allocator.active_watch_count.unwrap_or_default();
+    if active_watch_count >= MAX_CLUSTER_KV_ACTIVE_WATCHES {
+        if scanned {
+            persist_cluster_kv_watch_allocator_state(paths, &allocator)?;
+        }
         return Err(NetworkError::Kv(KvError::WatchLimit {
             max: MAX_CLUSTER_KV_ACTIVE_WATCHES,
         }));
     }
-    let mut watch_id = WatchId(cursor_id.max(scan.max_seen_id.saturating_add(1)).max(1));
+    let mut watch_id = WatchId(allocator.next_watch_id.max(1));
     loop {
         let registration = ClusterKvWatchRegistration {
             watch_id,
@@ -2286,7 +2400,13 @@ pub fn create_cluster_kv_watch(
         let watch_path = cluster_kv_watch_path(paths, watch_id);
         if write_object_file_create_new(&watch_path, &registration)? {
             record_current_cluster_kv_watch_registration_cache(&watch_path, registration.clone());
-            persist_next_cluster_kv_watch_id(paths, watch_id.0.saturating_add(1).max(1))?;
+            allocator.next_watch_id = watch_id.0.saturating_add(1).max(1);
+            allocator.active_watch_count = Some(active_watch_count.saturating_add(1));
+            allocator.pruned_compacted_revision = Some(snapshot.compacted_revision);
+            if let Err(error) = persist_cluster_kv_watch_allocator_state(paths, &allocator) {
+                remove_cluster_kv_watch_file(&watch_path);
+                return Err(error);
+            }
             return Ok(registration);
         }
         if watch_id.0 == u64::MAX {
@@ -2351,7 +2471,7 @@ pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
     if registration.next_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
-        remove_cluster_kv_watch_file(&watch_path);
+        remove_cluster_kv_watch_registration_with_allocator(paths, &watch_path)?;
         return Err(NetworkError::Kv(KvError::Compacted {
             requested: registration.next_revision,
             compacted: snapshot.compacted_revision,
@@ -2452,7 +2572,12 @@ pub fn cancel_cluster_kv_watch(
     request: ClusterKvWatchCancelRequest,
 ) -> Result<ClusterKvWatchCancelResponse, NetworkError> {
     let watch_path = cluster_kv_watch_path(paths, request.watch_id);
-    let cancelled = remove_cluster_kv_watch_file_if_exists(&watch_path)?;
+    let cancelled = if watch_path.exists() {
+        remove_cluster_kv_watch_registration_with_allocator(paths, &watch_path)?
+    } else {
+        invalidate_cluster_kv_watch_registration_cache(&watch_path);
+        false
+    };
     if cancelled {
         notify_cluster_kv_watchers(paths);
     }
@@ -3126,6 +3251,27 @@ fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, Networ
     }
 }
 
+fn remove_cluster_kv_watch_registration_with_allocator(
+    paths: &ClusterPaths,
+    path: &PathBuf,
+) -> Result<bool, NetworkError> {
+    let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
+    let removed = remove_cluster_kv_watch_file_if_exists(path)?;
+    if removed {
+        decrement_cluster_kv_watch_allocator_count(paths)?;
+    }
+    Ok(removed)
+}
+
+fn decrement_cluster_kv_watch_allocator_count(paths: &ClusterPaths) -> Result<(), NetworkError> {
+    let mut allocator = read_cluster_kv_watch_allocator_state(paths)?;
+    let Some(active_watch_count) = allocator.active_watch_count else {
+        return Ok(());
+    };
+    allocator.active_watch_count = Some(active_watch_count.saturating_sub(1));
+    persist_cluster_kv_watch_allocator_state(paths, &allocator)
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ClusterKvWatchScanResult {
     removed: usize,
@@ -3199,24 +3345,52 @@ fn cluster_kv_watch_id_from_file_name(name: &str) -> Option<u64> {
         .and_then(|id| id.parse::<u64>().ok())
 }
 
-fn read_cluster_kv_watch_allocator_cursor(paths: &ClusterPaths) -> Result<u64, NetworkError> {
-    let cursor_id = if paths.kv_watches_next_id.exists() {
-        read_object_file::<ClusterKvWatchAllocatorState>(&paths.kv_watches_next_id)
-            .map(|state| state.next_watch_id)?
-    } else {
-        1
-    };
-    Ok(cursor_id.max(1))
+fn cluster_kv_watch_allocator_needs_scan(
+    paths: &ClusterPaths,
+    allocator: &ClusterKvWatchAllocatorState,
+    compacted_revision: KvRevision,
+) -> bool {
+    if !cluster_kv_watch_allocator_trusted(paths) {
+        return true;
+    }
+    if allocator.active_watch_count.is_none() {
+        return true;
+    }
+    match allocator.pruned_compacted_revision {
+        Some(pruned) => pruned < compacted_revision,
+        None => true,
+    }
 }
 
-fn persist_next_cluster_kv_watch_id(
+fn read_cluster_kv_watch_allocator_state(
     paths: &ClusterPaths,
-    next_watch_id: u64,
+) -> Result<ClusterKvWatchAllocatorState, NetworkError> {
+    let state = if paths.kv_watches_next_id.exists() {
+        read_object_file::<ClusterKvWatchAllocatorState>(&paths.kv_watches_next_id)?
+    } else {
+        ClusterKvWatchAllocatorState::legacy(1)
+    };
+    Ok(ClusterKvWatchAllocatorState {
+        next_watch_id: state.next_watch_id.max(1),
+        active_watch_count: state.active_watch_count,
+        pruned_compacted_revision: state.pruned_compacted_revision,
+    })
+}
+
+fn persist_cluster_kv_watch_allocator_state(
+    paths: &ClusterPaths,
+    state: &ClusterKvWatchAllocatorState,
 ) -> Result<(), NetworkError> {
-    write_object_file(
-        &paths.kv_watches_next_id,
-        &ClusterKvWatchAllocatorState { next_watch_id },
-    )
+    #[cfg(test)]
+    if consume_cluster_kv_watch_allocator_persist_failure_for_test(paths) {
+        return Err(NetworkError::StorageIo {
+            path: paths.kv_watches_next_id.display().to_string(),
+            detail: "injected cluster kv watch allocator persist failure".to_string(),
+        });
+    }
+    write_object_file(&paths.kv_watches_next_id, state)?;
+    record_current_cluster_kv_watch_allocator_trust(paths);
+    Ok(())
 }
 
 pub fn read_cluster_state_without_kv(

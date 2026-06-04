@@ -1422,6 +1422,27 @@ impl DeliveryLedger {
         now: Instant,
         max_deliveries: usize,
     ) -> Vec<RouteDeliveryId> {
+        self.ready_delivery_ids_limited_at_inner(now, max_deliveries, |_| {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ready_delivery_ids_limited_at_counting(
+        &self,
+        now: Instant,
+        max_deliveries: usize,
+        inspected: &mut usize,
+    ) -> Vec<RouteDeliveryId> {
+        self.ready_delivery_ids_limited_at_inner(now, max_deliveries, |_| {
+            *inspected = inspected.saturating_add(1);
+        })
+    }
+
+    fn ready_delivery_ids_limited_at_inner(
+        &self,
+        now: Instant,
+        max_deliveries: usize,
+        mut on_inspect: impl FnMut(RouteDeliveryId),
+    ) -> Vec<RouteDeliveryId> {
         let max_deliveries = max_deliveries.max(1);
         let mut ready_by_priority = [
             Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
@@ -1430,12 +1451,20 @@ impl DeliveryLedger {
             Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
         ];
         for (delivery_id, record) in &self.records {
+            on_inspect(*delivery_id);
             if !delivery_is_ready(record, *delivery_id, &self.retry_not_before, now) {
                 continue;
             }
             let priority = latency_class_ready_priority(&record.delivery.latency_class) as usize;
             if ready_by_priority[priority].len() < max_deliveries {
                 ready_by_priority[priority].push(*delivery_id);
+            }
+            if ready_by_priority[0].len() >= max_deliveries
+                || ready_by_priority
+                    .iter()
+                    .all(|bucket| bucket.len() >= max_deliveries)
+            {
+                break;
             }
         }
 

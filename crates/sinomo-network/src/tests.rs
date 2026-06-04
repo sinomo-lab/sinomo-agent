@@ -2823,6 +2823,37 @@ fn public_ip_discovery_cache_does_not_store_deferred_result() {
 }
 
 #[test]
+fn public_ip_discovery_caches_non_empty_deferred_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let partial = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Deferred(vec!["203.0.113.18".parse().expect("ip")])
+        },
+    );
+    let cached = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.19".parse().expect("ip")])
+        },
+    );
+
+    assert_eq!(partial, vec!["203.0.113.18".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        cached, partial,
+        "a successful first public-IP service should be reused even if later DNS work was deferred"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
 fn public_ip_discovery_empty_cache_expires_before_positive_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
@@ -8579,6 +8610,195 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
 }
 
 #[test]
+fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-create-no-scan-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    let first = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/no-scan/first/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create first watch");
+    let allocator: ClusterKvWatchAllocatorState =
+        read_object_file(&paths.kv_watches_next_id).expect("read seeded allocator");
+    assert_eq!(allocator.active_watch_count, Some(1));
+    assert_eq!(allocator.pruned_compacted_revision, Some(KvRevision::ZERO));
+
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    let second = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/no-scan/second/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create second watch");
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        0,
+        "steady-state watch creation should use the durable allocator count"
+    );
+    let allocator: ClusterKvWatchAllocatorState =
+        read_object_file(&paths.kv_watches_next_id).expect("read allocator after second watch");
+    assert_eq!(allocator.active_watch_count, Some(2));
+    assert_eq!(allocator.next_watch_id, second.watch_id.0.saturating_add(1));
+
+    cancel_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchCancelRequest {
+            watch_id: first.watch_id,
+        },
+    )
+    .expect("cancel first watch");
+    let allocator: ClusterKvWatchAllocatorState =
+        read_object_file(&paths.kv_watches_next_id).expect("read allocator after cancel");
+    assert_eq!(allocator.active_watch_count, Some(1));
+
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    let replacement = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/no-scan/replacement/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create replacement watch");
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        0,
+        "replacement after a normal cancel should not need a directory scan"
+    );
+    assert!(
+        replacement.watch_id > second.watch_id,
+        "watch ids should keep advancing after cancel"
+    );
+    let allocator: ClusterKvWatchAllocatorState =
+        read_object_file(&paths.kv_watches_next_id).expect("read allocator after replacement");
+    assert_eq!(allocator.active_watch_count, Some(2));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-create-rescan-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/rescan/first/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create first watch");
+    let corrupt_path = paths.kv_watches.join("watch-99.sobj");
+    std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt watch");
+
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    let repaired = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/rescan/repaired/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch after external directory change");
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        1,
+        "watch-directory changes should invalidate allocator trust and force repair"
+    );
+    assert!(
+        !corrupt_path.exists(),
+        "rescan should prune the corrupt external registration"
+    );
+    assert!(
+        repaired.watch_id.0 > 99,
+        "watch ids must not reuse ids from externally observed registrations"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-create-persist-failure-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    fail_next_cluster_kv_watch_allocator_persist_for_test(&paths);
+    let error = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/persist-failure/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect_err("allocator persist failure");
+    assert!(matches!(error, NetworkError::StorageIo { .. }));
+    assert_eq!(
+        std::fs::read_dir(&paths.kv_watches)
+            .expect("watch registration directory")
+            .count(),
+        0,
+        "failed watch creation must roll back the registration file"
+    );
+    assert!(
+        !paths.kv_watches_next_id.exists(),
+        "allocator file should not be durable after injected pre-write failure"
+    );
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/persist-failure/retry/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("retry watch create");
+    assert_eq!(
+        watch.watch_id,
+        WatchId(1),
+        "rolled-back failed creates should not consume a watch id"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-registration-cache-{}",
@@ -9433,6 +9653,40 @@ fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
     assert_eq!(cache.expire_after_tick(14), 0);
     assert_eq!(cache.expire_after_tick(15), 1);
     assert!(cache.endpoint_candidates_for_node(&node_id).is_empty());
+}
+
+#[test]
+fn mdns_discovery_records_clamp_advertised_ttl() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_mdns_ttl").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mdns_ttl").expect("node");
+    let endpoint = MdnsDiscoveryRecord::lan_quic(
+        cluster_id.clone(),
+        node_id.clone(),
+        "192.168.51.20:21355",
+        10,
+        u64::MAX,
+    )
+    .endpoint;
+    let advertisement = MdnsDiscoveryAdvertisement {
+        ttl_ticks: u64::MAX,
+        ..MdnsDiscoveryAdvertisement::new(cluster_id.clone(), node_id.clone(), vec![endpoint], 10)
+    };
+    let records = advertisement.records();
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].expires_after_tick,
+        10 + crate::lan::MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS,
+        "untrusted LAN advertisements must not pin stale roaming endpoints indefinitely"
+    );
+
+    let helper_record =
+        MdnsDiscoveryRecord::lan_quic(cluster_id, node_id, "192.168.51.21:21355", 20, u64::MAX);
+    assert_eq!(
+        helper_record.expires_after_tick,
+        20 + crate::lan::MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS,
+        "direct record helpers should share the same TTL bound"
+    );
 }
 
 #[test]
@@ -11954,6 +12208,41 @@ fn delivery_ledger_limited_ready_batch_keeps_realtime_priority() {
         ledger.ready_delivery_ids_limited(2),
         vec![RouteDeliveryId(5), RouteDeliveryId(4)],
         "bounded pump batches should not let older bulk work fill the batch ahead of realtime work"
+    );
+}
+
+#[test]
+fn delivery_ledger_stops_ready_scan_after_full_realtime_batch() {
+    let node_a = NodeId::from_legacy_named("node_ready_scan_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ready_scan_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 8);
+    for index in 1..=8 {
+        let latency_class = if index <= 3 {
+            LatencyClass::Reactive
+        } else {
+            LatencyClass::Background
+        };
+        let event = fixture_event(&format!("evt_ready_scan_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    let mut inspected = 0;
+    assert_eq!(
+        ledger.ready_delivery_ids_limited_at_counting(Instant::now(), 3, &mut inspected),
+        vec![RouteDeliveryId(1), RouteDeliveryId(2), RouteDeliveryId(3),],
+        "a full reactive batch should be returned before lower-priority backlog"
+    );
+    assert_eq!(
+        inspected, 3,
+        "ready selection should not scan lower-priority backlog once realtime work fills the batch"
     );
 }
 

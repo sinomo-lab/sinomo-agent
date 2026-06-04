@@ -253,7 +253,10 @@ fn cached_default_public_ip_candidates_for_key_with(
     let result = discover();
     let candidates = match result {
         PublicIpDiscoveryResult::Complete(candidates) => candidates,
-        PublicIpDiscoveryResult::Deferred(candidates) => return candidates,
+        PublicIpDiscoveryResult::Deferred(candidates) if candidates.is_empty() => {
+            return candidates;
+        }
+        PublicIpDiscoveryResult::Deferred(candidates) => candidates,
     };
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES {
@@ -543,6 +546,7 @@ pub const SINOMO_LAN_DISCOVERY_PROTOCOL: &str = "sinomo.lan-discovery.v1";
 pub const SINOMO_LAN_DISCOVERY_MULTICAST: Ipv4Addr = Ipv4Addr::new(239, 255, 77, 77);
 pub const SINOMO_LAN_DISCOVERY_PORT: u16 = 21_359;
 pub const SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = 10;
+pub(crate) const MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS: u64 = SINOMO_LAN_DISCOVERY_TTL_TICKS * 3;
 pub(crate) const MAX_MDNS_DISCOVERY_RECORDS: usize = 4096;
 pub(crate) const MAX_MDNS_DISCOVERY_DRAIN_DATAGRAMS: usize = 256;
 
@@ -575,6 +579,7 @@ impl MdnsDiscoveryAdvertisement {
     }
 
     pub fn records(&self) -> Vec<MdnsDiscoveryRecord> {
+        let ttl_ticks = clamped_lan_discovery_ttl_ticks(self.ttl_ticks);
         self.endpoints
             .iter()
             .filter(|endpoint| {
@@ -599,11 +604,15 @@ impl MdnsDiscoveryAdvertisement {
                     cluster_id: self.cluster_id.clone(),
                     endpoint,
                     advertised_tick: self.advertised_tick,
-                    expires_after_tick: self.advertised_tick.saturating_add(self.ttl_ticks),
+                    expires_after_tick: self.advertised_tick.saturating_add(ttl_ticks),
                 }
             })
             .collect()
     }
+}
+
+fn clamped_lan_discovery_ttl_ticks(ttl_ticks: u64) -> u64 {
+    ttl_ticks.min(MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS)
 }
 
 #[derive(Debug)]
@@ -745,7 +754,8 @@ impl MdnsDiscoveryRecord {
                 last_observed_latency_ms: None,
             },
             advertised_tick,
-            expires_after_tick: advertised_tick.saturating_add(ttl_ticks),
+            expires_after_tick: advertised_tick
+                .saturating_add(clamped_lan_discovery_ttl_ticks(ttl_ticks)),
         }
     }
 }
