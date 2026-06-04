@@ -2,6 +2,18 @@ use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::peer::{NetworkFrame, PeerEndpointCandidate};
 use crate::prelude::*;
+use std::sync::LazyLock;
+use std::time::Instant;
+
+const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
+static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<PublicIpDiscoveryCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone, Debug)]
+struct PublicIpDiscoveryCacheEntry {
+    checked_at: Instant,
+    candidates: Vec<IpAddr>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LanQuicEndpointConfig {
@@ -90,7 +102,43 @@ pub fn iroh_disabled_by_env() -> bool {
 }
 
 pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
-    discover_public_ip_candidates_from_hosts(&[("api.ipify.org", "/"), ("ifconfig.me", "/ip")])
+    if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        return Vec::new();
+    }
+    cached_default_public_ip_candidates_with(|| {
+        discover_public_ip_candidates_from_hosts(&[("api.ipify.org", "/"), ("ifconfig.me", "/ip")])
+    })
+}
+
+pub(crate) fn cached_default_public_ip_candidates_with(
+    discover: impl FnOnce() -> Vec<IpAddr>,
+) -> Vec<IpAddr> {
+    let now = Instant::now();
+    if let Ok(cache) = PUBLIC_IP_DISCOVERY_CACHE.lock()
+        && let Some(entry) = cache.as_ref()
+        && now.duration_since(entry.checked_at) < PUBLIC_IP_DISCOVERY_CACHE_TTL
+    {
+        return entry.candidates.clone();
+    }
+    let candidates = discover();
+    if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
+        *cache = Some(PublicIpDiscoveryCacheEntry {
+            checked_at: now,
+            candidates: candidates.clone(),
+        });
+    }
+    candidates
+}
+
+#[cfg(test)]
+pub(crate) fn clear_public_ip_discovery_cache() {
+    if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
+        *cache = None;
+    }
 }
 
 pub fn discover_public_ip_candidates_from_hosts(hosts: &[(&str, &str)]) -> Vec<IpAddr> {

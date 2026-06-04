@@ -1136,8 +1136,8 @@ impl ClusterNetworkMaintenance {
         let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
         let probe_due =
             now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
-        let discovery_due =
-            now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL;
+        let discovery_due = self.discovery.is_some()
+            && now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL;
         if !(publish_due || probe_due || discovery_due) {
             return Ok(());
         }
@@ -4137,6 +4137,65 @@ mod tests {
             now,
         ));
         assert!(cluster_has_remote_peers(&state));
+    }
+
+    #[test]
+    fn cluster_network_maintenance_skips_discovery_tick_without_socket() {
+        let root = unique_cluster_test_root("sinomo-daemon-discovery-none-idle");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_discovery_none_idle").expect("cluster");
+        let local = NodeId::from_legacy_named("node_discovery_none_idle").expect("node");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "discovery none idle",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let idle_stats = Arc::new(IdleStatsAtomics::new());
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
+            environment_id: None,
+            last_desired_rollout_attempt: None,
+            tick: 0,
+            last_publish: maintenance_now,
+            last_discovery: maintenance_now
+                .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
+                .unwrap_or(maintenance_now),
+            last_probe: maintenance_now,
+            idle_stats: idle_stats.clone(),
+        };
+
+        maintenance
+            .tick(
+                &DaemonPaths::with_root(data_root.join("daemon")),
+                &DaemonRunOptions::default(),
+            )
+            .expect("maintenance tick");
+
+        let snapshot = idle_stats.snapshot();
+        assert_eq!(snapshot.ticks_total, 1);
+        assert_eq!(
+            snapshot.ticks_with_work, 0,
+            "a missing discovery socket should not turn an idle tick into work"
+        );
+        assert_eq!(
+            snapshot.disk_reads_cluster_state, 0,
+            "discovery-only ticks without a socket should not read cluster state"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

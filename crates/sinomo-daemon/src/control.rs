@@ -2,7 +2,7 @@ use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
     DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonDfsEndpointTransport, DaemonError,
     DaemonLock, DaemonPaths, authenticate_daemon_control_request, cluster_health_rows,
-    cluster_paths_from_daemon_paths, create_cluster_invite_challenge_proof,
+    cluster_paths_from_daemon_paths, create_cluster_invite_challenge_proof, daemon_connect_address,
     daemon_paths_are_shadow, daemon_rpc_command, ensure_daemon_status_cluster,
     ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     forward_cluster_invite_challenge_to_voter, handle_daemon_clear_rollout_status,
@@ -35,7 +35,6 @@ use time::OffsetDateTime;
 pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
-pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
@@ -279,7 +278,7 @@ pub fn run_daemon_control_loop(
     }
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = sinomo_network::DaemonControlListener::bind(&bind_address)?;
-    listener.set_nonblocking(true)?;
+    listener.set_nonblocking(false)?;
     println!("sinomo {label} listening on {bind_address}");
     if let Err(error) =
         start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label)
@@ -376,21 +375,27 @@ pub fn run_daemon_control_loop(
         })?;
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let accept_wake_address = daemon_connect_address(&options.host, options.port);
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
         match listener.accept() {
             Ok(Some(mut stream)) => {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
                 let client_paths = paths.clone();
                 let client_label = label.to_string();
                 let client_shutdown_tx = shutdown_tx.clone();
+                let client_accept_wake_address = accept_wake_address.clone();
                 thread::Builder::new()
                     .name(format!("sinomo-{label}-client"))
                     .spawn(
                         move || match handle_daemon_connection(&mut stream, &client_paths) {
                             Ok(true) => {
                                 let _ = client_shutdown_tx.send(());
+                                wake_daemon_control_accept(&client_accept_wake_address);
                             }
                             Ok(false) => {}
                             Err(error) => eprintln!("sinomo {client_label} client error: {error}"),
@@ -401,7 +406,7 @@ pub fn run_daemon_control_loop(
                         detail: source.to_string(),
                     })?;
             }
-            Ok(None) => thread::sleep(DAEMON_ACCEPT_IDLE_INTERVAL),
+            Ok(None) => {}
             Err(source) => {
                 return Err(DaemonError::Network {
                     address: bind_address.clone(),
@@ -411,6 +416,10 @@ pub fn run_daemon_control_loop(
         }
     }
     Ok(())
+}
+
+fn wake_daemon_control_accept(address: &str) {
+    let _ = sinomo_network::DaemonControlStream::connect(address);
 }
 
 pub fn handle_daemon_connection(
@@ -3702,7 +3711,8 @@ mod tests {
         let status_result =
             send_test_status_request(&data_dir, &address, Duration::from_millis(500));
         drop(idle_probe);
-        let _ = send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3));
+        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
+            .expect("shutdown request");
         daemon
             .join()
             .expect("daemon thread")

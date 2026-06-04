@@ -10,8 +10,8 @@ use sinomo_kv::cluster_member_key;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::SystemTime;
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
@@ -19,6 +19,10 @@ pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES: u64 = 1024 * 1024;
 const MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLUSTER_KV_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(30);
+const MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES: usize = 128;
+const PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL: Duration = Duration::from_secs(60);
+const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
@@ -26,6 +30,17 @@ static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
     Mutex<HashMap<PathBuf, Vec<ClusterConnectivityRecord>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLUSTER_KV_WATCH_NOTIFIERS: LazyLock<(Mutex<HashMap<PathBuf, u64>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<
+    Mutex<HashMap<SocketAddr, PublicEndpointReachabilityCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone, Debug)]
+struct PublicEndpointReachabilityCacheEntry {
+    checked_at: Instant,
+    reachable: bool,
+}
 
 /// Per-path record of the last content `write_object_file` wrote (or confirmed
 /// already on disk), used to skip the read-back + compare when nothing changed.
@@ -109,6 +124,7 @@ pub struct ClusterPaths {
     pub kv_snapshot: PathBuf,
     pub kv_raft: PathBuf,
     pub kv_watches: PathBuf,
+    pub kv_watches_lock: PathBuf,
     pub kv_watch_events: PathBuf,
     pub kv_watch_events_log: PathBuf,
 }
@@ -123,6 +139,7 @@ impl ClusterPaths {
             kv_snapshot: root.join("kv-snapshot.sobj"),
             kv_raft: root.join("kv-raft"),
             kv_watches: root.join("watches"),
+            kv_watches_lock: root.join("watches.lock"),
             kv_watch_events: root.join("watch-events.sobj"),
             kv_watch_events_log: root.join("watch-events.sobjlog"),
             root,
@@ -134,6 +151,70 @@ impl ClusterPaths {
             path: self.root.display().to_string(),
             detail: source.to_string(),
         })
+    }
+}
+
+fn cluster_kv_watch_notify_key(paths: &ClusterPaths) -> PathBuf {
+    paths.root.clone()
+}
+
+fn cluster_kv_watch_generation(paths: &ClusterPaths) -> u64 {
+    let (generations, _) = &*CLUSTER_KV_WATCH_NOTIFIERS;
+    generations
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .unwrap_or(0)
+}
+
+fn notify_cluster_kv_watchers(paths: &ClusterPaths) {
+    let (generations, changed) = &*CLUSTER_KV_WATCH_NOTIFIERS;
+    let Ok(mut guard) = generations.lock() else {
+        return;
+    };
+    let key = cluster_kv_watch_notify_key(paths);
+    if !guard.contains_key(&key)
+        && guard.len() >= MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES
+        && let Some(oldest) = guard.keys().next().cloned()
+    {
+        guard.remove(&oldest);
+    }
+    let generation = guard.entry(key).or_insert(0);
+    *generation = generation.saturating_add(1);
+    changed.notify_all();
+}
+
+fn wait_for_cluster_kv_watch_change(
+    paths: &ClusterPaths,
+    observed_generation: u64,
+    timeout: Duration,
+) -> bool {
+    if timeout.is_zero() {
+        return false;
+    }
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    let key = cluster_kv_watch_notify_key(paths);
+    let (generations, changed) = &*CLUSTER_KV_WATCH_NOTIFIERS;
+    let Ok(mut guard) = generations.lock() else {
+        return false;
+    };
+    loop {
+        if guard.get(&key).copied().unwrap_or(0) != observed_generation {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let Ok((next_guard, wait)) = changed.wait_timeout(guard, remaining) else {
+            return false;
+        };
+        guard = next_guard;
+        if wait.timed_out() {
+            return guard.get(&key).copied().unwrap_or(0) != observed_generation;
+        }
     }
 }
 
@@ -257,6 +338,8 @@ pub struct ClusterKvWatchRegistration {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterKvWatchDrainRequest {
     pub watch_id: WatchId,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wait_timeout_millis: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -265,6 +348,17 @@ pub struct ClusterKvWatchDrainResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<KvEvent>,
     pub next_revision: KvRevision,
+}
+
+impl ClusterKvWatchDrainRequest {
+    fn wait_timeout(&self) -> Duration {
+        let max_millis = MAX_CLUSTER_KV_WATCH_DRAIN_WAIT.as_millis() as u64;
+        Duration::from_millis(self.wait_timeout_millis.min(max_millis))
+    }
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1083,7 +1177,9 @@ pub fn write_cluster_kv_snapshot(
     let snapshot = compact_cluster_kv_snapshot_events(snapshot);
     cluster_kv_local_cache(paths)
         .write_snapshot(&snapshot)
-        .map_err(Into::into)
+        .map_err(NetworkError::from)?;
+    notify_cluster_kv_watchers(paths);
+    Ok(())
 }
 
 pub fn write_cluster_kv_snapshot_if_changed(
@@ -1105,6 +1201,9 @@ pub fn write_cluster_kv_snapshot_if_changed(
         } else {
             observer.on_kv_snapshot_skipped_write();
         }
+    }
+    if wrote {
+        notify_cluster_kv_watchers(paths);
     }
     Ok(wrote)
 }
@@ -1220,9 +1319,13 @@ pub fn restore_cluster_raft_from_snapshot_if_newer(
     node_id: &NodeId,
     snapshot: KvSnapshot,
 ) -> Result<bool, NetworkError> {
-    cluster_kv_local_cache(paths)
+    let restored = cluster_kv_local_cache(paths)
         .restore_raft_from_snapshot_if_newer(node_id.clone(), snapshot)
-        .map_err(Into::into)
+        .map_err(NetworkError::from)?;
+    if restored {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(restored)
 }
 
 pub async fn open_cluster_raft_kv_node_async(
@@ -1249,12 +1352,17 @@ pub fn append_cluster_raft_command_with_response(
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
     let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
+    let before_revision = node.store().revision();
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
     node.commit_to(entry.index)?;
     let txn_response = node.txn_response_at(entry.index).cloned();
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
-    mirror_cluster_raft_snapshot(paths, &node).map(|snapshot| (snapshot, txn_response))
+    let snapshot = mirror_cluster_raft_snapshot(paths, &node)?;
+    if snapshot.revision > before_revision {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok((snapshot, txn_response))
 }
 
 pub fn append_cluster_raft_command_uncommitted(
@@ -1306,13 +1414,16 @@ pub fn commit_cluster_raft_index_with_events(
     let txn_response = node.txn_response_at(commit_index).cloned();
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     let snapshot = node.store().snapshot();
-    let events = snapshot
+    let events: Vec<KvEvent> = snapshot
         .events
         .iter()
         .filter(|event| event.revision > before_revision)
         .cloned()
         .collect();
     write_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+    if !events.is_empty() {
+        notify_cluster_kv_watchers(paths);
+    }
     Ok(ClusterRaftCommitResult {
         snapshot,
         txn_response,
@@ -1350,6 +1461,7 @@ pub fn apply_cluster_raft_append(
     compact_cluster_raft_node_if_needed(paths, &mut node)?;
     if snapshot_restored || node.store().revision() != before_revision {
         mirror_cluster_raft_snapshot(paths, &node)?;
+        notify_cluster_kv_watchers(paths);
     }
     Ok(response)
 }
@@ -1500,22 +1612,61 @@ pub fn create_cluster_kv_watch(
         path: paths.kv_watches.display().to_string(),
         detail: source.to_string(),
     })?;
+    let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
     prune_compacted_cluster_kv_watches(paths, snapshot.compacted_revision)?;
-    let watch_id = next_cluster_kv_watch_id(paths)?;
-    let registration = ClusterKvWatchRegistration {
-        watch_id,
-        prefix: request.prefix,
-        next_revision: request.start_revision,
-    };
-    write_object_file(&cluster_kv_watch_path(paths, watch_id), &registration)?;
-    Ok(registration)
+    let mut watch_id = next_cluster_kv_watch_id(paths)?;
+    loop {
+        let registration = ClusterKvWatchRegistration {
+            watch_id,
+            prefix: request.prefix.clone(),
+            next_revision: request.start_revision,
+        };
+        if write_object_file_create_new(&cluster_kv_watch_path(paths, watch_id), &registration)? {
+            return Ok(registration);
+        }
+        if watch_id.0 == u64::MAX {
+            return Err(NetworkError::Serialization {
+                detail: "cluster kv watch id space exhausted".to_string(),
+            });
+        }
+        watch_id = WatchId(watch_id.0.saturating_add(1).max(1));
+    }
 }
 
 pub fn drain_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchDrainRequest,
 ) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
-    let watch_path = cluster_kv_watch_path(paths, request.watch_id);
+    let wait_timeout = request.wait_timeout();
+    let mut response = drain_cluster_kv_watch_once(paths, request.watch_id)?;
+    if !response.events.is_empty() || wait_timeout.is_zero() {
+        return Ok(response);
+    }
+
+    let Some(deadline) = Instant::now().checked_add(wait_timeout) else {
+        return Ok(response);
+    };
+    loop {
+        let observed_generation = cluster_kv_watch_generation(paths);
+        response = drain_cluster_kv_watch_once(paths, request.watch_id)?;
+        if !response.events.is_empty() {
+            return Ok(response);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(response);
+        }
+        if !wait_for_cluster_kv_watch_change(paths, observed_generation, remaining) {
+            return drain_cluster_kv_watch_once(paths, request.watch_id);
+        }
+    }
+}
+
+fn drain_cluster_kv_watch_once(
+    paths: &ClusterPaths,
+    watch_id: WatchId,
+) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
+    let watch_path = cluster_kv_watch_path(paths, watch_id);
     let mut registration: ClusterKvWatchRegistration = read_object_file(&watch_path)?;
     let snapshot = read_cluster_kv_store(paths)?.snapshot();
     if registration.next_revision <= snapshot.compacted_revision
@@ -1615,6 +1766,7 @@ pub fn append_cluster_kv_watch_events(
         write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
         truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
     }
+    notify_cluster_kv_watchers(paths);
     Ok(stored)
 }
 
@@ -1840,6 +1992,28 @@ fn compact_cluster_kv_watch_events(mut events: Vec<KvEvent>) -> Vec<KvEvent> {
 
 fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
     paths.kv_watches.join(format!("watch-{}.sobj", watch_id.0))
+}
+
+fn lock_cluster_kv_watch_allocator(paths: &ClusterPaths) -> Result<fs::File, NetworkError> {
+    fs::create_dir_all(&paths.root).map_err(|source| NetworkError::StorageIo {
+        path: paths.root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&paths.kv_watches_lock)
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watches_lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.lock_exclusive()
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watches_lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(file)
 }
 
 fn remove_cluster_kv_watch_file(path: &PathBuf) {
@@ -3279,8 +3453,55 @@ const PUBLIC_ENDPOINT_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 /// NAT'd node with no forward) would publish an unreachable address that every peer then
 /// wastes connection attempts on. Manual endpoint configuration is future work.
 fn public_endpoint_is_reachable(ip: IpAddr, port: u16) -> bool {
+    public_endpoint_is_reachable_with_probe(ip, port, |address| {
+        std::net::TcpStream::connect_timeout(&address, PUBLIC_ENDPOINT_PROBE_TIMEOUT).is_ok()
+    })
+}
+
+pub(crate) fn public_endpoint_is_reachable_with_probe(
+    ip: IpAddr,
+    port: u16,
+    probe: impl FnOnce(SocketAddr) -> bool,
+) -> bool {
     let address = SocketAddr::new(ip, port);
-    std::net::TcpStream::connect_timeout(&address, PUBLIC_ENDPOINT_PROBE_TIMEOUT).is_ok()
+    let now = Instant::now();
+    if let Ok(cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock()
+        && let Some(entry) = cache.get(&address)
+        && now.duration_since(entry.checked_at) < PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL
+    {
+        return entry.reachable;
+    }
+    let reachable = probe(address);
+    if let Ok(mut cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock() {
+        if cache.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES {
+            cache.retain(|_, entry| {
+                now.duration_since(entry.checked_at) < PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL
+            });
+        }
+        if cache.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.checked_at)
+                .map(|(address, _)| *address)
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(
+            address,
+            PublicEndpointReachabilityCacheEntry {
+                checked_at: now,
+                reachable,
+            },
+        );
+    }
+    reachable
+}
+
+#[cfg(test)]
+pub(crate) fn clear_public_endpoint_reachability_cache() {
+    if let Ok(mut cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock() {
+        cache.clear();
+    }
 }
 
 pub fn daemon_advertised_endpoints_from_addresses_with_public_discovery(
@@ -4461,6 +4682,54 @@ pub(crate) fn write_object_file<T: Serialize>(
         observer.on_disk_write(desired.len() as u64);
     }
     Ok(())
+}
+
+fn write_object_file_create_new<T: Serialize>(
+    path: &PathBuf,
+    value: &T,
+) -> Result<bool, NetworkError> {
+    let desired = SinomoObjectCodec::default().encode(value)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let mut file = match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(source) => {
+            return Err(NetworkError::StorageIo {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    file.write_all(&desired)
+        .map_err(|source| NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.sync_all().map_err(|source| NetworkError::StorageIo {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    sync_directory(parent)?;
+    let desired_hash = blake3::hash(&desired);
+    let modified = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    record_object_file_mark(path, desired_hash, desired.len() as u64, modified);
+    if let Some(observer) = io_observer() {
+        observer.on_object_file_actual_write();
+        observer.on_disk_write(desired.len() as u64);
+    }
+    Ok(true)
 }
 
 fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> Result<(), NetworkError> {

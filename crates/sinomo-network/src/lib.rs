@@ -53,6 +53,11 @@ pub fn register_storage_paths(
         StorageRing::R1,
         "cluster/watch-events.sobjlog",
     )?;
+    layout.register_file(sinomo_storage::StorageFileContract::binary(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watches.lock",
+    )?)?;
     layout.register_sinomo_object(
         "sinomo-network",
         StorageRing::R1,

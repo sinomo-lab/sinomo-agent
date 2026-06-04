@@ -12639,6 +12639,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         &DaemonPaths::with_root(peer_root.join("daemon")),
         sinomo_runtime::network::ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
         },
     )
     .expect("drain peer watch");
@@ -12652,6 +12653,7 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         &DaemonPaths::with_root(peer_root.join("daemon")),
         sinomo_runtime::network::ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
         },
     )
     .expect("drain peer watch again");

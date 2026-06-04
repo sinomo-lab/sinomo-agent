@@ -16,9 +16,9 @@ use sinomo_kv::{
 };
 use sinomo_node::NodeId;
 use std::io::Write;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[test]
 fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
@@ -1873,6 +1873,59 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
         endpoint.address == "198.18.0.76:21354"
             && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
     }));
+}
+
+static PUBLIC_ENDPOINT_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn public_ip_discovery_cache_reuses_recent_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let first = crate::lan::cached_default_public_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec!["203.0.113.10".parse().expect("ip")]
+    });
+    let second = crate::lan::cached_default_public_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec!["203.0.113.11".parse().expect("ip")]
+    });
+
+    assert_eq!(first, vec!["203.0.113.10".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        second, first,
+        "recent public IP discovery should be served from cache"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
+fn public_endpoint_reachability_cache_reuses_recent_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    clear_public_endpoint_reachability_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let ip = "203.0.113.12".parse().expect("ip");
+    let first = public_endpoint_is_reachable_with_probe(ip, 21353, |_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    });
+    let second = public_endpoint_is_reachable_with_probe(ip, 21353, |_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    });
+
+    assert!(first);
+    assert!(
+        second,
+        "recent public endpoint reachability should be served from cache"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    clear_public_endpoint_reachability_cache();
 }
 
 #[test]
@@ -4386,6 +4439,7 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
         &paths,
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
         },
     )
     .expect("drain watch");
@@ -4396,6 +4450,202 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
             .iter()
             .any(|event| event.key == "/watch/current")
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-wait-fanout-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/wait/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let (started_tx, started_rx) = mpsc::channel();
+    let drain_paths = paths.clone();
+    let handle = thread::spawn(move || {
+        started_tx.send(()).expect("signal drain start");
+        let started = Instant::now();
+        let drained = drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id: watch.watch_id,
+                wait_timeout_millis: 5_000,
+            },
+        )
+        .expect("wait drain");
+        (started.elapsed(), drained)
+    });
+    started_rx.recv().expect("drain thread started");
+    thread::sleep(Duration::from_millis(50));
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/wait/fanout".to_string(),
+        kind: KvEventKind::Put {
+            value: b"fanout".to_vec(),
+        },
+    };
+
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        .expect("append fanout event");
+    let (elapsed, drained) = handle.join().expect("wait drain thread");
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "waiting drain should be notified instead of timing out after {elapsed:?}"
+    );
+    assert_eq!(drained.events, vec![event]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-wait-raft-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_watch_wait_raft").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_watch_wait_raft").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "watch wait raft",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/wait/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let (started_tx, started_rx) = mpsc::channel();
+    let drain_paths = paths.clone();
+    let handle = thread::spawn(move || {
+        started_tx.send(()).expect("signal drain start");
+        let started = Instant::now();
+        let drained = drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id: watch.watch_id,
+                wait_timeout_millis: 5_000,
+            },
+        )
+        .expect("wait drain");
+        (started.elapsed(), drained)
+    });
+    started_rx.recv().expect("drain thread started");
+    thread::sleep(Duration::from_millis(50));
+
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/watch/wait/raft".to_string(),
+            value: b"raft".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("append local raft value");
+    let (elapsed, drained) = handle.join().expect("wait drain thread");
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "waiting drain should be notified by committed raft events after {elapsed:?}"
+    );
+    assert!(
+        drained
+            .events
+            .iter()
+            .any(|event| event.key == "/watch/wait/raft")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-create-concurrent-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let threads = 16;
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles = (0..threads)
+        .map(|index| {
+            let paths = paths.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                create_cluster_kv_watch(
+                    &paths,
+                    ClusterKvWatchPrefixRequest {
+                        prefix: format!("/watch/concurrent/{index}/"),
+                        start_revision: KvRevision(1),
+                    },
+                )
+                .expect("create concurrent watch")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut registrations = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("watch create thread"))
+        .collect::<Vec<_>>();
+    registrations.sort_by_key(|registration| registration.watch_id);
+    let mut unique_ids = registrations
+        .iter()
+        .map(|registration| registration.watch_id)
+        .collect::<Vec<_>>();
+    unique_ids.dedup();
+
+    assert_eq!(unique_ids.len(), threads);
+    assert!(
+        paths.kv_watches_lock.exists(),
+        "concurrent watch allocation should use a durable lock file"
+    );
+    for registration in registrations {
+        let watch_path = paths
+            .kv_watches
+            .join(format!("watch-{}.sobj", registration.watch_id.0));
+        let stored: ClusterKvWatchRegistration =
+            read_object_file(&watch_path).expect("read watch registration");
+        assert_eq!(stored, registration);
+    }
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -4437,6 +4687,7 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
         &paths,
         ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
         },
     )
     .expect_err("compacted watch");
