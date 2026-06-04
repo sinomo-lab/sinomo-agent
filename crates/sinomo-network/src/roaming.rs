@@ -618,29 +618,62 @@ pub(crate) async fn read_iroh_proxy_frame_async<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    use tokio::io::AsyncReadExt;
-
     let mut len_bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut len_bytes)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: format!("read iroh daemon {scope} frame length"),
-            detail: source.to_string(),
-        })?;
+    read_exact_iroh_proxy_frame_async(
+        reader,
+        &mut len_bytes,
+        format!("read iroh daemon {scope} frame length"),
+        "length",
+    )
+    .await?;
     let body_bytes = u32::from_be_bytes(len_bytes) as usize;
     let (mut frame, permit) = reserve_iroh_proxy_frame(len_bytes, body_bytes, budget)?;
-    reader
-        .read_exact(&mut frame[len_bytes.len()..])
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: format!("read iroh daemon {scope} frame body"),
-            detail: source.to_string(),
-        })?;
+    read_exact_iroh_proxy_frame_async(
+        reader,
+        &mut frame[len_bytes.len()..],
+        format!("read iroh daemon {scope} frame body"),
+        "body",
+    )
+    .await?;
     if let Some(observer) = crate::io_observer() {
         observer.on_net_recv(frame.len() as u64);
     }
     Ok((frame, permit))
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+async fn read_exact_iroh_proxy_frame_async<R>(
+    reader: &mut R,
+    buf: &mut [u8],
+    operation: String,
+    part: &'static str,
+) -> Result<(), NetworkError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let expected = buf.len();
+    let mut read = 0_usize;
+    while read < expected {
+        match reader.read(&mut buf[read..]).await {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation,
+                    detail: iroh_proxy_frame_eof_detail(part, read, expected),
+                });
+            }
+            Ok(n) => read = read.saturating_add(n),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation,
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -653,24 +686,66 @@ where
     R: std::io::Read,
 {
     let mut len_bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut len_bytes)
-        .map_err(|source| NetworkError::Io {
-            operation: format!("read iroh daemon {scope} frame length"),
-            detail: source.to_string(),
-        })?;
+    read_exact_iroh_proxy_frame_blocking(
+        reader,
+        &mut len_bytes,
+        format!("read iroh daemon {scope} frame length"),
+        "length",
+    )?;
     let body_bytes = u32::from_be_bytes(len_bytes) as usize;
     let (mut frame, permit) = reserve_iroh_proxy_frame(len_bytes, body_bytes, budget)?;
-    reader
-        .read_exact(&mut frame[len_bytes.len()..])
-        .map_err(|source| NetworkError::Io {
-            operation: format!("read iroh daemon {scope} frame body"),
-            detail: source.to_string(),
-        })?;
+    read_exact_iroh_proxy_frame_blocking(
+        reader,
+        &mut frame[len_bytes.len()..],
+        format!("read iroh daemon {scope} frame body"),
+        "body",
+    )?;
     if let Some(observer) = crate::io_observer() {
         observer.on_net_recv(frame.len() as u64);
     }
     Ok((frame, permit))
+}
+
+#[cfg(feature = "iroh-transport")]
+fn read_exact_iroh_proxy_frame_blocking<R>(
+    reader: &mut R,
+    buf: &mut [u8],
+    operation: String,
+    part: &'static str,
+) -> Result<(), NetworkError>
+where
+    R: std::io::Read,
+{
+    let expected = buf.len();
+    let mut read = 0_usize;
+    while read < expected {
+        match reader.read(&mut buf[read..]) {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation,
+                    detail: iroh_proxy_frame_eof_detail(part, read, expected),
+                });
+            }
+            Ok(n) => read = read.saturating_add(n),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation,
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+fn iroh_proxy_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
+    if read == 0 {
+        format!("peer closed before object frame {part} ({expected} bytes expected)")
+    } else {
+        format!("peer closed during object frame {part}: read {read} of {expected} bytes")
+    }
 }
 
 #[cfg(feature = "iroh-transport")]

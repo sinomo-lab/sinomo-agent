@@ -1196,6 +1196,28 @@ impl InProcessKvStore {
         })
     }
 
+    pub fn txn_response_if_selected_branch_empty(
+        &self,
+        txn: &KvTxn,
+    ) -> Result<Option<KvTxnResponse>, KvError> {
+        self.validate_txn_shape(txn)?;
+        validate_kv_txn_payload(txn)?;
+        let succeeded = txn.compares.iter().all(|compare| self.compare(compare));
+        let selected_branch_is_empty = if succeeded {
+            txn.success.is_empty()
+        } else {
+            txn.failure.is_empty()
+        };
+        if !selected_branch_is_empty {
+            return Ok(None);
+        }
+        Ok(Some(KvTxnResponse {
+            succeeded,
+            revision: self.revision,
+            responses: Vec::new(),
+        }))
+    }
+
     pub fn apply_command(&mut self, command: KvCommand) -> Result<KvRevision, KvError> {
         self.apply_command_with_response(command)
             .map(|(revision, _)| revision)
@@ -4176,6 +4198,59 @@ mod tests {
             b"old"
         );
         assert!(store.get("/config/b").is_none());
+    }
+
+    #[test]
+    fn txn_empty_selected_branch_response_is_read_only() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        let response = store
+            .txn_response_if_selected_branch_empty(&KvTxn {
+                compares: vec![KvCompare::Missing {
+                    key: "/config/a".to_string(),
+                }],
+                success: vec![KvOp::Put {
+                    key: "/config/a".to_string(),
+                    value: b"new".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            })
+            .expect("empty selected branch");
+
+        assert_eq!(
+            response,
+            Some(KvTxnResponse {
+                succeeded: false,
+                revision: revision_before,
+                responses: Vec::new(),
+            })
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(store.get("/config/a").expect("entry").value, b"old");
+
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_empty(&KvTxn {
+                    compares: vec![KvCompare::Exists {
+                        key: "/config/a".to_string(),
+                    }],
+                    success: vec![KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("mutating selected branch"),
+            None
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(store.get("/config/a").expect("entry").value, b"old");
     }
 
     #[test]

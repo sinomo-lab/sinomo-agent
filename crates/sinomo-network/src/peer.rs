@@ -831,7 +831,7 @@ impl<T: NetworkTransport> NetworkService<T> {
             if record.delivery.target_node_id != *self.transport.local_node_id()
                 && !self.registry().is_routable(&record.delivery.target_node_id)
             {
-                self.ledger.mark_for_retry(delivery_id)?;
+                self.ledger.mark_waiting_for_peer(delivery_id)?;
                 continue;
             }
 
@@ -888,11 +888,17 @@ impl<T: NetworkTransport> NetworkService<T> {
                     });
                 }
                 MeshMessageBody::Heartbeat(heartbeat) => {
+                    let was_routable = self.registry().is_routable(&heartbeat.node_id);
                     let status = self
                         .router
                         .registry_mut()
                         .record_heartbeat(&heartbeat.node_id, heartbeat.tick)?;
-                    let requeued = self.ledger.requeue_target(&heartbeat.node_id);
+                    let requeued = if was_routable {
+                        self.ledger.requeue_target(&heartbeat.node_id)
+                    } else {
+                        self.ledger
+                            .requeue_target_after_recovery(&heartbeat.node_id)
+                    };
                     outcomes.push(InboundOutcome::HeartbeatReceived {
                         node_id: heartbeat.node_id,
                         status,
@@ -918,6 +924,23 @@ impl<T: NetworkTransport> NetworkService<T> {
         };
         let frame = self.heartbeat_frame(target_node_id.clone(), heartbeat);
         self.transport.send(target_node_id, frame)
+    }
+
+    fn record_missed_heartbeat(
+        &mut self,
+        target_node_id: &NodeId,
+        policy: HeartbeatPolicy,
+    ) -> Result<(PeerStatus, usize), NetworkError> {
+        let status = self
+            .router
+            .registry_mut()
+            .record_missed_heartbeat(target_node_id, policy)?;
+        let waiting = if status.can_route_reactive() {
+            0
+        } else {
+            self.ledger.mark_target_waiting_for_peer(target_node_id)
+        };
+        Ok((status, waiting))
     }
 
     fn event_frame(&mut self, record: &DeliveryRecord) -> NetworkFrame {
@@ -1064,6 +1087,19 @@ where
     ) -> Result<(), NetworkError> {
         self.run_job(move |service, _store| service.send_heartbeat(&target_node_id, tick))
             .await?
+    }
+
+    /// Record a missed heartbeat for `target_node_id` and park its pending deliveries
+    /// when the peer crosses into a non-routable state.
+    pub async fn record_missed_heartbeat(
+        &self,
+        target_node_id: NodeId,
+        policy: HeartbeatPolicy,
+    ) -> Result<(PeerStatus, usize), NetworkError> {
+        self.run_job(move |service, _store| {
+            service.record_missed_heartbeat(&target_node_id, policy)
+        })
+        .await?
     }
 
     /// Snapshot the delivery-ledger records.
@@ -1223,6 +1259,20 @@ impl DeliveryLedger {
         Ok(())
     }
 
+    pub fn mark_waiting_for_peer(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+    ) -> Result<(), NetworkError> {
+        let record = self
+            .records
+            .get_mut(&delivery_id)
+            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+        if !record.delivery.status.is_terminal() {
+            record.delivery.status = DeliveryStatus::WaitingForPeer;
+        }
+        Ok(())
+    }
+
     pub fn mark_attempt_failed(
         &mut self,
         delivery_id: RouteDeliveryId,
@@ -1241,16 +1291,49 @@ impl DeliveryLedger {
     }
 
     pub fn requeue_target(&mut self, target_node_id: &NodeId) -> usize {
+        self.requeue_target_matching(target_node_id, false)
+    }
+
+    pub fn requeue_target_after_recovery(&mut self, target_node_id: &NodeId) -> usize {
+        self.requeue_target_matching(target_node_id, true)
+    }
+
+    fn requeue_target_matching(
+        &mut self,
+        target_node_id: &NodeId,
+        include_in_flight: bool,
+    ) -> usize {
         let mut requeued = 0;
         for record in self.records.values_mut() {
-            if &record.delivery.target_node_id == target_node_id
-                && record.delivery.status != DeliveryStatus::Delivered
-            {
+            if &record.delivery.target_node_id != target_node_id {
+                continue;
+            }
+            let should_requeue = matches!(
+                record.delivery.status,
+                DeliveryStatus::Failed | DeliveryStatus::WaitingForPeer
+            ) || (include_in_flight
+                && record.delivery.status == DeliveryStatus::Sent);
+            if should_requeue {
                 record.delivery.status = DeliveryStatus::Retrying;
+                record.attempts = 0;
                 requeued += 1;
             }
         }
         requeued
+    }
+
+    pub fn mark_target_waiting_for_peer(&mut self, target_node_id: &NodeId) -> usize {
+        let mut waiting = 0;
+        for record in self.records.values_mut() {
+            if &record.delivery.target_node_id == target_node_id
+                && !record.delivery.status.is_terminal()
+                && record.delivery.status != DeliveryStatus::WaitingForPeer
+            {
+                record.delivery.status = DeliveryStatus::WaitingForPeer;
+                waiting += 1;
+            }
+        }
+        waiting
     }
 
     pub fn ack(
@@ -1327,6 +1410,7 @@ pub enum DeliveryStatus {
     Queued,
     Sent,
     Retrying,
+    WaitingForPeer,
     Delivered,
     Failed,
 }

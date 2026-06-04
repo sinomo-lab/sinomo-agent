@@ -885,6 +885,30 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
             }
         ));
         assert_eq!(budget.in_flight_bytes(), 0);
+
+        let budget = crate::roaming::IrohProxyByteBudget::new(16);
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        writer
+            .write_all(&4_u32.to_be_bytes())
+            .await
+            .expect("write length");
+        writer.write_all(&[1, 2]).await.expect("write partial body");
+        drop(writer);
+        let error = crate::roaming::read_iroh_proxy_frame_async(&mut reader, &budget, "test")
+            .await
+            .expect_err("partial body");
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "read iroh daemon test frame body".to_string(),
+                detail: "peer closed during object frame body: read 2 of 4 bytes".to_string(),
+            }
+        );
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "aborted frame reads must release the reserved proxy budget"
+        );
     });
 }
 
@@ -2457,6 +2481,76 @@ fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
     assert_eq!(
         wal_len_before, wal_len_after,
         "empty transactions should not consume WAL writes"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-empty-selected-branch-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_empty_selected_branch_no_append").expect("node");
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed value");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::Txn(KvTxn {
+            compares: vec![KvCompare::Missing {
+                key: "/committed".to_string(),
+            }],
+            success: vec![KvOp::Put {
+                key: "/committed".to_string(),
+                value: b"replacement".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("failed compare with empty failure branch");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(
+        txn_response,
+        Some(KvTxnResponse {
+            succeeded: false,
+            revision: snapshot.revision,
+            responses: Vec::new(),
+        })
+    );
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "CAS no-ops should not consume WAL writes"
+    );
+    assert_eq!(
+        no_op_snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == "/committed")
+            .expect("committed entry")
+            .value,
+        b"committed"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -7986,6 +8080,66 @@ fn delivery_ledger_prunes_terminal_records_under_pressure() {
 }
 
 #[test]
+fn delivery_ledger_waits_for_offline_peer_until_recovery() {
+    let node_a = NodeId::from_legacy_named("node_ledger_wait_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ledger_wait_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_ledger_wait_peer", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    assert_eq!(ledger.ready_delivery_ids(), vec![RouteDeliveryId(1)]);
+
+    ledger
+        .mark_waiting_for_peer(RouteDeliveryId(1))
+        .expect("wait for peer");
+    assert!(
+        ledger.ready_delivery_ids().is_empty(),
+        "offline peers should not stay in the ready retry set"
+    );
+
+    assert_eq!(ledger.requeue_target(&node_b), 1);
+    let record = ledger.record(&RouteDeliveryId(1)).expect("record");
+    assert_eq!(record.delivery.status, DeliveryStatus::Retrying);
+    assert_eq!(record.attempts, 0);
+    assert_eq!(ledger.ready_delivery_ids(), vec![RouteDeliveryId(1)]);
+}
+
+#[test]
+fn delivery_ledger_only_requeues_sent_records_on_recovery() {
+    let node_a = NodeId::from_legacy_named("node_ledger_sent_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ledger_sent_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_ledger_sent_recovery", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger.mark_sent(RouteDeliveryId(1)).expect("mark sent");
+    assert_eq!(ledger.requeue_target(&node_b), 0);
+    assert!(ledger.ready_delivery_ids().is_empty());
+
+    assert_eq!(ledger.requeue_target_after_recovery(&node_b), 1);
+    let record = ledger.record(&RouteDeliveryId(1)).expect("record");
+    assert_eq!(record.delivery.status, DeliveryStatus::Retrying);
+    assert_eq!(record.attempts, 0);
+    assert_eq!(ledger.ready_delivery_ids(), vec![RouteDeliveryId(1)]);
+}
+
+#[test]
 fn heartbeat_marks_peer_healthy_and_updates_node_health() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let mut registry = PeerRegistry::new();
@@ -8173,9 +8327,226 @@ async fn direct_target_offline_buffers_instead_of_sending() {
     assert_eq!(transport_b.drain_incoming().expect("drain").len(), 0);
     assert_eq!(
         delivery_status(&service, delivery_id).await,
-        DeliveryStatus::Retrying
+        DeliveryStatus::WaitingForPeer
+    );
+    assert_eq!(service.pump_outbound().await.expect("still waiting"), 0);
+    assert_eq!(
+        delivery_status(&service, delivery_id).await,
+        DeliveryStatus::WaitingForPeer
     );
     service.shutdown().await;
+}
+
+#[tokio::test]
+async fn ordinary_heartbeat_does_not_requeue_in_flight_sent_delivery() {
+    let node_a = NodeId::from_legacy_named("node_sent_heartbeat_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_sent_heartbeat_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_sent_heartbeat_a"));
+    registry.register_node(node("node_sent_heartbeat_b"));
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_sent_heartbeat", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store);
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+    service_b
+        .send_heartbeat(node_a.clone(), 1)
+        .await
+        .expect("send heartbeat");
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("process heartbeat");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::HeartbeatReceived { requeued: 0, .. }]
+    ));
+    assert_eq!(service_a.pump_outbound().await.expect("no duplicate"), 0);
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+
+    service_a.shutdown().await;
+    service_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn heartbeat_recovery_requeues_delivery_waiting_for_peer() {
+    let node_a = NodeId::from_legacy_named("node_waiting_recovery_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_waiting_recovery_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_waiting_recovery_a"));
+    registry.register_node(node("node_waiting_recovery_b"));
+    for _ in 0..3 {
+        registry
+            .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+            .expect("miss heartbeat");
+    }
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_waiting_recovery", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("buffer offline"), 0);
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::WaitingForPeer
+    );
+
+    let transport_b = network.add_node(node_b.clone());
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    service_b
+        .send_heartbeat(node_a.clone(), 42)
+        .await
+        .expect("send heartbeat");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("process heartbeat");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::HeartbeatReceived {
+            status: PeerStatus::Healthy,
+            requeued: 1,
+            ..
+        }]
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Retrying
+    );
+    assert_eq!(service_a.pump_outbound().await.expect("send recovered"), 1);
+    service_a.shutdown().await;
+    service_b
+        .process_incoming()
+        .await
+        .expect("receive recovered event");
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
+}
+
+#[tokio::test]
+async fn missed_heartbeat_parks_sent_delivery_until_recovery() {
+    let node_a = NodeId::from_legacy_named("node_sent_recovery_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_sent_recovery_b").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_sent_recovery_a"));
+    registry.register_node(node("node_sent_recovery_b"));
+    let mut store = InMemoryEventStore::new();
+    let event = fixture_event("evt_sent_recovery", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store);
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+    assert_eq!(
+        service_a
+            .record_missed_heartbeat(node_b.clone(), HeartbeatPolicy::default())
+            .await
+            .expect("first missed heartbeat"),
+        (PeerStatus::Degraded, 0)
+    );
+    assert_eq!(
+        service_a
+            .record_missed_heartbeat(node_b.clone(), HeartbeatPolicy::default())
+            .await
+            .expect("second missed heartbeat"),
+        (PeerStatus::Suspect, 1)
+    );
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::WaitingForPeer
+    );
+    assert_eq!(service_a.pump_outbound().await.expect("parked"), 0);
+
+    service_b
+        .send_heartbeat(node_a.clone(), 7)
+        .await
+        .expect("send recovery heartbeat");
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("process recovery heartbeat");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::HeartbeatReceived {
+            status: PeerStatus::Healthy,
+            requeued: 1,
+            ..
+        }]
+    ));
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Retrying
+    );
+    assert_eq!(service_a.pump_outbound().await.expect("resend"), 1);
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("receive original and resent events");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, InboundOutcome::EventAccepted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, InboundOutcome::EventDuplicate { .. }))
+            .count(),
+        1
+    );
+    service_a.process_incoming().await.expect("process acks");
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Delivered
+    );
+    service_a.shutdown().await;
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
 }
 
 #[test]

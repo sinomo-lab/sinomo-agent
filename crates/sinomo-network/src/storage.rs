@@ -1706,20 +1706,10 @@ pub fn append_cluster_raft_command_with_response(
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
     let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
-    if let KvCommand::Txn(txn) = &command
-        && txn.compares.is_empty()
-        && txn.success.is_empty()
-        && txn.failure.is_empty()
-    {
-        let snapshot = node.store().snapshot();
-        return Ok((
-            snapshot.clone(),
-            Some(KvTxnResponse {
-                succeeded: true,
-                revision: snapshot.revision,
-                responses: Vec::new(),
-            }),
-        ));
+    if let KvCommand::Txn(txn) = &command {
+        if let Some(response) = node.store().txn_response_if_selected_branch_empty(txn)? {
+            return Ok((node.store().snapshot(), Some(response)));
+        }
     }
     let before_revision = node.store().revision();
     let term = node.hard_state().current_term.max(1);
