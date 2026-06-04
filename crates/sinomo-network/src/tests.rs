@@ -4102,6 +4102,176 @@ fn cluster_module_rollout_reconciliation_syncs_to_kv() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn stable_rollout_and_certificate_syncs_do_not_append_raft_log_entries() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-stable-rollout-put-noop-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_stable_rollout_put_noop").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_stable_rollout_put_noop").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "stable rollout put noop",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
+
+    let certificate = certificate(
+        cluster_id.clone(),
+        node_id.clone(),
+        node_id.clone(),
+        "stable-public-key",
+        now + time::Duration::seconds(86_400),
+    );
+    let rollout_desired = ClusterRolloutDesiredRecord {
+        cluster_id: cluster_id.clone(),
+        state: "active".to_string(),
+        source: Some("git".to_string()),
+        mode: Some("canary".to_string()),
+        source_head: Some("abc123".to_string()),
+        source_bundle: None,
+        remote_repo: None,
+        host: Some("127.0.0.1".to_string()),
+        port: Some(21353),
+        shadow_port: Some(21354),
+        requested_at: Some("2026-06-04T00:00:00Z".to_string()),
+        updated_at: now,
+    };
+    let rollout_status = ClusterNodeRolloutStatus {
+        status: "running".to_string(),
+        mode: Some("canary".to_string()),
+        detail: Some("stable repeat publish".to_string()),
+        phase: Some("stage".to_string()),
+        progress_current: Some(1),
+        progress_total: Some(2),
+        progress_message: Some("staged".to_string()),
+        source: Some("git".to_string()),
+        requested_at: Some("2026-06-04T00:00:00Z".to_string()),
+        staged_at: Some("2026-06-04T00:01:00Z".to_string()),
+        updated_at: Some("2026-06-04T00:02:00Z".to_string()),
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+
+    let module_id =
+        sinomo_core::Id::from_legacy_named("module.trigger.stable_rollout").expect("module");
+    let rollout_plan_id =
+        sinomo_core::Id::from_legacy_named("rollout_stable_repeat").expect("rollout");
+    let candidate_artifact_id =
+        sinomo_core::Id::from_legacy_named("artifact_stable_candidate").expect("candidate");
+    let active_artifact_id =
+        sinomo_core::Id::from_legacy_named("artifact_stable_active").expect("active");
+    let release_id = sinomo_core::Id::from_legacy_named("release_stable_repeat").expect("release");
+    let module_status = ClusterModuleRolloutStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        rollout_plan_id: rollout_plan_id.clone(),
+        module_id: module_id.clone(),
+        artifact_id: candidate_artifact_id.clone(),
+        stage: "canary".to_string(),
+        current_weight_bps: 500,
+        active_artifact_id: active_artifact_id.clone(),
+        previous_artifact_id: None,
+        candidate_artifact_id: Some(candidate_artifact_id.clone()),
+        shadow_artifact_id: None,
+        hot_swap_state: "active-candidate".to_string(),
+        telemetry_kind: Some("module.invocation.decision".to_string()),
+        telemetry_last_consumed_sequence: Some(sinomo_events::EventSequence(42)),
+        last_transition_record_id: Some(
+            sinomo_core::Id::from_legacy_named("transition_stable_repeat").expect("transition"),
+        ),
+        updated_at: now,
+    };
+    let rollout_plan = RolloutPlan {
+        rollout_plan_id: rollout_plan_id.clone(),
+        artifact_id: candidate_artifact_id.clone(),
+        module_id: module_id.clone(),
+        target_ring: TrustRing::R3SandboxedModule,
+        strategy: RolloutStrategy::Canary,
+        target_nodes: vec![node_id.clone()],
+        initial_weight_bps: 500,
+        promotion_steps_bps: vec![1_000, 5_000],
+        rollback_policy: RollbackPolicy::default(),
+    };
+    let module_desired = ClusterModuleRolloutDesiredRecord {
+        cluster_id: cluster_id.clone(),
+        state: "active".to_string(),
+        rollout_plan,
+        requested_by_node_id: node_id.clone(),
+        release_id: Some(release_id.clone()),
+        release_material_hash: Some("blake3:stable-repeat".to_string()),
+        evidence_refs: vec!["registry://artifact-evidence/stable-repeat".to_string()],
+        requested_at: Some("2026-06-04T00:00:00Z".to_string()),
+        updated_at: now,
+    };
+    let reconciliation = ClusterModuleRolloutReconciliationRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        rollout_plan_id: rollout_plan_id.clone(),
+        module_id: module_id.clone(),
+        artifact_id: candidate_artifact_id,
+        state: "ready".to_string(),
+        reason: "candidate material verified".to_string(),
+        release_id: Some(release_id),
+        release_material_hash: Some("blake3:stable-repeat".to_string()),
+        local_runtime_stage: Some("loaded".to_string()),
+        updated_at: now,
+    };
+
+    sync_cluster_certificate_to_kv(&paths, &certificate).expect("sync certificate");
+    sync_cluster_rollout_desired_to_kv(&paths, &rollout_desired).expect("sync rollout desired");
+    sync_cluster_rollout_node_to_kv(&paths, &rollout_status, &node_id).expect("sync rollout node");
+    sync_cluster_module_rollout_node_to_kv(&paths, &module_status)
+        .expect("sync module rollout status");
+    sync_cluster_module_rollout_desired_to_kv(&paths, &module_desired)
+        .expect("sync module rollout desired");
+    sync_cluster_module_rollout_reconciliation_to_kv(&paths, &reconciliation)
+        .expect("sync module rollout reconciliation");
+
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_after_first = std::fs::metadata(&wal_path)
+        .expect("wal after first publishes")
+        .len();
+
+    sync_cluster_certificate_to_kv(&paths, &certificate).expect("repeat certificate");
+    sync_cluster_rollout_desired_to_kv(&paths, &rollout_desired).expect("repeat rollout desired");
+    sync_cluster_rollout_node_to_kv(&paths, &rollout_status, &node_id)
+        .expect("repeat rollout node");
+    sync_cluster_module_rollout_node_to_kv(&paths, &module_status)
+        .expect("repeat module rollout status");
+    sync_cluster_module_rollout_desired_to_kv(&paths, &module_desired)
+        .expect("repeat module rollout desired");
+    sync_cluster_module_rollout_reconciliation_to_kv(&paths, &reconciliation)
+        .expect("repeat module rollout reconciliation");
+
+    assert_eq!(
+        wal_len_after_first,
+        std::fs::metadata(&wal_path)
+            .expect("wal after stable repeats")
+            .len(),
+        "stable rollout and certificate syncs should not append no-op raft entries"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn sobj_reported_len(bytes: &[u8]) -> usize {
     assert!(bytes.len() >= 12);
     assert_eq!(&bytes[..4], b"SOBJ");
@@ -4847,6 +5017,13 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         .expect("watch event log metadata")
         .len();
 
+    assert!(
+        crate::storage::cached_cluster_kv_watch_events_contain_all(
+            &paths,
+            std::slice::from_ref(&event)
+        ),
+        "first append should seed the cache used for duplicate suppression"
+    );
     assert_eq!(
         append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
             .expect("duplicate watch event"),

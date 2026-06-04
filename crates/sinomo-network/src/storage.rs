@@ -2154,6 +2154,9 @@ pub fn append_cluster_kv_watch_events(
     if incoming.is_empty() {
         return Ok(0);
     }
+    if cached_cluster_kv_watch_events_contain_all(paths, incoming) {
+        return Ok(0);
+    }
     let mut log_file = open_cluster_kv_watch_event_log_for_append(paths)?;
     log_file
         .lock_exclusive()
@@ -2208,6 +2211,21 @@ pub fn append_cluster_kv_watch_events(
     record_current_cluster_kv_watch_event_cache(paths, retained);
     notify_cluster_kv_watchers(paths);
     Ok(appended.len())
+}
+
+pub(crate) fn cached_cluster_kv_watch_events_contain_all(
+    paths: &ClusterPaths,
+    incoming: &[KvEvent],
+) -> bool {
+    let Some((checkpoint, log)) = cluster_kv_watch_event_cache_marks(paths) else {
+        return false;
+    };
+    let Some(events) = cached_cluster_kv_watch_events(paths, checkpoint, log) else {
+        return false;
+    };
+    incoming
+        .iter()
+        .all(|event| cluster_kv_events_contain(&events, event))
 }
 
 pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
@@ -2654,18 +2672,8 @@ fn prune_cluster_kv_watches(
             continue;
         };
         let path = entry.path();
-        match read_object_file::<ClusterKvWatchRegistration>(&path) {
-            Ok(registration) if registration.watch_id.0 != file_watch_id => {
-                eprintln!(
-                    "warning: removing mismatched cluster kv watch registration {}: file id {}, object id {}",
-                    path.display(),
-                    file_watch_id,
-                    registration.watch_id.0
-                );
-                if remove_cluster_kv_watch_file_if_exists(&path)? {
-                    result.removed = result.removed.saturating_add(1);
-                }
-            }
+        let watch_id = WatchId(file_watch_id);
+        match read_cluster_kv_watch_registration(&path, watch_id) {
             Ok(registration)
                 if compacted_revision != KvRevision::ZERO
                     && registration.next_revision <= compacted_revision =>
@@ -2676,6 +2684,11 @@ fn prune_cluster_kv_watches(
             }
             Ok(_) => {
                 result.retained = result.retained.saturating_add(1);
+            }
+            Err(NetworkError::Kv(KvError::UnknownWatch { watch_id: returned }))
+                if returned == watch_id =>
+            {
+                result.removed = result.removed.saturating_add(1);
             }
             Err(error) => {
                 eprintln!(
@@ -4964,11 +4977,26 @@ fn put_cluster_kv_value<T: Serialize + ?Sized>(
     key: String,
     value: &T,
 ) -> Result<KvSnapshot, NetworkError> {
-    append_cluster_raft_command(
-        paths,
-        node_id,
-        KvCommand::Op(KvOp::put_serde(key, value, None)?),
-    )
+    let op = KvOp::put_serde(key, value, None)?;
+    if cluster_kv_put_value_is_noop(paths, &op)? {
+        return read_cluster_kv_snapshot(paths);
+    }
+    append_cluster_raft_command(paths, node_id, KvCommand::Op(op))
+}
+
+fn cluster_kv_put_value_is_noop(paths: &ClusterPaths, op: &KvOp) -> Result<bool, NetworkError> {
+    let KvOp::Put {
+        key,
+        value,
+        lease_id,
+    } = op
+    else {
+        return Ok(false);
+    };
+    let Some(entry) = read_cluster_kv_entry(paths, key)? else {
+        return Ok(false);
+    };
+    Ok(entry.value.as_slice() == value.as_slice() && entry.lease_id == *lease_id)
 }
 
 impl From<&ClusterBootstrapState> for ClusterIdentityRecord {
