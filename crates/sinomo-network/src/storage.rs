@@ -7,7 +7,7 @@ use crate::{
 };
 use fs2::FileExt;
 use sinomo_kv::cluster_member_key;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -4527,7 +4527,8 @@ pub fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, NetworkError> {
-    let success = cluster_connectivity_full_sync_ops(paths, source_node_id, &records)?;
+    let success =
+        cluster_connectivity_full_sync_ops_from_cached_snapshot(paths, source_node_id, &records)?;
     if success.is_empty() {
         return read_cluster_kv_snapshot(paths);
     }
@@ -4663,12 +4664,42 @@ fn cluster_connectivity_sync_ops_from_snapshot(
     Ok(ops)
 }
 
-fn cluster_connectivity_full_sync_ops(
+pub fn cluster_connectivity_full_sync_ops(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
     let now = OffsetDateTime::now_utc();
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    cluster_connectivity_full_sync_ops_from_snapshot(
+        snapshot.as_ref(),
+        source_node_id,
+        records,
+        now,
+    )
+}
+
+fn cluster_connectivity_full_sync_ops_from_cached_snapshot(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<Vec<KvOp>, NetworkError> {
+    let now = OffsetDateTime::now_utc();
+    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    cluster_connectivity_full_sync_ops_from_snapshot(
+        snapshot.as_ref(),
+        source_node_id,
+        records,
+        now,
+    )
+}
+
+fn cluster_connectivity_full_sync_ops_from_snapshot(
+    snapshot: &KvSnapshot,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    now: OffsetDateTime,
+) -> Result<Vec<KvOp>, NetworkError> {
     let mut incoming = BTreeMap::new();
     for record in records {
         let key = cluster_connectivity_key(
@@ -4681,7 +4712,6 @@ fn cluster_connectivity_full_sync_ops(
 
     let mut existing = BTreeMap::new();
     let mut ops = Vec::new();
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     let prefix = cluster_connectivity_source_prefix(source_node_id);
     for entry in snapshot.prefix_entries(&prefix) {
         if !incoming.contains_key(&entry.key) {
@@ -4899,6 +4929,28 @@ pub fn cluster_member_publish_matches_kv(
 }
 
 pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, NetworkError> {
+    cluster_member_publish_txn_with_snapshot(None, members)
+}
+
+pub fn cluster_member_publish_txn_from_kv(
+    paths: &ClusterPaths,
+    members: &[ClusterMemberRecord],
+) -> Result<KvTxn, NetworkError> {
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    cluster_member_publish_txn_with_snapshot(Some(snapshot.as_ref()), members)
+}
+
+pub fn cluster_member_publish_txn_from_snapshot(
+    snapshot: &KvSnapshot,
+    members: &[ClusterMemberRecord],
+) -> Result<KvTxn, NetworkError> {
+    cluster_member_publish_txn_with_snapshot(Some(snapshot), members)
+}
+
+fn cluster_member_publish_txn_with_snapshot(
+    snapshot: Option<&KvSnapshot>,
+    members: &[ClusterMemberRecord],
+) -> Result<KvTxn, NetworkError> {
     let mut success = Vec::new();
     for member in members {
         let mut member = member.clone();
@@ -4913,15 +4965,19 @@ pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvT
             &ClusterCapabilityPolicyRecord::from(&member),
             None,
         )?);
-        success.push(KvOp::DeletePrefix {
-            prefix: cluster_endpoint_prefix(&member.node_id),
-        });
-        for endpoint in &member.endpoints {
-            success.push(KvOp::put_serde(
-                cluster_endpoint_key(&member.node_id, endpoint),
-                endpoint,
-                None,
-            )?);
+        if let Some(snapshot) = snapshot {
+            push_cluster_member_endpoint_diff_ops(snapshot, &member, &mut success)?;
+        } else {
+            success.push(KvOp::DeletePrefix {
+                prefix: cluster_endpoint_prefix(&member.node_id),
+            });
+            for endpoint in &member.endpoints {
+                success.push(KvOp::put_serde(
+                    cluster_endpoint_key(&member.node_id, endpoint),
+                    endpoint,
+                    None,
+                )?);
+            }
         }
     }
     Ok(KvTxn {
@@ -4929,6 +4985,46 @@ pub fn cluster_member_publish_txn(members: &[ClusterMemberRecord]) -> Result<KvT
         success,
         failure: Vec::new(),
     })
+}
+
+fn push_cluster_member_endpoint_diff_ops(
+    snapshot: &KvSnapshot,
+    member: &ClusterMemberRecord,
+    ops: &mut Vec<KvOp>,
+) -> Result<(), NetworkError> {
+    let endpoint_prefix = cluster_endpoint_prefix(&member.node_id);
+    let mut desired_endpoints = BTreeMap::new();
+    for endpoint in &member.endpoints {
+        let key = cluster_endpoint_key(&member.node_id, endpoint);
+        let op = KvOp::put_serde(key, endpoint, None)?;
+        let KvOp::Put { key, value, .. } = op else {
+            unreachable!("put_serde must produce a put operation");
+        };
+        desired_endpoints.insert(key, value);
+    }
+
+    for entry in snapshot.prefix_entries(&endpoint_prefix) {
+        if !desired_endpoints.contains_key(&entry.key) {
+            ops.push(KvOp::Delete {
+                key: entry.key.clone(),
+            });
+        }
+    }
+
+    for (key, value) in desired_endpoints {
+        if snapshot
+            .get(&key)
+            .is_none_or(|entry| entry.value != value || entry.lease_id.is_some())
+        {
+            ops.push(KvOp::Put {
+                key,
+                value,
+                lease_id: None,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 pub fn expire_cluster_network_records(

@@ -45,7 +45,7 @@ use sinomo_rollout::{
     ClusterRolloutBuildRequest, SelfRolloutPaths, managed_source_status, read_rollout_status,
     source_heads_match,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -193,6 +193,7 @@ fn connectivity_cache_key(paths: &ClusterPaths, record: &ClusterConnectivityReco
     )
 }
 
+#[cfg(test)]
 fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivityRecord) -> bool {
     let key = connectivity_cache_key(paths, record);
     let now = OffsetDateTime::now_utc();
@@ -203,6 +204,48 @@ fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivit
             cache.get(&key).is_some_and(|known| {
                 sinomo_network::cluster_connectivity_stable_eq(known, record)
                     && !sinomo_network::cluster_network_record_should_refresh(known.expires_at, now)
+            })
+        })
+}
+
+fn connectivity_cache_source_prefix(paths: &ClusterPaths, source_node_id: &NodeId) -> String {
+    format!(
+        "{}:{}",
+        paths.root.display(),
+        sinomo_network::cluster_connectivity_source_prefix(source_node_id)
+    )
+}
+
+fn cached_connectivity_record_set_matches(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> bool {
+    let now = OffsetDateTime::now_utc();
+    let incoming_keys = records
+        .iter()
+        .map(|record| connectivity_cache_key(paths, record))
+        .collect::<BTreeSet<_>>();
+    let source_prefix = connectivity_cache_source_prefix(paths, source_node_id);
+    PUBLISHED_CONNECTIVITY
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .is_ok_and(|cache| {
+            if cache
+                .keys()
+                .any(|key| key.starts_with(&source_prefix) && !incoming_keys.contains(key))
+            {
+                return false;
+            }
+            records.iter().all(|record| {
+                let key = connectivity_cache_key(paths, record);
+                cache.get(&key).is_some_and(|known| {
+                    sinomo_network::cluster_connectivity_stable_eq(known, record)
+                        && !sinomo_network::cluster_network_record_should_refresh(
+                            known.expires_at,
+                            now,
+                        )
+                })
             })
         })
 }
@@ -228,6 +271,27 @@ fn remember_connectivity_records(paths: &ClusterPaths, records: &[ClusterConnect
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
+        for record in records {
+            cache.insert(connectivity_cache_key(paths, record), record.clone());
+        }
+    }
+}
+
+fn remember_connectivity_record_set(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) {
+    if let Ok(mut cache) = PUBLISHED_CONNECTIVITY
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        let source_prefix = connectivity_cache_source_prefix(paths, source_node_id);
+        let incoming_keys = records
+            .iter()
+            .map(|record| connectivity_cache_key(paths, record))
+            .collect::<BTreeSet<_>>();
+        cache.retain(|key, _| !key.starts_with(&source_prefix) || incoming_keys.contains(key));
         for record in records {
             cache.insert(connectivity_cache_key(paths, record), record.clone());
         }
@@ -573,7 +637,10 @@ pub fn advertise_daemon_iroh_endpoint(
         let publish_result = commit_cluster_kv_txn_with_quorum(
             &cluster_paths,
             &mut commit_state,
-            sinomo_network::cluster_member_publish_txn(&[published_member])?,
+            sinomo_network::cluster_member_publish_txn_from_kv(
+                &cluster_paths,
+                &[published_member],
+            )?,
         );
         if let Err(error) = publish_result {
             eprintln!("sinomo iroh endpoint local quorum publication failed: {error}");
@@ -1054,7 +1121,7 @@ pub fn publish_local_members_to_quorum_if_needed(
         return commit_cluster_kv_txn_with_quorum(
             paths,
             &mut commit_state,
-            sinomo_network::cluster_member_publish_txn(&members)?,
+            sinomo_network::cluster_member_publish_txn_from_kv(paths, &members)?,
         )
         .map(Some);
     }
@@ -1089,6 +1156,19 @@ pub struct ClusterNetworkMaintenance {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClusterConnectivityProbeState {
     pub record: ClusterConnectivityRecord,
+}
+
+fn maintenance_interval_due(now: Instant, last: Instant, interval: Duration) -> bool {
+    now.saturating_duration_since(last) >= interval
+}
+
+fn maintenance_last_timestamp_for_next_due(
+    now: Instant,
+    interval: Duration,
+    delay: Duration,
+) -> Instant {
+    now.checked_add(delay.saturating_sub(interval))
+        .unwrap_or(now)
 }
 
 impl ClusterNetworkMaintenance {
@@ -1131,11 +1211,16 @@ impl ClusterNetworkMaintenance {
         self.tick = self.tick.saturating_add(1);
         self.idle_stats.incr_ticks_total();
         let now = Instant::now();
-        let publish_due = now.duration_since(self.last_publish) >= DAEMON_CLUSTER_PUBLISH_INTERVAL;
+        let publish_due =
+            maintenance_interval_due(now, self.last_publish, DAEMON_CLUSTER_PUBLISH_INTERVAL);
         let probe_due =
-            now.duration_since(self.last_probe) >= DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL;
+            maintenance_interval_due(now, self.last_probe, DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL);
         let discovery_due = self.discovery.is_some()
-            && now.duration_since(self.last_discovery) >= DAEMON_CLUSTER_DISCOVERY_INTERVAL;
+            && maintenance_interval_due(
+                now,
+                self.last_discovery,
+                DAEMON_CLUSTER_DISCOVERY_INTERVAL,
+            );
         if !(publish_due || probe_due || discovery_due) {
             return Ok(());
         }
@@ -1278,9 +1363,11 @@ impl ClusterNetworkMaintenance {
                 }
             }
             if publish_failed {
-                self.last_publish = now
-                    .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
-                    .unwrap_or(now);
+                self.last_publish = maintenance_last_timestamp_for_next_due(
+                    now,
+                    DAEMON_CLUSTER_PUBLISH_INTERVAL,
+                    DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+                );
             }
         }
 
@@ -1418,6 +1505,16 @@ impl ClusterNetworkMaintenance {
         };
         self.idle_stats
             .add_mdns_announces_recv(advertisements.len() as u64);
+        let changed = self.apply_discovery_advertisements(state, advertisements);
+        self.discovery_cache.expire_after_tick(self.tick);
+        changed
+    }
+
+    fn apply_discovery_advertisements(
+        &mut self,
+        state: &mut ClusterBootstrapState,
+        advertisements: Vec<MdnsDiscoveryAdvertisement>,
+    ) -> bool {
         let mut changed = false;
         for advertisement in advertisements {
             if advertisement.cluster_id != state.cluster_id
@@ -1432,12 +1529,10 @@ impl ClusterNetworkMaintenance {
                     .iter_mut()
                     .find(|member| member.node_id == record.endpoint.node_id)
                 {
-                    sinomo_network::upsert_member_endpoint(member, record.endpoint);
-                    changed = true;
+                    changed |= sinomo_network::upsert_member_endpoint(member, record.endpoint);
                 }
             }
         }
-        self.discovery_cache.expire_after_tick(self.tick);
         changed
     }
 
@@ -1486,6 +1581,13 @@ impl ClusterNetworkMaintenance {
         let timestamp = now
             .format(&Rfc3339)
             .unwrap_or_else(|_| "unknown".to_string());
+        let targets = sinomo_network::cluster_network_probe_targets(state);
+        let active_keys = targets
+            .iter()
+            .map(|endpoint| {
+                sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         // Seed the in-memory probe cache from the merged graph (KV + the local probe store,
         // local-authoritative for our own edges) rather than KV alone: a learner cannot commit
         // its connectivity edges to KV, so seeding from KV would discard our own last-known
@@ -1502,17 +1604,13 @@ impl ClusterNetworkMaintenance {
                     &record.target_node_id,
                     &record.endpoint_id,
                 );
+                if !active_keys.contains(&key) {
+                    continue;
+                }
                 self.connectivity
                     .insert(key, ClusterConnectivityProbeState { record });
             }
         }
-        let targets = sinomo_network::cluster_network_probe_targets(state);
-        let active_keys = targets
-            .iter()
-            .map(|endpoint| {
-                sinomo_network::cluster_connectivity_probe_key(&state.local_node_id, endpoint)
-            })
-            .collect::<std::collections::BTreeSet<_>>();
         let refresh_deadline =
             now + time::Duration::seconds(CLUSTER_CONNECTIVITY_REFRESH_MARGIN_SECONDS);
         let probe_targets = targets
@@ -1671,7 +1769,7 @@ impl ClusterNetworkMaintenance {
         }
 
         self.connectivity
-            .retain(|key, state| active_keys.contains(key) || state.record.expires_at > now);
+            .retain(|key, _state| active_keys.contains(key));
         self.connectivity
             .values()
             .map(|state| state.record.clone())
@@ -2232,7 +2330,7 @@ pub fn update_cluster_node_role(
         commit_cluster_kv_txn_with_quorum(
             paths,
             &mut state,
-            cluster_member_update_txn(member_entry, &member)?,
+            cluster_member_update_txn(&store, member_entry, &member)?,
         )?;
     }
     Ok(ClusterNodeRoleUpdate {
@@ -2343,6 +2441,7 @@ fn current_cluster_kv_store(
 }
 
 fn cluster_member_update_txn(
+    store: &InProcessKvStore,
     current_entry: KvEntry,
     member: &ClusterMemberRecord,
 ) -> Result<KvTxn, DaemonError> {
@@ -2351,7 +2450,7 @@ fn cluster_member_update_txn(
             key: current_entry.key,
             value: current_entry.value,
         }],
-        success: cluster_member_update_ops(member)?,
+        success: cluster_member_update_ops(store, member)?,
         failure: Vec::new(),
     })
 }
@@ -2390,7 +2489,7 @@ fn cluster_member_raft_update_txn(
     let current_config: sinomo_network::ClusterRaftConfigRecord = current_config_entry.decode()?;
     let next_config = cluster_raft_config_from_store(store, member, &current_config, now)?;
     sinomo_network::validate_raft_config_transition(&current_config, &next_config)?;
-    let mut success = cluster_member_update_ops(member)?;
+    let mut success = cluster_member_update_ops(store, member)?;
     success.push(KvOp::put_serde(
         raft_config_key.clone(),
         &next_config,
@@ -2412,7 +2511,10 @@ fn cluster_member_raft_update_txn(
     })
 }
 
-fn cluster_member_update_ops(member: &ClusterMemberRecord) -> Result<Vec<KvOp>, DaemonError> {
+fn cluster_member_update_ops(
+    store: &InProcessKvStore,
+    member: &ClusterMemberRecord,
+) -> Result<Vec<KvOp>, DaemonError> {
     let mut member = member.clone();
     sinomo_network::cleanup_member_iroh_endpoints(&mut member);
     let mut ops = vec![
@@ -2422,18 +2524,47 @@ fn cluster_member_update_ops(member: &ClusterMemberRecord) -> Result<Vec<KvOp>, 
             &sinomo_network::ClusterCapabilityPolicyRecord::from(&member),
             None,
         )?,
-        KvOp::DeletePrefix {
-            prefix: sinomo_network::cluster_endpoint_prefix(&member.node_id),
-        },
     ];
-    for endpoint in &member.endpoints {
-        ops.push(KvOp::put_serde(
-            sinomo_network::cluster_endpoint_key(&member.node_id, endpoint),
-            endpoint,
-            None,
-        )?);
-    }
+    push_cluster_member_endpoint_diff_ops(store, &member, &mut ops)?;
     Ok(ops)
+}
+
+fn push_cluster_member_endpoint_diff_ops(
+    store: &InProcessKvStore,
+    member: &ClusterMemberRecord,
+    ops: &mut Vec<KvOp>,
+) -> Result<(), DaemonError> {
+    let endpoint_prefix = sinomo_network::cluster_endpoint_prefix(&member.node_id);
+    let mut desired_endpoints = BTreeMap::new();
+    for endpoint in &member.endpoints {
+        let key = sinomo_network::cluster_endpoint_key(&member.node_id, endpoint);
+        let op = KvOp::put_serde(key, endpoint, None)?;
+        let KvOp::Put { key, value, .. } = op else {
+            unreachable!("put_serde must produce a put operation");
+        };
+        desired_endpoints.insert(key, value);
+    }
+
+    for entry in store.range_prefix(&endpoint_prefix) {
+        if !desired_endpoints.contains_key(&entry.key) {
+            ops.push(KvOp::Delete { key: entry.key });
+        }
+    }
+
+    for (key, value) in desired_endpoints {
+        if store
+            .get(&key)
+            .is_none_or(|entry| entry.value != value || entry.lease_id.is_some())
+        {
+            ops.push(KvOp::Put {
+                key,
+                value,
+                lease_id: None,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn cluster_raft_config_from_store(
@@ -2525,7 +2656,9 @@ pub fn remove_cluster_members(
         removed.push(member);
     }
 
-    commit_cluster_kv_txn_with_quorum(paths, &mut state, cluster_member_removal_txn(&removed)?)?;
+    for txn in cluster_member_removal_txns(&store, &removed)? {
+        commit_cluster_kv_txn_with_quorum(paths, &mut state, txn)?;
+    }
     Ok(ClusterMemberRemoval { removed })
 }
 
@@ -2540,24 +2673,54 @@ fn cluster_kv_member_is_voter(
     Ok(config.voters.iter().any(|voter| voter == node_id))
 }
 
-fn cluster_member_removal_txn(members: &[ClusterMemberRecord]) -> Result<KvTxn, DaemonError> {
-    let mut success = Vec::new();
+fn cluster_member_removal_txns(
+    store: &InProcessKvStore,
+    members: &[ClusterMemberRecord],
+) -> Result<Vec<KvTxn>, DaemonError> {
+    let mut txns = Vec::new();
+    let final_endpoint_prefix_delete_limit =
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND.saturating_sub(2);
+    let explicit_delete_batch_limit =
+        sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH.min(sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND);
     for member in members {
-        success.push(KvOp::Delete {
-            key: cluster_member_key(&member.node_id),
-        });
-        success.push(KvOp::Delete {
-            key: sinomo_network::cluster_capability_policy_key(&member.node_id),
-        });
-        success.push(KvOp::DeletePrefix {
-            prefix: sinomo_network::cluster_endpoint_prefix(&member.node_id),
+        let endpoint_prefix = sinomo_network::cluster_endpoint_prefix(&member.node_id);
+        let endpoint_keys = store
+            .range_prefix(&endpoint_prefix)
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect::<Vec<_>>();
+        let explicit_delete_count = endpoint_keys
+            .len()
+            .saturating_sub(final_endpoint_prefix_delete_limit);
+        for chunk in endpoint_keys[..explicit_delete_count].chunks(explicit_delete_batch_limit) {
+            txns.push(KvTxn {
+                compares: Vec::new(),
+                success: chunk
+                    .iter()
+                    .cloned()
+                    .map(|key| KvOp::Delete { key })
+                    .collect(),
+                failure: Vec::new(),
+            });
+        }
+
+        txns.push(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::Delete {
+                    key: cluster_member_key(&member.node_id),
+                },
+                KvOp::Delete {
+                    key: sinomo_network::cluster_capability_policy_key(&member.node_id),
+                },
+                KvOp::DeletePrefix {
+                    prefix: endpoint_prefix,
+                },
+            ],
+            failure: Vec::new(),
         });
     }
-    Ok(KvTxn {
-        compares: Vec::new(),
-        success,
-        failure: Vec::new(),
-    })
+    Ok(txns)
 }
 
 pub fn cluster_peer_members(
@@ -2818,16 +2981,13 @@ pub fn sync_cluster_connectivity_records_to_kv(
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
     sinomo_network::write_local_cluster_connectivity_records(paths, source_node_id, &records)?;
-    let publishable = records
-        .into_iter()
-        .filter(|record| !cached_connectivity_matches(paths, record))
-        .collect::<Vec<_>>();
-    if publishable.is_empty() {
+    if cached_connectivity_record_set_matches(paths, source_node_id, &records) {
         return Ok(None);
     }
     let success =
-        sinomo_network::cluster_connectivity_sync_ops(paths, source_node_id, &publishable)?;
+        sinomo_network::cluster_connectivity_full_sync_ops(paths, source_node_id, &records)?;
     if success.is_empty() {
+        remember_connectivity_record_set(paths, source_node_id, &records);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
@@ -2842,7 +3002,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     )
     .map(Some);
     if result.is_ok() {
-        remember_connectivity_records(paths, &publishable);
+        remember_connectivity_record_set(paths, source_node_id, &records);
     }
     result
 }
@@ -4051,7 +4211,7 @@ pub fn handle_daemon_cluster_member_publish_request(
     match commit_cluster_kv_txn_with_quorum(
         &cluster_paths,
         &mut commit_state,
-        sinomo_network::cluster_member_publish_txn(&request.members)?,
+        sinomo_network::cluster_member_publish_txn_from_kv(&cluster_paths, &request.members)?,
     ) {
         Ok(snapshot) => Ok(ClusterMemberPublishResponse {
             accepted: true,
@@ -4192,6 +4352,199 @@ mod tests {
                 .expect("clock")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn cluster_member_update_ops_diff_endpoint_records() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_endpoint_diff").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_daemon_endpoint_diff").expect("node");
+        let unchanged = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_diff_unchanged",
+            )
+            .expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.1:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let stale = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_diff_stale",
+            )
+            .expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.2:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 1,
+            last_observed_latency_ms: None,
+        };
+        let added = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_diff_added",
+            )
+            .expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.3:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 2,
+            last_observed_latency_ms: None,
+        };
+
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            node_id.clone(),
+            "endpoint diff",
+            "pk-endpoint-diff",
+            now,
+        );
+        member.endpoints = vec![unchanged.clone(), added.clone()];
+
+        let unchanged_key = sinomo_network::cluster_endpoint_key(&node_id, &unchanged);
+        let stale_key = sinomo_network::cluster_endpoint_key(&node_id, &stale);
+        let added_key = sinomo_network::cluster_endpoint_key(&node_id, &added);
+        let endpoint_prefix = sinomo_network::cluster_endpoint_prefix(&node_id);
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(unchanged_key.clone(), &unchanged, None)
+            .expect("unchanged endpoint");
+        store
+            .put_serde(stale_key.clone(), &stale, None)
+            .expect("stale endpoint");
+
+        let ops = cluster_member_update_ops(&store, &member).expect("member update ops");
+
+        assert!(
+            ops.iter().all(|op| !matches!(
+                op,
+                KvOp::DeletePrefix { prefix } if prefix == &endpoint_prefix
+            )),
+            "member updates should avoid broad endpoint prefix deletes"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_key)),
+            "stale endpoint should be deleted explicitly"
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, KvOp::Put { key, .. } if key == &added_key)),
+            "new endpoint should be put"
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &unchanged_key)),
+            "unchanged endpoint should not be re-put"
+        );
+    }
+
+    #[test]
+    fn cluster_member_removal_txns_bound_large_endpoint_prefix_cleanup() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_removal_endpoint_limit").expect("cluster");
+        let node_id =
+            NodeId::from_legacy_named("node_daemon_removal_endpoint_limit").expect("node");
+        let mut member = ClusterMemberRecord::pending_learner(
+            cluster_id,
+            node_id.clone(),
+            "removal endpoint limit",
+            "pk-removal-endpoint-limit",
+            now,
+        );
+        member.state = ClusterMemberState::NonVoting;
+        member.role = ClusterMemberRole::NonVoting;
+        member.capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::NonVoting);
+        member.allowed_capabilities = member.capabilities.clone();
+        member.endpoints = (0..=sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+            .map(|index| ClusterEndpointRecord {
+                endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(format!(
+                    "endpoint_daemon_removal_limit_{index}"
+                ))
+                .expect("endpoint"),
+                node_id: node_id.clone(),
+                transport: ClusterTransportKind::LanTcp,
+                address: format!("127.0.0.1:{}", 20_000 + index),
+                source: sinomo_core::ClusterEndpointSource::Static,
+                privacy: ClusterEndpointPrivacy::Lan,
+                priority: 0,
+                last_observed_latency_ms: None,
+            })
+            .collect();
+
+        let member_key = cluster_member_key(&node_id);
+        let policy_key = sinomo_network::cluster_capability_policy_key(&node_id);
+        let endpoint_prefix = sinomo_network::cluster_endpoint_prefix(&node_id);
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(member_key.clone(), &member, None)
+            .expect("member");
+        store
+            .put_serde(
+                policy_key.clone(),
+                &sinomo_network::ClusterCapabilityPolicyRecord::from(&member),
+                None,
+            )
+            .expect("policy");
+        for endpoint in &member.endpoints {
+            store
+                .put_serde(
+                    sinomo_network::cluster_endpoint_key(&node_id, endpoint),
+                    endpoint,
+                    None,
+                )
+                .expect("endpoint");
+        }
+
+        let txns =
+            cluster_member_removal_txns(&store, std::slice::from_ref(&member)).expect("txns");
+
+        assert!(
+            txns.len() > 1,
+            "large endpoint prefixes should be split before final removal"
+        );
+        assert!(
+            txns.iter()
+                .all(|txn| txn.success.len() <= sinomo_kv::MAX_KV_TXN_OPS_PER_BRANCH),
+            "all removal transactions must fit within the KV branch op limit"
+        );
+        for txn in &txns[..txns.len() - 1] {
+            assert!(
+                txn.success.iter().all(|op| !matches!(
+                    op,
+                    KvOp::DeletePrefix { prefix } if prefix == &endpoint_prefix
+                )),
+                "pre-final removal batches should use explicit deletes"
+            );
+        }
+        assert!(
+            txns.last().is_some_and(|txn| txn.success.iter().any(|op| {
+                matches!(op, KvOp::DeletePrefix { prefix } if prefix == &endpoint_prefix)
+            })),
+            "final removal should keep a prefix cleanup for residual endpoint keys"
+        );
+
+        for txn in txns {
+            store
+                .apply_command(KvCommand::Txn(txn))
+                .expect("apply removal txn");
+        }
+
+        assert!(store.get(&member_key).is_none(), "member should be removed");
+        assert!(store.get(&policy_key).is_none(), "policy should be removed");
+        assert!(
+            store.range_prefix(&endpoint_prefix).is_empty(),
+            "endpoint records should be removed"
+        );
     }
 
     #[test]
@@ -4403,6 +4756,43 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_failure_backoff_retries_after_configured_delay() {
+        let now = Instant::now();
+        let last_publish = maintenance_last_timestamp_for_next_due(
+            now,
+            DAEMON_CLUSTER_PUBLISH_INTERVAL,
+            DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+        );
+        let before_backoff = now
+            .checked_add(
+                DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF
+                    .checked_sub(Duration::from_secs(1))
+                    .expect("backoff duration"),
+            )
+            .expect("before backoff instant");
+        let after_backoff = now
+            .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+            .expect("after backoff instant");
+
+        assert!(
+            !maintenance_interval_due(
+                before_backoff,
+                last_publish,
+                DAEMON_CLUSTER_PUBLISH_INTERVAL
+            ),
+            "failed publishes should not retry before the configured backoff"
+        );
+        assert!(
+            maintenance_interval_due(after_backoff, last_publish, DAEMON_CLUSTER_PUBLISH_INTERVAL),
+            "failed publishes should retry at the configured backoff, not backoff plus the publish interval"
+        );
+        assert!(
+            !maintenance_interval_due(now, after_backoff, DAEMON_CLUSTER_PUBLISH_INTERVAL),
+            "future deferred timestamps should be safe and not immediately due"
+        );
+    }
+
+    #[test]
     fn cluster_has_remote_peers_treats_main_and_shadow_as_solo() {
         let now = OffsetDateTime::now_utc();
         let cluster_id = ClusterId::from_legacy_named("cluster_solo_check").expect("cluster");
@@ -4501,6 +4891,69 @@ mod tests {
             "discovery-only ticks without a socket should not read cluster state"
         );
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cluster_network_discovery_replay_does_not_mark_state_changed() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_discovery_replay_noop").expect("cluster");
+        let local = NodeId::from_legacy_named("node_discovery_replay_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_discovery_replay_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "discovery replay noop",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members.push(ClusterMemberRecord::pending_learner(
+            cluster_id.clone(),
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        ));
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_discovery_replay_remote",
+            )
+            .expect("endpoint"),
+            node_id: remote.clone(),
+            transport: ClusterTransportKind::LanQuic,
+            address: "10.0.0.20:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Mdns,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 10,
+            last_observed_latency_ms: None,
+        };
+        let advertisement =
+            MdnsDiscoveryAdvertisement::new(cluster_id, remote, vec![endpoint.clone()], 1);
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::new(),
+            connectivity_cursor: 0,
+            environment_id: None,
+            last_desired_rollout_attempt: None,
+            tick: 1,
+            last_publish: maintenance_now,
+            last_discovery: maintenance_now,
+            last_probe: maintenance_now,
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+        };
+
+        assert!(
+            maintenance.apply_discovery_advertisements(&mut state, vec![advertisement.clone()]),
+            "first discovery should add the remote endpoint"
+        );
+        assert_eq!(state.members[1].endpoints, vec![endpoint]);
+        assert!(
+            !maintenance.apply_discovery_advertisements(&mut state, vec![advertisement]),
+            "replayed identical discovery should not force a cluster-state write"
+        );
     }
 
     #[test]
@@ -4832,7 +5285,7 @@ mod tests {
         );
         let endpoint =
             sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.41:21353".to_string(), 10);
-        let mut remote_member = ClusterMemberRecord::local_voter(
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
             cluster_id,
             remote_node.clone(),
             "remote",
@@ -4880,6 +5333,222 @@ mod tests {
         assert_eq!(records, vec![record]);
         assert_eq!(records[0].source_node_id, local_node);
         assert_eq!(records[0].target_node_id, remote_node);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn connectivity_probe_drops_records_for_removed_endpoints() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-removed-endpoint");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_connectivity_removed")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_daemon_connectivity_removed_local")
+            .expect("local node");
+        let remote_node = NodeId::from_legacy_named("node_daemon_connectivity_removed_remote")
+            .expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity removed endpoint",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.52:21353".to_string(), 10);
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities = sinomo_node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![endpoint.clone()];
+        state.members.push(remote_member);
+
+        let record = sinomo_network::cluster_connectivity_record(
+            &state,
+            &endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            600,
+        );
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == remote_node)
+            .expect("remote member")
+            .endpoints
+            .clear();
+
+        let key = sinomo_network::cluster_connectivity_probe_key(&local_node, &endpoint);
+        let maintenance_now = Instant::now();
+        let mut maintenance = ClusterNetworkMaintenance {
+            discovery: None,
+            discovery_cache: MdnsDiscoveryCache::new(),
+            connectivity: std::collections::BTreeMap::from([(
+                key.clone(),
+                ClusterConnectivityProbeState { record },
+            )]),
+            connectivity_cursor: 0,
+            environment_id: None,
+            last_desired_rollout_attempt: None,
+            tick: 0,
+            last_publish: maintenance_now,
+            last_discovery: maintenance_now,
+            last_probe: maintenance_now,
+            idle_stats: Arc::new(IdleStatsAtomics::new()),
+        };
+
+        let records = maintenance.probe_connectivity(&paths, &state);
+
+        assert!(
+            records.is_empty(),
+            "removed endpoints should not keep stale connectivity records publishable"
+        );
+        assert!(
+            !maintenance.connectivity.contains_key(&key),
+            "removed endpoint connectivity should be dropped from the local cache"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn connectivity_sync_deletes_stale_kv_records_even_when_current_records_are_cached() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-cached-delete");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_connectivity_cached_delete")
+            .expect("cluster id");
+        let local_node = NodeId::from_legacy_named("node_daemon_connectivity_cached_delete_local")
+            .expect("local node");
+        let remote_node =
+            NodeId::from_legacy_named("node_daemon_connectivity_cached_delete_remote")
+                .expect("remote node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "connectivity cached delete",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0].capabilities =
+            sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+        let current_endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.61:21353".to_string(), 10);
+        let stale_endpoint =
+            sinomo_network::daemon_lan_endpoint(&remote_node, "10.0.0.62:21353".to_string(), 20);
+        let mut remote_member = ClusterMemberRecord::local_non_voting(
+            cluster_id,
+            remote_node.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        remote_member.capabilities = sinomo_node::main_daemon_capabilities(&remote_member.role);
+        remote_member.allowed_capabilities = remote_member.capabilities.clone();
+        remote_member.endpoints = vec![current_endpoint.clone(), stale_endpoint.clone()];
+        state.members.push(remote_member);
+        sinomo_network::write_cluster_state(&paths, &state).expect("write state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state");
+
+        let current_record = sinomo_network::cluster_connectivity_record(
+            &state,
+            &current_endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(7),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            600,
+        );
+        let stale_record = sinomo_network::cluster_connectivity_record(
+            &state,
+            &stale_endpoint,
+            sinomo_network::ClusterConnectivityState::Healthy,
+            Some(9),
+            0,
+            Some("old".to_string()),
+            None,
+            now,
+            600,
+        );
+        let current_key = sinomo_network::cluster_connectivity_key(
+            &current_record.source_node_id,
+            &current_record.target_node_id,
+            &current_record.endpoint_id,
+        );
+        let stale_key = sinomo_network::cluster_connectivity_key(
+            &stale_record.source_node_id,
+            &stale_record.target_node_id,
+            &stale_record.endpoint_id,
+        );
+        assert_ne!(
+            current_key, stale_key,
+            "test endpoints must use distinct connectivity keys"
+        );
+        sinomo_network::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node,
+            vec![current_record.clone(), stale_record.clone()],
+        )
+        .expect("seed connectivity records");
+        remember_connectivity_record_set(
+            &paths,
+            &local_node,
+            &[current_record.clone(), stale_record.clone()],
+        );
+        let seeded =
+            sinomo_network::read_cluster_kv_current_snapshot(&paths).expect("seeded snapshot");
+        assert!(
+            seeded.get(&current_key).is_some(),
+            "current connectivity should be seeded"
+        );
+        assert!(
+            seeded.get(&stale_key).is_some(),
+            "stale connectivity should be seeded"
+        );
+        assert!(
+            sinomo_network::cluster_connectivity_full_sync_ops(
+                &paths,
+                &local_node,
+                std::slice::from_ref(&current_record),
+            )
+            .expect("planned connectivity sync")
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_key)),
+            "planner should delete stale connectivity"
+        );
+
+        sync_cluster_connectivity_records_to_kv(&paths, &local_node, vec![current_record.clone()])
+            .expect("sync should delete stale connectivity");
+
+        let snapshot = sinomo_network::read_cluster_kv_current_snapshot(&paths).expect("snapshot");
+        assert!(
+            snapshot.get(&current_key).is_some(),
+            "current connectivity should remain"
+        );
+        assert!(
+            snapshot.get(&stale_key).is_none(),
+            "stale connectivity should be deleted even when current records are cached"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

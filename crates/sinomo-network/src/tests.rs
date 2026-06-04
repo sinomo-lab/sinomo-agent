@@ -3885,6 +3885,95 @@ fn cluster_state_sync_txn_diffs_member_endpoint_records() {
 }
 
 #[test]
+fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_endpoint_diff").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_endpoint_diff").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish endpoint diff",
+        "pk-member-publish",
+        now,
+    );
+    let unchanged = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_diff_unchanged")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.1:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    let stale = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_diff_stale")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.2:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 1,
+        last_observed_latency_ms: None,
+    };
+    let added = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_diff_added")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.3:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 2,
+        last_observed_latency_ms: None,
+    };
+    member.endpoints = vec![unchanged.clone(), added.clone()];
+
+    let unchanged_key = cluster_endpoint_key(&node_id, &unchanged);
+    let stale_key = cluster_endpoint_key(&node_id, &stale);
+    let added_key = cluster_endpoint_key(&node_id, &added);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(unchanged_key.clone(), &unchanged, None)
+        .expect("unchanged endpoint");
+    store
+        .put_serde(stale_key.clone(), &stale, None)
+        .expect("stale endpoint");
+
+    let txn = cluster_member_publish_txn_from_snapshot(&store.snapshot(), &[member])
+        .expect("member publish txn");
+
+    assert!(
+        txn.success.iter().all(|op| !matches!(
+            op,
+            KvOp::DeletePrefix { prefix } if prefix == &cluster_endpoint_prefix(&node_id)
+        )),
+        "member publish should avoid broad endpoint prefix deletes"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &stale_key)),
+        "stale endpoint should be deleted explicitly"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &added_key)),
+        "missing endpoint should be put"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &unchanged_key)),
+        "unchanged endpoint should not be re-put"
+    );
+}
+
+#[test]
 fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-unchecked-sync-noop-{}",
