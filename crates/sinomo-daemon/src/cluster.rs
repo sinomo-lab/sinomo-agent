@@ -3094,11 +3094,17 @@ pub fn commit_cluster_raft_command_with_quorum(
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
     let entry = {
         let _raft_guard = lock_cluster_raft_operation()?;
-        sinomo_network::append_cluster_raft_command_uncommitted(
+        match sinomo_network::append_cluster_raft_command_uncommitted_or_no_effect(
             paths,
             &state.local_node_id,
             command,
-        )?
+        )? {
+            sinomo_network::ClusterRaftUncommittedAppend::Appended(entry) => entry,
+            sinomo_network::ClusterRaftUncommittedAppend::NoEffect {
+                snapshot,
+                txn_response,
+            } => return Ok((snapshot, txn_response)),
+        }
     };
     let mut voter_acks = std::collections::BTreeSet::new();
     if sinomo_network::cluster_raft_local_is_voter(state) {
@@ -3194,8 +3200,14 @@ pub fn commit_cluster_raft_command_with_quorum(
             entry.index,
         )?
     };
-    fan_out_committed_cluster_raft_command(paths.clone(), state.clone(), commit.events.clone());
+    if committed_cluster_raft_command_needs_fanout(&targets) {
+        fan_out_committed_cluster_raft_command(paths.clone(), state.clone(), commit.events.clone());
+    }
     Ok((commit.snapshot, commit.txn_response))
+}
+
+fn committed_cluster_raft_command_needs_fanout(targets: &[ClusterEndpointRecord]) -> bool {
+    !targets.is_empty()
 }
 
 fn fan_out_committed_cluster_raft_command(
@@ -3262,26 +3274,40 @@ fn fan_out_committed_cluster_raft_command_blocking(
         if replicated_nodes.contains(&endpoint.node_id) {
             continue;
         }
-        if let Ok(response) = replicate_cluster_raft_to_endpoint(paths, state, &endpoint) {
-            if response.accepted {
+        if let Ok(outcome) = replicate_cluster_raft_to_endpoint_with_timeout_result(
+            paths,
+            state,
+            &endpoint,
+            DAEMON_CLUSTER_RAFT_APPEND_TIMEOUT,
+            &events,
+        ) {
+            if outcome.response.accepted {
                 replicated_nodes.insert(endpoint.node_id.clone());
-                if !events.is_empty() {
-                    for event_batch in cluster_kv_watch_event_fanout_batches(&events) {
-                        let response = send_cluster_kv_watch_events(
-                            &endpoint,
-                            &ClusterKvWatchEventsRequest {
-                                state: state.clone(),
-                                leader_id: state.local_node_id.clone(),
-                                events: event_batch.to_vec(),
-                            },
-                            DAEMON_CLUSTER_RPC_TIMEOUT,
-                        );
-                        if !response.is_ok_and(|response| response.accepted) {
-                            break;
-                        }
-                    }
+                if outcome.watch_event_fanout_needed {
+                    send_cluster_kv_watch_event_fanout_batches(state, &endpoint, &events);
                 }
             }
+        }
+    }
+}
+
+fn send_cluster_kv_watch_event_fanout_batches(
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    events: &[KvEvent],
+) {
+    for event_batch in cluster_kv_watch_event_fanout_batches(events) {
+        let response = send_cluster_kv_watch_events(
+            endpoint,
+            &ClusterKvWatchEventsRequest {
+                state: state.clone(),
+                leader_id: state.local_node_id.clone(),
+                events: event_batch.to_vec(),
+            },
+            DAEMON_CLUSTER_RPC_TIMEOUT,
+        );
+        if !response.is_ok_and(|response| response.accepted) {
+            break;
         }
     }
 }
@@ -3906,6 +3932,23 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
 ) -> Result<ClusterRaftAppendResponse, DaemonError> {
+    replicate_cluster_raft_to_endpoint_with_timeout_result(paths, state, endpoint, timeout, &[])
+        .map(|outcome| outcome.response)
+}
+
+#[derive(Debug)]
+struct ClusterRaftReplicationOutcome {
+    response: ClusterRaftAppendResponse,
+    watch_event_fanout_needed: bool,
+}
+
+fn replicate_cluster_raft_to_endpoint_with_timeout_result(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+    watch_events: &[KvEvent],
+) -> Result<ClusterRaftReplicationOutcome, DaemonError> {
     let deadline = Instant::now() + timeout;
     let mut next_index = {
         let _raft_guard = lock_cluster_raft_operation()?;
@@ -3931,9 +3974,14 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
         if let Some(stats) = crate::process_idle_stats() {
             stats.incr_raft_appends_sent();
         }
+        let watch_event_fanout_needed =
+            cluster_raft_append_request_needs_watch_event_fanout(&request, watch_events);
         let response = send_cluster_raft_append(endpoint, &request, attempt_timeout)?;
         if response.accepted {
-            return Ok(response);
+            return Ok(ClusterRaftReplicationOutcome {
+                response,
+                watch_event_fanout_needed,
+            });
         }
         let rejected_next_index = response.append.match_index.saturating_add(1);
         next_index = if rejected_next_index < next_index {
@@ -3945,19 +3993,45 @@ fn replicate_cluster_raft_to_endpoint_with_timeout(
         };
         last_response = Some(response);
     }
-    Ok(last_response.unwrap_or_else(|| ClusterRaftAppendResponse {
-        accepted: false,
-        detail: format!(
-            "raft append did not complete before {}ms catch-up budget",
-            timeout.as_millis()
-        ),
-        state: state.clone(),
-        append: RaftAppendEntriesResponse {
-            term: 0,
-            success: false,
-            match_index: 0,
-        },
-    }))
+    Ok(ClusterRaftReplicationOutcome {
+        response: last_response.unwrap_or_else(|| ClusterRaftAppendResponse {
+            accepted: false,
+            detail: format!(
+                "raft append did not complete before {}ms catch-up budget",
+                timeout.as_millis()
+            ),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 0,
+                success: false,
+                match_index: 0,
+            },
+        }),
+        watch_event_fanout_needed: false,
+    })
+}
+
+fn cluster_raft_append_request_needs_watch_event_fanout(
+    request: &ClusterRaftAppendRequest,
+    events: &[KvEvent],
+) -> bool {
+    if events.is_empty() {
+        return false;
+    }
+    let Some(snapshot) = request.snapshot.as_ref() else {
+        return false;
+    };
+    !cluster_kv_events_contain_all(&snapshot.kv.events, events)
+}
+
+fn cluster_kv_events_contain_all(existing: &[KvEvent], incoming: &[KvEvent]) -> bool {
+    incoming.iter().all(|event| {
+        existing.iter().any(|candidate| {
+            candidate.revision == event.revision
+                && candidate.key == event.key
+                && candidate.kind == event.kind
+        })
+    })
 }
 
 fn cluster_endpoint_command_timeout(
@@ -4614,6 +4688,77 @@ mod tests {
     }
 
     #[test]
+    fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_watch_fanout_needed").expect("cluster");
+        let leader_id =
+            NodeId::from_legacy_named("node_watch_fanout_needed_leader").expect("leader");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "watch fanout needed",
+            leader_id.clone(),
+            "leader",
+            "pk-leader",
+            now,
+        );
+        let first = KvEvent {
+            revision: sinomo_kv::KvRevision(1),
+            key: "/watch/fanout/first".to_string(),
+            kind: sinomo_kv::KvEventKind::Put {
+                value: b"first".to_vec(),
+            },
+        };
+        let second = KvEvent {
+            revision: sinomo_kv::KvRevision(2),
+            key: "/watch/fanout/second".to_string(),
+            kind: sinomo_kv::KvEventKind::Put {
+                value: b"second".to_vec(),
+            },
+        };
+        let append = sinomo_kv::RaftAppendEntriesRequest {
+            term: 1,
+            leader_id: leader_id.clone(),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 1,
+        };
+        let mut request = ClusterRaftAppendRequest {
+            state: state.clone(),
+            append,
+            snapshot: None,
+        };
+
+        assert!(
+            !cluster_raft_append_request_needs_watch_event_fanout(
+                &request,
+                std::slice::from_ref(&first)
+            ),
+            "incremental appends already apply and wake the follower's local watch state"
+        );
+
+        let mut snapshot = InProcessKvStore::new().snapshot();
+        snapshot.events = vec![first.clone()];
+        request.snapshot = Some(sinomo_kv::RaftSnapshot {
+            last_included_index: 1,
+            last_included_term: 1,
+            kv: snapshot,
+        });
+        assert!(
+            !cluster_raft_append_request_needs_watch_event_fanout(
+                &request,
+                std::slice::from_ref(&first)
+            ),
+            "snapshot installs that still contain the committed events do not need duplicate fanout"
+        );
+        assert!(
+            cluster_raft_append_request_needs_watch_event_fanout(&request, &[first, second]),
+            "snapshot installs with a trimmed event tail still need fanout for omitted watch events"
+        );
+    }
+
+    #[test]
     fn cluster_kv_watch_event_fanout_rejects_oversized_batches_before_storage() {
         let root = unique_cluster_test_root("sinomo-daemon-watch-fanout-oversized");
         let data_root = root.join("data");
@@ -4753,6 +4898,33 @@ mod tests {
         pending.store(true, Ordering::Release);
         assert!(claim_next_cluster_raft_fanout_pass(&active, &pending));
         assert!(active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn committed_cluster_raft_command_skips_fanout_without_remote_targets() {
+        assert!(
+            !committed_cluster_raft_command_needs_fanout(&[]),
+            "a solo voter commit should not spawn a background replication pass"
+        );
+
+        let node_id = NodeId::from_legacy_named("node_daemon_fanout_remote_target").expect("node");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_fanout_remote_target",
+            )
+            .expect("endpoint"),
+            node_id,
+            transport: ClusterTransportKind::LanTcp,
+            address: "127.0.0.1:21353".to_string(),
+            source: sinomo_core::ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        assert!(
+            committed_cluster_raft_command_needs_fanout(&[endpoint]),
+            "remote voter targets still need a post-commit pass to advance follower commit indexes"
+        );
     }
 
     #[test]
@@ -5036,6 +5208,89 @@ mod tests {
         assert_eq!(
             store.get("/test/local-lock-wait").expect("committed").value,
             b"ok"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn no_effect_cluster_kv_txn_with_quorum_does_not_append_raft_log_entry() {
+        let root = unique_cluster_test_root("sinomo-daemon-no-effect-kv-no-append");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_no_effect_kv_no_append").expect("cluster");
+        let local = NodeId::from_legacy_named("node_daemon_no_effect_kv_no_append").expect("node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "no effect kv no append",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_network::write_cluster_state(&paths, &state).expect("write cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&paths, &state)
+            .expect("sync state to raft");
+
+        let (committed, _) = commit_cluster_kv_txn_with_quorum_response(
+            &paths,
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/test/no-effect/present".to_string(),
+                    value: b"present".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+        )
+        .expect("seed kv entry");
+        let wal_path = sinomo_network::cluster_raft_wal_paths(&paths, &local).wal;
+        let wal_len_before = std::fs::metadata(&wal_path)
+            .expect("wal before no-effect")
+            .len();
+
+        let (snapshot, response) = commit_cluster_kv_txn_with_quorum_response(
+            &paths,
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Delete {
+                    key: "/test/no-effect/missing".to_string(),
+                }],
+                failure: Vec::new(),
+            },
+        )
+        .expect("no-effect txn should succeed without raft append");
+
+        assert_eq!(
+            snapshot.revision, committed.revision,
+            "no-effect daemon txn must not advance the cluster revision"
+        );
+        assert_eq!(
+            response,
+            Some(KvTxnResponse {
+                succeeded: true,
+                revision: committed.revision,
+                responses: vec![sinomo_kv::KvOpResponse::Delete {
+                    key: "/test/no-effect/missing".to_string(),
+                    deleted: false,
+                }],
+            })
+        );
+        assert_eq!(
+            std::fs::metadata(&wal_path)
+                .expect("wal after no-effect")
+                .len(),
+            wal_len_before,
+            "no-effect daemon txn must not append to the raft WAL"
         );
         let _ = std::fs::remove_dir_all(root);
     }

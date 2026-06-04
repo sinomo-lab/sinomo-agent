@@ -1883,11 +1883,67 @@ pub fn append_cluster_raft_command_uncommitted(
     node_id: &NodeId,
     command: KvCommand,
 ) -> Result<KvLogEntry, NetworkError> {
+    append_cluster_raft_command_uncommitted_entry(paths, node_id, command)
+}
+
+#[derive(Clone, Debug)]
+pub enum ClusterRaftUncommittedAppend {
+    Appended(KvLogEntry),
+    NoEffect {
+        snapshot: KvSnapshot,
+        txn_response: Option<KvTxnResponse>,
+    },
+}
+
+pub fn append_cluster_raft_command_uncommitted_or_no_effect(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: KvCommand,
+) -> Result<ClusterRaftUncommittedAppend, NetworkError> {
     let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
-    node.discard_uncommitted_tail()?;
+    match &command {
+        KvCommand::Op(op) => {
+            if node.store().op_response_if_no_effect(op)?.is_some() {
+                return Ok(ClusterRaftUncommittedAppend::NoEffect {
+                    snapshot: node.store().snapshot(),
+                    txn_response: None,
+                });
+            }
+        }
+        KvCommand::Txn(txn) => {
+            if let Some(response) = node
+                .store()
+                .txn_response_if_selected_branch_no_effect(txn)?
+            {
+                return Ok(ClusterRaftUncommittedAppend::NoEffect {
+                    snapshot: node.store().snapshot(),
+                    txn_response: Some(response),
+                });
+            }
+        }
+        KvCommand::PutClusterMember(_) => {}
+    }
+    let entry = append_cluster_raft_command_to_open_node(paths, &mut node, command)?;
+    Ok(ClusterRaftUncommittedAppend::Appended(entry))
+}
+
+fn append_cluster_raft_command_uncommitted_entry(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: KvCommand,
+) -> Result<KvLogEntry, NetworkError> {
+    let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
+    append_cluster_raft_command_to_open_node(paths, &mut node, command)
+}
+
+fn append_cluster_raft_command_to_open_node(
+    paths: &ClusterPaths,
+    node: &mut DurableRaftKvNode,
+    command: KvCommand,
+) -> Result<KvLogEntry, NetworkError> {
     let term = node.hard_state().current_term.max(1);
     let entry = node.append_local_command(term, command)?;
-    compact_cluster_raft_node_if_needed(paths, &mut node)?;
+    compact_cluster_raft_node_if_needed(paths, node)?;
     Ok(entry)
 }
 
@@ -2329,6 +2385,9 @@ pub fn append_cluster_kv_watch_events(
     if cached_cluster_kv_watch_events_contain_all(paths, incoming) {
         return Ok(0);
     }
+    if cached_cluster_kv_snapshot_events_contain_all(paths, incoming) {
+        return Ok(0);
+    }
     let mut log_file = open_cluster_kv_watch_event_log_for_append(paths)?;
     log_file
         .lock_exclusive()
@@ -2463,6 +2522,17 @@ pub(crate) fn cached_cluster_kv_watch_events_contain_all(
     incoming
         .iter()
         .all(|event| cluster_kv_events_contain(entry.events.as_ref(), event))
+}
+
+fn cached_cluster_kv_snapshot_events_contain_all(
+    paths: &ClusterPaths,
+    incoming: &[KvEvent],
+) -> bool {
+    read_cluster_kv_cached_snapshot(paths).is_ok_and(|snapshot| {
+        incoming
+            .iter()
+            .all(|event| cluster_kv_events_contain(&snapshot.events, event))
+    })
 }
 
 pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
@@ -5885,7 +5955,7 @@ pub(crate) fn write_object_file<T: Serialize>(
         std::process::id(),
         OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    {
+    let write_temp_result = (|| -> Result<(), NetworkError> {
         let mut file = fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -5904,8 +5974,16 @@ pub(crate) fn write_object_file<T: Serialize>(
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
+        Ok(())
+    })();
+    if let Err(error) = write_temp_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    replace_file(&temp_path, path)?;
+    if let Err(error) = replace_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     sync_directory(parent)?;
     let (modified, ino) = file_modified_and_ino(path);
     record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);

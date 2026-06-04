@@ -6924,8 +6924,19 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     let snapshot = store.snapshot();
     let duplicate = snapshot.events.first().expect("snapshot event").clone();
     write_cluster_kv_snapshot(&paths, &snapshot).expect("write snapshot");
-    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&duplicate))
-        .expect("append duplicate fanout event");
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&duplicate))
+            .expect("append duplicate fanout event"),
+        0
+    );
+    assert!(
+        !paths.kv_watch_events.exists(),
+        "duplicate snapshot events should not rewrite the watch checkpoint"
+    );
+    assert!(
+        !paths.kv_watch_events_log.exists(),
+        "duplicate snapshot events should not append the watch log"
+    );
     let watch = create_cluster_kv_watch(
         &paths,
         ClusterKvWatchPrefixRequest {
@@ -10408,6 +10419,43 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
     assert_eq!(
         restored, value,
         "a file changed since our last write must be rewritten, not skipped"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_object_file_cleans_temp_file_after_replace_failure() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-objfile-temp-cleanup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let path = root.join("obj.sobj");
+    std::fs::create_dir(&path).expect("target directory");
+
+    let error = crate::storage::write_object_file(&path, &"alpha".to_string())
+        .expect_err("replacing a directory should fail");
+    assert!(
+        error.to_string().contains("obj.sobj"),
+        "unexpected error: {error}"
+    );
+    let leftovers = std::fs::read_dir(&root)
+        .expect("read temp dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".obj.sobj.tmp-"))
+        })
+        .count();
+    assert_eq!(
+        leftovers, 0,
+        "failed object replacement should not leave staged temp files"
     );
 
     let _ = std::fs::remove_dir_all(&root);

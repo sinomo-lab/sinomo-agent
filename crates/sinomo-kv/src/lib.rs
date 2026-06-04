@@ -3482,7 +3482,7 @@ fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvErro
         std::process::id(),
         OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    {
+    let write_temp_result = (|| -> Result<(), KvError> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -3499,6 +3499,11 @@ fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvErro
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
+        Ok(())
+    })();
+    if let Err(error) = write_temp_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
     let result = replace_file(&temp_path, path).and_then(|()| sync_directory(parent));
     if result.is_err() {
@@ -3617,7 +3622,7 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
         std::process::id(),
         OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    {
+    let write_temp_result = (|| -> Result<(), KvError> {
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -3635,8 +3640,16 @@ fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
+        Ok(())
+    })();
+    if let Err(error) = write_temp_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
     }
-    replace_file(&temp_path, path)?;
+    if let Err(error) = replace_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     sync_directory(parent)?;
     let (modified, ino) = file_modified_and_ino(path);
     record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
@@ -3947,6 +3960,46 @@ mod tests {
         assert_eq!(
             restored, record,
             "a file changed since our last write must be rewritten, not skipped"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_object_file_cleans_temp_file_after_replace_failure() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-objfile-temp-cleanup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join("obj.sobj");
+        std::fs::create_dir(&path).expect("target directory");
+
+        let record = TestRecord {
+            name: "alpha".to_string(),
+            count: 7,
+        };
+        let error = write_object_file(&path, &record).expect_err("directory replace should fail");
+        assert!(
+            error.to_string().contains("obj.sobj"),
+            "unexpected error: {error}"
+        );
+        let leftovers = std::fs::read_dir(&root)
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".obj.sobj.tmp-"))
+            })
+            .count();
+        assert_eq!(
+            leftovers, 0,
+            "failed object replacement should not leave staged temp files"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -7187,6 +7240,37 @@ mod tests {
                 .is_some_and(|entry| entry.index > overgrown_log[0].index),
             "repaired WAL should start after the redundant pre-retention records"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wal_rewrite_cleans_temp_file_after_replace_failure() {
+        let root = temp_raft_root("sinomo-kv-wal-temp-cleanup");
+        let path = root.join("wal.sobjlog");
+        std::fs::create_dir_all(&path).expect("target directory");
+        let entry = KvLogEntry {
+            index: 1,
+            term: 1,
+            command: KvCommand::Op(KvOp::Delete {
+                key: "/wal/temp-cleanup".to_string(),
+            }),
+            revision: KvRevision::ZERO,
+        };
+
+        let error = rewrite_wal_entries(&path, &[entry]).expect_err("directory replace fails");
+        assert!(
+            error.to_string().contains("wal.sobjlog"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            fs::read_dir(&root)
+                .expect("raft dir")
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+                .all(|name| !name.starts_with(".wal.sobjlog.tmp-")),
+            "failed WAL rewrite must not leave staged temp files behind"
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 
