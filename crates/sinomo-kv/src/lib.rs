@@ -468,13 +468,23 @@ struct MaterializedSnapshotCacheEntry {
     snapshot: Arc<KvSnapshot>,
 }
 
+struct RaftViewCacheEntry {
+    identity: RaftViewIdentity,
+    snapshot: Arc<KvSnapshot>,
+}
+
 static MATERIALIZED_SNAPSHOT_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>,
 > = OnceLock::new();
+static RAFT_VIEW_CACHE: OnceLock<Mutex<HashMap<PathBuf, RaftViewCacheEntry>>> = OnceLock::new();
 
 fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>
 {
     MATERIALIZED_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn raft_view_cache() -> &'static Mutex<HashMap<PathBuf, RaftViewCacheEntry>> {
+    RAFT_VIEW_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Identity used to validate a cached file parse. Every persisted object/snapshot
@@ -488,6 +498,16 @@ struct FileIdentity {
     mtime: Option<SystemTime>,
     len: u64,
     ino: u64,
+}
+
+/// Point-in-time identity for a durable Raft view. The WAL is append/rewrite in
+/// place, hard state and snapshots use object-file rewrites, and any of those
+/// changing means a cached decoded store is no longer authoritative.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RaftViewIdentity {
+    hard_state: Option<FileIdentity>,
+    wal: Option<FileIdentity>,
+    snapshot: Option<FileIdentity>,
 }
 
 /// Upper bound on entries kept in each process-global file cache. The live set of
@@ -518,6 +538,29 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
     })
 }
 
+fn optional_file_identity(path: &Path) -> Option<Option<FileIdentity>> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let identity = FileIdentity {
+                mtime: metadata.modified().ok(),
+                len: metadata.len(),
+                ino: file_ino(&metadata),
+            };
+            identity.mtime.is_some().then_some(Some(identity))
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+fn raft_view_identity(paths: &KvWalPaths) -> Option<RaftViewIdentity> {
+    Some(RaftViewIdentity {
+        hard_state: optional_file_identity(&paths.hard_state)?,
+        wal: optional_file_identity(&paths.wal)?,
+        snapshot: optional_file_identity(&paths.snapshot)?,
+    })
+}
+
 fn cache_lookup_snapshot(path: &Path, identity: FileIdentity) -> Option<Arc<KvSnapshot>> {
     let guard = materialized_snapshot_cache().lock().ok()?;
     let entry = guard.get(path)?;
@@ -541,6 +584,35 @@ fn cache_store_snapshot(path: &Path, identity: FileIdentity, snapshot: Arc<KvSna
         guard.insert(
             path.to_path_buf(),
             MaterializedSnapshotCacheEntry { identity, snapshot },
+        );
+    }
+}
+
+fn cache_lookup_raft_view(paths: &KvWalPaths, identity: RaftViewIdentity) -> Option<KvSnapshot> {
+    let guard = raft_view_cache().lock().ok()?;
+    let entry = guard.get(&paths.root)?;
+    if entry.identity != identity {
+        return None;
+    }
+    let snapshot = (*entry.snapshot).clone();
+    drop(guard);
+    // Re-stat after cloning the cached view so a concurrent append/rewrite cannot
+    // slip between the first identity read and the return. If the files change
+    // after this check, the read linearizes before that change.
+    (raft_view_identity(paths) == Some(identity)).then_some(snapshot)
+}
+
+fn cache_store_raft_view(paths: &KvWalPaths, identity: RaftViewIdentity, snapshot: KvSnapshot) {
+    if let Ok(mut guard) = raft_view_cache().lock() {
+        if guard.len() >= FILE_CACHE_CAPACITY && !guard.contains_key(&paths.root) {
+            guard.clear();
+        }
+        guard.insert(
+            paths.root.clone(),
+            RaftViewCacheEntry {
+                identity,
+                snapshot: Arc::new(snapshot),
+            },
         );
     }
 }
@@ -648,6 +720,11 @@ impl KvMaterializedCache {
         paths: KvWalPaths,
     ) -> Result<InProcessKvStore, KvError> {
         if paths.root.exists() {
+            if let Some(identity) = raft_view_identity(&paths)
+                && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
+            {
+                return Ok(InProcessKvStore::restore(snapshot));
+            }
             let node =
                 match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
                     Ok(node) => node,
@@ -658,6 +735,9 @@ impl KvMaterializedCache {
                 };
             let store = node.store().clone();
             self.write_snapshot_if_changed(&store.snapshot())?;
+            if let Some(identity) = raft_view_identity(&node.paths) {
+                cache_store_raft_view(&node.paths, identity, store.snapshot());
+            }
             return Ok(store);
         }
         if self.exists() {
@@ -3152,6 +3232,116 @@ mod tests {
             current.get("/cached").expect("cached value").value,
             b"available"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_current_store_uses_raft_view_cache_when_lock_is_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-raft-view-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_local_cache_raft_view_cache").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        {
+            let mut node = cache.open_raft_node(node_id.clone()).expect("open raft");
+            node.append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/raft-cached".to_string(),
+                    value: b"current".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append raft value");
+            node.commit_to(1).expect("commit raft value");
+        }
+
+        let current = cache
+            .current_store(node_id.clone())
+            .expect("seed raft view cache");
+        assert_eq!(
+            current.get("/raft-cached").expect("raft value").value,
+            b"current"
+        );
+
+        let mut stale_store = InProcessKvStore::new();
+        stale_store
+            .put("/cache-only", b"stale".to_vec(), None)
+            .expect("seed stale cache");
+        cache
+            .write_snapshot(&stale_store.snapshot())
+            .expect("write stale materialized cache");
+        let _held_node = cache
+            .open_raft_node(node_id.clone())
+            .expect("hold raft lock");
+
+        let cached = cache
+            .current_store(node_id)
+            .expect("busy raft should use validated raft view cache");
+        assert!(cached.get("/cache-only").is_none());
+        assert_eq!(
+            cached.get("/raft-cached").expect("cached raft value").value,
+            b"current"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_raft_view_cache_invalidates_after_wal_change() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-local-cache-raft-view-invalidate-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id =
+            NodeId::from_legacy_named("node_local_cache_raft_view_invalidate").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        {
+            let mut node = cache.open_raft_node(node_id.clone()).expect("open raft");
+            let first = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/raft/first".to_string(),
+                        value: b"first".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append first");
+            node.commit_to(first.index).expect("commit first");
+        }
+        let first_view = cache
+            .current_store(node_id.clone())
+            .expect("seed raft view cache");
+        assert!(first_view.get("/raft/first").is_some());
+        assert!(first_view.get("/raft/second").is_none());
+
+        {
+            let mut node = cache.open_raft_node(node_id.clone()).expect("reopen raft");
+            let second = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/raft/second".to_string(),
+                        value: b"second".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append second");
+            node.commit_to(second.index).expect("commit second");
+        }
+
+        let refreshed = cache
+            .current_store(node_id)
+            .expect("read after wal changed");
+        assert!(refreshed.get("/raft/first").is_some());
+        assert!(refreshed.get("/raft/second").is_some());
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -5,8 +5,10 @@ use crate::{
     discover_default_public_ip_candidates, discover_local_ip_candidates_for_targets,
     format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
+use fs2::FileExt;
 use sinomo_kv::cluster_member_key;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
@@ -14,6 +16,9 @@ use std::time::SystemTime;
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
+const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
+const MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES: u64 = 1024 * 1024;
+const MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
@@ -105,6 +110,7 @@ pub struct ClusterPaths {
     pub kv_raft: PathBuf,
     pub kv_watches: PathBuf,
     pub kv_watch_events: PathBuf,
+    pub kv_watch_events_log: PathBuf,
 }
 
 impl ClusterPaths {
@@ -118,6 +124,7 @@ impl ClusterPaths {
             kv_raft: root.join("kv-raft"),
             kv_watches: root.join("watches"),
             kv_watch_events: root.join("watch-events.sobj"),
+            kv_watch_events_log: root.join("watch-events.sobjlog"),
             root,
         }
     }
@@ -1480,7 +1487,7 @@ pub fn create_cluster_kv_watch(
     paths: &ClusterPaths,
     request: ClusterKvWatchPrefixRequest,
 ) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let snapshot = read_cluster_kv_snapshot(paths)?;
+    let snapshot = read_cluster_kv_store(paths)?.snapshot();
     if request.start_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
@@ -1493,6 +1500,7 @@ pub fn create_cluster_kv_watch(
         path: paths.kv_watches.display().to_string(),
         detail: source.to_string(),
     })?;
+    prune_compacted_cluster_kv_watches(paths, snapshot.compacted_revision)?;
     let watch_id = next_cluster_kv_watch_id(paths)?;
     let registration = ClusterKvWatchRegistration {
         watch_id,
@@ -1509,10 +1517,11 @@ pub fn drain_cluster_kv_watch(
 ) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
     let watch_path = cluster_kv_watch_path(paths, request.watch_id);
     let mut registration: ClusterKvWatchRegistration = read_object_file(&watch_path)?;
-    let snapshot = read_cluster_kv_snapshot(paths)?;
+    let snapshot = read_cluster_kv_store(paths)?.snapshot();
     if registration.next_revision <= snapshot.compacted_revision
         && snapshot.compacted_revision != KvRevision::ZERO
     {
+        remove_cluster_kv_watch_file(&watch_path);
         return Err(NetworkError::Kv(KvError::Compacted {
             requested: registration.next_revision,
             compacted: snapshot.compacted_revision,
@@ -1551,15 +1560,35 @@ pub fn append_cluster_kv_watch_events(
     if incoming.is_empty() {
         return Ok(0);
     }
-    if let Some(parent) = paths.kv_watch_events.parent() {
-        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
-            path: parent.display().to_string(),
+    let mut log_file = open_cluster_kv_watch_event_log_for_append(paths)?;
+    log_file
+        .lock_exclusive()
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
             detail: source.to_string(),
         })?;
+    let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
+    let log = read_cluster_kv_watch_event_log_from_file(paths, &mut log_file)?;
+    let log_was_truncated = log.truncated;
+    let log_records = if log_was_truncated {
+        0
+    } else {
+        log.events.len()
+    };
+    let mut existing =
+        compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
+    if log_was_truncated {
+        write_cluster_kv_watch_event_checkpoint(paths, &existing)?;
+        truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
     }
-    let mut existing = cluster_kv_watch_events(paths)?;
+    let mut appended = Vec::new();
     let mut stored = 0;
     for event in incoming {
+        if existing.first().is_some_and(|first| {
+            existing.len() >= MAX_CLUSTER_KV_WATCH_EVENTS && event.revision < first.revision
+        }) {
+            continue;
+        }
         if existing.iter().any(|candidate| {
             candidate.revision == event.revision
                 && candidate.key == event.key
@@ -1568,25 +1597,45 @@ pub fn append_cluster_kv_watch_events(
             continue;
         }
         existing.push(event.clone());
+        appended.push(event.clone());
         stored += 1;
     }
-    if existing.len() > MAX_CLUSTER_KV_WATCH_EVENTS {
-        let retained = existing.split_off(existing.len() - MAX_CLUSTER_KV_WATCH_EVENTS);
-        write_cluster_kv_watch_events(paths, &retained)?;
-    } else if stored > 0 {
-        write_cluster_kv_watch_events(paths, &existing)?;
+    if appended.is_empty() {
+        return Ok(0);
+    }
+    append_cluster_kv_watch_event_log_to_file(paths, &mut log_file, &appended)?;
+    let should_compact = log_records.saturating_add(appended.len())
+        >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
+        || log_file
+            .metadata()
+            .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
+            .unwrap_or(false);
+    if should_compact {
+        let retained = compact_cluster_kv_watch_events(existing);
+        write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
+        truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
     }
     Ok(stored)
 }
 
 pub fn cluster_kv_watch_events(paths: &ClusterPaths) -> Result<Vec<KvEvent>, NetworkError> {
+    let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
+    let log = read_cluster_kv_watch_event_log(paths)?;
+    Ok(compact_cluster_kv_watch_events(
+        checkpoint.into_iter().chain(log.events).collect(),
+    ))
+}
+
+fn read_cluster_kv_watch_event_checkpoint(
+    paths: &ClusterPaths,
+) -> Result<Vec<KvEvent>, NetworkError> {
     if !paths.kv_watch_events.exists() {
         return Ok(Vec::new());
     }
     read_object_file(&paths.kv_watch_events)
 }
 
-fn write_cluster_kv_watch_events(
+fn write_cluster_kv_watch_event_checkpoint(
     paths: &ClusterPaths,
     events: &[KvEvent],
 ) -> Result<(), NetworkError> {
@@ -1601,8 +1650,253 @@ fn write_cluster_kv_watch_events(
     write_object_file(&paths.kv_watch_events, &events)
 }
 
+#[derive(Default)]
+struct ClusterKvWatchEventLogRead {
+    events: Vec<KvEvent>,
+    truncated: bool,
+}
+
+fn read_cluster_kv_watch_event_log(
+    paths: &ClusterPaths,
+) -> Result<ClusterKvWatchEventLogRead, NetworkError> {
+    if !paths.kv_watch_events_log.exists() {
+        return Ok(ClusterKvWatchEventLogRead::default());
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .open(&paths.kv_watch_events_log)
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.lock_shared()
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    read_cluster_kv_watch_event_log_from_file(paths, &mut file)
+}
+
+fn read_cluster_kv_watch_event_log_from_file(
+    paths: &ClusterPaths,
+    file: &mut fs::File,
+) -> Result<ClusterKvWatchEventLogRead, NetworkError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if let Some(observer) = io_observer() {
+        observer.on_disk_read(bytes.len() as u64);
+    }
+    let mut events = Vec::new();
+    let mut offset = 0;
+    let mut record_number = 0;
+    while offset < bytes.len() {
+        record_number += 1;
+        if bytes.len().saturating_sub(offset) < 4 {
+            eprintln!(
+                "warning: ignoring partial cluster kv watch-event log record {} in {}",
+                record_number,
+                paths.kv_watch_events_log.display()
+            );
+            return Ok(ClusterKvWatchEventLogRead {
+                events,
+                truncated: true,
+            });
+        }
+        let len = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        offset += 4;
+        if len == 0
+            || len > MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES
+            || bytes.len().saturating_sub(offset) < len
+        {
+            eprintln!(
+                "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
+                record_number,
+                paths.kv_watch_events_log.display()
+            );
+            return Ok(ClusterKvWatchEventLogRead {
+                events,
+                truncated: true,
+            });
+        }
+        let event = SinomoObjectCodec::default().decode(&bytes[offset..offset + len])?;
+        events.push(event);
+        offset += len;
+    }
+    Ok(ClusterKvWatchEventLogRead {
+        events,
+        truncated: false,
+    })
+}
+
+fn open_cluster_kv_watch_event_log_for_append(
+    paths: &ClusterPaths,
+) -> Result<fs::File, NetworkError> {
+    let parent = paths
+        .kv_watch_events_log
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
+        path: parent.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn append_cluster_kv_watch_event_log_to_file(
+    paths: &ClusterPaths,
+    file: &mut fs::File,
+    events: &[KvEvent],
+) -> Result<(), NetworkError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut written = 0_u64;
+    for event in events {
+        let record = SinomoObjectCodec::default().encode(event)?;
+        let len = u32::try_from(record.len()).map_err(|_| NetworkError::Serialization {
+            detail: format!(
+                "cluster kv watch-event log record for {} exceeds u32 length",
+                paths.kv_watch_events_log.display()
+            ),
+        })?;
+        file.write_all(&len.to_be_bytes())
+            .and_then(|()| file.write_all(&record))
+            .map_err(|source| NetworkError::StorageIo {
+                path: paths.kv_watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        written = written.saturating_add(4 + record.len() as u64);
+    }
+    file.sync_data().map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if let Some(observer) = io_observer() {
+        observer.on_disk_write(written);
+    }
+    Ok(())
+}
+
+fn truncate_cluster_kv_watch_event_log_file(
+    paths: &ClusterPaths,
+    file: &mut fs::File,
+) -> Result<(), NetworkError> {
+    file.set_len(0).map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.sync_data().map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(())
+}
+
+fn compact_cluster_kv_watch_events(mut events: Vec<KvEvent>) -> Vec<KvEvent> {
+    events.sort_by(|left, right| {
+        (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
+    });
+    events.dedup_by(|left, right| {
+        left.revision == right.revision && left.key == right.key && left.kind == right.kind
+    });
+    if events.len() > MAX_CLUSTER_KV_WATCH_EVENTS {
+        let mut split_at = events.len() - MAX_CLUSTER_KV_WATCH_EVENTS;
+        let retained_revision = events[split_at].revision;
+        while split_at > 0 && events[split_at - 1].revision == retained_revision {
+            split_at -= 1;
+        }
+        events.split_off(split_at)
+    } else {
+        events
+    }
+}
+
 fn cluster_kv_watch_path(paths: &ClusterPaths, watch_id: WatchId) -> PathBuf {
     paths.kv_watches.join(format!("watch-{}.sobj", watch_id.0))
+}
+
+fn remove_cluster_kv_watch_file(path: &PathBuf) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => eprintln!(
+            "warning: could not remove stale cluster kv watch registration {}: {}",
+            path.display(),
+            source
+        ),
+    }
+}
+
+fn prune_compacted_cluster_kv_watches(
+    paths: &ClusterPaths,
+    compacted_revision: KvRevision,
+) -> Result<usize, NetworkError> {
+    if compacted_revision == KvRevision::ZERO || !paths.kv_watches.exists() {
+        return Ok(0);
+    }
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
+        path: paths.kv_watches.display().to_string(),
+        detail: source.to_string(),
+    })? {
+        let entry = entry.map_err(|source| NetworkError::StorageIo {
+            path: paths.kv_watches.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if cluster_kv_watch_id_from_file_name(&name).is_none() {
+            continue;
+        }
+        let path = entry.path();
+        match read_object_file::<ClusterKvWatchRegistration>(&path) {
+            Ok(registration) if registration.next_revision <= compacted_revision => {
+                remove_cluster_kv_watch_file(&path);
+                removed = removed.saturating_add(1);
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "warning: ignoring unreadable cluster kv watch registration {}: {}",
+                path.display(),
+                error
+            ),
+        }
+    }
+    Ok(removed)
+}
+
+fn cluster_kv_watch_id_from_file_name(name: &str) -> Option<u64> {
+    name.strip_prefix("watch-")
+        .and_then(|name| name.strip_suffix(".sobj"))
+        .and_then(|id| id.parse::<u64>().ok())
 }
 
 fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkError> {
@@ -1619,11 +1913,7 @@ fn next_cluster_kv_watch_id(paths: &ClusterPaths) -> Result<WatchId, NetworkErro
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
-            if let Some(id) = name
-                .strip_prefix("watch-")
-                .and_then(|name| name.strip_suffix(".sobj"))
-                .and_then(|id| id.parse::<u64>().ok())
-            {
+            if let Some(id) = cluster_kv_watch_id_from_file_name(&name) {
                 max_id = max_id.max(id);
             }
         }

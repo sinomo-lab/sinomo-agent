@@ -48,6 +48,11 @@ pub fn register_storage_paths(
             STORAGE_CONTRACT_OBJECT_VERSION,
         ),
     )?;
+    layout.register_object_log(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watch-events.sobjlog",
+    )?;
     layout.register_sinomo_object(
         "sinomo-network",
         StorageRing::R1,

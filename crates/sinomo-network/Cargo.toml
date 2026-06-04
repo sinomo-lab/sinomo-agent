@@ -18,6 +18,7 @@ iroh-transport = ["dep:iroh"]
 [dependencies]
 base64 = "0.22"
 blake3.workspace = true
+fs2.workspace = true
 ring = "0.17"
 serde.workspace = true
 serde_bytes.workspace = true

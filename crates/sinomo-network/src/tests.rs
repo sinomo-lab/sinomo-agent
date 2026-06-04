@@ -11,11 +11,12 @@ use sinomo_core::{
 };
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
-    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvEventKind, KvOp, KvRevision, KvSnapshot,
-    KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot, cluster_member_key,
+    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvRevision,
+    KvSnapshot, KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot, cluster_member_key,
 };
 use sinomo_node::NodeId;
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
@@ -4032,6 +4033,497 @@ fn cluster_kv_watch_event_log_is_bounded() {
     assert_eq!(
         retained.last().expect("last retained").revision,
         KvRevision(MAX_CLUSTER_KV_WATCH_EVENTS as u64 + 10)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/append".to_string(),
+        kind: KvEventKind::Put {
+            value: b"value".to_vec(),
+        },
+    };
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("append watch event"),
+        1
+    );
+    assert!(
+        paths.kv_watch_events_log.exists(),
+        "new watch events should append to the log"
+    );
+    assert!(
+        !paths.kv_watch_events.exists(),
+        "small batches should not rewrite the compacted checkpoint"
+    );
+    let log_len = std::fs::metadata(&paths.kv_watch_events_log)
+        .expect("watch event log metadata")
+        .len();
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("duplicate watch event"),
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(&paths.kv_watch_events_log)
+            .expect("watch event log metadata after duplicate")
+            .len(),
+        log_len,
+        "duplicate batches should not append more log bytes"
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read watch events"),
+        vec![event]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-compact-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let events = (0..(MAX_CLUSTER_KV_WATCH_EVENTS * 2))
+        .map(|index| KvEvent {
+            revision: KvRevision(index as u64 + 1),
+            key: format!("/watch/compact/{index}"),
+            kind: KvEventKind::Put {
+                value: index.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, &events).expect("append watch events"),
+        events.len()
+    );
+
+    let retained = cluster_kv_watch_events(&paths).expect("read compacted watch events");
+    assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
+    assert_eq!(
+        retained.first().expect("first retained").revision,
+        KvRevision(MAX_CLUSTER_KV_WATCH_EVENTS as u64 + 1)
+    );
+    assert!(
+        paths.kv_watch_events.exists(),
+        "large batches should rewrite a bounded checkpoint"
+    );
+    assert_eq!(
+        std::fs::metadata(&paths.kv_watch_events_log)
+            .expect("watch event log metadata")
+            .len(),
+        0,
+        "compaction should clear the append log after checkpointing"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_keeps_complete_boundary_revision() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-boundary-revision-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let mut events = (1..=(MAX_CLUSTER_KV_WATCH_EVENTS as u64 + 10))
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/boundary/{revision:03}"),
+            kind: KvEventKind::Put {
+                value: revision.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    events.push(KvEvent {
+        revision: KvRevision(11),
+        key: "/watch/boundary/011-extra".to_string(),
+        kind: KvEventKind::Put {
+            value: b"extra".to_vec(),
+        },
+    });
+
+    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+
+    let retained = cluster_kv_watch_events(&paths).expect("read retained events");
+    assert_eq!(
+        retained.first().expect("first retained").revision,
+        KvRevision(11)
+    );
+    assert_eq!(
+        retained
+            .iter()
+            .filter(|event| event.revision == KvRevision(11))
+            .count(),
+        2,
+        "all events in the boundary revision should be retained together"
+    );
+    assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS + 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-drop-stale-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let events = (1..=(MAX_CLUSTER_KV_WATCH_EVENTS as u64 * 2))
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/drop-stale/{revision:03}"),
+            kind: KvEventKind::Put {
+                value: revision.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    append_cluster_kv_watch_events(&paths, &events).expect("append watch events");
+    let log_len = std::fs::metadata(&paths.kv_watch_events_log)
+        .expect("watch event log metadata")
+        .len();
+    let stale = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/drop-stale/001".to_string(),
+        kind: KvEventKind::Put {
+            value: b"stale".to_vec(),
+        },
+    };
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&stale))
+            .expect("append stale watch event"),
+        0
+    );
+    assert_eq!(
+        std::fs::metadata(&paths.kv_watch_events_log)
+            .expect("watch event log metadata after stale")
+            .len(),
+        log_len,
+        "stale delayed events should not add write amplification"
+    );
+    assert!(
+        !cluster_kv_watch_events(&paths)
+            .expect("read watch events")
+            .contains(&stale)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-partial-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/partial/1".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/partial/2".to_string(),
+        kind: KvEventKind::Put {
+            value: b"two".to_vec(),
+        },
+    };
+
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first)).expect("append first");
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.kv_watch_events_log)
+        .expect("open watch event log");
+    log.write_all(&16_u32.to_be_bytes())
+        .expect("write partial length");
+    log.write_all(b"partial").expect("write partial body");
+    log.sync_data().expect("sync partial tail");
+    drop(log);
+
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&second))
+            .expect("append after partial tail"),
+        1
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read repaired events"),
+        vec![first, second]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-concurrent-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/concurrent".to_string(),
+        kind: KvEventKind::Put {
+            value: b"value".to_vec(),
+        },
+    };
+    let threads = 8;
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles = (0..threads)
+        .map(|_| {
+            let paths = paths.clone();
+            let event = event.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+                    .expect("append duplicate watch event")
+            })
+        })
+        .collect::<Vec<_>>();
+    let stored = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("append thread"))
+        .sum::<usize>();
+
+    assert_eq!(stored, 1);
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read concurrent events"),
+        vec![event]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-current-raft-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_watch_current_raft").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_watch_current_raft").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "watch current raft",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/watch/current".to_string(),
+            value: b"current".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("append current raft value");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("overwrite stale materialized snapshot");
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+        },
+    )
+    .expect("drain watch");
+
+    assert!(
+        drained
+            .events
+            .iter()
+            .any(|event| event.key == "/watch/current")
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_removes_compacted_registration() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-compacted-drain-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let watch_path = paths
+        .kv_watches
+        .join(format!("watch-{}.sobj", watch.watch_id.0));
+    assert!(watch_path.exists(), "watch registration should exist");
+
+    let mut compacted = InProcessKvStore::new();
+    compacted
+        .put("/watch/old", b"old".to_vec(), None)
+        .expect("put compacted value");
+    compacted.compact(KvRevision(1)).expect("compact store");
+    write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
+
+    let error = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+        },
+    )
+    .expect_err("compacted watch");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::Compacted {
+            requested: KvRevision(1),
+            compacted: KvRevision(1),
+        })
+    ));
+    assert!(
+        !watch_path.exists(),
+        "compacted watch registration should be removed after failed drain"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_prunes_compacted_registrations() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-compacted-create-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let stale = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create stale watch");
+    let live = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/".to_string(),
+            start_revision: KvRevision(2),
+        },
+    )
+    .expect("create live watch");
+    let stale_path = paths
+        .kv_watches
+        .join(format!("watch-{}.sobj", stale.watch_id.0));
+    let live_path = paths
+        .kv_watches
+        .join(format!("watch-{}.sobj", live.watch_id.0));
+    assert!(stale_path.exists(), "stale watch registration should exist");
+    assert!(live_path.exists(), "live watch registration should exist");
+
+    let mut compacted = InProcessKvStore::new();
+    compacted
+        .put("/watch/old", b"old".to_vec(), None)
+        .expect("put compacted value");
+    compacted.compact(KvRevision(1)).expect("compact store");
+    write_cluster_kv_snapshot(&paths, &compacted.snapshot()).expect("write compacted snapshot");
+
+    let newest = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/".to_string(),
+            start_revision: KvRevision(2),
+        },
+    )
+    .expect("create watch after compaction");
+    let newest_path = paths
+        .kv_watches
+        .join(format!("watch-{}.sobj", newest.watch_id.0));
+
+    assert!(
+        !stale_path.exists(),
+        "watch registrations behind the compaction floor should be pruned"
+    );
+    assert!(
+        live_path.exists(),
+        "watch registrations newer than the compaction floor should be kept"
+    );
+    assert!(newest_path.exists(), "new watch registration should exist");
+    assert!(
+        newest.watch_id > live.watch_id,
+        "new watch ids should continue after retained registrations"
     );
     std::fs::remove_dir_all(root).ok();
 }
