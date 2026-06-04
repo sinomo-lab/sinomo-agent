@@ -73,6 +73,8 @@ pub enum AgentToolKind {
     WriteFile,
     SearchFiles,
     ApplyPatch,
+    ChangedFiles,
+    GitDiff,
     ConfigSearch,
     ConfigGet,
     ConfigSet,
@@ -364,6 +366,18 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             "apply_patch",
             "Apply a scoped workspace patch. Format: `*** Begin Patch`, one or more file hunks (`*** Add File: path`, `*** Update File: path`, or `*** Delete File: path`), then `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` and lines prefixed with space, `-`, or `+`; do not use git unified range headers.",
             true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ChangedFiles,
+            "changed_files",
+            "List workspace files changed relative to version control, including staged, unstaged, renamed, deleted, and untracked files.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::GitDiff,
+            "git_diff",
+            "Return a bounded version-control diff summary for the workspace and an evidence ref for the full diff when it is large.",
+            false,
         ),
         AgentToolSpec::new(
             AgentToolKind::RunShellCommand,

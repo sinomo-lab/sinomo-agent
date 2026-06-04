@@ -1,5 +1,7 @@
 mod apply_patch;
+mod changed_files;
 mod command_session;
+mod git_diff;
 mod read_file;
 mod request_user_input;
 mod run_command;
@@ -87,6 +89,8 @@ pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
         .with_tool(read_file::ReadFileTool::new(config.clone()))
         .with_tool(search::SearchFilesTool::new(config.clone()))
         .with_tool(apply_patch::ApplyPatchTool::new(config.clone()))
+        .with_tool(changed_files::ChangedFilesTool::new(config.clone()))
+        .with_tool(git_diff::GitDiffTool::new(config.clone()))
         .with_tool(run_command::RunCommandTool::new(config.clone()))
         .with_tool(command_session::StartCommandSessionTool::new(
             config.clone(),
@@ -112,6 +116,8 @@ pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
         read_file::descriptor(),
         search::descriptor(),
         apply_patch::descriptor(),
+        changed_files::descriptor(),
+        git_diff::descriptor(),
         run_command::descriptor(),
         command_session::start_descriptor(),
         command_session::inspect_descriptor(),

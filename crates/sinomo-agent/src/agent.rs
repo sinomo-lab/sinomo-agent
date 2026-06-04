@@ -6384,6 +6384,17 @@ mod tests {
             .unwrap_or_default()
     }
 
+    fn run_git_for_test<const N: usize>(root: &Path, args: [&str; N]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git command failed");
+    }
+
     #[test]
     fn agent_config_defaults_to_unlimited_runtime_limits() {
         let config = AgentConfig::new("fake", "fake");
@@ -7928,6 +7939,8 @@ mod tests {
             "read_file",
             "search",
             "apply_patch",
+            "changed_files",
+            "git_diff",
             "run_command",
             "start_command_session",
             "inspect_command_session",
@@ -8325,6 +8338,80 @@ mod tests {
         assert_eq!(search.status, AgentToolStatus::Succeeded);
         assert!(search.evidence.output.model_visible_bytes > 0);
         assert!(!search.evidence.output.truncated);
+    }
+
+    #[test]
+    fn local_workspace_registry_reports_changed_files_and_git_diff() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-git-tools-{}", TaskId::generate()));
+        let evidence_dir = root.join("evidence");
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("hello.txt"), "old\n").expect("seed file");
+        run_git_for_test(&root, ["init"]);
+        run_git_for_test(&root, ["config", "user.email", "sinomo@example.invalid"]);
+        run_git_for_test(&root, ["config", "user.name", "Sinomo Test"]);
+        run_git_for_test(&root, ["add", "hello.txt"]);
+        run_git_for_test(&root, ["commit", "-m", "seed"]);
+        fs::write(root.join("hello.txt"), "new\n").expect("modify file");
+        fs::write(root.join("new.txt"), "untracked\n").expect("untracked file");
+        let registry = AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root).with_evidence_dir(&evidence_dir),
+        );
+        let input = agent_input("inspect git state");
+
+        let changed = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "changed_files".to_string(),
+                input: serde_json::json!({}),
+                r#async: false,
+                summary: "List changes.".to_string(),
+            },
+        );
+        assert_eq!(changed.status, AgentToolStatus::Succeeded);
+        let paths = changed
+            .output
+            .get("paths")
+            .and_then(serde_json::Value::as_array)
+            .expect("paths");
+        assert!(paths.iter().any(|path| path == "hello.txt"));
+        assert!(paths.iter().any(|path| path == "new.txt"));
+
+        let diff = registry.execute(
+            &input.session,
+            0,
+            1,
+            &AgentToolCall {
+                tool: "git_diff".to_string(),
+                input: serde_json::json!({ "max_bytes": 4096 }),
+                r#async: false,
+                summary: "Read diff.".to_string(),
+            },
+        );
+        assert_eq!(diff.status, AgentToolStatus::Succeeded);
+        assert!(
+            diff.output
+                .get("diff")
+                .and_then(serde_json::Value::as_str)
+                .expect("diff")
+                .contains("-old")
+        );
+        let diff_ref = diff
+            .output
+            .get("full_diff_ref")
+            .and_then(serde_json::Value::as_str)
+            .expect("full diff ref");
+        assert!(Path::new(diff_ref).exists());
+        let coding = coding_evidence(&diff.evidence);
+        assert_eq!(coding.changed_files, vec!["hello.txt".to_string()]);
+        assert!(
+            coding
+                .diff_ref
+                .as_deref()
+                .is_some_and(|path| Path::new(path).exists())
+        );
     }
 
     #[test]
