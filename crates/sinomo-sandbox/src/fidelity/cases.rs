@@ -1,4 +1,4 @@
-use super::{SandboxBusyBoxFidelityCase, SandboxCommandFidelityCase, SandboxQuickJsFidelityCase};
+use super::{SandboxBusyBoxFidelityCase, SandboxCommandFidelityCase};
 use crate::{
     BASH_TOOLCHAIN_COMMAND, MAKE_TOOLCHAIN_COMMAND, MAKEPKG_TOOLCHAIN_COMMAND,
     PIP_TOOLCHAIN_COMMAND, PYTHON_TOOLCHAIN_COMMAND, SH_TOOLCHAIN_COMMAND, TCC_TOOLCHAIN_COMMAND,
@@ -416,75 +416,6 @@ pub const BUSYBOX_TOOLCHAIN_FIDELITY_CASES: &[SandboxBusyBoxFidelityCase] = &[
         stdin: None,
         expected_stdout: "",
         expected_exit_status: 0,
-    },
-];
-pub const QUICKJS_TOOLCHAIN_FIDELITY_CASES: &[SandboxQuickJsFidelityCase] = &[
-    SandboxQuickJsFidelityCase {
-        name: "eval-console-log",
-        argv: &["qjs", "-e", "console.log(1 + 1)"],
-        setup_files: &[],
-        expected_stdout: "2\n",
-        expected_stderr_contains: None,
-        expected_exit_status: 0,
-    },
-    SandboxQuickJsFidelityCase {
-        name: "json-and-array-runtime",
-        argv: &["qjs", "-e", "console.log(JSON.stringify([3, 1, 2].sort()))"],
-        setup_files: &[],
-        expected_stdout: "[1,2,3]\n",
-        expected_stderr_contains: None,
-        expected_exit_status: 0,
-    },
-    SandboxQuickJsFidelityCase {
-        name: "sandbox-file-io",
-        argv: &[
-            "qjs",
-            "--std",
-            "-e",
-            "let f=std.open('/work/quickjs-fixture.txt','r'); console.log(f.readAsString().trim()); f.close();",
-        ],
-        setup_files: &[("/work/quickjs-fixture.txt", "sinomo quickjs\n")],
-        expected_stdout: "sinomo quickjs\n",
-        expected_stderr_contains: None,
-        expected_exit_status: 0,
-    },
-    SandboxQuickJsFidelityCase {
-        name: "module-import",
-        argv: &["qjs", "/work/quickjs-main.mjs"],
-        setup_files: &[
-            (
-                "/work/quickjs-lib.mjs",
-                "export function value() { return 42; }\n",
-            ),
-            (
-                "/work/quickjs-main.mjs",
-                "import { value } from './quickjs-lib.mjs'; console.log(value());\n",
-            ),
-        ],
-        expected_stdout: "42\n",
-        expected_stderr_contains: None,
-        expected_exit_status: 0,
-    },
-    SandboxQuickJsFidelityCase {
-        name: "process-spawn-unsupported",
-        argv: &[
-            "qjs",
-            "--std",
-            "-e",
-            "let f=std.popen('echo forbidden','r'); console.log(f === null ? 'unsupported' : 'opened');",
-        ],
-        setup_files: &[],
-        expected_stdout: "unsupported\n",
-        expected_stderr_contains: None,
-        expected_exit_status: 0,
-    },
-    SandboxQuickJsFidelityCase {
-        name: "runtime-error-reports-stderr",
-        argv: &["qjs", "-e", "throw new Error('sinomo failure')"],
-        setup_files: &[],
-        expected_stdout: "",
-        expected_stderr_contains: Some("sinomo failure"),
-        expected_exit_status: 1,
     },
 ];
 pub const BASH_TOOLCHAIN_FIDELITY_CASES: &[SandboxCommandFidelityCase] = &[

@@ -43,17 +43,16 @@ use super::{
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_propose_options, parse_provider_command, parse_rollout_command, parse_sandbox_command,
     parse_slash_command, parse_uninstall_options, parse_usage_options, push_unique_introducer,
-    quickjs_setup_script, read_cluster_kv_snapshot, read_cluster_members_from_kv,
-    read_cluster_node_statuses_from_kv, read_cluster_rollout_status, read_cluster_state,
-    refresh_daemon_node_status_in_kv, require_cluster_runtime_quorum_with_paths_and_daemon,
-    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
-    rollout_endpoint_candidates, rollout_progress_bar, rollout_status_matches_expectation,
-    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
-    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
-    rollout_terminal_response, run_evolve_command, run_shadow_daemon_with_paths,
-    run_tui_with_handler_io, run_tui_with_handler_io_and_daemon, sandbox_cat_with_store,
-    sandbox_checkpoint_with_store, sandbox_config_with_store, sandbox_create_with_store,
-    sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
+    read_cluster_kv_snapshot, read_cluster_members_from_kv, read_cluster_node_statuses_from_kv,
+    read_cluster_rollout_status, read_cluster_state, refresh_daemon_node_status_in_kv,
+    require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
+    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
+    rollout_progress_bar, rollout_status_matches_expectation, rollout_target_endpoint_for_main,
+    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
+    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_evolve_command,
+    run_shadow_daemon_with_paths, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
+    sandbox_cat_with_store, sandbox_checkpoint_with_store, sandbox_config_with_store,
+    sandbox_create_with_store, sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
     sandbox_doctor_findings_with_stores_and_events,
     sandbox_fetch_with_store_transport_and_event_store, sandbox_ls_with_store,
     sandbox_policy_uses_cluster, sandbox_reboot_with_store, sandbox_resume_with_store,
@@ -575,7 +574,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
         sandbox_id.to_string(),
         "--allow-unsigned".to_string(),
         "--allow-capability".to_string(),
-        "preview1.pinned-subprocess".to_string(),
+        "wasix.unpinned-child-exec".to_string(),
         "python".to_string(),
         "--".to_string(),
         "-m".to_string(),
@@ -594,7 +593,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
     assert!(options.allow_unsigned);
     assert_eq!(
         options.allowed_capabilities,
-        vec!["preview1.pinned-subprocess"]
+        vec!["wasix.unpinned-child-exec"]
     );
     assert_eq!(options.argv, vec!["python", "-m", "pip", "--version"]);
     assert_eq!(options.execution, super::SandboxRunExecution::Local);
@@ -605,7 +604,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
             sandbox_id.to_string(),
             "--daemon".to_string(),
             "--allow-capability".to_string(),
-            "preview1.pinned-subprocess".to_string(),
+            "wasix.unpinned-child-exec".to_string(),
             "python".to_string(),
         ]),
         Err(CliError::Parse { .. })
@@ -615,7 +614,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
             "run".to_string(),
             sandbox_id.to_string(),
             "--allow-capability".to_string(),
-            "preview1.pinned-subprocess".to_string(),
+            "wasix.unpinned-child-exec".to_string(),
             "--wasm".to_string(),
             "/tmp/hello.wasm".to_string(),
         ]),
@@ -906,14 +905,14 @@ fn sandbox_toolchain_hash_parser_accepts_file() {
     let command = parse_sandbox_command(&[
         "toolchain".to_string(),
         "hash".to_string(),
-        "/tmp/qjs.wasm".to_string(),
+        "/tmp/script.wasm".to_string(),
     ])
     .expect("hash");
 
     let SandboxCliCommand::ToolchainHash(options) = command else {
         panic!("expected toolchain hash");
     };
-    assert_eq!(options.path, PathBuf::from("/tmp/qjs.wasm"));
+    assert_eq!(options.path, PathBuf::from("/tmp/script.wasm"));
 }
 
 #[test]
@@ -927,7 +926,7 @@ fn sandbox_module_artifact_parser_accepts_component_register() {
         artifact_id.to_string(),
         "--component-model".to_string(),
         "--abi".to_string(),
-        "preview1".to_string(),
+        "wasix".to_string(),
         "--sandbox".to_string(),
         sandbox_id.to_string(),
         "--argv".to_string(),
@@ -961,10 +960,7 @@ fn sandbox_module_artifact_parser_accepts_component_register() {
         Some(sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION)
     );
     assert!(options.component_model);
-    assert_eq!(
-        options.abi,
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1
-    );
+    assert_eq!(options.abi, sinomo_runtime::sandbox::SandboxWasiAbi::Wasix);
     assert_eq!(options.sandbox_id, Some(sandbox_id));
     assert_eq!(options.argv, vec!["component.wasm"]);
     assert_eq!(options.cwd.expect("cwd").as_str(), "/work");
@@ -1199,14 +1195,6 @@ fn sandbox_toolchain_busybox_plan_reports_known_mvp_gaps() {
 }
 
 #[test]
-fn sandbox_toolchain_quickjs_plan_parser_accepts_command() {
-    let command = parse_sandbox_command(&["toolchain".to_string(), "quickjs-plan".to_string()])
-        .expect("quickjs plan");
-
-    assert_eq!(command, SandboxCliCommand::ToolchainQuickJsPlan);
-}
-
-#[test]
 fn sandbox_toolchain_python_plan_parser_accepts_command() {
     let command = parse_sandbox_command(&["toolchain".to_string(), "python-plan".to_string()])
         .expect("python plan");
@@ -1215,7 +1203,7 @@ fn sandbox_toolchain_python_plan_parser_accepts_command() {
 }
 
 #[test]
-fn sandbox_toolchain_python_plan_reports_wasip1_gate() {
+fn sandbox_toolchain_python_plan_reports_wasix_gate() {
     let plan = sandbox_toolchain_python_plan_text();
     assert!(plan.contains("  python\n"));
     assert!(plan.contains("  pip\n"));
@@ -1234,25 +1222,20 @@ fn sandbox_toolchain_python_plan_reports_wasip1_gate() {
 }
 
 #[test]
-fn sandbox_python_verifier_script_tracks_mediated_pip_resolver_cases() {
-    let script = include_str!("../../sinomo-sandbox/toolchains/python/verify-python-wasi.sh");
+fn sandbox_python_wasix_native_verifier_script_tracks_active_gate() {
+    let script =
+        include_str!("../../sinomo-sandbox/toolchains/python/verify-python-wasix-native.sh");
 
-    assert!(script.contains("sinomo-dependency-fixture==0.0.0"));
-    assert!(script.contains("data-requires-python"));
-    assert!(script.contains("data-yanked"));
-    assert!(script.contains("sinomo-marker-fixture==0.0.0; python_version"));
-    assert!(script.contains("find_spec('sinomo_marker_fixture') is None"));
-    assert!(script.contains("--constraint /work/pip-constraints.txt"));
-    assert!(script.contains("--require-hashes"));
-    assert!(script.contains("/work/pip-hashes.txt"));
-    assert!(script.contains("/work/pip-bad-hashes.txt"));
-    assert!(script.contains("hash mismatch unexpectedly succeeded"));
-    assert!(script.contains("sinomo-index-fixture[cli]==0.0.0"));
-    assert!(script.contains("sinomo-extra-fixture"));
-    assert!(script.contains("Sinomo.Normalized_Fixture==0.0.0"));
-    assert!(script.contains("sinomo-normalized-fixture"));
-    assert!(script.contains("sinomo-transitive-fixture"));
-    assert!(script.contains("sandboxed pip unexpectedly accessed ambient HTTP package index"));
+    assert!(script.contains("subprocess.run"));
+    assert!(script.contains("Popen"));
+    assert!(script.contains("TimeoutExpired"));
+    assert!(script.contains("--no-index"));
+    assert!(script.contains("--find-links /work/wheelhouse"));
+    assert!(script.contains("numpy matplotlib"));
+    assert!(script.contains("sandbox checkpoint"));
+    assert!(script.contains("sandbox resume"));
+    assert!(script.contains("np.arange(4) ** 2"));
+    assert!(script.contains("matplotlib.use('Agg')"));
 }
 
 #[test]
@@ -1314,38 +1297,6 @@ fn sandbox_toolchain_verify_busybox_parser_accepts_options() {
     .expect("verify busybox daemon");
     let SandboxCliCommand::ToolchainVerifyBusyBox(options) = command else {
         panic!("expected toolchain verify busybox");
-    };
-    assert!(!options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
-}
-
-#[test]
-fn sandbox_toolchain_verify_quickjs_parser_accepts_options() {
-    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let command = parse_sandbox_command(&[
-        "toolchain".to_string(),
-        "verify-quickjs".to_string(),
-        sandbox_id.to_string(),
-        "--allow-unsigned".to_string(),
-    ])
-    .expect("verify quickjs");
-
-    let SandboxCliCommand::ToolchainVerifyQuickJs(options) = command else {
-        panic!("expected toolchain verify quickjs");
-    };
-    assert_eq!(options.sandbox_id, sandbox_id);
-    assert!(options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
-
-    let command = parse_sandbox_command(&[
-        "toolchain".to_string(),
-        "verify-quickjs".to_string(),
-        sandbox_id.to_string(),
-        "--daemon".to_string(),
-    ])
-    .expect("verify quickjs daemon");
-    let SandboxCliCommand::ToolchainVerifyQuickJs(options) = command else {
-        panic!("expected toolchain verify quickjs");
     };
     assert!(!options.allow_unsigned);
     assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
@@ -1423,7 +1374,6 @@ fn sandbox_toolchain_verify_parser_rejects_daemon_unsigned_override() {
     for command in [
         "verify-bash",
         "verify-busybox",
-        "verify-quickjs",
         "verify-python",
         "verify-coding",
         "verify-make",
@@ -1505,17 +1455,6 @@ fn sandbox_busybox_daemon_toolchain_request_preserves_stdin_and_command() {
     assert_eq!(request.argv, vec!["grep".to_string(), "hell".to_string()]);
     assert_eq!(request.stdin, Some(b"hello\n".to_vec()));
     assert_eq!(request.timeout_ms, 5_000);
-}
-
-#[test]
-fn sandbox_quickjs_setup_script_escapes_paths_and_contents() {
-    let script =
-        quickjs_setup_script(&[("/work/a\"b.txt", "one\\two\nthree")]).expect("setup script");
-
-    assert_eq!(
-        script,
-        "let f=std.open(\"/work/a\\\"b.txt\",'w'); f.puts(\"one\\\\two\\nthree\"); f.close();\n"
-    );
 }
 
 #[test]
@@ -2137,7 +2076,7 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
             "sandbox-run",
             &sinomo_runtime::sandbox::SandboxPolicyDenial::new(
                 "command-capability-denied",
-                "command qjs requires network",
+                "command wget requires network",
             ),
         ))
         .expect("append target policy event");
@@ -2248,7 +2187,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "coding-base-test",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -2295,12 +2234,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         .collect();
     assert_eq!(
         coding_findings.len(),
-        sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS.len()
-    );
-    assert!(
-        coding_findings
-            .iter()
-            .any(|finding| finding.detail.contains("`qjs`"))
+        sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS.len() - 1
     );
     for required in ["bash", "python", "pip"] {
         assert!(
@@ -2311,13 +2245,6 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
             "doctor should report missing required richer toolchain command {required}"
         );
     }
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.code == "rich-toolchain-command-missing"
-                && finding.detail.contains("`qjs`")
-                && finding.detail.contains("build-qjs-wasi.sh"))
-    );
     let planned_rich_targets: Vec<_> = findings
         .iter()
         .filter(|finding| finding.code == "rich-toolchain-target-planned")
@@ -2389,7 +2316,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
             .iter()
             .any(|finding| finding.code == "runtime-budget-supported"
                 && finding.severity == super::SandboxDoctorSeverity::Info
-                && finding.detail.contains("Preview1")
+                && finding.detail.contains("WASIX")
                 && finding.detail.contains("wall-timeout"))
     );
     assert!(
@@ -2495,7 +2422,7 @@ fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "shell-substrate-test",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -3704,7 +3631,7 @@ fn sandbox_run_uses_pinned_toolchain_command() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "test module",
         OffsetDateTime::now_utc(),
     )
@@ -3851,7 +3778,7 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "test process plan",
         OffsetDateTime::now_utc(),
     )
@@ -3983,7 +3910,7 @@ fn sandbox_shell_invokes_pinned_sh_command() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "test shell module",
         OffsetDateTime::now_utc(),
     )
@@ -4064,7 +3991,7 @@ fn sandbox_shell_rejects_toolchain_without_real_sh() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-no-shell",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "test toolchain without shell",
         OffsetDateTime::now_utc(),
     )
@@ -4156,7 +4083,7 @@ fn sandbox_toolchain_add_command_installs_local_command_module() {
         super::SandboxToolchainAddCommandOptions {
             toolchain_id: toolchain_id.clone(),
             version: "test-1".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             command_name: "hello".to_string(),
             module_path: module_path.clone(),
@@ -4179,7 +4106,7 @@ fn sandbox_toolchain_add_command_installs_local_command_module() {
     let command = manifest.command("hello").expect("command");
     assert_eq!(
         command.effective_target_abi(&manifest),
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix
     );
     assert_eq!(command.required_capabilities, vec!["network.http"]);
     assert_eq!(command.default_limits.memory_mb, 64);
@@ -4223,7 +4150,7 @@ fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
             source_path: source_path.clone(),
             interface_version: Some("custom-v0".to_string()),
             component_model: false,
-            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             sandbox_id: Some(sandbox_id.clone()),
             argv: vec!["module.wasm".to_string()],
             cwd: Some(cwd.clone()),
@@ -4260,10 +4187,7 @@ fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
     );
     assert_eq!(artifact.interface_version.as_deref(), Some("custom-v0"));
     assert!(!artifact.component_model);
-    assert_eq!(
-        artifact.abi,
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1
-    );
+    assert_eq!(artifact.abi, sinomo_runtime::sandbox::SandboxWasiAbi::Wasix);
     assert_eq!(artifact.sandbox_id, Some(sandbox_id));
     assert_eq!(artifact.argv, vec!["module.wasm"]);
     assert_eq!(artifact.cwd, Some(cwd));
@@ -4340,7 +4264,7 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
                 sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
             ),
             component_model: false,
-            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             sandbox_id: None,
             argv: Vec::new(),
             cwd: None,
@@ -4580,7 +4504,7 @@ fn self_evolution_module_candidate_flow_advances_to_canary_and_rolls_back() {
                 sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
             ),
             component_model: false,
-            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             sandbox_id: None,
             argv: Vec::new(),
             cwd: None,
@@ -5133,7 +5057,7 @@ fn register_self_evolution_replay_artifact(
                 sinomo_runtime::module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
             ),
             component_model: false,
-            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             sandbox_id: None,
             argv: Vec::new(),
             cwd: None,
@@ -5284,7 +5208,7 @@ fn sandbox_toolchain_verify_package_accepts_valid_package_without_importing() {
     ));
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::create_dir_all(root.join("share")).expect("share");
-    std::fs::write(root.join("bin/qjs.wasm"), b"quickjs wasm").expect("module");
+    std::fs::write(root.join("bin/script.wasm"), b"script wasm").expect("module");
     std::fs::write(root.join("share/runtime.js"), b"export const ok = true;\n").expect("artifact");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
     let package_path = root.join("package.json");
@@ -5292,15 +5216,15 @@ fn sandbox_toolchain_verify_package_accepts_valid_package_without_importing() {
         &package_path,
         serde_json::json!({
             "toolchain_id": toolchain_id,
-            "version": "quickjs-wasi-test",
-            "provenance": "sinomo://toolchains/quickjs/test",
+            "version": "script-wasix-test",
+            "provenance": "sinomo://toolchains/script/test",
             "commands": [{
-                "name": "qjs",
-                "module": "bin/qjs.wasm",
-                "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"quickjs wasm")
+                "name": "script",
+                "module": "bin/script.wasm",
+                "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"script wasm")
             }],
             "artifacts": [{
-                "relative_path": "share/quickjs/runtime.js",
+                "relative_path": "share/script/runtime.js",
                 "file": "share/runtime.js",
                 "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"export const ok = true;\n")
             }]
@@ -5572,7 +5496,7 @@ fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
             .as_nanos()
     ));
     std::fs::create_dir_all(root.join("bin")).expect("bin");
-    std::fs::write(root.join("bin/qjs.wasm"), b"quickjs wasm").expect("module");
+    std::fs::write(root.join("bin/script.wasm"), b"script wasm").expect("module");
     let package_toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
     let target_toolchain_id =
         sinomo_runtime::sandbox::SandboxToolchainId::from_legacy_named("toolchain_busybox")
@@ -5582,14 +5506,14 @@ fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
         &package_path,
         serde_json::json!({
             "toolchain_id": package_toolchain_id,
-            "version": "quickjs-wasi-test",
-            "target_abi": "preview1",
-            "provenance": "sinomo://toolchains/quickjs/test",
+            "version": "script-wasix-test",
+            "target_abi": "wasix",
+            "provenance": "sinomo://toolchains/script/test",
             "commands": [{
-                "name": "qjs",
-                "module": "bin/qjs.wasm",
+                "name": "script",
+                "module": "bin/script.wasm",
                 "target_abi": "wasix",
-                "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"quickjs wasm")
+                "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"script wasm")
             }],
             "artifacts": []
         })
@@ -5601,7 +5525,7 @@ fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
     let mut manifest = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         target_toolchain_id.clone(),
         "busybox-wasi-test",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "sinomo://toolchains/busybox/test",
         OffsetDateTime::now_utc(),
     )
@@ -5631,21 +5555,21 @@ fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
     assert_eq!(manifest.version, "busybox-wasi-test");
     assert_eq!(
         manifest.target_abi,
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix
     );
     assert!(manifest.command("cat").is_ok());
     assert_eq!(
         manifest
-            .command("qjs")
-            .expect("qjs")
+            .command("script")
+            .expect("script")
             .effective_target_abi(&manifest),
         sinomo_runtime::sandbox::SandboxWasiAbi::Wasix
     );
     assert_eq!(
         toolchain_store
-            .load_command_module(&manifest, "qjs")
+            .load_command_module(&manifest, "script")
             .expect("module"),
-        b"quickjs wasm"
+        b"script wasm"
     );
     assert!(matches!(
         toolchain_store.load_manifest(&package_toolchain_id),
@@ -5664,7 +5588,7 @@ fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
             .as_nanos()
     ));
     std::fs::create_dir_all(root.join("bin")).expect("bin");
-    std::fs::write(root.join("bin/qjs.wasm"), b"quickjs wasm").expect("qjs");
+    std::fs::write(root.join("bin/script.wasm"), b"script wasm").expect("script");
     std::fs::write(root.join("bin/cat.wasm"), b"duplicate cat").expect("cat");
     let target_toolchain_id =
         sinomo_runtime::sandbox::SandboxToolchainId::from_legacy_named("toolchain_busybox")
@@ -5678,9 +5602,9 @@ fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
             "provenance": "unit test",
             "commands": [
                 {
-                    "name": "qjs",
-                    "module": "bin/qjs.wasm",
-                    "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"quickjs wasm")
+                    "name": "script",
+                    "module": "bin/script.wasm",
+                    "content_hash": sinomo_runtime::sandbox::sandbox_module_hash(b"script wasm")
                 },
                 {
                     "name": "cat",
@@ -5698,7 +5622,7 @@ fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
     let mut manifest = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         target_toolchain_id.clone(),
         "busybox-wasi-test",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test base",
         OffsetDateTime::now_utc(),
     )
@@ -5726,7 +5650,7 @@ fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
         .load_manifest(&target_toolchain_id)
         .expect("manifest");
     assert!(manifest.command("cat").is_ok());
-    assert!(manifest.command("qjs").is_err());
+    assert!(manifest.command("script").is_err());
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -6151,7 +6075,7 @@ fn sandbox_run_applies_toolchain_command_default_limits() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "test module",
         OffsetDateTime::now_utc(),
     )
@@ -10496,7 +10420,7 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
         sinomo_runtime::sandbox::SandboxAddToolchainCommandRequest {
             toolchain_id: toolchain_id.clone(),
             version: "python-wasi-test".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             command_name: "python".to_string(),
             module_bytes: b"python module".to_vec(),
@@ -10541,7 +10465,7 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
         sinomo_runtime::sandbox::SandboxAddToolchainCommandRequest {
             toolchain_id: toolchain_id.clone(),
             version: "python-wasi-test".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             command_name: "node".to_string(),
             module_bytes: b"node module".to_vec(),
@@ -10561,7 +10485,7 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
         sinomo_runtime::sandbox::SandboxAddToolchainCommandRequest {
             toolchain_id: toolchain_id.clone(),
             version: "python-wasi-test".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             command_name: "curl".to_string(),
             module_bytes: b"curl module".to_vec(),
@@ -10745,7 +10669,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
         sinomo_runtime::sandbox::SandboxAddToolchainCommandRequest {
             toolchain_id: toolchain_id.clone(),
             version: "busybox-plus-python-test".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test base".to_string(),
             command_name: "cat".to_string(),
             module_bytes: b"busybox module".to_vec(),
@@ -10760,7 +10684,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
         sinomo_runtime::sandbox::SandboxImportToolchainPackageRequest {
             toolchain_id: toolchain_id.clone(),
             version: "python-wasi-test".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             commands: vec![
                 sinomo_runtime::sandbox::SandboxImportToolchainPackageCommand {
@@ -10831,7 +10755,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
         sinomo_runtime::sandbox::SandboxImportToolchainPackageRequest {
             toolchain_id: toolchain_id.clone(),
             version: "bad-extension".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             commands: vec![
                 sinomo_runtime::sandbox::SandboxImportToolchainPackageCommand {
@@ -10875,7 +10799,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
         sinomo_runtime::sandbox::SandboxImportToolchainPackageRequest {
             toolchain_id: toolchain_id.clone(),
             version: "denied-extension".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             commands: vec![
                 sinomo_runtime::sandbox::SandboxImportToolchainPackageCommand {
@@ -10906,7 +10830,7 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
         sinomo_runtime::sandbox::SandboxImportToolchainPackageRequest {
             toolchain_id: toolchain_id.clone(),
             version: "malformed-extension".to_string(),
-            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+            target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             commands: vec![
                 sinomo_runtime::sandbox::SandboxImportToolchainPackageCommand {
@@ -10993,7 +10917,7 @@ fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -11126,7 +11050,7 @@ fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test process plan",
         OffsetDateTime::now_utc(),
     )
@@ -11270,7 +11194,7 @@ fn daemon_sandbox_run_process_plan_stream_emits_output_and_completion_frames() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test process plan stream",
         OffsetDateTime::now_utc(),
     )
@@ -11450,7 +11374,7 @@ fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() 
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test process plan resource exhaustion",
         OffsetDateTime::now_utc(),
     )
@@ -11611,7 +11535,7 @@ fn daemon_sandbox_run_toolchain_stream_emits_output_and_completion_frames() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -11729,7 +11653,7 @@ fn daemon_sandbox_run_toolchain_audits_policy_denial() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -11827,7 +11751,7 @@ fn daemon_sandbox_run_toolchain_audits_mount_policy_denial() {
     let mut toolchain = sinomo_runtime::sandbox::SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "test-1",
-        sinomo_runtime::sandbox::SandboxWasiAbi::Preview1,
+        sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )

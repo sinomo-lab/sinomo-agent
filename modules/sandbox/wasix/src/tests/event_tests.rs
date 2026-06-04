@@ -357,7 +357,7 @@ fn sandbox_toolchain_events_report_pin_and_update_shapes() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -383,7 +383,7 @@ fn sandbox_toolchain_events_report_pin_and_update_shapes() {
     assert_eq!(updated.kind.as_str(), "sandbox.toolchain.updated");
     assert_eq!(updated.payload["toolchain_id"], toolchain_id.to_string());
     assert_eq!(updated.payload["version"], "busybox-1.0");
-    assert_eq!(updated.payload["target_abi"], "preview1");
+    assert_eq!(updated.payload["target_abi"], "wasix");
     assert_eq!(updated.payload["command_count"], 1);
     assert_eq!(updated.payload["module_hash"], "hash");
     assert_eq!(updated.payload["signed"], false);

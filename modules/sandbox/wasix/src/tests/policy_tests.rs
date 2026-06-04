@@ -162,7 +162,7 @@ fn sandbox_policy_denies_command_capability_without_allowlist() {
     command.required_capabilities = vec!["network.http".to_string()];
 
     let error = SandboxPolicy::default()
-        .validate_command(&command, &SandboxWasiAbi::Preview1)
+        .validate_command(&command, &SandboxWasiAbi::Wasix)
         .expect_err("capability denied");
 
     assert_eq!(error.code, "command-capability-denied");
@@ -186,12 +186,12 @@ fn sandbox_policy_allows_command_capability_when_listed() {
         .insert("network.http".to_string());
 
     policy
-        .validate_command(&command, &SandboxWasiAbi::Preview1)
+        .validate_command(&command, &SandboxWasiAbi::Wasix)
         .expect("capability allowed");
 }
 
 #[test]
-fn sandbox_policy_allows_preview1_pinned_subprocess_capability_when_listed() {
+fn sandbox_policy_allows_wasix_pinned_subprocess_capability_when_listed() {
     let toolchain_id =
         SandboxToolchainId::from_legacy_named("toolchain_python").expect("toolchain");
     let mut command = SandboxToolchainCommand::new(
@@ -201,15 +201,15 @@ fn sandbox_policy_allows_preview1_pinned_subprocess_capability_when_listed() {
         SandboxResourceLimits::default(),
     )
     .expect("command");
-    command.required_capabilities = vec![SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY.to_string()];
+    command.required_capabilities = vec![SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY.to_string()];
     let mut policy = SandboxPolicy::default();
     policy
         .allowed_command_capabilities
-        .insert(SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY.to_string());
+        .insert(SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY.to_string());
 
     policy
-        .validate_command(&command, &SandboxWasiAbi::Preview1)
-        .expect("bounded preview1 subprocess capability allowed");
+        .validate_command(&command, &SandboxWasiAbi::Wasix)
+        .expect("bounded wasix subprocess capability allowed");
 }
 
 #[test]
@@ -230,14 +230,14 @@ fn sandbox_policy_denies_unsupported_runtime_command_capability_even_when_allowe
         .insert(SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY.to_string());
 
     let error = policy
-        .validate_command(&command, &SandboxWasiAbi::Preview1)
+        .validate_command(&command, &SandboxWasiAbi::Wasix)
         .expect_err("unsupported runtime capability denied");
 
     assert_eq!(error.code, "command-capability-unsupported");
     assert!(
         error
             .detail
-            .contains("Preview1 sandbox runtime does not support")
+            .contains("WASIX sandbox runtime does not support")
     );
 }
 
@@ -463,7 +463,7 @@ fn sandbox_policy_denies_process_substrate_commands_without_support_even_without
         .expect("command");
 
         let error = SandboxPolicy::default()
-            .validate_command(&command, &SandboxWasiAbi::Preview1)
+            .validate_command(&command, &SandboxWasiAbi::Wasix)
             .expect_err("process substrate command denied");
 
         assert_eq!(error.code, "command-capability-unsupported");
@@ -578,7 +578,7 @@ fn sandbox_policy_requires_signed_allowed_toolchain() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -606,7 +606,7 @@ fn sandbox_policy_toolchain_update_preflight_does_not_require_signature() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "unit test import",
         OffsetDateTime::now_utc(),
     )
@@ -640,7 +640,7 @@ fn sandbox_policy_validates_toolchain_provenance_prefix() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "local-cli import",
         OffsetDateTime::now_utc(),
     )
@@ -675,7 +675,7 @@ fn sandbox_policy_validates_toolchain_package_cache_paths() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "python-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "sinomo://toolchains/python/1.0",
         OffsetDateTime::now_utc(),
     )
@@ -724,7 +724,7 @@ fn sandbox_policy_validates_complete_toolchain_invocation() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )

@@ -1739,13 +1739,6 @@ fn sandbox_children() -> Vec<CommandSpec> {
                     opts(&["--toolchain", "--json"]),
                     vec![],
                 ),
-                cmd(
-                    "verify-quickjs",
-                    "verify QuickJS toolchain",
-                    vec![],
-                    opts(&["--toolchain", "--json"]),
-                    vec![],
-                ),
             ],
             vec![],
             vec![],

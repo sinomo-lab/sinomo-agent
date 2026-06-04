@@ -7,7 +7,7 @@ fn sandbox_toolchain_manifest_records_command_hashes_and_paths() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "sinomo-maintained test build",
         OffsetDateTime::now_utc(),
     )
@@ -31,7 +31,7 @@ fn sandbox_toolchain_manifest_records_command_hashes_and_paths() {
     assert_eq!(command.content_hash, sandbox_module_hash(b"wasm bytes"));
     assert_eq!(
         command.effective_target_abi(&manifest),
-        SandboxWasiAbi::Preview1
+        SandboxWasiAbi::Wasix
     );
     let mut wasix_command = SandboxToolchainCommand::new(
         &toolchain_id,
@@ -122,7 +122,7 @@ fn local_sandbox_toolchain_store_persists_manifest_and_verifies_modules() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "sinomo-maintained test build",
         OffsetDateTime::now_utc(),
     )
@@ -282,51 +282,51 @@ fn sandbox_mvp_command_list_tracks_busybox_subset_and_known_gaps() {
         }),
         "default process capabilities should describe WASIX asyncified fork support"
     );
-    let preview1_process_capabilities =
-        sandbox_runtime_process_capabilities_for_abi(&SandboxWasiAbi::Preview1);
-    assert_eq!(preview1_process_capabilities.len(), 2);
+    let wasix_process_capabilities =
+        sandbox_runtime_process_capabilities_for_abi(&SandboxWasiAbi::Wasix);
+    assert_eq!(wasix_process_capabilities.len(), 2);
     assert!(
-        preview1_process_capabilities.iter().any(|capability| {
-            capability.capability == SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY
+        wasix_process_capabilities.iter().any(|capability| {
+            capability.capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY
                 && capability.supported
                 && capability.detail.contains("pinned /bin")
         }),
-        "preview1 should still report the bounded pinned subprocess bridge separately"
+        "wasix should still report the bounded pinned subprocess bridge separately"
     );
     assert!(
-        preview1_process_capabilities.iter().any(|capability| {
+        wasix_process_capabilities.iter().any(|capability| {
             capability.capability == "child-process-exec"
                 && !capability.supported
                 && capability.detail.contains("lacks POSIX fork")
         }),
-        "preview1 should still be honest about lacking POSIX child-process parity"
+        "wasix should still be honest about lacking POSIX child-process parity"
     );
-    let preview1_budget_capabilities =
-        sandbox_runtime_budget_capabilities_for_abi(&SandboxWasiAbi::Preview1);
-    assert_eq!(preview1_budget_capabilities.len(), 5);
+    let wasix_budget_capabilities =
+        sandbox_runtime_budget_capabilities_for_abi(&SandboxWasiAbi::Wasix);
+    assert_eq!(wasix_budget_capabilities.len(), 5);
     assert!(
-        preview1_budget_capabilities
+        wasix_budget_capabilities
             .iter()
             .all(|capability| capability.supported),
-        "preview1 runner should report timeout, cancellation, input, memory, and output-limit enforcement"
+        "wasix runner should report timeout, cancellation, input, memory, and output-limit enforcement"
     );
     assert!(
-        preview1_budget_capabilities
+        wasix_budget_capabilities
             .iter()
             .any(|capability| capability.capability == "output-limit"),
-        "preview1 runner should report output limit enforcement"
+        "wasix runner should report output limit enforcement"
     );
     assert!(
-        preview1_budget_capabilities
+        wasix_budget_capabilities
             .iter()
             .any(|capability| capability.capability == "input-limit" && capability.supported),
-        "preview1 runner should report stdin input limit enforcement"
+        "wasix runner should report stdin input limit enforcement"
     );
     assert!(
-        preview1_budget_capabilities
+        wasix_budget_capabilities
             .iter()
             .any(|capability| capability.capability == "memory-limit" && capability.supported),
-        "preview1 runner should report memory limit enforcement"
+        "wasix runner should report memory limit enforcement"
     );
     let wasix_budget_capabilities =
         sandbox_runtime_budget_capabilities_for_abi(&SandboxWasiAbi::Wasix);
@@ -617,27 +617,6 @@ fn busybox_wasi_config_fragment_enables_declared_applets() {
 }
 
 #[test]
-fn quickjs_toolchain_metadata_and_fidelity_cases_are_declared() {
-    SandboxToolchainId::new(QUICKJS_TOOLCHAIN_ID.to_string()).expect("valid quickjs id");
-    assert_eq!(QUICKJS_TOOLCHAIN_COMMAND, "qjs");
-    assert!(QUICKJS_TOOLCHAIN_VERSION.contains("quickjs-"));
-    assert!(QUICKJS_TOOLCHAIN_RECIPE.ends_with("build-qjs-wasi.sh"));
-    assert!(QUICKJS_TOOLCHAIN_PACKAGE_MANIFEST.ends_with("package.json"));
-    assert!(!QUICKJS_TOOLCHAIN_FIDELITY_CASES.is_empty());
-    for case in QUICKJS_TOOLCHAIN_FIDELITY_CASES {
-        assert_eq!(case.argv.first().copied(), Some(QUICKJS_TOOLCHAIN_COMMAND));
-        for (path, _contents) in case.setup_files {
-            SandboxPath::new(*path).expect("valid setup file path");
-        }
-    }
-    assert!(
-        QUICKJS_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| {
-            case.expected_exit_status != 0 && case.expected_stderr_contains.is_some()
-        })
-    );
-}
-
-#[test]
 fn required_bash_python_pip_and_make_fidelity_cases_are_declared() {
     assert!(!BASH_TOOLCHAIN_FIDELITY_CASES.is_empty());
     assert!(BASH_TOOLCHAIN_FIDELITY_CASES.iter().any(|case| {
@@ -766,12 +745,6 @@ fn rich_toolchain_targets_track_implemented_and_planned_packages() {
         .map(|target| target.command)
         .collect();
     assert_eq!(commands.len(), SANDBOX_RICH_TOOLCHAIN_TARGETS.len());
-    let quickjs = SANDBOX_RICH_TOOLCHAIN_TARGETS
-        .iter()
-        .find(|target| target.command == QUICKJS_TOOLCHAIN_COMMAND)
-        .expect("quickjs target");
-    assert_eq!(quickjs.status, SandboxRichToolchainStatus::Implemented);
-    assert_eq!(quickjs.recipe, Some(QUICKJS_TOOLCHAIN_RECIPE));
     for required in [
         BASH_TOOLCHAIN_COMMAND,
         PYTHON_TOOLCHAIN_COMMAND,
@@ -881,7 +854,7 @@ fn sifs_sandbox_toolchain_store_persists_manifest_and_verifies_modules() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "sinomo-maintained test build",
         OffsetDateTime::now_utc(),
     )
@@ -957,7 +930,7 @@ fn sifs_sandbox_toolchain_store_can_replicate_to_candidate_node() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "replicated-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "unit test build",
         OffsetDateTime::now_utc(),
     )
@@ -1023,7 +996,7 @@ fn sifs_sandbox_toolchain_store_rejects_tampered_module() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "sinomo-maintained test build",
         OffsetDateTime::now_utc(),
     )

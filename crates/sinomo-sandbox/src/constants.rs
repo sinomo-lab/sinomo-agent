@@ -15,13 +15,6 @@ pub const SANDBOX_TOOLCHAIN_MANIFEST_OBJECT_VERSION: u16 = 1;
 pub const SANDBOX_HTTP_EXCHANGE_OBJECT_VERSION: u16 = 1;
 pub const SANDBOX_MODULE_ARTIFACT_REGISTRY_OBJECT_VERSION: u16 = 1;
 pub const BUSYBOX_TOOLCHAIN_LEGACY_ID: &str = "toolchain_busybox";
-pub const QUICKJS_TOOLCHAIN_ID: &str = "01k4z8q5c00000000000000000";
-pub const QUICKJS_TOOLCHAIN_VERSION: &str = "quickjs-2025-09-13-2-wasip1";
-pub const QUICKJS_TOOLCHAIN_COMMAND: &str = "qjs";
-pub const QUICKJS_TOOLCHAIN_RECIPE: &str =
-    "crates/sinomo-sandbox/toolchains/quickjs/build-qjs-wasi.sh";
-pub const QUICKJS_TOOLCHAIN_PACKAGE_MANIFEST: &str =
-    "crates/sinomo-sandbox/toolchains/quickjs/out/package.json";
 pub const BASH_TOOLCHAIN_COMMAND: &str = "bash";
 pub const SH_TOOLCHAIN_COMMAND: &str = "sh";
 pub const BASH_TOOLCHAIN_RECIPE: &str = "crates/sinomo-sandbox/toolchains/bash/build-bash-wasix.sh";
@@ -74,12 +67,6 @@ pub const SANDBOX_MVP_VIRTUAL_DEVICES: &[&str] = &[
 pub const SANDBOX_WASI_ZERO_DEVICE_BYTES: usize = 1024 * 1024;
 
 pub const SANDBOX_RICH_TOOLCHAIN_TARGETS: &[SandboxRichToolchainTarget] = &[
-    SandboxRichToolchainTarget {
-        command: QUICKJS_TOOLCHAIN_COMMAND,
-        recipe: Some(QUICKJS_TOOLCHAIN_RECIPE),
-        status: SandboxRichToolchainStatus::Implemented,
-        note: "QuickJS is the first maintained language package target and is covered by verify-quickjs plus verify-coding",
-    },
     SandboxRichToolchainTarget {
         command: BASH_TOOLCHAIN_COMMAND,
         recipe: Some(BASH_TOOLCHAIN_RECIPE),

@@ -17,7 +17,7 @@ This crate owns the sandbox-facing contracts and implementation pieces:
 
 - manifest, policy, mount, command, event, and resource-limit data models,
 - local and daemon-backed sandbox stores,
-- runtime adapters for WASIX and Preview1,
+- runtime contracts for WASIX-backed execution,
 - virtual filesystem integration,
 - toolchain package metadata and import helpers,
 - durable command records, output logs, checkpoints, and artifacts,
@@ -27,9 +27,9 @@ It does not define global cluster storage layout outside the sandbox service pre
 
 ## Runtime Model
 
-WASIX is the default runtime because shell, Python, compiler, package manager, subprocess, pipe, threading, and filesystem workflows need process-oriented semantics. WASI Preview1 remains available as a compatibility runner for simple single-process modules.
+WASIX is the only maintained sandbox runtime because shell, Python, compiler, package manager, subprocess, pipe, threading, and filesystem workflows need process-oriented semantics. WASI Preview1 support has been removed rather than kept as a compatibility runner.
 
-Filesystem behavior should go through the sandbox virtual filesystem layer. Local host-backed storage is useful for development, but production sandbox state is expected to be backed by SIFS. SIFS-backed WASIX runs use direct virtual preopens backed by the sandbox filesystem; Preview1 is local-only legacy compatibility and is rejected for SIFS-backed execution.
+Filesystem behavior should go through the sandbox virtual filesystem layer. Local host-backed storage is useful for development, but production sandbox state is expected to be backed by SIFS. SIFS-backed WASIX runs use direct virtual preopens backed by the sandbox filesystem.
 
 ## Common Commands
 
@@ -91,7 +91,6 @@ Maintained toolchain packages live under `toolchains/`:
 - [Bash](toolchains/bash/README.md): real `bash` and `sh`.
 - [Python](toolchains/python/README.md): CPython and pip.
 - [Build tools](toolchains/build-tools/README.md): Make, TCC, Clang/LLVM, LLD, and support files.
-- [QuickJS](toolchains/quickjs/README.md): JavaScript helper package.
 
 Useful verifier entry points:
 

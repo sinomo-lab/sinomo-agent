@@ -21,22 +21,6 @@ impl SandboxBusyBoxFidelityCase {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SandboxQuickJsFidelityCase {
-    pub name: &'static str,
-    pub argv: &'static [&'static str],
-    pub setup_files: &'static [(&'static str, &'static str)],
-    pub expected_stdout: &'static str,
-    pub expected_stderr_contains: Option<&'static str>,
-    pub expected_exit_status: i32,
-}
-
-impl SandboxQuickJsFidelityCase {
-    pub fn argv_vec(&self) -> Vec<String> {
-        self.argv.iter().map(|value| value.to_string()).collect()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SandboxCommandFidelityCase {
     pub name: &'static str,
     pub command: &'static str,

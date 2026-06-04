@@ -284,7 +284,7 @@ fn toolchain_manifest_rejects_invalid_default_env_name() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -319,7 +319,7 @@ fn toolchain_manifest_rejects_invalid_default_env_value() {
     let mut manifest = SandboxToolchainManifest::new(
         toolchain_id.clone(),
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -358,7 +358,7 @@ fn local_staged_runner_executes_process_plan_with_stdout_pipe() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -540,7 +540,7 @@ fn local_staged_runner_preflights_process_plan_policy_before_first_step() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -559,7 +559,7 @@ fn local_staged_runner_preflights_process_plan_policy_before_first_step() {
             "python",
             wasi_stdout_module().as_bytes(),
             SandboxResourceLimits::default(),
-            vec![SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY.to_string()],
+            vec![SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY.to_string()],
         )
         .expect("put capability command");
     let runner = LocalStagedSandboxCommandRunner::new().expect("runner");
@@ -639,7 +639,7 @@ fn local_staged_runner_preflights_process_plan_explicit_stdin_before_first_step(
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -734,7 +734,7 @@ fn local_staged_runner_process_plan_piped_stdout_obeys_receiver_input_limit() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -836,7 +836,7 @@ fn local_staged_runner_process_plan_step_overrides_cwd_and_env() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -939,7 +939,7 @@ fn local_staged_runner_rejects_process_plan_trailing_pipe() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -997,7 +997,7 @@ fn local_staged_runner_rejects_process_plan_ambiguous_piped_stdin() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -1075,7 +1075,7 @@ fn local_staged_runner_rejects_process_plan_invalid_env_name() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -1135,7 +1135,7 @@ fn local_staged_runner_rejects_process_plan_invalid_env_value() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -1195,7 +1195,7 @@ fn local_staged_runner_preflights_process_plan_cwd_before_first_step() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -1270,7 +1270,7 @@ fn local_staged_runner_rejects_process_plan_argv0_mismatch() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -1329,7 +1329,7 @@ fn local_staged_runner_verifies_toolchain_fidelity_cases() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -1456,7 +1456,7 @@ fn local_staged_toolchain_command_stages_support_artifacts_read_only() {
     let mut toolchain = SandboxToolchainManifest::new(
         manifest.toolchain_id.clone(),
         "artifact-test",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -10052,7 +10052,8 @@ fn sifs_staged_wasix_var_is_sifs_backed_workspace() {
 }
 
 #[test]
-fn sifs_staged_toolchain_command_rejects_preview1_legacy_execution() {
+#[cfg(not(feature = "wasix-runtime"))]
+fn sifs_staged_toolchain_command_requires_wasix_runtime_feature() {
     let sifs_root = unique_test_dir("sinomo-sandbox-sifs-staged-artifacts-sifs");
     let local_root = unique_test_dir("sinomo-sandbox-sifs-staged-artifacts-local");
     let network = InProcessNetwork::new();
@@ -10078,7 +10079,7 @@ fn sifs_staged_toolchain_command_rejects_preview1_legacy_execution() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "artifact-test",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "unit test",
         OffsetDateTime::now_utc(),
     )
@@ -10109,7 +10110,7 @@ fn sifs_staged_toolchain_command_rejects_preview1_legacy_execution() {
         1_000,
         &policy,
     ) {
-        Ok(_) => panic!("SIFS must not run Preview1 through host staging"),
+        Ok(_) => panic!("SIFS WASIX toolchain execution must not fall back to host staging"),
         Err(error) => error,
     };
     assert!(
@@ -10121,18 +10122,19 @@ fn sifs_staged_toolchain_command_rejects_preview1_legacy_execution() {
 }
 
 #[test]
-fn sifs_staged_direct_module_rejects_preview1_legacy_execution() {
-    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-direct-preview1-reject-sifs");
-    let local_root = unique_test_dir("sinomo-sandbox-sifs-direct-preview1-reject-local");
+#[cfg(not(feature = "wasix-runtime"))]
+fn sifs_staged_direct_module_requires_wasix_runtime_feature() {
+    let sifs_root = unique_test_dir("sinomo-sandbox-sifs-direct-wasix-required-sifs");
+    let local_root = unique_test_dir("sinomo-sandbox-sifs-direct-wasix-required-local");
     let network = InProcessNetwork::new();
-    let node_id = NodeId::from_legacy_named("node_sifs_direct_preview1_reject").expect("node");
+    let node_id = NodeId::from_legacy_named("node_sifs_direct_wasix_required").expect("node");
     let mut dfs = NetworkedDfsService::new(
         network.add_node(node_id),
         LocalContentStore::new(sifs_root.join("content")).expect("content"),
     );
     dfs.bootstrap_distributed_sifs().expect("bootstrap");
     let sandbox_id =
-        SandboxId::from_legacy_named("sandbox_sifs_direct_preview1_reject").expect("sandbox");
+        SandboxId::from_legacy_named("sandbox_sifs_direct_wasix_required").expect("sandbox");
     let mut sifs_store = SifsSandboxInstanceStore::new(dfs);
     sifs_store
         .create(
@@ -10149,14 +10151,14 @@ fn sifs_staged_direct_module_rejects_preview1_legacy_execution() {
         &local_store,
         &sandbox_id,
         wasi_stdout_module(),
-        vec!["preview1".to_string()],
+        vec!["wasix".to_string()],
         None,
         1_000,
         None,
         None,
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
     ) {
-        Ok(_) => panic!("SIFS must not run direct Preview1 modules through host staging"),
+        Ok(_) => panic!("SIFS direct WASIX execution must not fall back to host staging"),
         Err(error) => error,
     };
     assert!(
@@ -10165,7 +10167,7 @@ fn sifs_staged_direct_module_rejects_preview1_legacy_execution() {
     );
     assert!(
         !local_store.layout(&sandbox_id).root.exists(),
-        "denied direct Preview1 execution must not create a local staged instance"
+        "WASIX execution without the runtime feature must not create a local staged instance"
     );
 
     fs::remove_dir_all(sifs_root).ok();
@@ -10474,7 +10476,7 @@ fn sifs_staged_toolchain_command_preserves_wasix_target_abi() {
         .expect_err("wasix feature should be required");
     assert!(
         error.to_string().contains("wasix-runtime"),
-        "SIFS toolchain execution must preserve target_abi=wasix instead of falling back to preview1: {error}"
+        "SIFS toolchain execution must preserve target_abi=wasix and require the WASIX runtime: {error}"
     );
 
     fs::remove_dir_all(sifs_root).ok();
@@ -10906,7 +10908,7 @@ fn sifs_staged_runner_preflights_process_plan_policy_before_first_step() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -10925,7 +10927,7 @@ fn sifs_staged_runner_preflights_process_plan_policy_before_first_step() {
             "python",
             wasi_stdout_module().as_bytes(),
             SandboxResourceLimits::default(),
-            vec![SANDBOX_PREVIEW1_PINNED_SUBPROCESS_CAPABILITY.to_string()],
+            vec![SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY.to_string()],
         )
         .expect("put capability command");
 
@@ -11007,7 +11009,7 @@ fn sifs_staged_runner_preflights_process_plan_explicit_stdin_before_first_step()
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -11336,7 +11338,7 @@ fn sifs_staged_runner_preflights_process_plan_cwd_before_first_step() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )
@@ -12323,7 +12325,7 @@ fn sifs_staged_runner_validates_sifs_toolchain_command_policy() {
     let mut toolchain = SandboxToolchainManifest::new(
         toolchain_id,
         "busybox-1.0",
-        SandboxWasiAbi::Preview1,
+        SandboxWasiAbi::Wasix,
         "test build",
         OffsetDateTime::now_utc(),
     )

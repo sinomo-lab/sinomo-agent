@@ -6,12 +6,10 @@ REPO_ROOT="$(cd "${ROOT}/../../.." && pwd)"
 TARGET_DIR="${TARGET_DIR:-"${REPO_ROOT}/target"}"
 BUSYBOX_WORKDIR="${BUSYBOX_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-busybox-work"}"
 BUSYBOX_OUTDIR="${BUSYBOX_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-busybox-out"}"
-QUICKJS_WORKDIR="${QUICKJS_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-quickjs-work"}"
-QUICKJS_OUTDIR="${QUICKJS_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-quickjs-out"}"
 BASH_WORKDIR="${BASH_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-bash-wasix-work"}"
 BASH_OUTDIR="${BASH_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-bash-wasix-out"}"
-PYTHON_WORKDIR="${PYTHON_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-python-work"}"
-PYTHON_OUTDIR="${PYTHON_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-python-out"}"
+PYTHON_WORKDIR="${PYTHON_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-python-wasix-work"}"
+PYTHON_OUTDIR="${PYTHON_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-python-wasix-out"}"
 MAKE_WORKDIR="${MAKE_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-make-wasix-work"}"
 MAKE_OUTDIR="${MAKE_OUTDIR:-"${TARGET_DIR}/sinomo-coding-verify-make-wasix-out"}"
 TCC_WORKDIR="${TCC_WORKDIR:-"${TARGET_DIR}/sinomo-coding-verify-tcc-wasix-work"}"
@@ -56,14 +54,7 @@ trap cleanup EXIT
 if [ -n "${SINOMO_BIN:-}" ]; then
     SINOMO_CMD=("${SINOMO_BIN}")
 else
-    SINOMO_CARGO_FEATURES="${SINOMO_CARGO_FEATURES:-}"
-    if [ "${VERIFY_FULL}" = "1" ] && [ -z "${SINOMO_CARGO_FEATURES}" ]; then
-        SINOMO_CARGO_FEATURES="sinomo-sandbox/wasix-runtime"
-    fi
     SINOMO_CMD=(cargo run --quiet --manifest-path "${REPO_ROOT}/Cargo.toml")
-    if [ -n "${SINOMO_CARGO_FEATURES}" ]; then
-        SINOMO_CMD+=(--features "${SINOMO_CARGO_FEATURES}")
-    fi
     SINOMO_CMD+=(--bin sinomo --)
 fi
 
@@ -72,18 +63,14 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
     WORKDIR="${BUSYBOX_WORKDIR}" OUTDIR="${BUSYBOX_OUTDIR}" \
         "${ROOT}/busybox/build-busybox-wasi.sh"
 
-    echo "building QuickJS WASIp1 package"
-    WORKDIR="${QUICKJS_WORKDIR}" OUTDIR="${QUICKJS_OUTDIR}" \
-        "${ROOT}/quickjs/build-qjs-wasi.sh"
-
     if [ "${VERIFY_FULL}" = "1" ]; then
         echo "building Bash WASIX package"
         WORKDIR="${BASH_WORKDIR}" OUTDIR="${BASH_OUTDIR}" \
             "${ROOT}/bash/build-bash-wasix.sh"
 
-        echo "building CPython WASIp1 package"
+        echo "building CPython WASIX package"
         WORKDIR="${PYTHON_WORKDIR}" OUTDIR="${PYTHON_OUTDIR}" \
-            "${ROOT}/python/build-cpython-wasi.sh"
+            "${ROOT}/python/build-cpython-wasix.sh"
 
         echo "building GNU Make WASIX package"
         WORKDIR="${MAKE_WORKDIR}" OUTDIR="${MAKE_OUTDIR}" \
@@ -96,13 +83,8 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 fi
 
 BUSYBOX_PACKAGE="${BUSYBOX_OUTDIR}/package.json"
-QUICKJS_PACKAGE="${QUICKJS_OUTDIR}/package.json"
 if [ ! -f "${BUSYBOX_PACKAGE}" ]; then
     echo "coding verifier BusyBox package manifest missing: ${BUSYBOX_PACKAGE}; rerun without SKIP_BUILD=1" >&2
-    exit 1
-fi
-if [ ! -f "${QUICKJS_PACKAGE}" ]; then
-    echo "coding verifier QuickJS package manifest missing: ${QUICKJS_PACKAGE}; rerun without SKIP_BUILD=1" >&2
     exit 1
 fi
 PYTHON_PACKAGE="${PYTHON_OUTDIR}/package.json"
@@ -125,8 +107,6 @@ if [ "${VERIFY_FULL}" = "1" ]; then
     done
 fi
 
-echo "verifying QuickJS package manifest"
-"${SINOMO_CMD[@]}" sandbox toolchain verify-package "${QUICKJS_PACKAGE}" >/dev/null
 if [ "${VERIFY_FULL}" = "1" ]; then
     echo "verifying full coding package manifests"
     "${SINOMO_CMD[@]}" sandbox toolchain verify-package "${PYTHON_PACKAGE}" >/dev/null
@@ -143,10 +123,6 @@ SINOMO_DATA_DIR="${SINOMO_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
     sandbox toolchain import-package \
     "${BUSYBOX_PACKAGE}"
 
-SINOMO_DATA_DIR="${SINOMO_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
-    sandbox toolchain import-package \
-    --into toolchain_busybox \
-    "${QUICKJS_PACKAGE}"
 if [ "${VERIFY_FULL}" = "1" ]; then
     SINOMO_DATA_DIR="${SINOMO_VERIFY_DATA_DIR}" "${SINOMO_CMD[@]}" \
         sandbox toolchain import-package \

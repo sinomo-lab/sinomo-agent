@@ -35,7 +35,6 @@ pub(crate) enum SandboxCliCommand {
     ToolchainImportBusyBox(SandboxToolchainImportBusyBoxOptions),
     ToolchainImportPackage(SandboxToolchainImportPackageOptions),
     ToolchainPythonPlan,
-    ToolchainQuickJsPlan,
     ToolchainVerifyPackage(SandboxToolchainVerifyPackageOptions),
     ToolchainVerifyBash(SandboxToolchainVerifyBashOptions),
     ToolchainVerifyBusyBox(SandboxToolchainVerifyBusyBoxOptions),
@@ -44,7 +43,6 @@ pub(crate) enum SandboxCliCommand {
     ToolchainVerifyMakepkg(SandboxToolchainVerifyMakepkgOptions),
     ToolchainVerifyPython(SandboxToolchainVerifyPythonOptions),
     ToolchainVerifyTcc(SandboxToolchainVerifyTccOptions),
-    ToolchainVerifyQuickJs(SandboxToolchainVerifyQuickJsOptions),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -381,13 +379,6 @@ pub(crate) struct SandboxToolchainVerifyTccOptions {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct SandboxToolchainVerifyPythonOptions {
-    pub(crate) sandbox_id: sinomo_runtime::sandbox::SandboxId,
-    pub(crate) allow_unsigned: bool,
-    pub(crate) execution: SandboxMetadataExecution,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct SandboxToolchainVerifyQuickJsOptions {
     pub(crate) sandbox_id: sinomo_runtime::sandbox::SandboxId,
     pub(crate) allow_unsigned: bool,
     pub(crate) execution: SandboxMetadataExecution,
@@ -1570,9 +1561,6 @@ pub(crate) fn parse_sandbox_toolchain_command(
         Some((command, [])) if command == "build-tools-plan" => {
             Ok(SandboxCliCommand::ToolchainBuildToolsPlan)
         }
-        Some((command, [])) if command == "quickjs-plan" => {
-            Ok(SandboxCliCommand::ToolchainQuickJsPlan)
-        }
         Some((command, [])) if command == "python-plan" => {
             Ok(SandboxCliCommand::ToolchainPythonPlan)
         }
@@ -1607,11 +1595,6 @@ pub(crate) fn parse_sandbox_toolchain_command(
         Some((command, rest)) if command == "verify-tcc" => {
             Ok(SandboxCliCommand::ToolchainVerifyTcc(
                 parse_sandbox_toolchain_verify_tcc_options(rest)?,
-            ))
-        }
-        Some((command, rest)) if command == "verify-quickjs" => {
-            Ok(SandboxCliCommand::ToolchainVerifyQuickJs(
-                parse_sandbox_toolchain_verify_quickjs_options(rest)?,
             ))
         }
         Some((command, rest)) if command == "verify-python" => {
@@ -1713,27 +1696,6 @@ pub(crate) fn parse_sandbox_toolchain_verify_bash_options(
     }
     validate_sandbox_verify_unsigned_scope(allow_unsigned, execution)?;
     Ok(SandboxToolchainVerifyBashOptions {
-        sandbox_id: parse_sandbox_id(sandbox_id)?,
-        allow_unsigned,
-        execution,
-    })
-}
-
-pub(crate) fn parse_sandbox_toolchain_verify_quickjs_options(
-    args: &[String],
-) -> Result<SandboxToolchainVerifyQuickJsOptions, CliError> {
-    let (sandbox_id, rest) = args.split_first().ok_or(CliError::Usage)?;
-    let mut allow_unsigned = false;
-    let mut execution = SandboxMetadataExecution::Local;
-    for arg in rest {
-        match arg.as_str() {
-            "--allow-unsigned" => allow_unsigned = true,
-            "--daemon" => execution = SandboxMetadataExecution::Daemon,
-            _ => return Err(CliError::Usage),
-        }
-    }
-    validate_sandbox_verify_unsigned_scope(allow_unsigned, execution)?;
-    Ok(SandboxToolchainVerifyQuickJsOptions {
         sandbox_id: parse_sandbox_id(sandbox_id)?,
         allow_unsigned,
         execution,
@@ -2265,10 +2227,6 @@ pub(crate) fn run_sandbox_cli_command(command: SandboxCliCommand) -> Result<(), 
             sandbox_toolchain_python_plan();
             Ok(())
         }
-        SandboxCliCommand::ToolchainQuickJsPlan => {
-            sandbox_toolchain_quickjs_plan();
-            Ok(())
-        }
         SandboxCliCommand::ToolchainVerifyBash(options) => sandbox_toolchain_verify_bash(options),
         SandboxCliCommand::ToolchainVerifyBusyBox(options) => {
             sandbox_toolchain_verify_busybox(options)
@@ -2284,9 +2242,6 @@ pub(crate) fn run_sandbox_cli_command(command: SandboxCliCommand) -> Result<(), 
             sandbox_toolchain_verify_python(options)
         }
         SandboxCliCommand::ToolchainVerifyTcc(options) => sandbox_toolchain_verify_tcc(options),
-        SandboxCliCommand::ToolchainVerifyQuickJs(options) => {
-            sandbox_toolchain_verify_quickjs(options)
-        }
     }
 }
 
@@ -2910,13 +2865,7 @@ fn append_sandbox_doctor_coding_toolchain_findings(
     manifest: &sinomo_runtime::sandbox::SandboxInstanceManifest,
     toolchain: &sinomo_runtime::sandbox::SandboxToolchainManifest,
 ) {
-    let commands = sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS
-        .iter()
-        .copied()
-        .chain(std::iter::once(
-            sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND,
-        ));
-    for command in commands {
+    for command in sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS {
         if toolchain.command(command).is_err() {
             findings.push(SandboxDoctorFinding::warning(
                 "coding-command-missing",
@@ -3543,52 +3492,6 @@ pub(crate) fn sandbox_toolchain_build_tools_plan_text() -> String {
     output
 }
 
-pub(crate) fn sandbox_toolchain_quickjs_plan() {
-    println!(
-        "toolchain: {}",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_ID
-    );
-    println!(
-        "command: {}",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND
-    );
-    println!(
-        "version: {}",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_VERSION
-    );
-    println!("build recipe:");
-    println!("  {}", sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_RECIPE);
-    println!("package output:");
-    println!(
-        "  {}",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_PACKAGE_MANIFEST
-    );
-    println!("import:");
-    println!(
-        "  sinomo sandbox toolchain import-package [--daemon] {}",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_PACKAGE_MANIFEST
-    );
-    println!("coding toolchain import:");
-    println!(
-        "  sinomo sandbox toolchain import-package [--daemon] --into {} {}",
-        sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_LEGACY_ID,
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_PACKAGE_MANIFEST
-    );
-    println!("coding toolchain verification:");
-    println!("  sinomo sandbox toolchain verify-coding <sandbox-id> [--daemon] [--allow-unsigned]");
-    println!(
-        "    --allow-unsigned is local-only; daemon verification uses the cluster sandbox policy"
-    );
-    println!("fidelity cases:");
-    for case in sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_FIDELITY_CASES {
-        println!(
-            "  {}: {}",
-            case.name,
-            sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND
-        );
-    }
-}
-
 pub(crate) fn sandbox_toolchain_python_plan() {
     print!("{}", sandbox_toolchain_python_plan_text());
 }
@@ -3778,32 +3681,11 @@ fn print_busybox_fidelity_results(results: &[sinomo_runtime::sandbox::SandboxToo
     }
 }
 
-pub(crate) fn sandbox_toolchain_verify_quickjs(
-    options: SandboxToolchainVerifyQuickJsOptions,
-) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    match options.execution {
-        SandboxMetadataExecution::Local => sandbox_toolchain_verify_quickjs_with_stores(
-            options,
-            &sandbox_store_from_data_dir(&data_dir),
-            &sandbox_toolchain_store_from_data_dir(&data_dir),
-        ),
-        SandboxMetadataExecution::Daemon => sandbox_toolchain_verify_quickjs_with_daemon(options),
-    }
-}
-
 pub(crate) fn sandbox_toolchain_verify_coding(
     options: SandboxToolchainVerifyCodingOptions,
 ) -> Result<(), CliError> {
     println!("BusyBox file/search fidelity:");
     sandbox_toolchain_verify_busybox(SandboxToolchainVerifyBusyBoxOptions {
-        sandbox_id: options.sandbox_id.clone(),
-        allow_unsigned: options.allow_unsigned,
-        execution: options.execution,
-    })?;
-    println!("QuickJS runtime fidelity:");
-    sandbox_toolchain_verify_quickjs(SandboxToolchainVerifyQuickJsOptions {
         sandbox_id: options.sandbox_id.clone(),
         allow_unsigned: options.allow_unsigned,
         execution: options.execution,
@@ -3899,56 +3781,6 @@ fn sandbox_toolchain_verify_coding_workflow_with_stores(
             &outcome.stderr,
         ));
     }
-    let script = coding_workflow_quickjs_script();
-    let qjs = runner.run_toolchain_command_with_stdin_and_policy(
-        store,
-        toolchain_store,
-        &options.sandbox_id,
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND,
-        vec![
-            "qjs".to_string(),
-            "--std".to_string(),
-            "-e".to_string(),
-            script,
-        ],
-        None,
-        sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-        &node_id,
-        &policy,
-    )?;
-    results.push(sandbox_tool_fidelity_result_from_outcome(
-        "quickjs-writes-work-file",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND,
-        qjs.response.exit_status,
-        &qjs.stdout,
-        &qjs.stderr,
-        0,
-        "",
-    ));
-    let grep = runner.run_toolchain_command_with_stdin_and_policy(
-        store,
-        toolchain_store,
-        &options.sandbox_id,
-        "grep",
-        vec![
-            "grep".to_string(),
-            "workflow".to_string(),
-            "/work/sinomo-coding-workflow.txt".to_string(),
-        ],
-        None,
-        sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-        &node_id,
-        &policy,
-    )?;
-    results.push(sandbox_tool_fidelity_result_from_outcome(
-        "busybox-grep-reads-quickjs-output",
-        "grep",
-        grep.response.exit_status,
-        &grep.stdout,
-        &grep.stderr,
-        0,
-        "sinomo coding workflow\n",
-    ));
     print_busybox_fidelity_results(&results);
     if results.iter().any(|result| !result.passed) {
         return Err(CliError::Parse {
@@ -3983,49 +3815,6 @@ fn sandbox_toolchain_verify_coding_workflow_with_daemon(
             &outcome.stderr,
         ));
     }
-    let qjs = daemon_run_toolchain_command(
-        &status.address,
-        options.sandbox_id.clone(),
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND.to_string(),
-        vec![
-            "qjs".to_string(),
-            "--std".to_string(),
-            "-e".to_string(),
-            coding_workflow_quickjs_script(),
-        ],
-        None,
-        sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-    )?;
-    results.push(sandbox_tool_fidelity_result_from_outcome(
-        "quickjs-writes-work-file",
-        sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND,
-        qjs.response.exit_status,
-        &qjs.stdout,
-        &qjs.stderr,
-        0,
-        "",
-    ));
-    let grep = daemon_run_toolchain_command(
-        &status.address,
-        options.sandbox_id,
-        "grep".to_string(),
-        vec![
-            "grep".to_string(),
-            "workflow".to_string(),
-            "/work/sinomo-coding-workflow.txt".to_string(),
-        ],
-        None,
-        sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-    )?;
-    results.push(sandbox_tool_fidelity_result_from_outcome(
-        "busybox-grep-reads-quickjs-output",
-        "grep",
-        grep.response.exit_status,
-        &grep.stdout,
-        &grep.stderr,
-        0,
-        "sinomo coding workflow\n",
-    ));
     print_busybox_fidelity_results(&results);
     if results.iter().any(|result| !result.passed) {
         return Err(CliError::Parse {
@@ -4229,10 +4018,6 @@ pub(crate) const CODING_WORKFLOW_BUSYBOX_CASES:
         expected_exit_status: 0,
     },
 ];
-
-fn coding_workflow_quickjs_script() -> String {
-    "let f=std.open('/work/sinomo-coding-workflow.txt','w'); f.puts('sinomo coding workflow\\n'); f.close();".to_string()
-}
 
 fn sandbox_tool_fidelity_result_from_busybox_case(
     case: &sinomo_runtime::sandbox::SandboxBusyBoxFidelityCase,
@@ -4623,197 +4408,6 @@ pub(crate) fn sandbox_toolchain_verify_python(
             )
         }
     }
-}
-
-#[cfg(not(feature = "sandbox"))]
-pub(crate) fn sandbox_toolchain_verify_quickjs_with_stores(
-    _options: SandboxToolchainVerifyQuickJsOptions,
-    _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
-    _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
-) -> Result<(), CliError> {
-    Err(sandbox_runtime_not_compiled_error())
-}
-
-#[cfg(feature = "sandbox")]
-pub(crate) fn sandbox_toolchain_verify_quickjs_with_stores(
-    options: SandboxToolchainVerifyQuickJsOptions,
-    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
-    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
-) -> Result<(), CliError> {
-    let runner = sandbox_wasix_runner_from_data_dir()?;
-    let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
-        detail: format!("invalid sandbox CLI node id: {source}"),
-    })?;
-    let mut policy = sinomo_runtime::sandbox::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = options.allow_unsigned;
-    let mut results = Vec::new();
-    for case in sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_FIDELITY_CASES {
-        if !case.setup_files.is_empty() {
-            let (_manifest, layout) = store.load(&options.sandbox_id)?;
-            let mut sandbox_fs = sinomo_runtime::sandbox::LocalSandboxFileSystem::new(layout);
-            for (path, contents) in case.setup_files {
-                sandbox_fs.write(
-                    &sinomo_runtime::sandbox::SandboxPath::new((*path).to_string())?,
-                    contents.as_bytes(),
-                )?;
-            }
-        }
-        let outcome = runner.run_toolchain_command_with_stdin_and_policy(
-            store,
-            toolchain_store,
-            &options.sandbox_id,
-            sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND,
-            case.argv_vec(),
-            None,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-            &node_id,
-            &policy,
-        )?;
-        let stdout = String::from_utf8_lossy(&outcome.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&outcome.stderr).to_string();
-        let mut mismatch = None;
-        if outcome.response.exit_status != case.expected_exit_status {
-            mismatch = Some(format!(
-                "expected exit {}, got {}",
-                case.expected_exit_status, outcome.response.exit_status
-            ));
-        } else if stdout != case.expected_stdout {
-            mismatch = Some(format!(
-                "expected stdout {:?}, got {:?}",
-                case.expected_stdout, stdout
-            ));
-        } else if let Some(expected) = case.expected_stderr_contains
-            && !stderr.contains(expected)
-        {
-            mismatch = Some(format!(
-                "expected stderr to contain {:?}, got {:?}",
-                expected, stderr
-            ));
-        }
-        results.push(sinomo_runtime::sandbox::SandboxToolFidelityResult {
-            case_name: case.name.to_string(),
-            command: sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND.to_string(),
-            passed: mismatch.is_none(),
-            exit_status: outcome.response.exit_status,
-            stdout,
-            stderr,
-            mismatch,
-        });
-    }
-    print_busybox_fidelity_results(&results);
-    if results.iter().any(|result| !result.passed) {
-        return Err(CliError::Parse {
-            detail: "QuickJS fidelity verification failed".to_string(),
-        });
-    }
-    Ok(())
-}
-
-pub(crate) fn sandbox_toolchain_verify_quickjs_with_daemon(
-    options: SandboxToolchainVerifyQuickJsOptions,
-) -> Result<(), CliError> {
-    let Some(status) = default_main_daemon_status()? else {
-        return Err(CliError::DaemonNotRunning {
-            detail: "sandbox daemon QuickJS verification requires the local daemon".to_string(),
-        });
-    };
-    let mut results = Vec::new();
-    for case in sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_FIDELITY_CASES {
-        if !case.setup_files.is_empty() {
-            let setup_script = quickjs_setup_script(case.setup_files)?;
-            let setup_outcome = daemon_run_toolchain_command(
-                &status.address,
-                options.sandbox_id.clone(),
-                sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND.to_string(),
-                vec![
-                    "qjs".to_string(),
-                    "--std".to_string(),
-                    "-e".to_string(),
-                    setup_script,
-                ],
-                None,
-                sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-            )?;
-            if setup_outcome.response.exit_status != 0 {
-                results.push(sinomo_runtime::sandbox::SandboxToolFidelityResult {
-                    case_name: format!("{}-setup", case.name),
-                    command: sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND.to_string(),
-                    passed: false,
-                    exit_status: setup_outcome.response.exit_status,
-                    stdout: String::from_utf8_lossy(&setup_outcome.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&setup_outcome.stderr).to_string(),
-                    mismatch: Some(format!(
-                        "expected setup exit 0, got {}",
-                        setup_outcome.response.exit_status
-                    )),
-                });
-                continue;
-            }
-        }
-        let outcome = daemon_run_toolchain_command(
-            &status.address,
-            options.sandbox_id.clone(),
-            sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND.to_string(),
-            case.argv_vec(),
-            None,
-            sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms,
-        )?;
-        let stdout = String::from_utf8_lossy(&outcome.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&outcome.stderr).to_string();
-        let mut mismatch = None;
-        if outcome.response.exit_status != case.expected_exit_status {
-            mismatch = Some(format!(
-                "expected exit {}, got {}",
-                case.expected_exit_status, outcome.response.exit_status
-            ));
-        } else if stdout != case.expected_stdout {
-            mismatch = Some(format!(
-                "expected stdout {:?}, got {:?}",
-                case.expected_stdout, stdout
-            ));
-        } else if let Some(expected) = case.expected_stderr_contains
-            && !stderr.contains(expected)
-        {
-            mismatch = Some(format!(
-                "expected stderr to contain {:?}, got {:?}",
-                expected, stderr
-            ));
-        }
-        results.push(sinomo_runtime::sandbox::SandboxToolFidelityResult {
-            case_name: case.name.to_string(),
-            command: sinomo_runtime::sandbox::QUICKJS_TOOLCHAIN_COMMAND.to_string(),
-            passed: mismatch.is_none(),
-            exit_status: outcome.response.exit_status,
-            stdout,
-            stderr,
-            mismatch,
-        });
-    }
-    print_busybox_fidelity_results(&results);
-    if results.iter().any(|result| !result.passed) {
-        return Err(CliError::Parse {
-            detail: "QuickJS fidelity verification failed".to_string(),
-        });
-    }
-    Ok(())
-}
-
-pub(crate) fn quickjs_setup_script(setup_files: &[(&str, &str)]) -> Result<String, CliError> {
-    let mut script = String::new();
-    for (path, contents) in setup_files {
-        let path = serde_json::to_string(path).map_err(|source| CliError::Parse {
-            detail: format!("failed to encode QuickJS setup path: {source}"),
-        })?;
-        let contents = serde_json::to_string(contents).map_err(|source| CliError::Parse {
-            detail: format!("failed to encode QuickJS setup contents: {source}"),
-        })?;
-        script.push_str("let f=std.open(");
-        script.push_str(&path);
-        script.push_str(",'w'); f.puts(");
-        script.push_str(&contents);
-        script.push_str("); f.close();\n");
-    }
-    Ok(script)
 }
 
 fn daemon_run_toolchain_command(

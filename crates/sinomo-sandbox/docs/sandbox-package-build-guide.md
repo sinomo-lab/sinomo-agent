@@ -225,7 +225,7 @@ Recommended preparation order:
 2. Implement the native ALPM bootstrap installer that writes through the VFS.
 3. Package `pacman` or a pacman-compatible manager for `wasm32-wasix` with its minimal dependencies.
 4. Add package bootstrap/install/remove/upgrade/sync/query CLI and daemon RPC commands.
-5. Convert existing BusyBox, Bash, Python, Clang/LLVM, Make, and QuickJS toolchain scripts into installable package recipes.
+5. Convert existing BusyBox, Bash, Python, Clang/LLVM, and Make toolchain scripts into installable package recipes.
 6. Implement the trusted package build worker and repository publication path.
 7. Add official Arch PKGBUILD ingestion for source packages.
 8. Add automated PKGBUILD classification: accepted, rejected, needs dependency, needs runtime feature, needs sysroot feature, needs build-system adapter, or unsafe script.

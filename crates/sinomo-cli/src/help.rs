@@ -323,20 +323,14 @@ pub(super) fn print_sandbox_help() {
     println!(
         "      Show real compiler/build-tool package status and gates for makepkg, tcc, and make."
     );
-    println!("  sinomo sandbox toolchain quickjs-plan");
-    println!("      Show the maintained QuickJS package target and fidelity cases.");
     println!("  sinomo sandbox toolchain python-plan");
-    println!("      Show the required CPython/pip WASIp1 package target and fidelity cases.");
+    println!("      Show the required CPython/pip WASIX package target and fidelity cases.");
     println!("  sinomo sandbox toolchain verify-bash <sandbox-id> [--daemon] [--allow-unsigned]");
     println!("      Run fidelity cases against the sandbox's pinned Bash toolchain.");
     println!(
         "  sinomo sandbox toolchain verify-busybox <sandbox-id> [--daemon] [--allow-unsigned]"
     );
     println!("      Run fidelity cases against the sandbox's pinned BusyBox toolchain.");
-    println!(
-        "  sinomo sandbox toolchain verify-quickjs <sandbox-id> [--daemon] [--allow-unsigned]"
-    );
-    println!("      Run fidelity cases against the sandbox's pinned QuickJS toolchain.");
     println!("  sinomo sandbox toolchain verify-python <sandbox-id> [--daemon] [--allow-unsigned]");
     println!("      Run fidelity cases against the sandbox's pinned CPython/pip toolchain.");
     println!("  sinomo sandbox toolchain verify-make <sandbox-id> [--daemon] [--allow-unsigned]");
@@ -351,7 +345,7 @@ pub(super) fn print_sandbox_help() {
         "  sinomo sandbox toolchain verify-coding <sandbox-id> [--daemon] [--allow-unsigned] [--full]"
     );
     println!(
-        "      Run coding fidelity cases against one pinned toolchain; --full expects that same sandbox to also provide Bash, Python/pip, Make, and TCC. The maintained full gate script uses separate WASIp1 and WASIX workspaces."
+        "      Run coding fidelity cases against one pinned toolchain; --full expects that same sandbox to also provide Bash, Python/pip, Make, and TCC."
     );
     println!("  sinomo sandbox doctor [<sandbox-id>]");
     println!("      Inspect local sandbox/toolchain readiness and policy compatibility.");
