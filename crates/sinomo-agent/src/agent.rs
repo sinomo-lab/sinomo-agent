@@ -7609,6 +7609,116 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn local_workspace_run_command_records_structured_output_and_stream_refs() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-command-structured-{}",
+            TaskId::generate()
+        ));
+        fs::create_dir_all(&root).expect("workspace");
+        let data_dir = SinomoDataDir::new(
+            std::env::temp_dir().join(format!("sinomo-agent-command-data-{}", TaskId::generate())),
+        );
+        let input = agent_input("structured command output");
+        let mut config = LocalWorkspaceAgentConfig::new(&root)
+            .allowing_shell_commands(true)
+            .with_data_dir_evidence(&data_dir, &input.session.session_id);
+        config.max_command_output_bytes = 4;
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "run_command".to_string(),
+                input: serde_json::json!({
+                    "command": "printf abcdef; printf uvwxyz >&2; exit 2"
+                }),
+                r#async: false,
+                summary: "run structured command".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Failed);
+        let command_output = outcome
+            .output
+            .get("command_output")
+            .expect("command output");
+        assert_eq!(
+            command_output
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64),
+            Some(2)
+        );
+        assert_eq!(
+            command_output
+                .get("stdout")
+                .and_then(serde_json::Value::as_str),
+            Some("abcd")
+        );
+        assert_eq!(
+            command_output
+                .get("stderr")
+                .and_then(serde_json::Value::as_str),
+            Some("uvwx")
+        );
+        assert_eq!(
+            command_output
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            command_output
+                .get("duration_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
+        assert!(
+            command_output
+                .get("aggregated_output")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("stderr:")
+        );
+        let stdout_ref = command_output
+            .get("stdout_ref")
+            .and_then(|value| value.get("uri"))
+            .and_then(serde_json::Value::as_str)
+            .expect("stdout ref");
+        let stderr_ref = command_output
+            .get("stderr_ref")
+            .and_then(|value| value.get("uri"))
+            .and_then(serde_json::Value::as_str)
+            .expect("stderr ref");
+        assert!(
+            fs::read_to_string(stdout_ref)
+                .expect("stdout ref")
+                .contains("abcdef")
+        );
+        assert!(
+            fs::read_to_string(stderr_ref)
+                .expect("stderr ref")
+                .contains("uvwxyz")
+        );
+        assert!(
+            outcome
+                .evidence
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "stdout")
+        );
+        assert!(
+            outcome
+                .evidence
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.kind == "stderr")
+        );
+    }
+
     #[test]
     fn local_workspace_registry_blocks_apply_patch_by_default() {
         let registry =

@@ -323,6 +323,32 @@ impl AgentToolArtifactRef {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentCommandOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub stdout: String,
+    #[serde(default)]
+    pub stderr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_ref: Option<AgentToolArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_ref: Option<AgentToolArtifactRef>,
+    #[serde(default)]
+    pub aggregated_output: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentToolExecutionEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,

@@ -6,9 +6,9 @@ mod run_command;
 mod search;
 
 use super::{
-    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentTool, AgentToolArtifactRef,
-    AgentToolCapability, AgentToolDescriptor, AgentToolEvidence, AgentToolProviderSpec,
-    AgentToolRegistry, AgentToolResult, AgentToolStatus,
+    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentCommandOutput, AgentTool,
+    AgentToolArtifactRef, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
+    AgentToolProviderSpec, AgentToolRegistry, AgentToolResult, AgentToolStatus,
 };
 use crate::{
     AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec, TaskId,
@@ -255,6 +255,7 @@ fn run_local_command_with_options(
         &args,
         &execution.output,
         execution.timed_out,
+        execution.duration_ms,
         options.timeout_ms,
         &options.evidence_tool_name,
         &options.evidence_reason,
@@ -268,6 +269,7 @@ struct LocalCommandExecution {
     cwd: PathBuf,
     output: Output,
     timed_out: bool,
+    duration_ms: u64,
 }
 
 fn execute_local_command(
@@ -315,6 +317,7 @@ fn execute_local_command(
             })?;
         }
     }
+    let started = Instant::now();
     let timed_out = if let Some(timeout_ms) = timeout_ms {
         wait_for_child_or_timeout(&mut child, timeout_ms).map_err(|source| {
             AgentToolResult::failed(
@@ -336,6 +339,7 @@ fn execute_local_command(
         cwd,
         output,
         timed_out,
+        duration_ms: duration_ms_from_elapsed(started.elapsed()),
     })
 }
 
@@ -354,6 +358,19 @@ fn wait_for_child_or_timeout(
             return Ok(true);
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn duration_ms_from_elapsed(elapsed: Duration) -> u64 {
+    elapsed.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn aggregate_command_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("stdout:\n{stdout}\nstderr:\n{stderr}"),
     }
 }
 
@@ -424,6 +441,7 @@ fn local_command_result_from_output(
     args: &[String],
     output: &Output,
     timed_out: bool,
+    duration_ms: u64,
     timeout_ms: Option<u64>,
     evidence_tool_name: &str,
     evidence_reason: &str,
@@ -435,6 +453,38 @@ fn local_command_result_from_output(
     let status = output.status.code();
     let succeeded = !timed_out && output.status.success();
     let cwd_display = display_workspace_path(config, &cwd);
+    let stdout_ref = if stdout.truncated {
+        write_local_evidence(config, evidence_tool_name, "stdout.txt", &output.stdout).map(|uri| {
+            AgentToolArtifactRef::new("stdout", uri)
+                .with_label("complete stdout")
+                .with_media_type("text/plain; charset=utf-8")
+        })
+    } else {
+        None
+    };
+    let stderr_ref = if stderr.truncated {
+        write_local_evidence(config, evidence_tool_name, "stderr.txt", &output.stderr).map(|uri| {
+            AgentToolArtifactRef::new("stderr", uri)
+                .with_label("complete stderr")
+                .with_media_type("text/plain; charset=utf-8")
+        })
+    } else {
+        None
+    };
+    let aggregated_output = aggregate_command_output(&stdout.text, &stderr.text);
+    let command_output = AgentCommandOutput {
+        exit_code: status,
+        stdout: stdout.text.clone(),
+        stderr: stderr.text.clone(),
+        stdout_ref: stdout_ref.clone(),
+        stderr_ref: stderr_ref.clone(),
+        aggregated_output: aggregated_output.clone(),
+        duration_ms,
+        timed_out,
+        truncated: stdout.truncated || stderr.truncated,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    };
     let summary = if timed_out {
         format!(
             "{program} {} timed out after {} ms",
@@ -459,9 +509,14 @@ fn local_command_result_from_output(
         "status": status,
         "success": succeeded,
         "timed_out": timed_out,
+        "duration_ms": duration_ms,
         "timeout_ms": timeout_ms,
         "stdout": stdout.text,
         "stderr": stderr.text,
+        "stdout_ref": stdout_ref,
+        "stderr_ref": stderr_ref,
+        "aggregated_output": aggregated_output,
+        "command_output": command_output,
         "stdout_truncated": stdout.truncated,
         "stderr_truncated": stderr.truncated,
         "changed_files": changed_files.clone(),
@@ -471,6 +526,7 @@ fn local_command_result_from_output(
             "program": program,
             "args": args,
             "cwd": cwd_display,
+            "duration_ms": duration_ms,
             "timed_out": timed_out,
             "timeout_ms": timeout_ms,
             "stdout": String::from_utf8_lossy(&output.stdout),
@@ -504,6 +560,12 @@ fn local_command_result_from_output(
             AgentToolArtifactRef::new("full_output", full_output_ref)
                 .with_media_type("application/json"),
         );
+    }
+    if let Some(stdout_ref) = command_output.stdout_ref.clone() {
+        evidence = evidence.with_artifact(stdout_ref);
+    }
+    if let Some(stderr_ref) = command_output.stderr_ref.clone() {
+        evidence = evidence.with_artifact(stderr_ref);
     }
     if succeeded {
         AgentToolResult::succeeded(summary, payload).with_evidence(evidence)
