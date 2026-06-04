@@ -4322,12 +4322,16 @@ pub fn publish_cluster_invitation_to_quorum(
     state: &ClusterBootstrapState,
     invite: &ClusterJoinInvite,
 ) -> Result<(), DaemonError> {
+    let txn = if sinomo_network::cluster_raft_local_is_voter(state) {
+        sinomo_network::cluster_invitation_publish_txn_from_kv(paths, invite)?
+    } else {
+        sinomo_network::cluster_invitation_publish_txn(invite)?
+    };
+    if txn.success.is_empty() {
+        return Ok(());
+    }
     let mut commit_state = state.clone();
-    commit_cluster_kv_txn_with_quorum(
-        paths,
-        &mut commit_state,
-        sinomo_network::cluster_invitation_publish_txn(invite)?,
-    )?;
+    commit_cluster_kv_txn_with_quorum(paths, &mut commit_state, txn)?;
     Ok(())
 }
 

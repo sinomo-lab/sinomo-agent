@@ -2052,7 +2052,15 @@ impl InProcessKvStore {
                     deleted_count: 0,
                 })
             }
-            KvOp::LeaseGrant { .. } => None,
+            KvOp::LeaseGrant {
+                lease_id,
+                ttl_ticks,
+            } => self.leases.get(lease_id).and_then(|lease| {
+                (lease.ttl_ticks == *ttl_ticks && lease.remaining_ticks == lease.ttl_ticks)
+                    .then_some(KvOpResponse::LeaseGrant {
+                        lease_id: *lease_id,
+                    })
+            }),
             KvOp::LeaseKeepAlive { lease_id } => {
                 let lease = self.leases.get(lease_id)?;
                 (lease.remaining_ticks == lease.ttl_ticks).then_some(KvOpResponse::LeaseKeepAlive {
@@ -5001,6 +5009,10 @@ mod tests {
                     KvOp::DeletePrefix {
                         prefix: "/missing-prefix/".to_string(),
                     },
+                    KvOp::LeaseGrant {
+                        lease_id: LeaseId(7),
+                        ttl_ticks: 10,
+                    },
                     KvOp::LeaseKeepAlive {
                         lease_id: LeaseId(7),
                     },
@@ -5029,6 +5041,9 @@ mod tests {
                     KvOpResponse::DeletePrefix {
                         prefix: "/missing-prefix/".to_string(),
                         deleted_count: 0,
+                    },
+                    KvOpResponse::LeaseGrant {
+                        lease_id: LeaseId(7),
                     },
                     KvOpResponse::LeaseKeepAlive {
                         lease_id: LeaseId(7),
@@ -5069,6 +5084,37 @@ mod tests {
                 .expect("mutating keepalive"),
             None
         );
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_no_effect(&KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::LeaseGrant {
+                        lease_id: LeaseId(7),
+                        ttl_ticks: 10,
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("mutating lease grant refresh"),
+            None
+        );
+        store
+            .apply_op(KvOp::LeaseKeepAlive {
+                lease_id: LeaseId(7),
+            })
+            .expect("refresh lease");
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_no_effect(&KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::LeaseGrant {
+                        lease_id: LeaseId(7),
+                        ttl_ticks: 20,
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("changed lease ttl"),
+            None
+        );
 
         let error = store
             .txn_response_if_selected_branch_no_effect(&KvTxn {
@@ -5096,6 +5142,12 @@ mod tests {
         store
             .put("/config/a", b"old".to_vec(), None)
             .expect("initial put");
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(7),
+                ttl_ticks: 10,
+            })
+            .expect("lease grant");
         let revision_before = store.revision();
 
         assert_eq!(
@@ -5122,6 +5174,17 @@ mod tests {
         );
         assert_eq!(
             store
+                .op_response_if_no_effect(&KvOp::LeaseGrant {
+                    lease_id: LeaseId(7),
+                    ttl_ticks: 10,
+                })
+                .expect("stable lease grant"),
+            Some(KvOpResponse::LeaseGrant {
+                lease_id: LeaseId(7),
+            })
+        );
+        assert_eq!(
+            store
                 .op_response_if_no_effect(&KvOp::LeaseRevoke {
                     lease_id: LeaseId(99),
                 })
@@ -5144,12 +5207,31 @@ mod tests {
         );
         assert_eq!(
             store
-                .op_response_if_no_effect(&KvOp::LeaseKeepAlive {
+                .op_response_if_no_effect(&KvOp::LeaseGrant {
                     lease_id: LeaseId(7),
+                    ttl_ticks: 20,
+                })
+                .expect("changed lease grant"),
+            None
+        );
+        store.tick_leases(1).expect("age lease");
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::LeaseGrant {
+                    lease_id: LeaseId(7),
+                    ttl_ticks: 10,
+                })
+                .expect("aged lease grant"),
+            None
+        );
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::LeaseKeepAlive {
+                    lease_id: LeaseId(99),
                 })
                 .expect_err("unknown keepalive"),
             KvError::UnknownLease {
-                lease_id: LeaseId(7),
+                lease_id: LeaseId(99),
             }
         );
     }

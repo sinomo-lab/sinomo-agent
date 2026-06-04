@@ -11,6 +11,7 @@ use std::time::Instant;
 
 const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
+pub(crate) const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_PUBLIC_IP_DNS_WORKERS: usize = 2;
@@ -31,6 +32,20 @@ struct LocalIpDiscoveryCacheEntry {
 struct PublicIpDiscoveryCacheEntry {
     checked_at: Instant,
     candidates: Vec<IpAddr>,
+}
+
+impl PublicIpDiscoveryCacheEntry {
+    fn ttl(&self) -> Duration {
+        if self.candidates.is_empty() {
+            PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL
+        } else {
+            PUBLIC_IP_DISCOVERY_CACHE_TTL
+        }
+    }
+
+    fn is_fresh_at(&self, now: Instant) -> bool {
+        now.duration_since(self.checked_at) < self.ttl()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,7 +246,7 @@ fn cached_default_public_ip_candidates_for_key_with(
     let now = Instant::now();
     if let Ok(cache) = PUBLIC_IP_DISCOVERY_CACHE.lock()
         && let Some(entry) = cache.get(&cache_key)
-        && now.duration_since(entry.checked_at) < PUBLIC_IP_DISCOVERY_CACHE_TTL
+        && entry.is_fresh_at(now)
     {
         return entry.candidates.clone();
     }
@@ -242,9 +257,7 @@ fn cached_default_public_ip_candidates_for_key_with(
     };
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES {
-            cache.retain(|_, entry| {
-                now.duration_since(entry.checked_at) < PUBLIC_IP_DISCOVERY_CACHE_TTL
-            });
+            cache.retain(|_, entry| entry.is_fresh_at(now));
         }
         if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES
             && let Some(oldest) = cache
@@ -280,6 +293,17 @@ pub(crate) fn local_network_cache_key(local_ips: impl IntoIterator<Item = IpAddr
 pub(crate) fn clear_public_ip_discovery_cache() {
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         cache.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn age_public_ip_discovery_cache_for_test(age: Duration) {
+    if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
+        for entry in cache.values_mut() {
+            if let Some(checked_at) = entry.checked_at.checked_sub(age) {
+                entry.checked_at = checked_at;
+            }
+        }
     }
 }
 

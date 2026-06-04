@@ -2658,6 +2658,70 @@ fn public_ip_discovery_cache_does_not_store_deferred_result() {
 }
 
 #[test]
+fn public_ip_discovery_empty_cache_expires_before_positive_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let empty = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(Vec::new())
+        },
+    );
+    let empty_cached = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.15".parse().expect("ip")])
+        },
+    );
+
+    assert!(empty.is_empty());
+    assert!(empty_cached.is_empty());
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "empty discovery results should still be cached briefly to avoid tight retry loops"
+    );
+
+    crate::lan::age_public_ip_discovery_cache_for_test(
+        crate::lan::PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL + Duration::from_millis(1),
+    );
+    let recovered = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.16".parse().expect("ip")])
+        },
+    );
+    assert_eq!(
+        recovered,
+        vec!["203.0.113.16".parse::<IpAddr>().expect("ip")]
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+    crate::lan::age_public_ip_discovery_cache_for_test(
+        crate::lan::PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL + Duration::from_millis(1),
+    );
+    let positive_cached = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.17".parse().expect("ip")])
+        },
+    );
+    assert_eq!(
+        positive_cached, recovered,
+        "positive discovery results should retain the longer cache TTL"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
 fn public_ip_dns_worker_limit_releases_permits() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
@@ -3094,6 +3158,88 @@ fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
     assert_eq!(
         wal_len_before, wal_len_after,
         "direct no-effect operations should not consume WAL writes"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stable_lease_grant_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-stable-lease-grant-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_stable_lease_grant_no_append").expect("node");
+    let lease_id = LeaseId(7);
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::LeaseGrant {
+            lease_id,
+            ttl_ticks: 10,
+        }),
+    )
+    .expect("grant lease");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::LeaseGrant {
+            lease_id,
+            ttl_ticks: 10,
+        }),
+    )
+    .expect("stable lease grant");
+    let wal_len_after_noop = std::fs::metadata(&wal_path).expect("wal after noop").len();
+
+    assert_eq!(txn_response, None);
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(
+        no_op_snapshot
+            .leases
+            .iter()
+            .find(|lease| lease.lease_id == lease_id)
+            .expect("lease")
+            .ttl_ticks,
+        10
+    );
+    assert_eq!(
+        wal_len_before, wal_len_after_noop,
+        "stable full lease grants should not consume WAL writes"
+    );
+
+    let changed = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::LeaseGrant {
+            lease_id,
+            ttl_ticks: 20,
+        }),
+    )
+    .expect("changed lease ttl");
+    assert_eq!(
+        changed
+            .leases
+            .iter()
+            .find(|lease| lease.lease_id == lease_id)
+            .expect("changed lease")
+            .ttl_ticks,
+        20
+    );
+    assert!(
+        std::fs::metadata(&wal_path)
+            .expect("wal after changed ttl")
+            .len()
+            > wal_len_after_noop,
+        "changing a lease TTL must still append a durable raft entry"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -3613,6 +3759,91 @@ fn cluster_invitation_sync_batches_invite_and_state_in_one_revision() {
         .expect("invite state");
     assert_eq!(state.invite_id, invite.invite_id);
     assert_eq!(state.state, "active");
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-invite-sync-noop-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_invite_sync_noop").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_invite_sync_noop").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "invite sync noop",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    let invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_sync_noop").expect("invite"),
+        cluster_id,
+        cluster_name: Some("invite sync noop".to_string()),
+        cluster_public_key: "cluster-pk".to_string(),
+        invitation_secret: "secret".to_string(),
+        communication_channels: Vec::new(),
+        introducers: Vec::new(),
+        token_id: "token".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: node_id.clone(),
+        issuer_public_key: "issuer-pk".to_string(),
+        signature: String::new(),
+    };
+
+    let first = sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    let wal_path = cluster_raft_wal_paths(&paths, &state.local_node_id).wal;
+    let wal_len_after_first = std::fs::metadata(&wal_path)
+        .expect("wal after first invite")
+        .len();
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("overwrite stale materialized snapshot");
+
+    thread::sleep(Duration::from_millis(5));
+    let txn = cluster_invitation_publish_txn_from_kv(&paths, &invite).expect("invite txn");
+    assert!(
+        txn.success.is_empty(),
+        "stable invite publish should ignore invitation-state updated_at"
+    );
+    let repeat = sync_cluster_invitation_to_kv(&paths, &invite).expect("repeat invitation");
+
+    assert_eq!(repeat.revision, first.revision);
+    assert_eq!(
+        repeat
+            .get(&cluster_invitation_key(&invite.invite_id))
+            .expect("current invite entry")
+            .decode::<ClusterJoinInvite>()
+            .expect("invite"),
+        invite,
+        "stable no-op sync should return the current raft-backed snapshot, not a stale materialized snapshot"
+    );
+    assert_eq!(
+        wal_len_after_first,
+        std::fs::metadata(&wal_path)
+            .expect("wal after stable repeat")
+            .len(),
+        "stable invite syncs should not append no-op raft entries"
+    );
+    let node =
+        open_cluster_raft_kv_node(&paths, &state.local_node_id).expect("open raft after repeat");
+    assert_eq!(
+        node.last_log_index(),
+        1,
+        "repeat invite sync should not create another raft log entry"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

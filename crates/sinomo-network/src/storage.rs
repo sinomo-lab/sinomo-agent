@@ -5605,6 +5605,21 @@ pub fn read_cluster_invitation_from_kv(
 pub fn cluster_invitation_publish_txn(
     invite: &sinomo_core::ClusterJoinInvite,
 ) -> Result<KvTxn, NetworkError> {
+    cluster_invitation_publish_txn_with_snapshot(None, invite)
+}
+
+pub fn cluster_invitation_publish_txn_from_kv(
+    paths: &ClusterPaths,
+    invite: &sinomo_core::ClusterJoinInvite,
+) -> Result<KvTxn, NetworkError> {
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    cluster_invitation_publish_txn_with_snapshot(Some(snapshot.as_ref()), invite)
+}
+
+fn cluster_invitation_publish_txn_with_snapshot(
+    snapshot: Option<&KvSnapshot>,
+    invite: &sinomo_core::ClusterJoinInvite,
+) -> Result<KvTxn, NetworkError> {
     let invitation_state = ClusterInvitationStateRecord {
         cluster_id: invite.cluster_id.clone(),
         invite_id: invite.invite_id.clone(),
@@ -5613,30 +5628,60 @@ pub fn cluster_invitation_publish_txn(
         expires_at: invite.expires_at,
         updated_at: OffsetDateTime::now_utc(),
     };
+    let mut success = Vec::new();
+    push_snapshot_diff_put_op(
+        snapshot,
+        cluster_invitation_key(&invite.invite_id),
+        invite,
+        &mut success,
+    )?;
+    push_invitation_state_diff_op(snapshot, &invitation_state, &mut success)?;
     Ok(KvTxn {
         compares: Vec::new(),
-        success: vec![
-            KvOp::put_serde(cluster_invitation_key(&invite.invite_id), invite, None)?,
-            KvOp::put_serde(
-                cluster_invitation_state_key(&invite.invite_id),
-                &invitation_state,
-                None,
-            )?,
-        ],
+        success,
         failure: Vec::new(),
     })
+}
+
+fn push_invitation_state_diff_op(
+    snapshot: Option<&KvSnapshot>,
+    invitation_state: &ClusterInvitationStateRecord,
+    ops: &mut Vec<KvOp>,
+) -> Result<(), NetworkError> {
+    let key = cluster_invitation_state_key(&invitation_state.invite_id);
+    if let Some(snapshot) = snapshot
+        && let Some(entry) = snapshot.get(&key)
+        && let Ok(existing) = entry.decode::<ClusterInvitationStateRecord>()
+        && cluster_invitation_state_stable_eq(&existing, invitation_state)
+    {
+        return Ok(());
+    }
+    ops.push(KvOp::put_serde(key, invitation_state, None)?);
+    Ok(())
+}
+
+fn cluster_invitation_state_stable_eq(
+    left: &ClusterInvitationStateRecord,
+    right: &ClusterInvitationStateRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.invite_id == right.invite_id
+        && left.state == right.state
+        && left.issuer_node_id == right.issuer_node_id
+        && left.expires_at == right.expires_at
 }
 
 pub fn sync_cluster_invitation_to_kv(
     paths: &ClusterPaths,
     invite: &sinomo_core::ClusterJoinInvite,
 ) -> Result<KvSnapshot, NetworkError> {
+    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let txn = cluster_invitation_publish_txn_with_snapshot(Some(snapshot.as_ref()), invite)?;
+    if txn.success.is_empty() {
+        return Ok(snapshot.as_ref().clone());
+    }
     let state = read_cluster_state_without_kv(paths)?;
-    append_cluster_raft_command(
-        paths,
-        &state.local_node_id,
-        KvCommand::Txn(cluster_invitation_publish_txn(invite)?),
-    )
+    append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
 }
 
 pub fn sync_cluster_certificate_to_kv(
