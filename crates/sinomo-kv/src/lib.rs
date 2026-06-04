@@ -30,6 +30,9 @@ const MAX_ACTIVE_WATCHES: usize = 1024;
 const MAX_ACTIVE_LEASES: usize = 4096;
 const MAX_TXN_COMPARES: usize = 1024;
 const MAX_TXN_OPS_PER_BRANCH: usize = 4096;
+pub const MAX_KV_MUTATION_EVENTS_PER_COMMAND: usize = 4096;
+pub const MAX_DELETE_PREFIX_KEYS: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
+pub const MAX_KEYS_PER_LEASE: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
 pub const MAX_KV_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_KV_COMMAND_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// Committed log entries kept in memory after a local snapshot compaction. A
@@ -191,6 +194,26 @@ impl KvEntry {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SimulatedKeyState {
+    present: bool,
+    lease_id: Option<LeaseId>,
+}
+
+impl SimulatedKeyState {
+    const ABSENT: Self = Self {
+        present: false,
+        lease_id: None,
+    };
+
+    fn present(lease_id: Option<LeaseId>) -> Self {
+        Self {
+            present: true,
+            lease_id,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct KvLease {
     pub lease_id: LeaseId,
@@ -335,6 +358,22 @@ fn validate_kv_payload_total(actual_bytes: usize) -> Result<(), KvError> {
         });
     }
     Ok(())
+}
+
+fn record_kv_mutation_events(total: &mut usize, delta: usize) -> Result<(), KvError> {
+    let observed_events = total.saturating_add(delta);
+    if observed_events > MAX_KV_MUTATION_EVENTS_PER_COMMAND {
+        return Err(KvError::MutationEventLimit {
+            observed_events,
+            max_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        });
+    }
+    *total = observed_events;
+    Ok(())
+}
+
+fn kv_entry_payload_bytes(entry: &KvEntry) -> usize {
+    entry.key.len().saturating_add(entry.value.len())
 }
 
 fn validate_kv_txn_payload(txn: &KvTxn) -> Result<(), KvError> {
@@ -901,6 +940,17 @@ impl KvLocalCache {
             .range_prefix_limited(prefix, max_entries)
     }
 
+    pub fn current_range_prefix_limited_by_payload_bytes(
+        &self,
+        node_id: NodeId,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, KvError> {
+        self.current_store(node_id)?
+            .range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+    }
+
     pub fn current_range_prefix_serde<T: DeserializeOwned>(
         &self,
         node_id: NodeId,
@@ -1049,7 +1099,17 @@ impl InProcessKvStore {
         prefix: &str,
         max_entries: usize,
     ) -> Result<Vec<KvEntry>, KvError> {
+        self.range_prefix_limited_by_payload_bytes(prefix, max_entries, usize::MAX)
+    }
+
+    pub fn range_prefix_limited_by_payload_bytes(
+        &self,
+        prefix: &str,
+        max_entries: usize,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<KvEntry>, KvError> {
         let mut entries = Vec::new();
+        let mut payload_bytes = 0_usize;
         for (key, entry) in self.entries.range(prefix.to_string()..) {
             if !key.starts_with(prefix) {
                 break;
@@ -1058,6 +1118,14 @@ impl InProcessKvStore {
                 return Err(KvError::RangeLimit {
                     prefix: prefix.to_string(),
                     max_entries,
+                });
+            }
+            payload_bytes = payload_bytes.saturating_add(kv_entry_payload_bytes(entry));
+            if payload_bytes > max_payload_bytes {
+                return Err(KvError::RangePayloadLimit {
+                    prefix: prefix.to_string(),
+                    observed_bytes: payload_bytes,
+                    max_bytes: max_payload_bytes,
                 });
             }
             entries.push(entry.clone());
@@ -1298,18 +1366,31 @@ impl InProcessKvStore {
     }
 
     pub fn tick_leases(&mut self, ticks: u64) -> Result<Vec<LeaseId>, KvError> {
-        let mut expired = Vec::new();
+        let mut candidates = Vec::new();
         for lease in self.leases.values_mut() {
             lease.remaining_ticks = lease.remaining_ticks.saturating_sub(ticks);
             if lease.remaining_ticks == 0 {
-                expired.push(lease.lease_id);
+                candidates.push(lease.lease_id);
             }
         }
 
-        for lease_id in &expired {
-            self.apply_op(KvOp::LeaseRevoke {
-                lease_id: *lease_id,
-            })?;
+        let mut expired = Vec::new();
+        let mut mutation_events = 0_usize;
+        for lease_id in candidates {
+            let remaining_budget =
+                MAX_KV_MUTATION_EVENTS_PER_COMMAND.saturating_sub(mutation_events);
+            let (keys, complete) = self.lease_revoke_batch(lease_id, remaining_budget);
+            if keys.is_empty() && !complete {
+                break;
+            }
+            mutation_events = mutation_events.saturating_add(keys.len());
+            if complete {
+                self.remove_lease_and_delete_keys(lease_id, keys)?;
+                expired.push(lease_id);
+            } else {
+                self.delete_lease_keys(keys)?;
+                break;
+            }
         }
 
         Ok(expired)
@@ -1349,20 +1430,9 @@ impl InProcessKvStore {
                 Ok(KvOpResponse::LeaseKeepAlive { lease_id })
             }
             KvOp::LeaseRevoke { lease_id } => {
-                self.leases.remove(&lease_id);
-                let keys: Vec<String> = self
-                    .lease_keys
-                    .remove(&lease_id)
-                    .map(|keys| keys.into_iter().collect())
-                    .unwrap_or_default();
-                let deleted_count = keys.len();
-                for key in keys {
-                    self.apply_delete(key)?;
-                }
-                Ok(KvOpResponse::LeaseRevoke {
-                    lease_id,
-                    deleted_count,
-                })
+                let keys =
+                    self.keys_for_lease_limited(lease_id, MAX_KV_MUTATION_EVENTS_PER_COMMAND)?;
+                self.remove_lease_and_delete_keys(lease_id, keys)
             }
         }
     }
@@ -1385,10 +1455,15 @@ impl InProcessKvStore {
 
     fn validate_ops(&self, ops: &[KvOp]) -> Result<(), KvError> {
         let mut active_leases = self.leases.keys().copied().collect::<BTreeSet<_>>();
+        let mut touched_keys = BTreeMap::<String, SimulatedKeyState>::new();
+        let mut deleted_prefixes = Vec::<String>::new();
+        let mut revoked_leases = Vec::<LeaseId>::new();
+        let mut mutation_events = 0_usize;
         for op in ops {
             validate_kv_op_payload(op)?;
             match op {
                 KvOp::Put {
+                    key,
                     lease_id: Some(lease_id),
                     ..
                 } => {
@@ -1397,10 +1472,63 @@ impl InProcessKvStore {
                             lease_id: *lease_id,
                         });
                     }
+                    let old_state = self.simulated_key_state(
+                        key,
+                        &touched_keys,
+                        &deleted_prefixes,
+                        &revoked_leases,
+                    );
+                    if old_state.lease_id != Some(*lease_id) {
+                        let lease_keys = self.simulated_lease_key_count(
+                            *lease_id,
+                            &touched_keys,
+                            &deleted_prefixes,
+                            &revoked_leases,
+                        );
+                        if lease_keys >= MAX_KEYS_PER_LEASE {
+                            return Err(KvError::LeaseKeyLimit {
+                                lease_id: *lease_id,
+                                observed_keys: lease_keys.saturating_add(1),
+                                max_keys: MAX_KEYS_PER_LEASE,
+                            });
+                        }
+                    }
+                    record_kv_mutation_events(&mut mutation_events, 1)?;
+                    touched_keys.insert(key.clone(), SimulatedKeyState::present(Some(*lease_id)));
                 }
-                KvOp::Put { lease_id: None, .. }
-                | KvOp::Delete { .. }
-                | KvOp::DeletePrefix { .. } => {}
+                KvOp::Put {
+                    key,
+                    lease_id: None,
+                    ..
+                } => {
+                    record_kv_mutation_events(&mut mutation_events, 1)?;
+                    touched_keys.insert(key.clone(), SimulatedKeyState::present(None));
+                }
+                KvOp::Delete { key } => {
+                    if self
+                        .simulated_key_state(key, &touched_keys, &deleted_prefixes, &revoked_leases)
+                        .present
+                    {
+                        record_kv_mutation_events(&mut mutation_events, 1)?;
+                    }
+                    touched_keys.insert(key.clone(), SimulatedKeyState::ABSENT);
+                }
+                KvOp::DeletePrefix { prefix } => {
+                    let deleted_count = self.simulated_delete_prefix_count(
+                        prefix,
+                        &touched_keys,
+                        &deleted_prefixes,
+                        &revoked_leases,
+                        MAX_DELETE_PREFIX_KEYS,
+                    )?;
+                    record_kv_mutation_events(&mut mutation_events, deleted_count)?;
+                    for (key, state) in &mut touched_keys {
+                        if key.starts_with(prefix) {
+                            *state = SimulatedKeyState::ABSENT;
+                        }
+                    }
+                    deleted_prefixes.push(prefix.clone());
+                }
                 KvOp::LeaseGrant {
                     lease_id,
                     ttl_ticks,
@@ -1426,7 +1554,20 @@ impl InProcessKvStore {
                     }
                 }
                 KvOp::LeaseRevoke { lease_id } => {
+                    let deleted_count = self.simulated_lease_revoke_count(
+                        *lease_id,
+                        &touched_keys,
+                        &deleted_prefixes,
+                        &revoked_leases,
+                    );
+                    record_kv_mutation_events(&mut mutation_events, deleted_count)?;
                     active_leases.remove(lease_id);
+                    for state in touched_keys.values_mut() {
+                        if state.present && state.lease_id == Some(*lease_id) {
+                            *state = SimulatedKeyState::ABSENT;
+                        }
+                    }
+                    revoked_leases.push(*lease_id);
                 }
             }
         }
@@ -1443,6 +1584,10 @@ impl InProcessKvStore {
         if let Some(lease_id) = lease_id {
             if !self.leases.contains_key(&lease_id) {
                 return Err(KvError::UnknownLease { lease_id });
+            }
+            let old_lease_id = self.entries.get(&key).and_then(|entry| entry.lease_id);
+            if old_lease_id != Some(lease_id) {
+                self.validate_lease_key_capacity(lease_id)?;
             }
         }
 
@@ -1500,7 +1645,7 @@ impl InProcessKvStore {
     }
 
     fn apply_delete_prefix(&mut self, prefix: String) -> Result<KvOpResponse, KvError> {
-        let keys = self.keys_with_prefix(&prefix);
+        let keys = self.keys_with_prefix_limited(&prefix, MAX_DELETE_PREFIX_KEYS)?;
         let deleted_count = keys.len();
         for key in keys {
             self.apply_delete(key)?;
@@ -1511,15 +1656,200 @@ impl InProcessKvStore {
         })
     }
 
-    fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+    fn keys_with_prefix_limited(
+        &self,
+        prefix: &str,
+        max_keys: usize,
+    ) -> Result<Vec<String>, KvError> {
         let mut keys = Vec::new();
         for key in self.entries.range(prefix.to_string()..).map(|(key, _)| key) {
             if !key.starts_with(prefix) {
                 break;
             }
+            if keys.len() >= max_keys {
+                return Err(KvError::DeletePrefixLimit {
+                    prefix: prefix.to_string(),
+                    observed_keys: max_keys.saturating_add(1),
+                    max_keys,
+                });
+            }
             keys.push(key.clone());
         }
-        keys
+        Ok(keys)
+    }
+
+    fn simulated_delete_prefix_count(
+        &self,
+        prefix: &str,
+        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        deleted_prefixes: &[String],
+        revoked_leases: &[LeaseId],
+        max_keys: usize,
+    ) -> Result<usize, KvError> {
+        let mut count = 0_usize;
+        for key in self.entries.range(prefix.to_string()..).map(|(key, _)| key) {
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if self
+                .simulated_key_state(key, touched_keys, deleted_prefixes, revoked_leases)
+                .present
+            {
+                count = count.saturating_add(1);
+                if count > max_keys {
+                    return Err(KvError::DeletePrefixLimit {
+                        prefix: prefix.to_string(),
+                        observed_keys: count,
+                        max_keys,
+                    });
+                }
+            }
+        }
+        for (key, state) in touched_keys {
+            if state.present && key.starts_with(prefix) && !self.entries.contains_key(key) {
+                count = count.saturating_add(1);
+                if count > max_keys {
+                    return Err(KvError::DeletePrefixLimit {
+                        prefix: prefix.to_string(),
+                        observed_keys: count,
+                        max_keys,
+                    });
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    fn simulated_lease_revoke_count(
+        &self,
+        lease_id: LeaseId,
+        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        deleted_prefixes: &[String],
+        revoked_leases: &[LeaseId],
+    ) -> usize {
+        self.simulated_lease_key_count(lease_id, touched_keys, deleted_prefixes, revoked_leases)
+    }
+
+    fn simulated_lease_key_count(
+        &self,
+        lease_id: LeaseId,
+        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        deleted_prefixes: &[String],
+        revoked_leases: &[LeaseId],
+    ) -> usize {
+        let mut count = 0_usize;
+        if let Some(keys) = self.lease_keys.get(&lease_id) {
+            for key in keys {
+                let state =
+                    self.simulated_key_state(key, touched_keys, deleted_prefixes, revoked_leases);
+                if state.present && state.lease_id == Some(lease_id) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        for (key, state) in touched_keys {
+            if state.present
+                && state.lease_id == Some(lease_id)
+                && !self
+                    .lease_keys
+                    .get(&lease_id)
+                    .is_some_and(|keys| keys.contains(key))
+            {
+                count = count.saturating_add(1);
+            }
+        }
+        count
+    }
+
+    fn validate_lease_key_capacity(&self, lease_id: LeaseId) -> Result<(), KvError> {
+        let lease_keys = self
+            .lease_keys
+            .get(&lease_id)
+            .map(BTreeSet::len)
+            .unwrap_or_default();
+        if lease_keys >= MAX_KEYS_PER_LEASE {
+            return Err(KvError::LeaseKeyLimit {
+                lease_id,
+                observed_keys: lease_keys.saturating_add(1),
+                max_keys: MAX_KEYS_PER_LEASE,
+            });
+        }
+        Ok(())
+    }
+
+    fn keys_for_lease_limited(
+        &self,
+        lease_id: LeaseId,
+        max_keys: usize,
+    ) -> Result<Vec<String>, KvError> {
+        let Some(keys) = self.lease_keys.get(&lease_id) else {
+            return Ok(Vec::new());
+        };
+        if keys.len() > max_keys {
+            return Err(KvError::MutationEventLimit {
+                observed_events: keys.len(),
+                max_events: max_keys,
+            });
+        }
+        Ok(keys.iter().cloned().collect())
+    }
+
+    fn lease_revoke_batch(&self, lease_id: LeaseId, max_keys: usize) -> (Vec<String>, bool) {
+        let Some(keys) = self.lease_keys.get(&lease_id) else {
+            return (Vec::new(), true);
+        };
+        let complete = keys.len() <= max_keys;
+        (keys.iter().take(max_keys).cloned().collect(), complete)
+    }
+
+    fn remove_lease_and_delete_keys(
+        &mut self,
+        lease_id: LeaseId,
+        keys: Vec<String>,
+    ) -> Result<KvOpResponse, KvError> {
+        self.leases.remove(&lease_id);
+        self.lease_keys.remove(&lease_id);
+        let deleted_count = keys.len();
+        self.delete_lease_keys(keys)?;
+        Ok(KvOpResponse::LeaseRevoke {
+            lease_id,
+            deleted_count,
+        })
+    }
+
+    fn delete_lease_keys(&mut self, keys: Vec<String>) -> Result<(), KvError> {
+        for key in keys {
+            self.apply_delete(key)?;
+        }
+        Ok(())
+    }
+
+    fn simulated_key_state(
+        &self,
+        key: &str,
+        touched_keys: &BTreeMap<String, SimulatedKeyState>,
+        deleted_prefixes: &[String],
+        revoked_leases: &[LeaseId],
+    ) -> SimulatedKeyState {
+        if let Some(state) = touched_keys.get(key) {
+            return *state;
+        }
+        if deleted_prefixes
+            .iter()
+            .any(|prefix| key.starts_with(prefix))
+        {
+            return SimulatedKeyState::ABSENT;
+        }
+        let Some(entry) = self.entries.get(key) else {
+            return SimulatedKeyState::ABSENT;
+        };
+        if entry
+            .lease_id
+            .is_some_and(|lease_id| revoked_leases.contains(&lease_id))
+        {
+            return SimulatedKeyState::ABSENT;
+        }
+        SimulatedKeyState::present(entry.lease_id)
     }
 
     fn compare(&self, compare: &KvCompare) -> bool {
@@ -3199,6 +3529,35 @@ pub enum KvError {
     WatchIdExhausted,
     #[error("range for prefix {prefix} exceeded max {max_entries} entries")]
     RangeLimit { prefix: String, max_entries: usize },
+    #[error(
+        "range for prefix {prefix} is at least {observed_bytes} payload bytes; max is {max_bytes}"
+    )]
+    RangePayloadLimit {
+        prefix: String,
+        observed_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error(
+        "delete-prefix for prefix {prefix} matched at least {observed_keys} keys; max is {max_keys}"
+    )]
+    DeletePrefixLimit {
+        prefix: String,
+        observed_keys: usize,
+        max_keys: usize,
+    },
+    #[error(
+        "kv command would emit at least {observed_events} mutation events; max is {max_events}"
+    )]
+    MutationEventLimit {
+        observed_events: usize,
+        max_events: usize,
+    },
+    #[error("lease {lease_id:?} would have {observed_keys} attached keys; max is {max_keys}")]
+    LeaseKeyLimit {
+        lease_id: LeaseId,
+        observed_keys: usize,
+        max_keys: usize,
+    },
     #[error("kv value is {actual_bytes} bytes; max is {max_bytes}")]
     ValueTooLarge {
         actual_bytes: usize,
@@ -3242,6 +3601,27 @@ mod tests {
     struct TestRecord {
         name: String,
         count: u64,
+    }
+
+    fn put_test_prefix_keys(store: &mut InProcessKvStore, prefix: &str, count: usize) {
+        for index in 0..count {
+            let key = format!("{prefix}{index:05}");
+            store.put(key, vec![index as u8], None).expect("put");
+        }
+    }
+
+    fn put_test_lease_keys(
+        store: &mut InProcessKvStore,
+        prefix: &str,
+        count: usize,
+        lease_id: LeaseId,
+    ) {
+        for index in 0..count {
+            let key = format!("{prefix}{index:05}");
+            store
+                .put(key, vec![index as u8], Some(lease_id))
+                .expect("leased put");
+        }
     }
 
     #[test]
@@ -3385,6 +3765,18 @@ mod tests {
             KvError::RangeLimit {
                 prefix: "/apps/service/".to_string(),
                 max_entries: 1,
+            }
+        );
+
+        let error = store
+            .range_prefix_limited_by_payload_bytes("/apps/service/", 4, "/apps/service/a".len())
+            .expect_err("range payload limit");
+        assert_eq!(
+            error,
+            KvError::RangePayloadLimit {
+                prefix: "/apps/service/".to_string(),
+                observed_bytes: "/apps/service/a".len() + "/apps/service/a".len(),
+                max_bytes: "/apps/service/a".len(),
             }
         );
     }
@@ -3558,6 +3950,127 @@ mod tests {
         assert!(store.get("/apps/service/b").is_none());
         assert!(store.get("/apps/servicez/not-a-child").is_some());
         assert!(store.get("/apps/servicf/not-a-child").is_some());
+    }
+
+    #[test]
+    fn delete_prefix_rejects_oversized_prefix_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        put_test_prefix_keys(&mut store, "/huge/", MAX_DELETE_PREFIX_KEYS + 1);
+        store
+            .put("/other/key", b"keep".to_vec(), None)
+            .expect("outside put");
+        let revision_before = store.revision();
+
+        let error = store
+            .apply_op(KvOp::DeletePrefix {
+                prefix: "/huge/".to_string(),
+            })
+            .expect_err("delete-prefix limit");
+
+        assert_eq!(
+            error,
+            KvError::DeletePrefixLimit {
+                prefix: "/huge/".to_string(),
+                observed_keys: MAX_DELETE_PREFIX_KEYS + 1,
+                max_keys: MAX_DELETE_PREFIX_KEYS,
+            }
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert!(store.get("/huge/00000").is_some());
+        assert!(
+            store
+                .get(&format!("/huge/{:05}", MAX_DELETE_PREFIX_KEYS))
+                .is_some()
+        );
+        assert!(store.get("/other/key").is_some());
+    }
+
+    #[test]
+    fn txn_rejects_delete_prefix_over_mutation_budget_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        put_test_prefix_keys(&mut store, "/huge/", MAX_DELETE_PREFIX_KEYS);
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::DeletePrefix {
+                        prefix: "/huge/".to_string(),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("mutation budget aborts txn");
+
+        assert_eq!(
+            error,
+            KvError::MutationEventLimit {
+                observed_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND + 1,
+                max_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            }
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(
+            store.get("/config/a").expect("existing value").value,
+            b"old"
+        );
+        assert!(store.get("/huge/00000").is_some());
+        assert!(
+            store
+                .get(&format!("/huge/{:05}", MAX_DELETE_PREFIX_KEYS - 1))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn txn_delete_prefix_budget_accounts_for_prior_branch_deletes() {
+        let mut store = InProcessKvStore::new();
+        put_test_prefix_keys(&mut store, "/huge/", MAX_DELETE_PREFIX_KEYS);
+        let revision_before = store.revision();
+
+        let response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Delete {
+                        key: "/huge/00000".to_string(),
+                    },
+                    KvOp::DeletePrefix {
+                        prefix: "/huge/".to_string(),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect("txn within mutation budget");
+
+        assert!(response.succeeded);
+        assert_eq!(
+            response.responses,
+            vec![
+                KvOpResponse::Delete {
+                    key: "/huge/00000".to_string(),
+                    deleted: true,
+                },
+                KvOpResponse::DeletePrefix {
+                    prefix: "/huge/".to_string(),
+                    deleted_count: MAX_DELETE_PREFIX_KEYS - 1,
+                },
+            ]
+        );
+        assert_eq!(
+            store.revision(),
+            KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64)
+        );
+        assert!(store.range_prefix("/huge/").is_empty());
     }
 
     #[test]
@@ -3753,6 +4266,256 @@ mod tests {
         );
         assert!(store.leases.contains_key(&LeaseId(2)));
         assert!(!store.leases.contains_key(&rejected_lease));
+    }
+
+    #[test]
+    fn leased_put_rejects_over_key_limit_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        let lease_id = LeaseId(50);
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id,
+                ttl_ticks: 10,
+            })
+            .expect("lease grant");
+        put_test_lease_keys(&mut store, "/lease/full/", MAX_KEYS_PER_LEASE, lease_id);
+        let revision_before = store.revision();
+
+        let error = store
+            .put(
+                format!("/lease/full/{:05}", MAX_KEYS_PER_LEASE),
+                b"too-many".to_vec(),
+                Some(lease_id),
+            )
+            .expect_err("lease key limit");
+
+        assert_eq!(
+            error,
+            KvError::LeaseKeyLimit {
+                lease_id,
+                observed_keys: MAX_KEYS_PER_LEASE + 1,
+                max_keys: MAX_KEYS_PER_LEASE,
+            }
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert!(
+            store
+                .get(&format!("/lease/full/{:05}", MAX_KEYS_PER_LEASE))
+                .is_none()
+        );
+
+        store
+            .put("/lease/full/00000", b"updated".to_vec(), Some(lease_id))
+            .expect("update existing leased key at limit");
+        assert_eq!(
+            store.get("/lease/full/00000").expect("updated").value,
+            b"updated"
+        );
+    }
+
+    #[test]
+    fn txn_rejects_leased_put_over_key_limit_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        let lease_id = LeaseId(51);
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id,
+                ttl_ticks: 10,
+            })
+            .expect("lease grant");
+        put_test_lease_keys(&mut store, "/lease/txn-full/", MAX_KEYS_PER_LEASE, lease_id);
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::Put {
+                        key: format!("/lease/txn-full/{:05}", MAX_KEYS_PER_LEASE),
+                        value: b"too-many".to_vec(),
+                        lease_id: Some(lease_id),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("lease key limit aborts txn");
+
+        assert_eq!(
+            error,
+            KvError::LeaseKeyLimit {
+                lease_id,
+                observed_keys: MAX_KEYS_PER_LEASE + 1,
+                max_keys: MAX_KEYS_PER_LEASE,
+            }
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(
+            store.get("/config/a").expect("existing value").value,
+            b"old"
+        );
+        assert!(
+            store
+                .get(&format!("/lease/txn-full/{:05}", MAX_KEYS_PER_LEASE))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn txn_lease_key_limit_accounts_for_prior_branch_delete() {
+        let mut store = InProcessKvStore::new();
+        let lease_id = LeaseId(52);
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id,
+                ttl_ticks: 10,
+            })
+            .expect("lease grant");
+        put_test_lease_keys(&mut store, "/lease/rotate/", MAX_KEYS_PER_LEASE, lease_id);
+        let revision_before = store.revision();
+
+        let response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Delete {
+                        key: "/lease/rotate/00000".to_string(),
+                    },
+                    KvOp::Put {
+                        key: format!("/lease/rotate/{:05}", MAX_KEYS_PER_LEASE),
+                        value: b"replacement".to_vec(),
+                        lease_id: Some(lease_id),
+                    },
+                ],
+                failure: Vec::new(),
+            })
+            .expect("delete frees lease capacity");
+
+        assert!(response.succeeded);
+        assert_eq!(
+            store.revision(),
+            KvRevision(revision_before.0.saturating_add(2))
+        );
+        assert!(store.get("/lease/rotate/00000").is_none());
+        assert!(
+            store
+                .get(&format!("/lease/rotate/{:05}", MAX_KEYS_PER_LEASE))
+                .is_some()
+        );
+        assert_eq!(
+            store.lease_keys.get(&lease_id).expect("lease keys").len(),
+            MAX_KEYS_PER_LEASE
+        );
+    }
+
+    #[test]
+    fn lease_revoke_rejects_over_mutation_budget_without_partial_apply() {
+        let lease_id = LeaseId(42);
+        let entries = (0..=MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+            .map(|index| KvEntry {
+                key: format!("/leased/huge/{index:05}"),
+                value: vec![index as u8],
+                create_revision: KvRevision((index + 1) as u64),
+                modify_revision: KvRevision((index + 1) as u64),
+                version: KvVersion(1),
+                lease_id: Some(lease_id),
+            })
+            .collect::<Vec<_>>();
+        let mut store = InProcessKvStore::restore(KvSnapshot {
+            revision: KvRevision(entries.len() as u64),
+            compacted_revision: KvRevision::ZERO,
+            entries,
+            leases: vec![KvLease {
+                lease_id,
+                ttl_ticks: 10,
+                remaining_ticks: 10,
+                granted_at: OffsetDateTime::now_utc(),
+            }],
+            events: Vec::new(),
+        });
+        let revision_before = store.revision();
+
+        let error = store
+            .apply_op(KvOp::LeaseRevoke { lease_id })
+            .expect_err("lease revoke limit");
+
+        assert_eq!(
+            error,
+            KvError::MutationEventLimit {
+                observed_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND + 1,
+                max_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            }
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert!(store.leases.contains_key(&lease_id));
+        assert!(store.get("/leased/huge/00000").is_some());
+        assert!(
+            store
+                .get(&format!(
+                    "/leased/huge/{:05}",
+                    MAX_KV_MUTATION_EVENTS_PER_COMMAND
+                ))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn txn_rejects_lease_revoke_over_mutation_budget_without_partial_apply() {
+        let mut store = InProcessKvStore::new();
+        let lease_id = LeaseId(43);
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id,
+                ttl_ticks: 10,
+            })
+            .expect("lease grant");
+        put_test_lease_keys(
+            &mut store,
+            "/leased/budget/",
+            MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            lease_id,
+        );
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        let error = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    },
+                    KvOp::LeaseRevoke { lease_id },
+                ],
+                failure: Vec::new(),
+            })
+            .expect_err("mutation budget aborts txn");
+
+        assert_eq!(
+            error,
+            KvError::MutationEventLimit {
+                observed_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND + 1,
+                max_events: MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            }
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(
+            store.get("/config/a").expect("existing value").value,
+            b"old"
+        );
+        assert!(store.leases.contains_key(&lease_id));
+        assert!(store.get("/leased/budget/00000").is_some());
     }
 
     #[test]
@@ -3956,6 +4719,99 @@ mod tests {
         assert!(store.get("/services/live").is_some());
         assert_eq!(store.tick_leases(1).expect("expire"), vec![LeaseId(1)]);
         assert!(store.get("/services/live").is_none());
+    }
+
+    #[test]
+    fn tick_leases_spreads_large_expiration_batches_across_calls() {
+        let mut store = InProcessKvStore::new();
+        for lease_id in [LeaseId(1), LeaseId(2)] {
+            store
+                .apply_op(KvOp::LeaseGrant {
+                    lease_id,
+                    ttl_ticks: 1,
+                })
+                .expect("lease grant");
+        }
+        put_test_lease_keys(&mut store, "/lease/one/", 3000, LeaseId(1));
+        put_test_lease_keys(&mut store, "/lease/two/", 3000, LeaseId(2));
+        let revision_before = store.revision();
+
+        assert_eq!(
+            store.tick_leases(1).expect("first expiry"),
+            vec![LeaseId(1)]
+        );
+        assert!(!store.leases.contains_key(&LeaseId(1)));
+        assert!(store.leases.contains_key(&LeaseId(2)));
+        assert!(store.get("/lease/one/00000").is_none());
+        assert!(store.get("/lease/two/00000").is_none());
+        assert!(store.get("/lease/two/01095").is_none());
+        assert!(store.get("/lease/two/01096").is_some());
+        assert_eq!(
+            store.revision(),
+            KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64)
+        );
+
+        assert_eq!(
+            store.tick_leases(0).expect("second expiry"),
+            vec![LeaseId(2)]
+        );
+        assert!(!store.leases.contains_key(&LeaseId(2)));
+        assert!(store.range_prefix("/lease/").is_empty());
+        assert_eq!(store.revision(), KvRevision(revision_before.0 + 6000));
+    }
+
+    #[test]
+    fn tick_leases_partially_drains_oversized_legacy_lease() {
+        let lease_id = LeaseId(9);
+        let entries = (0..=MAX_KV_MUTATION_EVENTS_PER_COMMAND)
+            .map(|index| KvEntry {
+                key: format!("/lease/legacy/{index:05}"),
+                value: vec![index as u8],
+                create_revision: KvRevision((index + 1) as u64),
+                modify_revision: KvRevision((index + 1) as u64),
+                version: KvVersion(1),
+                lease_id: Some(lease_id),
+            })
+            .collect::<Vec<_>>();
+        let mut store = InProcessKvStore::restore(KvSnapshot {
+            revision: KvRevision(entries.len() as u64),
+            compacted_revision: KvRevision::ZERO,
+            entries,
+            leases: vec![KvLease {
+                lease_id,
+                ttl_ticks: 1,
+                remaining_ticks: 1,
+                granted_at: OffsetDateTime::now_utc(),
+            }],
+            events: Vec::new(),
+        });
+        let revision_before = store.revision();
+
+        assert_eq!(
+            store.tick_leases(1).expect("partial expiry"),
+            Vec::<LeaseId>::new()
+        );
+        assert!(store.leases.contains_key(&lease_id));
+        assert_eq!(
+            store
+                .lease_keys
+                .get(&lease_id)
+                .expect("remaining legacy lease keys")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.revision(),
+            KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64)
+        );
+
+        assert_eq!(store.tick_leases(0).expect("finish expiry"), vec![lease_id]);
+        assert!(!store.leases.contains_key(&lease_id));
+        assert!(store.range_prefix("/lease/legacy/").is_empty());
+        assert_eq!(
+            store.revision(),
+            KvRevision(revision_before.0 + MAX_KV_MUTATION_EVENTS_PER_COMMAND as u64 + 1)
+        );
     }
 
     #[test]

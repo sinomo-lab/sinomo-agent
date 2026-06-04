@@ -15,8 +15,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
+pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES: usize =
+    sinomo_kv::MAX_KV_COMMAND_PAYLOAD_BYTES;
+pub(crate) const MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES: usize =
+    sinomo_kv::MAX_KV_COMMAND_PAYLOAD_BYTES;
 pub(crate) const MAX_CLUSTER_KV_ACTIVE_WATCHES: usize = 1024;
+pub const CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
+pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize =
+    sinomo_kv::MAX_KV_COMMAND_PAYLOAD_BYTES;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
@@ -1547,10 +1554,7 @@ pub fn read_cluster_kv_prefix_entries(
     paths: &ClusterPaths,
     prefix: &str,
 ) -> Result<Vec<KvEntry>, NetworkError> {
-    let node_id = read_cluster_kv_reader_node_id(paths)?;
-    cluster_kv_local_cache(paths)
-        .current_range_prefix(node_id, prefix)
-        .map_err(Into::into)
+    read_cluster_kv_prefix_entries_limited(paths, prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
 }
 
 pub fn read_cluster_kv_prefix_entries_limited(
@@ -1558,9 +1562,28 @@ pub fn read_cluster_kv_prefix_entries_limited(
     prefix: &str,
     max_entries: usize,
 ) -> Result<Vec<KvEntry>, NetworkError> {
+    read_cluster_kv_prefix_entries_limited_by_payload_bytes(
+        paths,
+        prefix,
+        max_entries,
+        CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+    )
+}
+
+pub(crate) fn read_cluster_kv_prefix_entries_limited_by_payload_bytes(
+    paths: &ClusterPaths,
+    prefix: &str,
+    max_entries: usize,
+    max_payload_bytes: usize,
+) -> Result<Vec<KvEntry>, NetworkError> {
     let node_id = read_cluster_kv_reader_node_id(paths)?;
     cluster_kv_local_cache(paths)
-        .current_range_prefix_limited(node_id, prefix, max_entries)
+        .current_range_prefix_limited_by_payload_bytes(
+            node_id,
+            prefix,
+            max_entries,
+            max_payload_bytes,
+        )
         .map_err(Into::into)
 }
 
@@ -2004,6 +2027,18 @@ fn drain_cluster_kv_watch_once(
     paths: &ClusterPaths,
     watch_id: WatchId,
 ) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
+    drain_cluster_kv_watch_once_limited_by_payload_bytes(
+        paths,
+        watch_id,
+        MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+    )
+}
+
+pub(crate) fn drain_cluster_kv_watch_once_limited_by_payload_bytes(
+    paths: &ClusterPaths,
+    watch_id: WatchId,
+    max_payload_bytes: usize,
+) -> Result<ClusterKvWatchDrainResponse, NetworkError> {
     #[cfg(test)]
     record_cluster_kv_watch_drain_once_for_test(paths);
 
@@ -2034,6 +2069,7 @@ fn drain_cluster_kv_watch_once(
                 && event.key.starts_with(&registration.prefix)
         })
         .collect::<Vec<_>>();
+    let events = limit_cluster_kv_watch_drain_events(events, max_payload_bytes);
     if let Some(last) = events.last() {
         registration.next_revision = KvRevision(last.revision.0.saturating_add(1));
         write_object_file(&watch_path, &registration)?;
@@ -2044,6 +2080,41 @@ fn drain_cluster_kv_watch_once(
         events,
         next_revision: registration.next_revision,
     })
+}
+
+fn limit_cluster_kv_watch_drain_events(
+    events: Vec<KvEvent>,
+    max_payload_bytes: usize,
+) -> Vec<KvEvent> {
+    let mut limited = Vec::new();
+    let mut payload_bytes = 0_usize;
+    for event in events {
+        let event_bytes = cluster_kv_watch_event_payload_bytes(&event);
+        let next_payload_bytes = payload_bytes.saturating_add(event_bytes);
+        if !limited.is_empty() && next_payload_bytes > max_payload_bytes {
+            break;
+        }
+        payload_bytes = next_payload_bytes;
+        limited.push(event);
+        if payload_bytes >= max_payload_bytes {
+            break;
+        }
+    }
+    limited
+}
+
+pub fn cluster_kv_watch_events_payload_bytes(events: &[KvEvent]) -> usize {
+    events.iter().fold(0_usize, |total, event| {
+        total.saturating_add(cluster_kv_watch_event_payload_bytes(event))
+    })
+}
+
+pub fn cluster_kv_watch_event_payload_bytes(event: &KvEvent) -> usize {
+    let value_bytes = match &event.kind {
+        sinomo_kv::KvEventKind::Put { value } => value.len(),
+        sinomo_kv::KvEventKind::Delete => 0,
+    };
+    event.key.len().saturating_add(value_bytes)
 }
 
 pub fn cancel_cluster_kv_watch(

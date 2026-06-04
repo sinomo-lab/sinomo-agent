@@ -1862,6 +1862,17 @@ pub fn handle_daemon_cluster_kv_watch_events_request(
             stored_events: 0,
         });
     }
+    let payload_bytes = sinomo_network::cluster_kv_watch_events_payload_bytes(&request.events);
+    if payload_bytes > sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: format!(
+                "watch event fan-out batch is {payload_bytes} payload bytes; max is {}",
+                sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES
+            ),
+            stored_events: 0,
+        });
+    }
     let stored_events =
         sinomo_network::append_cluster_kv_watch_events(&cluster_paths, &request.events)?;
     Ok(ClusterKvWatchEventsResponse {
@@ -3116,7 +3127,33 @@ fn fan_out_committed_cluster_raft_command_blocking(
 }
 
 fn cluster_kv_watch_event_fanout_batches(events: &[KvEvent]) -> impl Iterator<Item = &[KvEvent]> {
-    events.chunks(sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS)
+    let mut batches = Vec::new();
+    let mut start = 0_usize;
+    while start < events.len() {
+        let mut end = start;
+        let mut payload_bytes = 0_usize;
+        while end < events.len() {
+            if end - start >= sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS {
+                break;
+            }
+            let event_bytes = sinomo_network::cluster_kv_watch_event_payload_bytes(&events[end]);
+            let next_payload_bytes = payload_bytes.saturating_add(event_bytes);
+            if end > start
+                && next_payload_bytes
+                    > sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES
+            {
+                break;
+            }
+            payload_bytes = next_payload_bytes;
+            end += 1;
+        }
+        if end == start {
+            end += 1;
+        }
+        batches.push(&events[start..end]);
+        start = end;
+    }
+    batches.into_iter()
 }
 
 pub fn commit_cluster_kv_txn_with_quorum(
@@ -4174,6 +4211,42 @@ mod tests {
         assert!(batches.iter().all(|batch| {
             !batch.is_empty()
                 && batch.len() <= sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS
+                && sinomo_network::cluster_kv_watch_events_payload_bytes(batch)
+                    <= sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES
+        }));
+        assert_eq!(
+            batches
+                .iter()
+                .flat_map(|batch| batch.iter().map(|event| event.revision))
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_fanout_batches_split_on_payload_size() {
+        let value_len = sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES / 2;
+        let events = (0..3)
+            .map(|index| KvEvent {
+                revision: sinomo_kv::KvRevision(index + 1),
+                key: format!("/watch/fanout/payload/{index}"),
+                kind: sinomo_kv::KvEventKind::Put {
+                    value: vec![index as u8; value_len],
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let batches = cluster_kv_watch_event_fanout_batches(&events).collect::<Vec<_>>();
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            vec![1, 1, 1]
+        );
+        assert!(batches.iter().all(|batch| {
+            sinomo_network::cluster_kv_watch_events_payload_bytes(batch)
+                <= sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES
         }));
         assert_eq!(
             batches
@@ -4247,6 +4320,71 @@ mod tests {
         assert!(
             !cluster_paths.kv_watch_events_log.exists(),
             "oversized batch must not append watch events"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_fanout_rejects_oversized_payload_before_storage() {
+        let root = unique_cluster_test_root("sinomo-daemon-watch-fanout-oversized-payload");
+        let data_root = root.join("data");
+        let data_dir = SinomoDataDir::new(&data_root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_watch_fanout_payload").expect("cluster");
+        let leader_id =
+            NodeId::from_legacy_named("node_watch_fanout_payload_leader").expect("leader");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "watch fanout payload",
+            leader_id.clone(),
+            "leader",
+            "pk-leader",
+            now,
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
+        let value_len = sinomo_network::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES / 2;
+        let events = (0..2)
+            .map(|index| KvEvent {
+                revision: sinomo_kv::KvRevision(index as u64 + 1),
+                key: format!("/watch/fanout/payload/{index}"),
+                kind: sinomo_kv::KvEventKind::Put {
+                    value: vec![index as u8; value_len],
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let response = handle_daemon_cluster_kv_watch_events_request(
+            &daemon_paths,
+            ClusterKvWatchEventsRequest {
+                state,
+                leader_id,
+                events,
+            },
+        )
+        .expect("watch event fanout response");
+
+        assert!(!response.accepted);
+        assert_eq!(response.stored_events, 0);
+        assert!(
+            response.detail.contains("payload bytes"),
+            "unexpected detail: {}",
+            response.detail
+        );
+        assert!(
+            !cluster_paths.kv_watch_events.exists(),
+            "oversized payload must not checkpoint watch events"
+        );
+        assert!(
+            !cluster_paths.kv_watch_events_log.exists(),
+            "oversized payload must not append watch events"
         );
         let _ = std::fs::remove_dir_all(root);
     }

@@ -2296,6 +2296,60 @@ fn cluster_kv_prefix_range_limited_rejects_large_external_ranges() {
             max_entries: 1,
         }) if prefix == "/external/range/"
     ));
+
+    let max_payload_bytes = "/external/range/a".len() + "/external/range/a".len();
+    let error = read_cluster_kv_prefix_entries_limited_by_payload_bytes(
+        &paths,
+        "/external/range/",
+        2,
+        max_payload_bytes,
+    )
+    .expect_err("range payload limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangePayloadLimit {
+            ref prefix,
+            observed_bytes,
+            max_bytes,
+        }) if prefix == "/external/range/"
+            && observed_bytes == max_payload_bytes
+                + "/external/range/b".len()
+                + "/external/range/b".len()
+            && max_bytes == max_payload_bytes
+    ));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_prefix_range_default_reader_is_bounded() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-range-default-bounded-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let mut store = InProcessKvStore::new();
+    for index in 0..=CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+        store
+            .put(format!("/external/default/{index:05}"), Vec::new(), None)
+            .expect("put");
+    }
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+    let error =
+        read_cluster_kv_prefix_entries(&paths, "/external/default/").expect_err("range limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::RangeLimit {
+            ref prefix,
+            max_entries: CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+        }) if prefix == "/external/default/"
+    ));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -4999,6 +5053,66 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         "waiting drain should be notified instead of timing out after {elapsed:?}"
     );
     assert_eq!(drained.events, vec![event]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-drain-payload-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/payload/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/payload/0001".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![1_u8; 32],
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/payload/0002".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![2_u8; 32],
+        },
+    };
+    append_cluster_kv_watch_events(&paths, &[first.clone(), second.clone()])
+        .expect("append watch events");
+
+    let max_payload_bytes = first.key.len() + 32;
+    let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
+        &paths,
+        watch.watch_id,
+        max_payload_bytes,
+    )
+    .expect("first bounded drain");
+    assert_eq!(drained.events, vec![first]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+
+    let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
+        &paths,
+        watch.watch_id,
+        max_payload_bytes,
+    )
+    .expect("second bounded drain");
+    assert_eq!(drained.events, vec![second]);
+    assert_eq!(drained.next_revision, KvRevision(3));
     std::fs::remove_dir_all(root).ok();
 }
 
