@@ -12,8 +12,9 @@ use sinomo_core::{
 };
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
-    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvRevision,
-    KvSnapshot, KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot, cluster_member_key,
+    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse,
+    KvRevision, KvSnapshot, KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot,
+    cluster_member_key,
 };
 use sinomo_node::NodeId;
 use std::io::Write;
@@ -2653,6 +2654,52 @@ fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
 }
 
 #[test]
+fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-no-effect-op-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_no_effect_op_no_append").expect("node");
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed value");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Delete {
+            key: "/missing".to_string(),
+        }),
+    )
+    .expect("missing delete op");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(txn_response, None);
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "direct no-effect operations should not consume WAL writes"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-empty-selected-branch-no-raft-append-{}",
@@ -2718,6 +2765,85 @@ fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
             .expect("committed entry")
             .value,
         b"committed"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-no-effect-selected-branch-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id =
+        NodeId::from_legacy_named("node_no_effect_selected_branch_no_append").expect("node");
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/committed".to_string(),
+            value: b"committed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed value");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::Delete {
+                    key: "/missing".to_string(),
+                },
+                KvOp::DeletePrefix {
+                    prefix: "/missing-prefix/".to_string(),
+                },
+                KvOp::LeaseRevoke {
+                    lease_id: LeaseId(99),
+                },
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("no-effect txn");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(
+        txn_response,
+        Some(KvTxnResponse {
+            succeeded: true,
+            revision: snapshot.revision,
+            responses: vec![
+                KvOpResponse::Delete {
+                    key: "/missing".to_string(),
+                    deleted: false,
+                },
+                KvOpResponse::DeletePrefix {
+                    prefix: "/missing-prefix/".to_string(),
+                    deleted_count: 0,
+                },
+                KvOpResponse::LeaseRevoke {
+                    lease_id: LeaseId(99),
+                    deleted_count: 0,
+                },
+            ],
+        })
+    );
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "no-effect transactions should not consume WAL writes"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -4061,6 +4187,105 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
 }
 
 #[test]
+fn cluster_member_publish_txn_from_snapshot_skips_stable_member_records() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_stable").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_stable").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish stable",
+        "pk-member-publish-stable",
+        now,
+    );
+    member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_stable")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.1:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    }];
+
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(cluster_member_key(&node_id), &member, None)
+        .expect("member record");
+    store
+        .put_serde(
+            cluster_capability_policy_key(&node_id),
+            &ClusterCapabilityPolicyRecord::from(&member),
+            None,
+        )
+        .expect("policy record");
+    store
+        .put_serde(
+            cluster_endpoint_key(&node_id, &member.endpoints[0]),
+            &member.endpoints[0],
+            None,
+        )
+        .expect("endpoint record");
+
+    let snapshot = store.snapshot();
+    let stable = cluster_member_publish_txn_from_snapshot(&snapshot, &[member.clone()])
+        .expect("stable member publish txn");
+    assert!(
+        stable.success.is_empty(),
+        "stable member publish should not emit no-op raft writes: {:?}",
+        stable.success
+    );
+
+    let member_key = cluster_member_key(&node_id);
+    let policy_key = cluster_capability_policy_key(&node_id);
+    let mut renamed = member.clone();
+    renamed.display_name = "renamed member".to_string();
+    let renamed_txn =
+        cluster_member_publish_txn_from_snapshot(&snapshot, &[renamed]).expect("renamed txn");
+    assert!(
+        renamed_txn
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &member_key)),
+        "changed member record should still be published"
+    );
+    assert!(
+        renamed_txn
+            .success
+            .iter()
+            .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &policy_key)),
+        "unchanged capability policy should not be re-put"
+    );
+
+    let mut recapped = member;
+    recapped
+        .capabilities
+        .push(CapabilityName::new("daemon.shadow.run").expect("capability"));
+    recapped.allowed_capabilities = recapped.capabilities.clone();
+    let recapped_txn =
+        cluster_member_publish_txn_from_snapshot(&snapshot, &[recapped]).expect("recapped txn");
+    assert!(
+        recapped_txn
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &member_key)),
+        "changed member capabilities should publish the member record"
+    );
+    assert!(
+        recapped_txn
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &policy_key)),
+        "changed member capabilities should publish the capability policy"
+    );
+}
+
+#[test]
 fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-unchecked-sync-noop-{}",
@@ -5379,6 +5604,16 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
             _ => unreachable!("put_serde creates put op"),
         }
     }
+    let first_batch = crate::storage::cluster_network_expiry_delete_ops(
+        &store.snapshot(),
+        now,
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    );
+    assert_eq!(
+        first_batch.len(),
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        "expiry planning should return one bounded mutation batch"
+    );
     write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write large snapshot");
 
     read_cluster_kv_prefix_entries(&paths, "/cluster/network/connectivity/")

@@ -1367,6 +1367,41 @@ impl InProcessKvStore {
         }))
     }
 
+    pub fn txn_response_if_selected_branch_no_effect(
+        &self,
+        txn: &KvTxn,
+    ) -> Result<Option<KvTxnResponse>, KvError> {
+        self.validate_txn_shape(txn)?;
+        validate_kv_txn_payload(txn)?;
+        let succeeded = txn.compares.iter().all(|compare| self.compare(compare));
+        let ops = if succeeded {
+            txn.success.as_slice()
+        } else {
+            txn.failure.as_slice()
+        };
+        self.validate_ops(ops)?;
+
+        let mut responses = Vec::with_capacity(ops.len());
+        for op in ops {
+            let Some(response) = self.no_effect_response_for_op(op) else {
+                return Ok(None);
+            };
+            responses.push(response);
+        }
+        Ok(Some(KvTxnResponse {
+            succeeded,
+            revision: self.revision,
+            responses,
+        }))
+    }
+
+    pub fn op_response_if_no_effect(&self, op: &KvOp) -> Result<Option<KvOpResponse>, KvError> {
+        validate_kv_op_payload(op)?;
+        validate_kv_payload_total(kv_op_payload_bytes(op))?;
+        self.validate_ops(std::slice::from_ref(op))?;
+        Ok(self.no_effect_response_for_op(op))
+    }
+
     pub fn apply_command(&mut self, command: KvCommand) -> Result<KvRevision, KvError> {
         self.apply_command_with_response(command)
             .map(|(revision, _)| revision)
@@ -1946,6 +1981,41 @@ impl InProcessKvStore {
             });
         }
         Ok(())
+    }
+
+    fn no_effect_response_for_op(&self, op: &KvOp) -> Option<KvOpResponse> {
+        match op {
+            KvOp::Put { .. } => None,
+            KvOp::Delete { key } => {
+                (!self.entries.contains_key(key)).then(|| KvOpResponse::Delete {
+                    key: key.clone(),
+                    deleted: false,
+                })
+            }
+            KvOp::DeletePrefix { prefix } => {
+                let mut entries = self.entries.range(prefix.clone()..);
+                let has_matching_key = entries
+                    .next()
+                    .is_some_and(|(key, _)| key.starts_with(prefix));
+                (!has_matching_key).then(|| KvOpResponse::DeletePrefix {
+                    prefix: prefix.clone(),
+                    deleted_count: 0,
+                })
+            }
+            KvOp::LeaseGrant { .. } => None,
+            KvOp::LeaseKeepAlive { lease_id } => {
+                let lease = self.leases.get(lease_id)?;
+                (lease.remaining_ticks == lease.ttl_ticks).then_some(KvOpResponse::LeaseKeepAlive {
+                    lease_id: *lease_id,
+                })
+            }
+            KvOp::LeaseRevoke { lease_id } => {
+                (!self.leases.contains_key(lease_id)).then_some(KvOpResponse::LeaseRevoke {
+                    lease_id: *lease_id,
+                    deleted_count: 0,
+                })
+            }
+        }
     }
 
     fn keys_for_lease_limited(
@@ -4485,6 +4555,183 @@ mod tests {
         );
         assert_eq!(store.revision(), revision_before);
         assert_eq!(store.get("/config/a").expect("entry").value, b"old");
+    }
+
+    #[test]
+    fn txn_no_effect_selected_branch_response_is_read_only() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(7),
+                ttl_ticks: 10,
+            })
+            .expect("lease grant");
+        let revision_before = store.revision();
+
+        let response = store
+            .txn_response_if_selected_branch_no_effect(&KvTxn {
+                compares: Vec::new(),
+                success: vec![
+                    KvOp::Delete {
+                        key: "/missing".to_string(),
+                    },
+                    KvOp::DeletePrefix {
+                        prefix: "/missing-prefix/".to_string(),
+                    },
+                    KvOp::LeaseKeepAlive {
+                        lease_id: LeaseId(7),
+                    },
+                    KvOp::LeaseRevoke {
+                        lease_id: LeaseId(99),
+                    },
+                ],
+                failure: vec![KvOp::Put {
+                    key: "/config/a".to_string(),
+                    value: b"failed".to_vec(),
+                    lease_id: None,
+                }],
+            })
+            .expect("no-effect selected branch");
+
+        assert_eq!(
+            response,
+            Some(KvTxnResponse {
+                succeeded: true,
+                revision: revision_before,
+                responses: vec![
+                    KvOpResponse::Delete {
+                        key: "/missing".to_string(),
+                        deleted: false,
+                    },
+                    KvOpResponse::DeletePrefix {
+                        prefix: "/missing-prefix/".to_string(),
+                        deleted_count: 0,
+                    },
+                    KvOpResponse::LeaseKeepAlive {
+                        lease_id: LeaseId(7),
+                    },
+                    KvOpResponse::LeaseRevoke {
+                        lease_id: LeaseId(99),
+                        deleted_count: 0,
+                    },
+                ],
+            })
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(store.get("/config/a").expect("entry").value, b"old");
+
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_no_effect(&KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Delete {
+                        key: "/config/a".to_string(),
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("mutating delete"),
+            None
+        );
+
+        store.tick_leases(1).expect("age lease");
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_no_effect(&KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::LeaseKeepAlive {
+                        lease_id: LeaseId(7),
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("mutating keepalive"),
+            None
+        );
+
+        let error = store
+            .txn_response_if_selected_branch_no_effect(&KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/too-large".to_string(),
+                    value: vec![0_u8; MAX_KV_VALUE_BYTES + 1],
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            })
+            .expect_err("no-effect preflight still validates payloads");
+        assert_eq!(
+            error,
+            KvError::ValueTooLarge {
+                actual_bytes: MAX_KV_VALUE_BYTES + 1,
+                max_bytes: MAX_KV_VALUE_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn op_no_effect_response_is_read_only_and_validated() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/config/a", b"old".to_vec(), None)
+            .expect("initial put");
+        let revision_before = store.revision();
+
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::Delete {
+                    key: "/missing".to_string(),
+                })
+                .expect("missing delete"),
+            Some(KvOpResponse::Delete {
+                key: "/missing".to_string(),
+                deleted: false,
+            })
+        );
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::DeletePrefix {
+                    prefix: "/missing-prefix/".to_string(),
+                })
+                .expect("empty delete prefix"),
+            Some(KvOpResponse::DeletePrefix {
+                prefix: "/missing-prefix/".to_string(),
+                deleted_count: 0,
+            })
+        );
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::LeaseRevoke {
+                    lease_id: LeaseId(99),
+                })
+                .expect("missing lease revoke"),
+            Some(KvOpResponse::LeaseRevoke {
+                lease_id: LeaseId(99),
+                deleted_count: 0,
+            })
+        );
+        assert_eq!(store.revision(), revision_before);
+        assert_eq!(store.get("/config/a").expect("entry").value, b"old");
+
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::Delete {
+                    key: "/config/a".to_string(),
+                })
+                .expect("mutating delete"),
+            None
+        );
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::LeaseKeepAlive {
+                    lease_id: LeaseId(7),
+                })
+                .expect_err("unknown keepalive"),
+            KvError::UnknownLease {
+                lease_id: LeaseId(7),
+            }
+        );
     }
 
     #[test]

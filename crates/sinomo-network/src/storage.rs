@@ -1849,10 +1849,21 @@ pub fn append_cluster_raft_command_with_response(
     command: KvCommand,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), NetworkError> {
     let mut node = open_cluster_raft_kv_node_discarding_uncommitted_tail(paths, node_id)?;
-    if let KvCommand::Txn(txn) = &command {
-        if let Some(response) = node.store().txn_response_if_selected_branch_empty(txn)? {
-            return Ok((node.store().snapshot(), Some(response)));
+    match &command {
+        KvCommand::Op(op) => {
+            if node.store().op_response_if_no_effect(op)?.is_some() {
+                return Ok((node.store().snapshot(), None));
+            }
         }
+        KvCommand::Txn(txn) => {
+            if let Some(response) = node
+                .store()
+                .txn_response_if_selected_branch_no_effect(txn)?
+            {
+                return Ok((node.store().snapshot(), Some(response)));
+            }
+        }
+        KvCommand::PutClusterMember(_) => {}
     }
     let before_revision = node.store().revision();
     let term = node.hard_state().current_term.max(1);
@@ -4989,16 +5000,18 @@ fn cluster_member_publish_txn_with_snapshot(
     for member in members {
         let mut member = member.clone();
         cleanup_member_iroh_endpoints(&mut member);
-        success.push(KvOp::put_serde(
+        push_snapshot_diff_put_op(
+            snapshot,
             cluster_member_key(&member.node_id),
             &member,
-            None,
-        )?);
-        success.push(KvOp::put_serde(
+            &mut success,
+        )?;
+        push_snapshot_diff_put_op(
+            snapshot,
             cluster_capability_policy_key(&member.node_id),
             &ClusterCapabilityPolicyRecord::from(&member),
-            None,
-        )?);
+            &mut success,
+        )?;
         if let Some(snapshot) = snapshot {
             push_cluster_member_endpoint_diff_ops(snapshot, &member, &mut success)?;
         } else {
@@ -5018,6 +5031,34 @@ fn cluster_member_publish_txn_with_snapshot(
         compares: Vec::new(),
         success,
         failure: Vec::new(),
+    })
+}
+
+fn push_snapshot_diff_put_op<T: Serialize + ?Sized>(
+    snapshot: Option<&KvSnapshot>,
+    key: String,
+    value: &T,
+    ops: &mut Vec<KvOp>,
+) -> Result<(), NetworkError> {
+    let op = KvOp::put_serde(key, value, None)?;
+    if snapshot.is_some_and(|snapshot| kv_put_op_matches_snapshot(snapshot, &op)) {
+        return Ok(());
+    }
+    ops.push(op);
+    Ok(())
+}
+
+fn kv_put_op_matches_snapshot(snapshot: &KvSnapshot, op: &KvOp) -> bool {
+    let KvOp::Put {
+        key,
+        value,
+        lease_id,
+    } = op
+    else {
+        return false;
+    };
+    snapshot.get(key).is_some_and(|entry| {
+        entry.value.as_slice() == value.as_slice() && entry.lease_id == *lease_id
     })
 }
 
@@ -5065,19 +5106,44 @@ pub fn expire_cluster_network_records(
     paths: &ClusterPaths,
     now: OffsetDateTime,
 ) -> Result<KvSnapshot, NetworkError> {
-    let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
-    let success = cluster_network_expiry_delete_ops(snapshot.as_ref(), now);
+    let mut snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
+    let mut success = cluster_network_expiry_delete_ops(
+        snapshot.as_ref(),
+        now,
+        sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+    );
     if success.is_empty() {
         return Ok(snapshot.as_ref().clone());
     }
 
     let state = read_cluster_state_without_kv(paths)?;
-    append_cluster_raft_ops_in_batches(paths, &state.local_node_id, success)
+    loop {
+        snapshot = Arc::new(append_cluster_raft_ops_in_batches(
+            paths,
+            &state.local_node_id,
+            success,
+        )?);
+        success = cluster_network_expiry_delete_ops(
+            snapshot.as_ref(),
+            now,
+            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+        );
+        if success.is_empty() {
+            return Ok(snapshot.as_ref().clone());
+        }
+    }
 }
 
-fn cluster_network_expiry_delete_ops(snapshot: &KvSnapshot, now: OffsetDateTime) -> Vec<KvOp> {
+pub(crate) fn cluster_network_expiry_delete_ops(
+    snapshot: &KvSnapshot,
+    now: OffsetDateTime,
+    max_ops: usize,
+) -> Vec<KvOp> {
     let mut success = Vec::new();
     for entry in snapshot.prefix_entries("/cluster/network/info/") {
+        if success.len() >= max_ops {
+            return success;
+        }
         let Ok(record) = entry.decode::<ClusterNetworkInfoRecord>() else {
             continue;
         };
@@ -5088,6 +5154,9 @@ fn cluster_network_expiry_delete_ops(snapshot: &KvSnapshot, now: OffsetDateTime)
         }
     }
     for entry in snapshot.prefix_entries("/cluster/network/connectivity/") {
+        if success.len() >= max_ops {
+            return success;
+        }
         let Ok(record) = entry.decode::<ClusterConnectivityRecord>() else {
             continue;
         };
