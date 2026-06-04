@@ -3163,6 +3163,78 @@ fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
 }
 
 #[test]
+fn stable_put_does_not_append_raft_log_entry() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-stable-put-no-raft-append-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_stable_put_no_append").expect("node");
+
+    let snapshot = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/stable/put".to_string(),
+            value: b"stable".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("seed committed value");
+    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
+    let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
+
+    let (no_op_snapshot, txn_response) = append_cluster_raft_command_with_response(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/stable/put".to_string(),
+            value: b"stable".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("stable put");
+    let wal_len_after = std::fs::metadata(&wal_path).expect("wal after").len();
+
+    assert_eq!(no_op_snapshot.revision, snapshot.revision);
+    assert_eq!(
+        no_op_snapshot
+            .get("/stable/put")
+            .expect("stable entry")
+            .value,
+        b"stable"
+    );
+    assert_eq!(txn_response, None);
+    assert_eq!(
+        wal_len_before, wal_len_after,
+        "stable puts should not consume WAL writes"
+    );
+
+    let changed = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Op(KvOp::Put {
+            key: "/stable/put".to_string(),
+            value: b"changed".to_vec(),
+            lease_id: None,
+        }),
+    )
+    .expect("changed put");
+    let wal_len_changed = std::fs::metadata(&wal_path).expect("wal changed").len();
+    assert_eq!(changed.revision, snapshot.revision.next());
+    assert!(
+        wal_len_changed > wal_len_after,
+        "changed puts must still append to the WAL"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stable_lease_grant_does_not_append_raft_log_entry() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-stable-lease-grant-no-raft-append-{}",
@@ -3348,6 +3420,11 @@ fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry(
         KvCommand::Txn(KvTxn {
             compares: Vec::new(),
             success: vec![
+                KvOp::Put {
+                    key: "/committed".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                },
                 KvOp::Delete {
                     key: "/missing".to_string(),
                 },
@@ -3371,6 +3448,10 @@ fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry(
             succeeded: true,
             revision: snapshot.revision,
             responses: vec![
+                KvOpResponse::Put {
+                    key: "/committed".to_string(),
+                    revision: snapshot.revision,
+                },
                 KvOpResponse::Delete {
                     key: "/missing".to_string(),
                     deleted: false,
@@ -3389,6 +3470,28 @@ fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry(
     assert_eq!(
         wal_len_before, wal_len_after,
         "no-effect transactions should not consume WAL writes"
+    );
+    let changed = append_cluster_raft_command(
+        &paths,
+        &node_id,
+        KvCommand::Txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/committed".to_string(),
+                value: b"changed".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("changed put txn");
+    assert_eq!(changed.revision, snapshot.revision.next());
+    assert!(
+        std::fs::metadata(&wal_path)
+            .expect("wal after changed put txn")
+            .len()
+            > wal_len_after,
+        "changed puts inside transactions must still append durable raft entries"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -9851,6 +9954,153 @@ async fn network_service_delivers_event_and_processes_ack() {
 }
 
 #[tokio::test]
+async fn process_incoming_keeps_event_when_ack_send_mailbox_is_full() {
+    let node_a = NodeId::from_legacy_named("node_ack_full_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_full_receiver").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+
+    for index in 0..crate::peer::IN_PROCESS_MAILBOX_CAPACITY {
+        transport_b
+            .send(
+                &node_a,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(index as u64 + 1),
+                    source_node_id: node_b.clone(),
+                    target_node_id: node_a.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(index as u64 + 1),
+                        origin_node_id: node_b.clone(),
+                        target_node_id: node_a.clone(),
+                        body: MeshMessageBody::Heartbeat(Heartbeat {
+                            node_id: node_b.clone(),
+                            tick: index as u64,
+                        }),
+                    },
+                },
+            )
+            .expect("fill sender mailbox");
+    }
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_ack_full_sender"));
+    registry.register_node(node("node_ack_full_receiver"));
+
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_ack_mailbox_full", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store_a);
+    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    assert_eq!(service_a.pump_outbound().await.expect("send event"), 1);
+    assert_eq!(
+        delivery_status(&service_a, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("event ingest should survive ack send failure");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::EventAccepted { .. },
+            InboundOutcome::AckSendFailed {
+                target_node_id,
+                detail,
+                ..
+            }
+        ] if target_node_id == &node_a && detail.contains("mailbox")
+    ));
+
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 1);
+    service_a.shutdown().await;
+}
+
+#[tokio::test]
+async fn process_incoming_ignores_stale_ack_and_continues_batch() {
+    let node_a = NodeId::from_legacy_named("node_stale_ack_receiver").expect("node");
+    let node_b = NodeId::from_legacy_named("node_stale_ack_sender").expect("node");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_stale_ack_receiver"));
+    registry.register_node(node("node_stale_ack_sender"));
+    let service_a = NetworkService::new(registry, transport_a).spawn(InMemoryEventStore::new());
+
+    transport_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_b.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Ack(DeliveryAck {
+                        delivery_id: RouteDeliveryId(99),
+                        event_id: EventId::from_legacy_named("evt_stale_ack").expect("event"),
+                        target_node_id: node_b.clone(),
+                    }),
+                },
+            },
+        )
+        .expect("send stale ack");
+    transport_b
+        .send(
+            &node_a,
+            NetworkFrame {
+                frame_id: NetworkFrameId(2),
+                source_node_id: node_b.clone(),
+                target_node_id: node_a.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(2),
+                    origin_node_id: node_b.clone(),
+                    target_node_id: node_a.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 7,
+                    }),
+                },
+            },
+        )
+        .expect("send heartbeat after stale ack");
+
+    let outcomes = service_a
+        .process_incoming()
+        .await
+        .expect("stale ack should not abort batch");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [
+            InboundOutcome::AckIgnored {
+                delivery_id: RouteDeliveryId(99),
+                target_node_id,
+            },
+            InboundOutcome::HeartbeatReceived {
+                node_id,
+                status: PeerStatus::Healthy,
+                ..
+            }
+        ] if target_node_id == &node_b && node_id == &node_b
+    ));
+    service_a.shutdown().await;
+}
+
+#[tokio::test]
 async fn network_service_pump_outbound_batches_large_ready_backlogs() {
     let node_a = NodeId::from_legacy_named("node_batch_sender").expect("node");
     let session_id = SessionId::from_legacy_named("sess_batch_delivery").expect("session");
@@ -10440,6 +10690,149 @@ fn delivery_ledger_outbound_wake_hint_tracks_immediate_and_waiting_work() {
         Some(now),
         "deadline-free retries should wake immediately"
     );
+}
+
+#[test]
+fn delivery_ledger_sent_ack_deadline_retries_stale_in_flight_work() {
+    let node_a = NodeId::from_legacy_named("node_ack_timeout_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_timeout_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_ack_timeout_retry", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let now = Instant::now();
+    let deadline = now + crate::peer::ack_timeout_for_latency_class(&LatencyClass::Interactive);
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger
+        .mark_sent_at(RouteDeliveryId(1), now)
+        .expect("mark sent");
+    assert_eq!(
+        ledger.next_outbound_wake_at_at(now),
+        Some(deadline),
+        "sent work should expose its ack deadline so schedulers can sleep until useful work exists"
+    );
+    assert_eq!(
+        ledger.expire_ack_deadlines_at(deadline - Duration::from_millis(1)),
+        0,
+        "unexpired sent work must not become retryable early"
+    );
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::Sent
+    );
+
+    assert_eq!(ledger.expire_ack_deadlines_at(deadline), 1);
+    let record = ledger.record(&RouteDeliveryId(1)).expect("record");
+    assert_eq!(record.delivery.status, DeliveryStatus::Retrying);
+    assert_eq!(record.attempts, 1);
+    assert!(
+        ledger.ready_delivery_ids_at(deadline).is_empty(),
+        "ack timeouts should still respect retry backoff before resending"
+    );
+    let retry_wake = ledger
+        .next_outbound_wake_at_at(deadline)
+        .expect("retry wake");
+    assert!(retry_wake > deadline);
+    assert_eq!(
+        ledger.ready_delivery_ids_at(retry_wake),
+        vec![RouteDeliveryId(1)]
+    );
+}
+
+#[test]
+fn delivery_ledger_ack_clears_sent_deadline() {
+    let node_a = NodeId::from_legacy_named("node_ack_deadline_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_deadline_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_ack_deadline_clear", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let now = Instant::now();
+    let deadline = now + crate::peer::ack_timeout_for_latency_class(&LatencyClass::Interactive);
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger
+        .mark_sent_at(RouteDeliveryId(1), now)
+        .expect("mark sent");
+    ledger.ack(RouteDeliveryId(1), &node_b).expect("ack");
+
+    assert_eq!(ledger.next_outbound_wake_at_at(now), None);
+    assert_eq!(ledger.expire_ack_deadlines_at(deadline), 0);
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::Delivered
+    );
+}
+
+#[test]
+fn delivery_ledger_ack_timeout_marks_failed_after_max_attempts() {
+    let node_a = NodeId::from_legacy_named("node_ack_failed_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_failed_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy { max_attempts: 1 }, 1);
+    let event = fixture_event("evt_ack_failed_one", node_a.clone());
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Reactive,
+        status: DeliveryStatus::Queued,
+    };
+    let now = Instant::now();
+    let deadline = now + crate::peer::ack_timeout_for_latency_class(&LatencyClass::Reactive);
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger
+        .mark_sent_at(RouteDeliveryId(1), now)
+        .expect("mark sent");
+    assert_eq!(ledger.expire_ack_deadlines_at(deadline), 1);
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::Failed
+    );
+    assert_eq!(ledger.next_outbound_wake_at_at(deadline), None);
+
+    let event = fixture_event("evt_ack_failed_two", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(2),
+        event_sequence: EventSequence(2),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Reactive,
+        status: DeliveryStatus::Queued,
+    };
+    assert_eq!(
+        ledger
+            .enqueue(delivery, event)
+            .expect("terminal timeout should not clog capacity"),
+        Some(RouteDeliveryId(2))
+    );
+    assert!(ledger.record(&RouteDeliveryId(1)).is_none());
 }
 
 #[test]

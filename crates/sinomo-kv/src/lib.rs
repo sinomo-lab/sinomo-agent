@@ -2035,7 +2035,17 @@ impl InProcessKvStore {
 
     fn no_effect_response_for_op(&self, op: &KvOp) -> Option<KvOpResponse> {
         match op {
-            KvOp::Put { .. } => None,
+            KvOp::Put {
+                key,
+                value,
+                lease_id,
+            } => self.entries.get(key).and_then(|entry| {
+                (entry.value.as_slice() == value.as_slice() && entry.lease_id == *lease_id)
+                    .then_some(KvOpResponse::Put {
+                        key: key.clone(),
+                        revision: entry.modify_revision,
+                    })
+            }),
             KvOp::Delete { key } => {
                 (!self.entries.contains_key(key)).then(|| KvOpResponse::Delete {
                     key: key.clone(),
@@ -5003,6 +5013,11 @@ mod tests {
             .txn_response_if_selected_branch_no_effect(&KvTxn {
                 compares: Vec::new(),
                 success: vec![
+                    KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"old".to_vec(),
+                        lease_id: None,
+                    },
                     KvOp::Delete {
                         key: "/missing".to_string(),
                     },
@@ -5034,6 +5049,10 @@ mod tests {
                 succeeded: true,
                 revision: revision_before,
                 responses: vec![
+                    KvOpResponse::Put {
+                        key: "/config/a".to_string(),
+                        revision: revision_before,
+                    },
                     KvOpResponse::Delete {
                         key: "/missing".to_string(),
                         deleted: false,
@@ -5068,6 +5087,34 @@ mod tests {
                     failure: Vec::new(),
                 })
                 .expect("mutating delete"),
+            None
+        );
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_no_effect(&KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"new".to_vec(),
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("changed put value"),
+            None
+        );
+        assert_eq!(
+            store
+                .txn_response_if_selected_branch_no_effect(&KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key: "/config/a".to_string(),
+                        value: b"old".to_vec(),
+                        lease_id: Some(LeaseId(7)),
+                    }],
+                    failure: Vec::new(),
+                })
+                .expect("changed put lease"),
             None
         );
 
@@ -5152,6 +5199,19 @@ mod tests {
 
         assert_eq!(
             store
+                .op_response_if_no_effect(&KvOp::Put {
+                    key: "/config/a".to_string(),
+                    value: b"old".to_vec(),
+                    lease_id: None,
+                })
+                .expect("stable put"),
+            Some(KvOpResponse::Put {
+                key: "/config/a".to_string(),
+                revision: revision_before,
+            })
+        );
+        assert_eq!(
+            store
                 .op_response_if_no_effect(&KvOp::Delete {
                     key: "/missing".to_string(),
                 })
@@ -5203,6 +5263,26 @@ mod tests {
                     key: "/config/a".to_string(),
                 })
                 .expect("mutating delete"),
+            None
+        );
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::Put {
+                    key: "/config/a".to_string(),
+                    value: b"new".to_vec(),
+                    lease_id: None,
+                })
+                .expect("changed put value"),
+            None
+        );
+        assert_eq!(
+            store
+                .op_response_if_no_effect(&KvOp::Put {
+                    key: "/config/a".to_string(),
+                    value: b"old".to_vec(),
+                    lease_id: Some(LeaseId(7)),
+                })
+                .expect("changed put lease"),
             None
         );
         assert_eq!(
