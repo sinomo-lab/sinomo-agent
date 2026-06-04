@@ -20,6 +20,12 @@ struct PublicIpDiscoveryCacheEntry {
     candidates: Vec<IpAddr>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PublicIpDiscoveryResult {
+    Complete(Vec<IpAddr>),
+    Deferred(Vec<IpAddr>),
+}
+
 #[derive(Debug)]
 pub(crate) struct PublicIpDnsWorkerPermit;
 
@@ -142,12 +148,15 @@ pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
         return Vec::new();
     }
     cached_default_public_ip_candidates_with(|| {
-        discover_public_ip_candidates_from_hosts(&[("api.ipify.org", "/"), ("ifconfig.me", "/ip")])
+        discover_public_ip_candidates_from_hosts_with_status(&[
+            ("api.ipify.org", "/"),
+            ("ifconfig.me", "/ip"),
+        ])
     })
 }
 
 pub(crate) fn cached_default_public_ip_candidates_with(
-    discover: impl FnOnce() -> Vec<IpAddr>,
+    discover: impl FnOnce() -> PublicIpDiscoveryResult,
 ) -> Vec<IpAddr> {
     let now = Instant::now();
     if let Ok(cache) = PUBLIC_IP_DISCOVERY_CACHE.lock()
@@ -156,7 +165,11 @@ pub(crate) fn cached_default_public_ip_candidates_with(
     {
         return entry.candidates.clone();
     }
-    let candidates = discover();
+    let result = discover();
+    let candidates = match result {
+        PublicIpDiscoveryResult::Complete(candidates) => candidates,
+        PublicIpDiscoveryResult::Deferred(candidates) => return candidates,
+    };
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         *cache = Some(PublicIpDiscoveryCacheEntry {
             checked_at: now,
@@ -174,18 +187,30 @@ pub(crate) fn clear_public_ip_discovery_cache() {
 }
 
 pub fn discover_public_ip_candidates_from_hosts(hosts: &[(&str, &str)]) -> Vec<IpAddr> {
+    match discover_public_ip_candidates_from_hosts_with_status(hosts) {
+        PublicIpDiscoveryResult::Complete(candidates)
+        | PublicIpDiscoveryResult::Deferred(candidates) => candidates,
+    }
+}
+
+pub(crate) fn discover_public_ip_candidates_from_hosts_with_status(
+    hosts: &[(&str, &str)],
+) -> PublicIpDiscoveryResult {
     let mut candidates = Vec::new();
     if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
         .ok()
         .as_deref()
         == Some("1")
     {
-        return candidates;
+        return PublicIpDiscoveryResult::Complete(candidates);
     }
     for (host, path) in hosts {
-        let Some(address) = resolve_public_ip_service_address(host, Duration::from_millis(750))
-        else {
-            continue;
+        let address = match resolve_public_ip_service_address(host, Duration::from_millis(750)) {
+            PublicIpServiceAddressResolution::Resolved(address) => address,
+            PublicIpServiceAddressResolution::Unavailable => continue,
+            PublicIpServiceAddressResolution::Deferred => {
+                return PublicIpDiscoveryResult::Deferred(candidates);
+            }
         };
         let Ok(mut stream) =
             std::net::TcpStream::connect_timeout(&address, Duration::from_millis(750))
@@ -219,11 +244,23 @@ pub fn discover_public_ip_candidates_from_hosts(hosts: &[(&str, &str)]) -> Vec<I
             }
         }
     }
-    candidates
+    PublicIpDiscoveryResult::Complete(candidates)
 }
 
-fn resolve_public_ip_service_address(host: &str, timeout: Duration) -> Option<SocketAddr> {
-    let permit = try_acquire_public_ip_dns_worker()?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicIpServiceAddressResolution {
+    Resolved(SocketAddr),
+    Unavailable,
+    Deferred,
+}
+
+fn resolve_public_ip_service_address(
+    host: &str,
+    timeout: Duration,
+) -> PublicIpServiceAddressResolution {
+    let Some(permit) = try_acquire_public_ip_dns_worker() else {
+        return PublicIpServiceAddressResolution::Deferred;
+    };
     let host = host.to_string();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -233,7 +270,15 @@ fn resolve_public_ip_service_address(host: &str, timeout: Duration) -> Option<So
             .and_then(|mut addresses| addresses.next());
         let _ = sender.send(address);
     });
-    receiver.recv_timeout(timeout).ok().flatten()
+    match receiver.recv_timeout(timeout) {
+        Ok(Some(address)) => PublicIpServiceAddressResolution::Resolved(address),
+        Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            PublicIpServiceAddressResolution::Unavailable
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            PublicIpServiceAddressResolution::Deferred
+        }
+    }
 }
 
 pub fn is_private_or_link_local_ip(ip: IpAddr) -> bool {

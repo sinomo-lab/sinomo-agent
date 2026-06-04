@@ -33,17 +33,21 @@ const MAX_CLUSTER_KV_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(30);
 const MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES: usize = 128;
 const MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES: usize = 128;
 const MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES: usize = MAX_CLUSTER_KV_ACTIVE_WATCHES;
-const PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_POSITIVE_CACHE_TTL: Duration =
+    Duration::from_secs(60);
+pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL: Duration =
+    Duration::from_secs(10);
 const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
 const FILE_CACHE_CAPACITY: usize = 4096;
+const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
-    Mutex<HashMap<PathBuf, Vec<ClusterConnectivityRecord>>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    Mutex<BTreeMap<PathBuf, Vec<ClusterConnectivityRecord>>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static CLUSTER_KV_WATCH_NOTIFIERS: LazyLock<(Mutex<HashMap<PathBuf, u64>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
 static CLUSTER_KV_WATCH_EVENT_CACHE: LazyLock<
@@ -104,6 +108,20 @@ struct ClusterKvReaderNodeIdCacheEntry {
 struct PublicEndpointReachabilityCacheEntry {
     checked_at: Instant,
     reachable: bool,
+}
+
+impl PublicEndpointReachabilityCacheEntry {
+    fn ttl(&self) -> Duration {
+        if self.reachable {
+            PUBLIC_ENDPOINT_REACHABILITY_POSITIVE_CACHE_TTL
+        } else {
+            PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL
+        }
+    }
+
+    fn is_fresh_at(&self, now: Instant) -> bool {
+        now.duration_since(self.checked_at) < self.ttl()
+    }
 }
 
 /// Per-path record of the last content `write_object_file` wrote (or confirmed
@@ -475,6 +493,16 @@ pub(crate) fn cluster_kv_cached_snapshot_reads_for_test(paths: &ClusterPaths) ->
 pub(crate) fn cached_cluster_kv_reader_node_id_for_test(paths: &ClusterPaths) -> Option<NodeId> {
     let mark = cluster_file_mark(&paths.state)?;
     cached_cluster_kv_reader_node_id(&paths.state, mark)
+}
+
+#[cfg(test)]
+pub(crate) fn local_cluster_connectivity_record_cache_contains_for_test(
+    paths: &ClusterPaths,
+) -> bool {
+    LOCAL_CLUSTER_CONNECTIVITY_RECORDS
+        .lock()
+        .map(|cache| cache.contains_key(&paths.root))
+        .unwrap_or(false)
 }
 
 /// Receives notifications about disk and network I/O performed by the network
@@ -3358,10 +3386,14 @@ pub fn read_local_cluster_connectivity_records(
                 operation: "lock local cluster connectivity cache".to_string(),
                 detail: error.to_string(),
             })?;
-    let local_records = cache.entry(paths.root.clone()).or_default();
+    let Some(local_records) = cache.get_mut(&paths.root) else {
+        return Ok(Vec::new());
+    };
     local_records.retain(|record| cluster_network_record_live(record.expires_at, now));
     let mut records = local_records.clone();
-    records.retain(|record| cluster_network_record_live(record.expires_at, now));
+    if local_records.is_empty() {
+        cache.remove(&paths.root);
+    }
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
 }
@@ -3396,8 +3428,8 @@ fn write_local_cluster_connectivity_records_inner(
                 operation: "lock local cluster connectivity cache".to_string(),
                 detail: error.to_string(),
             })?;
-    let local_records = cache.entry(paths.root.clone()).or_default();
-    let mut merged = local_records
+    let existing_records = cache.get(&paths.root).cloned().unwrap_or_default();
+    let mut merged = existing_records
         .iter()
         .filter(|record| {
             cluster_network_record_live(record.expires_at, now)
@@ -3430,7 +3462,17 @@ fn write_local_cluster_connectivity_records_inner(
     }
     let mut merged = merged.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut merged);
-    *local_records = merged;
+    if merged.is_empty() {
+        cache.remove(&paths.root);
+    } else {
+        if !cache.contains_key(&paths.root)
+            && cache.len() >= MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES
+            && let Some(oldest) = cache.keys().next().cloned()
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(paths.root.clone(), merged);
+    }
     Ok(())
 }
 
@@ -4454,20 +4496,26 @@ pub(crate) fn public_endpoint_is_reachable_with_probe(
     port: u16,
     probe: impl FnOnce(SocketAddr) -> bool,
 ) -> bool {
+    public_endpoint_is_reachable_with_probe_at(ip, port, Instant::now(), probe)
+}
+
+pub(crate) fn public_endpoint_is_reachable_with_probe_at(
+    ip: IpAddr,
+    port: u16,
+    now: Instant,
+    probe: impl FnOnce(SocketAddr) -> bool,
+) -> bool {
     let address = SocketAddr::new(ip, port);
-    let now = Instant::now();
     if let Ok(cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock()
         && let Some(entry) = cache.get(&address)
-        && now.duration_since(entry.checked_at) < PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL
+        && entry.is_fresh_at(now)
     {
         return entry.reachable;
     }
     let reachable = probe(address);
     if let Ok(mut cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock() {
         if cache.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES {
-            cache.retain(|_, entry| {
-                now.duration_since(entry.checked_at) < PUBLIC_ENDPOINT_REACHABILITY_CACHE_TTL
-            });
+            cache.retain(|_, entry| entry.is_fresh_at(now));
         }
         if cache.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES
             && let Some(oldest) = cache

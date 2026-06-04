@@ -520,6 +520,14 @@ pub trait NetworkTransport {
     fn local_node_id(&self) -> &NodeId;
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
+
+    fn drain_incoming_limited(
+        &mut self,
+        max_frames: usize,
+    ) -> Result<Vec<InboundFrame>, NetworkError> {
+        let _ = max_frames;
+        self.drain_incoming()
+    }
 }
 
 pub(crate) const SEEN_EVENT_CACHE_CAPACITY: usize = 16_384;
@@ -760,6 +768,24 @@ impl NetworkTransport for InProcessTransport {
 
         Ok(mailbox.drain(..).collect())
     }
+
+    fn drain_incoming_limited(
+        &mut self,
+        max_frames: usize,
+    ) -> Result<Vec<InboundFrame>, NetworkError> {
+        let mut inner = self.inner.lock().map_err(|_| NetworkError::Serialization {
+            detail: "in-process network lock poisoned".to_string(),
+        })?;
+        let mailbox = inner
+            .mailboxes
+            .get_mut(&self.local_node_id)
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: self.local_node_id.clone(),
+            })?;
+        let take = mailbox.len().min(max_frames.max(1));
+
+        Ok(mailbox.drain(..take).collect())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -803,6 +829,10 @@ impl<T: NetworkTransport> NetworkService<T> {
         &self.ledger
     }
 
+    fn next_outbound_wake_at(&self) -> Option<Instant> {
+        self.ledger.next_outbound_wake_at()
+    }
+
     fn enqueue_event(
         &mut self,
         stored_event: &StoredEvent,
@@ -824,8 +854,16 @@ impl<T: NetworkTransport> NetworkService<T> {
     }
 
     fn pump_outbound(&mut self) -> Result<usize, NetworkError> {
+        self.pump_outbound_limited(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)
+    }
+
+    fn pump_outbound_limited(&mut self, max_deliveries: usize) -> Result<usize, NetworkError> {
         let mut sent = 0;
-        let delivery_ids = self.ledger.ready_delivery_ids();
+        let delivery_ids = self
+            .ledger
+            .ready_delivery_ids()
+            .into_iter()
+            .take(max_deliveries.max(1));
 
         for delivery_id in delivery_ids {
             let Some(record) = self.ledger.record(&delivery_id).cloned() else {
@@ -865,7 +903,9 @@ impl<T: NetworkTransport> NetworkService<T> {
         &mut self,
         store: &mut S,
     ) -> Result<Vec<InboundOutcome>, NetworkError> {
-        let inbound_frames = self.transport.drain_incoming()?;
+        let inbound_frames = self
+            .transport
+            .drain_incoming_limited(NETWORK_SERVICE_INBOUND_BATCH_LIMIT)?;
         let mut outcomes = Vec::with_capacity(inbound_frames.len());
 
         for inbound in inbound_frames {
@@ -1005,6 +1045,8 @@ impl<T: NetworkTransport> NetworkService<T> {
 /// Bounded command-queue depth for a spawned [`NetworkService`] actor. Once this many
 /// commands are in flight, [`NetworkServiceHandle`] methods await room (backpressure).
 const NETWORK_SERVICE_QUEUE_CAPACITY: usize = 256;
+pub(crate) const NETWORK_SERVICE_INBOUND_BATCH_LIMIT: usize = 256;
+pub(crate) const NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT: usize = 256;
 
 /// A unit of work run on the actor's owned [`NetworkService`] and event store.
 type NetworkServiceJob<T, S> = Box<dyn FnOnce(&mut NetworkService<T>, &mut S) + Send>;
@@ -1109,6 +1151,14 @@ where
     /// Snapshot the delivery-ledger records.
     pub async fn ledger_records(&self) -> Result<Vec<DeliveryRecord>, NetworkError> {
         self.run_job(|service, _store| service.ledger().records().into_iter().cloned().collect())
+            .await
+    }
+
+    /// Earliest time a future [`NetworkServiceHandle::pump_outbound`] could make
+    /// progress for queued or retrying work. Schedulers can use this to sleep through
+    /// retry backoff windows instead of polling while no delivery is ready.
+    pub async fn next_outbound_wake_at(&self) -> Result<Option<Instant>, NetworkError> {
+        self.run_job(|service, _store| service.next_outbound_wake_at())
             .await
     }
 
@@ -1248,6 +1298,28 @@ impl DeliveryLedger {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn next_outbound_wake_at(&self) -> Option<Instant> {
+        self.next_outbound_wake_at_at(Instant::now())
+    }
+
+    pub(crate) fn next_outbound_wake_at_at(&self, now: Instant) -> Option<Instant> {
+        let mut next_wake: Option<Instant> = None;
+        for (delivery_id, record) in &self.records {
+            match record.delivery.status {
+                DeliveryStatus::Queued => return Some(now),
+                DeliveryStatus::Retrying => match self.retry_not_before.get(delivery_id).copied() {
+                    Some(deadline) if deadline > now => {
+                        next_wake =
+                            Some(next_wake.map_or(deadline, |existing| existing.min(deadline)));
+                    }
+                    _ => return Some(now),
+                },
+                _ => {}
+            }
+        }
+        next_wake
     }
 
     pub fn mark_sent(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {

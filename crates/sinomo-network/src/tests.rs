@@ -1402,6 +1402,70 @@ fn local_connectivity_records_are_in_memory_not_disk() {
 }
 
 #[test]
+fn local_connectivity_cache_does_not_retain_empty_roots() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-empty-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_empty_cache").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_empty_cache_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_empty_cache_b").expect("node b");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity empty cache",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+
+    assert!(
+        read_local_cluster_connectivity_records(&paths)
+            .expect("read absent local connectivity")
+            .is_empty()
+    );
+    assert!(
+        !local_cluster_connectivity_record_cache_contains_for_test(&paths),
+        "reading absent local connectivity must not allocate an empty per-root cache entry"
+    );
+
+    write_local_cluster_connectivity_records(&paths, &node_a, &[])
+        .expect("write empty local connectivity");
+    assert!(
+        !local_cluster_connectivity_record_cache_contains_for_test(&paths),
+        "writing an empty local connectivity set must not leave a per-root cache entry"
+    );
+
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.62:21353".to_string(), 10);
+    let expired = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("expired".to_string()),
+        None,
+        now - time::Duration::seconds(60),
+        1,
+    );
+    write_local_cluster_connectivity_records(&paths, &node_a, &[expired])
+        .expect("write expired local connectivity");
+    assert!(
+        !local_cluster_connectivity_record_cache_contains_for_test(&paths),
+        "expired-only local connectivity writes must not leave a per-root cache entry"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn connectivity_full_sync_replaces_local_source_records() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-local-replace-{}",
@@ -2411,11 +2475,11 @@ fn public_ip_discovery_cache_reuses_recent_result() {
     let calls = std::sync::atomic::AtomicU64::new(0);
     let first = crate::lan::cached_default_public_ip_candidates_with(|| {
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        vec!["203.0.113.10".parse().expect("ip")]
+        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.10".parse().expect("ip")])
     });
     let second = crate::lan::cached_default_public_ip_candidates_with(|| {
         calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        vec!["203.0.113.11".parse().expect("ip")]
+        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.11".parse().expect("ip")])
     });
 
     assert_eq!(first, vec!["203.0.113.10".parse::<IpAddr>().expect("ip")]);
@@ -2424,6 +2488,39 @@ fn public_ip_discovery_cache_reuses_recent_result() {
         "recent public IP discovery should be served from cache"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
+fn public_ip_discovery_cache_does_not_store_deferred_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let deferred = crate::lan::cached_default_public_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::lan::PublicIpDiscoveryResult::Deferred(Vec::new())
+    });
+    let recovered = crate::lan::cached_default_public_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.13".parse().expect("ip")])
+    });
+    let cached = crate::lan::cached_default_public_ip_candidates_with(|| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.14".parse().expect("ip")])
+    });
+
+    assert!(deferred.is_empty());
+    assert_eq!(
+        recovered,
+        vec!["203.0.113.13".parse::<IpAddr>().expect("ip")]
+    );
+    assert_eq!(
+        cached, recovered,
+        "completed discovery should be cached after a deferred attempt"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     crate::lan::clear_public_ip_discovery_cache();
 }
 
@@ -2445,6 +2542,26 @@ fn public_ip_dns_worker_limit_releases_permits() {
     let replacement =
         crate::lan::try_acquire_public_ip_dns_worker().expect("released dns worker permit");
     drop(replacement);
+}
+
+#[test]
+fn public_ip_discovery_reports_deferred_when_dns_workers_saturated() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    let permits = (0..crate::lan::MAX_PUBLIC_IP_DNS_WORKERS)
+        .map(|_| crate::lan::try_acquire_public_ip_dns_worker().expect("dns worker permit"))
+        .collect::<Vec<_>>();
+
+    let result =
+        crate::lan::discover_public_ip_candidates_from_hosts_with_status(&[("api.ipify.org", "/")]);
+
+    assert_eq!(
+        result,
+        crate::lan::PublicIpDiscoveryResult::Deferred(Vec::new()),
+        "DNS worker saturation should be treated as deferred discovery, not a negative result"
+    );
+    drop(permits);
 }
 
 #[test]
@@ -2470,6 +2587,64 @@ fn public_endpoint_reachability_cache_reuses_recent_result() {
         "recent public endpoint reachability should be served from cache"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    clear_public_endpoint_reachability_cache();
+}
+
+#[test]
+fn public_endpoint_negative_reachability_cache_expires_quickly() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    clear_public_endpoint_reachability_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let ip = "203.0.113.15".parse().expect("ip");
+    let start = Instant::now();
+    let first = public_endpoint_is_reachable_with_probe_at(ip, 21353, start, |_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    });
+    let still_cached = public_endpoint_is_reachable_with_probe_at(
+        ip,
+        21353,
+        start + PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL / 2,
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        },
+    );
+    let recovered = public_endpoint_is_reachable_with_probe_at(
+        ip,
+        21353,
+        start + PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL + Duration::from_millis(1),
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        },
+    );
+    let positive_cached = public_endpoint_is_reachable_with_probe_at(
+        ip,
+        21353,
+        start + PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL + Duration::from_millis(2),
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        },
+    );
+
+    assert!(!first);
+    assert!(
+        !still_cached,
+        "fresh negative reachability should avoid repeated failed probes"
+    );
+    assert!(
+        recovered,
+        "negative public endpoint reachability should expire before the positive cache ttl"
+    );
+    assert!(
+        positive_cached,
+        "fresh positive reachability should still be cached"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     clear_public_endpoint_reachability_cache();
 }
 
@@ -9008,6 +9183,118 @@ async fn network_service_delivers_event_and_processes_ack() {
 }
 
 #[tokio::test]
+async fn network_service_pump_outbound_batches_large_ready_backlogs() {
+    let node_a = NodeId::from_legacy_named("node_batch_sender").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_batch_delivery").expect("session");
+    let network = InProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_batch_sender"));
+    let target_count = crate::peer::NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT + 1;
+    for index in 0..target_count {
+        let target_id = format!("node_batch_receiver_{index:03}");
+        let target_node = NodeId::from_legacy_named(&target_id).expect("target node");
+        network.add_node(target_node.clone());
+        registry.register_node(node(&target_id));
+        registry
+            .join_session(session_id.clone(), target_node)
+            .expect("join target");
+    }
+
+    let mut store = InMemoryEventStore::new();
+    let event = fixture_event("evt_batch_delivery", node_a).with_session(session_id);
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service = NetworkService::new(registry, transport_a).spawn(store);
+    let deliveries = service.enqueue_event(stored).await.expect("enqueue");
+    assert_eq!(deliveries.len(), target_count);
+
+    assert_eq!(
+        service.pump_outbound().await.expect("first batch"),
+        crate::peer::NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT
+    );
+    assert!(
+        service
+            .next_outbound_wake_at()
+            .await
+            .expect("wake hint")
+            .expect("remaining ready work")
+            <= Instant::now(),
+        "remaining queued delivery should request another immediate pump"
+    );
+    assert_eq!(service.pump_outbound().await.expect("second batch"), 1);
+    assert_eq!(service.pump_outbound().await.expect("empty batch"), 0);
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn network_service_process_incoming_batches_large_mailboxes() {
+    let node_a = NodeId::from_legacy_named("node_inbound_batch_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_inbound_batch_receiver").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let frame_count = crate::peer::NETWORK_SERVICE_INBOUND_BATCH_LIMIT + 1;
+
+    for index in 0..frame_count {
+        transport_a
+            .send(
+                &node_b,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(index as u64 + 1),
+                    source_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(index as u64 + 1),
+                        origin_node_id: node_a.clone(),
+                        target_node_id: node_b.clone(),
+                        body: MeshMessageBody::Heartbeat(Heartbeat {
+                            node_id: node_a.clone(),
+                            tick: index as u64,
+                        }),
+                    },
+                },
+            )
+            .expect("enqueue inbound frame");
+    }
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_inbound_batch_sender"));
+    registry.register_node(node("node_inbound_batch_receiver"));
+    let service = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+
+    assert_eq!(
+        service
+            .process_incoming()
+            .await
+            .expect("first inbound batch")
+            .len(),
+        crate::peer::NETWORK_SERVICE_INBOUND_BATCH_LIMIT
+    );
+    assert_eq!(
+        service
+            .process_incoming()
+            .await
+            .expect("second inbound batch")
+            .len(),
+        1
+    );
+    assert_eq!(
+        service
+            .process_incoming()
+            .await
+            .expect("empty inbound batch")
+            .len(),
+        0
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
 async fn delivery_ledger_suppresses_duplicate_event_targets() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
@@ -9288,6 +9575,16 @@ async fn retry_policy_marks_delivery_failed_after_max_attempts() {
         delivery_status(&service, delivery.delivery_id).await,
         DeliveryStatus::Retrying
     );
+    let before_wake = Instant::now();
+    let wake = service
+        .next_outbound_wake_at()
+        .await
+        .expect("wake hint")
+        .expect("retry wake");
+    assert!(
+        wake > before_wake && wake <= before_wake + Duration::from_secs(1),
+        "retry wake hint should point at the pending backoff deadline"
+    );
     assert_eq!(
         service
             .pump_outbound()
@@ -9297,6 +9594,15 @@ async fn retry_policy_marks_delivery_failed_after_max_attempts() {
         "failed sends should not retry again in the same pump loop"
     );
     tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(
+        service
+            .next_outbound_wake_at()
+            .await
+            .expect("expired wake hint")
+            .expect("retry ready")
+            <= Instant::now(),
+        "expired retry wake hint should let schedulers pump immediately"
+    );
     let error = service
         .pump_outbound()
         .await
@@ -9332,6 +9638,13 @@ fn delivery_ledger_applies_latency_class_retry_backoff() {
         .mark_attempt_failed(RouteDeliveryId(1))
         .expect("mark failed");
     assert!(ledger.ready_delivery_ids().is_empty());
+    let wake = ledger
+        .next_outbound_wake_at_at(before_failure + Duration::from_millis(500))
+        .expect("retry wake");
+    assert!(
+        wake >= before_failure + Duration::from_millis(900),
+        "retry wake hint should let schedulers sleep through most of the backoff"
+    );
     assert!(
         ledger
             .ready_delivery_ids_at(before_failure + Duration::from_millis(500))
@@ -9342,6 +9655,46 @@ fn delivery_ledger_applies_latency_class_retry_backoff() {
         ledger.ready_delivery_ids_at(before_failure + Duration::from_millis(1_200)),
         vec![RouteDeliveryId(1)],
         "background delivery retries should become ready after backoff"
+    );
+    assert_eq!(
+        ledger.next_outbound_wake_at_at(before_failure + Duration::from_millis(1_200)),
+        Some(before_failure + Duration::from_millis(1_200)),
+        "expired retry wake hint should be immediate"
+    );
+}
+
+#[test]
+fn delivery_ledger_outbound_wake_hint_tracks_immediate_and_waiting_work() {
+    let node_a = NodeId::from_legacy_named("node_retry_wake_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_retry_wake_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let event = fixture_event("evt_retry_wake", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let now = Instant::now();
+
+    assert_eq!(ledger.next_outbound_wake_at_at(now), None);
+    ledger.enqueue(delivery, event).expect("enqueue");
+    assert_eq!(ledger.next_outbound_wake_at_at(now), Some(now));
+    ledger
+        .mark_waiting_for_peer(RouteDeliveryId(1))
+        .expect("waiting");
+    assert_eq!(
+        ledger.next_outbound_wake_at_at(now),
+        None,
+        "offline peer work should not create an idle retry wakeup"
+    );
+    ledger.mark_for_retry(RouteDeliveryId(1)).expect("retry");
+    assert_eq!(
+        ledger.next_outbound_wake_at_at(now),
+        Some(now),
+        "deadline-free retries should wake immediately"
     );
 }
 
