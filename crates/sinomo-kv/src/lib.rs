@@ -27,6 +27,7 @@ pub const KV_WAL_OBJECT_VERSION_ID: u16 = 2;
 const MAX_RETAINED_EVENTS: usize = 4096;
 const MAX_PENDING_EVENTS_PER_WATCH: usize = MAX_RETAINED_EVENTS;
 const MAX_ACTIVE_WATCHES: usize = 1024;
+const MAX_ACTIVE_LEASES: usize = 4096;
 /// Committed log entries kept in memory after a local snapshot compaction. A
 /// follower that has fallen at most this many entries behind can be caught up
 /// with small incremental appends instead of a full snapshot install. The tail is
@@ -909,6 +910,7 @@ pub struct InProcessKvStore {
     entries: BTreeMap<String, KvEntry>,
     events: Vec<KvEvent>,
     leases: BTreeMap<LeaseId, KvLease>,
+    lease_keys: BTreeMap<LeaseId, BTreeSet<String>>,
     watches: BTreeMap<WatchId, KvWatchState>,
     next_watch_id: u64,
 }
@@ -1126,20 +1128,23 @@ impl InProcessKvStore {
     }
 
     pub fn restore(snapshot: KvSnapshot) -> Self {
+        let entries: BTreeMap<_, _> = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| (entry.key.clone(), entry))
+            .collect();
+        let lease_keys = build_lease_key_index(&entries);
         Self {
             revision: snapshot.revision,
             compacted_revision: snapshot.compacted_revision,
-            entries: snapshot
-                .entries
-                .into_iter()
-                .map(|entry| (entry.key.clone(), entry))
-                .collect(),
+            entries,
             events: snapshot.events,
             leases: snapshot
                 .leases
                 .into_iter()
                 .map(|lease| (lease.lease_id, lease))
                 .collect(),
+            lease_keys,
             watches: BTreeMap::new(),
             next_watch_id: 1,
         }
@@ -1197,6 +1202,11 @@ impl InProcessKvStore {
                 if ttl_ticks == 0 {
                     return Err(KvError::InvalidLeaseTtl { ttl_ticks });
                 }
+                if !self.leases.contains_key(&lease_id) && self.leases.len() >= MAX_ACTIVE_LEASES {
+                    return Err(KvError::LeaseLimit {
+                        max: MAX_ACTIVE_LEASES,
+                    });
+                }
                 self.leases
                     .insert(lease_id, KvLease::new(lease_id, ttl_ticks));
                 Ok(KvOpResponse::LeaseGrant { lease_id })
@@ -1212,11 +1222,10 @@ impl InProcessKvStore {
             KvOp::LeaseRevoke { lease_id } => {
                 self.leases.remove(&lease_id);
                 let keys: Vec<String> = self
-                    .entries
-                    .iter()
-                    .filter(|(_, entry)| entry.lease_id == Some(lease_id))
-                    .map(|(key, _)| key.clone())
-                    .collect();
+                    .lease_keys
+                    .remove(&lease_id)
+                    .map(|keys| keys.into_iter().collect())
+                    .unwrap_or_default();
                 let deleted_count = keys.len();
                 for key in keys {
                     self.apply_delete(key)?;
@@ -1250,6 +1259,7 @@ impl InProcessKvStore {
         }
 
         let revision = self.bump_revision();
+        let old_lease_id = self.entries.get(&key).and_then(|entry| entry.lease_id);
         let entry = match self.entries.remove(&key) {
             Some(mut existing) => {
                 existing.value = value.clone();
@@ -1267,6 +1277,12 @@ impl InProcessKvStore {
                 lease_id,
             },
         };
+        if let Some(old_lease_id) = old_lease_id {
+            self.remove_lease_key(old_lease_id, &key);
+        }
+        if let Some(lease_id) = lease_id {
+            self.add_lease_key(lease_id, key.clone());
+        }
         self.entries.insert(key.clone(), entry);
         self.record_event(KvEvent {
             revision,
@@ -1277,11 +1293,14 @@ impl InProcessKvStore {
     }
 
     fn apply_delete(&mut self, key: String) -> Result<KvOpResponse, KvError> {
-        if self.entries.remove(&key).is_none() {
+        let Some(entry) = self.entries.remove(&key) else {
             return Ok(KvOpResponse::Delete {
                 key,
                 deleted: false,
             });
+        };
+        if let Some(lease_id) = entry.lease_id {
+            self.remove_lease_key(lease_id, &key);
         }
         let revision = self.bump_revision();
         self.record_event(KvEvent {
@@ -1357,6 +1376,21 @@ impl InProcessKvStore {
     fn trim_event_history(&mut self) {
         self.compact_event_history_to(MAX_RETAINED_EVENTS);
     }
+
+    fn add_lease_key(&mut self, lease_id: LeaseId, key: String) {
+        self.lease_keys.entry(lease_id).or_default().insert(key);
+    }
+
+    fn remove_lease_key(&mut self, lease_id: LeaseId, key: &str) {
+        let Some(keys) = self.lease_keys.get_mut(&lease_id) else {
+            return;
+        };
+        keys.remove(key);
+        let remove_empty = keys.is_empty();
+        if remove_empty {
+            self.lease_keys.remove(&lease_id);
+        }
+    }
 }
 
 /// Compares two snapshots by their durable key/value/lease state, ignoring the
@@ -1410,6 +1444,18 @@ fn compact_snapshot_event_history(
     let compacted = events[excess - 1].revision;
     events.drain(..excess);
     *compacted_revision = (*compacted_revision).max(compacted);
+}
+
+fn build_lease_key_index(
+    entries: &BTreeMap<String, KvEntry>,
+) -> BTreeMap<LeaseId, BTreeSet<String>> {
+    let mut lease_keys = BTreeMap::<LeaseId, BTreeSet<String>>::new();
+    for (key, entry) in entries {
+        if let Some(lease_id) = entry.lease_id {
+            lease_keys.entry(lease_id).or_default().insert(key.clone());
+        }
+    }
+    lease_keys
 }
 
 #[derive(Clone, Debug)]
@@ -2188,9 +2234,13 @@ impl DurableRaftKvNode {
             }
         };
         let committed_index = node.hard_state.commit_index.max(node.applied_index);
+        let retain_after_index = node
+            .snapshot_index
+            .saturating_sub(RAFT_COMPACTION_RETAINED_ENTRIES);
         let WalRead { entries, truncated } = read_wal_entries(
             &paths.wal,
             discard_uncommitted_tail.then_some(committed_index),
+            retain_after_index,
         )?;
         // Preserve the already-applied tail (kept by local_compact for incremental
         // replication) instead of discarding it as append_entries would.
@@ -2459,7 +2509,11 @@ struct WalRead {
     truncated: bool,
 }
 
-fn read_wal_entries(path: &Path, max_index: Option<u64>) -> Result<WalRead, KvError> {
+fn read_wal_entries(
+    path: &Path,
+    max_index: Option<u64>,
+    retain_after_index: u64,
+) -> Result<WalRead, KvError> {
     if !path.exists() {
         return Ok(WalRead::default());
     }
@@ -2498,6 +2552,10 @@ fn read_wal_entries(path: &Path, max_index: Option<u64>) -> Result<WalRead, KvEr
         match sinomo_object_serde::from_bytes(&record) {
             Ok(entry) => {
                 let entry: KvLogEntry = entry;
+                if entry.index <= retain_after_index {
+                    truncated = true;
+                    continue;
+                }
                 if max_index.is_some_and(|limit| entry.index > limit) {
                     truncated = true;
                     break;
@@ -2911,6 +2969,8 @@ pub enum KvError {
     UnknownLease { lease_id: LeaseId },
     #[error("invalid lease ttl: {ttl_ticks}")]
     InvalidLeaseTtl { ttl_ticks: u64 },
+    #[error("too many active leases: max {max}")]
+    LeaseLimit { max: usize },
     #[error("unknown watch: {watch_id:?}")]
     UnknownWatch { watch_id: WatchId },
     #[error("too many active watches: max {max}")]
@@ -3283,6 +3343,132 @@ mod tests {
         assert!(store.get("/services/live").is_some());
         assert_eq!(store.tick_leases(1).expect("expire"), vec![LeaseId(1)]);
         assert!(store.get("/services/live").is_none());
+    }
+
+    #[test]
+    fn lease_revoke_uses_index_and_tracks_reassignment() {
+        let mut store = InProcessKvStore::new();
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(1),
+                ttl_ticks: 10,
+            })
+            .expect("lease one");
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(2),
+                ttl_ticks: 10,
+            })
+            .expect("lease two");
+        store
+            .put("/lease/a", b"a".to_vec(), Some(LeaseId(1)))
+            .expect("leased a");
+        store
+            .put("/lease/b", b"b".to_vec(), Some(LeaseId(1)))
+            .expect("leased b");
+        store
+            .put("/lease/a", b"moved".to_vec(), Some(LeaseId(2)))
+            .expect("move a to lease two");
+        store
+            .put("/lease/free", b"free".to_vec(), None)
+            .expect("free");
+
+        assert_eq!(
+            store
+                .lease_keys
+                .get(&LeaseId(1))
+                .expect("lease one keys")
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["/lease/b".to_string()]
+        );
+        assert!(
+            store
+                .lease_keys
+                .get(&LeaseId(2))
+                .expect("lease two keys")
+                .contains("/lease/a")
+        );
+
+        let response = store
+            .apply_op(KvOp::LeaseRevoke {
+                lease_id: LeaseId(1),
+            })
+            .expect("revoke lease one");
+        assert_eq!(
+            response,
+            KvOpResponse::LeaseRevoke {
+                lease_id: LeaseId(1),
+                deleted_count: 1,
+            }
+        );
+        assert!(store.get("/lease/b").is_none());
+        assert!(store.get("/lease/a").is_some());
+        assert!(store.get("/lease/free").is_some());
+        assert!(!store.lease_keys.contains_key(&LeaseId(1)));
+    }
+
+    #[test]
+    fn lease_index_is_restored_from_snapshot() {
+        let mut store = InProcessKvStore::new();
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(7),
+                ttl_ticks: 10,
+            })
+            .expect("lease");
+        store
+            .put("/lease/restored", b"value".to_vec(), Some(LeaseId(7)))
+            .expect("leased value");
+
+        let mut restored = InProcessKvStore::restore(store.snapshot());
+        assert!(
+            restored
+                .lease_keys
+                .get(&LeaseId(7))
+                .expect("restored lease keys")
+                .contains("/lease/restored")
+        );
+
+        restored
+            .apply_op(KvOp::LeaseRevoke {
+                lease_id: LeaseId(7),
+            })
+            .expect("revoke restored lease");
+        assert!(restored.get("/lease/restored").is_none());
+    }
+
+    #[test]
+    fn active_lease_count_is_bounded_and_existing_grants_can_refresh() {
+        let mut store = InProcessKvStore::new();
+        for index in 1..=MAX_ACTIVE_LEASES {
+            store
+                .apply_op(KvOp::LeaseGrant {
+                    lease_id: LeaseId(index as u64),
+                    ttl_ticks: 10,
+                })
+                .expect("lease within limit");
+        }
+
+        assert_eq!(
+            store.apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(MAX_ACTIVE_LEASES as u64 + 1),
+                ttl_ticks: 10,
+            }),
+            Err(KvError::LeaseLimit {
+                max: MAX_ACTIVE_LEASES,
+            })
+        );
+        assert!(
+            store
+                .apply_op(KvOp::LeaseGrant {
+                    lease_id: LeaseId(1),
+                    ttl_ticks: 20,
+                })
+                .is_ok(),
+            "refreshing an existing lease id should not consume another active slot"
+        );
     }
 
     #[test]
@@ -4701,6 +4887,73 @@ mod tests {
                 .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
                 .all(|name| !name.starts_with(".wal.sobjlog.tmp-")),
             "WAL repair must not leave rewrite temp files behind"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_open_repairs_wal_records_already_covered_by_snapshot() {
+        let root = temp_raft_root("sinomo-kv-snapshot-covered-wal");
+        let node_id = NodeId::from_legacy_named("node_snapshot_covered_wal").expect("node id");
+        let paths = KvWalPaths::new(&root);
+        let command_count = RAFT_COMPACTION_RETAINED_ENTRIES + 20;
+        let overgrown_log = {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("open node");
+            for index in 1..=command_count {
+                let entry = node
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: format!("/covered/{index}"),
+                            value: index.to_be_bytes().to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append command");
+                node.commit_to(entry.index).expect("commit command");
+            }
+            let overgrown_log = node.log().to_vec();
+            assert!(
+                overgrown_log.len() > RAFT_COMPACTION_RETAINED_ENTRIES as usize,
+                "fixture should start with a WAL larger than the retained tail"
+            );
+            node.save_snapshot().expect("snapshot");
+            rewrite_wal_entries(&paths.wal, &overgrown_log).expect("restore overgrown wal");
+            overgrown_log
+        };
+
+        let before = read_wal_entries(&paths.wal, None, 0).expect("read overgrown wal");
+        assert_eq!(before.entries.len(), overgrown_log.len());
+        assert!(!before.truncated);
+
+        let recovered = DurableRaftKvNode::open(node_id, paths.clone()).expect("recover node");
+        assert_eq!(
+            recovered
+                .store()
+                .get(&format!("/covered/{command_count}"))
+                .expect("last committed value")
+                .value,
+            command_count.to_be_bytes().to_vec()
+        );
+        drop(recovered);
+
+        let after = read_wal_entries(&paths.wal, None, 0).expect("read repaired wal");
+        assert!(!after.truncated);
+        assert!(
+            after.entries.len() <= RAFT_COMPACTION_RETAINED_ENTRIES as usize,
+            "recovery should rewrite snapshot-covered WAL records out of the file"
+        );
+        assert_eq!(
+            after.entries.last().map(|entry| entry.index),
+            Some(command_count)
+        );
+        assert!(
+            after
+                .entries
+                .first()
+                .is_some_and(|entry| entry.index > overgrown_log[0].index),
+            "repaired WAL should start after the redundant pre-retention records"
         );
         std::fs::remove_dir_all(root).ok();
     }

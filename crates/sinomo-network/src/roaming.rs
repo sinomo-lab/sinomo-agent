@@ -10,6 +10,10 @@ pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 #[cfg(feature = "iroh-transport")]
 const IROH_DAEMON_PROXY_RESTART_BACKOFF: Duration = Duration::from_secs(5);
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 128;
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 512;
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -435,6 +439,21 @@ pub fn write_iroh_endpoint_record(
     write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
 }
 
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn try_acquire_iroh_proxy_permit(
+    limiter: &Arc<tokio::sync::Semaphore>,
+    limit: usize,
+    scope: &str,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match limiter.clone().try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            eprintln!("sinomo iroh daemon proxy dropping {scope}: active limit {limit} reached");
+            None
+        }
+    }
+}
+
 #[cfg(feature = "iroh-transport")]
 pub fn start_iroh_daemon_proxy(
     paths: ClusterPaths,
@@ -566,9 +585,24 @@ async fn run_iroh_daemon_proxy(
         let _ = ready.send(Ok(record));
     }
 
+    let connection_limiter = Arc::new(tokio::sync::Semaphore::new(
+        IROH_DAEMON_PROXY_MAX_CONNECTIONS,
+    ));
+    let command_limiter = Arc::new(tokio::sync::Semaphore::new(
+        IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS,
+    ));
     while let Some(connecting) = endpoint.accept().await {
+        let Some(connection_permit) = try_acquire_iroh_proxy_permit(
+            &connection_limiter,
+            IROH_DAEMON_PROXY_MAX_CONNECTIONS,
+            "connection",
+        ) else {
+            continue;
+        };
         let daemon_address = daemon_address.clone();
+        let command_limiter = command_limiter.clone();
         tokio::spawn(async move {
+            let _connection_permit = connection_permit;
             let Ok(connection) = connecting.await else {
                 return;
             };
@@ -576,8 +610,16 @@ async fn run_iroh_daemon_proxy(
                 let Ok((mut send, mut recv)) = connection.accept_bi().await else {
                     break;
                 };
+                let Some(command_permit) = try_acquire_iroh_proxy_permit(
+                    &command_limiter,
+                    IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS,
+                    "command stream",
+                ) else {
+                    continue;
+                };
                 let daemon_address = daemon_address.clone();
                 tokio::spawn(async move {
+                    let _command_permit = command_permit;
                     let Ok(request) = recv.read_to_end(IROH_DAEMON_COMMAND_MAX_BYTES).await else {
                         return;
                     };

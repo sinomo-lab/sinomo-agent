@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub(crate) const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
+pub(crate) const MAX_CLUSTER_KV_ACTIVE_WATCHES: usize = 1024;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
@@ -1661,7 +1662,12 @@ pub fn create_cluster_kv_watch(
     })?;
     let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
     let mut watch_id = next_cluster_kv_watch_id(paths)?;
-    prune_cluster_kv_watches(paths, snapshot.compacted_revision)?;
+    let prune = prune_cluster_kv_watches(paths, snapshot.compacted_revision)?;
+    if prune.retained >= MAX_CLUSTER_KV_ACTIVE_WATCHES {
+        return Err(NetworkError::Kv(KvError::WatchLimit {
+            max: MAX_CLUSTER_KV_ACTIVE_WATCHES,
+        }));
+    }
     loop {
         let registration = ClusterKvWatchRegistration {
             watch_id,
@@ -2205,14 +2211,20 @@ fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, Networ
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClusterKvWatchPruneResult {
+    removed: usize,
+    retained: usize,
+}
+
 fn prune_cluster_kv_watches(
     paths: &ClusterPaths,
     compacted_revision: KvRevision,
-) -> Result<usize, NetworkError> {
+) -> Result<ClusterKvWatchPruneResult, NetworkError> {
     if !paths.kv_watches.exists() {
-        return Ok(0);
+        return Ok(ClusterKvWatchPruneResult::default());
     }
-    let mut removed = 0usize;
+    let mut result = ClusterKvWatchPruneResult::default();
     for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
         path: paths.kv_watches.display().to_string(),
         detail: source.to_string(),
@@ -2237,17 +2249,20 @@ fn prune_cluster_kv_watches(
                     registration.watch_id.0
                 );
                 if remove_cluster_kv_watch_file_if_exists(&path)? {
-                    removed = removed.saturating_add(1);
+                    result.removed = result.removed.saturating_add(1);
                 }
             }
             Ok(registration)
                 if compacted_revision != KvRevision::ZERO
                     && registration.next_revision <= compacted_revision =>
             {
-                remove_cluster_kv_watch_file(&path);
-                removed = removed.saturating_add(1);
+                if remove_cluster_kv_watch_file_if_exists(&path)? {
+                    result.removed = result.removed.saturating_add(1);
+                }
             }
-            Ok(_) => {}
+            Ok(_) => {
+                result.retained = result.retained.saturating_add(1);
+            }
             Err(error) => {
                 eprintln!(
                     "warning: removing unreadable cluster kv watch registration {}: {}",
@@ -2255,12 +2270,12 @@ fn prune_cluster_kv_watches(
                     error
                 );
                 if remove_cluster_kv_watch_file_if_exists(&path)? {
-                    removed = removed.saturating_add(1);
+                    result.removed = result.removed.saturating_add(1);
                 }
             }
         }
     }
-    Ok(removed)
+    Ok(result)
 }
 
 fn cluster_kv_watch_id_from_file_name(name: &str) -> Option<u64> {

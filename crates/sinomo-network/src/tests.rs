@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use crate::storage::MAX_CLUSTER_KV_ACTIVE_WATCHES;
 use crate::*;
 
 use sinomo_core::{
@@ -643,6 +644,33 @@ fn iroh_daemon_proxy_keeps_short_timeout_for_regular_commands() {
         iroh_daemon_command_forward_timeout(&payload),
         std::time::Duration::from_secs(10)
     );
+}
+
+#[test]
+fn iroh_daemon_proxy_admission_limit_releases_permits() {
+    assert!(crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS >= 2);
+    assert!(
+        crate::roaming::IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS
+            >= crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS
+    );
+    let limiter = Arc::new(tokio::sync::Semaphore::new(2));
+    let first =
+        crate::roaming::try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("first permit");
+    let second =
+        crate::roaming::try_acquire_iroh_proxy_permit(&limiter, 2, "test").expect("second permit");
+
+    assert!(
+        crate::roaming::try_acquire_iroh_proxy_permit(&limiter, 2, "test").is_none(),
+        "admission should reject work once all permits are active"
+    );
+
+    drop(first);
+    let replacement = crate::roaming::try_acquire_iroh_proxy_permit(&limiter, 2, "test")
+        .expect("replacement permit");
+    drop(second);
+    drop(replacement);
+
+    assert_eq!(limiter.available_permits(), 2);
 }
 
 #[test]
@@ -5097,6 +5125,120 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
 }
 
 #[test]
+fn create_cluster_kv_watch_enforces_active_registration_limit() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-active-limit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
+        create_cluster_kv_watch(
+            &paths,
+            ClusterKvWatchPrefixRequest {
+                prefix: format!("/watch/limit/{index}/"),
+                start_revision: KvRevision(1),
+            },
+        )
+        .expect("create bounded watch");
+    }
+
+    let error = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/limit/overflow/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect_err("active watch limit");
+    assert!(matches!(
+        error,
+        NetworkError::Kv(KvError::WatchLimit {
+            max: MAX_CLUSTER_KV_ACTIVE_WATCHES
+        })
+    ));
+    assert_eq!(
+        std::fs::read_dir(&paths.kv_watches)
+            .expect("watch registrations")
+            .count(),
+        MAX_CLUSTER_KV_ACTIVE_WATCHES
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-active-limit-cancel-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    let mut first_watch = None;
+    let mut last_watch = None;
+    for index in 0..MAX_CLUSTER_KV_ACTIVE_WATCHES {
+        let watch = create_cluster_kv_watch(
+            &paths,
+            ClusterKvWatchPrefixRequest {
+                prefix: format!("/watch/limit-cancel/{index}/"),
+                start_revision: KvRevision(1),
+            },
+        )
+        .expect("create bounded watch");
+        first_watch.get_or_insert(watch.watch_id);
+        last_watch = Some(watch.watch_id);
+    }
+    let first_watch = first_watch.expect("first watch id");
+    let last_watch = last_watch.expect("last watch id");
+
+    let cancelled = cancel_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchCancelRequest {
+            watch_id: first_watch,
+        },
+    )
+    .expect("cancel watch");
+    assert!(cancelled.cancelled);
+
+    let replacement = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/limit-cancel/replacement/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("replacement watch after cancel");
+
+    assert!(
+        replacement.watch_id > last_watch,
+        "durable watch ids should keep advancing after a cancellation"
+    );
+    assert_eq!(
+        std::fs::read_dir(&paths.kv_watches)
+            .expect("watch registrations")
+            .count(),
+        MAX_CLUSTER_KV_ACTIVE_WATCHES
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_drain_removes_compacted_registration() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-compacted-drain-{}",
@@ -6404,6 +6546,95 @@ async fn delivery_ledger_suppresses_duplicate_event_targets() {
     service.shutdown().await;
 }
 
+#[test]
+fn seen_event_cache_evicts_oldest_entries_at_capacity() {
+    let node_id = NodeId::from_legacy_named("node_seen_cache").expect("node");
+    let key_one = (
+        node_id.clone(),
+        EventId::from_legacy_named("evt_seen_cache_one").expect("event"),
+    );
+    let key_two = (
+        node_id.clone(),
+        EventId::from_legacy_named("evt_seen_cache_two").expect("event"),
+    );
+    let key_three = (
+        node_id,
+        EventId::from_legacy_named("evt_seen_cache_three").expect("event"),
+    );
+    let mut cache = crate::peer::SeenEventCache::with_capacity(2);
+
+    cache.insert(key_one.clone());
+    cache.insert(key_two.clone());
+    cache.insert(key_three.clone());
+
+    assert_eq!(cache.len(), 2);
+    assert!(!cache.contains(&key_one));
+    assert!(cache.contains(&key_two));
+    assert!(cache.contains(&key_three));
+}
+
+#[test]
+fn in_process_transport_rejects_full_mailbox() {
+    let node_a = NodeId::from_legacy_named("node_mailbox_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_mailbox_receiver").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+
+    for index in 0..crate::peer::IN_PROCESS_MAILBOX_CAPACITY {
+        transport_a
+            .send(
+                &node_b,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(index as u64 + 1),
+                    source_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(index as u64 + 1),
+                        origin_node_id: node_a.clone(),
+                        target_node_id: node_b.clone(),
+                        body: MeshMessageBody::Heartbeat(Heartbeat {
+                            node_id: node_a.clone(),
+                            tick: index as u64,
+                        }),
+                    },
+                },
+            )
+            .expect("mailbox slot");
+    }
+
+    let error = transport_a
+        .send(
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(999_999),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(999_999),
+                    origin_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_a,
+                        tick: 999_999,
+                    }),
+                },
+            },
+        )
+        .expect_err("full mailbox");
+    assert_eq!(
+        error,
+        NetworkError::MailboxFull {
+            node_id: node_b,
+            max_frames: crate::peer::IN_PROCESS_MAILBOX_CAPACITY,
+        }
+    );
+    assert_eq!(
+        transport_b.drain_incoming().expect("drain").len(),
+        crate::peer::IN_PROCESS_MAILBOX_CAPACITY
+    );
+}
+
 #[tokio::test]
 async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
@@ -6446,6 +6677,88 @@ async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
     assert!(matches!(outcomes[1], InboundOutcome::EventDuplicate { .. }));
     let store_b = service_b.shutdown().await;
     assert_eq!(store_b.len(), 1);
+}
+
+#[tokio::test]
+async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
+    let node_a = NodeId::from_legacy_named("node_seen_eviction_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_seen_eviction_b").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_seen_eviction_a"));
+    registry.register_node(node("node_seen_eviction_b"));
+    let service_b = NetworkService::new(registry, transport_b)
+        .with_seen_event_cache_capacity(1)
+        .spawn(InMemoryEventStore::new());
+    let event_one =
+        fixture_event("evt_seen_eviction_one", node_a.clone()).with_target_node(node_b.clone());
+    let event_two =
+        fixture_event("evt_seen_eviction_two", node_a.clone()).with_target_node(node_b.clone());
+
+    for (delivery_id, event) in [
+        (RouteDeliveryId(1), event_one.clone()),
+        (RouteDeliveryId(2), event_two),
+    ] {
+        transport_a
+            .send(
+                &node_b,
+                NetworkFrame {
+                    frame_id: NetworkFrameId(delivery_id.0),
+                    source_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(delivery_id.0),
+                        origin_node_id: node_a.clone(),
+                        target_node_id: node_b.clone(),
+                        body: MeshMessageBody::Event {
+                            delivery_id,
+                            event: Box::new(event),
+                        },
+                    },
+                },
+            )
+            .expect("send event");
+    }
+
+    let outcomes = service_b.process_incoming().await.expect("process events");
+    assert!(matches!(outcomes[0], InboundOutcome::EventAccepted { .. }));
+    assert!(matches!(outcomes[1], InboundOutcome::EventAccepted { .. }));
+
+    transport_a
+        .send(
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(3),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(3),
+                    origin_node_id: node_a,
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Event {
+                        delivery_id: RouteDeliveryId(3),
+                        event: Box::new(event_one),
+                    },
+                },
+            },
+        )
+        .expect("send duplicate after cache eviction");
+
+    let outcomes = service_b
+        .process_incoming()
+        .await
+        .expect("process duplicate");
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::EventDuplicate {
+            delivery_id: RouteDeliveryId(3),
+            ..
+        }]
+    ));
+    let store_b = service_b.shutdown().await;
+    assert_eq!(store_b.len(), 2);
 }
 
 #[tokio::test]
@@ -6516,6 +6829,86 @@ fn ack_rejects_wrong_target_node() {
             .target_node_id,
         node_b
     );
+}
+
+#[test]
+fn delivery_ledger_rejects_new_work_when_active_records_are_full() {
+    let node_a = NodeId::from_legacy_named("node_ledger_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ledger_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 1);
+    let event_one = fixture_event("evt_ledger_active_one", node_a.clone());
+    let event_two = fixture_event("evt_ledger_active_two", node_a);
+    let delivery_one = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event_one.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    let delivery_two = RouteDelivery {
+        delivery_id: RouteDeliveryId(2),
+        event_sequence: EventSequence(2),
+        event_id: event_two.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+
+    assert_eq!(
+        ledger.enqueue(delivery_one, event_one).expect("enqueue"),
+        Some(RouteDeliveryId(1))
+    );
+    assert_eq!(
+        ledger.enqueue(delivery_two, event_two),
+        Err(NetworkError::DeliveryLedgerFull { max_records: 1 })
+    );
+}
+
+#[test]
+fn delivery_ledger_prunes_terminal_records_under_pressure() {
+    let node_a = NodeId::from_legacy_named("node_ledger_source_prune").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ledger_target_prune").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    for index in 1..=2 {
+        let event_id = format!("evt_ledger_prune_{index}");
+        let event = fixture_event(&event_id, node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Interactive,
+            status: DeliveryStatus::Queued,
+        };
+        assert_eq!(
+            ledger.enqueue(delivery, event).expect("enqueue"),
+            Some(RouteDeliveryId(index))
+        );
+    }
+    ledger
+        .ack(RouteDeliveryId(1), &node_b)
+        .expect("mark first delivered");
+
+    let event = fixture_event("evt_ledger_prune_3", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(3),
+        event_sequence: EventSequence(3),
+        event_id: event.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    assert_eq!(
+        ledger
+            .enqueue(delivery, event)
+            .expect("enqueue after prune"),
+        Some(RouteDeliveryId(3))
+    );
+
+    assert!(ledger.record(&RouteDeliveryId(1)).is_none());
+    assert!(ledger.record(&RouteDeliveryId(2)).is_some());
+    assert!(ledger.record(&RouteDeliveryId(3)).is_some());
 }
 
 #[test]

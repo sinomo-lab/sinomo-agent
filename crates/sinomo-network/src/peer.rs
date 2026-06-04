@@ -519,11 +519,56 @@ pub trait NetworkTransport {
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
 }
 
+pub(crate) const SEEN_EVENT_CACHE_CAPACITY: usize = 16_384;
+
+#[derive(Clone, Debug)]
+pub(crate) struct SeenEventCache {
+    capacity: usize,
+    keys: BTreeSet<(NodeId, EventId)>,
+    order: VecDeque<(NodeId, EventId)>,
+}
+
+impl SeenEventCache {
+    pub(crate) fn new() -> Self {
+        Self::with_capacity(SEEN_EVENT_CACHE_CAPACITY)
+    }
+
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            keys: BTreeSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub(crate) fn contains(&self, key: &(NodeId, EventId)) -> bool {
+        self.keys.contains(key)
+    }
+
+    pub(crate) fn insert(&mut self, key: (NodeId, EventId)) {
+        if !self.keys.insert(key.clone()) {
+            return;
+        }
+        self.order.push_back(key);
+        while self.keys.len() > self.capacity {
+            let Some(evicted) = self.order.pop_front() else {
+                return;
+            };
+            self.keys.remove(&evicted);
+        }
+    }
+}
+
 /// Core event-ingest step used by the [`NetworkService`] actor's inbound dispatch:
 /// dedups on `(origin_node_id, event_id)` and, for a new event, appends it to `store`.
 /// A store-level `DuplicateEventId` is folded into the same idempotent dedup result.
 fn ingest_event<S: EventStore>(
-    seen_events: &mut BTreeSet<(NodeId, EventId)>,
+    seen_events: &mut SeenEventCache,
     store: &mut S,
     delivery_id: RouteDeliveryId,
     event: &EventEnvelope,
@@ -620,6 +665,9 @@ pub struct InProcessNetwork {
     inner: Arc<Mutex<InProcessNetworkState>>,
 }
 
+pub(crate) const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
+pub(crate) const DELIVERY_LEDGER_CAPACITY: usize = 8192;
+
 impl InProcessNetwork {
     pub fn new() -> Self {
         Self::default()
@@ -681,6 +729,12 @@ impl NetworkTransport for InProcessTransport {
                 .ok_or_else(|| NetworkError::UnknownNode {
                     node_id: target_node_id.clone(),
                 })?;
+        if mailbox.len() >= IN_PROCESS_MAILBOX_CAPACITY {
+            return Err(NetworkError::MailboxFull {
+                node_id: target_node_id.clone(),
+                max_frames: IN_PROCESS_MAILBOX_CAPACITY,
+            });
+        }
 
         mailbox.push_back(InboundFrame {
             received_by: target_node_id.clone(),
@@ -709,7 +763,7 @@ pub struct NetworkService<T> {
     router: InProcessRouter,
     pub(crate) transport: T,
     ledger: DeliveryLedger,
-    seen_events: BTreeSet<(NodeId, EventId)>,
+    seen_events: SeenEventCache,
     next_frame_id: u64,
     next_message_id: u64,
 }
@@ -720,7 +774,7 @@ impl<T: NetworkTransport> NetworkService<T> {
             router: InProcessRouter::new(registry),
             transport,
             ledger: DeliveryLedger::new(RetryPolicy::default()),
-            seen_events: BTreeSet::new(),
+            seen_events: SeenEventCache::new(),
             next_frame_id: 1,
             next_message_id: 1,
         }
@@ -728,6 +782,12 @@ impl<T: NetworkTransport> NetworkService<T> {
 
     pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.ledger.retry_policy = retry_policy;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_seen_event_cache_capacity(mut self, capacity: usize) -> Self {
+        self.seen_events = SeenEventCache::with_capacity(capacity);
         self
     }
 
@@ -750,7 +810,7 @@ impl<T: NetworkTransport> NetworkService<T> {
             if self
                 .ledger
                 .enqueue(delivery.clone(), stored_event.event.clone())
-                .is_some()
+                .map(|delivery_id| delivery_id.is_some())?
             {
                 accepted.push(delivery);
             }
@@ -1073,14 +1133,20 @@ impl Default for RetryPolicy {
 #[derive(Clone, Debug)]
 pub struct DeliveryLedger {
     retry_policy: RetryPolicy,
+    capacity: usize,
     records: BTreeMap<RouteDeliveryId, DeliveryRecord>,
     active_by_event_target: BTreeMap<(EventId, NodeId), RouteDeliveryId>,
 }
 
 impl DeliveryLedger {
     pub fn new(retry_policy: RetryPolicy) -> Self {
+        Self::with_capacity(retry_policy, DELIVERY_LEDGER_CAPACITY)
+    }
+
+    pub(crate) fn with_capacity(retry_policy: RetryPolicy, capacity: usize) -> Self {
         Self {
             retry_policy,
+            capacity: capacity.max(1),
             records: BTreeMap::new(),
             active_by_event_target: BTreeMap::new(),
         }
@@ -1090,10 +1156,16 @@ impl DeliveryLedger {
         &mut self,
         delivery: RouteDelivery,
         event: EventEnvelope,
-    ) -> Option<RouteDeliveryId> {
+    ) -> Result<Option<RouteDeliveryId>, NetworkError> {
         let key = (delivery.event_id.clone(), delivery.target_node_id.clone());
         if self.active_by_event_target.contains_key(&key) {
-            return None;
+            return Ok(None);
+        }
+        self.prune_terminal_records_to_capacity();
+        if self.records.len() >= self.capacity {
+            return Err(NetworkError::DeliveryLedgerFull {
+                max_records: self.capacity,
+            });
         }
 
         let delivery_id = delivery.delivery_id;
@@ -1106,7 +1178,7 @@ impl DeliveryLedger {
                 attempts: 0,
             },
         );
-        Some(delivery_id)
+        Ok(Some(delivery_id))
     }
 
     pub fn record(&self, delivery_id: &RouteDeliveryId) -> Option<&DeliveryRecord> {
@@ -1201,6 +1273,26 @@ impl DeliveryLedger {
         record.delivery.status = DeliveryStatus::Delivered;
         Ok(())
     }
+
+    fn prune_terminal_records_to_capacity(&mut self) {
+        while self.records.len() >= self.capacity {
+            let Some(delivery_id) = self.records.iter().find_map(|(delivery_id, record)| {
+                record.delivery.status.is_terminal().then_some(*delivery_id)
+            }) else {
+                return;
+            };
+            self.remove_record(delivery_id);
+        }
+    }
+
+    fn remove_record(&mut self, delivery_id: RouteDeliveryId) -> Option<DeliveryRecord> {
+        let record = self.records.remove(&delivery_id)?;
+        self.active_by_event_target.remove(&(
+            record.delivery.event_id.clone(),
+            record.delivery.target_node_id.clone(),
+        ));
+        Some(record)
+    }
 }
 
 impl Default for DeliveryLedger {
@@ -1237,4 +1329,10 @@ pub enum DeliveryStatus {
     Retrying,
     Delivered,
     Failed,
+}
+
+impl DeliveryStatus {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Delivered | Self::Failed)
+    }
 }

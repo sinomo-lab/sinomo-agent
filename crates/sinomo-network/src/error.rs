@@ -25,6 +25,10 @@ pub enum NetworkError {
     },
     #[error("unknown delivery: {delivery_id:?}")]
     UnknownDelivery { delivery_id: RouteDeliveryId },
+    #[error("delivery ledger is full: max {max_records} records")]
+    DeliveryLedgerFull { max_records: usize },
+    #[error("in-process mailbox for {node_id} is full: max {max_frames} frames")]
+    MailboxFull { node_id: NodeId, max_frames: usize },
     #[error("unknown object rpc route: {route}")]
     UnknownRoute { route: String },
     #[error(
