@@ -2980,7 +2980,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    sinomo_network::write_local_cluster_connectivity_records(paths, source_node_id, &records)?;
+    sinomo_network::write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
     if cached_connectivity_record_set_matches(paths, source_node_id, &records) {
         return Ok(None);
     }

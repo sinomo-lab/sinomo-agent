@@ -1381,6 +1381,93 @@ fn local_connectivity_records_are_in_memory_not_disk() {
 }
 
 #[test]
+fn connectivity_full_sync_replaces_local_source_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-local-replace-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_local_replace").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_local_replace_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_local_replace_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity local replace",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let current_endpoint = daemon_lan_endpoint(&node_b, "10.0.0.71:21353".to_string(), 10);
+    let stale_endpoint = daemon_lan_endpoint(&node_b, "10.0.0.72:21353".to_string(), 20);
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id.clone(), node_b.clone(), "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![current_endpoint.clone(), stale_endpoint.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let current_record = cluster_connectivity_record(
+        &state,
+        &current_endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    let stale_record = cluster_connectivity_record(
+        &state,
+        &stale_endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(8),
+        0,
+        Some("old".to_string()),
+        None,
+        now,
+        600,
+    );
+    write_local_cluster_connectivity_records(
+        &paths,
+        &node_a,
+        &[current_record.clone(), stale_record.clone()],
+    )
+    .expect("seed local connectivity");
+    assert_eq!(
+        read_local_cluster_connectivity_records(&paths)
+            .expect("seeded local connectivity")
+            .len(),
+        2
+    );
+
+    sync_cluster_connectivity_records_to_kv(&paths, &node_a, vec![current_record.clone()])
+        .expect("full connectivity sync");
+
+    let local_records = read_local_cluster_connectivity_records(&paths).expect("local records");
+    assert_eq!(local_records, vec![current_record.clone()]);
+    let graph = read_cluster_connectivity_graph(&paths).expect("merged graph");
+    assert_eq!(graph, vec![current_record.clone()]);
+    assert!(
+        !graph
+            .iter()
+            .any(|record| record.endpoint_id == stale_record.endpoint_id),
+        "stale local connectivity should not survive a full source sync"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-public-tcp-sort-{}",
@@ -6517,6 +6604,73 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
 }
 
 #[test]
+fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-drain-revision-group-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/revision-group/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/revision-group/0001".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![1_u8; 32],
+        },
+    };
+    let second = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/revision-group/0002".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![2_u8; 32],
+        },
+    };
+    let third = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/revision-group/0003".to_string(),
+        kind: KvEventKind::Put {
+            value: vec![3_u8; 32],
+        },
+    };
+    append_cluster_kv_watch_events(&paths, &[first.clone(), second.clone(), third.clone()])
+        .expect("append watch events");
+
+    let max_payload_bytes = first.key.len() + 32;
+    let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
+        &paths,
+        watch.watch_id,
+        max_payload_bytes,
+    )
+    .expect("first bounded drain");
+    assert_eq!(drained.events, vec![first, second]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+
+    let drained = drain_cluster_kv_watch_once_limited_by_payload_bytes(
+        &paths,
+        watch.watch_id,
+        max_payload_bytes,
+    )
+    .expect("second bounded drain");
+    assert_eq!(drained.events, vec![third]);
+    assert_eq!(drained.next_revision, KvRevision(3));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-drain-dedup-{}",
@@ -7620,6 +7774,16 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
             .transport,
         ClusterTransportKind::LanQuic
     );
+
+    let mut withdrawn = member.clone();
+    withdrawn.endpoints.clear();
+    registry.upsert_cluster_member(withdrawn.clone());
+    assert_eq!(registry.cluster_member(&node_id), Some(&withdrawn));
+    assert!(registry.endpoint_candidates(&node_id).is_empty());
+    assert!(registry.best_endpoint_candidate(&node_id).is_none());
+
+    registry.upsert_cluster_member(member.clone());
+    assert_eq!(registry.endpoint_candidates(&node_id).len(), 2);
 }
 
 #[test]
@@ -8846,6 +9010,42 @@ fn delivery_ledger_prunes_terminal_records_under_pressure() {
     assert!(ledger.record(&RouteDeliveryId(1)).is_none());
     assert!(ledger.record(&RouteDeliveryId(2)).is_some());
     assert!(ledger.record(&RouteDeliveryId(3)).is_some());
+}
+
+#[test]
+fn delivery_ledger_prunes_terminal_records_without_enqueue_pressure() {
+    let node_a = NodeId::from_legacy_named("node_ledger_terminal_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ledger_terminal_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 4);
+    for index in 1..=4 {
+        let event_id = format!("evt_ledger_terminal_{index}");
+        let event = fixture_event(&event_id, node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Interactive,
+            status: DeliveryStatus::Queued,
+        };
+        assert_eq!(
+            ledger.enqueue(delivery, event).expect("enqueue"),
+            Some(RouteDeliveryId(index))
+        );
+    }
+
+    for index in 1..=4 {
+        ledger
+            .ack(RouteDeliveryId(index), &node_b)
+            .expect("mark delivered");
+    }
+
+    assert!(ledger.record(&RouteDeliveryId(1)).is_none());
+    assert!(ledger.record(&RouteDeliveryId(2)).is_none());
+    assert!(ledger.record(&RouteDeliveryId(3)).is_none());
+    let retained = ledger.record(&RouteDeliveryId(4)).expect("retained record");
+    assert_eq!(retained.delivery.status, DeliveryStatus::Delivered);
+    assert_eq!(ledger.records().len(), 1);
 }
 
 #[test]

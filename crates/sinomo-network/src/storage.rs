@@ -2251,16 +2251,29 @@ fn limit_cluster_kv_watch_drain_events(
 ) -> Vec<KvEvent> {
     let mut limited = Vec::new();
     let mut payload_bytes = 0_usize;
-    for event in events {
+    let mut events = events.into_iter().peekable();
+    while let Some(event) = events.next() {
         let event_bytes = cluster_kv_watch_event_payload_bytes(&event);
         let next_payload_bytes = payload_bytes.saturating_add(event_bytes);
         if !limited.is_empty() && next_payload_bytes > max_payload_bytes {
-            break;
+            let current_revision = limited
+                .last()
+                .map(|last: &KvEvent| last.revision)
+                .unwrap_or(KvRevision::ZERO);
+            if event.revision != current_revision {
+                break;
+            }
         }
         payload_bytes = next_payload_bytes;
         limited.push(event.clone());
         if payload_bytes >= max_payload_bytes {
-            break;
+            let current_revision = event.revision;
+            if !events
+                .peek()
+                .is_some_and(|candidate| candidate.revision == current_revision)
+            {
+                break;
+            }
         }
     }
     limited
@@ -3270,6 +3283,23 @@ pub fn write_local_cluster_connectivity_records(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<(), NetworkError> {
+    write_local_cluster_connectivity_records_inner(paths, source_node_id, records, false)
+}
+
+pub fn write_local_cluster_connectivity_record_set(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<(), NetworkError> {
+    write_local_cluster_connectivity_records_inner(paths, source_node_id, records, true)
+}
+
+fn write_local_cluster_connectivity_records_inner(
+    paths: &ClusterPaths,
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+    replace_source_records: bool,
+) -> Result<(), NetworkError> {
     let now = OffsetDateTime::now_utc();
     let mut cache =
         LOCAL_CLUSTER_CONNECTIVITY_RECORDS
@@ -3281,7 +3311,10 @@ pub fn write_local_cluster_connectivity_records(
     let local_records = cache.entry(paths.root.clone()).or_default();
     let mut merged = local_records
         .iter()
-        .filter(|record| cluster_network_record_live(record.expires_at, now))
+        .filter(|record| {
+            cluster_network_record_live(record.expires_at, now)
+                && (!replace_source_records || record.source_node_id != *source_node_id)
+        })
         .map(|record| {
             (
                 (
@@ -4527,6 +4560,7 @@ pub fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<KvSnapshot, NetworkError> {
+    write_local_cluster_connectivity_record_set(paths, source_node_id, &records)?;
     let success =
         cluster_connectivity_full_sync_ops_from_cached_snapshot(paths, source_node_id, &records)?;
     if success.is_empty() {

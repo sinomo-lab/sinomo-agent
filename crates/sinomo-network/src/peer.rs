@@ -39,7 +39,9 @@ impl PeerRegistry {
         self.cluster_id
             .get_or_insert_with(|| member.cluster_id.clone());
         let node_id = member.node_id.clone();
-        if !member.endpoints.is_empty() {
+        if member.endpoints.is_empty() {
+            self.endpoint_candidates.remove(&node_id);
+        } else {
             self.endpoint_candidates.insert(
                 node_id.clone(),
                 member
@@ -667,6 +669,7 @@ pub struct InProcessNetwork {
 
 pub(crate) const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
 pub(crate) const DELIVERY_LEDGER_CAPACITY: usize = 8192;
+pub(crate) const DELIVERY_LEDGER_TERMINAL_RECORD_CAP: usize = 1024;
 
 impl InProcessNetwork {
     pub fn new() -> Self {
@@ -1287,6 +1290,7 @@ impl DeliveryLedger {
         } else {
             record.delivery.status = DeliveryStatus::Retrying;
         }
+        self.prune_terminal_records_to_retention();
         Ok(())
     }
 
@@ -1354,7 +1358,34 @@ impl DeliveryLedger {
         }
 
         record.delivery.status = DeliveryStatus::Delivered;
+        self.prune_terminal_records_to_retention();
         Ok(())
+    }
+
+    fn retained_terminal_record_limit(&self) -> usize {
+        (self.capacity / 4)
+            .max(1)
+            .min(DELIVERY_LEDGER_TERMINAL_RECORD_CAP)
+    }
+
+    fn prune_terminal_records_to_retention(&mut self) {
+        let limit = self.retained_terminal_record_limit();
+        loop {
+            let terminal_count = self
+                .records
+                .values()
+                .filter(|record| record.delivery.status.is_terminal())
+                .count();
+            if terminal_count <= limit {
+                return;
+            }
+            let Some(delivery_id) = self.records.iter().find_map(|(delivery_id, record)| {
+                record.delivery.status.is_terminal().then_some(*delivery_id)
+            }) else {
+                return;
+            };
+            self.remove_record(delivery_id);
+        }
     }
 
     fn prune_terminal_records_to_capacity(&mut self) {
