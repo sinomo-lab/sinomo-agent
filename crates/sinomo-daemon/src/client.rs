@@ -28,8 +28,12 @@ use sinomo_rollout::{
     ROLLOUT_RPC_CATEGORY,
 };
 use std::io::Write;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+const MAX_DAEMON_CONTROL_DNS_WORKERS: usize = 4;
+static DAEMON_CONTROL_DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn send_daemon_rpc(
     address: &str,
@@ -79,13 +83,9 @@ pub fn send_daemon_rpc_stream(
         request.clone(),
         signed,
     );
-    let mut stream = DaemonControlStream::connect(address).map_err(DaemonError::from)?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(DaemonError::from)?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(DaemonError::from)?;
+    let deadline = DaemonRpcAttemptDeadline::new(timeout);
+    let mut stream = connect_daemon_control_stream(address, &deadline, "daemon control address")?;
+    configure_daemon_control_stream_deadline(&stream, &deadline, false, true)?;
     sinomo_network::write_object_frame_blocking(&mut stream, &control_request)
         .map_err(DaemonError::from)?;
     stream.flush().map_err(|source| DaemonError::Network {
@@ -93,6 +93,7 @@ pub fn send_daemon_rpc_stream(
         detail: source.to_string(),
     })?;
     stream.shutdown_write();
+    stream.set_read_timeout(Some(timeout))?;
     loop {
         let response: sinomo_network::DaemonControlResponse =
             sinomo_network::read_object_frame_blocking(
@@ -117,8 +118,9 @@ pub fn send_daemon_rpc_to_endpoint(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
     let command = daemon_rpc_command(&request.route);
+    let deadline = DaemonRpcAttemptDeadline::new(timeout);
     if let Some(response) =
-        route_endpoint_request_via_local_daemon(endpoint, request, &signed, &command, timeout)
+        route_endpoint_request_via_local_daemon(endpoint, request, &signed, &command, &deadline)
     {
         return response;
     }
@@ -133,7 +135,7 @@ pub fn send_daemon_rpc_to_endpoint(
             &command,
             Some(&signed),
             request,
-            timeout,
+            deadline.remaining(),
         ) {
             Ok(response) => return Ok(response),
             Err(direct_error) => {
@@ -141,7 +143,11 @@ pub fn send_daemon_rpc_to_endpoint(
                 // target node through a reachable bridge, relay the (already signed) request one
                 // hop closer; otherwise surface the original error.
                 return match crate::cluster::relay_request_to_endpoint(
-                    endpoint, request, &signed, &command, timeout,
+                    endpoint,
+                    request,
+                    &signed,
+                    &command,
+                    deadline.remaining(),
                 ) {
                     Some(result) => result,
                     None => Err(DaemonError::from(direct_error)),
@@ -149,7 +155,13 @@ pub fn send_daemon_rpc_to_endpoint(
             }
         }
     }
-    match crate::cluster::relay_request_to_endpoint(endpoint, request, &signed, &command, timeout) {
+    match crate::cluster::relay_request_to_endpoint(
+        endpoint,
+        request,
+        &signed,
+        &command,
+        deadline.remaining(),
+    ) {
         Some(result) => result,
         None => Err(DaemonError::Network {
             address: endpoint.address.clone(),
@@ -161,17 +173,38 @@ pub fn send_daemon_rpc_to_endpoint(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DaemonRpcAttemptDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl DaemonRpcAttemptDeadline {
+    pub(crate) fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .unwrap_or_else(|| Duration::from_millis(1))
+    }
+}
+
 fn route_endpoint_request_via_local_daemon(
     endpoint: &ClusterEndpointRecord,
     request: &ObjectRpcRequest,
     request_auth: &[u8],
     request_command: &str,
-    timeout: Duration,
+    deadline: &DaemonRpcAttemptDeadline,
 ) -> Option<Result<sinomo_network::ObjectRpcResponse, DaemonError>> {
     if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
         return None;
     }
-    let status = match crate::default_main_daemon_status(timeout) {
+    let status = match crate::default_main_daemon_status(deadline.remaining()) {
         Ok(Some(status)) => status,
         Ok(None) | Err(_) => return None,
     };
@@ -200,7 +233,7 @@ fn route_endpoint_request_via_local_daemon(
         Ok(outer) => outer,
         Err(error) => return Some(Err(DaemonError::from(error))),
     };
-    match send_daemon_rpc(&status.address, &outer, timeout) {
+    match send_daemon_rpc(&status.address, &outer, deadline.remaining()) {
         Ok(response) if is_relay_routing_error(&response) => None,
         Ok(response) => Some(Ok(response)),
         Err(_) => None,
@@ -453,7 +486,8 @@ fn send_cluster_join_registration_single_connection(
     request: &ClusterJoinRegistrationRequest,
     timeout: Duration,
 ) -> Result<ClusterJoinRegistrationResponse, DaemonError> {
-    let mut stream = connect_daemon_control_stream(address, timeout)?;
+    let deadline = DaemonRpcAttemptDeadline::new(timeout);
+    let mut stream = connect_daemon_control_stream(address, &deadline, "join introducer")?;
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
@@ -469,11 +503,13 @@ fn send_cluster_join_registration_single_connection(
         daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE),
         challenge_rpc,
     );
+    configure_daemon_control_stream_deadline(&stream, &deadline, false, true)?;
     sinomo_network::write_object_frame_blocking(&mut stream, &challenge_control)?;
     let proof_response = read_join_rpc_response(
         &mut stream,
         address,
         sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+        &deadline,
     )?;
     let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
@@ -488,48 +524,142 @@ fn send_cluster_join_registration_single_connection(
         register_rpc,
         signed,
     );
+    configure_daemon_control_stream_deadline(&stream, &deadline, false, true)?;
     sinomo_network::write_object_frame_blocking(&mut stream, &register_control)?;
     stream.shutdown_write();
     let response = read_join_rpc_response(
         &mut stream,
         address,
         sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE,
+        &deadline,
     )?;
     response.decode_body().map_err(DaemonError::from)
 }
 
 fn connect_daemon_control_stream(
     address: &str,
-    timeout: Duration,
+    deadline: &DaemonRpcAttemptDeadline,
+    resolution_target: &'static str,
 ) -> Result<DaemonControlStream, DaemonError> {
-    let socket_address = address
-        .to_socket_addrs()
-        .map_err(|source| DaemonError::Network {
-            address: address.to_string(),
-            detail: format!("failed to resolve join introducer: {source}"),
-        })?
-        .next()
-        .ok_or_else(|| DaemonError::Network {
-            address: address.to_string(),
-            detail: "failed to resolve join introducer: no socket addresses".to_string(),
+    let socket_address =
+        resolve_daemon_control_socket_address(address, deadline, resolution_target)?;
+    let stream =
+        TcpStream::connect_timeout(&socket_address, deadline.remaining()).map_err(|source| {
+            DaemonError::Network {
+                address: address.to_string(),
+                detail: format!("failed to connect {resolution_target}: {source}"),
+            }
         })?;
-    let stream = TcpStream::connect_timeout(&socket_address, timeout).map_err(|source| {
-        DaemonError::Network {
-            address: address.to_string(),
-            detail: format!("failed to connect join introducer: {source}"),
-        }
-    })?;
     let stream = DaemonControlStream::new(stream);
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    configure_daemon_control_stream_deadline(&stream, deadline, true, true)?;
     Ok(stream)
+}
+
+struct DaemonControlDnsWorkerPermit;
+
+impl Drop for DaemonControlDnsWorkerPermit {
+    fn drop(&mut self) {
+        DAEMON_CONTROL_DNS_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn try_acquire_daemon_control_dns_worker() -> Option<DaemonControlDnsWorkerPermit> {
+    let mut current = DAEMON_CONTROL_DNS_WORKERS.load(Ordering::Acquire);
+    loop {
+        if current >= MAX_DAEMON_CONTROL_DNS_WORKERS {
+            return None;
+        }
+        match DAEMON_CONTROL_DNS_WORKERS.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Some(DaemonControlDnsWorkerPermit),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+#[cfg(test)]
+fn daemon_control_dns_worker_count_for_test() -> usize {
+    DAEMON_CONTROL_DNS_WORKERS.load(Ordering::Acquire)
+}
+
+fn resolve_daemon_control_socket_address(
+    address: &str,
+    deadline: &DaemonRpcAttemptDeadline,
+    resolution_target: &'static str,
+) -> Result<SocketAddr, DaemonError> {
+    if let Ok(socket_address) = address.parse::<SocketAddr>() {
+        return Ok(socket_address);
+    }
+    let Some(permit) = try_acquire_daemon_control_dns_worker() else {
+        return Err(DaemonError::Network {
+            address: address.to_string(),
+            detail: format!(
+                "{resolution_target} DNS worker limit reached ({MAX_DAEMON_CONTROL_DNS_WORKERS})"
+            ),
+        });
+    };
+
+    let address = address.to_string();
+    let worker_address = address.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _permit = permit;
+        let resolved = std::net::ToSocketAddrs::to_socket_addrs(&worker_address)
+            .map_err(|source| format!("failed to resolve {resolution_target}: {source}"))
+            .and_then(|mut addresses| {
+                addresses.next().ok_or_else(|| {
+                    format!("failed to resolve {resolution_target}: no socket addresses")
+                })
+            });
+        let _ = sender.send(resolved);
+    });
+
+    match receiver.recv_timeout(deadline.remaining()) {
+        Ok(Ok(socket_address)) => Ok(socket_address),
+        Ok(Err(detail)) => Err(DaemonError::Network { address, detail }),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(DaemonError::Network {
+            address,
+            detail: format!(
+                "failed to resolve {resolution_target} before deadline: timed out after {}ms",
+                deadline.timeout.as_millis()
+            ),
+        }),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(DaemonError::Network {
+            address,
+            detail: format!(
+                "{resolution_target} resolver worker disconnected before returning an address"
+            ),
+        }),
+    }
+}
+
+fn configure_daemon_control_stream_deadline(
+    stream: &DaemonControlStream,
+    deadline: &DaemonRpcAttemptDeadline,
+    read: bool,
+    write: bool,
+) -> Result<Duration, DaemonError> {
+    let timeout = deadline.remaining();
+    if read {
+        stream.set_read_timeout(Some(timeout))?;
+    }
+    if write {
+        stream.set_write_timeout(Some(timeout))?;
+    }
+    Ok(timeout)
 }
 
 fn read_join_rpc_response(
     stream: &mut DaemonControlStream,
     address: &str,
     route: &str,
+    deadline: &DaemonRpcAttemptDeadline,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    configure_daemon_control_stream_deadline(stream, deadline, true, false)?;
     let response: DaemonControlResponse = sinomo_network::read_object_frame_blocking(
         stream,
         sinomo_network::IROH_DAEMON_COMMAND_MAX_BYTES,
@@ -551,12 +681,7 @@ pub fn send_cluster_join_registration_to_endpoint(
     request: &ClusterJoinRegistrationRequest,
     timeout: Duration,
 ) -> Result<ClusterJoinRegistrationResponse, DaemonError> {
-    let deadline = Instant::now() + timeout;
-    let remaining = || {
-        deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or_else(|| Duration::from_millis(1))
-    };
+    let deadline = DaemonRpcAttemptDeadline::new(timeout);
     let challenge = random_url_secret(32)?;
     let challenge_request = ClusterInviteChallengeRequest {
         protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
@@ -573,7 +698,7 @@ pub fn send_cluster_join_registration_to_endpoint(
         &daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE),
         None,
         &challenge_rpc,
-        remaining(),
+        deadline.remaining(),
     )?;
     let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
     verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
@@ -588,7 +713,7 @@ pub fn send_cluster_join_registration_to_endpoint(
         &daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE),
         Some(&signed),
         &register_rpc,
-        remaining(),
+        deadline.remaining(),
     )?;
     response.decode_body().map_err(DaemonError::from)
 }
@@ -761,17 +886,18 @@ pub fn send_daemon_rollout_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRpcAddressTransport, daemon_rpc_address_transport, is_relay_routing_error,
-        local_daemon_can_gateway_endpoint,
+        DaemonRpcAddressTransport, DaemonRpcAttemptDeadline, daemon_rpc_address_transport,
+        is_relay_routing_error, local_daemon_can_gateway_endpoint,
     };
     use crate::DaemonClusterStatus;
     use sinomo_core::{
         ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterMemberRole,
         ClusterMemberState, ClusterTransportKind,
     };
-    use sinomo_network::{ClusterId, ObjectRpcResponse};
+    use sinomo_network::{ClusterId, DaemonControlStream, ObjectRpcResponse};
     use sinomo_node::NodeId;
     use sinomo_rollout::ROLLOUT_BUILD_ROUTE;
+    use std::time::{Duration, Instant};
 
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
@@ -864,5 +990,163 @@ mod tests {
         let target_error = ObjectRpcResponse::encode_error(ROLLOUT_BUILD_ROUTE, "build failed")
             .expect("target error");
         assert!(!is_relay_routing_error(&target_error));
+    }
+
+    #[test]
+    fn daemon_rpc_attempt_deadline_shrinks_fallback_budget() {
+        let deadline = DaemonRpcAttemptDeadline {
+            started: Instant::now() - Duration::from_millis(40),
+            timeout: Duration::from_millis(100),
+        };
+
+        let remaining = deadline.remaining();
+
+        assert!(
+            remaining < Duration::from_millis(100),
+            "fallback attempts must not receive the original timeout"
+        );
+        assert!(
+            remaining <= Duration::from_millis(80),
+            "expected elapsed time to reduce the remaining budget, got {remaining:?}"
+        );
+    }
+
+    #[test]
+    fn daemon_rpc_attempt_deadline_bounds_elapsed_budget_to_short_tail() {
+        let deadline = DaemonRpcAttemptDeadline {
+            started: Instant::now() - Duration::from_millis(100),
+            timeout: Duration::from_millis(10),
+        };
+
+        assert_eq!(deadline.remaining(), Duration::from_millis(1));
+    }
+
+    #[test]
+    fn join_rpc_deadline_refreshes_blocking_stream_timeouts() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("local address");
+        let accepted = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let stream =
+            DaemonControlStream::new(std::net::TcpStream::connect(address).expect("connect"));
+        let deadline = DaemonRpcAttemptDeadline::new(Duration::from_millis(500));
+
+        let initial =
+            super::configure_daemon_control_stream_deadline(&stream, &deadline, true, true)
+                .expect("initial timeout configuration");
+        let initial_read_timeout = stream
+            .read_timeout()
+            .expect("read timeout")
+            .expect("read timeout set");
+        let initial_write_timeout = stream
+            .write_timeout()
+            .expect("write timeout")
+            .expect("write timeout set");
+
+        std::thread::sleep(Duration::from_millis(100));
+        let refreshed =
+            super::configure_daemon_control_stream_deadline(&stream, &deadline, true, false)
+                .expect("refreshed timeout configuration");
+        let refreshed_read_timeout = stream
+            .read_timeout()
+            .expect("read timeout")
+            .expect("read timeout set");
+
+        assert!(
+            refreshed < initial,
+            "join RPC phases must share elapsed budget instead of reusing the original timeout"
+        );
+        assert!(
+            refreshed_read_timeout < initial_read_timeout,
+            "blocking join RPC reads must use the remaining join budget"
+        );
+        assert_eq!(
+            stream
+                .write_timeout()
+                .expect("write timeout")
+                .expect("write timeout set"),
+            initial_write_timeout,
+            "refreshing the read phase must not lengthen the write timeout"
+        );
+
+        drop(stream);
+        accepted.join().expect("accepted thread");
+    }
+
+    #[test]
+    fn daemon_control_resolver_uses_socket_addresses_and_bounds_dns_workers() {
+        let deadline = DaemonRpcAttemptDeadline::new(Duration::from_millis(10));
+        let mut permits = Vec::new();
+        for _ in 0..super::MAX_DAEMON_CONTROL_DNS_WORKERS {
+            permits.push(
+                super::try_acquire_daemon_control_dns_worker()
+                    .expect("reserve daemon control DNS worker"),
+            );
+        }
+
+        let resolved = super::resolve_daemon_control_socket_address(
+            "127.0.0.1:21353",
+            &deadline,
+            "join introducer",
+        )
+        .expect("socket address resolves without DNS");
+
+        assert_eq!(
+            resolved,
+            "127.0.0.1:21353"
+                .parse::<std::net::SocketAddr>()
+                .expect("socket address")
+        );
+        assert_eq!(
+            super::daemon_control_dns_worker_count_for_test(),
+            super::MAX_DAEMON_CONTROL_DNS_WORKERS,
+            "already-normalized daemon control addresses must not consume DNS workers"
+        );
+
+        let error = super::resolve_daemon_control_socket_address(
+            "localhost:21353",
+            &deadline,
+            "join introducer",
+        )
+        .expect_err("dns worker saturation");
+
+        match error {
+            crate::DaemonError::Network { address, detail } => {
+                assert_eq!(address, "localhost:21353");
+                assert_eq!(
+                    detail,
+                    format!(
+                        "join introducer DNS worker limit reached ({})",
+                        super::MAX_DAEMON_CONTROL_DNS_WORKERS
+                    )
+                );
+            }
+            error => panic!("unexpected error: {error}"),
+        }
+
+        let error = super::connect_daemon_control_stream(
+            "localhost:21353",
+            &deadline,
+            "daemon control address",
+        )
+        .expect_err("stream setup must reject saturated DNS before connect");
+        match error {
+            crate::DaemonError::Network { address, detail } => {
+                assert_eq!(address, "localhost:21353");
+                assert_eq!(
+                    detail,
+                    format!(
+                        "daemon control address DNS worker limit reached ({})",
+                        super::MAX_DAEMON_CONTROL_DNS_WORKERS
+                    )
+                );
+            }
+            error => panic!("unexpected error: {error}"),
+        }
+
+        drop(permits);
+        assert_eq!(super::daemon_control_dns_worker_count_for_test(), 0);
     }
 }

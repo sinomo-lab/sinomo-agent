@@ -24,14 +24,14 @@ use sinomo_config::{
 use sinomo_dfs::{
     DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE, register_services as register_dfs_services,
 };
-use sinomo_kv::{KvEntry, KvTxn, KvTxnResponse};
+use sinomo_kv::{KvEntry, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE, CLUSTER_RAFT_APPEND_ROUTE,
-    CLUSTER_RAFT_VOTE_ROUTE, ClusterPaths, ClusterRaftAppendRequest, ClusterRaftVoteRequest,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonControlStream, ObjectRpcRequest,
-    ObjectRpcResponse, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
-    read_cluster_kv_entry, read_cluster_kv_prefix_entries,
+    CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES, CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE, ClusterPaths, ClusterRaftAppendRequest,
+    ClusterRaftVoteRequest, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonControlStream,
+    ObjectRpcRequest, ObjectRpcResponse, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, read_cluster_kv_entry, read_cluster_kv_prefix_entries,
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
@@ -135,6 +135,30 @@ impl ClusterAccess for DaemonClusterAccess {
     }
 }
 
+fn encode_cluster_kv_snapshot_response(
+    snapshot: &KvSnapshot,
+) -> Result<ObjectRpcResponse, sinomo_network::NetworkError> {
+    encode_cluster_kv_snapshot_response_limited(snapshot, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES)
+}
+
+fn encode_cluster_kv_snapshot_response_limited(
+    snapshot: &KvSnapshot,
+    max_payload_bytes: usize,
+) -> Result<ObjectRpcResponse, sinomo_network::NetworkError> {
+    let response = ObjectRpcResponse::encode_body(CLUSTER_KV_SNAPSHOT_ROUTE, snapshot)?;
+    if response.body.len() > max_payload_bytes {
+        return ObjectRpcResponse::encode_error(
+            CLUSTER_KV_SNAPSHOT_ROUTE,
+            format!(
+                "cluster kv snapshot response is {} bytes; max is {} bytes",
+                response.body.len(),
+                max_payload_bytes
+            ),
+        );
+    }
+    Ok(response)
+}
+
 /// Daemon-foundational service: daemon status + shutdown. Holds this daemon's paths so
 /// status reflects the right (main/shadow) process; shutdown reports `Stop`.
 struct DaemonControlService {
@@ -204,7 +228,7 @@ impl Service for ClusterKvService {
                     let _: () = request.decode_body()?;
                     let snapshot =
                         handle_daemon_cluster_kv_snapshot(&paths).map_err(daemon_error)?;
-                    ObjectRpcResponse::encode_body(CLUSTER_KV_SNAPSHOT_ROUTE, &snapshot)?
+                    encode_cluster_kv_snapshot_response(&snapshot)?
                 }
                 CLUSTER_KV_TXN_ROUTE => {
                     let txn: KvTxn = request.decode_body()?;
@@ -747,4 +771,50 @@ fn dispatch_via_registry(
         std::thread::sleep(ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE);
     }
     Ok(stop)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_kv::{InProcessKvStore, KvEntry, KvRevision, KvVersion};
+
+    #[test]
+    fn cluster_kv_snapshot_response_rejects_oversized_body_as_rpc_error() {
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/snapshot/small", b"ok".to_vec(), None)
+            .expect("small put");
+        let snapshot = store.snapshot();
+
+        let response =
+            encode_cluster_kv_snapshot_response_limited(&snapshot, usize::MAX).expect("encode ok");
+        let decoded: KvSnapshot = response.decode_body().expect("decode snapshot");
+        assert_eq!(decoded.entries.len(), 1);
+
+        let oversized = KvSnapshot {
+            revision: KvRevision(1),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![KvEntry {
+                key: "/snapshot/large".to_string(),
+                value: vec![7_u8; 64],
+                create_revision: KvRevision(1),
+                modify_revision: KvRevision(1),
+                version: KvVersion(1),
+                lease_id: None,
+            }],
+            leases: Vec::new(),
+            events: Vec::new(),
+        };
+        let response =
+            encode_cluster_kv_snapshot_response_limited(&oversized, 1).expect("encode rpc error");
+        let error = response
+            .decode_body::<KvSnapshot>()
+            .expect_err("oversized body");
+        assert!(
+            error
+                .to_string()
+                .contains("cluster kv snapshot response is"),
+            "unexpected error: {error}"
+        );
+    }
 }

@@ -48,6 +48,26 @@ pub fn register_storage_paths(
             STORAGE_CONTRACT_OBJECT_VERSION,
         ),
     )?;
+    layout.register_object_log(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watch-events.sobjlog",
+    )?;
+    layout.register_file(sinomo_storage::StorageFileContract::binary(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watches.lock",
+    )?)?;
+    layout.register_sinomo_object(
+        "sinomo-network",
+        StorageRing::R1,
+        "cluster/watches-next.sobj",
+        ObjectSchema::new(
+            "ClusterKvWatchAllocatorState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("next_watch_id", "u64"),
+    )?;
     layout.register_sinomo_object(
         "sinomo-network",
         StorageRing::R1,
@@ -99,12 +119,12 @@ pub(crate) mod prelude {
         daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_capabilities,
         shadow_daemon_node_id,
     };
-    pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    pub(crate) use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
     pub(crate) use std::fs;
     pub(crate) use std::io::{self, Write};
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+    pub(crate) use std::net::{Shutdown, TcpStream};
     pub(crate) use std::path::PathBuf;
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::sync::mpsc;

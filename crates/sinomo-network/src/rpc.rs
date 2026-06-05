@@ -27,6 +27,7 @@ pub const CLUSTER_KV_TXN_ROUTE: &str = "/cluster/kv/txn";
 pub const CLUSTER_KV_RANGE_PREFIX_ROUTE: &str = "/cluster/kv/range-prefix";
 pub const CLUSTER_KV_WATCH_PREFIX_ROUTE: &str = "/cluster/kv/watch-prefix";
 pub const CLUSTER_KV_WATCH_DRAIN_ROUTE: &str = "/cluster/kv/watch-drain";
+pub const CLUSTER_KV_WATCH_CANCEL_ROUTE: &str = "/cluster/kv/watch-cancel";
 pub const CLUSTER_KV_WATCH_EVENTS_ROUTE: &str = "/cluster/kv/watch-events";
 pub const CLUSTER_HEALTH_ROUTE: &str = "/cluster/health";
 pub const CLUSTER_RAFT_RPC_CATEGORY: &str = "cluster.raft";

@@ -455,6 +455,7 @@ pub fn authorize_authenticated_daemon_command(
         command
             if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE)
                 || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE)
+                || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE)
                 || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE) =>
         {
             matches!(
@@ -988,6 +989,30 @@ mod tests {
         }
         let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
         assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+    }
+
+    #[test]
+    fn cluster_kv_watch_routes_authorize_cluster_members() {
+        for route in [
+            sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE,
+            sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE,
+            sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE,
+            sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE,
+        ] {
+            let command = daemon_rpc_command(route);
+            for signer in [
+                DaemonSignerAuthority::Local,
+                DaemonSignerAuthority::Voter,
+                DaemonSignerAuthority::Member,
+            ] {
+                let authenticated = authenticated_command(command.clone(), signer);
+                authorize_authenticated_daemon_command(&authenticated)
+                    .expect("cluster members must be able to manage cluster KV watches");
+            }
+            let authenticated =
+                authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
+            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+        }
     }
 
     #[test]

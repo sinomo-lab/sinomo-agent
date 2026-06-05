@@ -156,11 +156,29 @@ impl DaemonControlStream {
             })
     }
 
+    pub fn read_timeout(&self) -> Result<Option<Duration>, NetworkError> {
+        self.stream
+            .read_timeout()
+            .map_err(|source| NetworkError::Io {
+                operation: "read daemon control read timeout".to_string(),
+                detail: source.to_string(),
+            })
+    }
+
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<(), NetworkError> {
         self.stream
             .set_write_timeout(timeout)
             .map_err(|source| NetworkError::Io {
                 operation: "configure daemon control write timeout".to_string(),
+                detail: source.to_string(),
+            })
+    }
+
+    pub fn write_timeout(&self) -> Result<Option<Duration>, NetworkError> {
+        self.stream
+            .write_timeout()
+            .map_err(|source| NetworkError::Io {
+                operation: "read daemon control write timeout".to_string(),
                 detail: source.to_string(),
             })
     }
@@ -244,12 +262,7 @@ where
     T: serde::de::DeserializeOwned,
 {
     let mut len_bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut len_bytes)
-        .map_err(|source| NetworkError::Io {
-            operation: "read object frame length".to_string(),
-            detail: source.to_string(),
-        })?;
+    read_exact_blocking_frame(reader, &mut len_bytes, "read object frame length", "length")?;
     let len = u32::from_be_bytes(len_bytes) as usize;
     if len > max_bytes {
         return Err(NetworkError::FrameTooLarge {
@@ -258,16 +271,40 @@ where
         });
     }
     let mut bytes = vec![0_u8; len];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|source| NetworkError::Io {
-            operation: "read object frame body".to_string(),
-            detail: source.to_string(),
-        })?;
+    read_exact_blocking_frame(reader, &mut bytes, "read object frame body", "body")?;
     if let Some(observer) = crate::io_observer() {
         observer.on_net_recv(4 + bytes.len() as u64);
     }
     SinomoObjectCodec::default().decode(&bytes)
+}
+
+fn read_exact_blocking_frame<R: Read>(
+    reader: &mut R,
+    buf: &mut [u8],
+    operation: &'static str,
+    part: &'static str,
+) -> Result<(), NetworkError> {
+    let expected = buf.len();
+    let mut read = 0_usize;
+    while read < expected {
+        match reader.read(&mut buf[read..]) {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: object_frame_eof_detail(part, read, expected),
+                });
+            }
+            Ok(n) => read = read.saturating_add(n),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub async fn write_object_frame_async<W, T>(writer: &mut W, value: &T) -> Result<(), NetworkError>
@@ -309,13 +346,13 @@ where
     T: serde::de::DeserializeOwned,
 {
     let mut len_bytes = [0_u8; 4];
-    reader
-        .read_exact(&mut len_bytes)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "read async object frame length".to_string(),
-            detail: source.to_string(),
-        })?;
+    read_exact_async_frame(
+        reader,
+        &mut len_bytes,
+        "read async object frame length",
+        "length",
+    )
+    .await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
     if len > max_bytes {
         return Err(NetworkError::FrameTooLarge {
@@ -324,23 +361,57 @@ where
         });
     }
     let mut bytes = vec![0_u8; len];
-    reader
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "read async object frame body".to_string(),
-            detail: source.to_string(),
-        })?;
+    read_exact_async_frame(reader, &mut bytes, "read async object frame body", "body").await?;
     if let Some(observer) = crate::io_observer() {
         observer.on_net_recv(4 + bytes.len() as u64);
     }
     SinomoObjectCodec::default().decode(&bytes)
 }
 
+async fn read_exact_async_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    operation: &'static str,
+    part: &'static str,
+) -> Result<(), NetworkError> {
+    let expected = buf.len();
+    let mut read = 0_usize;
+    while read < expected {
+        match reader.read(&mut buf[read..]).await {
+            Ok(0) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: object_frame_eof_detail(part, read, expected),
+                });
+            }
+            Ok(n) => read = read.saturating_add(n),
+            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(source) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn object_frame_eof_detail(part: &str, read: usize, expected: usize) -> String {
+    if read == 0 {
+        format!("peer closed before object frame {part} ({expected} bytes expected)")
+    } else {
+        format!("peer closed during object frame {part}: read {read} of {expected} bytes")
+    }
+}
+
 #[cfg(test)]
 mod serde_bytes_tests {
-    use super::SinomoObjectCodec;
+    use super::{SinomoObjectCodec, read_object_frame_async, read_object_frame_blocking};
+    use crate::error::NetworkError;
     use serde::{Deserialize, Serialize};
+    use std::io::Cursor;
+    use tokio::io::AsyncWriteExt;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct BundleRecord {
@@ -394,5 +465,60 @@ mod serde_bytes_tests {
             .decode(&encoded_none)
             .expect("decode none");
         assert_eq!(decoded_none, none);
+    }
+
+    #[test]
+    fn blocking_object_frame_reports_closed_before_length() {
+        let mut cursor = Cursor::new(Vec::<u8>::new());
+        let error =
+            read_object_frame_blocking::<_, BundleRecord>(&mut cursor, 1024).expect_err("eof");
+
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "read object frame length".to_string(),
+                detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn blocking_object_frame_reports_partial_body() {
+        let mut bytes = 8_u32.to_be_bytes().to_vec();
+        bytes.extend_from_slice(b"abc");
+        let mut cursor = Cursor::new(bytes);
+        let error =
+            read_object_frame_blocking::<_, BundleRecord>(&mut cursor, 1024).expect_err("eof");
+
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "read object frame body".to_string(),
+                detail: "peer closed during object frame body: read 3 of 8 bytes".to_string(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn async_object_frame_reports_partial_body() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        server
+            .write_all(&8_u32.to_be_bytes())
+            .await
+            .expect("write length");
+        server.write_all(b"abc").await.expect("write partial body");
+        drop(server);
+
+        let error = read_object_frame_async::<_, BundleRecord>(&mut client, 1024)
+            .await
+            .expect_err("eof");
+
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "read async object frame body".to_string(),
+                detail: "peer closed during object frame body: read 3 of 8 bytes".to_string(),
+            }
+        );
     }
 }

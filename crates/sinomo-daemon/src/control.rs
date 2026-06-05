@@ -2,17 +2,17 @@ use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
     DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonDfsEndpointTransport, DaemonError,
     DaemonLock, DaemonPaths, authenticate_daemon_control_request, cluster_health_rows,
-    cluster_paths_from_daemon_paths, create_cluster_invite_challenge_proof,
+    cluster_paths_from_daemon_paths, create_cluster_invite_challenge_proof, daemon_connect_address,
     daemon_paths_are_shadow, daemon_rpc_command, ensure_daemon_status_cluster,
     ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     forward_cluster_invite_challenge_to_voter, handle_daemon_clear_rollout_status,
     handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
-    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_member_publish_request,
-    handle_daemon_cluster_relay_request, handle_daemon_finalize_shadow_rollout,
-    prune_local_cluster_raft_uncommitted_tail, read_daemon_status, run_daemon_dfs_maintenance_tick,
-    start_daemon_iroh_proxy_if_clustered,
+    handle_daemon_cluster_kv_watch_cancel_request, handle_daemon_cluster_kv_watch_drain_request,
+    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
+    handle_daemon_cluster_member_publish_request, handle_daemon_cluster_relay_request,
+    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
+    read_daemon_status, run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_node::NodeId;
@@ -35,7 +35,6 @@ use time::OffsetDateTime;
 pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
-pub const DAEMON_ACCEPT_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
@@ -279,7 +278,7 @@ pub fn run_daemon_control_loop(
     }
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = sinomo_network::DaemonControlListener::bind(&bind_address)?;
-    listener.set_nonblocking(true)?;
+    listener.set_nonblocking(false)?;
     println!("sinomo {label} listening on {bind_address}");
     if let Err(error) =
         start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label)
@@ -376,21 +375,27 @@ pub fn run_daemon_control_loop(
         })?;
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let accept_wake_address = daemon_connect_address(&options.host, options.port);
     loop {
         if shutdown_rx.try_recv().is_ok() {
             break;
         }
         match listener.accept() {
             Ok(Some(mut stream)) => {
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
                 let client_paths = paths.clone();
                 let client_label = label.to_string();
                 let client_shutdown_tx = shutdown_tx.clone();
+                let client_accept_wake_address = accept_wake_address.clone();
                 thread::Builder::new()
                     .name(format!("sinomo-{label}-client"))
                     .spawn(
                         move || match handle_daemon_connection(&mut stream, &client_paths) {
                             Ok(true) => {
                                 let _ = client_shutdown_tx.send(());
+                                wake_daemon_control_accept(&client_accept_wake_address);
                             }
                             Ok(false) => {}
                             Err(error) => eprintln!("sinomo {client_label} client error: {error}"),
@@ -401,7 +406,7 @@ pub fn run_daemon_control_loop(
                         detail: source.to_string(),
                     })?;
             }
-            Ok(None) => thread::sleep(DAEMON_ACCEPT_IDLE_INTERVAL),
+            Ok(None) => {}
             Err(source) => {
                 return Err(DaemonError::Network {
                     address: bind_address.clone(),
@@ -411,6 +416,10 @@ pub fn run_daemon_control_loop(
         }
     }
     Ok(())
+}
+
+fn wake_daemon_control_accept(address: &str) {
+    let _ = sinomo_network::DaemonControlStream::connect(address);
 }
 
 pub fn handle_daemon_connection(
@@ -478,6 +487,24 @@ pub fn handle_daemon_connection(
                 let result = handle_daemon_cluster_kv_watch_drain_request(paths, request)?;
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
                     sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE,
+                    &result,
+                )
+                .map_err(DaemonError::from)?;
+                write_daemon_rpc_response_frame(stream, response)?;
+                Ok(false)
+            }
+            command
+                if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE) =>
+            {
+                let request = require_daemon_rpc_request(
+                    rpc_request,
+                    sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE,
+                    sinomo_network::CLUSTER_KV_RPC_CATEGORY,
+                )?;
+                let request = request.decode_body().map_err(DaemonError::from)?;
+                let result = handle_daemon_cluster_kv_watch_cancel_request(paths, request)?;
+                let response = sinomo_network::ObjectRpcResponse::encode_body(
+                    sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE,
                     &result,
                 )
                 .map_err(DaemonError::from)?;
@@ -3702,7 +3729,8 @@ mod tests {
         let status_result =
             send_test_status_request(&data_dir, &address, Duration::from_millis(500));
         drop(idle_probe);
-        let _ = send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3));
+        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
+            .expect("shutdown request");
         daemon
             .join()
             .expect("daemon thread")

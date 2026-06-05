@@ -25,6 +25,18 @@ pub enum NetworkError {
     },
     #[error("unknown delivery: {delivery_id:?}")]
     UnknownDelivery { delivery_id: RouteDeliveryId },
+    #[error("delivery ledger is full: max {max_records} records")]
+    DeliveryLedgerFull { max_records: usize },
+    #[error("in-process mailbox for {node_id} is full: max {max_frames} frames")]
+    MailboxFull { node_id: NodeId, max_frames: usize },
+    #[error(
+        "iroh daemon proxy in-flight frame budget exceeded: requested {frame_bytes} bytes with {in_flight_bytes} already active; max is {max_in_flight_bytes}"
+    )]
+    IrohProxyFrameBudgetExceeded {
+        frame_bytes: usize,
+        in_flight_bytes: usize,
+        max_in_flight_bytes: usize,
+    },
     #[error("unknown object rpc route: {route}")]
     UnknownRoute { route: String },
     #[error(
@@ -35,6 +47,12 @@ pub enum NetworkError {
         expected_target_node_id: NodeId,
         acking_node_id: NodeId,
     },
+    #[error("delivery {delivery_id:?} acked event {acking_event_id}, expected {expected_event_id}")]
+    AckEventMismatch {
+        delivery_id: RouteDeliveryId,
+        expected_event_id: EventId,
+        acking_event_id: EventId,
+    },
     #[error("cluster mismatch: expected {expected}, got {actual}")]
     ClusterMismatch {
         expected: ClusterId,
@@ -42,6 +60,21 @@ pub enum NetworkError {
     },
     #[error("cluster is read-only: {detail}")]
     ClusterReadOnly { detail: String },
+    #[error(
+        "cluster connectivity record source mismatch: expected {expected_source_node_id}, got {record_source_node_id}"
+    )]
+    ClusterConnectivitySourceMismatch {
+        expected_source_node_id: NodeId,
+        record_source_node_id: NodeId,
+    },
+    #[error(
+        "too many cluster connectivity records for {source_node_id}: {observed_records} records; max {max_records}"
+    )]
+    ClusterConnectivityRecordLimit {
+        source_node_id: NodeId,
+        observed_records: usize,
+        max_records: usize,
+    },
     #[error(
         "certificate node {certificate_node_id} does not match material node {material_node_id}"
     )]

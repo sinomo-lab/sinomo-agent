@@ -53,30 +53,41 @@ fn cluster_route_next_hop_excluding(
     let mut seen: BTreeSet<NodeId> = BTreeSet::new();
     seen.extend(excluded.iter().cloned());
     seen.insert(local.clone());
-    let mut queue: VecDeque<Vec<NodeId>> = VecDeque::new();
-    queue.push_back(vec![local.clone()]);
-    while let Some(path) = queue.pop_front() {
-        let current = path.last().expect("BFS path is never empty");
-        for next in graph.healthy_targets(current) {
+    let mut predecessor = BTreeMap::<NodeId, NodeId>::new();
+    let mut queue = VecDeque::from([local.clone()]);
+    while let Some(current) = queue.pop_front() {
+        for next in graph.healthy_target_refs(&current) {
             if !seen.insert(next.clone()) {
                 continue;
             }
-            let mut next_path = path.clone();
-            next_path.push(next.clone());
-            if next == *target {
-                let next_hop = next_path
-                    .get(1)
-                    .cloned()
-                    .expect("a path to a distinct target has a hop beyond local");
-                return Some(ClusterRoute {
-                    next_hop,
-                    path: next_path,
-                });
+            predecessor.insert(next.clone(), current.clone());
+            if next == target {
+                return route_from_predecessors(local, target, predecessor);
             }
-            queue.push_back(next_path);
+            queue.push_back(next.clone());
         }
     }
     None
+}
+
+fn route_from_predecessors(
+    local: &NodeId,
+    target: &NodeId,
+    predecessor: BTreeMap<NodeId, NodeId>,
+) -> Option<ClusterRoute> {
+    let mut reversed = vec![target.clone()];
+    let mut current = target;
+    while current != local {
+        let previous = predecessor.get(current)?;
+        reversed.push(previous.clone());
+        current = previous;
+    }
+    reversed.reverse();
+    let next_hop = reversed.get(1).cloned()?;
+    Some(ClusterRoute {
+        next_hop,
+        path: reversed,
+    })
 }
 
 /// The next hop `local` should send a relay toward `target`.
@@ -118,11 +129,11 @@ pub fn cluster_route_next_hops_best_effort(
     }
     let excluded = excluded.iter().collect::<BTreeSet<_>>();
     let mut candidates = graph
-        .healthy_targets(local)
-        .into_iter()
+        .healthy_target_refs(local)
         .filter(|candidate| {
-            candidate != target && candidate != local && !excluded.contains(candidate)
+            *candidate != target && *candidate != local && !excluded.contains(candidate)
         })
+        .cloned()
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         best_effort_candidate_rank(graph, local, target, &excluded, left)
@@ -141,16 +152,16 @@ fn best_effort_candidate_rank(
     excluded: &BTreeSet<&NodeId>,
     candidate: &NodeId,
 ) -> (u8, usize) {
-    let healthy_targets = graph.healthy_targets(candidate);
-    let target_hint = if healthy_targets.contains(target) {
-        0
-    } else {
-        1
-    };
-    let forward_frontier = healthy_targets
-        .iter()
-        .filter(|next| *next != local && *next != candidate && !excluded.contains(next))
-        .count();
+    let mut target_hint = 1;
+    let mut forward_frontier = 0;
+    for next in graph.healthy_target_refs(candidate) {
+        if next == target {
+            target_hint = 0;
+        }
+        if next != local && next != candidate && !excluded.contains(next) {
+            forward_frontier += 1;
+        }
+    }
     (target_hint, usize::MAX - forward_frontier)
 }
 
@@ -324,6 +335,48 @@ mod tests {
         let route = cluster_route_next_hop(&g, &a, &c).expect("route");
         assert_eq!(route.next_hop, b);
         assert_eq!(route.path, vec![a, b, c]);
+    }
+
+    #[test]
+    fn next_hop_long_chain_reconstructs_path_once() {
+        let nodes = (0..24)
+            .map(|index| nid(&format!("node_chain_{index:02}")))
+            .collect::<Vec<_>>();
+        let edges = nodes
+            .windows(2)
+            .map(|window| edge(&window[0], &window[1], ClusterConnectivityState::Healthy))
+            .collect::<Vec<_>>();
+        let g = graph(edges);
+
+        let route = cluster_route_next_hop(
+            &g,
+            nodes.first().expect("first node"),
+            nodes.last().expect("last node"),
+        )
+        .expect("route");
+
+        assert_eq!(route.next_hop, nodes[1]);
+        assert_eq!(route.path, nodes);
+    }
+
+    #[test]
+    fn connectivity_graph_cached_adjacency_matches_reachability_rules() {
+        let (a, b, c, d) = (nid("node_a"), nid("node_b"), nid("node_c"), nid("node_d"));
+        let g = graph(vec![
+            edge(&a, &b, ClusterConnectivityState::Healthy),
+            edge(&a, &c, ClusterConnectivityState::Degraded),
+            edge(&a, &d, ClusterConnectivityState::Unreachable),
+            edge(&a, &a, ClusterConnectivityState::Healthy),
+        ]);
+
+        assert_eq!(
+            g.reachable_targets(&a),
+            [b.clone(), c].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            g.healthy_targets(&a),
+            [b].into_iter().collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]
