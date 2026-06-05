@@ -1360,6 +1360,9 @@ pub struct InProcessKvStore {
     entries: BTreeMap<String, KvEntry>,
     events: Vec<Arc<KvEvent>>,
     leases: BTreeMap<LeaseId, KvLease>,
+    lease_clock: u64,
+    lease_deadline_by_id: BTreeMap<LeaseId, u64>,
+    lease_deadlines: BTreeMap<u64, BTreeSet<LeaseId>>,
     lease_keys: BTreeMap<LeaseId, BTreeSet<String>>,
     watches: BTreeMap<WatchId, KvWatchState>,
     next_watch_id: u64,
@@ -1709,7 +1712,7 @@ impl InProcessKvStore {
             revision: self.revision,
             compacted_revision: self.compacted_revision,
             entries: self.entries.values().cloned().collect(),
-            leases: self.leases.values().cloned().collect(),
+            leases: self.current_leases_for_snapshot(),
             events: self
                 .events
                 .iter()
@@ -1725,16 +1728,21 @@ impl InProcessKvStore {
             .map(|entry| (entry.key.clone(), entry))
             .collect();
         let lease_keys = build_lease_key_index(&entries);
+        let leases: BTreeMap<_, _> = snapshot
+            .leases
+            .into_iter()
+            .map(|lease| (lease.lease_id, lease))
+            .collect();
+        let (lease_deadline_by_id, lease_deadlines) = build_lease_deadline_index(&leases, 0);
         Self {
             revision: snapshot.revision,
             compacted_revision: snapshot.compacted_revision,
             entries,
             events: snapshot.events.into_iter().map(Arc::new).collect(),
-            leases: snapshot
-                .leases
-                .into_iter()
-                .map(|lease| (lease.lease_id, lease))
-                .collect(),
+            leases,
+            lease_clock: 0,
+            lease_deadline_by_id,
+            lease_deadlines,
             lease_keys,
             watches: BTreeMap::new(),
             next_watch_id: 1,
@@ -1760,17 +1768,18 @@ impl InProcessKvStore {
     }
 
     pub fn tick_leases(&mut self, ticks: u64) -> Result<Vec<LeaseId>, KvError> {
-        let mut candidates = Vec::new();
-        for lease in self.leases.values_mut() {
-            lease.remaining_ticks = lease.remaining_ticks.saturating_sub(ticks);
-            if lease.remaining_ticks == 0 {
-                candidates.push(lease.lease_id);
-            }
-        }
+        self.lease_clock = self.lease_clock.saturating_add(ticks);
+        let candidates = self.expired_lease_candidates();
 
         let mut expired = Vec::new();
         let mut mutation_events = 0_usize;
         for lease_id in candidates {
+            if let Some(lease) = self.leases.get_mut(&lease_id) {
+                lease.remaining_ticks = 0;
+            } else {
+                self.remove_lease_deadline(lease_id);
+                continue;
+            }
             let remaining_budget =
                 MAX_KV_MUTATION_EVENTS_PER_COMMAND.saturating_sub(mutation_events);
             let (keys, complete) = self.lease_revoke_batch(lease_id, remaining_budget);
@@ -1811,16 +1820,16 @@ impl InProcessKvStore {
                         max: MAX_ACTIVE_LEASES,
                     });
                 }
-                self.leases
-                    .insert(lease_id, KvLease::new(lease_id, ttl_ticks));
+                self.upsert_lease(KvLease::new(lease_id, ttl_ticks));
                 Ok(KvOpResponse::LeaseGrant { lease_id })
             }
             KvOp::LeaseKeepAlive { lease_id } => {
-                let lease = self
+                let ttl_ticks = self
                     .leases
-                    .get_mut(&lease_id)
-                    .ok_or(KvError::UnknownLease { lease_id })?;
-                lease.remaining_ticks = lease.ttl_ticks;
+                    .get(&lease_id)
+                    .ok_or(KvError::UnknownLease { lease_id })?
+                    .ttl_ticks;
+                self.upsert_lease(KvLease::new(lease_id, ttl_ticks));
                 Ok(KvOpResponse::LeaseKeepAlive { lease_id })
             }
             KvOp::LeaseRevoke { lease_id } => {
@@ -2220,16 +2229,19 @@ impl InProcessKvStore {
                 lease_id,
                 ttl_ticks,
             } => self.leases.get(lease_id).and_then(|lease| {
-                (lease.ttl_ticks == *ttl_ticks && lease.remaining_ticks == lease.ttl_ticks)
-                    .then_some(KvOpResponse::LeaseGrant {
-                        lease_id: *lease_id,
-                    })
+                (lease.ttl_ticks == *ttl_ticks
+                    && self.lease_remaining_ticks(*lease_id) == Some(lease.ttl_ticks))
+                .then_some(KvOpResponse::LeaseGrant {
+                    lease_id: *lease_id,
+                })
             }),
             KvOp::LeaseKeepAlive { lease_id } => {
                 let lease = self.leases.get(lease_id)?;
-                (lease.remaining_ticks == lease.ttl_ticks).then_some(KvOpResponse::LeaseKeepAlive {
-                    lease_id: *lease_id,
-                })
+                (self.lease_remaining_ticks(*lease_id) == Some(lease.ttl_ticks)).then_some(
+                    KvOpResponse::LeaseKeepAlive {
+                        lease_id: *lease_id,
+                    },
+                )
             }
             KvOp::LeaseRevoke { lease_id } => {
                 (!self.leases.contains_key(lease_id)).then_some(KvOpResponse::LeaseRevoke {
@@ -2265,12 +2277,70 @@ impl InProcessKvStore {
         (keys.iter().take(max_keys).cloned().collect(), complete)
     }
 
+    fn current_leases_for_snapshot(&self) -> Vec<KvLease> {
+        self.leases
+            .values()
+            .map(|lease| {
+                let mut lease = lease.clone();
+                lease.remaining_ticks = self
+                    .lease_remaining_ticks(lease.lease_id)
+                    .unwrap_or(lease.remaining_ticks);
+                lease
+            })
+            .collect()
+    }
+
+    fn lease_remaining_ticks(&self, lease_id: LeaseId) -> Option<u64> {
+        let lease = self.leases.get(&lease_id)?;
+        let deadline = self.lease_deadline_by_id.get(&lease_id).copied()?;
+        Some(
+            deadline
+                .saturating_sub(self.lease_clock)
+                .min(lease.ttl_ticks),
+        )
+    }
+
+    fn expired_lease_candidates(&self) -> Vec<LeaseId> {
+        self.lease_deadlines
+            .range(..=self.lease_clock)
+            .flat_map(|(_, lease_ids)| lease_ids.iter().copied())
+            .collect()
+    }
+
+    fn upsert_lease(&mut self, lease: KvLease) {
+        let lease_id = lease.lease_id;
+        self.remove_lease_deadline(lease_id);
+        let deadline = self.lease_clock.saturating_add(lease.remaining_ticks);
+        self.lease_deadline_by_id.insert(lease_id, deadline);
+        self.lease_deadlines
+            .entry(deadline)
+            .or_default()
+            .insert(lease_id);
+        self.leases.insert(lease_id, lease);
+    }
+
+    fn remove_lease_deadline(&mut self, lease_id: LeaseId) -> Option<u64> {
+        let deadline = self.lease_deadline_by_id.remove(&lease_id)?;
+        let should_remove_deadline =
+            if let Some(lease_ids) = self.lease_deadlines.get_mut(&deadline) {
+                lease_ids.remove(&lease_id);
+                lease_ids.is_empty()
+            } else {
+                false
+            };
+        if should_remove_deadline {
+            self.lease_deadlines.remove(&deadline);
+        }
+        Some(deadline)
+    }
+
     fn remove_lease_and_delete_keys(
         &mut self,
         lease_id: LeaseId,
         keys: Vec<String>,
     ) -> Result<KvOpResponse, KvError> {
         self.leases.remove(&lease_id);
+        self.remove_lease_deadline(lease_id);
         self.lease_keys.remove(&lease_id);
         let deleted_count = keys.len();
         self.delete_lease_keys(keys)?;
@@ -2460,6 +2530,23 @@ fn build_lease_key_index(
         }
     }
     lease_keys
+}
+
+fn build_lease_deadline_index(
+    leases: &BTreeMap<LeaseId, KvLease>,
+    lease_clock: u64,
+) -> (BTreeMap<LeaseId, u64>, BTreeMap<u64, BTreeSet<LeaseId>>) {
+    let mut deadline_by_id = BTreeMap::new();
+    let mut deadlines = BTreeMap::<u64, BTreeSet<LeaseId>>::new();
+    for lease in leases.values() {
+        let deadline = lease_clock.saturating_add(lease.remaining_ticks);
+        deadline_by_id.insert(lease.lease_id, deadline);
+        deadlines
+            .entry(deadline)
+            .or_default()
+            .insert(lease.lease_id);
+    }
+    (deadline_by_id, deadlines)
 }
 
 #[derive(Clone, Debug)]
@@ -6262,6 +6349,97 @@ mod tests {
         assert!(store.get("/services/live").is_some());
         assert_eq!(store.tick_leases(1).expect("expire"), vec![LeaseId(1)]);
         assert!(store.get("/services/live").is_none());
+    }
+
+    #[test]
+    fn lease_deadline_index_preserves_snapshot_remaining_ticks_and_keepalive() {
+        let mut store = InProcessKvStore::new();
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(1),
+                ttl_ticks: 10,
+            })
+            .expect("long lease");
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(2),
+                ttl_ticks: 2,
+            })
+            .expect("short lease");
+        store
+            .put("/lease/short", b"short".to_vec(), Some(LeaseId(2)))
+            .expect("leased short");
+
+        assert_eq!(
+            store.tick_leases(2).expect("expire short"),
+            vec![LeaseId(2)]
+        );
+        assert!(store.get("/lease/short").is_none());
+        let remaining = store
+            .snapshot()
+            .leases
+            .into_iter()
+            .find(|lease| lease.lease_id == LeaseId(1))
+            .expect("long lease")
+            .remaining_ticks;
+        assert_eq!(
+            remaining, 8,
+            "snapshot materialization should expose aged remaining ticks without scanning all leases"
+        );
+        assert!(
+            store
+                .op_response_if_no_effect(&KvOp::LeaseKeepAlive {
+                    lease_id: LeaseId(1)
+                })
+                .expect("keepalive no-effect check")
+                .is_none(),
+            "aged leases still need a real keepalive"
+        );
+
+        store
+            .apply_op(KvOp::LeaseKeepAlive {
+                lease_id: LeaseId(1),
+            })
+            .expect("keepalive");
+        let refreshed = store
+            .snapshot()
+            .leases
+            .into_iter()
+            .find(|lease| lease.lease_id == LeaseId(1))
+            .expect("refreshed lease")
+            .remaining_ticks;
+        assert_eq!(refreshed, 10);
+    }
+
+    #[test]
+    fn lease_deadline_index_is_restored_from_snapshot_remaining_ticks() {
+        let mut store = InProcessKvStore::new();
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(7),
+                ttl_ticks: 5,
+            })
+            .expect("lease");
+        store
+            .put(
+                "/lease/restored-deadline",
+                b"value".to_vec(),
+                Some(LeaseId(7)),
+            )
+            .expect("leased value");
+        assert_eq!(
+            store.tick_leases(2).expect("age lease"),
+            Vec::<LeaseId>::new()
+        );
+
+        let mut restored = InProcessKvStore::restore(store.snapshot());
+        assert_eq!(
+            restored.tick_leases(2).expect("not expired yet"),
+            Vec::<LeaseId>::new()
+        );
+        assert!(restored.get("/lease/restored-deadline").is_some());
+        assert_eq!(restored.tick_leases(1).expect("expire"), vec![LeaseId(7)]);
+        assert!(restored.get("/lease/restored-deadline").is_none());
     }
 
     #[test]

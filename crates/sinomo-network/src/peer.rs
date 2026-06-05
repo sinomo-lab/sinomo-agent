@@ -1349,7 +1349,13 @@ pub struct DeliveryLedger {
     records: BTreeMap<RouteDeliveryId, DeliveryRecord>,
     active_by_event_target: BTreeMap<(EventId, NodeId), RouteDeliveryId>,
     retry_not_before: BTreeMap<RouteDeliveryId, Instant>,
+    retry_deadline_ids: BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
     ack_deadline: BTreeMap<RouteDeliveryId, Instant>,
+    ack_deadline_ids: BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
+    queued_record_ids: BTreeSet<RouteDeliveryId>,
+    immediate_retry_ids: BTreeSet<RouteDeliveryId>,
+    sent_without_ack_deadline_ids: BTreeSet<RouteDeliveryId>,
+    terminal_record_ids: BTreeSet<RouteDeliveryId>,
 }
 
 impl DeliveryLedger {
@@ -1364,7 +1370,13 @@ impl DeliveryLedger {
             records: BTreeMap::new(),
             active_by_event_target: BTreeMap::new(),
             retry_not_before: BTreeMap::new(),
+            retry_deadline_ids: BTreeMap::new(),
             ack_deadline: BTreeMap::new(),
+            ack_deadline_ids: BTreeMap::new(),
+            queued_record_ids: BTreeSet::new(),
+            immediate_retry_ids: BTreeSet::new(),
+            sent_without_ack_deadline_ids: BTreeSet::new(),
+            terminal_record_ids: BTreeSet::new(),
         }
     }
 
@@ -1386,6 +1398,8 @@ impl DeliveryLedger {
 
         let delivery_id = delivery.delivery_id;
         self.active_by_event_target.insert(key, delivery_id);
+        self.clear_delivery_index_state(delivery_id);
+        self.index_deadline_free_status(delivery_id, &delivery.status);
         self.records.insert(
             delivery_id,
             DeliveryRecord {
@@ -1450,14 +1464,14 @@ impl DeliveryLedger {
             Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
             Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
         ];
-        for (delivery_id, record) in &self.records {
-            on_inspect(*delivery_id);
-            if !delivery_is_ready(record, *delivery_id, &self.retry_not_before, now) {
+        for delivery_id in self.ready_candidate_ids_at(now) {
+            on_inspect(delivery_id);
+            let Some(record) = self.records.get(&delivery_id) else {
                 continue;
-            }
+            };
             let priority = latency_class_ready_priority(&record.delivery.latency_class) as usize;
             if ready_by_priority[priority].len() < max_deliveries {
-                ready_by_priority[priority].push(*delivery_id);
+                ready_by_priority[priority].push(delivery_id);
             }
             if ready_by_priority[0].len() >= max_deliveries
                 || ready_by_priority
@@ -1479,33 +1493,40 @@ impl DeliveryLedger {
         ready
     }
 
+    fn ready_candidate_ids_at(&self, now: Instant) -> BTreeSet<RouteDeliveryId> {
+        let mut ready = self.queued_record_ids.clone();
+        ready.extend(self.immediate_retry_ids.iter().copied());
+        for (_, delivery_ids) in self.retry_deadline_ids.range(..=now) {
+            ready.extend(delivery_ids.iter().copied());
+        }
+        ready
+    }
+
     pub fn next_outbound_wake_at(&self) -> Option<Instant> {
         self.next_outbound_wake_at_at(Instant::now())
     }
 
     pub(crate) fn next_outbound_wake_at_at(&self, now: Instant) -> Option<Instant> {
-        let mut next_wake: Option<Instant> = None;
-        for (delivery_id, record) in &self.records {
-            match record.delivery.status {
-                DeliveryStatus::Queued => return Some(now),
-                DeliveryStatus::Retrying => match self.retry_not_before.get(delivery_id).copied() {
-                    Some(deadline) if deadline > now => {
-                        next_wake =
-                            Some(next_wake.map_or(deadline, |existing| existing.min(deadline)));
-                    }
-                    _ => return Some(now),
-                },
-                DeliveryStatus::Sent => match self.ack_deadline.get(delivery_id).copied() {
-                    Some(deadline) if deadline > now => {
-                        next_wake =
-                            Some(next_wake.map_or(deadline, |existing| existing.min(deadline)));
-                    }
-                    _ => return Some(now),
-                },
-                _ => {}
-            }
+        if !self.queued_record_ids.is_empty()
+            || !self.immediate_retry_ids.is_empty()
+            || !self.sent_without_ack_deadline_ids.is_empty()
+        {
+            return Some(now);
         }
-        next_wake
+        let retry_wake = self
+            .retry_deadline_ids
+            .first_key_value()
+            .map(|(deadline, _)| *deadline);
+        let ack_wake = self
+            .ack_deadline_ids
+            .first_key_value()
+            .map(|(deadline, _)| *deadline);
+        let wake = match (retry_wake, ack_wake) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(wake), None) | (None, Some(wake)) => Some(wake),
+            (None, None) => None,
+        }?;
+        Some(if wake <= now { now } else { wake })
     }
 
     pub fn mark_sent(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {
@@ -1517,27 +1538,36 @@ impl DeliveryLedger {
         delivery_id: RouteDeliveryId,
         now: Instant,
     ) -> Result<(), NetworkError> {
-        let record = self
-            .records
-            .get_mut(&delivery_id)
-            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
-        record.attempts += 1;
-        record.delivery.status = DeliveryStatus::Sent;
-        self.retry_not_before.remove(&delivery_id);
-        self.ack_deadline
-            .insert(delivery_id, now + ack_timeout_for_record(record));
+        let deadline = {
+            let record = self
+                .records
+                .get_mut(&delivery_id)
+                .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+            record.attempts += 1;
+            record.delivery.status = DeliveryStatus::Sent;
+            now + ack_timeout_for_record(record)
+        };
+        self.clear_delivery_index_state(delivery_id);
+        self.insert_ack_deadline(delivery_id, deadline);
         Ok(())
     }
 
     pub fn mark_for_retry(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {
-        let record = self
-            .records
-            .get_mut(&delivery_id)
-            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
-        if record.delivery.status != DeliveryStatus::Delivered {
-            record.delivery.status = DeliveryStatus::Retrying;
-            self.retry_not_before.remove(&delivery_id);
-            self.ack_deadline.remove(&delivery_id);
+        let should_retry = {
+            let record = self
+                .records
+                .get_mut(&delivery_id)
+                .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+            if record.delivery.status == DeliveryStatus::Delivered {
+                false
+            } else {
+                record.delivery.status = DeliveryStatus::Retrying;
+                true
+            }
+        };
+        if should_retry {
+            self.clear_delivery_index_state(delivery_id);
+            self.immediate_retry_ids.insert(delivery_id);
         }
         Ok(())
     }
@@ -1546,14 +1576,20 @@ impl DeliveryLedger {
         &mut self,
         delivery_id: RouteDeliveryId,
     ) -> Result<(), NetworkError> {
-        let record = self
-            .records
-            .get_mut(&delivery_id)
-            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
-        if !record.delivery.status.is_terminal() {
-            record.delivery.status = DeliveryStatus::WaitingForPeer;
-            self.retry_not_before.remove(&delivery_id);
-            self.ack_deadline.remove(&delivery_id);
+        let should_wait = {
+            let record = self
+                .records
+                .get_mut(&delivery_id)
+                .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+            if record.delivery.status.is_terminal() {
+                false
+            } else {
+                record.delivery.status = DeliveryStatus::WaitingForPeer;
+                true
+            }
+        };
+        if should_wait {
+            self.clear_delivery_index_state(delivery_id);
         }
         Ok(())
     }
@@ -1570,56 +1606,82 @@ impl DeliveryLedger {
         delivery_id: RouteDeliveryId,
         now: Instant,
     ) -> Result<(), NetworkError> {
-        let record = self
-            .records
-            .get_mut(&delivery_id)
-            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
-        record.attempts += 1;
-        if record.attempts >= self.retry_policy.max_attempts {
-            record.delivery.status = DeliveryStatus::Failed;
-            self.retry_not_before.remove(&delivery_id);
-            self.ack_deadline.remove(&delivery_id);
+        let new_retry_deadline = {
+            let record = self
+                .records
+                .get_mut(&delivery_id)
+                .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+            record.attempts += 1;
+            if record.attempts >= self.retry_policy.max_attempts {
+                record.delivery.status = DeliveryStatus::Failed;
+                None
+            } else {
+                record.delivery.status = DeliveryStatus::Retrying;
+                Some(now + retry_delay_for_record(record))
+            }
+        };
+        self.clear_delivery_index_state(delivery_id);
+        if let Some(deadline) = new_retry_deadline {
+            self.insert_retry_deadline(delivery_id, deadline);
         } else {
-            record.delivery.status = DeliveryStatus::Retrying;
-            let delay = retry_delay_for_record(record);
-            self.retry_not_before.insert(delivery_id, now + delay);
-            self.ack_deadline.remove(&delivery_id);
+            self.terminal_record_ids.insert(delivery_id);
         }
         self.prune_terminal_records_to_retention();
         Ok(())
     }
 
     pub(crate) fn expire_ack_deadlines_at(&mut self, now: Instant) -> usize {
-        let mut expired = self
-            .ack_deadline
-            .iter()
-            .filter_map(|(delivery_id, deadline)| (*deadline <= now).then_some(*delivery_id))
-            .collect::<Vec<_>>();
-        expired.extend(self.records.iter().filter_map(|(delivery_id, record)| {
-            (record.delivery.status == DeliveryStatus::Sent
-                && !self.ack_deadline.contains_key(delivery_id))
-            .then_some(*delivery_id)
-        }));
+        let mut expired = Vec::new();
+        while let Some((deadline, _)) = self.ack_deadline_ids.first_key_value() {
+            if *deadline > now {
+                break;
+            }
+            let deadline = *deadline;
+            let Some((_, delivery_ids)) = self.ack_deadline_ids.pop_first() else {
+                break;
+            };
+            expired.extend(
+                delivery_ids
+                    .into_iter()
+                    .filter(|delivery_id| self.ack_deadline.get(delivery_id) == Some(&deadline)),
+            );
+        }
+        expired.extend(self.sent_without_ack_deadline_ids.iter().copied());
 
         let mut expired_count = 0;
         for delivery_id in expired {
-            let Some(record) = self.records.get_mut(&delivery_id) else {
-                self.ack_deadline.remove(&delivery_id);
+            if !self.records.contains_key(&delivery_id) {
+                self.clear_delivery_index_state(delivery_id);
                 continue;
+            }
+            let mut stale_non_sent_deadline = false;
+            let new_retry_deadline = {
+                let record = self
+                    .records
+                    .get_mut(&delivery_id)
+                    .expect("record existence checked before ack expiry reconciliation");
+                if record.delivery.status != DeliveryStatus::Sent {
+                    stale_non_sent_deadline = true;
+                    None
+                } else if record.attempts >= self.retry_policy.max_attempts {
+                    record.delivery.status = DeliveryStatus::Failed;
+                    None
+                } else {
+                    record.delivery.status = DeliveryStatus::Retrying;
+                    Some(now + retry_delay_for_record(record))
+                }
             };
-            if record.delivery.status != DeliveryStatus::Sent {
-                self.ack_deadline.remove(&delivery_id);
+            if stale_non_sent_deadline {
+                self.clear_ack_deadline(delivery_id);
+                self.sent_without_ack_deadline_ids.remove(&delivery_id);
                 continue;
             }
-            if record.attempts >= self.retry_policy.max_attempts {
-                record.delivery.status = DeliveryStatus::Failed;
-                self.retry_not_before.remove(&delivery_id);
+            self.clear_delivery_index_state(delivery_id);
+            if let Some(deadline) = new_retry_deadline {
+                self.insert_retry_deadline(delivery_id, deadline);
             } else {
-                record.delivery.status = DeliveryStatus::Retrying;
-                let delay = retry_delay_for_record(record);
-                self.retry_not_before.insert(delivery_id, now + delay);
+                self.terminal_record_ids.insert(delivery_id);
             }
-            self.ack_deadline.remove(&delivery_id);
             expired_count += 1;
         }
         if expired_count > 0 {
@@ -1630,7 +1692,14 @@ impl DeliveryLedger {
 
     #[cfg(test)]
     pub(crate) fn clear_ack_deadline_for_test(&mut self, delivery_id: RouteDeliveryId) {
-        self.ack_deadline.remove(&delivery_id);
+        self.clear_ack_deadline(delivery_id);
+        if self
+            .records
+            .get(&delivery_id)
+            .is_some_and(|record| record.delivery.status == DeliveryStatus::Sent)
+        {
+            self.sent_without_ack_deadline_ids.insert(delivery_id);
+        }
     }
 
     pub fn requeue_target(&mut self, target_node_id: &NodeId) -> usize {
@@ -1647,6 +1716,7 @@ impl DeliveryLedger {
         include_in_flight: bool,
     ) -> usize {
         let mut requeued = 0;
+        let mut requeued_ids = Vec::new();
         for (delivery_id, record) in self.records.iter_mut() {
             if &record.delivery.target_node_id != target_node_id {
                 continue;
@@ -1659,26 +1729,32 @@ impl DeliveryLedger {
             if should_requeue {
                 record.delivery.status = DeliveryStatus::Retrying;
                 record.attempts = 0;
-                self.retry_not_before.remove(delivery_id);
-                self.ack_deadline.remove(delivery_id);
+                requeued_ids.push(*delivery_id);
                 requeued += 1;
             }
+        }
+        for delivery_id in requeued_ids {
+            self.clear_delivery_index_state(delivery_id);
+            self.immediate_retry_ids.insert(delivery_id);
         }
         requeued
     }
 
     pub fn mark_target_waiting_for_peer(&mut self, target_node_id: &NodeId) -> usize {
         let mut waiting = 0;
+        let mut waiting_ids = Vec::new();
         for (delivery_id, record) in self.records.iter_mut() {
             if &record.delivery.target_node_id == target_node_id
                 && !record.delivery.status.is_terminal()
                 && record.delivery.status != DeliveryStatus::WaitingForPeer
             {
                 record.delivery.status = DeliveryStatus::WaitingForPeer;
-                self.retry_not_before.remove(delivery_id);
-                self.ack_deadline.remove(delivery_id);
+                waiting_ids.push(*delivery_id);
                 waiting += 1;
             }
+        }
+        for delivery_id in waiting_ids {
+            self.clear_delivery_index_state(delivery_id);
         }
         waiting
     }
@@ -1689,28 +1765,29 @@ impl DeliveryLedger {
         event_id: &EventId,
         acking_node_id: &NodeId,
     ) -> Result<(), NetworkError> {
-        let record = self
-            .records
-            .get_mut(&delivery_id)
-            .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
-        if &record.delivery.target_node_id != acking_node_id {
-            return Err(NetworkError::AckTargetMismatch {
-                delivery_id,
-                expected_target_node_id: record.delivery.target_node_id.clone(),
-                acking_node_id: acking_node_id.clone(),
-            });
+        {
+            let record = self
+                .records
+                .get_mut(&delivery_id)
+                .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
+            if &record.delivery.target_node_id != acking_node_id {
+                return Err(NetworkError::AckTargetMismatch {
+                    delivery_id,
+                    expected_target_node_id: record.delivery.target_node_id.clone(),
+                    acking_node_id: acking_node_id.clone(),
+                });
+            }
+            if &record.delivery.event_id != event_id {
+                return Err(NetworkError::AckEventMismatch {
+                    delivery_id,
+                    expected_event_id: record.delivery.event_id.clone(),
+                    acking_event_id: event_id.clone(),
+                });
+            }
+            record.delivery.status = DeliveryStatus::Delivered;
         }
-        if &record.delivery.event_id != event_id {
-            return Err(NetworkError::AckEventMismatch {
-                delivery_id,
-                expected_event_id: record.delivery.event_id.clone(),
-                acking_event_id: event_id.clone(),
-            });
-        }
-
-        record.delivery.status = DeliveryStatus::Delivered;
-        self.retry_not_before.remove(&delivery_id);
-        self.ack_deadline.remove(&delivery_id);
+        self.clear_delivery_index_state(delivery_id);
+        self.terminal_record_ids.insert(delivery_id);
         self.prune_terminal_records_to_retention();
         Ok(())
     }
@@ -1723,18 +1800,8 @@ impl DeliveryLedger {
 
     fn prune_terminal_records_to_retention(&mut self) {
         let limit = self.retained_terminal_record_limit();
-        loop {
-            let terminal_count = self
-                .records
-                .values()
-                .filter(|record| record.delivery.status.is_terminal())
-                .count();
-            if terminal_count <= limit {
-                return;
-            }
-            let Some(delivery_id) = self.records.iter().find_map(|(delivery_id, record)| {
-                record.delivery.status.is_terminal().then_some(*delivery_id)
-            }) else {
+        while self.terminal_record_ids.len() > limit {
+            let Some(delivery_id) = self.terminal_record_ids.first().copied() else {
                 return;
             };
             self.remove_record(delivery_id);
@@ -1743,9 +1810,7 @@ impl DeliveryLedger {
 
     fn prune_terminal_records_to_capacity(&mut self) {
         while self.records.len() >= self.capacity {
-            let Some(delivery_id) = self.records.iter().find_map(|(delivery_id, record)| {
-                record.delivery.status.is_terminal().then_some(*delivery_id)
-            }) else {
+            let Some(delivery_id) = self.terminal_record_ids.first().copied() else {
                 return;
             };
             self.remove_record(delivery_id);
@@ -1754,13 +1819,91 @@ impl DeliveryLedger {
 
     fn remove_record(&mut self, delivery_id: RouteDeliveryId) -> Option<DeliveryRecord> {
         let record = self.records.remove(&delivery_id)?;
-        self.retry_not_before.remove(&delivery_id);
-        self.ack_deadline.remove(&delivery_id);
+        self.clear_delivery_index_state(delivery_id);
         self.active_by_event_target.remove(&(
             record.delivery.event_id.clone(),
             record.delivery.target_node_id.clone(),
         ));
         Some(record)
+    }
+
+    fn index_deadline_free_status(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+        status: &DeliveryStatus,
+    ) {
+        match status {
+            DeliveryStatus::Queued => {
+                self.queued_record_ids.insert(delivery_id);
+            }
+            DeliveryStatus::Retrying => {
+                self.immediate_retry_ids.insert(delivery_id);
+            }
+            DeliveryStatus::Sent => {
+                self.sent_without_ack_deadline_ids.insert(delivery_id);
+            }
+            DeliveryStatus::Delivered | DeliveryStatus::Failed => {
+                self.terminal_record_ids.insert(delivery_id);
+            }
+            DeliveryStatus::WaitingForPeer => {}
+        }
+    }
+
+    fn clear_delivery_index_state(&mut self, delivery_id: RouteDeliveryId) {
+        self.queued_record_ids.remove(&delivery_id);
+        self.immediate_retry_ids.remove(&delivery_id);
+        self.sent_without_ack_deadline_ids.remove(&delivery_id);
+        self.terminal_record_ids.remove(&delivery_id);
+        self.clear_retry_deadline(delivery_id);
+        self.clear_ack_deadline(delivery_id);
+    }
+
+    fn insert_retry_deadline(&mut self, delivery_id: RouteDeliveryId, deadline: Instant) {
+        self.clear_retry_deadline(delivery_id);
+        self.immediate_retry_ids.remove(&delivery_id);
+        self.retry_not_before.insert(delivery_id, deadline);
+        self.retry_deadline_ids
+            .entry(deadline)
+            .or_default()
+            .insert(delivery_id);
+    }
+
+    fn clear_retry_deadline(&mut self, delivery_id: RouteDeliveryId) -> Option<Instant> {
+        let deadline = self.retry_not_before.remove(&delivery_id)?;
+        remove_deadline_index_entry(&mut self.retry_deadline_ids, deadline, delivery_id);
+        Some(deadline)
+    }
+
+    fn insert_ack_deadline(&mut self, delivery_id: RouteDeliveryId, deadline: Instant) {
+        self.clear_ack_deadline(delivery_id);
+        self.sent_without_ack_deadline_ids.remove(&delivery_id);
+        self.ack_deadline.insert(delivery_id, deadline);
+        self.ack_deadline_ids
+            .entry(deadline)
+            .or_default()
+            .insert(delivery_id);
+    }
+
+    fn clear_ack_deadline(&mut self, delivery_id: RouteDeliveryId) -> Option<Instant> {
+        let deadline = self.ack_deadline.remove(&delivery_id)?;
+        remove_deadline_index_entry(&mut self.ack_deadline_ids, deadline, delivery_id);
+        Some(deadline)
+    }
+}
+
+fn remove_deadline_index_entry(
+    index: &mut BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
+    deadline: Instant,
+    delivery_id: RouteDeliveryId,
+) {
+    let should_remove = if let Some(delivery_ids) = index.get_mut(&deadline) {
+        delivery_ids.remove(&delivery_id);
+        delivery_ids.is_empty()
+    } else {
+        false
+    };
+    if should_remove {
+        index.remove(&deadline);
     }
 }
 
@@ -1787,21 +1930,6 @@ pub(crate) fn ack_timeout_for_latency_class(latency_class: &LatencyClass) -> Dur
 
 fn ack_timeout_for_record(record: &DeliveryRecord) -> Duration {
     ack_timeout_for_latency_class(&record.delivery.latency_class)
-}
-
-fn delivery_is_ready(
-    record: &DeliveryRecord,
-    delivery_id: RouteDeliveryId,
-    retry_not_before: &BTreeMap<RouteDeliveryId, Instant>,
-    now: Instant,
-) -> bool {
-    match record.delivery.status {
-        DeliveryStatus::Queued => true,
-        DeliveryStatus::Retrying => retry_not_before
-            .get(&delivery_id)
-            .is_none_or(|deadline| *deadline <= now),
-        _ => false,
-    }
 }
 
 fn retry_delay_for_record(record: &DeliveryRecord) -> Duration {

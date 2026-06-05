@@ -12915,6 +12915,12 @@ fn delivery_ledger_spreads_background_retry_wakeups() {
         .mark_attempt_failed_at(RouteDeliveryId(2), now)
         .expect("mark second failed");
 
+    let first_retry_wake = ledger.next_outbound_wake_at_at(now).expect("retry wake");
+    assert!(
+        first_retry_wake > now + Duration::from_secs(1)
+            && first_retry_wake <= now + Duration::from_millis(1_050),
+        "retry wake hints should use the earliest jittered retry deadline"
+    );
     assert!(
         ledger
             .ready_delivery_ids_at(now + Duration::from_secs(1))
@@ -13055,6 +13061,60 @@ fn delivery_ledger_sent_ack_deadline_retries_stale_in_flight_work() {
     assert_eq!(
         ledger.ready_delivery_ids_at(retry_wake),
         vec![RouteDeliveryId(1)]
+    );
+}
+
+#[test]
+fn delivery_ledger_ack_deadline_expiry_uses_deadline_order() {
+    let node_a = NodeId::from_legacy_named("node_ack_deadline_order_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ack_deadline_order_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    let start = Instant::now();
+    let ack_timeout = crate::peer::ack_timeout_for_latency_class(&LatencyClass::Interactive);
+    for delivery_id in [RouteDeliveryId(1), RouteDeliveryId(2)] {
+        let event = fixture_event(
+            &format!("evt_ack_deadline_order_{}", delivery_id.0),
+            node_a.clone(),
+        );
+        let delivery = RouteDelivery {
+            delivery_id,
+            event_sequence: EventSequence(delivery_id.0),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Interactive,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    ledger
+        .mark_sent_at(RouteDeliveryId(1), start + Duration::from_millis(500))
+        .expect("mark later deadline");
+    ledger
+        .mark_sent_at(RouteDeliveryId(2), start)
+        .expect("mark earlier deadline");
+
+    assert_eq!(
+        ledger.next_outbound_wake_at_at(start),
+        Some(start + ack_timeout),
+        "wake hints should use the earliest ack deadline, not delivery-id order"
+    );
+    assert_eq!(ledger.expire_ack_deadlines_at(start + ack_timeout), 1);
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(2))
+            .expect("earlier deadline record")
+            .delivery
+            .status,
+        DeliveryStatus::Retrying
+    );
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("later deadline record")
+            .delivery
+            .status,
+        DeliveryStatus::Sent
     );
 }
 
@@ -13291,6 +13351,63 @@ fn delivery_ledger_stops_ready_scan_after_full_realtime_batch() {
     assert_eq!(
         inspected, 3,
         "ready selection should not scan lower-priority backlog once realtime work fills the batch"
+    );
+}
+
+#[test]
+fn delivery_ledger_ready_selection_skips_non_ready_backlog() {
+    let node_a = NodeId::from_legacy_named("node_ready_index_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ready_index_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 8);
+    let now = Instant::now();
+    for (index, status) in [
+        (1, DeliveryStatus::Sent),
+        (2, DeliveryStatus::Sent),
+        (3, DeliveryStatus::WaitingForPeer),
+        (4, DeliveryStatus::Retrying),
+        (5, DeliveryStatus::Queued),
+        (6, DeliveryStatus::Queued),
+    ] {
+        let event = fixture_event(&format!("evt_ready_index_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Interactive,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+        match status {
+            DeliveryStatus::Sent => {
+                ledger
+                    .mark_sent_at(RouteDeliveryId(index), now)
+                    .expect("mark sent");
+            }
+            DeliveryStatus::WaitingForPeer => {
+                ledger
+                    .mark_waiting_for_peer(RouteDeliveryId(index))
+                    .expect("mark waiting");
+            }
+            DeliveryStatus::Retrying => {
+                ledger
+                    .mark_attempt_failed_at(RouteDeliveryId(index), now)
+                    .expect("mark sleeping retry");
+            }
+            DeliveryStatus::Queued => {}
+            _ => unreachable!("fixture only uses active non-terminal states"),
+        }
+    }
+
+    let mut inspected = 0;
+    assert_eq!(
+        ledger.ready_delivery_ids_limited_at_counting(now, 2, &mut inspected),
+        vec![RouteDeliveryId(5), RouteDeliveryId(6)],
+        "ready selection should return queued work without walking sent, waiting, or sleeping retry records"
+    );
+    assert_eq!(
+        inspected, 2,
+        "indexed ready selection should inspect only candidate ready records"
     );
 }
 
@@ -13540,6 +13657,84 @@ fn delivery_ledger_only_requeues_sent_records_on_recovery() {
     assert_eq!(record.delivery.status, DeliveryStatus::Retrying);
     assert_eq!(record.attempts, 0);
     assert_eq!(ledger.ready_delivery_ids(), vec![RouteDeliveryId(1)]);
+}
+
+#[test]
+fn delivery_ledger_requeued_failed_records_are_not_pruned_as_terminal() {
+    let node_a = NodeId::from_legacy_named("node_ledger_requeue_failed_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ledger_requeue_failed_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy { max_attempts: 1 }, 2);
+
+    let event_one = fixture_event("evt_ledger_requeue_failed_one", node_a.clone());
+    let delivery_one = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event_one.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    ledger
+        .enqueue(delivery_one, event_one)
+        .expect("enqueue one");
+    ledger
+        .mark_attempt_failed(RouteDeliveryId(1))
+        .expect("fail one");
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("failed record")
+            .delivery
+            .status,
+        DeliveryStatus::Failed
+    );
+
+    assert_eq!(ledger.requeue_target(&node_b), 1);
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("requeued record")
+            .delivery
+            .status,
+        DeliveryStatus::Retrying
+    );
+
+    let event_two = fixture_event("evt_ledger_requeue_failed_two", node_a.clone());
+    let delivery_two = RouteDelivery {
+        delivery_id: RouteDeliveryId(2),
+        event_sequence: EventSequence(2),
+        event_id: event_two.event_id.clone(),
+        target_node_id: node_b.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+    ledger
+        .enqueue(delivery_two, event_two)
+        .expect("enqueue two");
+
+    let event_three = fixture_event("evt_ledger_requeue_failed_three", node_a);
+    let delivery_three = RouteDelivery {
+        delivery_id: RouteDeliveryId(3),
+        event_sequence: EventSequence(3),
+        event_id: event_three.event_id.clone(),
+        target_node_id: node_b,
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+
+    assert_eq!(
+        ledger.enqueue(delivery_three, event_three),
+        Err(NetworkError::DeliveryLedgerFull { max_records: 2 }),
+        "a requeued failed delivery is active work and must not be pruned as terminal"
+    );
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("requeued record retained")
+            .delivery
+            .status,
+        DeliveryStatus::Retrying
+    );
 }
 
 #[test]
