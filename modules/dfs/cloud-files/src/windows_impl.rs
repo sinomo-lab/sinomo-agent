@@ -352,6 +352,9 @@ impl CloudFilesProvider {
     }
 
     fn prepopulate(&self, depth: u32) -> Result<u64, CloudFilesModuleError> {
+        if depth == 0 {
+            return Ok(0);
+        }
         self.prepopulate_dir(&self.root_path, &self.sync_root, depth)
     }
 
@@ -368,9 +371,9 @@ impl CloudFilesProvider {
                 detail: format!("read SIFS directory `{sifs_path}` for Cloud Files: {status:?}"),
             })?;
         let mut created = create_placeholders(local_base, payloads)?;
-        if depth == 0 {
+        let Some(child_depth) = child_prepopulate_depth(depth) else {
             return Ok(created);
-        }
+        };
         let children = self
             .lock_dfs()
             .and_then(|mut dfs| {
@@ -386,7 +389,7 @@ impl CloudFilesProvider {
                 continue;
             }
             let child_base = local_base.join(&child.name);
-            created += self.prepopulate_dir(&child.path, &child_base, depth.saturating_sub(1))?;
+            created += self.prepopulate_dir(&child.path, &child_base, child_depth)?;
         }
         Ok(created)
     }
@@ -420,6 +423,10 @@ impl CloudFilesProvider {
         };
         Ok(slice_bytes(&bytes, offset as usize, len))
     }
+}
+
+fn child_prepopulate_depth(depth: u32) -> Option<u32> {
+    depth.checked_sub(1).filter(|child_depth| *child_depth > 0)
 }
 
 struct PlaceholderPayload {
@@ -898,4 +905,17 @@ fn slice_bytes(bytes: &[u8], start: usize, len: usize) -> Vec<u8> {
     }
     let end = start.saturating_add(len).min(bytes.len());
     bytes[start..end].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepopulate_depth_counts_visible_levels() {
+        assert_eq!(child_prepopulate_depth(0), None);
+        assert_eq!(child_prepopulate_depth(1), None);
+        assert_eq!(child_prepopulate_depth(2), Some(1));
+        assert_eq!(child_prepopulate_depth(3), Some(2));
+    }
 }
