@@ -267,10 +267,18 @@ pub(crate) enum SandboxRunTarget {
     WasmModule(PathBuf),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum SandboxRunExecution {
     Local,
     Daemon,
+    Container(sinomo_runtime::sandbox::SandboxContainerBackendConfig),
+}
+
+#[derive(Debug, Clone, Default)]
+struct SandboxContainerRunBuilder {
+    runtime: Option<sinomo_runtime::sandbox::SandboxContainerRuntime>,
+    image: Option<String>,
+    requested: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1302,6 +1310,61 @@ pub(crate) fn parse_sandbox_fetch_options(
     })
 }
 
+fn parse_sandbox_container_runtime_arg(
+    value: Option<&String>,
+) -> Result<sinomo_runtime::sandbox::SandboxContainerRuntime, CliError> {
+    let Some(value) = value else {
+        return Err(CliError::Usage);
+    };
+    sinomo_runtime::sandbox::SandboxContainerRuntime::parse(value).map_err(|source| {
+        CliError::Parse {
+            detail: source.to_string(),
+        }
+    })
+}
+
+fn parse_sandbox_container_image_arg(value: Option<&String>) -> Result<String, CliError> {
+    let Some(value) = value else {
+        return Err(CliError::Usage);
+    };
+    sinomo_runtime::sandbox::SandboxContainerBackendConfig::new(
+        sinomo_runtime::sandbox::SandboxContainerRuntime::Docker,
+        value.clone(),
+    )
+    .map(|config| config.image)
+    .map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })
+}
+
+fn finalize_sandbox_run_execution(
+    execution: SandboxRunExecution,
+    container: SandboxContainerRunBuilder,
+) -> Result<SandboxRunExecution, CliError> {
+    if !container.requested {
+        return Ok(execution);
+    }
+    if matches!(&execution, SandboxRunExecution::Daemon) {
+        return Err(CliError::Parse {
+            detail: "container sandbox execution is local-only; do not combine it with --daemon"
+                .to_string(),
+        });
+    }
+    let runtime = container
+        .runtime
+        .unwrap_or(sinomo_runtime::sandbox::SandboxContainerRuntime::Docker);
+    let Some(image) = container.image else {
+        return Err(CliError::Parse {
+            detail: "container sandbox execution requires --container-image <image>".to_string(),
+        });
+    };
+    let config = sinomo_runtime::sandbox::SandboxContainerBackendConfig::new(runtime, image)
+        .map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })?;
+    Ok(SandboxRunExecution::Container(config))
+}
+
 pub(crate) fn parse_sandbox_shell_options(
     args: &[String],
 ) -> Result<SandboxShellOptions, CliError> {
@@ -1310,11 +1373,38 @@ pub(crate) fn parse_sandbox_shell_options(
     let mut timeout_ms = 0;
     let mut script = None;
     let mut execution = SandboxRunExecution::Local;
+    let mut container = SandboxContainerRunBuilder::default();
     let mut index = 0;
     while index < rest.len() {
         match rest[index].as_str() {
             "--daemon" => {
                 execution = SandboxRunExecution::Daemon;
+                index += 1;
+            }
+            "--container-runtime" => {
+                index += 1;
+                container.runtime = Some(parse_sandbox_container_runtime_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--container-image" => {
+                index += 1;
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--docker" => {
+                index += 1;
+                container.runtime = Some(sinomo_runtime::sandbox::SandboxContainerRuntime::Docker);
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--podman" => {
+                index += 1;
+                container.runtime = Some(sinomo_runtime::sandbox::SandboxContainerRuntime::Podman);
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
                 index += 1;
             }
             "--timeout-ms" => {
@@ -1343,7 +1433,7 @@ pub(crate) fn parse_sandbox_shell_options(
         sandbox_id,
         script,
         timeout_ms,
-        execution,
+        execution: finalize_sandbox_run_execution(execution, container)?,
     })
 }
 
@@ -1353,6 +1443,7 @@ pub(crate) fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOpt
     let mut timeout_ms = 0;
     let mut target = None;
     let mut execution = SandboxRunExecution::Local;
+    let mut container = SandboxContainerRunBuilder::default();
     let mut stdin = false;
     let mut allow_unsigned = false;
     let mut allowed_capabilities = Vec::new();
@@ -1361,6 +1452,32 @@ pub(crate) fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOpt
         match rest[index].as_str() {
             "--daemon" => {
                 execution = SandboxRunExecution::Daemon;
+                index += 1;
+            }
+            "--container-runtime" => {
+                index += 1;
+                container.runtime = Some(parse_sandbox_container_runtime_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--container-image" => {
+                index += 1;
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--docker" => {
+                index += 1;
+                container.runtime = Some(sinomo_runtime::sandbox::SandboxContainerRuntime::Docker);
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--podman" => {
+                index += 1;
+                container.runtime = Some(sinomo_runtime::sandbox::SandboxContainerRuntime::Podman);
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
                 index += 1;
             }
             "--timeout-ms" => {
@@ -1418,19 +1535,37 @@ pub(crate) fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOpt
             _ => return Err(CliError::Usage),
         }
     }
+    let execution = finalize_sandbox_run_execution(execution, container)?;
     let target = target.ok_or(CliError::Usage)?;
-    if execution == SandboxRunExecution::Daemon && matches!(target, SandboxRunTarget::WasmModule(_))
+    if matches!(&execution, SandboxRunExecution::Daemon)
+        && matches!(target, SandboxRunTarget::WasmModule(_))
     {
         return Err(CliError::Parse {
             detail: "sandbox daemon execution requires a pinned toolchain command, not --wasm"
                 .to_string(),
         });
     }
-    if execution == SandboxRunExecution::Daemon
+    if matches!(&execution, SandboxRunExecution::Container(_))
+        && matches!(target, SandboxRunTarget::WasmModule(_))
+    {
+        return Err(CliError::Parse {
+            detail: "container sandbox execution runs commands inside an image and does not accept --wasm"
+                .to_string(),
+        });
+    }
+    if matches!(&execution, SandboxRunExecution::Daemon)
         && (allow_unsigned || !allowed_capabilities.is_empty())
     {
         return Err(CliError::Parse {
             detail: "--allow-unsigned and --allow-capability only apply to local sandbox runs; daemon-backed runs use the cluster sandbox policy (`sinomo sandbox policy set ...`)"
+                .to_string(),
+        });
+    }
+    if matches!(&execution, SandboxRunExecution::Container(_))
+        && (allow_unsigned || !allowed_capabilities.is_empty())
+    {
+        return Err(CliError::Parse {
+            detail: "--allow-unsigned and --allow-capability apply to WASIX toolchain execution, not container sandbox execution"
                 .to_string(),
         });
     }
@@ -1456,7 +1591,7 @@ pub(crate) fn parse_sandbox_run_options(args: &[String]) -> Result<SandboxRunOpt
         argv,
         timeout_ms,
         stdin,
-        allow_unsigned: allow_unsigned || execution == SandboxRunExecution::Local,
+        allow_unsigned: allow_unsigned || matches!(&execution, SandboxRunExecution::Local),
         allowed_capabilities,
         execution,
     })
@@ -1469,6 +1604,7 @@ pub(crate) fn parse_sandbox_process_plan_options(
     let sandbox_id = parse_sandbox_id(sandbox_id)?;
     let mut timeout_ms = sinomo_runtime::sandbox::SandboxResourceLimits::default().wall_time_ms;
     let mut execution = SandboxRunExecution::Local;
+    let mut container = SandboxContainerRunBuilder::default();
     let mut plan_path = None;
     let mut index = 0;
     while index < rest.len() {
@@ -1492,6 +1628,32 @@ pub(crate) fn parse_sandbox_process_plan_options(
                 execution = SandboxRunExecution::Daemon;
                 index += 1;
             }
+            "--container-runtime" => {
+                index += 1;
+                container.runtime = Some(parse_sandbox_container_runtime_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--container-image" => {
+                index += 1;
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--docker" => {
+                index += 1;
+                container.runtime = Some(sinomo_runtime::sandbox::SandboxContainerRuntime::Docker);
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
+            "--podman" => {
+                index += 1;
+                container.runtime = Some(sinomo_runtime::sandbox::SandboxContainerRuntime::Podman);
+                container.image = Some(parse_sandbox_container_image_arg(rest.get(index))?);
+                container.requested = true;
+                index += 1;
+            }
             value if plan_path.is_none() => {
                 plan_path = Some(PathBuf::from(value));
                 index += 1;
@@ -1503,7 +1665,7 @@ pub(crate) fn parse_sandbox_process_plan_options(
         sandbox_id,
         plan_path: plan_path.ok_or(CliError::Usage)?,
         timeout_ms,
-        execution,
+        execution: finalize_sandbox_run_execution(execution, container)?,
     })
 }
 
@@ -2293,12 +2455,14 @@ pub(crate) fn sandbox_run(options: SandboxRunOptions) -> Result<(), CliError> {
         None
     };
     match &options.execution {
-        SandboxRunExecution::Local => sandbox_run_with_stores_and_stdin(
-            options,
-            stdin,
-            &sandbox_store_from_data_dir(&data_dir),
-            &sandbox_toolchain_store_from_data_dir(&data_dir),
-        ),
+        SandboxRunExecution::Local | SandboxRunExecution::Container(_) => {
+            sandbox_run_with_stores_and_stdin(
+                options,
+                stdin,
+                &sandbox_store_from_data_dir(&data_dir),
+                &sandbox_toolchain_store_from_data_dir(&data_dir),
+            )
+        }
         SandboxRunExecution::Daemon => sandbox_run_with_daemon_and_stdin(options, stdin),
     }
 }
@@ -2306,12 +2470,14 @@ pub(crate) fn sandbox_run(options: SandboxRunOptions) -> Result<(), CliError> {
 pub(crate) fn sandbox_process_plan(options: SandboxProcessPlanOptions) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
-    match options.execution {
-        SandboxRunExecution::Local => sandbox_process_plan_with_stores(
-            options,
-            &sandbox_store_from_data_dir(&data_dir),
-            &sandbox_toolchain_store_from_data_dir(&data_dir),
-        ),
+    match &options.execution {
+        SandboxRunExecution::Local | SandboxRunExecution::Container(_) => {
+            sandbox_process_plan_with_stores(
+                options,
+                &sandbox_store_from_data_dir(&data_dir),
+                &sandbox_toolchain_store_from_data_dir(&data_dir),
+            )
+        }
         SandboxRunExecution::Daemon => sandbox_process_plan_with_daemon(options),
     }
 }
@@ -2330,13 +2496,15 @@ pub(crate) fn sandbox_shell(options: SandboxShellOptions) -> Result<(), CliError
             bytes
         }
     };
-    match options.execution {
-        SandboxRunExecution::Local => sandbox_shell_with_stores(
-            options,
-            stdin,
-            &sandbox_store_from_data_dir(&data_dir),
-            &sandbox_toolchain_store_from_data_dir(&data_dir),
-        ),
+    match &options.execution {
+        SandboxRunExecution::Local | SandboxRunExecution::Container(_) => {
+            sandbox_shell_with_stores(
+                options,
+                stdin,
+                &sandbox_store_from_data_dir(&data_dir),
+                &sandbox_toolchain_store_from_data_dir(&data_dir),
+            )
+        }
         SandboxRunExecution::Daemon => sandbox_shell_with_daemon(options, stdin),
     }
 }
@@ -5567,9 +5735,29 @@ pub(crate) fn sandbox_run_with_stores(
     sandbox_run_with_stores_and_stdin(options, None, store, toolchain_store)
 }
 
-#[cfg(not(feature = "sandbox"))]
 pub(crate) fn sandbox_process_plan_with_stores(
+    options: SandboxProcessPlanOptions,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    let plan = read_sandbox_process_plan_file(&options.plan_path)?;
+    if let Some(runner) = sandbox_container_runner_for_execution(&options.execution)? {
+        let outcome = runner.run_process_plan_with_output_sink(
+            store,
+            &options.sandbox_id,
+            &plan,
+            options.timeout_ms,
+            Some(sandbox_cli_streaming_output_sink()),
+        )?;
+        return print_sandbox_process_plan_outcome(&outcome, false);
+    }
+    sandbox_process_plan_wasix_with_stores(options, &plan, store, toolchain_store)
+}
+
+#[cfg(not(feature = "sandbox"))]
+fn sandbox_process_plan_wasix_with_stores(
     _options: SandboxProcessPlanOptions,
+    _plan: &sinomo_runtime::sandbox::SandboxProcessPlan,
     _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
     _toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
@@ -5577,12 +5765,12 @@ pub(crate) fn sandbox_process_plan_with_stores(
 }
 
 #[cfg(feature = "sandbox")]
-pub(crate) fn sandbox_process_plan_with_stores(
+fn sandbox_process_plan_wasix_with_stores(
     options: SandboxProcessPlanOptions,
+    plan: &sinomo_runtime::sandbox::SandboxProcessPlan,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
     toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
 ) -> Result<(), CliError> {
-    let plan = read_sandbox_process_plan_file(&options.plan_path)?;
     let execution_node_id =
         NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
             detail: format!("invalid sandbox CLI node id: {source}"),
@@ -5594,7 +5782,7 @@ pub(crate) fn sandbox_process_plan_with_stores(
             store,
             toolchain_store,
             &options.sandbox_id,
-            &plan,
+            plan,
             options.timeout_ms,
             &execution_node_id,
             &policy,
@@ -5692,7 +5880,7 @@ pub(crate) fn sandbox_shell_with_stores(
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: SandboxRunExecution::Local,
+            execution: options.execution,
         },
         Some(stdin),
         store,
@@ -5719,8 +5907,61 @@ pub(crate) fn sandbox_shell_with_daemon(
     )
 }
 
-#[cfg(not(feature = "sandbox"))]
 pub(crate) fn sandbox_run_with_stores_and_stdin(
+    options: SandboxRunOptions,
+    stdin: Option<Vec<u8>>,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), CliError> {
+    if let Some(runner) = sandbox_container_runner_for_execution(&options.execution)? {
+        return sandbox_run_container_with_store(options, stdin, store, runner);
+    }
+    sandbox_run_wasix_with_stores_and_stdin(options, stdin, store, toolchain_store)
+}
+
+fn sandbox_container_runner_for_execution(
+    execution: &SandboxRunExecution,
+) -> Result<Option<sinomo_runtime::sandbox::SandboxContainerCommandRunner>, CliError> {
+    match execution {
+        SandboxRunExecution::Container(config) => Ok(Some(
+            sinomo_runtime::sandbox::SandboxContainerCommandRunner::new(config.clone()),
+        )),
+        SandboxRunExecution::Local => {
+            let config = sinomo_runtime::sandbox::SandboxContainerBackendConfig::from_env()
+                .map_err(|source| CliError::Parse {
+                    detail: source.to_string(),
+                })?;
+            Ok(config.map(sinomo_runtime::sandbox::SandboxContainerCommandRunner::new))
+        }
+        SandboxRunExecution::Daemon => Ok(None),
+    }
+}
+
+fn sandbox_run_container_with_store(
+    options: SandboxRunOptions,
+    stdin: Option<Vec<u8>>,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    runner: sinomo_runtime::sandbox::SandboxContainerCommandRunner,
+) -> Result<(), CliError> {
+    let SandboxRunTarget::ToolchainCommand(command_name) = &options.target else {
+        return Err(CliError::Parse {
+            detail: "container sandbox execution requires an image command, not --wasm".to_string(),
+        });
+    };
+    let outcome = runner.run_toolchain_command_with_stdin_and_output_sink(
+        store,
+        &options.sandbox_id,
+        command_name,
+        options.argv,
+        stdin,
+        options.timeout_ms,
+        Some(sandbox_cli_streaming_output_sink()),
+    )?;
+    print_sandbox_command_outcome(&outcome, false)
+}
+
+#[cfg(not(feature = "sandbox"))]
+fn sandbox_run_wasix_with_stores_and_stdin(
     _options: SandboxRunOptions,
     _stdin: Option<Vec<u8>>,
     _store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -5730,7 +5971,7 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
 }
 
 #[cfg(feature = "sandbox")]
-pub(crate) fn sandbox_run_with_stores_and_stdin(
+fn sandbox_run_wasix_with_stores_and_stdin(
     options: SandboxRunOptions,
     stdin: Option<Vec<u8>>,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -5805,7 +6046,6 @@ pub(crate) fn sandbox_run_with_stores_and_stdin(
     }
 }
 
-#[cfg(feature = "sandbox")]
 fn sandbox_cli_streaming_output_sink()
 -> std::sync::Arc<dyn sinomo_runtime::sandbox::SandboxOutputSink> {
     std::sync::Arc::new(

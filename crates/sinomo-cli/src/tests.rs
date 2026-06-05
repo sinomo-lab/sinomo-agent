@@ -567,6 +567,81 @@ fn sandbox_run_parser_accepts_toolchain_command_and_args() {
 }
 
 #[test]
+fn sandbox_run_parser_accepts_container_backend_options() {
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    let command = parse_sandbox_command(&[
+        "run".to_string(),
+        sandbox_id.to_string(),
+        "--container-runtime".to_string(),
+        "podman".to_string(),
+        "--container-image".to_string(),
+        "alpine:3.20".to_string(),
+        "sh".to_string(),
+        "--".to_string(),
+        "-c".to_string(),
+        "pwd".to_string(),
+    ])
+    .expect("sandbox run");
+
+    let SandboxCliCommand::Run(options) = command else {
+        panic!("expected run");
+    };
+    assert_eq!(options.sandbox_id, sandbox_id);
+    assert_eq!(
+        options.target,
+        super::SandboxRunTarget::ToolchainCommand("sh".to_string())
+    );
+    assert_eq!(options.argv, vec!["sh", "-c", "pwd"]);
+    let super::SandboxRunExecution::Container(config) = options.execution else {
+        panic!("expected container execution");
+    };
+    assert_eq!(
+        config.runtime,
+        sinomo_runtime::sandbox::SandboxContainerRuntime::Podman
+    );
+    assert_eq!(config.image, "alpine:3.20");
+}
+
+#[test]
+fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
+    let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--docker".to_string(),
+            "alpine:3.20".to_string(),
+            "--wasm".to_string(),
+            "/tmp/hello.wasm".to_string(),
+        ]),
+        Err(CliError::Parse { .. })
+    ));
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--docker".to_string(),
+            "alpine:3.20".to_string(),
+            "--allow-capability".to_string(),
+            "wasix.unpinned-child-exec".to_string(),
+            "sh".to_string(),
+        ]),
+        Err(CliError::Parse { .. })
+    ));
+    assert!(matches!(
+        parse_sandbox_command(&[
+            "run".to_string(),
+            sandbox_id.to_string(),
+            "--daemon".to_string(),
+            "--podman".to_string(),
+            "alpine:3.20".to_string(),
+            "sh".to_string(),
+        ]),
+        Err(CliError::Parse { .. })
+    ));
+}
+
+#[test]
 fn sandbox_run_parser_accepts_local_capability_overrides() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let command = parse_sandbox_command(&[
@@ -679,6 +754,22 @@ fn sandbox_process_plan_parser_accepts_plan_path_and_timeout() {
         panic!("expected process plan");
     };
     assert_eq!(daemon_options.execution, super::SandboxRunExecution::Daemon);
+
+    let container_command = parse_sandbox_command(&[
+        "process-plan".to_string(),
+        sandbox_id.to_string(),
+        "--docker".to_string(),
+        "alpine:3.20".to_string(),
+        "/tmp/plan.json".to_string(),
+    ])
+    .expect("container sandbox process plan");
+    let SandboxCliCommand::ProcessPlan(container_options) = container_command else {
+        panic!("expected process plan");
+    };
+    assert!(matches!(
+        container_options.execution,
+        super::SandboxRunExecution::Container(_)
+    ));
 }
 
 #[test]
@@ -702,6 +793,23 @@ fn sandbox_shell_parser_accepts_script_and_timeout() {
     assert_eq!(options.timeout_ms, 2345);
     assert_eq!(options.script.as_deref(), Some("printf hello"));
     assert_eq!(options.execution, super::SandboxRunExecution::Daemon);
+
+    let container_command = parse_sandbox_command(&[
+        "shell".to_string(),
+        sandbox_id.to_string(),
+        "--podman".to_string(),
+        "alpine:3.20".to_string(),
+        "--".to_string(),
+        "echo hi".to_string(),
+    ])
+    .expect("container sandbox shell");
+    let SandboxCliCommand::Shell(container_options) = container_command else {
+        panic!("expected shell");
+    };
+    assert!(matches!(
+        container_options.execution,
+        super::SandboxRunExecution::Container(_)
+    ));
 }
 
 #[test]

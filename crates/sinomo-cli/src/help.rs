@@ -262,22 +262,24 @@ pub(super) fn print_sandbox_help() {
     );
     println!("      Update persisted sandbox cwd and environment.");
     println!(
-        "  sinomo sandbox run <sandbox-id> [--daemon] [--stdin] [--timeout-ms <ms>] [--allow-capability <name>] <command> -- [args...]"
+        "  sinomo sandbox run <sandbox-id> [--daemon|--container-runtime docker|podman --container-image <image>|--docker <image>|--podman <image>] [--stdin] [--timeout-ms <ms>] [--allow-capability <name>] <command> -- [args...]"
     );
     println!(
-        "      Run a named command from the sandbox's pinned toolchain; --allow-capability is local-only and --daemon uses the cluster sandbox policy."
+        "      Run a named command from the sandbox's pinned toolchain, or from a Docker/Podman image in container mode; --daemon uses the cluster sandbox policy."
     );
     println!(
         "  sinomo sandbox run <sandbox-id> [--timeout-ms <ms>] --wasm <module.wasm> -- [args...]"
     );
     println!("      Run an explicit WASI module for runtime verification.");
     println!(
-        "  sinomo sandbox process-plan <sandbox-id> [--daemon] <plan.json> [--timeout-ms <ms>]"
+        "  sinomo sandbox process-plan <sandbox-id> [--daemon|--container-runtime docker|podman --container-image <image>|--docker <image>|--podman <image>] <plan.json> [--timeout-ms <ms>]"
     );
     println!(
-        "      Run a structured process plan of pinned toolchain commands with per-step cwd/env and explicit stdout-to-stdin pipes; --daemon uses SIFS through the local daemon."
+        "      Run a structured process plan with per-step cwd/env and explicit stdout-to-stdin pipes; --daemon uses SIFS through the local daemon."
     );
-    println!("  sinomo sandbox shell <sandbox-id> [--daemon] [--timeout-ms <ms>] [-- <script>]");
+    println!(
+        "  sinomo sandbox shell <sandbox-id> [--daemon|--container-runtime docker|podman --container-image <image>|--docker <image>|--podman <image>] [--timeout-ms <ms>] [-- <script>]"
+    );
     println!(
         "      Run the pinned real `sh` command with stdin or the provided script; --daemon uses SIFS through the local daemon."
     );
@@ -387,7 +389,7 @@ pub(super) fn print_sandbox_help() {
     println!("      Delete a sandbox instance and all checkpoints.");
     println!();
     println!(
-        "Local commands use the local staging backend. Use --daemon on create, status, config, toolchain imports/adds, toolchain verifiers, run, process-plan, shell, logs, ls, cat, write, fetch, checkpoint, resume, reboot, and destroy for the SIFS-backed daemon path. `sandbox process-plan` executes structured steps, not shell syntax. `sandbox shell` only invokes a pinned real `sh` command when the toolchain provides one; it does not fake shell behavior."
+        "Local commands use the local staging backend. Use --daemon on create, status, config, toolchain imports/adds, toolchain verifiers, run, process-plan, shell, logs, ls, cat, write, fetch, checkpoint, resume, reboot, and destroy for the SIFS-backed daemon path. For local run/process-plan/shell, set SINOMO_SANDBOX_BACKEND=docker|podman and SINOMO_SANDBOX_CONTAINER_IMAGE=<image>, or pass the container flags explicitly. `sandbox process-plan` executes structured steps, not shell syntax. `sandbox shell` invokes `sh` from the selected WASIX toolchain or container image."
     );
 }
 

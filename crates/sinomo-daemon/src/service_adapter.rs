@@ -596,9 +596,11 @@ impl SandboxBackendFactory for DaemonSandboxBackendFactory {
                 paths: self.paths.clone(),
             }))
         } else {
-            Ok(Box::new(LocalSandboxBackend::new(
-                ctx.data_dir.root().join("sandbox").join("runtime"),
-            )))
+            let backend =
+                LocalSandboxBackend::new(ctx.data_dir.root().join("sandbox").join("runtime"))
+                    .with_container_config_from_env()
+                    .map_err(|source| ServiceError::Service(source.to_string()))?;
+            Ok(Box::new(backend))
         }
     }
 }

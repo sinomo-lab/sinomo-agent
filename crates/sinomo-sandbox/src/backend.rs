@@ -136,6 +136,7 @@ pub trait SandboxBackend: Send {
 /// log) do not apply here.
 pub struct LocalSandboxBackend {
     store: LocalSandboxInstanceStore,
+    container_runner: Option<SandboxContainerCommandRunner>,
 }
 
 impl LocalSandboxBackend {
@@ -143,6 +144,7 @@ impl LocalSandboxBackend {
     pub fn new(runtime_root: impl Into<PathBuf>) -> Self {
         Self {
             store: LocalSandboxInstanceStore::new(runtime_root),
+            container_runner: None,
         }
     }
 
@@ -150,7 +152,26 @@ impl LocalSandboxBackend {
     /// cheap `Clone` (just a runtime-root path), so callers holding a `&store` can route
     /// through the shared backend without restructuring (e.g. CLI handlers and their tests).
     pub fn with_store(store: LocalSandboxInstanceStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            container_runner: None,
+        }
+    }
+
+    pub fn with_container_runner(mut self, runner: SandboxContainerCommandRunner) -> Self {
+        self.container_runner = Some(runner);
+        self
+    }
+
+    pub fn with_container_config(self, config: SandboxContainerBackendConfig) -> Self {
+        self.with_container_runner(SandboxContainerCommandRunner::new(config))
+    }
+
+    pub fn with_container_config_from_env(self) -> Result<Self, SandboxContainerConfigError> {
+        match SandboxContainerBackendConfig::from_env()? {
+            Some(config) => Ok(self.with_container_config(config)),
+            None => Ok(self),
+        }
     }
 }
 
@@ -377,16 +398,40 @@ impl SandboxBackend for LocalSandboxBackend {
 
     fn run_toolchain(
         &mut self,
-        _request: SandboxRunToolchainRequest,
+        request: SandboxRunToolchainRequest,
     ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
-        Err(local_mode_unsupported("toolchain execution"))
+        let Some(runner) = &self.container_runner else {
+            return Err(local_mode_unsupported("toolchain execution"));
+        };
+        runner
+            .run_toolchain_command_with_stdin_and_output_sink(
+                &self.store,
+                &request.sandbox_id,
+                &request.command_name,
+                request.argv,
+                request.stdin,
+                request.timeout_ms,
+                None,
+            )
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))
     }
 
     fn run_process_plan(
         &mut self,
-        _request: SandboxRunProcessPlanRequest,
+        request: SandboxRunProcessPlanRequest,
     ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
-        Err(local_mode_unsupported("process-plan execution"))
+        let Some(runner) = &self.container_runner else {
+            return Err(local_mode_unsupported("process-plan execution"));
+        };
+        runner
+            .run_process_plan_with_output_sink(
+                &self.store,
+                &request.sandbox_id,
+                &request.plan,
+                request.timeout_ms,
+                None,
+            )
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))
     }
 }
 

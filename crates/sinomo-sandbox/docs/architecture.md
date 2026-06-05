@@ -7,8 +7,7 @@ agent or CLI request
   -> sinomo sandbox command or daemon RPC
   -> cluster sandbox policy
   -> sandbox instance manifest
-  -> pinned toolchain package
-  -> WASIX runtime
+  -> execution backend
   -> sandbox virtual filesystem
   -> local development backend or SIFS
 ```
@@ -70,6 +69,8 @@ All sandbox filesystem operations should go through the virtual filesystem layer
 
 SIFS-backed WASIX execution mounts the sandbox workspace and declared SIFS mounts as virtual preopens backed directly by `SandboxFileSystem`; it must not copy SIFS state into host directories for the actual command run. Toolchain artifacts are provided through read-only virtual preopens built from the SIFS toolchain objects.
 
+Docker/Podman execution is a local host-container backend. It binds the local sandbox instance directories to `/root`, `/home`, `/tmp`, `/work`, `/var`, `/logs`, and `/artifacts` inside a selected image. It does not replace the SIFS-backed WASIX path for clustered execution; clustered execution still needs the policy-visible SIFS virtual filesystem and pinned toolchain model.
+
 The virtual filesystem layer owns:
 
 - path normalization and escape checks,
@@ -79,11 +80,29 @@ The virtual filesystem layer owns:
 - direct SIFS-backed WASIX mounts and local development backends,
 - generated device and procfs entries.
 
-## Runtime Model
+## Execution Backend Model
 
-WASIX is the only maintained sandbox runtime. It is required for real shell, Python, compiler, package manager, subprocess, pipe, and threading workloads. WASI Preview1 support has been removed rather than kept as a compatibility path.
+Sinomo supports multiple sandbox execution backends behind the same instance, command, output, and command-record contracts.
 
-Runtime target code is split under `src/runtime/`:
+WASIX is the production SIFS backend. It is required for policy-visible clustered execution, pinned toolchain packages, direct SIFS mounts, and the long-term self-evolution path. WASI Preview1 support has been removed rather than kept as a compatibility path.
+
+Docker/Podman is a local backend for development and compatibility workloads. It runs commands from a configured image with network disabled by default, a read-only image root, dropped Linux capabilities, and writable sandbox mounts for the standard sandbox directories. Container mode treats the requested command name as an executable inside the image; it does not use WASIX module artifacts from the sandbox toolchain store.
+
+Container mode can be selected explicitly:
+
+```text
+sinomo sandbox run <sandbox-id> --docker <image> sh -- -c 'echo hello'
+sinomo sandbox process-plan <sandbox-id> --podman <image> plan.json
+```
+
+It can also be selected for local service routes and local CLI execution through:
+
+```text
+SINOMO_SANDBOX_BACKEND=docker|podman
+SINOMO_SANDBOX_CONTAINER_IMAGE=<image>
+```
+
+WASIX runtime code is split under `src/runtime/`:
 
 - `src/runtime/wasix/` owns Wasmer/WASIX setup, budget guards, process-tree signaling, virtual preopens, output streaming, memory checks, and metering.
 - `src/runtime/capabilities/` describes runtime capability reporting used by diagnostics.
