@@ -29,6 +29,7 @@ pub mod r1 {
     pub use sinomo_daemon as daemon;
     pub use sinomo_device as device;
     pub use sinomo_dfs as dfs;
+    pub use sinomo_dfs_cloud_files_api as dfs_cloud_files_api;
     pub use sinomo_eval as eval;
     pub use sinomo_events as events;
     pub use sinomo_kv as kv;
@@ -185,9 +186,9 @@ pub use r0::{core, object};
 #[cfg(feature = "sandbox")]
 pub use r1::sandbox_wasix_host;
 pub use r1::{
-    api, config, daemon, device, dfs, eval, events, kv, local, module, module_api, modules,
-    network, node, policy, registry, rollout, sandbox, sandbox_wasix_api, service, storage,
-    supervision,
+    api, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local, module,
+    module_api, modules, network, node, policy, registry, rollout, sandbox, sandbox_wasix_api,
+    service, storage, supervision,
 };
 
 #[cfg(test)]

@@ -1,0 +1,31 @@
+[package]
+name = "sinomo-dfs-cloud-files"
+version.workspace = true
+description = "Trusted native-dylib Windows Cloud Files provider for SIFS"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+
+[dependencies]
+sinomo-dfs-cloud-files-api = { path = "../../../crates/sinomo-dfs-cloud-files-api" }
+sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
+sinomo-runtime = { path = "../../../crates/sinomo-runtime" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_CloudFilters",
+    "Win32_Storage_FileSystem",
+    "Win32_System_CorrelationVector",
+] }

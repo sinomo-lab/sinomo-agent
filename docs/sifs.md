@@ -62,3 +62,5 @@ Per-path metadata, object metadata, object versions, write intents, replica rece
 `crates/sinomo-dfs/src/local_owned.rs` defines the local-owned node file exposure at `/sinomo/nodes/<node_id>/files`.
 
 `crates/sinomo-dfs/src/posix.rs` exposes SIFS through a POSIX-like path API for mkdir, paginated list, stat, read, streaming read, write, write-at, rename, and unlink operations. Large recursive clears and directory renames are durable bounded namespace jobs so they can resume after daemon or process restart.
+
+`crates/sinomo-dfs-fuse` adapts that POSIX-like SIFS API to a host FUSE mount. It is an application-level crate with target gating: Unix builds enable the FUSE backend by default, while unsupported platforms compile only the stub API. Windows exposes SIFS through the Cloud Files API via the trusted native-dylib module at `modules/dfs/cloud-files`, which is built and activated by default on Windows install/rollout paths. The CLI entry point is `sinomo dfs mount <mount-point> [--root <sifs-path>]`; on Unix the mount point is a FUSE mount, and on Windows it is a Cloud Files sync root.

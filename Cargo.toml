@@ -20,6 +20,7 @@ default-members = [
     "crates/sinomo-deliberation",
     "crates/sinomo-device",
     "crates/sinomo-dfs",
+    "crates/sinomo-dfs-cloud-files-api",
     "crates/sinomo-eval",
     "crates/sinomo-events",
     "crates/sinomo-evolution",

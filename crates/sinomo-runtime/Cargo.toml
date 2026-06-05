@@ -22,6 +22,7 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 sinomo-eval = { path = "../sinomo-eval" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-local = { path = "../sinomo-local" }

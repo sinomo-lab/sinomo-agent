@@ -69,11 +69,13 @@ pub use native_install::{
 pub use paths::{
     BENCHMARKS_MODULE_ID, BENCHMARKS_MODULE_INTERFACE_VERSION, BENCHMARKS_MODULE_PACKAGE,
     BENCHMARKS_NATIVE_MODULE_CACHE_KEY, BENCHMARKS_NATIVE_MODULE_SOURCE,
-    SANDBOX_WASIX_MODULE_PACKAGE, SANDBOX_WASIX_MODULE_RUNTIME_FEATURE,
-    SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY, SANDBOX_WASIX_NATIVE_MODULE_SOURCE,
-    SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths, SelfRolloutPlan,
-    append_native_dylib_module_build_args, benchmark_native_dylib_module_build,
+    DFS_CLOUD_FILES_MODULE_PACKAGE, DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY,
+    DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE, SANDBOX_WASIX_MODULE_PACKAGE,
+    SANDBOX_WASIX_MODULE_RUNTIME_FEATURE, SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY,
+    SANDBOX_WASIX_NATIVE_MODULE_SOURCE, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
+    SelfRolloutPlan, append_native_dylib_module_build_args, benchmark_native_dylib_module_build,
     benchmarks_native_module_library_name, default_native_dylib_module_builds,
+    dfs_cloud_files_native_dylib_module_build, dfs_cloud_files_native_module_library_name,
     ensure_rollout_layout, executable_name, native_dylib_library_name,
     sandbox_wasix_native_module_library_name,
 };

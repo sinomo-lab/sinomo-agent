@@ -1,0 +1,24 @@
+[package]
+name = "sinomo-dfs-fuse"
+version.workspace = true
+description = "Optional FUSE mount adapter for Sinomo DFS/SIFS"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "application"
+
+[features]
+default = ["fuse"]
+fuse = ["dep:fuser", "dep:libc"]
+
+[dependencies]
+sinomo-runtime = { path = "../sinomo-runtime" }
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.15", optional = true, default-features = false }
+libc = { version = "0.2", optional = true }

@@ -12,6 +12,9 @@ pub const BENCHMARKS_MODULE_ID: &str = "module.benchmarks";
 pub const BENCHMARKS_MODULE_INTERFACE_VERSION: &str = "sinomo.benchmarks.v1";
 pub const BENCHMARKS_NATIVE_MODULE_CACHE_KEY: &str = "module/benchmark/sinomo-benchmarks";
 pub const BENCHMARKS_NATIVE_MODULE_SOURCE: &str = "rollout:modules/benchmark/sinomo-benchmarks";
+pub const DFS_CLOUD_FILES_MODULE_PACKAGE: &str = "sinomo-dfs-cloud-files";
+pub const DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY: &str = "module/dfs/cloud-files";
+pub const DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE: &str = "rollout:modules/dfs/cloud-files";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SelfRolloutPaths {
@@ -112,11 +115,15 @@ pub fn benchmarks_native_module_library_name() -> String {
     native_dylib_library_name("sinomo_benchmarks")
 }
 
+pub fn dfs_cloud_files_native_module_library_name() -> String {
+    native_dylib_library_name("sinomo_dfs_cloud_files")
+}
+
 pub fn default_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Vec<SelfRolloutNativeDylibModuleBuild> {
     let library_name = sandbox_wasix_native_module_library_name();
-    vec![SelfRolloutNativeDylibModuleBuild {
+    let mut modules = vec![SelfRolloutNativeDylibModuleBuild {
         package: SANDBOX_WASIX_MODULE_PACKAGE.to_string(),
         features: vec![SANDBOX_WASIX_MODULE_RUNTIME_FEATURE.to_string()],
         module_id: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID.to_string(),
@@ -126,7 +133,11 @@ pub fn default_native_dylib_module_builds(
         library_name: library_name.clone(),
         built_library: build_dir.join("target").join("debug").join(library_name),
         source: SANDBOX_WASIX_NATIVE_MODULE_SOURCE.to_string(),
-    }]
+    }];
+    if cfg!(windows) {
+        modules.push(dfs_cloud_files_native_dylib_module_build(build_dir));
+    }
+    modules
 }
 
 pub fn benchmark_native_dylib_module_build(build_dir: &Path) -> SelfRolloutNativeDylibModuleBuild {
@@ -140,6 +151,23 @@ pub fn benchmark_native_dylib_module_build(build_dir: &Path) -> SelfRolloutNativ
         library_name: library_name.clone(),
         built_library: build_dir.join("target").join("debug").join(library_name),
         source: BENCHMARKS_NATIVE_MODULE_SOURCE.to_string(),
+    }
+}
+
+pub fn dfs_cloud_files_native_dylib_module_build(
+    build_dir: &Path,
+) -> SelfRolloutNativeDylibModuleBuild {
+    let library_name = dfs_cloud_files_native_module_library_name();
+    SelfRolloutNativeDylibModuleBuild {
+        package: DFS_CLOUD_FILES_MODULE_PACKAGE.to_string(),
+        features: Vec::new(),
+        module_id: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID.to_string(),
+        interface_version: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+            .to_string(),
+        cache_key: DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY.to_string(),
+        library_name: library_name.clone(),
+        built_library: build_dir.join("target").join("debug").join(library_name),
+        source: DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE.to_string(),
     }
 }
 
@@ -205,20 +233,13 @@ mod tests {
     fn self_rollout_plan_builds_sinomo_binary_from_source_repo() {
         let paths = SelfRolloutPaths::new(Path::new("/tmp/sinomo-data"));
         let plan = paths.plan();
+        let expected_modules = default_native_dylib_module_builds(&paths.source_repo);
+        let mut expected_build_args =
+            vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
+        append_native_dylib_module_build_args(&mut expected_build_args, &expected_modules);
 
         assert_eq!(plan.build_program, "cargo");
-        assert_eq!(
-            plan.build_args,
-            vec![
-                "build".to_string(),
-                "-p".to_string(),
-                "sinomo".to_string(),
-                "-p".to_string(),
-                SANDBOX_WASIX_MODULE_PACKAGE.to_string(),
-                "--features".to_string(),
-                SANDBOX_WASIX_MODULE_RUNTIME_FEATURE.to_string(),
-            ]
-        );
+        assert_eq!(plan.build_args, expected_build_args);
         assert_eq!(plan.build_dir, paths.source_repo);
         assert_eq!(
             plan.built_binary,
@@ -263,6 +284,44 @@ mod tests {
                 .join("target")
                 .join("debug")
                 .join(benchmarks_native_module_library_name())
+        );
+    }
+
+    #[test]
+    fn dfs_cloud_files_native_dylib_module_is_default_only_on_windows() {
+        let build_dir = Path::new("/tmp/sinomo-source");
+        let default_modules = default_native_dylib_module_builds(build_dir);
+        let cloud_files_module = dfs_cloud_files_native_dylib_module_build(build_dir);
+
+        assert_eq!(cloud_files_module.package, DFS_CLOUD_FILES_MODULE_PACKAGE);
+        assert_eq!(
+            cloud_files_module.module_id,
+            sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID
+        );
+        assert_eq!(
+            cloud_files_module.interface_version,
+            sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+        );
+        assert_eq!(
+            cloud_files_module.cache_key,
+            DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY
+        );
+        assert_eq!(
+            cloud_files_module.source,
+            DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE
+        );
+        assert_eq!(
+            cloud_files_module.built_library,
+            build_dir
+                .join("target")
+                .join("debug")
+                .join(dfs_cloud_files_native_module_library_name())
+        );
+        assert_eq!(
+            default_modules
+                .iter()
+                .any(|module| module.package == DFS_CLOUD_FILES_MODULE_PACKAGE),
+            cfg!(windows)
         );
     }
 }

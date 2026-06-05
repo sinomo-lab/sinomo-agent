@@ -125,6 +125,10 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
         "the generic native module ABI crate should remain in default builds"
     );
     assert!(
+        default_members.contains(&"crates/sinomo-dfs-cloud-files-api".to_string()),
+        "the lightweight Cloud Files module API crate should remain in default builds"
+    );
+    assert!(
         default_members.contains(&"crates/sinomo-sandbox-wasix-host".to_string()),
         "the lightweight WASIX host loader should remain in default builds"
     );
@@ -135,6 +139,10 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
     assert!(
         !default_members.contains(&"modules/benchmark/sinomo-benchmarks".to_string()),
         "the benchmark native-dylib module must be built explicitly, not by default"
+    );
+    assert!(
+        !default_members.contains(&"modules/dfs/cloud-files".to_string()),
+        "the Cloud Files native-dylib module must be built explicitly, not by default"
     );
     assert!(
         !default_members.contains(&"crates/sinomo-benchmarks".to_string()),

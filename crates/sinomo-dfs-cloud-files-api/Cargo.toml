@@ -1,0 +1,15 @@
+[package]
+name = "sinomo-dfs-cloud-files-api"
+version.workspace = true
+description = "Stable native-dylib API for exposing SIFS through Windows Cloud Files"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+serde.workspace = true

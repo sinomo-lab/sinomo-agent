@@ -4,9 +4,9 @@ use super::{
     ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
     ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
-    DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
-    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+    DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions, DfsPinCliCommand, EvolutionJobStatus,
+    EvolutionPaths, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
     ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
     ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
     ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
@@ -7701,6 +7701,27 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
     assert_eq!(
         parse_dfs_command(&["smoke".to_string(), "--json".to_string()]).expect("dfs smoke"),
         DfsCliCommand::Smoke { json: true }
+    );
+    assert_eq!(
+        parse_dfs_command(&[
+            "mount".to_string(),
+            "/mnt/sifs".to_string(),
+            "--root".to_string(),
+            "/sinomo/nodes/node_alpha/files".to_string(),
+            "--read-only".to_string(),
+            "--allow-other".to_string(),
+            "--data-dir".to_string(),
+            "/tmp/sinomo-data".to_string(),
+        ])
+        .expect("dfs mount"),
+        DfsCliCommand::Mount(DfsMountOptions {
+            mount_point: PathBuf::from("/mnt/sifs"),
+            root_path: "/sinomo/nodes/node_alpha/files".to_string(),
+            data_dir: Some(PathBuf::from("/tmp/sinomo-data")),
+            read_only: true,
+            allow_other: true,
+            foreground: true,
+        })
     );
     assert!(matches!(
         parse_dfs_command(&[

@@ -26,6 +26,7 @@ sinomo-module = { path = "../sinomo-module" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-registry = { path = "../sinomo-registry" }
+sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
 sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }

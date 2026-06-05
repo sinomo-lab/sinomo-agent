@@ -1434,6 +1434,21 @@ fn dfs_children() -> Vec<CommandSpec> {
             vec![],
         ),
         cmd(
+            "mount",
+            "expose SIFS locally",
+            vec![],
+            opts(&[
+                "--root",
+                "--data-dir",
+                "--read-only",
+                "--ro",
+                "--allow-other",
+                "--foreground",
+                "--background",
+            ]),
+            vec![value("mount-point", "local mount directory", &[])],
+        ),
+        cmd(
             "pin",
             "manage local DFS pins",
             vec![
@@ -2215,6 +2230,8 @@ fn option_placeholder(name: &str) -> &'static str {
         | "--binary"
         | "--output"
         | "--path"
+        | "--root"
+        | "--data-dir"
         | "--source"
         | "--config"
         | "--metadata-root"

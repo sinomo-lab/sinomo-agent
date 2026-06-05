@@ -10,9 +10,11 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "application"
 [features]
+default = ["sandbox", "dfs-fuse"]
 # Enable sandbox execution through the native-module host loader. The heavy
 # WASIX engine is built and activated as a separate native-dylib module.
 sandbox = ["sinomo-cli/sandbox"]
+dfs-fuse = ["sinomo-cli/dfs-fuse"]
 
 [dependencies]
-sinomo-cli = { path = "../sinomo-cli" }
+sinomo-cli = { path = "../sinomo-cli", default-features = false }

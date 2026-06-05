@@ -221,6 +221,10 @@ pub(super) fn print_dfs_help() {
     );
     println!("  sinomo dfs metadata publish [--json]");
     println!("      Publish the local primary metadata shard journal to configured replicas.");
+    println!(
+        "  sinomo dfs mount <mount-point> [--root <sifs-path>] [--read-only] [--allow-other] [--data-dir <path>]"
+    );
+    println!("      Expose SIFS locally through FUSE on Unix or Windows Cloud Files on Windows.");
     println!("  sinomo dfs pin list [--filesystem <file_system_id>] [--pin-root <path>] [--json]");
     println!(
         "  sinomo dfs pin add --path <path> [--filesystem <file_system_id>] [--object <object_id>] [--node <node_id>] [--mode metadata|content] [--pin-root <path>] [--json]"

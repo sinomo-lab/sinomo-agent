@@ -27,6 +27,7 @@ pub(crate) enum DfsCliCommand {
     MetadataPublish {
         json: bool,
     },
+    Mount(DfsMountOptions),
     Services {
         json: bool,
     },
@@ -48,6 +49,16 @@ pub(crate) struct DfsFilterOptions {
     pub(crate) object_id: Option<DfsObjectId>,
     pub(crate) limit: Option<usize>,
     pub(crate) cursor: Option<DfsOperatorInspectionCursor>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsMountOptions {
+    pub(crate) mount_point: PathBuf,
+    pub(crate) root_path: String,
+    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) read_only: bool,
+    pub(crate) allow_other: bool,
+    pub(crate) foreground: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +188,9 @@ pub(crate) fn parse_dfs_command(args: &[String]) -> Result<DfsCliCommand, CliErr
         Some((command, rest)) if command == "smoke" => parse_dfs_smoke_command(rest),
         Some((command, rest)) if command == "services" => parse_dfs_services_command(rest),
         Some((command, rest)) if command == "metadata" => parse_dfs_metadata_command(rest),
+        Some((command, rest)) if command == "mount" => {
+            Ok(DfsCliCommand::Mount(parse_dfs_mount_options(rest)?))
+        }
         Some((command, rest)) if command == "pin" => {
             Ok(DfsCliCommand::Pin(parse_dfs_pin_command(rest)?))
         }
@@ -328,6 +342,48 @@ pub(crate) fn parse_dfs_metadata_command(args: &[String]) -> Result<DfsCliComman
         }
         _ => Err(CliError::Usage),
     }
+}
+
+pub(crate) fn parse_dfs_mount_options(args: &[String]) -> Result<DfsMountOptions, CliError> {
+    let mut mount_point = None;
+    let mut root_path = "/".to_string();
+    let mut data_dir = None;
+    let mut read_only = false;
+    let mut allow_other = false;
+    let mut foreground = true;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" | "--path" => {
+                index += 1;
+                root_path = non_empty_string(args.get(index).ok_or(CliError::Usage)?, "root")?;
+            }
+            "--data-dir" => {
+                index += 1;
+                data_dir = Some(PathBuf::from(args.get(index).ok_or(CliError::Usage)?));
+            }
+            "--read-only" | "--ro" => read_only = true,
+            "--allow-other" => allow_other = true,
+            "--foreground" => foreground = true,
+            "--background" => foreground = false,
+            value if value.starts_with('-') => return Err(CliError::Usage),
+            value => {
+                if mount_point.is_some() {
+                    return Err(CliError::Usage);
+                }
+                mount_point = Some(PathBuf::from(value));
+            }
+        }
+        index += 1;
+    }
+    Ok(DfsMountOptions {
+        mount_point: mount_point.ok_or(CliError::Usage)?,
+        root_path,
+        data_dir,
+        read_only,
+        allow_other,
+        foreground,
+    })
 }
 
 pub(crate) fn parse_dfs_pin_command(args: &[String]) -> Result<DfsPinCliCommand, CliError> {
@@ -1012,8 +1068,155 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             }
             Ok(())
         }
+        DfsCliCommand::Mount(options) => run_dfs_mount_command(options),
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
         DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
+    }
+}
+
+pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
+    #[cfg(windows)]
+    {
+        run_dfs_cloud_files_mount_command(options)
+    }
+    #[cfg(all(not(windows), feature = "dfs-fuse"))]
+    {
+        let mut mount_options =
+            sinomo_dfs_fuse::DfsFuseMountOptions::new(options.mount_point.clone())
+                .with_root_path(options.root_path);
+        if let Some(data_dir) = options.data_dir {
+            mount_options = mount_options.with_data_dir(data_dir);
+        }
+        mount_options.read_only = options.read_only;
+        mount_options.allow_other = options.allow_other;
+        mount_options.foreground = options.foreground;
+        sinomo_dfs_fuse::mount_sifs(mount_options).map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })
+    }
+    #[cfg(all(not(windows), not(feature = "dfs-fuse")))]
+    {
+        let _ = options;
+        Err(CliError::Parse {
+            detail: "SIFS FUSE support is disabled in this build; use a default Unix build or rebuild with `--features dfs-fuse`".to_string(),
+        })
+    }
+}
+
+#[cfg(windows)]
+fn run_dfs_cloud_files_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CloudFilesModuleRequest, CloudFilesModuleResponse, CloudFilesMountRequest,
+        SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+    };
+    use sinomo_runtime::module::{
+        ModuleId, NativeModule, native_module_cache_path, read_native_dylib_module_loader_state,
+    };
+    use sinomo_runtime::module_api::{
+        NativeModuleInvocationRequest, NativeModuleRequest, NativeModuleResponse, decode_sobj,
+        encode_sobj,
+    };
+
+    if options.allow_other {
+        return Err(CliError::Parse {
+            detail: "`--allow-other` is only supported by the Unix FUSE backend".to_string(),
+        });
+    }
+    let data_dir = match options.data_dir.clone() {
+        Some(path) => SinomoDataDir::new(path),
+        None => SinomoDataDir::from_env_or_home()?,
+    };
+    data_dir.ensure_root_layout()?;
+    let data_dir_root = data_dir.root();
+    let module_id =
+        ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID).map_err(|source| {
+            CliError::Parse {
+                detail: format!("invalid Cloud Files module id: {source}"),
+            }
+        })?;
+    let state = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
+        .map_err(|source| CliError::Parse {
+            detail: format!("read Cloud Files native module loader state: {source}"),
+        })?
+        .ok_or_else(|| CliError::Parse {
+            detail: format!(
+                "Cloud Files native module is not active; run `sinomo install` or activate `{SINOMO_DFS_CLOUD_FILES_MODULE_ID}`"
+            ),
+        })?;
+    if state.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
+        return Err(CliError::Parse {
+            detail: format!(
+                "Cloud Files native module interface mismatch: expected {}, got {}",
+                SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, state.interface_version
+            ),
+        });
+    }
+    let library_path = native_module_cache_path(
+        &data_dir_root,
+        &state.cache_key,
+        &state.content_hash,
+        &state.library_name,
+    );
+    let module = unsafe {
+        NativeModule::load_from_content_addressed_path(&library_path, &state.content_hash)
+    }
+    .map_err(|source| CliError::Parse {
+        detail: format!("load Cloud Files native module: {source}"),
+    })?;
+    let request = CloudFilesMountRequest {
+        sync_root: options.mount_point,
+        root_path: options.root_path,
+        data_dir_root: Some(data_dir_root),
+        read_only: options.read_only,
+        provider_name: "Sinomo SIFS".to_string(),
+        provider_version: env!("CARGO_PKG_VERSION").to_string(),
+        prepopulate_depth: 1,
+        connect: options.foreground,
+        max_run_seconds: None,
+    };
+    let payload_sobj = encode_sobj(&CloudFilesModuleRequest::Mount(request)).map_err(|source| {
+        CliError::Parse {
+            detail: format!("encode Cloud Files mount request: {source}"),
+        }
+    })?;
+    let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
+        operation: SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
+        payload_sobj,
+    });
+    match module
+        .invoke(&native_request)
+        .map_err(|source| CliError::Parse {
+            detail: format!("invoke Cloud Files native module: {source}"),
+        })? {
+        NativeModuleResponse::Invocation(response)
+            if response.operation == SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION =>
+        {
+            match decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj).map_err(
+                |source| CliError::Parse {
+                    detail: format!("decode Cloud Files mount response: {source}"),
+                },
+            )? {
+                CloudFilesModuleResponse::Mounted(response) => {
+                    println!(
+                        "SIFS Cloud Files sync root {} -> {} ({})",
+                        response.sync_root.display(),
+                        response.root_path,
+                        response.detail
+                    );
+                    Ok(())
+                }
+                CloudFilesModuleResponse::Error(error) => Err(CliError::Parse {
+                    detail: format!("Cloud Files mount failed: {}: {}", error.code, error.detail),
+                }),
+            }
+        }
+        NativeModuleResponse::Error(error) => Err(CliError::Parse {
+            detail: format!("Cloud Files mount failed: {}: {}", error.code, error.detail),
+        }),
+        other => Err(CliError::Parse {
+            detail: format!("unexpected Cloud Files native module response: {other:?}"),
+        }),
     }
 }
 
