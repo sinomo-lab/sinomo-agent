@@ -26,6 +26,7 @@ pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
 pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize =
     sinomo_kv::MAX_KV_COMMAND_PAYLOAD_BYTES;
 pub(crate) const MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS: usize = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+pub const MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS: usize = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 pub(crate) const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub(crate) const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
@@ -3739,12 +3740,35 @@ pub fn write_local_cluster_connectivity_record_set(
     write_local_cluster_connectivity_records_inner(paths, source_node_id, records, true)
 }
 
+fn validate_cluster_connectivity_records_for_source(
+    source_node_id: &NodeId,
+    records: &[ClusterConnectivityRecord],
+) -> Result<(), NetworkError> {
+    if records.len() > MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS {
+        return Err(NetworkError::ClusterConnectivityRecordLimit {
+            source_node_id: source_node_id.clone(),
+            observed_records: records.len(),
+            max_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+        });
+    }
+    for record in records {
+        if record.source_node_id != *source_node_id {
+            return Err(NetworkError::ClusterConnectivitySourceMismatch {
+                expected_source_node_id: source_node_id.clone(),
+                record_source_node_id: record.source_node_id.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn write_local_cluster_connectivity_records_inner(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
     replace_source_records: bool,
 ) -> Result<(), NetworkError> {
+    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
     let mut cache =
         LOCAL_CLUSTER_CONNECTIVITY_RECORDS
@@ -3784,6 +3808,17 @@ fn write_local_cluster_connectivity_records_inner(
                 record.clone(),
             );
         }
+    }
+    let retained_source_records = merged
+        .values()
+        .filter(|record| record.source_node_id == *source_node_id)
+        .count();
+    if retained_source_records > MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS {
+        return Err(NetworkError::ClusterConnectivityRecordLimit {
+            source_node_id: source_node_id.clone(),
+            observed_records: retained_source_records,
+            max_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+        });
     }
     let mut merged = merged.into_values().collect::<Vec<_>>();
     sort_cluster_connectivity_records(&mut merged);
@@ -5176,6 +5211,7 @@ pub fn cluster_connectivity_sync_ops(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
+    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
     let snapshot = read_cluster_kv_cached_snapshot(paths)?;
     cluster_connectivity_sync_ops_from_snapshot(snapshot.as_ref(), source_node_id, records, now)
@@ -5225,6 +5261,7 @@ pub fn cluster_connectivity_full_sync_ops(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<Vec<KvOp>, NetworkError> {
+    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
     let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
     cluster_connectivity_full_sync_ops_from_snapshot(
@@ -5241,6 +5278,7 @@ pub fn cluster_connectivity_full_sync_batch_ops(
     records: &[ClusterConnectivityRecord],
     max_ops: usize,
 ) -> Result<Vec<KvOp>, NetworkError> {
+    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
     let snapshot = read_cluster_kv_current_snapshot_arc(paths)?;
     cluster_connectivity_full_sync_batch_ops_from_snapshot(
@@ -5364,6 +5402,7 @@ pub fn cluster_connectivity_sync_is_noop(
     source_node_id: &NodeId,
     records: &[ClusterConnectivityRecord],
 ) -> Result<bool, NetworkError> {
+    validate_cluster_connectivity_records_for_source(source_node_id, records)?;
     let now = OffsetDateTime::now_utc();
     let incoming_keys: BTreeSet<String> = records
         .iter()

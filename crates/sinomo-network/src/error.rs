@@ -61,6 +61,21 @@ pub enum NetworkError {
     #[error("cluster is read-only: {detail}")]
     ClusterReadOnly { detail: String },
     #[error(
+        "cluster connectivity record source mismatch: expected {expected_source_node_id}, got {record_source_node_id}"
+    )]
+    ClusterConnectivitySourceMismatch {
+        expected_source_node_id: NodeId,
+        record_source_node_id: NodeId,
+    },
+    #[error(
+        "too many cluster connectivity records for {source_node_id}: {observed_records} records; max {max_records}"
+    )]
+    ClusterConnectivityRecordLimit {
+        source_node_id: NodeId,
+        observed_records: usize,
+        max_records: usize,
+    },
+    #[error(
         "certificate node {certificate_node_id} does not match material node {material_node_id}"
     )]
     CertificateNodeMismatch {

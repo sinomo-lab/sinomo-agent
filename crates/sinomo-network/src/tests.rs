@@ -1,5 +1,8 @@
 use crate::prelude::*;
-use crate::storage::{MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS};
+use crate::storage::{
+    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
+};
 use crate::*;
 
 use sinomo_core::{
@@ -1690,6 +1693,127 @@ fn local_connectivity_records_are_in_memory_not_disk() {
     assert_eq!(
         read_cluster_connectivity_graph(&paths).expect("read merged graph"),
         vec![record]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_connectivity_cache_rejects_mismatched_source_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-source-mismatch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_source_mismatch").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_source_mismatch_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_source_mismatch_b").expect("node b");
+    let wrong_source =
+        NodeId::from_legacy_named("node_conn_source_mismatch_wrong").expect("wrong source");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity source mismatch",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.64:21353".to_string(), 10);
+    let mut record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    record.source_node_id = wrong_source.clone();
+
+    let error = write_local_cluster_connectivity_records(&paths, &node_a, &[record])
+        .expect_err("mismatched source should be rejected");
+    assert_eq!(
+        error,
+        NetworkError::ClusterConnectivitySourceMismatch {
+            expected_source_node_id: node_a,
+            record_source_node_id: wrong_source,
+        }
+    );
+    assert!(
+        !local_cluster_connectivity_record_cache_contains_for_test(&paths),
+        "rejected records must not allocate a per-root connectivity cache"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_connectivity_cache_rejects_oversized_source_record_sets() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-source-limit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_source_limit").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_source_limit_a").expect("node a");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity source limit",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let mut records = Vec::new();
+    for index in 0..=MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS {
+        let target_node =
+            NodeId::from_legacy_named(format!("node_conn_source_limit_target_{index:05}"))
+                .expect("target");
+        let endpoint = daemon_lan_endpoint(
+            &target_node,
+            format!("10.0.{}.{}:21353", index / 255, index % 255),
+            10,
+        );
+        records.push(cluster_connectivity_record(
+            &state,
+            &endpoint,
+            ClusterConnectivityState::Healthy,
+            Some(4),
+            0,
+            Some("ok".to_string()),
+            None,
+            now,
+            600,
+        ));
+    }
+
+    let error = write_local_cluster_connectivity_record_set(&paths, &node_a, &records)
+        .expect_err("oversized source record set should be rejected");
+    assert_eq!(
+        error,
+        NetworkError::ClusterConnectivityRecordLimit {
+            source_node_id: node_a,
+            observed_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS + 1,
+            max_records: MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+        }
+    );
+    assert!(
+        !local_cluster_connectivity_record_cache_contains_for_test(&paths),
+        "rejected oversized records must not be retained in memory"
     );
 
     std::fs::remove_dir_all(root).ok();

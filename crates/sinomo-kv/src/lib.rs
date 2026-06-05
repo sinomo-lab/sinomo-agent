@@ -2295,9 +2295,11 @@ impl InProcessKvStore {
 
 /// Compares two snapshots by their durable key/value/lease state, ignoring the
 /// top-level revision, per-entry revision metadata (`create_revision`,
-/// `modify_revision`, `version`), lease decay (`remaining_ticks`, `granted_at`),
-/// and the watch-event tail. Two snapshots that are durable-equal materialize to
-/// the same observable KV state, so there is no need to rewrite the persisted file.
+/// `modify_revision`, `version`), lease grant wall-clock timestamps, and the
+/// watch-event tail. Lease `remaining_ticks` is intentionally durable: once lease
+/// ticking starts, skipping that field would let a restart resurrect expired time.
+/// Two snapshots that are durable-equal materialize to the same observable KV
+/// state, so there is no need to rewrite the persisted file.
 pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
     if left.entries.len() != right.entries.len() || left.leases.len() != right.leases.len() {
         return false;
@@ -2316,11 +2318,11 @@ pub fn kv_snapshot_durable_eq(left: &KvSnapshot, right: &KvSnapshot) -> bool {
     let left_leases = left
         .leases
         .iter()
-        .map(|lease| (&lease.lease_id, lease.ttl_ticks));
+        .map(|lease| (&lease.lease_id, lease.ttl_ticks, lease.remaining_ticks));
     let right_leases = right
         .leases
         .iter()
-        .map(|lease| (&lease.lease_id, lease.ttl_ticks));
+        .map(|lease| (&lease.lease_id, lease.ttl_ticks, lease.remaining_ticks));
     left_leases.eq(right_leases)
 }
 
@@ -6488,6 +6490,64 @@ mod tests {
                 .expect("a")
                 .value,
             b"two"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_persists_lease_decay() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-lease-decay-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let mut store = InProcessKvStore::new();
+        store
+            .apply_op(KvOp::LeaseGrant {
+                lease_id: LeaseId(1),
+                ttl_ticks: 10,
+            })
+            .expect("lease");
+        store
+            .put("/lease/live", b"yes".to_vec(), Some(LeaseId(1)))
+            .expect("put leased");
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("initial write")
+        );
+
+        store.tick_leases(4).expect("age lease");
+        assert_eq!(
+            store
+                .snapshot()
+                .leases
+                .iter()
+                .find(|lease| lease.lease_id == LeaseId(1))
+                .expect("aged lease")
+                .remaining_ticks,
+            6
+        );
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("lease decay write"),
+            "lease countdown state is restart-visible and must be persisted"
+        );
+
+        let restored = cache.read_store().expect("read");
+        assert_eq!(
+            restored
+                .snapshot()
+                .leases
+                .iter()
+                .find(|lease| lease.lease_id == LeaseId(1))
+                .expect("restored lease")
+                .remaining_ticks,
+            6
         );
         std::fs::remove_dir_all(root).ok();
     }

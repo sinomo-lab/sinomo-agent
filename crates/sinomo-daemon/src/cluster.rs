@@ -81,6 +81,13 @@ pub const CLUSTER_CONNECTIVITY_FAILURE_THRESHOLD: u16 = 3;
 const CLUSTER_CONNECTIVITY_PROBE_MAX_ENDPOINTS_PER_TICK: usize = 32;
 const CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 const CLUSTER_RAFT_ELECTION_TERM_BUMP: u64 = 64;
+const PUBLISHED_NODE_CACHE_MAX_ENTRIES: usize = sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+const PUBLISHED_CONNECTIVITY_CACHE_MAX_SOURCES: usize =
+    sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
+const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE: usize =
+    sinomo_network::MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS;
+const PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS: usize =
+    sinomo_network::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
 static CLUSTER_RAFT_FANOUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_FANOUT_PENDING: AtomicBool = AtomicBool::new(false);
 static CLUSTER_RAFT_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -88,11 +95,92 @@ static PUBLISHED_NETWORK_INFO: OnceLock<Mutex<BTreeMap<String, ClusterNetworkInf
     OnceLock::new();
 static PUBLISHED_NODE_STATUS: OnceLock<Mutex<BTreeMap<String, ClusterNodeStatusRecord>>> =
     OnceLock::new();
-static PUBLISHED_CONNECTIVITY: OnceLock<Mutex<BTreeMap<String, ClusterConnectivityRecord>>> =
+static PUBLISHED_CONNECTIVITY: OnceLock<Mutex<BTreeMap<String, PublishedConnectivitySourceCache>>> =
     OnceLock::new();
+
+#[derive(Clone, Debug, Default)]
+struct PublishedConnectivitySourceCache {
+    records: BTreeMap<String, ClusterConnectivityRecord>,
+}
 
 fn publish_cache_key(paths: &ClusterPaths, node_id: &NodeId) -> String {
     format!("{}:{node_id}", paths.root.display())
+}
+
+fn insert_bounded_published_cache<T>(
+    cache: &mut BTreeMap<String, T>,
+    key: String,
+    value: T,
+    max_entries: usize,
+) {
+    if !cache.contains_key(&key) {
+        while cache.len() >= max_entries {
+            let Some(oldest) = cache.keys().next().cloned() else {
+                break;
+            };
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, value);
+}
+
+fn published_connectivity_cache_record_count(
+    cache: &BTreeMap<String, PublishedConnectivitySourceCache>,
+) -> usize {
+    cache.values().map(|source| source.records.len()).sum()
+}
+
+fn ensure_published_connectivity_source(
+    cache: &mut BTreeMap<String, PublishedConnectivitySourceCache>,
+    source_prefix: String,
+) {
+    if cache.contains_key(&source_prefix) {
+        return;
+    }
+    while cache.len() >= PUBLISHED_CONNECTIVITY_CACHE_MAX_SOURCES {
+        let Some(oldest) = cache.keys().next().cloned() else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(source_prefix, PublishedConnectivitySourceCache::default());
+}
+
+fn trim_published_connectivity_cache_records(
+    cache: &mut BTreeMap<String, PublishedConnectivitySourceCache>,
+    protected_source_prefix: &str,
+) {
+    while published_connectivity_cache_record_count(cache)
+        > PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS
+    {
+        let evict_source = cache
+            .iter()
+            .find(|(source_prefix, source)| {
+                source_prefix.as_str() != protected_source_prefix && !source.records.is_empty()
+            })
+            .map(|(source_prefix, _)| source_prefix.clone())
+            .or_else(|| {
+                cache
+                    .keys()
+                    .find(|source_prefix| source_prefix.as_str() != protected_source_prefix)
+                    .cloned()
+            });
+        if let Some(source_prefix) = evict_source {
+            cache.remove(&source_prefix);
+            continue;
+        }
+
+        let Some(source) = cache.get_mut(protected_source_prefix) else {
+            break;
+        };
+        while source.records.len() > PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS {
+            let Some(key) = source.records.keys().next().cloned() else {
+                break;
+            };
+            source.records.remove(&key);
+        }
+        break;
+    }
 }
 
 fn lock_cluster_raft_operation() -> Result<std::sync::MutexGuard<'static, ()>, DaemonError> {
@@ -150,7 +238,12 @@ fn remember_network_info(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) 
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
-        cache.insert(key, info.clone());
+        insert_bounded_published_cache(
+            &mut cache,
+            key,
+            info.clone(),
+            PUBLISHED_NODE_CACHE_MAX_ENTRIES,
+        );
     }
 }
 
@@ -177,7 +270,12 @@ fn remember_node_status(paths: &ClusterPaths, status: &ClusterNodeStatusRecord) 
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
     {
-        cache.insert(key, status.clone());
+        insert_bounded_published_cache(
+            &mut cache,
+            key,
+            status.clone(),
+            PUBLISHED_NODE_CACHE_MAX_ENTRIES,
+        );
     }
 }
 
@@ -196,15 +294,22 @@ fn connectivity_cache_key(paths: &ClusterPaths, record: &ClusterConnectivityReco
 #[cfg(test)]
 fn cached_connectivity_matches(paths: &ClusterPaths, record: &ClusterConnectivityRecord) -> bool {
     let key = connectivity_cache_key(paths, record);
+    let source_prefix = connectivity_cache_source_prefix(paths, &record.source_node_id);
     let now = OffsetDateTime::now_utc();
     PUBLISHED_CONNECTIVITY
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            cache.get(&key).is_some_and(|known| {
-                sinomo_network::cluster_connectivity_stable_eq(known, record)
-                    && !sinomo_network::cluster_network_record_should_refresh(known.expires_at, now)
-            })
+            cache
+                .get(&source_prefix)
+                .and_then(|source| source.records.get(&key))
+                .is_some_and(|known| {
+                    sinomo_network::cluster_connectivity_stable_eq(known, record)
+                        && !sinomo_network::cluster_network_record_should_refresh(
+                            known.expires_at,
+                            now,
+                        )
+                })
         })
 }
 
@@ -231,15 +336,19 @@ fn cached_connectivity_record_set_matches(
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
         .is_ok_and(|cache| {
-            if cache
+            let Some(source) = cache.get(&source_prefix) else {
+                return false;
+            };
+            if source
+                .records
                 .keys()
-                .any(|key| key.starts_with(&source_prefix) && !incoming_keys.contains(key))
+                .any(|key| !incoming_keys.contains(key))
             {
                 return false;
             }
             records.iter().all(|record| {
                 let key = connectivity_cache_key(paths, record);
-                cache.get(&key).is_some_and(|known| {
+                source.records.get(&key).is_some_and(|known| {
                     sinomo_network::cluster_connectivity_stable_eq(known, record)
                         && !sinomo_network::cluster_network_record_should_refresh(
                             known.expires_at,
@@ -272,7 +381,21 @@ fn remember_connectivity_records(paths: &ClusterPaths, records: &[ClusterConnect
         .lock()
     {
         for record in records {
-            cache.insert(connectivity_cache_key(paths, record), record.clone());
+            let source_prefix = connectivity_cache_source_prefix(paths, &record.source_node_id);
+            {
+                ensure_published_connectivity_source(&mut cache, source_prefix.clone());
+                let source = cache
+                    .get_mut(&source_prefix)
+                    .expect("published connectivity source was inserted");
+                let key = connectivity_cache_key(paths, record);
+                if !source.records.contains_key(&key)
+                    && source.records.len() >= PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE
+                {
+                    source.records.clear();
+                }
+                source.records.insert(key, record.clone());
+            }
+            trim_published_connectivity_cache_records(&mut cache, &source_prefix);
         }
     }
 }
@@ -287,14 +410,22 @@ fn remember_connectivity_record_set(
         .lock()
     {
         let source_prefix = connectivity_cache_source_prefix(paths, source_node_id);
-        let incoming_keys = records
-            .iter()
-            .map(|record| connectivity_cache_key(paths, record))
-            .collect::<BTreeSet<_>>();
-        cache.retain(|key, _| !key.starts_with(&source_prefix) || incoming_keys.contains(key));
-        for record in records {
-            cache.insert(connectivity_cache_key(paths, record), record.clone());
+        ensure_published_connectivity_source(&mut cache, source_prefix.clone());
+        {
+            let source = cache
+                .get_mut(&source_prefix)
+                .expect("published connectivity source was inserted");
+            source.records.clear();
+            if records.len() > PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS_PER_SOURCE {
+                return;
+            }
+            for record in records {
+                source
+                    .records
+                    .insert(connectivity_cache_key(paths, record), record.clone());
+            }
         }
+        trim_published_connectivity_cache_records(&mut cache, &source_prefix);
     }
 }
 
@@ -2973,6 +3104,7 @@ pub fn sync_cluster_network_info_to_kv(
         return Ok(None);
     }
     if sinomo_network::stored_cluster_network_info_matches(paths, &info)? {
+        remember_network_info(paths, &info);
         return Ok(None);
     }
     let mut state = sinomo_network::read_cluster_state(paths)?;
@@ -4461,6 +4593,107 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn published_cache_insert_is_bounded() {
+        let mut cache = BTreeMap::new();
+        insert_bounded_published_cache(&mut cache, "a".to_string(), 1, 2);
+        insert_bounded_published_cache(&mut cache, "b".to_string(), 2, 2);
+        insert_bounded_published_cache(&mut cache, "c".to_string(), 3, 2);
+
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.contains_key("a"));
+        assert_eq!(cache.get("b"), Some(&2));
+        assert_eq!(cache.get("c"), Some(&3));
+    }
+
+    #[test]
+    fn published_connectivity_cache_total_records_is_bounded() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = ClusterId::from_legacy_named("cluster_daemon_connectivity_total_cache")
+            .expect("cluster");
+        let record_a = ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: NodeId::from_legacy_named("node_daemon_total_cache_source_a")
+                .expect("source a"),
+            target_node_id: NodeId::from_legacy_named("node_daemon_total_cache_target_a")
+                .expect("target a"),
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_total_cache_a",
+            )
+            .expect("endpoint a"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.10:21353".to_string(),
+            state: sinomo_network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(4),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(300),
+        };
+        let record_b = ClusterConnectivityRecord {
+            cluster_id,
+            source_node_id: NodeId::from_legacy_named("node_daemon_total_cache_source_b")
+                .expect("source b"),
+            target_node_id: NodeId::from_legacy_named("node_daemon_total_cache_target_b")
+                .expect("target b"),
+            endpoint_id: sinomo_network::ClusterEndpointId::from_legacy_named(
+                "endpoint_daemon_total_cache_b",
+            )
+            .expect("endpoint b"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "192.0.2.11:21353".to_string(),
+            state: sinomo_network::ClusterConnectivityState::Healthy,
+            latency_ms: Some(5),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(300),
+        };
+        let source_a = "source-a".to_string();
+        let source_b = "source-b".to_string();
+        let mut source_a_records = BTreeMap::new();
+        for index in 0..PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS {
+            source_a_records.insert(format!("a-{index:04}"), record_a.clone());
+        }
+        let mut source_b_records = BTreeMap::new();
+        source_b_records.insert("b".to_string(), record_b);
+
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            source_a.clone(),
+            PublishedConnectivitySourceCache {
+                records: source_a_records,
+            },
+        );
+        cache.insert(
+            source_b.clone(),
+            PublishedConnectivitySourceCache {
+                records: source_b_records,
+            },
+        );
+
+        trim_published_connectivity_cache_records(&mut cache, &source_b);
+
+        assert!(
+            published_connectivity_cache_record_count(&cache)
+                <= PUBLISHED_CONNECTIVITY_CACHE_MAX_RECORDS,
+            "published connectivity cache must enforce a process-wide record cap"
+        );
+        assert!(
+            cache
+                .get(&source_b)
+                .and_then(|source| source.records.get("b"))
+                .is_some(),
+            "the source that was just published should be preserved when trimming"
+        );
+        assert!(
+            !cache.contains_key(&source_a),
+            "older non-protected sources should be evicted first"
+        );
+    }
+
     fn assert_daemon_range_limit(error: DaemonError, prefix: &str) {
         let detail = match error {
             DaemonError::Parse { detail } => detail,
@@ -5692,6 +5925,78 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_record_set_cache_distinguishes_unknown_empty_source() {
+        let root = unique_cluster_test_root("sinomo-daemon-connectivity-empty-source-cache");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let source_node =
+            NodeId::from_legacy_named("node_daemon_empty_source_cache").expect("source");
+
+        assert!(
+            !cached_connectivity_record_set_matches(&paths, &source_node, &[]),
+            "an unknown source must not be treated as a known empty published set"
+        );
+        remember_connectivity_record_set(&paths, &source_node, &[]);
+        assert!(
+            cached_connectivity_record_set_matches(&paths, &source_node, &[]),
+            "an explicitly synced empty source can be cached"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stored_network_info_match_populates_publish_cache() {
+        let root = unique_cluster_test_root("sinomo-daemon-network-info-cache");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("paths");
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_daemon_network_info_cache").expect("cluster");
+        let local_node =
+            NodeId::from_legacy_named("node_daemon_network_info_cache_local").expect("local");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "network info cache",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let info = sinomo_network::build_cluster_network_info_record(
+            &state,
+            &local_node,
+            now,
+            CLUSTER_NETWORK_INFO_TTL_SECONDS,
+        );
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(
+                sinomo_network::cluster_network_info_key(&local_node),
+                &info,
+                None,
+            )
+            .expect("seed network info");
+        sinomo_network::write_cluster_kv_snapshot(&paths, &store.snapshot())
+            .expect("write matching snapshot");
+
+        assert!(
+            sync_cluster_network_info_to_kv(&paths, info.clone())
+                .expect("stored match")
+                .is_none()
+        );
+        std::fs::remove_file(&paths.kv_snapshot).expect("remove snapshot");
+        assert!(
+            sync_cluster_network_info_to_kv(&paths, info)
+                .expect("cached match without snapshot")
+                .is_none(),
+            "stored-match caching should avoid repeated stable KV snapshot reads"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn connectivity_probe_state_is_source_local_even_for_non_voters() {
         let root = unique_cluster_test_root("sinomo-daemon-connectivity-non-voter");
         let data_dir = SinomoDataDir::new(&root);
@@ -6037,13 +6342,45 @@ mod tests {
                 600,
             ));
         }
-        sinomo_network::sync_cluster_connectivity_records_to_kv(
-            &paths,
-            &local_node,
-            stale_records.clone(),
-        )
-        .expect("seed stale connectivity");
-        remember_connectivity_record_set(&paths, &local_node, &stale_records);
+        let mut stale_ops = Vec::new();
+        for record in &stale_records {
+            stale_ops.push(
+                KvOp::put_serde(
+                    sinomo_network::cluster_connectivity_key(
+                        &record.source_node_id,
+                        &record.target_node_id,
+                        &record.endpoint_id,
+                    ),
+                    record,
+                    None,
+                )
+                .expect("stale connectivity put op"),
+            );
+            if stale_ops.len() >= sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND {
+                sinomo_network::append_cluster_raft_command(
+                    &paths,
+                    &local_node,
+                    KvCommand::Txn(KvTxn {
+                        compares: Vec::new(),
+                        success: std::mem::take(&mut stale_ops),
+                        failure: Vec::new(),
+                    }),
+                )
+                .expect("seed stale connectivity batch");
+            }
+        }
+        if !stale_ops.is_empty() {
+            sinomo_network::append_cluster_raft_command(
+                &paths,
+                &local_node,
+                KvCommand::Txn(KvTxn {
+                    compares: Vec::new(),
+                    success: stale_ops,
+                    failure: Vec::new(),
+                }),
+            )
+            .expect("seed final stale connectivity batch");
+        }
 
         sync_cluster_connectivity_records_to_kv(&paths, &local_node, Vec::new())
             .expect("delete stale connectivity in batches");
