@@ -13554,6 +13554,51 @@ fn delivery_ledger_reconciles_sent_records_missing_ack_deadlines() {
 }
 
 #[test]
+fn delivery_ledger_reconciles_all_sent_records_missing_ack_deadlines() {
+    let node_a = NodeId::from_legacy_named("node_orphan_ack_drain_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_orphan_ack_drain_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 4);
+    let now = Instant::now();
+
+    for index in 1..=3 {
+        let event = fixture_event(&format!("evt_orphan_ack_drain_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Interactive,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+        ledger
+            .mark_sent_at(RouteDeliveryId(index), now)
+            .expect("mark sent");
+        ledger.clear_ack_deadline_for_test(RouteDeliveryId(index));
+    }
+
+    assert_eq!(
+        ledger.expire_ack_deadlines_at(now),
+        3,
+        "orphaned sent reconciliation should drain every indexed delivery"
+    );
+    for index in 1..=3 {
+        assert_eq!(
+            ledger
+                .record(&RouteDeliveryId(index))
+                .expect("record")
+                .delivery
+                .status,
+            DeliveryStatus::Retrying
+        );
+    }
+    assert!(
+        ledger.next_outbound_wake_at_at(now).expect("retry wake") > now,
+        "reconciled work should sleep until retry backoff"
+    );
+}
+
+#[test]
 fn delivery_ledger_ack_clears_sent_deadline() {
     let node_a = NodeId::from_legacy_named("node_ack_deadline_source").expect("node");
     let node_b = NodeId::from_legacy_named("node_ack_deadline_target").expect("node");
@@ -14144,6 +14189,121 @@ fn delivery_ledger_target_transitions_skip_unrelated_backlog() {
         ledger.ready_delivery_ids_limited(1),
         vec![RouteDeliveryId(6)],
         "recovered target work should become ready without touching unrelated backlog"
+    );
+}
+
+#[test]
+fn delivery_ledger_target_transitions_skip_delivered_history_for_same_target() {
+    let node_a = NodeId::from_legacy_named("node_ledger_target_history_source").expect("node");
+    let target = NodeId::from_legacy_named("node_ledger_target_history_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 32);
+
+    for index in 1..=8 {
+        let event = fixture_event(
+            &format!("evt_ledger_target_history_{index}"),
+            node_a.clone(),
+        );
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: target.clone(),
+            latency_class: LatencyClass::Background,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event.clone()).expect("enqueue");
+        ledger.mark_sent(RouteDeliveryId(index)).expect("mark sent");
+        ledger
+            .ack(RouteDeliveryId(index), &event.event_id, &target)
+            .expect("ack delivered");
+    }
+
+    let event = fixture_event("evt_ledger_target_history_active", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(100),
+        event_sequence: EventSequence(100),
+        event_id: event.event_id.clone(),
+        target_node_id: target.clone(),
+        latency_class: LatencyClass::Reactive,
+        status: DeliveryStatus::Queued,
+    };
+    ledger.enqueue(delivery, event).expect("enqueue active");
+
+    let mut inspected = 0;
+    assert_eq!(
+        ledger.mark_target_waiting_for_peer_counting_for_test(&target, &mut inspected),
+        1
+    );
+    assert_eq!(
+        inspected, 1,
+        "offline transitions should skip retained delivered history for the same target"
+    );
+
+    inspected = 0;
+    assert_eq!(
+        ledger.requeue_target_after_recovery_counting_for_test(&target, &mut inspected),
+        1
+    );
+    assert_eq!(
+        inspected, 1,
+        "recovery transitions should skip retained delivered history for the same target"
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_limited(1),
+        vec![RouteDeliveryId(100)]
+    );
+}
+
+#[test]
+fn delivery_ledger_mark_for_retry_updates_target_transition_indexes() {
+    let node_a = NodeId::from_legacy_named("node_ledger_retry_index_source").expect("node");
+    let target = NodeId::from_legacy_named("node_ledger_retry_index_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 8);
+    let event = fixture_event("evt_ledger_retry_index", node_a);
+    let delivery = RouteDelivery {
+        delivery_id: RouteDeliveryId(1),
+        event_sequence: EventSequence(1),
+        event_id: event.event_id.clone(),
+        target_node_id: target.clone(),
+        latency_class: LatencyClass::Interactive,
+        status: DeliveryStatus::Queued,
+    };
+
+    ledger.enqueue(delivery, event).expect("enqueue");
+    ledger
+        .mark_for_retry(RouteDeliveryId(1))
+        .expect("mark retry");
+
+    let mut inspected = 0;
+    assert_eq!(
+        ledger.mark_target_waiting_for_peer_counting_for_test(&target, &mut inspected),
+        1
+    );
+    assert_eq!(
+        inspected, 1,
+        "retrying work should remain in the target offline-transition index"
+    );
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(1))
+            .expect("record")
+            .delivery
+            .status,
+        DeliveryStatus::WaitingForPeer
+    );
+
+    inspected = 0;
+    assert_eq!(
+        ledger.requeue_target_after_recovery_counting_for_test(&target, &mut inspected),
+        1
+    );
+    assert_eq!(
+        inspected, 1,
+        "waiting work should remain in the target recovery-transition index"
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_limited(1),
+        vec![RouteDeliveryId(1)]
     );
 }
 

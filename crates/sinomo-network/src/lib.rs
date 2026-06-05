@@ -119,7 +119,7 @@ pub(crate) mod prelude {
         daemon_loopback_endpoint_id, main_daemon_capabilities, shadow_daemon_capabilities,
         shadow_daemon_node_id,
     };
-    pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    pub(crate) use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
     pub(crate) use std::fs;
     pub(crate) use std::io::{self, Write};
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};

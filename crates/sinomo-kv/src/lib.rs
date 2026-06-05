@@ -3073,6 +3073,22 @@ impl ReplicatedKvNode {
             .unwrap_or(self.snapshot_term)
     }
 
+    fn log_position(&self, index: u64) -> Option<usize> {
+        self.log
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+    }
+
+    fn log_entry_at(&self, index: u64) -> Option<&KvLogEntry> {
+        self.log_position(index)
+            .and_then(|position| self.log.get(position))
+    }
+
+    fn log_entry_at_mut(&mut self, index: u64) -> Option<&mut KvLogEntry> {
+        let position = self.log_position(index)?;
+        self.log.get_mut(position)
+    }
+
     fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);
@@ -3080,10 +3096,45 @@ impl ReplicatedKvNode {
         if index == self.snapshot_index {
             return Some(self.snapshot_term);
         }
-        self.log
-            .iter()
-            .find(|entry| entry.index == index)
-            .map(|entry| entry.term)
+        self.log_entry_at(index).map(|entry| entry.term)
+    }
+
+    fn read_only_append_entries_response(
+        &self,
+        request: &RaftAppendEntriesRequest,
+    ) -> Option<RaftAppendEntriesResponse> {
+        if request.term < self.hard_state.current_term {
+            return Some(RaftAppendEntriesResponse {
+                term: self.hard_state.current_term,
+                success: false,
+                match_index: self.last_log_index(),
+            });
+        }
+
+        if request.term != self.hard_state.current_term
+            || self.hard_state.leader_id.as_ref() != Some(&request.leader_id)
+            || !request.entries.is_empty()
+        {
+            return None;
+        }
+
+        if self.term_at(request.prev_log_index) != Some(request.prev_log_term) {
+            return Some(RaftAppendEntriesResponse {
+                term: self.hard_state.current_term,
+                success: false,
+                match_index: self.last_log_index(),
+            });
+        }
+
+        if request.leader_commit > self.hard_state.commit_index {
+            return None;
+        }
+
+        Some(RaftAppendEntriesResponse {
+            term: self.hard_state.current_term,
+            success: true,
+            match_index: self.last_log_index(),
+        })
     }
 
     /// Loads persisted WAL entries on open. Entries beyond the installed snapshot
@@ -3136,38 +3187,37 @@ impl ReplicatedKvNode {
         for entry in entries {
             validate_kv_command_payload(&entry.command)?;
             if entry.index <= self.applied_index {
-                if let Some(existing) = self
-                    .log
-                    .iter()
-                    .find(|candidate| candidate.index == entry.index)
+                if let Some(existing) = self.log_entry_at(entry.index)
                     && (existing.term != entry.term || existing.command != entry.command)
                 {
                     return Err(KvError::ConflictingLogEntry { index: entry.index });
                 }
                 continue;
             }
-            if let Some(existing_position) = self
+            match self
                 .log
-                .iter()
-                .position(|candidate| candidate.index == entry.index)
+                .binary_search_by_key(&entry.index, |candidate| candidate.index)
             {
-                if self.log[existing_position].term != entry.term {
+                Ok(existing_position) if self.log[existing_position].term != entry.term => {
                     self.log.truncate(existing_position);
                     self.log.push(entry.clone());
                     appended.push(entry);
-                } else if self.log[existing_position].command != entry.command {
+                }
+                Ok(existing_position) if self.log[existing_position].command != entry.command => {
                     return Err(KvError::ConflictingLogEntry { index: entry.index });
                 }
-            } else {
-                let expected = self.last_log_index().saturating_add(1);
-                if entry.index != expected {
-                    return Err(KvError::LogGap {
-                        expected,
-                        actual: entry.index,
-                    });
+                Ok(_) => {}
+                Err(_) => {
+                    let expected = self.last_log_index().saturating_add(1);
+                    if entry.index != expected {
+                        return Err(KvError::LogGap {
+                            expected,
+                            actual: entry.index,
+                        });
+                    }
+                    self.log.push(entry.clone());
+                    appended.push(entry);
                 }
-                self.log.push(entry.clone());
-                appended.push(entry);
             }
         }
         Ok(appended)
@@ -3299,12 +3349,13 @@ impl ReplicatedKvNode {
                 index: last_log_index.saturating_add(1),
             });
         }
-        let entries = self
+        let start = self
             .log
-            .iter()
-            .filter(|entry| entry.index > self.applied_index && entry.index <= commit_index)
-            .cloned()
-            .collect::<Vec<_>>();
+            .partition_point(|entry| entry.index <= self.applied_index);
+        let end = self
+            .log
+            .partition_point(|entry| entry.index <= commit_index);
+        let entries = self.log[start..end].to_vec();
         let mut expected_index = self.applied_index.saturating_add(1);
         for entry in &entries {
             if entry.index != expected_index {
@@ -3343,11 +3394,7 @@ impl ReplicatedKvNode {
     ) -> Result<(), KvError> {
         for entry in entries {
             let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
-            if let Some(log_entry) = self
-                .log
-                .iter_mut()
-                .find(|candidate| candidate.index == entry.index)
-            {
+            if let Some(log_entry) = self.log_entry_at_mut(entry.index) {
                 log_entry.revision = revision;
             }
             if let Some(response) = txn_response {
@@ -3627,6 +3674,10 @@ impl DurableRaftKvNode {
         &mut self,
         request: RaftAppendEntriesRequest,
     ) -> Result<RaftAppendEntriesResponse, KvError> {
+        if let Some(response) = self.node.read_only_append_entries_response(&request) {
+            return Ok(response);
+        }
+
         let hard_state_before = self.node.hard_state.clone();
         let log_before = self.node.log.clone();
         let txn_responses_before = self.node.txn_responses.clone();
@@ -8674,6 +8725,91 @@ mod tests {
             .expect("hard state modified after");
 
         assert_eq!(before, after);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn durable_raft_unchanged_heartbeat_with_wal_tail_does_not_rewrite_files() {
+        let root = temp_raft_root("sinomo-kv-unchanged-heartbeat-wal");
+        let follower_id =
+            NodeId::from_legacy_named("node_unchanged_heartbeat_wal_follower").expect("node");
+        let leader_id =
+            NodeId::from_legacy_named("node_unchanged_heartbeat_wal_leader").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let entry = KvLogEntry {
+            index: 1,
+            term: 2,
+            command: KvCommand::Op(KvOp::Put {
+                key: "/config/heartbeat-wal".to_string(),
+                value: b"reachable".to_vec(),
+                lease_id: None,
+            }),
+            revision: KvRevision::ZERO,
+        };
+
+        {
+            let mut follower =
+                DurableRaftKvNode::open(follower_id.clone(), paths.clone()).expect("open");
+            let response = follower
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 2,
+                    leader_id: leader_id.clone(),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![entry],
+                    leader_commit: 0,
+                })
+                .expect("append leader entry");
+            assert!(response.success);
+            let response = follower
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 2,
+                    leader_id: leader_id.clone(),
+                    prev_log_index: 1,
+                    prev_log_term: 2,
+                    entries: Vec::new(),
+                    leader_commit: 1,
+                })
+                .expect("commit leader entry");
+            assert!(response.success);
+        }
+
+        let hard_state_before = fs::metadata(&paths.hard_state)
+            .expect("hard state metadata")
+            .modified()
+            .expect("hard state modified");
+        let wal_before = fs::metadata(&paths.wal)
+            .expect("wal metadata")
+            .modified()
+            .expect("wal modified");
+        thread::sleep(Duration::from_millis(20));
+
+        {
+            let mut follower = DurableRaftKvNode::open(follower_id, paths.clone()).expect("reopen");
+            let response = follower
+                .append_entries(RaftAppendEntriesRequest {
+                    term: 2,
+                    leader_id,
+                    prev_log_index: 1,
+                    prev_log_term: 2,
+                    entries: Vec::new(),
+                    leader_commit: 1,
+                })
+                .expect("unchanged heartbeat");
+            assert!(response.success);
+        }
+
+        let hard_state_after = fs::metadata(&paths.hard_state)
+            .expect("hard state metadata after")
+            .modified()
+            .expect("hard state modified after");
+        let wal_after = fs::metadata(&paths.wal)
+            .expect("wal metadata after")
+            .modified()
+            .expect("wal modified after");
+
+        assert_eq!(hard_state_before, hard_state_after);
+        assert_eq!(wal_before, wal_after);
         std::fs::remove_dir_all(root).ok();
     }
 
