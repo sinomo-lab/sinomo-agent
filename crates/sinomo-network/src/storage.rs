@@ -2650,6 +2650,19 @@ fn read_cluster_kv_cached_snapshot(paths: &ClusterPaths) -> Result<Arc<KvSnapsho
         .map_err(NetworkError::from)
 }
 
+fn read_cluster_kv_cached_snapshot_if_present(
+    paths: &ClusterPaths,
+) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
+    let snapshot = cluster_kv_local_cache(paths)
+        .cached_snapshot_arc_if_present()
+        .map_err(NetworkError::from)?;
+    #[cfg(test)]
+    if snapshot.is_some() {
+        record_cluster_kv_cached_snapshot_read_for_test(paths);
+    }
+    Ok(snapshot)
+}
+
 fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
     KvLocalCache::new(paths.kv_snapshot.clone(), paths.kv_raft.clone())
         .with_max_materialized_events(MAX_CLUSTER_KV_MATERIALIZED_EVENTS)
@@ -4124,10 +4137,9 @@ pub fn read_cluster_state_without_kv(
 pub fn read_cluster_members_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut members: Vec<ClusterMemberRecord> = Vec::new();
     for entry in
         snapshot.range_prefix_limited("/cluster/members/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
@@ -4158,10 +4170,9 @@ pub fn read_cluster_members_from_kv(
 pub fn read_cluster_endpoints_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?
         .into_values()
         .flatten()
@@ -4228,10 +4239,9 @@ fn read_cluster_capability_policies_from_snapshot(
 pub fn read_cluster_node_statuses_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNodeStatusRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
     for entry in snapshot
         .range_prefix_limited("/cluster/node-status/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
@@ -4245,10 +4255,9 @@ pub fn read_cluster_node_statuses_from_kv(
 pub fn read_cluster_module_rollout_statuses_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutStatusRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
     let prefix = cluster_module_rollout_node_prefix();
     for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
@@ -4266,10 +4275,9 @@ pub fn read_cluster_module_rollout_statuses_from_kv(
 pub fn read_cluster_module_rollout_desired_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutDesiredRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
     let prefix = cluster_module_rollout_desired_prefix();
     for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
@@ -4291,10 +4299,9 @@ pub fn read_cluster_module_rollout_desired_from_kv(
 pub fn read_cluster_module_rollout_reconciliations_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
     let prefix = cluster_module_rollout_reconcile_prefix();
     for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
@@ -4312,10 +4319,9 @@ pub fn read_cluster_module_rollout_reconciliations_from_kv(
 pub fn read_cluster_network_info_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNetworkInfoRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
     for entry in snapshot.range_prefix_limited(
@@ -4334,10 +4340,9 @@ pub fn read_cluster_network_info_from_kv(
 pub fn read_cluster_connectivity_graph_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in snapshot.range_prefix_limited(

@@ -9160,6 +9160,72 @@ fn cluster_kv_reader_node_id_cache_tracks_state_rewrites_and_removal() {
 }
 
 #[test]
+fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-metadata-no-snapshot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    assert!(
+        !paths.kv_snapshot.exists(),
+        "test setup should not create a materialized snapshot"
+    );
+
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+    assert!(
+        read_cluster_members_from_kv(&paths)
+            .expect("members")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_endpoints_from_kv(&paths)
+            .expect("endpoints")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_node_statuses_from_kv(&paths)
+            .expect("statuses")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_module_rollout_statuses_from_kv(&paths)
+            .expect("rollout statuses")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_module_rollout_desired_from_kv(&paths)
+            .expect("rollout desired")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_module_rollout_reconciliations_from_kv(&paths)
+            .expect("rollout reconciliations")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_network_info_from_kv(&paths)
+            .expect("network info")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .expect("connectivity")
+            .is_empty()
+    );
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        0,
+        "missing materialized snapshots should not be counted as cached snapshot reads"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
     let _guard = CLUSTER_KV_METADATA_CACHE_TEST_MUTEX
         .lock()

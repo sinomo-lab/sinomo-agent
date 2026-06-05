@@ -741,10 +741,31 @@ impl KvWalPaths {
     /// opening the full raft node. Opening the node replays the entire WAL — up to
     /// the retained tail, ~MBs — which is wasteful for read-only leadership/term
     /// queries that only need this tiny, atomically-rewritten file. The value is a
-    /// lock-free point read: it reflects the last durably persisted hard state and
-    /// is never torn (writes go through a temp-file rename). Defaults when absent.
+    /// cheap point read: it reflects the last durably persisted hard state and is
+    /// never torn (writes go through a temp-file rename). Defaults when absent.
     pub fn read_persisted_hard_state(&self) -> Result<RaftHardState, KvError> {
-        Ok(read_optional_object::<RaftHardState>(&self.hard_state)?.unwrap_or_default())
+        let identity = optional_file_identity(&self.hard_state);
+        if let Some(identity) = identity
+            && let Some(cached) = cache_lookup_hard_state(&self.hard_state, identity)
+        {
+            return Ok(cached);
+        }
+        #[cfg(test)]
+        record_persisted_hard_state_actual_read_for_test(&self.hard_state);
+        let hard_state =
+            read_optional_object::<RaftHardState>(&self.hard_state)?.unwrap_or_default();
+        if let Some(identity) = identity {
+            cache_store_hard_state(&self.hard_state, identity, hard_state.clone());
+        }
+        Ok(hard_state)
+    }
+
+    pub fn write_persisted_hard_state(&self, hard_state: &RaftHardState) -> Result<(), KvError> {
+        write_object_file(&self.hard_state, hard_state)?;
+        if let Some(identity) = optional_file_identity(&self.hard_state) {
+            cache_store_hard_state(&self.hard_state, identity, hard_state.clone());
+        }
+        Ok(())
     }
 }
 
@@ -765,10 +786,17 @@ struct RaftViewCacheEntry {
     last_used: u64,
 }
 
+struct HardStateCacheEntry {
+    identity: Option<FileIdentity>,
+    hard_state: RaftHardState,
+    last_used: u64,
+}
+
 static MATERIALIZED_SNAPSHOT_CACHE: OnceLock<
     Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>,
 > = OnceLock::new();
 static RAFT_VIEW_CACHE: OnceLock<Mutex<HashMap<PathBuf, RaftViewCacheEntry>>> = OnceLock::new();
+static HARD_STATE_CACHE: OnceLock<Mutex<HashMap<PathBuf, HardStateCacheEntry>>> = OnceLock::new();
 
 fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, MaterializedSnapshotCacheEntry>>
 {
@@ -777,6 +805,10 @@ fn materialized_snapshot_cache() -> &'static Mutex<HashMap<PathBuf, Materialized
 
 fn raft_view_cache() -> &'static Mutex<HashMap<PathBuf, RaftViewCacheEntry>> {
     RAFT_VIEW_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hard_state_cache() -> &'static Mutex<HashMap<PathBuf, HardStateCacheEntry>> {
+    HARD_STATE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Identity used to validate a cached file parse. Every persisted object/snapshot
@@ -821,6 +853,8 @@ fn file_ino(metadata: &fs::Metadata) -> u64 {
 }
 
 fn path_exists(path: &Path) -> Result<bool, KvError> {
+    #[cfg(test)]
+    record_durable_state_path_exists_probe_for_test(path);
     match fs::metadata(path) {
         Ok(_) => Ok(true),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -829,6 +863,44 @@ fn path_exists(path: &Path) -> Result<bool, KvError> {
             detail: source.to_string(),
         }),
     }
+}
+
+#[cfg(test)]
+static DURABLE_STATE_PATH_EXISTS_PROBES_FOR_TEST: OnceLock<Mutex<HashMap<PathBuf, u64>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn durable_state_path_exists_probes_for_test() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    DURABLE_STATE_PATH_EXISTS_PROBES_FOR_TEST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_durable_state_path_exists_probe_for_test(path: &Path) {
+    if let Ok(mut probes) = durable_state_path_exists_probes_for_test().lock() {
+        *probes.entry(path.to_path_buf()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+fn reset_durable_state_path_exists_probes_for_test(paths: &KvWalPaths) {
+    if let Ok(mut probes) = durable_state_path_exists_probes_for_test().lock() {
+        probes.remove(&paths.hard_state);
+        probes.remove(&paths.wal);
+        probes.remove(&paths.snapshot);
+    }
+}
+
+#[cfg(test)]
+fn durable_state_path_exists_probe_count_for_test(paths: &KvWalPaths) -> u64 {
+    durable_state_path_exists_probes_for_test()
+        .lock()
+        .ok()
+        .map(|probes| {
+            probes.get(&paths.hard_state).copied().unwrap_or_default()
+                + probes.get(&paths.wal).copied().unwrap_or_default()
+                + probes.get(&paths.snapshot).copied().unwrap_or_default()
+        })
+        .unwrap_or_default()
 }
 
 fn file_identity(path: &Path) -> Option<FileIdentity> {
@@ -855,12 +927,52 @@ fn optional_file_identity(path: &Path) -> Option<Option<FileIdentity>> {
     }
 }
 
+/// Returns `Some(None)` for an absent file, `Some(Some(identity))` for a
+/// cacheable present file, and `None` for a present file whose identity cannot be
+/// validated. Filesystem errors other than not-found are preserved for callers
+/// that use this to decide whether durable raft state exists.
+fn optional_file_identity_for_read(path: &Path) -> Result<Option<Option<FileIdentity>>, KvError> {
+    match fs::metadata(path) {
+        Ok(metadata) => {
+            let identity = FileIdentity {
+                mtime: metadata.modified().ok(),
+                len: metadata.len(),
+                ino: file_ino(&metadata),
+            };
+            Ok(identity.mtime.is_some().then_some(Some(identity)))
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(Some(None)),
+        Err(source) => Err(KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
 fn raft_view_identity(paths: &KvWalPaths) -> Option<RaftViewIdentity> {
     Some(RaftViewIdentity {
         hard_state: optional_file_identity(&paths.hard_state)?,
         wal: optional_file_identity(&paths.wal)?,
         snapshot: optional_file_identity(&paths.snapshot)?,
     })
+}
+
+fn raft_view_identity_for_read(
+    paths: &KvWalPaths,
+) -> Result<(bool, Option<RaftViewIdentity>), KvError> {
+    let hard_state = optional_file_identity_for_read(&paths.hard_state)?;
+    let wal = optional_file_identity_for_read(&paths.wal)?;
+    let snapshot = optional_file_identity_for_read(&paths.snapshot)?;
+    let has_durable_state = hard_state != Some(None) || wal != Some(None) || snapshot != Some(None);
+    let identity = match (hard_state, wal, snapshot) {
+        (Some(hard_state), Some(wal), Some(snapshot)) => Some(RaftViewIdentity {
+            hard_state,
+            wal,
+            snapshot,
+        }),
+        _ => None,
+    };
+    Ok((has_durable_state, identity))
 }
 
 fn kv_read_cache_tick() -> u64 {
@@ -886,6 +998,23 @@ fn evict_materialized_snapshot_cache_entry_if_needed(
 
 fn evict_raft_view_cache_entry_if_needed(
     guard: &mut HashMap<PathBuf, RaftViewCacheEntry>,
+    protected: &Path,
+) {
+    if guard.contains_key(protected) || guard.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = guard
+        .iter()
+        .filter(|(path, _)| path.as_path() != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        guard.remove(&path);
+    }
+}
+
+fn evict_hard_state_cache_entry_if_needed(
+    guard: &mut HashMap<PathBuf, HardStateCacheEntry>,
     protected: &Path,
 ) {
     if guard.contains_key(protected) || guard.len() < FILE_CACHE_CAPACITY {
@@ -929,6 +1058,67 @@ fn cache_store_snapshot(path: &Path, identity: FileIdentity, snapshot: Arc<KvSna
             },
         );
     }
+}
+
+fn cache_lookup_hard_state(path: &Path, identity: Option<FileIdentity>) -> Option<RaftHardState> {
+    let mut guard = hard_state_cache().lock().ok()?;
+    let entry = guard.get_mut(path)?;
+    if entry.identity != identity {
+        return None;
+    }
+    entry.last_used = kv_read_cache_tick();
+    let hard_state = entry.hard_state.clone();
+    drop(guard);
+    // Re-stat after cloning the cached hard state so a concurrent replace cannot
+    // slip between the caller's identity read and the return. If it changes after
+    // this check, the read linearizes before that change.
+    (optional_file_identity(path) == Some(identity)).then_some(hard_state)
+}
+
+fn cache_store_hard_state(path: &Path, identity: Option<FileIdentity>, hard_state: RaftHardState) {
+    if let Ok(mut guard) = hard_state_cache().lock() {
+        evict_hard_state_cache_entry_if_needed(&mut guard, path);
+        guard.insert(
+            path.to_path_buf(),
+            HardStateCacheEntry {
+                identity,
+                hard_state,
+                last_used: kv_read_cache_tick(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+static PERSISTED_HARD_STATE_READS_FOR_TEST: OnceLock<Mutex<HashMap<PathBuf, u64>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn persisted_hard_state_reads_for_test() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    PERSISTED_HARD_STATE_READS_FOR_TEST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_persisted_hard_state_actual_read_for_test(path: &Path) {
+    if let Ok(mut reads) = persisted_hard_state_reads_for_test().lock() {
+        *reads.entry(path.to_path_buf()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+fn reset_persisted_hard_state_actual_reads_for_test(path: &Path) {
+    if let Ok(mut reads) = persisted_hard_state_reads_for_test().lock() {
+        reads.remove(path);
+    }
+}
+
+#[cfg(test)]
+fn persisted_hard_state_actual_reads_for_test(path: &Path) -> u64 {
+    persisted_hard_state_reads_for_test()
+        .lock()
+        .ok()
+        .and_then(|reads| reads.get(path).copied())
+        .unwrap_or_default()
 }
 
 fn cache_lookup_raft_view(
@@ -1013,6 +1203,29 @@ impl KvMaterializedCache {
         Ok(snapshot)
     }
 
+    pub fn read_snapshot_arc_if_present(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        let identity = optional_file_identity_for_read(&self.path)?;
+        let cache_identity = match identity {
+            Some(Some(identity)) => Some(identity),
+            Some(None) => return Ok(None),
+            None => None,
+        };
+        if let Some(identity) = cache_identity
+            && let Some(cached) = cache_lookup_snapshot(&self.path, identity)
+        {
+            return Ok(Some(cached));
+        }
+        let Some(bytes) = read_optional_object_file_bytes(&self.path)? else {
+            return Ok(None);
+        };
+        let snapshot =
+            Arc::new(decode_object_file::<KvSnapshot>(&self.path, &bytes)?.canonicalized());
+        if let Some(identity) = cache_identity {
+            cache_store_snapshot(&self.path, identity, snapshot.clone());
+        }
+        Ok(Some(snapshot))
+    }
+
     pub fn read_snapshot(&self) -> Result<KvSnapshot, KvError> {
         let snapshot = self.read_snapshot_arc()?;
         Ok((*snapshot).clone())
@@ -1023,8 +1236,9 @@ impl KvMaterializedCache {
         node_id: NodeId,
         paths: KvWalPaths,
     ) -> Result<Arc<KvSnapshot>, KvError> {
-        if paths.has_durable_state()? {
-            if let Some(identity) = raft_view_identity(&paths)
+        let (has_durable_state, identity) = raft_view_identity_for_read(&paths)?;
+        if has_durable_state {
+            if let Some(identity) = identity
                 && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
             {
                 return Ok(snapshot);
@@ -1263,6 +1477,10 @@ impl KvLocalCache {
 
     pub fn cached_snapshot_arc(&self) -> Result<Arc<KvSnapshot>, KvError> {
         self.materialized.read_snapshot_arc()
+    }
+
+    pub fn cached_snapshot_arc_if_present(&self) -> Result<Option<Arc<KvSnapshot>>, KvError> {
+        self.materialized.read_snapshot_arc_if_present()
     }
 
     pub fn write_snapshot(&self, snapshot: &KvSnapshot) -> Result<(), KvError> {
@@ -3514,8 +3732,7 @@ impl DurableRaftKvNode {
         let lock = open_node_lock(&paths)?;
         lock_node_exclusive(&lock, &paths.lock, lock_wait)?;
         let snapshot = read_optional_object::<RaftSnapshot>(&paths.snapshot)?;
-        let hard_state: RaftHardState =
-            read_optional_object(&paths.hard_state)?.unwrap_or_default();
+        let hard_state = paths.read_persisted_hard_state()?;
         let mut node = if let Some(snapshot) = snapshot {
             let mut node = ReplicatedKvNode {
                 store: InProcessKvStore::new(),
@@ -3571,7 +3788,7 @@ impl DurableRaftKvNode {
         let commit_index = node.hard_state.commit_index;
         node.commit_to(commit_index)?;
         if repaired_hard_state {
-            write_object_file(&paths.hard_state, &node.hard_state)?;
+            paths.write_persisted_hard_state(&node.hard_state)?;
         }
         if truncated || load_truncated {
             rewrite_wal_entries(&paths.wal, &node.log)?;
@@ -3977,7 +4194,7 @@ impl DurableRaftKvNode {
     }
 
     fn persist_hard_state(&self) -> Result<(), KvError> {
-        write_object_file(&self.paths.hard_state, &self.node.hard_state)
+        self.paths.write_persisted_hard_state(&self.node.hard_state)
     }
 
     fn persist_hard_state_if_changed(&self, before: &RaftHardState) -> Result<(), KvError> {
@@ -4252,17 +4469,38 @@ fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvErro
 }
 
 fn read_optional_object<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, KvError> {
-    if !path.exists() {
+    let Some(bytes) = read_optional_object_file_bytes(path)? else {
         return Ok(None);
-    }
-    read_object_file(path).map(Some)
+    };
+    decode_object_file(path, &bytes).map(Some)
 }
 
 fn read_object_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, KvError> {
     let bytes = read_object_file_bytes(path)?;
+    decode_object_file(path, &bytes)
+}
+
+fn decode_object_file<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<T, KvError> {
     sinomo_object_serde::from_bytes(&bytes).map_err(|source| KvError::Serialization {
         detail: format!("{}: {source}", path.display()),
     })
+}
+
+fn read_optional_object_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, KvError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(KvError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    read_object_file_bytes_from_open_file(path, file).map(Some)
 }
 
 fn read_object_file_bytes(path: &Path) -> Result<Vec<u8>, KvError> {
@@ -4270,6 +4508,10 @@ fn read_object_file_bytes(path: &Path) -> Result<Vec<u8>, KvError> {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    read_object_file_bytes_from_open_file(path, file)
+}
+
+fn read_object_file_bytes_from_open_file(path: &Path, file: File) -> Result<Vec<u8>, KvError> {
     let len = file
         .metadata()
         .map_err(|source| KvError::Io {
@@ -4819,6 +5061,45 @@ mod tests {
         assert_eq!(
             leftovers, 0,
             "failed object replacement should not leave staged temp files"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_optional_object_returns_none_only_for_missing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-optional-objfile-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let missing_path = root.join("missing.sobj");
+        assert_eq!(
+            read_optional_object::<TestRecord>(&missing_path).expect("missing optional object"),
+            None
+        );
+
+        let record = TestRecord {
+            name: "alpha".to_string(),
+            count: 7,
+        };
+        let object_path = root.join("record.sobj");
+        write_object_file(&object_path, &record).expect("write object");
+        assert_eq!(
+            read_optional_object::<TestRecord>(&object_path).expect("present optional object"),
+            Some(record)
+        );
+
+        let directory_path = root.join("directory.sobj");
+        std::fs::create_dir(&directory_path).expect("directory");
+        let error =
+            read_optional_object::<TestRecord>(&directory_path).expect_err("directory is not none");
+        assert!(
+            error.to_string().contains("directory.sobj"),
+            "present unreadable objects should stay errors, got {error}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -6911,6 +7192,48 @@ mod tests {
     }
 
     #[test]
+    fn materialized_cache_optional_snapshot_read_handles_absent_present_and_invalid() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-materialized-optional-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        assert!(
+            cache
+                .read_snapshot_arc_if_present()
+                .expect("absent optional snapshot")
+                .is_none()
+        );
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put("alpha", b"one".to_vec(), None)
+            .expect("seed cache");
+        cache
+            .write_snapshot(&store.snapshot())
+            .expect("write materialized snapshot");
+        let snapshot = cache
+            .read_snapshot_arc_if_present()
+            .expect("present optional snapshot")
+            .expect("snapshot");
+        assert_eq!(snapshot.get("alpha").expect("alpha").value, b"one");
+
+        std::fs::remove_file(cache.path()).expect("remove snapshot");
+        std::fs::create_dir(cache.path()).expect("replace snapshot with directory");
+        let error = cache
+            .read_snapshot_arc_if_present()
+            .expect_err("directory is not absence");
+        assert!(
+            error.to_string().contains("kv-cache.sobj"),
+            "present invalid snapshots should stay errors, got {error}"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn materialized_cache_canonicalizes_external_snapshot_entries_on_read() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-kv-materialized-canonical-read-{}",
@@ -7014,6 +7337,54 @@ mod tests {
                 .expect("a")
                 .value,
             b"two"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_raft_view_read_skips_extra_durable_state_stats() {
+        let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
+        let root = temp_raft_root("sinomo-kv-raft-view-single-identity-probe");
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let wal_paths = KvWalPaths::new(root.join("raft"));
+        let node_id =
+            NodeId::from_legacy_named("node_raft_view_single_identity_probe").expect("node id");
+
+        {
+            let mut node = DurableRaftKvNode::open_with_materialized_cache(
+                node_id.clone(),
+                wal_paths.clone(),
+                &cache,
+            )
+            .expect("open durable node");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/raft-view/single-probe".to_string(),
+                        value: b"value".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append command");
+            node.commit_to(entry.index).expect("commit command");
+        }
+
+        reset_durable_state_path_exists_probes_for_test(&wal_paths);
+        let snapshot = cache
+            .read_snapshot_with_raft_view(node_id, wal_paths.clone())
+            .expect("read raft view");
+        assert_eq!(
+            snapshot
+                .get("/raft-view/single-probe")
+                .expect("committed value")
+                .value,
+            b"value"
+        );
+        assert_eq!(
+            durable_state_path_exists_probe_count_for_test(&wal_paths),
+            0,
+            "raft-view reads should derive durable-state presence from the identity probe"
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -8431,6 +8802,93 @@ mod tests {
     }
 
     #[test]
+    fn persisted_hard_state_reads_use_identity_cache() {
+        let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
+        let root = temp_raft_root("sinomo-kv-hard-state-cache");
+        let paths = KvWalPaths::new(&root);
+        hard_state_cache().lock().expect("hard-state cache").clear();
+        reset_persisted_hard_state_actual_reads_for_test(&paths.hard_state);
+
+        assert_eq!(
+            paths.read_persisted_hard_state().expect("read absent"),
+            RaftHardState::default()
+        );
+        assert_eq!(
+            persisted_hard_state_actual_reads_for_test(&paths.hard_state),
+            1,
+            "the first absent-file read should touch the filesystem"
+        );
+        assert_eq!(
+            paths
+                .read_persisted_hard_state()
+                .expect("read absent again"),
+            RaftHardState::default()
+        );
+        assert_eq!(
+            persisted_hard_state_actual_reads_for_test(&paths.hard_state),
+            1,
+            "unchanged absent hard state should be served from cache"
+        );
+
+        let first_leader = NodeId::from_legacy_named("hard_state_cache_first").expect("leader");
+        let first = RaftHardState {
+            current_term: 3,
+            voted_for: Some(first_leader.clone()),
+            leader_id: Some(first_leader),
+            commit_index: 5,
+        };
+        paths
+            .write_persisted_hard_state(&first)
+            .expect("write hard state");
+        reset_persisted_hard_state_actual_reads_for_test(&paths.hard_state);
+        assert_eq!(
+            paths
+                .read_persisted_hard_state()
+                .expect("read write-through cache"),
+            first
+        );
+        assert_eq!(
+            persisted_hard_state_actual_reads_for_test(&paths.hard_state),
+            0,
+            "local hard-state writes should refresh the read cache"
+        );
+
+        let second_leader = NodeId::from_legacy_named("hard_state_cache_second").expect("leader");
+        let second = RaftHardState {
+            current_term: 4,
+            voted_for: Some(second_leader.clone()),
+            leader_id: Some(second_leader),
+            commit_index: 6,
+        };
+        write_object_file(&paths.hard_state, &second).expect("external hard-state replace");
+        reset_persisted_hard_state_actual_reads_for_test(&paths.hard_state);
+        assert_eq!(
+            paths
+                .read_persisted_hard_state()
+                .expect("read external replacement"),
+            second
+        );
+        assert_eq!(
+            persisted_hard_state_actual_reads_for_test(&paths.hard_state),
+            1,
+            "a changed file identity must force one real read"
+        );
+        assert_eq!(
+            paths
+                .read_persisted_hard_state()
+                .expect("read cached replacement"),
+            second
+        );
+        assert_eq!(
+            persisted_hard_state_actual_reads_for_test(&paths.hard_state),
+            1,
+            "unchanged replacement should be cached after the first read"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn replicated_node_commit_gap_does_not_partially_apply() {
         let mut node = ReplicatedKvNode {
             store: InProcessKvStore::new(),
@@ -9631,9 +10089,11 @@ mod tests {
         let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
         materialized_snapshot_cache().lock().expect("cache").clear();
         raft_view_cache().lock().expect("raft cache").clear();
+        hard_state_cache().lock().expect("hard-state cache").clear();
         KV_READ_CACHE_CLOCK.store(1, Ordering::Relaxed);
 
         let snapshot = Arc::new(InProcessKvStore::new().snapshot());
+        let hard_state = RaftHardState::default();
         let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
         for index in 0..FILE_CACHE_CAPACITY.saturating_sub(1) {
             cache_store_snapshot(
@@ -9644,6 +10104,13 @@ mod tests {
                     ino: (index + 1) as u64,
                 },
                 snapshot.clone(),
+            );
+            cache_store_hard_state(
+                &PathBuf::from(format!(
+                    "/sinomo-kv-lru-test/100-quiet-hard-{index:04}.sobj"
+                )),
+                None,
+                hard_state.clone(),
             );
             let quiet_paths =
                 KvWalPaths::new(format!("/sinomo-kv-lru-test/100-quiet-raft-{index:04}"));
@@ -9665,6 +10132,13 @@ mod tests {
             ino: (FILE_CACHE_CAPACITY + 1) as u64,
         };
         cache_store_snapshot(&hot_snapshot_path, hot_snapshot_identity, snapshot.clone());
+        let hot_hard_state_path = PathBuf::from("/sinomo-kv-lru-test/000-hot-hard.sobj");
+        let hot_hard_state_identity = None;
+        cache_store_hard_state(
+            &hot_hard_state_path,
+            hot_hard_state_identity,
+            hard_state.clone(),
+        );
         let hot_raft_paths = KvWalPaths::new("/sinomo-kv-lru-test/000-hot-raft");
         let hot_raft_identity = RaftViewIdentity {
             hard_state: None,
@@ -9676,6 +10150,10 @@ mod tests {
         assert!(
             cache_lookup_snapshot(&hot_snapshot_path, hot_snapshot_identity).is_some(),
             "looking up the hot materialized snapshot should refresh its recency"
+        );
+        assert!(
+            cache_lookup_hard_state(&hot_hard_state_path, hot_hard_state_identity).is_some(),
+            "looking up the hot hard-state cache entry should refresh its recency"
         );
         assert!(
             cache_lookup_raft_view(&hot_raft_paths, hot_raft_identity).is_some(),
@@ -9691,6 +10169,11 @@ mod tests {
             },
             snapshot.clone(),
         );
+        cache_store_hard_state(
+            &PathBuf::from("/sinomo-kv-lru-test/999-extra-hard.sobj"),
+            None,
+            hard_state,
+        );
         cache_store_raft_view(
             &KvWalPaths::new("/sinomo-kv-lru-test/999-extra-raft"),
             hot_raft_identity,
@@ -9700,6 +10183,10 @@ mod tests {
         assert!(
             cache_lookup_snapshot(&hot_snapshot_path, hot_snapshot_identity).is_some(),
             "recent materialized snapshot cache entry should survive capacity churn"
+        );
+        assert!(
+            cache_lookup_hard_state(&hot_hard_state_path, hot_hard_state_identity).is_some(),
+            "recent hard-state cache entry should survive capacity churn"
         );
         assert!(
             cache_lookup_raft_view(&hot_raft_paths, hot_raft_identity).is_some(),
@@ -9712,6 +10199,10 @@ mod tests {
         raft_view_cache()
             .lock()
             .expect("raft cache")
+            .retain(|path, _| !path.starts_with("/sinomo-kv-lru-test"));
+        hard_state_cache()
+            .lock()
+            .expect("hard-state cache")
             .retain(|path, _| !path.starts_with("/sinomo-kv-lru-test"));
     }
 
