@@ -1,8 +1,8 @@
 services:
   minestudio:
     build:
-      context: ../../../..
-      dockerfile: crates/sinomo-benchmarks/minestudio/docker/Dockerfile
+      context: ../../../../..
+      dockerfile: modules/benchmark/sinomo-benchmarks/minestudio/docker/Dockerfile
     image: sinomo/minestudio-benchmark:local
     cpus: "${SINOMO_MINESTUDIO_CPUS:-8.0}"
     mem_limit: "${SINOMO_MINESTUDIO_MEM_LIMIT:-8g}"
@@ -22,7 +22,7 @@ services:
       JAVA_TOOL_OPTIONS: "${JAVA_TOOL_OPTIONS:--Xmx6g}"
       HF_HOME: /cache/huggingface
     volumes:
-      - ../../../../benchmark-results:/workspace/benchmark-results
+      - ../../../../../benchmark-results:/workspace/benchmark-results
       - minestudio-engine:/tmp/MineStudio
       - huggingface-cache:/cache/huggingface
     healthcheck:

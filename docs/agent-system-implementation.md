@@ -137,14 +137,14 @@ sinomo --local agent run --provider deepseek --model deepseek-v4-flash --prompt 
 
 ## Benchmark Harnesses
 
-`crates/sinomo-benchmarks` is an application-level optional harness crate. It does not participate in production runtime dependencies.
+`modules/benchmark/sinomo-benchmarks` is an application-level optional native-dylib module. It is outside default workspace builds and production runtime dependencies; development and self-evolution flows opt into it when they need benchmark catalog data or local research harness scripts.
 
 Terminal-Bench 2.0 is represented through Harbor:
 
 - current install smoke: `pip install harbor`;
 - command smoke: `harbor run --help`;
 - current dataset id from Harbor docs: `terminal-bench/terminal-bench-2`;
-- adapter template: `crates/sinomo-benchmarks/harbor/sinomo_harbor_agent.py`.
+- adapter template: `modules/benchmark/sinomo-benchmarks/harbor/sinomo_harbor_agent.py`.
 
 The Harbor adapter is an external agent. It runs the Sinomo agent loop on the host side with stored Codex credentials and uses Harbor's `environment.exec` only for bounded task-container commands. This keeps Sinomo tools and credentials out of the benchmark container.
 
@@ -152,14 +152,14 @@ MineStudio is represented through a vision-path smoke:
 
 - current install smoke: `pip install minestudio`;
 - import smoke: `import minestudio`;
-- synthetic request-path smoke: `crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py`.
+- synthetic request-path smoke: `modules/benchmark/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py`.
 
-The smoke script has a local mock mode so it validates the vision request path without requiring the full MiniCPM-o model. Benchmark harnesses may still accept environment variables because they are local experiment launchers, but Sinomo runtime commands should read model runtime settings from cluster KV. The Docker runtime in `crates/sinomo-benchmarks/minestudio/docker/compose.yml` builds a headless Xvfb/Mesa/OpenJDK 8 MineStudio container with an HTTP wrapper for `reset`/`observe`/`step` control from the host. The real action-loop runner is `crates/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py`; it starts `minestudio.simulator.MinecraftSim`, reads rendered frames from `info["pov"]` or `obs["image"]`, asks MiniCPM-o for one action macro, applies the action with `env.step`, and repeats. It can also use the Docker wrapper by setting `SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080`. `crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py` uses the same wrapper for a live-style duplex workflow: it samples chronological frame sequences, sends them to MiniCPM-o as streaming duplex requests, consumes incremental output chunks, and applies the recovered action back to MineStudio.
+The smoke script has a local mock mode so it validates the vision request path without requiring the full MiniCPM-o model. Benchmark harnesses may still accept environment variables because they are local experiment launchers, but Sinomo runtime commands should read model runtime settings from cluster KV. The Docker runtime in `modules/benchmark/sinomo-benchmarks/minestudio/docker/compose.yml` builds a headless Xvfb/Mesa/OpenJDK 8 MineStudio container with an HTTP wrapper for `reset`/`observe`/`step` control from the host. The real action-loop runner is `modules/benchmark/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py`; it starts `minestudio.simulator.MinecraftSim`, reads rendered frames from `info["pov"]` or `obs["image"]`, asks MiniCPM-o for one action macro, applies the action with `env.step`, and repeats. It can also use the Docker wrapper by setting `SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080`. `modules/benchmark/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py` uses the same wrapper for a live-style duplex workflow: it samples chronological frame sequences, sends them to MiniCPM-o as streaming duplex requests, consumes incremental output chunks, and applies the recovered action back to MineStudio.
 
 MCU-turbo is represented through a MineStudio-compatible task-config runner:
 
 - clone the benchmark configs from `https://github.com/CraftJarvis/MCU` into `/tmp/mcu` or set `MCU_ROOT`;
-- configure the product runtime with `sinomo models runtime set --pytorch-endpoint <server-or-proxy-url>`, then run `crates/sinomo-benchmarks/mcu/sinomo_mcu_runner.py`;
+- configure the product runtime with `sinomo models runtime set --pytorch-endpoint <server-or-proxy-url>`, then run `modules/benchmark/sinomo-benchmarks/mcu/sinomo_mcu_runner.py`;
 - results are written under the gitignored `benchmark-results/` folder as per-task JSON, `summary.json`, and `case_studies.md`.
 
 The MCU runner uses the benchmark YAML files from `MCU_benchmark/task_configs` and drives Sinomo's main-agent loop with Minecraft task text, init commands, a MineStudio-style observation summary, and an expected `send_game_action` macro. This is a lightweight integration benchmark for the Sinomo agent interface; full MCU scoring still requires running MineStudio simulator episodes and VLM video evaluation.
@@ -190,7 +190,7 @@ Live smoke status from this implementation pass:
 
 - `docker run python:3.12 ... pip install harbor && harbor run --help` completed successfully;
 - `docker run python:3.10 ... pip install minestudio && import minestudio` completed successfully;
-- `PATH=target/debug:$PATH python3 crates/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py` completed and returned a MiniCPM vision-mode response from the mock bridge;
+- `PATH=target/debug:$PATH python3 modules/benchmark/sinomo-benchmarks/minestudio/sinomo_minestudio_smoke.py` completed and returned a MiniCPM vision-mode response from the mock bridge;
 - `sinomo models runtime set --pytorch-endpoint http://127.0.0.1:32154` followed by `sinomo agent run --provider minicpm-o ...` completed through the Windows RTX 3090 server;
 - `docker run --rm --network host ... python /tmp/sinomo_minestudio_smoke.py` completed through the same live MiniCPM endpoint and reported about 7.5 estimated output tokens/sec for the short vision smoke;
 - a longer text completion through the Windows RTX 3090 endpoint reported 79 estimated output tokens in 4272 ms, or about 18.5 estimated output tokens/sec;

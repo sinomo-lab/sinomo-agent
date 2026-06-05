@@ -1,8 +1,9 @@
-//! Optional benchmark adapters for validating Sinomo's agent loop.
+//! Optional native-dylib benchmark module for validating Sinomo's agent loop.
 //!
-//! These adapters deliberately live outside the production runtime. They
-//! generate harness code and smoke-test plans for Terminal-Bench/Harbor and
-//! MineStudio without making either benchmark a production dependency.
+//! These adapters deliberately live outside the production runtime. They can be
+//! built as an opt-in native-dylib module for catalog/inspection purposes, and
+//! they still expose explicit research harness scripts for Terminal-Bench/Harbor,
+//! SWE-bench, MCU, and MineStudio.
 
 use serde::{Deserialize, Serialize};
 use sinomo_agent::{
@@ -10,8 +11,22 @@ use sinomo_agent::{
     main_agent_system_prompt,
 };
 use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig};
+use sinomo_runtime::module_api::{
+    NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
+    NativeModuleErrorResponse, NativeModuleInvocationRequest, NativeModuleInvocationResponse,
+    NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
+    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
+    SinomoModuleByteSlice, SinomoModuleHostApiV1, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use thiserror::Error;
+
+pub const SINOMO_BENCHMARKS_MODULE_ID: &str = "module.benchmarks";
+pub const SINOMO_BENCHMARKS_INTERFACE_VERSION: &str = "sinomo.benchmarks.v1";
+pub const SINOMO_BENCHMARKS_OPERATION: &str = "benchmarks.catalog";
+pub const SINOMO_BENCHMARKS_MODULE_ROOT: &str = "modules/benchmark/sinomo-benchmarks";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct BenchmarkHarnessPlan {
@@ -58,11 +73,80 @@ pub struct SweBenchInstance {
     pub difficulty: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum BenchmarkModuleRequest {
+    Catalog,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum BenchmarkModuleResponse {
+    Catalog(BenchmarkModuleCatalog),
+    Error(BenchmarkModuleError),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BenchmarkModuleCatalog {
+    pub module_root: String,
+    pub suites: Vec<BenchmarkSuiteDescriptor>,
+    pub plans: Vec<BenchmarkHarnessPlan>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BenchmarkModuleError {
+    pub code: String,
+    pub detail: String,
+}
+
+pub fn benchmark_module_root() -> &'static str {
+    SINOMO_BENCHMARKS_MODULE_ROOT
+}
+
+pub fn benchmark_module_path(relative_path: &str) -> String {
+    format!(
+        "{}/{}",
+        SINOMO_BENCHMARKS_MODULE_ROOT,
+        relative_path.trim_start_matches('/')
+    )
+}
+
+pub fn benchmark_module_catalog() -> BenchmarkModuleCatalog {
+    BenchmarkModuleCatalog {
+        module_root: SINOMO_BENCHMARKS_MODULE_ROOT.to_string(),
+        suites: vec![swebench_verified_10_descriptor()],
+        plans: vec![
+            swebench_verified_10_plan(),
+            terminalbench_harbor_plan(),
+            mcu_minestudio_plan(),
+            minestudio_plan(),
+            minestudio_vision_action_loop_plan(),
+            minestudio_live_duplex_loop_plan(),
+        ],
+    }
+}
+
+pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
+    NativeModuleDescriptor {
+        module_id: SINOMO_BENCHMARKS_MODULE_ID.to_string(),
+        module_version: env!("CARGO_PKG_VERSION").to_string(),
+        native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
+        backend: NativeModuleBackend::NativeDylib,
+        interface_version: SINOMO_BENCHMARKS_INTERFACE_VERSION.to_string(),
+        platform_triple: platform_triple(),
+        supported_operations: vec![SINOMO_BENCHMARKS_OPERATION.to_string()],
+        capabilities: vec![
+            "benchmark.catalog.read".to_string(),
+            "benchmark.swebench.plan".to_string(),
+            "benchmark.minestudio.plan".to_string(),
+            "benchmark.terminalbench.plan".to_string(),
+        ],
+    }
+}
+
 pub fn swebench_verified_10_suite() -> SweBenchSuite {
-    serde_json::from_str(include_str!(
-        "../../sinomo-benchmarks/swebench/verified_10.json"
-    ))
-    .expect("checked-in SWE-bench Verified suite is valid JSON")
+    serde_json::from_str(include_str!("../swebench/verified_10.json"))
+        .expect("checked-in SWE-bench Verified suite is valid JSON")
 }
 
 pub fn swebench_verified_10_descriptor() -> BenchmarkSuiteDescriptor {
@@ -73,7 +157,7 @@ pub fn swebench_verified_10_descriptor() -> BenchmarkSuiteDescriptor {
         task_count: suite.instances.len(),
         dataset: Some(suite.dataset),
         split: Some(suite.split),
-        runner: "crates/sinomo-benchmarks/swebench/run_swebench_verified.py".to_string(),
+        runner: benchmark_module_path("swebench/run_swebench_verified.py"),
         baseline: Some("mini-extra swebench".to_string()),
     }
 }
@@ -116,8 +200,10 @@ pub fn swebench_verified_10_plan() -> BenchmarkHarnessPlan {
             "cargo build -p sinomo-benchmarks --bin sinomo-swebench-agent".to_string(),
             "sinomo --local providers test deepseek".to_string(),
         ],
-        run_command: "python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py --mode both --provider deepseek --model deepseek-v4-flash --baseline-model deepseek/deepseek-v4-flash --evaluate --summary-out benchmark-results/swebench/summary.json --progress-out benchmark-results/swebench/progress.jsonl"
-            .to_string(),
+        run_command: format!(
+            "python3 {} --mode both --provider deepseek --model deepseek-v4-flash --baseline-model deepseek/deepseek-v4-flash --evaluate --summary-out benchmark-results/swebench/summary.json --progress-out benchmark-results/swebench/progress.jsonl",
+            benchmark_module_path("swebench/run_swebench_verified.py")
+        ),
         required_tools: default_coding_agent_tools()
             .into_iter()
             .filter(|tool| {
@@ -168,11 +254,19 @@ pub fn mcu_minestudio_plan() -> BenchmarkHarnessPlan {
         name: "mcu-minestudio".to_string(),
         setup_commands: vec![
             "git clone --depth 1 https://github.com/CraftJarvis/MCU.git /tmp/mcu".to_string(),
-            "docker compose -f crates/sinomo-benchmarks/minestudio/docker/compose.yml up -d --build minestudio".to_string(),
-            "python crates/sinomo-benchmarks/mcu/mcu_live_duplex_runner.py --help".to_string(),
+            format!(
+                "docker compose -f {} up -d --build minestudio",
+                benchmark_module_path("minestudio/docker/compose.yml")
+            ),
+            format!(
+                "python {} --help",
+                benchmark_module_path("mcu/mcu_live_duplex_runner.py")
+            ),
         ],
-        run_command: "MCU_ROOT=/tmp/mcu SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python crates/sinomo-benchmarks/mcu/mcu_live_duplex_runner.py"
-            .to_string(),
+        run_command: format!(
+            "MCU_ROOT=/tmp/mcu SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python {}",
+            benchmark_module_path("mcu/mcu_live_duplex_runner.py")
+        ),
         required_tools: vec![AgentToolKind::ObserveVision, AgentToolKind::RunShellCommand],
         notes: vec![
             "MCU-turbo task configs are consumed from MCU_benchmark/task_configs and executed through the MineStudio HTTP wrapper.".to_string(),
@@ -209,12 +303,19 @@ pub fn minestudio_vision_action_loop_plan() -> BenchmarkHarnessPlan {
         name: "minestudio-vision-action-loop".to_string(),
         setup_commands: vec![
             "python -m pip install minestudio".to_string(),
-            "docker compose -f crates/sinomo-benchmarks/minestudio/docker/compose.yml build".to_string(),
-            "python crates/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py --help"
-                .to_string(),
+            format!(
+                "docker compose -f {} build",
+                benchmark_module_path("minestudio/docker/compose.yml")
+            ),
+            format!(
+                "python {} --help",
+                benchmark_module_path("minestudio/minestudio_vision_action_loop.py")
+            ),
         ],
-        run_command: "SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python crates/sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py"
-            .to_string(),
+        run_command: format!(
+            "SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python {}",
+            benchmark_module_path("minestudio/minestudio_vision_action_loop.py")
+        ),
         required_tools: vec![AgentToolKind::ObserveVision],
         notes: vec![
             "The loop starts a real MineStudio MinecraftSim environment and sends task text plus rendered pov frames to MiniCPM-o.".to_string(),
@@ -228,12 +329,19 @@ pub fn minestudio_live_duplex_loop_plan() -> BenchmarkHarnessPlan {
     BenchmarkHarnessPlan {
         name: "minestudio-live-duplex-loop".to_string(),
         setup_commands: vec![
-            "docker compose -f crates/sinomo-benchmarks/minestudio/docker/compose.yml up -d minestudio".to_string(),
-            "python crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py --help"
-                .to_string(),
+            format!(
+                "docker compose -f {} up -d minestudio",
+                benchmark_module_path("minestudio/docker/compose.yml")
+            ),
+            format!(
+                "python {} --help",
+                benchmark_module_path("minestudio/minestudio_live_duplex_loop.py")
+            ),
         ],
-        run_command: "SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py"
-            .to_string(),
+        run_command: format!(
+            "SINOMO_MINESTUDIO_ENV_URL=http://127.0.0.1:18080 SINOMO_PYTORCH_ENDPOINT=http://127.0.0.1:32153 python {}",
+            benchmark_module_path("minestudio/minestudio_live_duplex_loop.py")
+        ),
         required_tools: vec![AgentToolKind::ObserveVision],
         notes: vec![
             "The loop sends chronological MineStudio rendered frame sequences to MiniCPM-o with stream=true and consumes streaming response chunks.".to_string(),
@@ -448,7 +556,10 @@ pub fn docker_smoke_command(plan: &BenchmarkHarnessPlan) -> String {
         "minestudio-smoke" => "docker run --rm python:3.10 bash -lc 'pip install minestudio && python - <<\\'PY\\'\nimport minestudio\nprint(\"minestudio import ok\")\nPY'".to_string(),
         "mcu-minestudio" => "docker run --rm python:3.10 bash -lc 'pip install minestudio && python - <<\\'PY\\'\nimport minestudio\nprint(\"mcu minestudio import ok\")\nPY'".to_string(),
         "minestudio-vision-action-loop" => "docker run --rm python:3.10 bash -lc 'pip install minestudio && python - <<\\'PY\\'\nfrom minestudio.simulator import MinecraftSim\nprint(\"real minestudio env import ok\", MinecraftSim)\nPY'".to_string(),
-        "minestudio-live-duplex-loop" => "python3 crates/sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py --help".to_string(),
+        "minestudio-live-duplex-loop" => format!(
+            "python3 {} --help",
+            benchmark_module_path("minestudio/minestudio_live_duplex_loop.py")
+        ),
         _ => "docker --version".to_string(),
     }
 }
@@ -458,6 +569,181 @@ pub fn docker_smoke_command(plan: &BenchmarkHarnessPlan) -> Result<String, Bench
     Err(BenchmarkError::Disabled {
         name: plan.name.clone(),
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_api_version() -> u32 {
+    SINOMO_NATIVE_MODULE_ABI_VERSION
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_descriptor(
+    out: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
+    write_buffer(out, encode_sobj(&benchmarks_module_descriptor()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV1) -> SinomoModuleStatusCode {
+    if host.abi_version == SINOMO_NATIVE_MODULE_ABI_VERSION {
+        SINOMO_MODULE_STATUS_OK
+    } else {
+        SINOMO_MODULE_STATUS_UNSUPPORTED_ABI
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_invoke(
+    request_sobj: SinomoModuleByteSlice,
+    response_sobj: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        invoke_unchecked(request_sobj, response_sobj)
+    }));
+    match result {
+        Ok(status) => status,
+        Err(_) => write_response(
+            response_sobj,
+            NativeModuleResponse::Error(native_error_response(
+                "panic",
+                "benchmark module panicked while handling invocation",
+            )),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        ),
+    }
+}
+
+fn invoke_unchecked(
+    request_sobj: SinomoModuleByteSlice,
+    response_sobj: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
+    let response = match decode_native_module_request(request_sobj) {
+        Ok(NativeModuleRequest::ProbeCapabilities(_)) => {
+            NativeModuleResponse::Capabilities(NativeModuleCapabilitiesResponse {
+                descriptor: benchmarks_module_descriptor(),
+            })
+        }
+        Ok(NativeModuleRequest::Invoke(request)) => invoke_benchmark_operation(request),
+        Err(error) => NativeModuleResponse::Error(native_error_response(
+            "invalid-request",
+            &format!("decode benchmark module request: {error}"),
+        )),
+    };
+    write_response(response_sobj, response, SINOMO_MODULE_STATUS_OK)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
+    SINOMO_MODULE_STATUS_OK
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sinomo_module_free_buffer(buffer: SinomoModuleByteBuffer) {
+    unsafe {
+        drop(SinomoModuleByteBuffer::into_vec(buffer));
+    }
+}
+
+fn invoke_benchmark_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    if request.operation != SINOMO_BENCHMARKS_OPERATION {
+        return NativeModuleResponse::Error(native_error_response(
+            "unsupported-operation",
+            &format!(
+                "unsupported benchmark module operation `{}`",
+                request.operation
+            ),
+        ));
+    }
+    let benchmark_request = match decode_sobj::<BenchmarkModuleRequest>(&request.payload_sobj) {
+        Ok(request) => request,
+        Err(error) => {
+            return NativeModuleResponse::Error(native_error_response(
+                "invalid-benchmark-request",
+                &format!("decode benchmark catalog request: {error}"),
+            ));
+        }
+    };
+    let benchmark_response = match benchmark_request {
+        BenchmarkModuleRequest::Catalog => {
+            BenchmarkModuleResponse::Catalog(benchmark_module_catalog())
+        }
+    };
+    match encode_sobj(&benchmark_response) {
+        Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
+            operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
+            payload_sobj,
+        }),
+        Err(error) => NativeModuleResponse::Error(native_error_response(
+            "encode-benchmark-response",
+            &format!("encode benchmark catalog response: {error}"),
+        )),
+    }
+}
+
+fn decode_native_module_request(
+    request_sobj: SinomoModuleByteSlice,
+) -> Result<NativeModuleRequest, sinomo_runtime::module_api::NativeModuleApiError> {
+    let request_bytes = unsafe { request_sobj.as_slice() };
+    decode_sobj(request_bytes)
+}
+
+fn native_error_response(code: &str, detail: &str) -> NativeModuleErrorResponse {
+    NativeModuleErrorResponse {
+        code: code.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn write_response(
+    out: *mut SinomoModuleByteBuffer,
+    response: NativeModuleResponse,
+    success_status: SinomoModuleStatusCode,
+) -> SinomoModuleStatusCode {
+    match encode_sobj(&response) {
+        Ok(bytes) => {
+            let status = write_buffer(out, Ok(bytes));
+            if status == SINOMO_MODULE_STATUS_OK {
+                success_status
+            } else {
+                status
+            }
+        }
+        Err(error) => write_buffer(
+            out,
+            encode_sobj(&NativeModuleResponse::Error(native_error_response(
+                "encode-native-response",
+                &format!("encode native benchmark module response: {error}"),
+            ))),
+        ),
+    }
+}
+
+fn write_buffer(
+    out: *mut SinomoModuleByteBuffer,
+    bytes: Result<Vec<u8>, sinomo_runtime::module_api::NativeModuleApiError>,
+) -> SinomoModuleStatusCode {
+    match bytes {
+        Ok(bytes) => {
+            if out.is_null() {
+                SINOMO_MODULE_STATUS_INVALID_ARGUMENT
+            } else {
+                unsafe {
+                    *out = SinomoModuleByteBuffer::from_vec(bytes);
+                }
+                SINOMO_MODULE_STATUS_OK
+            }
+        }
+        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    }
+}
+
+fn platform_triple() -> String {
+    format!(
+        "{}-{}-{}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        std::env::consts::FAMILY
+    )
 }
 
 #[cfg(test)]
@@ -528,27 +814,23 @@ mod tests {
             plan.required_tools
                 .contains(&AgentToolKind::RunShellCommand)
         );
+        assert!(include_str!("../swebench/run_swebench_verified.py").contains("mini-extra"));
         assert!(
-            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
-                .contains("mini-extra")
-        );
-        assert!(
-            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
+            include_str!("../swebench/run_swebench_verified.py")
                 .contains("swebench.harness.run_evaluation")
         );
         assert!(
-            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
+            include_str!("../swebench/run_swebench_verified.py")
                 .contains("official_evaluation_prerequisite_issues")
         );
         assert!(
-            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
-                .contains("evaluation-blocked")
+            include_str!("../swebench/run_swebench_verified.py").contains("evaluation-blocked")
         );
     }
 
     #[test]
     fn swebench_runner_rebuilds_default_agent_and_records_binary_provenance() {
-        let runner = include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py");
+        let runner = include_str!("../swebench/run_swebench_verified.py");
         assert!(runner.contains("DEFAULT_AGENT_BIN"));
         assert!(runner.contains("sinomo_agent_bin_explicit"));
         assert!(runner.contains("rebuilt-default-before-run"));
@@ -579,10 +861,7 @@ mod tests {
                 .iter()
                 .any(|note| note.contains("MCU_benchmark/task_configs"))
         );
-        assert!(
-            include_str!("../../sinomo-benchmarks/mcu/mcu_live_duplex_runner.py")
-                .contains("call_minicpm_stream")
-        );
+        assert!(include_str!("../mcu/mcu_live_duplex_runner.py").contains("call_minicpm_stream"));
     }
 
     #[test]
@@ -609,12 +888,10 @@ mod tests {
                 .any(|note| note.contains("real MineStudio MinecraftSim"))
         );
         assert!(
-            include_str!("../../sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py")
-                .contains("MinecraftSim")
+            include_str!("../minestudio/minestudio_vision_action_loop.py").contains("MinecraftSim")
         );
         assert!(
-            !include_str!("../../sinomo-benchmarks/minestudio/minestudio_vision_action_loop.py")
-                .contains("ImageDraw")
+            !include_str!("../minestudio/minestudio_vision_action_loop.py").contains("ImageDraw")
         );
     }
 
@@ -629,15 +906,15 @@ mod tests {
                 .any(|note| note.contains("RecordCallback"))
         );
         assert!(
-            include_str!("../../sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py")
+            include_str!("../minestudio/minestudio_live_duplex_loop.py")
                 .contains("\"image_sequence_base64\"")
         );
         assert!(
-            include_str!("../../sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py")
+            include_str!("../minestudio/minestudio_live_duplex_loop.py")
                 .contains("\"stream\": True")
         );
         assert!(
-            include_str!("../../sinomo-benchmarks/minestudio/minestudio_live_duplex_loop.py")
+            include_str!("../minestudio/minestudio_live_duplex_loop.py")
                 .contains("collect_minestudio_recordings")
         );
     }
@@ -647,5 +924,90 @@ mod tests {
         let config = AgentEnvironmentConfig::default();
         assert!(config.prompt.contains("async"));
         assert!(config.prompt.contains("run_shell_command"));
+    }
+
+    #[test]
+    fn benchmark_module_descriptor_exports_catalog_operation() {
+        let descriptor = benchmarks_module_descriptor();
+
+        assert_eq!(descriptor.module_id, SINOMO_BENCHMARKS_MODULE_ID);
+        assert_eq!(
+            descriptor.interface_version,
+            SINOMO_BENCHMARKS_INTERFACE_VERSION
+        );
+        assert_eq!(descriptor.backend, NativeModuleBackend::NativeDylib);
+        assert!(
+            descriptor
+                .supported_operations
+                .contains(&SINOMO_BENCHMARKS_OPERATION.to_string())
+        );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&"benchmark.catalog.read".to_string())
+        );
+    }
+
+    #[test]
+    fn benchmark_module_catalog_lists_research_harnesses() {
+        let catalog = benchmark_module_catalog();
+
+        assert_eq!(catalog.module_root, SINOMO_BENCHMARKS_MODULE_ROOT);
+        assert_eq!(catalog.suites.len(), 1);
+        assert_eq!(catalog.suites[0].name, "swebench-verified-10");
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "swebench-verified-10")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "minestudio-live-duplex-loop")
+        );
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .all(|plan| !plan.run_command.contains("crates/sinomo-benchmarks"))
+        );
+    }
+
+    #[test]
+    fn benchmark_module_native_abi_returns_catalog() {
+        let payload_sobj = encode_sobj(&BenchmarkModuleRequest::Catalog).expect("payload");
+        let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
+            operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
+            payload_sobj,
+        });
+        let request_sobj = encode_sobj(&request).expect("request");
+        let mut response_buffer = SinomoModuleByteBuffer::null();
+
+        let status = sinomo_module_invoke(
+            SinomoModuleByteSlice::from_slice(&request_sobj),
+            &mut response_buffer,
+        );
+
+        assert_eq!(status, SINOMO_MODULE_STATUS_OK);
+        let response_bytes = unsafe { SinomoModuleByteBuffer::into_vec(response_buffer) };
+        let native_response: NativeModuleResponse =
+            decode_sobj(&response_bytes).expect("native response");
+        let NativeModuleResponse::Invocation(response) = native_response else {
+            panic!("expected invocation response");
+        };
+        assert_eq!(response.operation, SINOMO_BENCHMARKS_OPERATION);
+        let benchmark_response: BenchmarkModuleResponse =
+            decode_sobj(&response.payload_sobj).expect("benchmark response");
+        let BenchmarkModuleResponse::Catalog(catalog) = benchmark_response else {
+            panic!("expected catalog response");
+        };
+        assert!(
+            catalog
+                .plans
+                .iter()
+                .any(|plan| plan.name == "swebench-verified-10")
+        );
     }
 }

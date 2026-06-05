@@ -7,6 +7,11 @@ pub const SANDBOX_WASIX_MODULE_PACKAGE: &str = "sinomo-sandbox-wasix-module";
 pub const SANDBOX_WASIX_MODULE_RUNTIME_FEATURE: &str = "sinomo-sandbox-wasix-module/wasix-runtime";
 pub const SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY: &str = "module/sandbox/wasix";
 pub const SANDBOX_WASIX_NATIVE_MODULE_SOURCE: &str = "rollout:modules/sandbox/wasix";
+pub const BENCHMARKS_MODULE_PACKAGE: &str = "sinomo-benchmarks";
+pub const BENCHMARKS_MODULE_ID: &str = "module.benchmarks";
+pub const BENCHMARKS_MODULE_INTERFACE_VERSION: &str = "sinomo.benchmarks.v1";
+pub const BENCHMARKS_NATIVE_MODULE_CACHE_KEY: &str = "module/benchmark/sinomo-benchmarks";
+pub const BENCHMARKS_NATIVE_MODULE_SOURCE: &str = "rollout:modules/benchmark/sinomo-benchmarks";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SelfRolloutPaths {
@@ -103,6 +108,10 @@ pub fn sandbox_wasix_native_module_library_name() -> String {
     native_dylib_library_name("sinomo_sandbox_wasix_module")
 }
 
+pub fn benchmarks_native_module_library_name() -> String {
+    native_dylib_library_name("sinomo_benchmarks")
+}
+
 pub fn default_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Vec<SelfRolloutNativeDylibModuleBuild> {
@@ -118,6 +127,20 @@ pub fn default_native_dylib_module_builds(
         built_library: build_dir.join("target").join("debug").join(library_name),
         source: SANDBOX_WASIX_NATIVE_MODULE_SOURCE.to_string(),
     }]
+}
+
+pub fn benchmark_native_dylib_module_build(build_dir: &Path) -> SelfRolloutNativeDylibModuleBuild {
+    let library_name = benchmarks_native_module_library_name();
+    SelfRolloutNativeDylibModuleBuild {
+        package: BENCHMARKS_MODULE_PACKAGE.to_string(),
+        features: Vec::new(),
+        module_id: BENCHMARKS_MODULE_ID.to_string(),
+        interface_version: BENCHMARKS_MODULE_INTERFACE_VERSION.to_string(),
+        cache_key: BENCHMARKS_NATIVE_MODULE_CACHE_KEY.to_string(),
+        library_name: library_name.clone(),
+        built_library: build_dir.join("target").join("debug").join(library_name),
+        source: BENCHMARKS_NATIVE_MODULE_SOURCE.to_string(),
+    }
 }
 
 pub fn append_native_dylib_module_build_args(
@@ -209,6 +232,37 @@ mod tests {
         assert_eq!(
             plan.native_dylib_modules,
             default_native_dylib_module_builds(&plan.build_dir)
+        );
+    }
+
+    #[test]
+    fn benchmark_native_dylib_module_build_is_opt_in() {
+        let build_dir = Path::new("/tmp/sinomo-source");
+        let default_modules = default_native_dylib_module_builds(build_dir);
+        let benchmark_module = benchmark_native_dylib_module_build(build_dir);
+
+        assert!(
+            default_modules
+                .iter()
+                .all(|module| module.package != BENCHMARKS_MODULE_PACKAGE)
+        );
+        assert_eq!(benchmark_module.package, BENCHMARKS_MODULE_PACKAGE);
+        assert_eq!(benchmark_module.module_id, BENCHMARKS_MODULE_ID);
+        assert_eq!(
+            benchmark_module.interface_version,
+            BENCHMARKS_MODULE_INTERFACE_VERSION
+        );
+        assert_eq!(
+            benchmark_module.cache_key,
+            BENCHMARKS_NATIVE_MODULE_CACHE_KEY
+        );
+        assert_eq!(benchmark_module.source, BENCHMARKS_NATIVE_MODULE_SOURCE);
+        assert_eq!(
+            benchmark_module.built_library,
+            build_dir
+                .join("target")
+                .join("debug")
+                .join(benchmarks_native_module_library_name())
         );
     }
 }

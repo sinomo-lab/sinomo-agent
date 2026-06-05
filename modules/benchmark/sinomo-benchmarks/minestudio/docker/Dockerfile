@@ -37,10 +37,10 @@ RUN python -m pip install --upgrade 'pip<26' 'setuptools<81' wheel \
 
 WORKDIR /opt/sinomo/minestudio
 
-COPY crates/sinomo-benchmarks/minestudio/minestudio_action_bridge.py /opt/sinomo/minestudio/minestudio_action_bridge.py
-COPY crates/sinomo-benchmarks/minestudio/docker/entrypoint.sh /opt/sinomo/minestudio/entrypoint.sh
-COPY crates/sinomo-benchmarks/minestudio/docker/minestudio_http_server.py /opt/sinomo/minestudio/minestudio_http_server.py
-COPY crates/sinomo-benchmarks/minestudio/docker/minestudio_client.py /opt/sinomo/minestudio/minestudio_client.py
+COPY modules/benchmark/sinomo-benchmarks/minestudio/minestudio_action_bridge.py /opt/sinomo/minestudio/minestudio_action_bridge.py
+COPY modules/benchmark/sinomo-benchmarks/minestudio/docker/entrypoint.sh /opt/sinomo/minestudio/entrypoint.sh
+COPY modules/benchmark/sinomo-benchmarks/minestudio/docker/minestudio_http_server.py /opt/sinomo/minestudio/minestudio_http_server.py
+COPY modules/benchmark/sinomo-benchmarks/minestudio/docker/minestudio_client.py /opt/sinomo/minestudio/minestudio_client.py
 
 RUN chmod +x /opt/sinomo/minestudio/entrypoint.sh /opt/sinomo/minestudio/minestudio_client.py
 

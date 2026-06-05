@@ -26,13 +26,13 @@ The single-node compose file builds the Sinomo image with `SINOMO_BENCH_DEPS=1`,
 ## Plan
 
 ```sh
-python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py --mode plan
+python3 modules/benchmark/sinomo-benchmarks/swebench/run_swebench_verified.py --mode plan
 ```
 
 ## Sinomo Harness Run
 
 ```sh
-python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py \
+python3 modules/benchmark/sinomo-benchmarks/swebench/run_swebench_verified.py \
   --mode sinomo \
   --provider deepseek \
   --model deepseek-v4-flash \
@@ -53,7 +53,7 @@ Use `--repair-steps 0` to disable the bounded repair turn when a post-patch synt
 ## mini-SWE-agent Baseline
 
 ```sh
-python3 crates/sinomo-benchmarks/swebench/run_swebench_verified.py \
+python3 modules/benchmark/sinomo-benchmarks/swebench/run_swebench_verified.py \
   --mode mini \
   --baseline-model deepseek/deepseek-v4-flash \
   --workers 2

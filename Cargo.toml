@@ -13,7 +13,6 @@ default-members = [
     "crates/sinomo-api",
     "crates/sinomo-app",
     "crates/sinomo-audio",
-    "crates/sinomo-benchmarks",
     "crates/sinomo-cli",
     "crates/sinomo-config",
     "crates/sinomo-core",

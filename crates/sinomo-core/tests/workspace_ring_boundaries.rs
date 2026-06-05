@@ -109,7 +109,7 @@ fn runtime_boundary_crate_exports_only_r0_r1_dependencies() {
 }
 
 #[test]
-fn wasix_native_module_is_not_a_default_workspace_build_member() {
+fn native_dylib_modules_are_not_default_workspace_build_members() {
     let default_members = read_workspace_default_members();
 
     assert!(
@@ -131,6 +131,14 @@ fn wasix_native_module_is_not_a_default_workspace_build_member() {
     assert!(
         !default_members.contains(&"modules/sandbox/wasix".to_string()),
         "the heavy WASIX native-dylib module must be built explicitly, not by default"
+    );
+    assert!(
+        !default_members.contains(&"modules/benchmark/sinomo-benchmarks".to_string()),
+        "the benchmark native-dylib module must be built explicitly, not by default"
+    );
+    assert!(
+        !default_members.contains(&"crates/sinomo-benchmarks".to_string()),
+        "the old benchmark crate path must not remain in default-members"
     );
 }
 

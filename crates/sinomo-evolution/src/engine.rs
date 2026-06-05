@@ -65,6 +65,8 @@ use time::OffsetDateTime;
 pub const CANDIDATE_REGRESSION_EVIDENCE_RELATIVE_PATH: &str = "regression-evidence.json";
 pub const CANDIDATE_EVOLUTION_LESSON_RELATIVE_PATH: &str = "evolution-lesson.json";
 pub const CANDIDATE_EVIDENCE_SUMMARY_RELATIVE_PATH: &str = "candidate-evidence-summary.md";
+const SINOMO_BENCHMARK_MODULE_ROOT_ENV: &str = "SINOMO_BENCHMARK_MODULE_ROOT";
+const DEFAULT_BENCHMARK_MODULE_ROOT: &str = "modules/benchmark/sinomo-benchmarks";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct EvolutionRequest {
@@ -6035,7 +6037,7 @@ fn prepare_benchmark_gate_execution(
             let progress_path = results_dir.join("progress.jsonl");
             let mut args = vec![
                 swebench_python_command(),
-                "crates/sinomo-benchmarks/swebench/run_swebench_verified.py".to_string(),
+                benchmark_module_path("swebench/run_swebench_verified.py"),
                 "--mode".to_string(),
                 "sinomo".to_string(),
                 "--provider".to_string(),
@@ -6123,6 +6125,19 @@ fn swebench_python_command() -> String {
                 "python3".to_string()
             }
         })
+}
+
+fn benchmark_module_path(relative_path: &str) -> String {
+    let root = std::env::var(SINOMO_BENCHMARK_MODULE_ROOT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_BENCHMARK_MODULE_ROOT.to_string());
+    format!(
+        "{}/{}",
+        root.trim_end_matches('/'),
+        relative_path.trim_start_matches('/')
+    )
 }
 
 fn finalize_benchmark_gate_reports(

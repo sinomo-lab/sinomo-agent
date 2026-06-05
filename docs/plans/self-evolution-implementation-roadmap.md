@@ -122,7 +122,7 @@ SWE-bench smoke:
 
 Implementation approach:
 
-- Keep `sinomo-benchmarks` outside production runtime dependencies.
+- Keep `modules/benchmark/sinomo-benchmarks` as an optional native-dylib module outside production runtime dependencies.
 - Let `sinomo-evolution` call benchmark runners as command gates first.
 - Add scorecard adapters that parse benchmark output JSON into `EvaluationMetric` values:
   - `swebench_total_instances`
