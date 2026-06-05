@@ -1809,10 +1809,15 @@ pub struct ClusterConnectivityRecord {
 #[derive(Clone, Debug)]
 pub struct ClusterConnectivityGraph {
     source_node_id: NodeId,
-    records: BTreeMap<(NodeId, NodeId, ClusterEndpointId), ClusterConnectivityRecord>,
+    records: BTreeMap<ClusterConnectivityRecordKey, ClusterConnectivityRecord>,
+    records_by_address: BTreeMap<ClusterConnectivityAddressKey, ClusterConnectivityRecordKey>,
+    healthy_records_by_pair: BTreeMap<(NodeId, NodeId), BTreeSet<(u64, ClusterEndpointId)>>,
     reachable_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
     healthy_targets_by_source: BTreeMap<NodeId, BTreeSet<NodeId>>,
 }
+
+type ClusterConnectivityRecordKey = (NodeId, NodeId, ClusterEndpointId);
+type ClusterConnectivityAddressKey = (NodeId, NodeId, String);
 
 impl ClusterConnectivityGraph {
     pub fn from_records(
@@ -1834,7 +1839,25 @@ impl ClusterConnectivityGraph {
             .collect();
         let mut reachable_targets_by_source = BTreeMap::<NodeId, BTreeSet<NodeId>>::new();
         let mut healthy_targets_by_source = BTreeMap::<NodeId, BTreeSet<NodeId>>::new();
+        let mut records_by_address =
+            BTreeMap::<ClusterConnectivityAddressKey, ClusterConnectivityRecordKey>::new();
+        let mut healthy_records_by_pair =
+            BTreeMap::<(NodeId, NodeId), BTreeSet<(u64, ClusterEndpointId)>>::new();
         for record in records.values() {
+            let record_key = (
+                record.source_node_id.clone(),
+                record.target_node_id.clone(),
+                record.endpoint_id.clone(),
+            );
+            for address_key in cluster_endpoint_address_lookup_keys(&record.address) {
+                records_by_address
+                    .entry((
+                        record.source_node_id.clone(),
+                        record.target_node_id.clone(),
+                        address_key,
+                    ))
+                    .or_insert_with(|| record_key.clone());
+            }
             if record.target_node_id == record.source_node_id {
                 continue;
             }
@@ -1849,11 +1872,20 @@ impl ClusterConnectivityGraph {
                     .entry(record.source_node_id.clone())
                     .or_default()
                     .insert(record.target_node_id.clone());
+                healthy_records_by_pair
+                    .entry((record.source_node_id.clone(), record.target_node_id.clone()))
+                    .or_default()
+                    .insert((
+                        record.latency_ms.unwrap_or(u64::MAX),
+                        record.endpoint_id.clone(),
+                    ));
             }
         }
         Self {
             source_node_id,
             records,
+            records_by_address,
+            healthy_records_by_pair,
             reachable_targets_by_source,
             healthy_targets_by_source,
         }
@@ -1883,11 +1915,17 @@ impl ClusterConnectivityGraph {
                 // probe uses member endpoints; routing queries with command-target endpoints),
                 // which previously caused a silent miss -- so this no longer requires the
                 // transport to match and normalizes the address.
-                self.records.values().find(|record| {
-                    record.source_node_id == self.source_node_id
-                        && record.target_node_id == endpoint.node_id
-                        && cluster_endpoint_addresses_equivalent(&record.address, &endpoint.address)
-                })
+                cluster_endpoint_address_lookup_keys(&endpoint.address)
+                    .into_iter()
+                    .find_map(|address_key| {
+                        self.records_by_address
+                            .get(&(
+                                self.source_node_id.clone(),
+                                endpoint.node_id.clone(),
+                                address_key,
+                            ))
+                            .and_then(|record_key| self.records.get(record_key))
+                    })
             })
     }
 
@@ -1950,14 +1988,14 @@ impl ClusterConnectivityGraph {
         source: &NodeId,
         target: &NodeId,
     ) -> Option<ClusterEndpointRecord> {
-        self.records
-            .values()
-            .filter(|record| {
-                &record.source_node_id == source
-                    && &record.target_node_id == target
-                    && record.state == ClusterConnectivityState::Healthy
+        self.healthy_records_by_pair
+            .get(&(source.clone(), target.clone()))
+            .into_iter()
+            .flat_map(|records| records.iter())
+            .find_map(|(_, endpoint_id)| {
+                self.records
+                    .get(&(source.clone(), target.clone(), endpoint_id.clone()))
             })
-            .min_by_key(|record| record.latency_ms.unwrap_or(u64::MAX))
             .map(|record| ClusterEndpointRecord {
                 endpoint_id: record.endpoint_id.clone(),
                 node_id: record.target_node_id.clone(),
@@ -1977,14 +2015,12 @@ impl ClusterConnectivityGraph {
 /// strings, then a normalized `SocketAddr` parse so equivalent spellings still match. Used by
 /// connectivity-record lookup, where the same address may be derived slightly differently
 /// across code paths (probe targets vs command targets).
-fn cluster_endpoint_addresses_equivalent(left: &str, right: &str) -> bool {
-    if left == right {
-        return true;
+fn cluster_endpoint_address_lookup_keys(address: &str) -> Vec<String> {
+    let mut keys = vec![format!("raw:{address}")];
+    if let Ok(socket_addr) = address.parse::<SocketAddr>() {
+        keys.push(format!("socket:{socket_addr}"));
     }
-    matches!(
-        (left.parse::<SocketAddr>(), right.parse::<SocketAddr>()),
-        (Ok(l), Ok(r)) if l == r
-    )
+    keys
 }
 
 pub fn build_cluster_network_info_record(

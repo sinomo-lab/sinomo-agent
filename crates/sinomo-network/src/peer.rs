@@ -10,6 +10,9 @@ pub struct PeerRegistry {
     peer_states: BTreeMap<NodeId, PeerState>,
     endpoint_candidates: BTreeMap<NodeId, Vec<PeerEndpointCandidate>>,
     sessions: BTreeMap<SessionId, BTreeSet<NodeId>>,
+    sessions_by_node: BTreeMap<NodeId, BTreeSet<SessionId>>,
+    routable_nodes: BTreeSet<NodeId>,
+    routable_sessions: BTreeMap<SessionId, BTreeSet<NodeId>>,
 }
 
 impl PeerRegistry {
@@ -27,9 +30,13 @@ impl PeerRegistry {
 
     pub fn register_node(&mut self, profile: NodeProfile) -> Option<NodeProfile> {
         let node_id = profile.node_id.clone();
-        self.peer_states
+        let can_route = self
+            .peer_states
             .entry(node_id.clone())
-            .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())));
+            .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())))
+            .status
+            .can_route_reactive();
+        self.set_node_routable_index(&node_id, can_route);
         self.nodes.insert(node_id, profile)
     }
 
@@ -94,7 +101,20 @@ impl PeerRegistry {
             return Err(NetworkError::UnknownNode { node_id });
         }
 
-        self.sessions.entry(session_id).or_default().insert(node_id);
+        self.sessions
+            .entry(session_id.clone())
+            .or_default()
+            .insert(node_id.clone());
+        self.sessions_by_node
+            .entry(node_id.clone())
+            .or_default()
+            .insert(session_id.clone());
+        if self.is_routable(&node_id) {
+            self.routable_sessions
+                .entry(session_id)
+                .or_default()
+                .insert(node_id);
+        }
         Ok(())
     }
 
@@ -132,7 +152,9 @@ impl PeerRegistry {
         state.link.last_seen_tick = Some(tick);
         state.link.missed_heartbeats = 0;
         profile.set_health(NodeHealth::available());
-        Ok(state.status.clone())
+        let status = state.status.clone();
+        self.set_node_routable_index(node_id, true);
+        Ok(status)
     }
 
     pub fn record_missed_heartbeat(
@@ -151,7 +173,7 @@ impl PeerRegistry {
             .or_insert_with(|| PeerState::new(NodeEndpoint::in_process(node_id.clone())));
 
         state.link.missed_heartbeats = state.link.missed_heartbeats.saturating_add(1);
-        state.status = if state.link.missed_heartbeats >= policy.offline_after_missed {
+        let status = if state.link.missed_heartbeats >= policy.offline_after_missed {
             profile.set_health(NodeHealth {
                 availability: NodeAvailability::Offline,
                 message: Some("network heartbeat missed offline threshold".to_string()),
@@ -166,8 +188,10 @@ impl PeerRegistry {
             profile.set_health(NodeHealth::degraded("network heartbeat missed"));
             PeerStatus::Degraded
         };
+        state.status = status.clone();
 
-        Ok(state.status.clone())
+        self.set_node_routable_index(node_id, status.can_route_reactive());
+        Ok(status)
     }
 
     pub fn session_nodes(&self, session_id: &SessionId) -> Vec<NodeId> {
@@ -178,24 +202,48 @@ impl PeerRegistry {
     }
 
     pub fn routable_session_nodes(&self, session_id: &SessionId) -> Vec<NodeId> {
-        self.sessions
+        self.routable_sessions
             .get(session_id)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .filter(|node_id| self.is_routable(node_id))
-                    .cloned()
-                    .collect()
-            })
+            .map(|nodes| nodes.iter().cloned().collect())
             .unwrap_or_default()
     }
 
     pub fn routable_network_nodes(&self) -> Vec<NodeId> {
-        self.nodes
-            .keys()
-            .filter(|node_id| self.is_routable(node_id))
+        self.routable_nodes.iter().cloned().collect()
+    }
+
+    fn set_node_routable_index(&mut self, node_id: &NodeId, can_route: bool) {
+        if can_route {
+            self.routable_nodes.insert(node_id.clone());
+        } else {
+            self.routable_nodes.remove(node_id);
+        }
+        for session_id in self
+            .sessions_by_node
+            .get(node_id)
+            .into_iter()
+            .flat_map(|sessions| sessions.iter())
             .cloned()
-            .collect()
+            .collect::<Vec<_>>()
+        {
+            if can_route {
+                self.routable_sessions
+                    .entry(session_id)
+                    .or_default()
+                    .insert(node_id.clone());
+            } else {
+                let should_remove = if let Some(nodes) = self.routable_sessions.get_mut(&session_id)
+                {
+                    nodes.remove(node_id);
+                    nodes.is_empty()
+                } else {
+                    false
+                };
+                if should_remove {
+                    self.routable_sessions.remove(&session_id);
+                }
+            }
+        }
     }
 }
 
@@ -693,6 +741,7 @@ pub struct InProcessNetwork {
 pub(crate) const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
 pub(crate) const DELIVERY_LEDGER_CAPACITY: usize = 8192;
 pub(crate) const DELIVERY_LEDGER_TERMINAL_RECORD_CAP: usize = 1024;
+const LATENCY_CLASS_READY_PRIORITY_COUNT: usize = 4;
 
 impl InProcessNetwork {
     pub fn new() -> Self {
@@ -1347,13 +1396,19 @@ pub struct DeliveryLedger {
     retry_policy: RetryPolicy,
     capacity: usize,
     records: BTreeMap<RouteDeliveryId, DeliveryRecord>,
+    records_by_target: BTreeMap<NodeId, BTreeSet<RouteDeliveryId>>,
     active_by_event_target: BTreeMap<(EventId, NodeId), RouteDeliveryId>,
     retry_not_before: BTreeMap<RouteDeliveryId, Instant>,
     retry_deadline_ids: BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
+    retry_deadline_ids_by_priority:
+        [BTreeMap<Instant, BTreeSet<RouteDeliveryId>>; LATENCY_CLASS_READY_PRIORITY_COUNT],
     ack_deadline: BTreeMap<RouteDeliveryId, Instant>,
     ack_deadline_ids: BTreeMap<Instant, BTreeSet<RouteDeliveryId>>,
     queued_record_ids: BTreeSet<RouteDeliveryId>,
+    queued_record_ids_by_priority: [BTreeSet<RouteDeliveryId>; LATENCY_CLASS_READY_PRIORITY_COUNT],
     immediate_retry_ids: BTreeSet<RouteDeliveryId>,
+    immediate_retry_ids_by_priority:
+        [BTreeSet<RouteDeliveryId>; LATENCY_CLASS_READY_PRIORITY_COUNT],
     sent_without_ack_deadline_ids: BTreeSet<RouteDeliveryId>,
     terminal_record_ids: BTreeSet<RouteDeliveryId>,
 }
@@ -1368,13 +1423,17 @@ impl DeliveryLedger {
             retry_policy,
             capacity: capacity.max(1),
             records: BTreeMap::new(),
+            records_by_target: BTreeMap::new(),
             active_by_event_target: BTreeMap::new(),
             retry_not_before: BTreeMap::new(),
             retry_deadline_ids: BTreeMap::new(),
+            retry_deadline_ids_by_priority: std::array::from_fn(|_| BTreeMap::new()),
             ack_deadline: BTreeMap::new(),
             ack_deadline_ids: BTreeMap::new(),
             queued_record_ids: BTreeSet::new(),
+            queued_record_ids_by_priority: std::array::from_fn(|_| BTreeSet::new()),
             immediate_retry_ids: BTreeSet::new(),
+            immediate_retry_ids_by_priority: std::array::from_fn(|_| BTreeSet::new()),
             sent_without_ack_deadline_ids: BTreeSet::new(),
             terminal_record_ids: BTreeSet::new(),
         }
@@ -1397,9 +1456,14 @@ impl DeliveryLedger {
         }
 
         let delivery_id = delivery.delivery_id;
+        let target_node_id = delivery.target_node_id.clone();
         self.active_by_event_target.insert(key, delivery_id);
         self.clear_delivery_index_state(delivery_id);
-        self.index_deadline_free_status(delivery_id, &delivery.status);
+        self.index_deadline_free_status(delivery_id, &delivery.status, &delivery.latency_class);
+        self.records_by_target
+            .entry(target_node_id)
+            .or_default()
+            .insert(delivery_id);
         self.records.insert(
             delivery_id,
             DeliveryRecord {
@@ -1458,48 +1522,66 @@ impl DeliveryLedger {
         mut on_inspect: impl FnMut(RouteDeliveryId),
     ) -> Vec<RouteDeliveryId> {
         let max_deliveries = max_deliveries.max(1);
-        let mut ready_by_priority = [
-            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
-            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
-            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
-            Vec::with_capacity(max_deliveries.min(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)),
-        ];
-        for delivery_id in self.ready_candidate_ids_at(now) {
-            on_inspect(delivery_id);
-            let Some(record) = self.records.get(&delivery_id) else {
-                continue;
-            };
-            let priority = latency_class_ready_priority(&record.delivery.latency_class) as usize;
-            if ready_by_priority[priority].len() < max_deliveries {
-                ready_by_priority[priority].push(delivery_id);
-            }
-            if ready_by_priority[0].len() >= max_deliveries
-                || ready_by_priority
-                    .iter()
-                    .all(|bucket| bucket.len() >= max_deliveries)
-            {
-                break;
-            }
-        }
-
         let mut ready = Vec::with_capacity(max_deliveries.min(self.records.len()));
-        for bucket in ready_by_priority {
-            let remaining = max_deliveries.saturating_sub(ready.len());
-            if remaining == 0 {
-                break;
+        'priorities: for priority in 0..LATENCY_CLASS_READY_PRIORITY_COUNT {
+            for delivery_id in self.queued_record_ids_by_priority[priority].iter().copied() {
+                if self.push_ready_candidate(
+                    delivery_id,
+                    priority,
+                    max_deliveries,
+                    &mut ready,
+                    &mut on_inspect,
+                ) {
+                    break 'priorities;
+                }
             }
-            ready.extend(bucket.into_iter().take(remaining));
+            for delivery_id in self.immediate_retry_ids_by_priority[priority]
+                .iter()
+                .copied()
+            {
+                if self.push_ready_candidate(
+                    delivery_id,
+                    priority,
+                    max_deliveries,
+                    &mut ready,
+                    &mut on_inspect,
+                ) {
+                    break 'priorities;
+                }
+            }
+            for (_, delivery_ids) in self.retry_deadline_ids_by_priority[priority].range(..=now) {
+                for delivery_id in delivery_ids.iter().copied() {
+                    if self.push_ready_candidate(
+                        delivery_id,
+                        priority,
+                        max_deliveries,
+                        &mut ready,
+                        &mut on_inspect,
+                    ) {
+                        break 'priorities;
+                    }
+                }
+            }
         }
         ready
     }
 
-    fn ready_candidate_ids_at(&self, now: Instant) -> BTreeSet<RouteDeliveryId> {
-        let mut ready = self.queued_record_ids.clone();
-        ready.extend(self.immediate_retry_ids.iter().copied());
-        for (_, delivery_ids) in self.retry_deadline_ids.range(..=now) {
-            ready.extend(delivery_ids.iter().copied());
+    fn push_ready_candidate(
+        &self,
+        delivery_id: RouteDeliveryId,
+        priority: usize,
+        max_deliveries: usize,
+        ready: &mut Vec<RouteDeliveryId>,
+        on_inspect: &mut impl FnMut(RouteDeliveryId),
+    ) -> bool {
+        on_inspect(delivery_id);
+        let Some(record) = self.records.get(&delivery_id) else {
+            return ready.len() >= max_deliveries;
+        };
+        if latency_class_ready_priority(&record.delivery.latency_class) as usize == priority {
+            ready.push(delivery_id);
         }
-        ready
+        ready.len() >= max_deliveries
     }
 
     pub fn next_outbound_wake_at(&self) -> Option<Instant> {
@@ -1553,21 +1635,21 @@ impl DeliveryLedger {
     }
 
     pub fn mark_for_retry(&mut self, delivery_id: RouteDeliveryId) -> Result<(), NetworkError> {
-        let should_retry = {
+        let retry_latency_class = {
             let record = self
                 .records
                 .get_mut(&delivery_id)
                 .ok_or(NetworkError::UnknownDelivery { delivery_id })?;
             if record.delivery.status == DeliveryStatus::Delivered {
-                false
+                None
             } else {
                 record.delivery.status = DeliveryStatus::Retrying;
-                true
+                Some(record.delivery.latency_class.clone())
             }
         };
-        if should_retry {
+        if let Some(latency_class) = retry_latency_class {
             self.clear_delivery_index_state(delivery_id);
-            self.immediate_retry_ids.insert(delivery_id);
+            self.insert_immediate_retry_index(delivery_id, &latency_class);
         }
         Ok(())
     }
@@ -1715,12 +1797,22 @@ impl DeliveryLedger {
         target_node_id: &NodeId,
         include_in_flight: bool,
     ) -> usize {
+        self.requeue_target_matching_inner(target_node_id, include_in_flight, |_| {})
+    }
+
+    fn requeue_target_matching_inner(
+        &mut self,
+        target_node_id: &NodeId,
+        include_in_flight: bool,
+        mut on_inspect: impl FnMut(RouteDeliveryId),
+    ) -> usize {
         let mut requeued = 0;
         let mut requeued_ids = Vec::new();
-        for (delivery_id, record) in self.records.iter_mut() {
-            if &record.delivery.target_node_id != target_node_id {
+        for delivery_id in self.target_delivery_ids(target_node_id) {
+            on_inspect(delivery_id);
+            let Some(record) = self.records.get_mut(&delivery_id) else {
                 continue;
-            }
+            };
             let should_requeue = matches!(
                 record.delivery.status,
                 DeliveryStatus::Failed | DeliveryStatus::WaitingForPeer
@@ -1729,27 +1821,49 @@ impl DeliveryLedger {
             if should_requeue {
                 record.delivery.status = DeliveryStatus::Retrying;
                 record.attempts = 0;
-                requeued_ids.push(*delivery_id);
+                requeued_ids.push((delivery_id, record.delivery.latency_class.clone()));
                 requeued += 1;
             }
         }
-        for delivery_id in requeued_ids {
+        for (delivery_id, latency_class) in requeued_ids {
             self.clear_delivery_index_state(delivery_id);
-            self.immediate_retry_ids.insert(delivery_id);
+            self.insert_immediate_retry_index(delivery_id, &latency_class);
         }
         requeued
     }
 
+    #[cfg(test)]
+    pub(crate) fn requeue_target_after_recovery_counting_for_test(
+        &mut self,
+        target_node_id: &NodeId,
+        inspected: &mut usize,
+    ) -> usize {
+        self.requeue_target_matching_inner(target_node_id, true, |_| {
+            *inspected = inspected.saturating_add(1);
+        })
+    }
+
     pub fn mark_target_waiting_for_peer(&mut self, target_node_id: &NodeId) -> usize {
+        self.mark_target_waiting_for_peer_inner(target_node_id, |_| {})
+    }
+
+    fn mark_target_waiting_for_peer_inner(
+        &mut self,
+        target_node_id: &NodeId,
+        mut on_inspect: impl FnMut(RouteDeliveryId),
+    ) -> usize {
         let mut waiting = 0;
         let mut waiting_ids = Vec::new();
-        for (delivery_id, record) in self.records.iter_mut() {
-            if &record.delivery.target_node_id == target_node_id
-                && !record.delivery.status.is_terminal()
+        for delivery_id in self.target_delivery_ids(target_node_id) {
+            on_inspect(delivery_id);
+            let Some(record) = self.records.get_mut(&delivery_id) else {
+                continue;
+            };
+            if !record.delivery.status.is_terminal()
                 && record.delivery.status != DeliveryStatus::WaitingForPeer
             {
                 record.delivery.status = DeliveryStatus::WaitingForPeer;
-                waiting_ids.push(*delivery_id);
+                waiting_ids.push(delivery_id);
                 waiting += 1;
             }
         }
@@ -1757,6 +1871,17 @@ impl DeliveryLedger {
             self.clear_delivery_index_state(delivery_id);
         }
         waiting
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_target_waiting_for_peer_counting_for_test(
+        &mut self,
+        target_node_id: &NodeId,
+        inspected: &mut usize,
+    ) -> usize {
+        self.mark_target_waiting_for_peer_inner(target_node_id, |_| {
+            *inspected = inspected.saturating_add(1);
+        })
     }
 
     pub fn ack(
@@ -1820,6 +1945,7 @@ impl DeliveryLedger {
     fn remove_record(&mut self, delivery_id: RouteDeliveryId) -> Option<DeliveryRecord> {
         let record = self.records.remove(&delivery_id)?;
         self.clear_delivery_index_state(delivery_id);
+        self.remove_record_target_index(delivery_id, &record.delivery.target_node_id);
         self.active_by_event_target.remove(&(
             record.delivery.event_id.clone(),
             record.delivery.target_node_id.clone(),
@@ -1827,17 +1953,42 @@ impl DeliveryLedger {
         Some(record)
     }
 
+    fn target_delivery_ids(&self, target_node_id: &NodeId) -> Vec<RouteDeliveryId> {
+        self.records_by_target
+            .get(target_node_id)
+            .map(|delivery_ids| delivery_ids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn remove_record_target_index(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+        target_node_id: &NodeId,
+    ) {
+        let should_remove =
+            if let Some(delivery_ids) = self.records_by_target.get_mut(target_node_id) {
+                delivery_ids.remove(&delivery_id);
+                delivery_ids.is_empty()
+            } else {
+                false
+            };
+        if should_remove {
+            self.records_by_target.remove(target_node_id);
+        }
+    }
+
     fn index_deadline_free_status(
         &mut self,
         delivery_id: RouteDeliveryId,
         status: &DeliveryStatus,
+        latency_class: &LatencyClass,
     ) {
         match status {
             DeliveryStatus::Queued => {
-                self.queued_record_ids.insert(delivery_id);
+                self.insert_queued_index(delivery_id, latency_class);
             }
             DeliveryStatus::Retrying => {
-                self.immediate_retry_ids.insert(delivery_id);
+                self.insert_immediate_retry_index(delivery_id, latency_class);
             }
             DeliveryStatus::Sent => {
                 self.sent_without_ack_deadline_ids.insert(delivery_id);
@@ -1852,26 +2003,66 @@ impl DeliveryLedger {
     fn clear_delivery_index_state(&mut self, delivery_id: RouteDeliveryId) {
         self.queued_record_ids.remove(&delivery_id);
         self.immediate_retry_ids.remove(&delivery_id);
+        for queued_ids in &mut self.queued_record_ids_by_priority {
+            queued_ids.remove(&delivery_id);
+        }
+        for retry_ids in &mut self.immediate_retry_ids_by_priority {
+            retry_ids.remove(&delivery_id);
+        }
         self.sent_without_ack_deadline_ids.remove(&delivery_id);
         self.terminal_record_ids.remove(&delivery_id);
         self.clear_retry_deadline(delivery_id);
         self.clear_ack_deadline(delivery_id);
     }
 
+    fn insert_queued_index(&mut self, delivery_id: RouteDeliveryId, latency_class: &LatencyClass) {
+        self.queued_record_ids.insert(delivery_id);
+        self.queued_record_ids_by_priority[latency_class_ready_priority(latency_class) as usize]
+            .insert(delivery_id);
+    }
+
+    fn insert_immediate_retry_index(
+        &mut self,
+        delivery_id: RouteDeliveryId,
+        latency_class: &LatencyClass,
+    ) {
+        self.immediate_retry_ids.insert(delivery_id);
+        self.immediate_retry_ids_by_priority[latency_class_ready_priority(latency_class) as usize]
+            .insert(delivery_id);
+    }
+
     fn insert_retry_deadline(&mut self, delivery_id: RouteDeliveryId, deadline: Instant) {
         self.clear_retry_deadline(delivery_id);
         self.immediate_retry_ids.remove(&delivery_id);
+        for retry_ids in &mut self.immediate_retry_ids_by_priority {
+            retry_ids.remove(&delivery_id);
+        }
         self.retry_not_before.insert(delivery_id, deadline);
         self.retry_deadline_ids
             .entry(deadline)
             .or_default()
             .insert(delivery_id);
+        if let Some(priority) = self.record_ready_priority(delivery_id) {
+            self.retry_deadline_ids_by_priority[priority]
+                .entry(deadline)
+                .or_default()
+                .insert(delivery_id);
+        }
     }
 
     fn clear_retry_deadline(&mut self, delivery_id: RouteDeliveryId) -> Option<Instant> {
         let deadline = self.retry_not_before.remove(&delivery_id)?;
         remove_deadline_index_entry(&mut self.retry_deadline_ids, deadline, delivery_id);
+        for index in &mut self.retry_deadline_ids_by_priority {
+            remove_deadline_index_entry(index, deadline, delivery_id);
+        }
         Some(deadline)
+    }
+
+    fn record_ready_priority(&self, delivery_id: RouteDeliveryId) -> Option<usize> {
+        self.records
+            .get(&delivery_id)
+            .map(|record| latency_class_ready_priority(&record.delivery.latency_class) as usize)
     }
 
     fn insert_ack_deadline(&mut self, delivery_id: RouteDeliveryId, deadline: Instant) {

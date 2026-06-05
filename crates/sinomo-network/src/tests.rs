@@ -1353,6 +1353,128 @@ fn connectivity_graph_keys_records_by_source_target_and_endpoint() {
 }
 
 #[test]
+fn connectivity_graph_indexes_equivalent_endpoint_addresses() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_address_index").expect("cluster");
+    let source = NodeId::from_legacy_named("node_connectivity_address_source").expect("source");
+    let target = NodeId::from_legacy_named("node_connectivity_address_target").expect("target");
+    let recorded_endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_connectivity_address_recorded")
+            .expect("endpoint");
+    let query_endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_connectivity_address_query")
+            .expect("endpoint");
+    let graph = ClusterConnectivityGraph::from_records(
+        source.clone(),
+        [ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: recorded_endpoint_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "[2001:0db8:0:0:0:0:0:1]:21353".to_string(),
+            state: ClusterConnectivityState::Unreachable,
+            latency_ms: None,
+            consecutive_failures: 3,
+            last_success_at: None,
+            last_failure_at: Some("failed".to_string()),
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        }],
+    );
+    let endpoint = ClusterEndpointRecord {
+        endpoint_id: query_endpoint_id,
+        node_id: target,
+        transport: ClusterTransportKind::LanTcp,
+        address: "[2001:db8::1]:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+
+    let record = graph
+        .record_for_endpoint(&endpoint)
+        .expect("equivalent socket address lookup");
+    assert_eq!(record.endpoint_id, recorded_endpoint_id);
+    assert_eq!(graph.unavailability_rank(&endpoint), 1);
+}
+
+#[test]
+fn connectivity_graph_indexes_best_healthy_endpoint_by_pair() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_best_index").expect("cluster");
+    let source = NodeId::from_legacy_named("node_connectivity_best_source").expect("source");
+    let target = NodeId::from_legacy_named("node_connectivity_best_target").expect("target");
+    let unrelated =
+        NodeId::from_legacy_named("node_connectivity_best_unrelated").expect("unrelated");
+    let slow_endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_connectivity_best_slow").expect("endpoint");
+    let fast_endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_connectivity_best_fast").expect("endpoint");
+    let unrelated_endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_connectivity_best_unrelated")
+            .expect("endpoint");
+    let records = [
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: slow_endpoint_id,
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.80:21353".to_string(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(50),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            endpoint_id: fast_endpoint_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://fast".to_string(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(5),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+        ClusterConnectivityRecord {
+            cluster_id,
+            source_node_id: source.clone(),
+            target_node_id: unrelated,
+            endpoint_id: unrelated_endpoint_id,
+            transport: ClusterTransportKind::LanTcp,
+            address: "10.0.0.81:21353".to_string(),
+            state: ClusterConnectivityState::Healthy,
+            latency_ms: Some(1),
+            consecutive_failures: 0,
+            last_success_at: Some("ok".to_string()),
+            last_failure_at: None,
+            observed_at: now,
+            expires_at: now + time::Duration::seconds(30),
+        },
+    ];
+    let graph = ClusterConnectivityGraph::from_records(source.clone(), records);
+
+    let endpoint = graph
+        .best_healthy_endpoint(&source, &target)
+        .expect("best healthy endpoint");
+    assert_eq!(endpoint.endpoint_id, fast_endpoint_id);
+    assert_eq!(endpoint.address, "iroh://fast");
+    assert_eq!(endpoint.last_observed_latency_ms, Some(5));
+}
+
+#[test]
 fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-noop-{}",
@@ -11538,6 +11660,82 @@ fn routes_session_events_to_participants() {
 }
 
 #[test]
+fn peer_registry_routable_indexes_track_session_and_status_changes() {
+    let node_a = NodeId::from_legacy_named("node_route_index_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_route_index_b").expect("node b");
+    let session_id = SessionId::from_legacy_named("sess_route_index").expect("session");
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_route_index_a"));
+    registry.register_node(node("node_route_index_b"));
+    registry
+        .join_session(session_id.clone(), node_a.clone())
+        .expect("join a");
+    registry
+        .join_session(session_id.clone(), node_b.clone())
+        .expect("join b");
+
+    let expected_all = [node_a.clone(), node_b.clone()]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        registry
+            .routable_session_nodes(&session_id)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        expected_all
+    );
+    assert_eq!(
+        registry
+            .routable_network_nodes()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [node_a.clone(), node_b.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+
+    registry
+        .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+        .expect("first miss");
+    assert_eq!(
+        registry
+            .routable_session_nodes(&session_id)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [node_a.clone(), node_b.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "degraded peers remain routable"
+    );
+    registry
+        .record_missed_heartbeat(&node_b, HeartbeatPolicy::default())
+        .expect("second miss");
+    assert_eq!(
+        registry.routable_session_nodes(&session_id),
+        vec![node_a.clone()],
+        "suspect peers should leave the maintained routable session index"
+    );
+    assert_eq!(registry.routable_network_nodes(), vec![node_a.clone()]);
+
+    registry
+        .record_heartbeat(&node_b, 42)
+        .expect("heartbeat recovery");
+    assert_eq!(
+        registry
+            .routable_session_nodes(&session_id)
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        [node_a, node_b.clone()]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(
+        registry.routable_network_nodes().contains(&node_b),
+        "heartbeat recovery should restore the maintained routable network index"
+    );
+}
+
+#[test]
 fn in_process_transport_delivers_typed_frames() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
@@ -13547,6 +13745,41 @@ fn delivery_ledger_stops_ready_scan_after_full_realtime_batch() {
 }
 
 #[test]
+fn delivery_ledger_ready_priority_index_skips_older_bulk_backlog() {
+    let node_a = NodeId::from_legacy_named("node_ready_priority_index_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ready_priority_index_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 8);
+    for index in 1..=6 {
+        let latency_class = if index == 6 {
+            LatencyClass::Reactive
+        } else {
+            LatencyClass::Background
+        };
+        let event = fixture_event(&format!("evt_ready_priority_index_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    let mut inspected = 0;
+    assert_eq!(
+        ledger.ready_delivery_ids_limited_at_counting(Instant::now(), 1, &mut inspected),
+        vec![RouteDeliveryId(6)],
+        "reactive work should be selected ahead of older background backlog"
+    );
+    assert_eq!(
+        inspected, 1,
+        "priority-indexed ready selection should not walk older bulk backlog for a reactive batch"
+    );
+}
+
+#[test]
 fn delivery_ledger_ready_selection_skips_non_ready_backlog() {
     let node_a = NodeId::from_legacy_named("node_ready_index_source").expect("node");
     let node_b = NodeId::from_legacy_named("node_ready_index_target").expect("node");
@@ -13849,6 +14082,69 @@ fn delivery_ledger_only_requeues_sent_records_on_recovery() {
     assert_eq!(record.delivery.status, DeliveryStatus::Retrying);
     assert_eq!(record.attempts, 0);
     assert_eq!(ledger.ready_delivery_ids(), vec![RouteDeliveryId(1)]);
+}
+
+#[test]
+fn delivery_ledger_target_transitions_skip_unrelated_backlog() {
+    let node_a = NodeId::from_legacy_named("node_ledger_target_index_source").expect("node");
+    let target = NodeId::from_legacy_named("node_ledger_target_index_hot").expect("node");
+    let unrelated = NodeId::from_legacy_named("node_ledger_target_index_cold").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 8);
+    for index in 1..=6 {
+        let target_node_id = if index == 6 {
+            target.clone()
+        } else {
+            unrelated.clone()
+        };
+        let latency_class = if index == 6 {
+            LatencyClass::Reactive
+        } else {
+            LatencyClass::Background
+        };
+        let event = fixture_event(&format!("evt_ledger_target_index_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id,
+            latency_class,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    let mut inspected = 0;
+    assert_eq!(
+        ledger.mark_target_waiting_for_peer_counting_for_test(&target, &mut inspected),
+        1
+    );
+    assert_eq!(
+        inspected, 1,
+        "offline transitions should inspect only records for the changed target"
+    );
+    assert_eq!(
+        ledger
+            .record(&RouteDeliveryId(6))
+            .expect("target record")
+            .delivery
+            .status,
+        DeliveryStatus::WaitingForPeer
+    );
+
+    inspected = 0;
+    assert_eq!(
+        ledger.requeue_target_after_recovery_counting_for_test(&target, &mut inspected),
+        1
+    );
+    assert_eq!(
+        inspected, 1,
+        "recovery transitions should inspect only records for the changed target"
+    );
+    assert_eq!(
+        ledger.ready_delivery_ids_limited(1),
+        vec![RouteDeliveryId(6)],
+        "recovered target work should become ready without touching unrelated backlog"
+    );
 }
 
 #[test]

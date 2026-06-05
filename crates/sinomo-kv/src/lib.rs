@@ -1365,6 +1365,7 @@ pub struct InProcessKvStore {
     lease_deadlines: BTreeMap<u64, BTreeSet<LeaseId>>,
     lease_keys: BTreeMap<LeaseId, BTreeSet<String>>,
     watches: BTreeMap<WatchId, KvWatchState>,
+    watch_prefixes: BTreeMap<String, BTreeSet<WatchId>>,
     next_watch_id: u64,
 }
 
@@ -1672,6 +1673,7 @@ impl InProcessKvStore {
             compacted_revision: None,
         };
         compact_watch_pending(&mut watch);
+        self.index_watch_prefix(watch_id, &watch.watch.prefix);
         self.watches.insert(watch_id, watch);
         Ok(watch_id)
     }
@@ -1683,8 +1685,7 @@ impl InProcessKvStore {
             .and_then(|watch| watch.compacted_revision)
         {
             let requested = self
-                .watches
-                .remove(&watch_id)
+                .remove_watch(watch_id)
                 .map(|watch| watch.watch.start_revision)
                 .unwrap_or(KvRevision::ZERO);
             return Err(KvError::Compacted {
@@ -1704,7 +1705,7 @@ impl InProcessKvStore {
     }
 
     pub fn cancel_watch(&mut self, watch_id: WatchId) -> Result<bool, KvError> {
-        Ok(self.watches.remove(&watch_id).is_some())
+        Ok(self.remove_watch(watch_id).is_some())
     }
 
     pub fn snapshot(&self) -> KvSnapshot {
@@ -1745,6 +1746,7 @@ impl InProcessKvStore {
             lease_deadlines,
             lease_keys,
             watches: BTreeMap::new(),
+            watch_prefixes: BTreeMap::new(),
             next_watch_id: 1,
         }
     }
@@ -2419,9 +2421,9 @@ impl InProcessKvStore {
 
     fn record_event(&mut self, event: KvEvent) {
         let event = Arc::new(event);
-        for watch in self.watches.values_mut() {
-            if event.revision >= watch.watch.start_revision
-                && event.key.starts_with(&watch.watch.prefix)
+        for watch_id in self.matching_watch_ids_for_event_key(&event.key) {
+            if let Some(watch) = self.watches.get_mut(&watch_id)
+                && event.revision >= watch.watch.start_revision
             {
                 watch.pending.push_back(Arc::clone(&event));
                 compact_watch_pending(watch);
@@ -2429,6 +2431,52 @@ impl InProcessKvStore {
         }
         self.events.push(event);
         self.trim_event_history();
+    }
+
+    fn index_watch_prefix(&mut self, watch_id: WatchId, prefix: &str) {
+        self.watch_prefixes
+            .entry(prefix.to_string())
+            .or_default()
+            .insert(watch_id);
+    }
+
+    fn remove_watch(&mut self, watch_id: WatchId) -> Option<KvWatchState> {
+        let watch = self.watches.remove(&watch_id)?;
+        self.remove_watch_prefix_index(watch_id, &watch.watch.prefix);
+        Some(watch)
+    }
+
+    fn remove_watch_prefix_index(&mut self, watch_id: WatchId, prefix: &str) {
+        let should_remove = if let Some(watch_ids) = self.watch_prefixes.get_mut(prefix) {
+            watch_ids.remove(&watch_id);
+            watch_ids.is_empty()
+        } else {
+            false
+        };
+        if should_remove {
+            self.watch_prefixes.remove(prefix);
+        }
+    }
+
+    fn matching_watch_ids_for_event_key(&self, key: &str) -> BTreeSet<WatchId> {
+        let mut watch_ids = BTreeSet::new();
+        if let Some(prefix_watch_ids) = self.watch_prefixes.get("") {
+            watch_ids.extend(prefix_watch_ids.iter().copied());
+        }
+        for (start, ch) in key.char_indices() {
+            let end = start + ch.len_utf8();
+            if let Some(prefix_watch_ids) = self.watch_prefixes.get(&key[..end]) {
+                watch_ids.extend(prefix_watch_ids.iter().copied());
+            }
+        }
+        watch_ids
+    }
+
+    #[cfg(test)]
+    fn matching_watch_ids_for_event_key_for_test(&self, key: &str) -> Vec<WatchId> {
+        self.matching_watch_ids_for_event_key(key)
+            .into_iter()
+            .collect()
     }
 
     fn trim_event_history(&mut self) {
@@ -6172,6 +6220,61 @@ mod tests {
     }
 
     #[test]
+    fn watch_prefix_index_routes_only_matching_prefixes() {
+        let mut store = InProcessKvStore::new();
+        let root = store.watch_prefix("", KvRevision(1)).expect("root watch");
+        let services = store
+            .watch_prefix("/services/", KvRevision(1))
+            .expect("services watch");
+        let exact = store
+            .watch_prefix("/services/a", KvRevision(1))
+            .expect("exact watch");
+        let other = store
+            .watch_prefix("/other/", KvRevision(1))
+            .expect("other watch");
+
+        assert_eq!(
+            store.matching_watch_ids_for_event_key_for_test("/services/a"),
+            vec![root, services, exact],
+            "event routing should enumerate only watches whose prefixes match the changed key"
+        );
+
+        store
+            .put("/services/a", b"one".to_vec(), None)
+            .expect("put services");
+        assert_eq!(store.drain_watch(root).expect("root events").len(), 1);
+        assert_eq!(
+            store.drain_watch(services).expect("services events").len(),
+            1
+        );
+        assert_eq!(store.drain_watch(exact).expect("exact events").len(), 1);
+        assert!(
+            store.drain_watch(other).expect("other events").is_empty(),
+            "unmatched watches should not receive the event"
+        );
+
+        assert_eq!(store.cancel_watch(services), Ok(true));
+        assert_eq!(
+            store.matching_watch_ids_for_event_key_for_test("/services/b"),
+            vec![root],
+            "canceled watches must be removed from the prefix index"
+        );
+
+        store
+            .put("/services/b", b"two".to_vec(), None)
+            .expect("put after cancel");
+        assert_eq!(store.drain_watch(root).expect("root second").len(), 1);
+        assert!(
+            store.drain_watch(exact).expect("exact second").is_empty(),
+            "exact key watch should not match a sibling key"
+        );
+        assert_eq!(
+            store.drain_watch(services),
+            Err(KvError::UnknownWatch { watch_id: services })
+        );
+    }
+
+    #[test]
     fn matching_watch_queues_share_event_payloads() {
         let mut store = InProcessKvStore::new();
         let first = store
@@ -6255,6 +6358,12 @@ mod tests {
             store.drain_watch(watch_id),
             Err(KvError::UnknownWatch { watch_id })
         );
+        assert!(
+            store
+                .matching_watch_ids_for_event_key_for_test("/events/next")
+                .is_empty(),
+            "lagged watches removed after compaction must leave the prefix index"
+        );
     }
 
     #[test]
@@ -6272,6 +6381,12 @@ mod tests {
         assert_eq!(
             store.drain_watch(watch_id),
             Err(KvError::UnknownWatch { watch_id })
+        );
+        assert!(
+            store
+                .matching_watch_ids_for_event_key_for_test("/services/b")
+                .is_empty(),
+            "canceled watches must leave the prefix index"
         );
         store
             .put("/services/b", b"two".to_vec(), None)
