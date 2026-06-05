@@ -10,5 +10,7 @@ pub use registry::*;
 pub use types::*;
 
 pub fn default_agent_tool_descriptors() -> Vec<AgentToolDescriptor> {
-    local_workspace::default_local_workspace_tool_descriptors()
+    let mut descriptors = local_workspace::default_local_workspace_tool_descriptors();
+    descriptors.extend(tool_disclosure_descriptors());
+    descriptors
 }

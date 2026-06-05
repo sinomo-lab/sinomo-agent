@@ -2,6 +2,7 @@ mod apply_patch;
 mod changed_files;
 mod command_session;
 mod git_diff;
+mod list_files;
 mod read_file;
 mod replace;
 mod request_user_input;
@@ -30,11 +31,13 @@ const DEFAULT_LOCAL_MAX_SEARCH_BYTES_PER_FILE: u64 = 512 * 1024;
 const DEFAULT_LOCAL_MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_LOCAL_MAX_PATCH_BYTES: usize = 512 * 1024;
 const DEFAULT_LOCAL_MAX_SEARCH_MATCHES: usize = 100;
+const DEFAULT_LOCAL_MAX_LIST_ENTRIES: usize = 200;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalWorkspaceAgentConfig {
     pub root: PathBuf,
     pub evidence_dir: Option<PathBuf>,
+    pub sifs_evidence: Option<LocalWorkspaceSifsEvidenceConfig>,
     pub allow_shell_commands: bool,
     pub allow_file_writes: bool,
     pub max_read_bytes: usize,
@@ -42,6 +45,34 @@ pub struct LocalWorkspaceAgentConfig {
     pub max_command_output_bytes: usize,
     pub max_patch_bytes: usize,
     pub max_search_matches: usize,
+    pub max_list_entries: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalWorkspaceSifsEvidenceConfig {
+    pub mount_dir: PathBuf,
+    pub sifs_root: String,
+}
+
+impl LocalWorkspaceSifsEvidenceConfig {
+    pub fn new(mount_dir: impl Into<PathBuf>, sifs_root: impl Into<String>) -> Self {
+        Self {
+            mount_dir: mount_dir.into(),
+            sifs_root: normalize_sifs_evidence_root(sifs_root.into()),
+        }
+    }
+
+    fn sifs_uri_for_file(&self, file_name: &str) -> String {
+        AgentToolArtifactRef::sifs(
+            "evidence",
+            format!(
+                "{}/{}",
+                self.sifs_root.trim_end_matches('/'),
+                file_name.trim_start_matches('/')
+            ),
+        )
+        .uri
+    }
 }
 
 impl LocalWorkspaceAgentConfig {
@@ -49,6 +80,7 @@ impl LocalWorkspaceAgentConfig {
         Self {
             root: root.into(),
             evidence_dir: None,
+            sifs_evidence: None,
             allow_shell_commands: false,
             allow_file_writes: false,
             max_read_bytes: DEFAULT_LOCAL_MAX_READ_BYTES,
@@ -56,6 +88,7 @@ impl LocalWorkspaceAgentConfig {
             max_command_output_bytes: DEFAULT_LOCAL_MAX_COMMAND_OUTPUT_BYTES,
             max_patch_bytes: DEFAULT_LOCAL_MAX_PATCH_BYTES,
             max_search_matches: DEFAULT_LOCAL_MAX_SEARCH_MATCHES,
+            max_list_entries: DEFAULT_LOCAL_MAX_LIST_ENTRIES,
         }
     }
 
@@ -74,6 +107,15 @@ impl LocalWorkspaceAgentConfig {
         self
     }
 
+    pub fn with_sifs_evidence_mount(
+        mut self,
+        mount_dir: impl Into<PathBuf>,
+        sifs_root: impl Into<String>,
+    ) -> Self {
+        self.sifs_evidence = Some(LocalWorkspaceSifsEvidenceConfig::new(mount_dir, sifs_root));
+        self
+    }
+
     pub fn with_agent_storage(mut self, paths: &AgentStoragePaths, session_id: &SessionId) -> Self {
         self.evidence_dir = Some(paths.evidence_dir_for_session(session_id));
         self
@@ -88,6 +130,7 @@ pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
     let command_sessions = command_session::CommandSessionStore::new();
     AgentToolRegistry::new()
         .with_tool(read_file::ReadFileTool::new(config.clone()))
+        .with_tool(list_files::ListFilesTool::new(config.clone()))
         .with_tool(search::SearchFilesTool::new(config.clone()))
         .with_tool(apply_patch::ApplyPatchTool::new(config.clone()))
         .with_tool(changed_files::ChangedFilesTool::new(config.clone()))
@@ -117,6 +160,7 @@ pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
 pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
     vec![
         read_file::descriptor(),
+        list_files::descriptor(),
         search::descriptor(),
         apply_patch::descriptor(),
         changed_files::descriptor(),
@@ -591,16 +635,55 @@ fn write_local_evidence(
     extension: &str,
     bytes: &[u8],
 ) -> Option<String> {
-    let evidence_dir = config.evidence_dir.as_ref()?;
-    fs::create_dir_all(evidence_dir).ok()?;
-    let path = evidence_dir.join(format!(
+    let file_name = format!(
         "{}-{}.{}",
-        tool_name.replace('_', "-"),
+        sanitize_evidence_component(&tool_name.replace('_', "-")),
         TaskId::generate(),
-        extension
-    ));
-    fs::write(&path, bytes).ok()?;
-    Some(path.display().to_string())
+        sanitize_evidence_component(extension.trim_start_matches('.'))
+    );
+    let local_ref = config.evidence_dir.as_ref().and_then(|evidence_dir| {
+        fs::create_dir_all(evidence_dir).ok()?;
+        let path = evidence_dir.join(&file_name);
+        fs::write(&path, bytes).ok()?;
+        Some(path.display().to_string())
+    });
+    let sifs_ref = config.sifs_evidence.as_ref().and_then(|sifs| {
+        fs::create_dir_all(&sifs.mount_dir).ok()?;
+        let path = sifs.mount_dir.join(&file_name);
+        fs::write(&path, bytes).ok()?;
+        Some(sifs.sifs_uri_for_file(&file_name))
+    });
+    sifs_ref.or(local_ref)
+}
+
+fn normalize_sifs_evidence_root(root: String) -> String {
+    let root = root
+        .trim()
+        .trim_start_matches("sifs://")
+        .trim_start_matches('/')
+        .trim_end_matches('/')
+        .to_string();
+    if root.is_empty() {
+        "/events/agent/evidence".to_string()
+    } else {
+        format!("/{root}")
+    }
+}
+
+fn sanitize_evidence_component(component: &str) -> String {
+    let sanitized: String = component
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => ch,
+            _ => '-',
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('-').trim_matches('.').to_string();
+    if sanitized.is_empty() {
+        "evidence".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn input_string(call: &AgentToolCall, key: &str) -> Option<String> {

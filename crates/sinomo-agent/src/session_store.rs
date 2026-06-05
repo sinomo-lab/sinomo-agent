@@ -1,14 +1,14 @@
 use crate::TaskId;
 use crate::agent::{
     AgentAbortRecord, AgentCompactionSummary, AgentFollowUpMessage, AgentItem, AgentRole,
-    AgentRunContext, AgentSession, AgentSessionProjection, AgentSteeringMessage, AgentStopReason,
-    AgentStoragePaths, agent_item_id,
+    AgentRunContext, AgentSession, AgentSessionControlSnapshot, AgentSessionProjection,
+    AgentSteeringMessage, AgentStopReason, AgentStoragePaths, AgentTaskSnapshot, agent_item_id,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 pub const AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -35,6 +35,13 @@ pub trait AgentSessionStore: Send + Sync {
 
     fn append_record(&self, record: &AgentSessionStoreRecord)
     -> Result<(), AgentSessionStoreError>;
+
+    fn load_control_snapshot(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<Option<AgentSessionControlSnapshot>, AgentSessionStoreError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -149,6 +156,15 @@ pub enum AgentSessionStoreRecordKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         previous_projection_id: Option<TaskId>,
         retained_item_count: usize,
+    },
+    ControlEventPublished {
+        event: crate::agent::AgentEvent,
+    },
+    ControlSnapshotSaved {
+        snapshot: AgentSessionControlSnapshot,
+    },
+    TaskStatusChanged {
+        snapshot: AgentTaskSnapshot,
     },
     SteeringQueued {
         steering: AgentSteeringMessage,
@@ -325,6 +341,41 @@ impl AgentSessionStore for FileAgentSessionStore {
             .paths
             .session_events_path_for_session(&record.session_id);
         append_jsonl_record(&path, record)
+    }
+
+    fn load_control_snapshot(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<AgentSessionControlSnapshot>, AgentSessionStoreError> {
+        let path = self.paths.session_events_path_for_session(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = File::open(&path).map_err(|source| AgentSessionStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut latest = None;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| AgentSessionStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AgentSessionStoreRecord =
+                serde_json::from_str(&line).map_err(|source| {
+                    AgentSessionStoreError::Deserialization {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+            if let AgentSessionStoreRecordKind::ControlSnapshotSaved { snapshot } = record.record {
+                latest = Some(snapshot);
+            }
+        }
+        Ok(latest)
     }
 }
 

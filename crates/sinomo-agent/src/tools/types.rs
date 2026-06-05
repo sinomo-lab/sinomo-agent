@@ -1,6 +1,11 @@
-use crate::{AgentToolCall, AgentToolSpec, AgentVerificationState, InteractionSession, TaskId};
+use crate::{
+    AgentToolCall, AgentToolKind, AgentToolSpec, AgentVerificationState, InteractionSession, TaskId,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sinomo_runtime::core::{HotSwapState, ModuleLoaderState};
 use sinomo_runtime::events::EventId;
+use sinomo_runtime::module::ModuleRegistration;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolDescriptor {
@@ -80,6 +85,7 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
     use crate::AgentToolKind;
     match kind {
         AgentToolKind::ReadFile
+        | AgentToolKind::ListFiles
         | AgentToolKind::SearchFiles
         | AgentToolKind::WriteFile
         | AgentToolKind::ApplyPatch
@@ -92,7 +98,11 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::InspectCommandSession
         | AgentToolKind::WriteCommandStdin
         | AgentToolKind::CancelCommandSession => vec!["core", "coding", "local"],
+        AgentToolKind::ModuleObjectRpc => vec!["module", "object_rpc"],
         AgentToolKind::RequestUserInput => vec!["core", "interactive"],
+        AgentToolKind::ToolSearch | AgentToolKind::ToolDescribe | AgentToolKind::ToolCall => {
+            vec!["core", "discovery"]
+        }
         AgentToolKind::ConfigSearch | AgentToolKind::ConfigGet | AgentToolKind::ConfigSet => {
             vec!["config", "local"]
         }
@@ -158,6 +168,7 @@ pub enum AgentToolCustomFormat {
 #[serde(rename_all = "snake_case")]
 pub enum AgentToolPlanSource {
     Runtime,
+    Module,
     Session,
     Default,
 }
@@ -199,6 +210,26 @@ impl AgentToolPlan {
 
     pub fn descriptor(&self, tool_name: &str) -> Option<&AgentToolDescriptor> {
         self.entry(tool_name).map(|entry| &entry.descriptor)
+    }
+
+    pub fn descriptors_matching(
+        &self,
+        query: Option<&str>,
+        include_bridge_tools: bool,
+    ) -> Vec<&AgentToolPlanEntry> {
+        let query = query.map(|query| query.trim().to_ascii_lowercase());
+        self.entries
+            .iter()
+            .filter(|entry| {
+                include_bridge_tools || !is_tool_disclosure_bridge_name(&entry.descriptor.spec.name)
+            })
+            .filter(|entry| {
+                let Some(query) = query.as_deref().filter(|query| !query.is_empty()) else {
+                    return true;
+                };
+                descriptor_matches_query(&entry.descriptor, query)
+            })
+            .collect()
     }
 
     pub fn is_executable(&self, tool_name: &str) -> bool {
@@ -245,12 +276,110 @@ impl AgentToolPlan {
     }
 }
 
+pub fn tool_disclosure_descriptors() -> Vec<AgentToolDescriptor> {
+    vec![
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ToolSearch,
+            "tool_search",
+            "Search planned tools by name, description, toolset, or capability. Results include hidden tools so large module/plugin/MCP surfaces can stay out of the prompt until needed.",
+            false,
+        ))
+        .with_capabilities([AgentToolCapability::ObserveEnvironment])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive query over tool names, descriptions, toolsets, and capabilities."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum results to return. Defaults to 20."
+                },
+                "include_bridge_tools": {
+                    "type": "boolean",
+                    "description": "Whether to include tool_search/tool_describe/tool_call in results. Defaults to false."
+                }
+            }
+        })),
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ToolDescribe,
+            "tool_describe",
+            "Return the full planned descriptor and availability metadata for one tool.",
+            false,
+        ))
+        .with_capabilities([AgentToolCapability::ObserveEnvironment])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "required": ["tool"],
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "Tool name to describe."
+                }
+            }
+        })),
+        AgentToolDescriptor::new(AgentToolSpec::new(
+            AgentToolKind::ToolCall,
+            "tool_call",
+            "Execute a planned tool by name with input discovered through tool_search/tool_describe. The target call is checked by the same agent policy and registry path.",
+            true,
+        ))
+        .with_capabilities([AgentToolCapability::ObserveEnvironment])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "required": ["tool", "input"],
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "Planned target tool name to execute."
+                },
+                "input": {
+                    "type": "object",
+                    "description": "Target tool input object."
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Short reason for executing the target tool."
+                },
+                "async": {
+                    "type": "boolean",
+                    "description": "Whether the target call should be treated as async by higher-level runtimes."
+                }
+            }
+        })),
+    ]
+}
+
+pub fn is_tool_disclosure_bridge_name(tool_name: &str) -> bool {
+    matches!(tool_name, "tool_search" | "tool_describe" | "tool_call")
+}
+
+fn descriptor_matches_query(descriptor: &AgentToolDescriptor, query: &str) -> bool {
+    descriptor.spec.name.to_ascii_lowercase().contains(query)
+        || descriptor
+            .spec
+            .description
+            .to_ascii_lowercase()
+            .contains(query)
+        || descriptor
+            .toolsets
+            .iter()
+            .any(|toolset| toolset.to_ascii_lowercase().contains(query))
+        || descriptor
+            .capabilities
+            .iter()
+            .any(|capability| capability.policy_label().contains(query))
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct AgentToolPlanner;
 
 impl AgentToolPlanner {
     pub fn plan(
         runtime_descriptors: impl IntoIterator<Item = AgentToolDescriptor>,
+        module_projection: &AgentModuleToolProjection,
         session_specs: impl IntoIterator<Item = AgentToolSpec>,
         default_specs: impl IntoIterator<Item = AgentToolSpec>,
         use_default_specs: bool,
@@ -269,6 +398,12 @@ impl AgentToolPlanner {
                 );
             }
         }
+        for descriptor in tool_disclosure_descriptors() {
+            plan.push_or_replace(descriptor, AgentToolPlanSource::Runtime, true);
+        }
+        for descriptor in module_projection.project_descriptors() {
+            plan.push_or_replace(descriptor, AgentToolPlanSource::Module, false);
+        }
         for spec in session_specs {
             plan.push_or_replace(
                 AgentToolDescriptor::from_spec(spec),
@@ -281,6 +416,142 @@ impl AgentToolPlanner {
         }
         plan
     }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentModuleToolProjection {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registrations: Vec<ModuleRegistration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loader_states: Vec<ModuleLoaderState>,
+}
+
+impl AgentModuleToolProjection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.registrations.is_empty() && self.loader_states.is_empty()
+    }
+
+    pub fn with_registration(mut self, registration: ModuleRegistration) -> Self {
+        self.registrations.push(registration);
+        self
+    }
+
+    pub fn with_loader_state(mut self, state: ModuleLoaderState) -> Self {
+        self.loader_states.push(state);
+        self
+    }
+
+    pub fn project_descriptors(&self) -> Vec<AgentToolDescriptor> {
+        let active_module_ids = self
+            .loader_states
+            .iter()
+            .filter(|state| module_loader_state_is_routable(state))
+            .map(|state| state.module_id.as_str().to_string())
+            .collect::<BTreeSet<_>>();
+        if active_module_ids.is_empty() {
+            return Vec::new();
+        }
+        let mut descriptors = Vec::new();
+        let mut names = BTreeSet::new();
+        for registration in &self.registrations {
+            if !active_module_ids.contains(registration.manifest.module_id.as_str()) {
+                continue;
+            }
+            for route in &registration.surfaces.object_rpc_routes {
+                let base_name = module_object_rpc_tool_name(&route.category, &route.operation);
+                let name = unique_module_tool_name(base_name, &mut names);
+                let descriptor = AgentToolDescriptor::new(AgentToolSpec::new(
+                    AgentToolKind::ModuleObjectRpc,
+                    name,
+                    format!(
+                        "Call active module object-RPC route {} for module {} ({}/{})",
+                        route.route,
+                        registration.manifest.module_id,
+                        registration.manifest.owner,
+                        registration.manifest.version
+                    ),
+                    true,
+                ))
+                .with_toolsets([
+                    "module".to_string(),
+                    "object_rpc".to_string(),
+                    registration.manifest.owner.clone(),
+                ])
+                .with_capabilities([AgentToolCapability::CallModule])
+                .with_input_schema(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "route_key": {
+                            "type": "string",
+                            "description": "Optional routing key for the module invocation."
+                        },
+                        "input": {
+                            "description": "Route-specific object-RPC request payload."
+                        }
+                    }
+                }))
+                .with_output_schema(serde_json::json!({
+                    "type": "object",
+                    "description": "Route-specific object-RPC response payload."
+                }));
+                descriptors.push(descriptor);
+            }
+        }
+        descriptors
+    }
+}
+
+fn module_loader_state_is_routable(state: &ModuleLoaderState) -> bool {
+    !matches!(state.hot_swap_state, HotSwapState::Quarantined)
+}
+
+fn module_object_rpc_tool_name(category: &str, operation: &str) -> String {
+    let category = sanitize_tool_name_segment(category);
+    let operation = sanitize_tool_name_segment(operation);
+    if category.is_empty() {
+        format!("module_rpc_{operation}")
+    } else if operation.is_empty() {
+        format!("module_rpc_{category}")
+    } else {
+        format!("module_rpc_{category}_{operation}")
+    }
+}
+
+fn sanitize_tool_name_segment(value: &str) -> String {
+    let mut sanitized = String::new();
+    let mut previous_was_underscore = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+            previous_was_underscore = false;
+        } else if !previous_was_underscore {
+            sanitized.push('_');
+            previous_was_underscore = true;
+        }
+    }
+    sanitized.trim_matches('_').to_string()
+}
+
+fn unique_module_tool_name(base: String, names: &mut BTreeSet<String>) -> String {
+    let base = if base == "module_rpc_" || base.is_empty() {
+        "module_rpc_route".to_string()
+    } else {
+        base
+    };
+    if names.insert(base.clone()) {
+        return base;
+    }
+    for index in 2usize.. {
+        let candidate = format!("{base}_{index}");
+        if names.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded numeric suffix loop always returns")
 }
 
 fn descriptor_matches_toolsets(
@@ -306,6 +577,7 @@ pub enum AgentToolCapability {
     Delegate,
     ObserveEnvironment,
     CallModel,
+    CallModule,
     ManageBackgroundTask,
     InspectClusterState,
     ManageConfig,
@@ -323,6 +595,7 @@ impl AgentToolCapability {
             AgentToolCapability::Delegate => "delegate",
             AgentToolCapability::ObserveEnvironment => "observe_environment",
             AgentToolCapability::CallModel => "call_model",
+            AgentToolCapability::CallModule => "call_module",
             AgentToolCapability::ManageBackgroundTask => "manage_background_task",
             AgentToolCapability::InspectClusterState => "inspect_cluster_state",
             AgentToolCapability::ManageConfig => "manage_config",
@@ -386,6 +659,20 @@ impl AgentToolArtifactRef {
             label: None,
             media_type: None,
         }
+    }
+
+    pub fn sifs(kind: impl Into<String>, path: impl AsRef<str>) -> Self {
+        let path = path.as_ref().trim();
+        let uri = if path.starts_with("sifs://") {
+            path.to_string()
+        } else {
+            format!("sifs://{}", path.trim_start_matches('/'))
+        };
+        Self::new(kind, uri)
+    }
+
+    pub fn is_sifs(&self) -> bool {
+        self.uri.starts_with("sifs://")
     }
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {

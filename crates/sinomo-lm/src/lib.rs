@@ -275,12 +275,23 @@ pub struct LanguageModelToolAdapterOutput {
     pub text: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<LanguageModelToolCall>,
+    #[serde(default)]
+    pub source: LanguageModelToolAdapterSource,
 }
 
 impl LanguageModelToolAdapterOutput {
     pub fn is_empty(&self) -> bool {
         self.tool_calls.is_empty()
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageModelToolAdapterSource {
+    #[default]
+    None,
+    Native,
+    VendorFallback,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,6 +334,11 @@ impl LanguageModelToolAdapter {
     ) -> LanguageModelToolAdapterOutput {
         let mut tool_calls = native_language_model_tool_calls(response, stream_events, tools);
         let mut text = None;
+        let mut source = if tool_calls.is_empty() {
+            LanguageModelToolAdapterSource::None
+        } else {
+            LanguageModelToolAdapterSource::Native
+        };
         if tool_calls.is_empty() {
             for syntax in self.fallback_syntaxes {
                 let fallback = match syntax {
@@ -333,11 +349,16 @@ impl LanguageModelToolAdapter {
                 if !fallback.tool_calls.is_empty() {
                     text = fallback.text;
                     tool_calls = fallback.tool_calls;
+                    source = LanguageModelToolAdapterSource::VendorFallback;
                     break;
                 }
             }
         }
-        LanguageModelToolAdapterOutput { text, tool_calls }
+        LanguageModelToolAdapterOutput {
+            text,
+            tool_calls,
+            source,
+        }
     }
 }
 
@@ -438,7 +459,16 @@ fn parse_dsml_tool_adapter_output(raw: &str) -> LanguageModelToolAdapterOutput {
     } else {
         Some(remove_dsml_tool_call_blocks(raw).trim().to_string())
     };
-    LanguageModelToolAdapterOutput { text, tool_calls }
+    let source = if tool_calls.is_empty() {
+        LanguageModelToolAdapterSource::None
+    } else {
+        LanguageModelToolAdapterSource::VendorFallback
+    };
+    LanguageModelToolAdapterOutput {
+        text,
+        tool_calls,
+        source,
+    }
 }
 
 fn parse_dsml_tool_calls(raw: &str) -> Vec<LanguageModelToolCall> {
@@ -2665,6 +2695,118 @@ pub enum LanguageModelError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LanguageModelErrorCategory {
+    PromptTooLarge,
+    OutputTooLarge,
+    RateLimit,
+    Authentication,
+    MalformedResponse,
+    UnsupportedToolFormat,
+    RepairNeeded,
+    ProviderUnavailable,
+    ProviderUnsupported,
+    Config,
+    Unknown,
+}
+
+impl LanguageModelError {
+    pub fn category(&self) -> LanguageModelErrorCategory {
+        match self {
+            Self::RequestSerialization { detail } => classify_language_model_error_detail(detail)
+                .unwrap_or(LanguageModelErrorCategory::MalformedResponse),
+            Self::AuthenticationRequired { .. } | Self::UnsupportedToken { .. } => {
+                LanguageModelErrorCategory::Authentication
+            }
+            Self::TokenStore { .. } | Self::ConfigStore { .. } => {
+                LanguageModelErrorCategory::Config
+            }
+            Self::ProviderSpawnFailed { .. } => LanguageModelErrorCategory::ProviderUnavailable,
+            Self::ProviderInvocationFailed { detail, .. } => {
+                classify_language_model_error_detail(detail)
+                    .unwrap_or(LanguageModelErrorCategory::Unknown)
+            }
+        }
+    }
+}
+
+pub fn classify_language_model_error_detail(detail: &str) -> Option<LanguageModelErrorCategory> {
+    let detail = detail.to_ascii_lowercase();
+    if detail.contains("repair") {
+        return Some(LanguageModelErrorCategory::RepairNeeded);
+    }
+    if detail.contains("rate limit")
+        || detail.contains("too many requests")
+        || detail.contains("http 429")
+        || detail.contains("status 429")
+    {
+        return Some(LanguageModelErrorCategory::RateLimit);
+    }
+    if detail.contains("context_length")
+        || detail.contains("context length")
+        || detail.contains("maximum context")
+        || detail.contains("input too large")
+        || detail.contains("prompt too large")
+        || detail.contains("too many input tokens")
+        || detail.contains("token limit")
+    {
+        return Some(LanguageModelErrorCategory::PromptTooLarge);
+    }
+    if detail.contains("max output")
+        || detail.contains("output too large")
+        || detail.contains("too many output tokens")
+        || detail.contains("completion token limit")
+    {
+        return Some(LanguageModelErrorCategory::OutputTooLarge);
+    }
+    if detail.contains("api key")
+        || detail.contains("unauthorized")
+        || detail.contains("forbidden")
+        || detail.contains("authentication")
+        || detail.contains("auth")
+        || detail.contains("http 401")
+        || detail.contains("http 403")
+        || detail.contains("status 401")
+        || detail.contains("status 403")
+    {
+        return Some(LanguageModelErrorCategory::Authentication);
+    }
+    if detail.contains("unknown language model provider")
+        || detail.contains("unsupported provider")
+        || detail.contains("unknown provider")
+    {
+        return Some(LanguageModelErrorCategory::ProviderUnsupported);
+    }
+    if detail.contains("tool")
+        && (detail.contains("unsupported")
+            || detail.contains("not supported")
+            || detail.contains("does not support"))
+    {
+        return Some(LanguageModelErrorCategory::UnsupportedToolFormat);
+    }
+    if detail.contains("invalid json")
+        || detail.contains("malformed")
+        || detail.contains("failed to parse")
+        || detail.contains("missing field")
+        || detail.contains("no choices")
+        || detail.contains("no output")
+    {
+        return Some(LanguageModelErrorCategory::MalformedResponse);
+    }
+    if detail.contains("connection refused")
+        || detail.contains("connection reset")
+        || detail.contains("timed out")
+        || detail.contains("timeout")
+        || detail.contains("dns")
+        || detail.contains("network")
+        || detail.contains("failed to send")
+    {
+        return Some(LanguageModelErrorCategory::ProviderUnavailable);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2731,6 +2873,7 @@ mod tests {
             collect_language_model_tool_calls("openai", "gpt-5.2-codex", &response, &[], &[tool]);
 
         assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.source, LanguageModelToolAdapterSource::Native);
         assert_eq!(
             output.tool_calls[0].input,
             serde_json::json!({ "patch": "*** Begin Patch\n*** End Patch\n" })
@@ -2762,6 +2905,10 @@ mod tests {
             collect_language_model_tool_calls("deepseek", "deepseek-v4-pro", &response, &[], &[]);
 
         assert_eq!(output.text.as_deref(), Some("I found it."));
+        assert_eq!(
+            output.source,
+            LanguageModelToolAdapterSource::VendorFallback
+        );
         assert_eq!(output.tool_calls.len(), 1);
         assert_eq!(output.tool_calls[0].name, "run_command");
         assert_eq!(
@@ -2778,6 +2925,42 @@ mod tests {
                 .and_then(serde_json::Value::as_i64),
             Some(15000)
         );
+    }
+
+    #[test]
+    fn language_model_errors_have_normalized_categories() {
+        let rate_limit = LanguageModelError::ProviderInvocationFailed {
+            provider: "openai".to_string(),
+            model: "gpt".to_string(),
+            detail: "HTTP 429: rate limit exceeded".to_string(),
+        };
+        assert_eq!(rate_limit.category(), LanguageModelErrorCategory::RateLimit);
+
+        let prompt_too_large = LanguageModelError::ProviderInvocationFailed {
+            provider: "openai".to_string(),
+            model: "gpt".to_string(),
+            detail: "context_length_exceeded: maximum context length".to_string(),
+        };
+        assert_eq!(
+            prompt_too_large.category(),
+            LanguageModelErrorCategory::PromptTooLarge
+        );
+
+        let unsupported_tools = LanguageModelError::ProviderInvocationFailed {
+            provider: "test".to_string(),
+            model: "test".to_string(),
+            detail: "provider does not support tool calls".to_string(),
+        };
+        assert_eq!(
+            unsupported_tools.category(),
+            LanguageModelErrorCategory::UnsupportedToolFormat
+        );
+
+        let auth = LanguageModelError::AuthenticationRequired {
+            provider: "openai".to_string(),
+            detail: "missing key".to_string(),
+        };
+        assert_eq!(auth.category(), LanguageModelErrorCategory::Authentication);
     }
 
     #[test]

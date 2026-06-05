@@ -1,11 +1,12 @@
 use crate::session_store::{
-    AgentSessionStore, AgentSessionStoreRecord, AgentSessionStoreRecordKind, NoopAgentSessionStore,
+    AgentSessionStore, AgentSessionStoreError, AgentSessionStoreRecord,
+    AgentSessionStoreRecordKind, NoopAgentSessionStore,
 };
 use crate::tools::{
-    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentTool, AgentToolCapability,
-    AgentToolCustomFormat, AgentToolCustomSpec, AgentToolDescriptor, AgentToolEvidence,
-    AgentToolOutcome, AgentToolPlan, AgentToolPlanner, AgentToolPolicyDecision,
-    AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus,
+    AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentModuleToolProjection, AgentTool,
+    AgentToolCapability, AgentToolCustomFormat, AgentToolCustomSpec, AgentToolDescriptor,
+    AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner, AgentToolPolicyDecision,
+    AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus, is_tool_disclosure_bridge_name,
 };
 use crate::{
     AgentDefinition, AgentError, AgentLoopDecision, AgentLoopInput, AgentOutputFormat,
@@ -14,10 +15,11 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
-    LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelMessage,
-    LanguageModelProviderToolSpec, LanguageModelRequest, LanguageModelRequestItem,
-    LanguageModelResponse, LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall,
-    LanguageModelToolChoice, LanguageModelToolSpec, collect_language_model_tool_calls,
+    LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelErrorCategory,
+    LanguageModelMessage, LanguageModelProviderToolSpec, LanguageModelRequest,
+    LanguageModelRequestItem, LanguageModelResponse, LanguageModelRole, LanguageModelStreamEvent,
+    LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
+    classify_language_model_error_detail, collect_language_model_tool_calls,
     inferred_model_context_window_tokens,
 };
 use sinomo_runtime::core::{
@@ -499,6 +501,18 @@ impl AgentStoragePaths {
 
     pub fn evidence_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
         self.evidence_dir.join(session_id.as_str())
+    }
+
+    pub fn sifs_evidence_path_for_session(
+        &self,
+        session_id: &SessionId,
+        file_name: impl AsRef<str>,
+    ) -> String {
+        format!(
+            "/events/agent/evidence/{}/{}",
+            session_id.as_str(),
+            file_name.as_ref().trim_start_matches('/')
+        )
     }
 }
 
@@ -1563,6 +1577,8 @@ pub enum AgentModelEvent {
     Error {
         step_index: usize,
         detail: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<LanguageModelErrorCategory>,
     },
     Aborted {
         reason: String,
@@ -1668,7 +1684,11 @@ impl AgentModelEvent {
                     });
                 }
                 LanguageModelStreamEvent::Error { detail } => {
-                    events.push(AgentModelEvent::Error { step_index, detail });
+                    events.push(AgentModelEvent::Error {
+                        step_index,
+                        category: classify_language_model_error_detail(&detail),
+                        detail,
+                    });
                 }
                 LanguageModelStreamEvent::Aborted { reason } => {
                     events.push(AgentModelEvent::Aborted { reason });
@@ -1806,7 +1826,11 @@ impl AgentModelEvent {
                 }
                 LanguageModelStreamEvent::Finished { .. } => {}
                 LanguageModelStreamEvent::Error { detail } => {
-                    events.push(AgentModelEvent::Error { step_index, detail });
+                    events.push(AgentModelEvent::Error {
+                        step_index,
+                        category: classify_language_model_error_detail(&detail),
+                        detail,
+                    });
                 }
                 LanguageModelStreamEvent::Aborted { reason } => {
                     events.push(AgentModelEvent::Aborted { reason });
@@ -1837,7 +1861,12 @@ impl AgentModelEvent {
                 usage: response.usage.clone(),
             });
         }
-        events.push(AgentModelEvent::Error { step_index, detail });
+        events.push(AgentModelEvent::Error {
+            step_index,
+            category: classify_language_model_error_detail(&detail)
+                .or(Some(LanguageModelErrorCategory::RepairNeeded)),
+            detail,
+        });
         events
     }
 }
@@ -2592,6 +2621,8 @@ pub struct AgentConfig {
     pub run_context: AgentRunContext,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "AgentModuleToolProjection::is_empty")]
+    pub module_tool_projection: AgentModuleToolProjection,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
     #[serde(default = "default_expand_prompt_references")]
@@ -2613,6 +2644,7 @@ impl AgentConfig {
         let provider = provider.into();
         let model = model.into();
         let definition = AgentDefinition::coding();
+        let visible_toolsets = default_visible_toolsets_for_role(&definition.role);
         Self {
             provider,
             model,
@@ -2624,7 +2656,8 @@ impl AgentConfig {
             max_model_repair_attempts: None,
             workspace_root: None,
             run_context: AgentRunContext::default(),
-            visible_toolsets: Vec::new(),
+            visible_toolsets,
+            module_tool_projection: AgentModuleToolProjection::default(),
             workspace_instruction_files: default_workspace_instruction_files(),
             expand_prompt_references: default_expand_prompt_references(),
             prompt_reference_max_bytes: None,
@@ -2634,8 +2667,12 @@ impl AgentConfig {
     }
 
     pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
+        let previous_default_toolsets = default_visible_toolsets_for_role(&self.definition.role);
         self.temperature = definition.temperature;
         self.max_output_tokens = definition.max_output_tokens;
+        if self.visible_toolsets == previous_default_toolsets {
+            self.visible_toolsets = default_visible_toolsets_for_role(&definition.role);
+        }
         self.definition = definition;
         self
     }
@@ -2702,6 +2739,11 @@ impl AgentConfig {
         self
     }
 
+    pub fn with_module_tool_projection(mut self, projection: AgentModuleToolProjection) -> Self {
+        self.module_tool_projection = projection;
+        self
+    }
+
     pub fn with_placement(mut self, placement: AgentPlacementMetadata) -> Self {
         self.run_context.placement = Some(placement);
         self
@@ -2723,6 +2765,25 @@ impl AgentConfig {
 
 fn default_agent_config_definition() -> AgentDefinition {
     AgentDefinition::coding()
+}
+
+fn default_visible_toolsets_for_role(role: &crate::AgentRole) -> Vec<String> {
+    let toolsets: &[&str] = match role {
+        crate::AgentRole::Main => &["core", "interactive", "config", "delegation", "perception"],
+        crate::AgentRole::Background => &[
+            "core",
+            "interactive",
+            "config",
+            "delegation",
+            "perception",
+            "cluster",
+            "sifs",
+        ],
+        crate::AgentRole::Deliberation | crate::AgentRole::Evolution => {
+            &["core", "coding", "local", "interactive", "discovery"]
+        }
+    };
+    toolsets.iter().copied().map(str::to_string).collect()
 }
 
 fn default_workspace_instruction_files() -> Vec<PathBuf> {
@@ -3065,6 +3126,55 @@ pub struct AgentSessionControlResult {
     pub snapshot: AgentSessionControlSnapshot,
 }
 
+impl AgentSessionControlResult {
+    pub fn terminal_results(&self) -> Vec<AgentTaskTerminalResult> {
+        terminal_results_from_tasks(&self.snapshot.tasks)
+    }
+
+    pub fn persist_to_store(
+        &self,
+        store: &dyn AgentSessionStore,
+    ) -> Result<(), AgentSessionStoreError> {
+        for event in &self.events {
+            append_control_event_to_store(store, event)?;
+        }
+        append_control_snapshot_to_store(store, &self.snapshot)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentSessionControlEventCursor {
+    pub offset: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<TaskId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentSessionControlEventBatch {
+    pub cursor: AgentSessionControlEventCursor,
+    pub next_cursor: AgentSessionControlEventCursor,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<AgentEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub task_updates: Vec<AgentTaskSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_results: Vec<AgentTaskTerminalResult>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentTaskTerminalResult {
+    pub task: AgentTaskRef,
+    pub status: AgentTaskLifecycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_ids: Vec<EventId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: time::OffsetDateTime,
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentSessionControlPlane {
     session: AgentSession,
@@ -3085,6 +3195,25 @@ impl AgentSessionControlPlane {
         }
     }
 
+    pub fn from_snapshot(
+        session: AgentSession,
+        snapshot: AgentSessionControlSnapshot,
+    ) -> Result<Self, AgentSessionControlRestoreError> {
+        if snapshot.session_id != session.session_id {
+            return Err(AgentSessionControlRestoreError::SessionMismatch {
+                expected: session.session_id,
+                actual: snapshot.session_id,
+            });
+        }
+        Ok(Self {
+            session,
+            next_sequence: snapshot.next_sequence,
+            active_turn: snapshot.active_turn,
+            tasks: snapshot.tasks,
+            events: Vec::new(),
+        })
+    }
+
     pub fn session(&self) -> &AgentSession {
         &self.session
     }
@@ -3101,8 +3230,107 @@ impl AgentSessionControlPlane {
         &self.events
     }
 
+    pub fn events_since(&self, offset: usize) -> &[AgentEvent] {
+        self.events.get(offset..).unwrap_or_default()
+    }
+
+    pub fn event_cursor(&self) -> AgentSessionControlEventCursor {
+        AgentSessionControlEventCursor {
+            offset: self.events.len(),
+            last_event_id: self.events.last().map(|event| event.event_id.clone()),
+        }
+    }
+
+    pub fn progress_since(
+        &self,
+        cursor: AgentSessionControlEventCursor,
+    ) -> AgentSessionControlEventBatch {
+        let start = cursor.offset.min(self.events.len());
+        let events: Vec<_> = self.events[start..].to_vec();
+        let task_updates = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEventPayload::TaskStatusChanged { snapshot } => Some(snapshot.clone()),
+                _ => None,
+            })
+            .collect();
+        let terminal_results = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEventPayload::TaskStatusChanged { snapshot } => {
+                    AgentTaskTerminalResult::from_snapshot(snapshot)
+                }
+                _ => None,
+            })
+            .collect();
+        AgentSessionControlEventBatch {
+            cursor,
+            next_cursor: self.event_cursor(),
+            events,
+            task_updates,
+            terminal_results,
+        }
+    }
+
     pub fn drain_events(&mut self) -> Vec<AgentEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    pub fn tasks(&self) -> &[AgentTaskSnapshot] {
+        &self.tasks
+    }
+
+    pub fn task_snapshot(&self, task_id: &TaskId) -> Option<&AgentTaskSnapshot> {
+        self.tasks
+            .iter()
+            .find(|snapshot| &snapshot.task.task_id == task_id)
+    }
+
+    pub fn terminal_task_snapshots(&self) -> impl Iterator<Item = &AgentTaskSnapshot> {
+        self.tasks.iter().filter(|snapshot| {
+            matches!(
+                snapshot.status,
+                AgentTaskLifecycleStatus::Completed
+                    | AgentTaskLifecycleStatus::Failed
+                    | AgentTaskLifecycleStatus::Cancelled
+                    | AgentTaskLifecycleStatus::TimedOut
+            )
+        })
+    }
+
+    pub fn terminal_result(&self, task_id: &TaskId) -> Option<AgentTaskTerminalResult> {
+        self.task_snapshot(task_id)
+            .and_then(AgentTaskTerminalResult::from_snapshot)
+    }
+
+    pub fn terminal_results(&self) -> Vec<AgentTaskTerminalResult> {
+        terminal_results_from_tasks(&self.tasks)
+    }
+
+    pub fn persist_events_to_store(
+        &self,
+        store: &dyn AgentSessionStore,
+        events: &[AgentEvent],
+    ) -> Result<(), AgentSessionStoreError> {
+        for event in events {
+            append_control_event_to_store(store, event)?;
+        }
+        Ok(())
+    }
+
+    pub fn persist_snapshot_to_store(
+        &self,
+        store: &dyn AgentSessionStore,
+    ) -> Result<(), AgentSessionStoreError> {
+        append_control_snapshot_to_store(store, &self.snapshot())
+    }
+
+    pub fn persist_result_to_store(
+        &self,
+        store: &dyn AgentSessionStore,
+        result: &AgentSessionControlResult,
+    ) -> Result<(), AgentSessionStoreError> {
+        result.persist_to_store(store)
     }
 
     pub fn snapshot(&self) -> AgentSessionControlSnapshot {
@@ -3418,6 +3646,81 @@ impl AgentSessionControlPlane {
             AgentEventPayload::TaskStatusChanged { snapshot },
         )
     }
+}
+
+impl AgentTaskTerminalResult {
+    fn from_snapshot(snapshot: &AgentTaskSnapshot) -> Option<Self> {
+        if !is_terminal_task_status(&snapshot.status) {
+            return None;
+        }
+        Some(Self {
+            task: snapshot.task.clone(),
+            status: snapshot.status.clone(),
+            progress_summary: snapshot.progress_summary.clone(),
+            result_ref: snapshot.result_ref.clone(),
+            event_ids: snapshot.event_ids.clone(),
+            updated_at: snapshot.updated_at,
+        })
+    }
+}
+
+fn terminal_results_from_tasks(tasks: &[AgentTaskSnapshot]) -> Vec<AgentTaskTerminalResult> {
+    tasks
+        .iter()
+        .filter_map(AgentTaskTerminalResult::from_snapshot)
+        .collect()
+}
+
+fn is_terminal_task_status(status: &AgentTaskLifecycleStatus) -> bool {
+    matches!(
+        status,
+        AgentTaskLifecycleStatus::Completed
+            | AgentTaskLifecycleStatus::Failed
+            | AgentTaskLifecycleStatus::Cancelled
+            | AgentTaskLifecycleStatus::TimedOut
+    )
+}
+
+fn append_control_event_to_store(
+    store: &dyn AgentSessionStore,
+    event: &AgentEvent,
+) -> Result<(), AgentSessionStoreError> {
+    store.append_record(&AgentSessionStoreRecord::new(
+        event.session_id.clone(),
+        AgentSessionStoreRecordKind::ControlEventPublished {
+            event: event.clone(),
+        },
+    ))?;
+    if let AgentEventPayload::TaskStatusChanged { snapshot } = &event.payload {
+        store.append_record(&AgentSessionStoreRecord::new(
+            event.session_id.clone(),
+            AgentSessionStoreRecordKind::TaskStatusChanged {
+                snapshot: snapshot.clone(),
+            },
+        ))?;
+    }
+    Ok(())
+}
+
+fn append_control_snapshot_to_store(
+    store: &dyn AgentSessionStore,
+    snapshot: &AgentSessionControlSnapshot,
+) -> Result<(), AgentSessionStoreError> {
+    store.append_record(&AgentSessionStoreRecord::new(
+        snapshot.session_id.clone(),
+        AgentSessionStoreRecordKind::ControlSnapshotSaved {
+            snapshot: snapshot.clone(),
+        },
+    ))
+}
+
+#[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
+pub enum AgentSessionControlRestoreError {
+    #[error("session control snapshot belongs to {actual}, expected {expected}")]
+    SessionMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
 }
 
 fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleStatus {
@@ -3843,6 +4146,13 @@ impl<'a> AgentToolOrchestrator<'a> {
                 },
                 Some("missing_executor".to_string()),
             )
+        } else if is_tool_disclosure_bridge_name(&call.tool) {
+            (
+                self.execute_tool_disclosure_bridge(
+                    registry, session, tool_plan, step_index, call_index, call,
+                ),
+                None,
+            )
         } else {
             (
                 registry.execute(session, step_index, call_index, call),
@@ -3867,6 +4177,390 @@ impl<'a> AgentToolOrchestrator<'a> {
         outcome.evidence = with_tool_orchestration_record(outcome.evidence, &record);
         outcome
     }
+
+    fn execute_tool_disclosure_bridge(
+        &self,
+        registry: &AgentToolRegistry,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        match call.tool.as_str() {
+            "tool_search" => {
+                self.execute_tool_search(session, tool_plan, step_index, call_index, call)
+            }
+            "tool_describe" => {
+                self.execute_tool_describe(session, tool_plan, step_index, call_index, call)
+            }
+            "tool_call" => self.execute_tool_call_bridge(
+                registry, session, tool_plan, step_index, call_index, call,
+            ),
+            _ => unreachable!("tool disclosure bridge names are matched by caller"),
+        }
+    }
+
+    fn execute_tool_search(
+        &self,
+        _session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let query = json_input_string(call, "query");
+        let include_bridge_tools = json_input_bool(call, "include_bridge_tools").unwrap_or(false);
+        let max_results = json_input_usize(call, "max_results").unwrap_or(20).min(50);
+        let matches = tool_plan
+            .descriptors_matching(query.as_deref(), include_bridge_tools)
+            .into_iter()
+            .take(max_results)
+            .map(|entry| {
+                let descriptor = &entry.descriptor;
+                serde_json::json!({
+                    "name": descriptor.spec.name,
+                    "description": descriptor.spec.description,
+                    "toolsets": descriptor.toolsets,
+                    "capabilities": descriptor.capabilities,
+                    "source": entry.source,
+                    "executable": entry.executable,
+                    "model_visible": tool_plan.is_model_visible(&descriptor.spec.name),
+                })
+            })
+            .collect::<Vec<_>>();
+        let match_count = matches.len();
+        let output = serde_json::json!({
+            "query": query,
+            "max_results": max_results,
+            "include_bridge_tools": include_bridge_tools,
+            "count": match_count,
+            "registry_generation": tool_plan.registry_generation,
+            "visible_toolsets": &tool_plan.visible_toolsets,
+            "matches": matches,
+        });
+        let evidence =
+            AgentToolEvidence::policy_only(true, "inspected planned agent tool descriptors")
+                .with_output_value(&output, false)
+                .with_record_value(
+                    "tool_disclosure",
+                    serde_json::json!({
+                        "operation": "search",
+                        "query": output.get("query").cloned().unwrap_or(serde_json::Value::Null),
+                        "count": output.get("count").cloned().unwrap_or(serde_json::Value::Null),
+                    }),
+                );
+        AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: AgentToolStatus::Succeeded,
+            summary: format!("found {match_count} planned tool(s)"),
+            output,
+            event_id: None,
+            evidence,
+        }
+    }
+
+    fn execute_tool_describe(
+        &self,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let Some(tool_name) = json_input_string(call, "tool") else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                "tool_describe requires a string tool",
+                serde_json::json!({ "error": "missing_tool" }),
+            );
+        };
+        let Some(entry) = tool_plan.entry(&tool_name) else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!("tool `{tool_name}` is not planned"),
+                serde_json::json!({ "error": "unknown_planned_tool", "tool": tool_name }),
+            );
+        };
+        let output = serde_json::json!({
+            "tool": tool_name,
+            "descriptor": entry.descriptor,
+            "source": entry.source,
+            "executable": entry.executable,
+            "model_visible": tool_plan.is_model_visible(&entry.descriptor.spec.name),
+            "registry_generation": tool_plan.registry_generation,
+            "visible_toolsets": &tool_plan.visible_toolsets,
+        });
+        let evidence =
+            AgentToolEvidence::policy_only(true, "inspected planned agent tool descriptor")
+                .with_output_value(&output, false)
+                .with_record_value(
+                    "tool_disclosure",
+                    serde_json::json!({
+                        "operation": "describe",
+                        "tool": entry.descriptor.spec.name,
+                    }),
+                );
+        AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: AgentToolStatus::Succeeded,
+            summary: format!("described tool `{}`", entry.descriptor.spec.name),
+            output,
+            event_id: None,
+            evidence,
+        }
+    }
+
+    fn execute_tool_call_bridge(
+        &self,
+        registry: &AgentToolRegistry,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+    ) -> AgentToolOutcome {
+        let Some(target_tool) = json_input_string(call, "tool") else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                "tool_call requires a string tool",
+                serde_json::json!({ "error": "missing_tool" }),
+            );
+        };
+        if is_tool_disclosure_bridge_name(&target_tool) {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                "tool_call cannot recursively call disclosure bridge tools",
+                serde_json::json!({ "error": "recursive_tool_disclosure", "tool": target_tool }),
+            );
+        }
+        let Some(entry) = tool_plan.entry(&target_tool) else {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!("tool `{target_tool}` is not planned"),
+                serde_json::json!({ "error": "unknown_planned_tool", "tool": target_tool }),
+            );
+        };
+        let target_input = call
+            .input
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !target_input.is_object() {
+            return bridge_failed_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                "tool_call input must be an object",
+                serde_json::json!({
+                    "error": "invalid_target_input",
+                    "tool": target_tool,
+                }),
+            );
+        }
+        if !entry.executable {
+            return bridge_blocked_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                format!("tool `{target_tool}` is planned but has no executor attached"),
+                serde_json::json!({
+                    "error": "missing_executor",
+                    "tool": target_tool,
+                    "source": entry.source,
+                }),
+            );
+        }
+        let target_call = AgentToolCall {
+            tool: target_tool.clone(),
+            input: target_input,
+            r#async: json_input_bool(call, "async").unwrap_or(false),
+            summary: json_input_string(call, "summary").unwrap_or_else(|| {
+                format!("called through progressive tool disclosure for `{target_tool}`")
+            }),
+        };
+        let target_policy = self
+            .policy
+            .evaluate_tool_call(Some(&entry.descriptor), &target_call);
+        if !target_policy.allowed {
+            return bridge_blocked_outcome(
+                session,
+                step_index,
+                call_index,
+                call,
+                target_policy.reason.clone(),
+                serde_json::json!({
+                    "error": "policy_denied",
+                    "policy_id": self.policy.policy_id,
+                    "tool": target_tool,
+                    "reason": target_policy.reason,
+                }),
+            );
+        }
+        let target_outcome = registry.execute(session, step_index, call_index, &target_call);
+        let target_record = AgentToolOrchestrationRecord {
+            policy_id: self.policy.policy_id.clone(),
+            policy_allowed: target_policy.allowed,
+            policy_reason: target_policy.reason,
+            descriptor_visible: tool_plan.is_model_visible(&target_tool),
+            executor_available: entry.executable,
+            blocked_reason: (target_outcome.status == AgentToolStatus::Blocked)
+                .then_some("target_blocked".to_string()),
+            max_tool_calls_per_step: self.max_tool_calls_per_step,
+            requested_timeout_ms: target_call
+                .input
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64),
+            run_context: self.run_context.clone(),
+        };
+        let mut evidence = target_outcome.evidence.clone();
+        evidence = with_tool_disclosure_metadata(
+            evidence,
+            serde_json::json!({
+                "operation": "call",
+                "target_tool": target_tool,
+                "target_source": entry.source,
+                "target_model_visible": tool_plan.is_model_visible(&target_call.tool),
+                "target_orchestration": target_record,
+            }),
+        );
+        let output = tool_call_bridge_output(&target_outcome);
+        AgentToolOutcome {
+            call_id: TaskId::generate(),
+            step_index,
+            call_index,
+            call: call.clone(),
+            status: target_outcome.status,
+            summary: format!(
+                "tool_call executed `{}`: {}",
+                target_call.tool, target_outcome.summary
+            ),
+            output,
+            event_id: None,
+            evidence,
+        }
+    }
+}
+
+fn json_input_string(call: &AgentToolCall, key: &str) -> Option<String> {
+    call.input
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn json_input_bool(call: &AgentToolCall, key: &str) -> Option<bool> {
+    call.input.get(key).and_then(serde_json::Value::as_bool)
+}
+
+fn json_input_usize(call: &AgentToolCall, key: &str) -> Option<usize> {
+    call.input
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+}
+
+fn bridge_failed_outcome(
+    _session: &InteractionSession,
+    step_index: usize,
+    call_index: usize,
+    call: &AgentToolCall,
+    summary: impl Into<String>,
+    output: serde_json::Value,
+) -> AgentToolOutcome {
+    let summary = summary.into();
+    AgentToolOutcome {
+        call_id: TaskId::generate(),
+        step_index,
+        call_index,
+        call: call.clone(),
+        status: AgentToolStatus::Failed,
+        summary: summary.clone(),
+        output: output.clone(),
+        event_id: None,
+        evidence: AgentToolEvidence::policy_only(true, "tool disclosure bridge failed")
+            .with_output_value(&output, false),
+    }
+}
+
+fn bridge_blocked_outcome(
+    _session: &InteractionSession,
+    step_index: usize,
+    call_index: usize,
+    call: &AgentToolCall,
+    summary: impl Into<String>,
+    output: serde_json::Value,
+) -> AgentToolOutcome {
+    let summary = summary.into();
+    AgentToolOutcome {
+        call_id: TaskId::generate(),
+        step_index,
+        call_index,
+        call: call.clone(),
+        status: AgentToolStatus::Blocked,
+        summary: summary.clone(),
+        output: output.clone(),
+        event_id: None,
+        evidence: AgentToolEvidence::policy_only(false, summary).with_output_value(&output, false),
+    }
+}
+
+fn tool_call_bridge_output(target_outcome: &AgentToolOutcome) -> serde_json::Value {
+    let marker = serde_json::json!({
+        "target_tool": target_outcome.call.tool,
+        "target_status": target_outcome.status,
+        "target_summary": target_outcome.summary,
+    });
+    match target_outcome.output.clone() {
+        serde_json::Value::Object(mut object) => {
+            object.insert("_tool_call".to_string(), marker);
+            serde_json::Value::Object(object)
+        }
+        output => serde_json::json!({
+            "_tool_call": marker,
+            "target_output": output,
+        }),
+    }
+}
+
+fn with_tool_disclosure_metadata(
+    mut evidence: AgentToolEvidence,
+    disclosure: serde_json::Value,
+) -> AgentToolEvidence {
+    let mut metadata = evidence
+        .metadata
+        .as_object()
+        .cloned()
+        .unwrap_or_else(serde_json::Map::new);
+    metadata.insert("tool_disclosure".to_string(), disclosure.clone());
+    evidence.metadata = serde_json::Value::Object(metadata);
+    evidence.with_record_value("tool_disclosure", disclosure)
 }
 
 fn with_tool_orchestration_record(
@@ -5002,7 +5696,10 @@ impl<M: InteractionModel> Agent<M> {
         step_index: usize,
     ) -> Result<TurnContext, AgentError> {
         let tool_plan = self.tool_plan(input);
-        let all_tool_descriptors = tool_plan.model_visible_descriptors();
+        let all_tool_descriptors = match self.config.definition.output_format {
+            AgentOutputFormat::JsonDecision => tool_plan.model_visible_descriptors(),
+            AgentOutputFormat::Text => Vec::new(),
+        };
         let (tool_descriptors, policy_omissions) =
             self.policy.filter_tool_descriptors(all_tool_descriptors);
         let mut context = self.context_assembler.assemble(
@@ -5120,6 +5817,7 @@ impl<M: InteractionModel> Agent<M> {
     fn tool_plan(&self, input: &AgentLoopInput) -> AgentToolPlan {
         AgentToolPlanner::plan(
             self.tools.descriptors(),
+            &self.config.module_tool_projection,
             input.tool_specs.clone(),
             self.config.definition.tools.clone(),
             input.tool_specs.is_empty(),
@@ -7058,6 +7756,26 @@ mod tests {
             paths.evidence_dir_for_session(&session_id),
             paths.evidence_dir.join(session_id.as_str())
         );
+        assert_eq!(
+            paths.sifs_evidence_path_for_session(&session_id, "apply-patch.diff"),
+            format!(
+                "/events/agent/evidence/{}/apply-patch.diff",
+                session_id.as_str()
+            )
+        );
+
+        let artifact = AgentToolArtifactRef::sifs(
+            "diff",
+            paths.sifs_evidence_path_for_session(&session_id, "diff.patch"),
+        );
+        assert!(artifact.is_sifs());
+        assert_eq!(
+            artifact.uri,
+            format!(
+                "sifs://events/agent/evidence/{}/diff.patch",
+                session_id.as_str()
+            )
+        );
     }
 
     #[test]
@@ -7591,6 +8309,7 @@ mod tests {
 
         let plan = AgentToolPlanner::plan(
             runtime_descriptors,
+            &AgentModuleToolProjection::default(),
             std::iter::empty::<AgentToolSpec>(),
             std::iter::empty::<AgentToolSpec>(),
             false,
@@ -7609,6 +8328,198 @@ mod tests {
         assert!(!plan.is_model_visible("read_file"));
         assert!(plan.is_model_visible("config_get"));
         assert_eq!(visible_tools, vec!["config_get"]);
+    }
+
+    #[test]
+    fn progressive_tool_disclosure_searches_describes_and_calls_hidden_tools() {
+        let registry = AgentToolRegistry::new().with_tool(EchoTool);
+        let plan = AgentToolPlanner::plan(
+            registry.descriptors(),
+            &AgentModuleToolProjection::default(),
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["discovery"],
+            registry.generation(),
+        );
+        let input = agent_input("use disclosure");
+        let policy = AgentPolicyBundle::default_for_role(AgentRole::Deliberation);
+        let run_context = AgentRunContext::default();
+        let orchestrator = AgentToolOrchestrator::new(&policy, None, &run_context);
+
+        assert!(!plan.is_model_visible("read_file"));
+        assert!(plan.is_model_visible("tool_search"));
+
+        let search = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "tool_search".to_string(),
+                input: serde_json::json!({ "query": "read" }),
+                r#async: false,
+                summary: "find read tool".to_string(),
+            },
+        );
+        assert_eq!(search.status, AgentToolStatus::Succeeded);
+        assert!(
+            search
+                .output
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .expect("matches")
+                .iter()
+                .any(
+                    |entry| entry.get("name").and_then(serde_json::Value::as_str)
+                        == Some("read_file")
+                        && entry
+                            .get("model_visible")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(false)
+                )
+        );
+
+        let describe = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            1,
+            &AgentToolCall {
+                tool: "tool_describe".to_string(),
+                input: serde_json::json!({ "tool": "read_file" }),
+                r#async: false,
+                summary: "describe read tool".to_string(),
+            },
+        );
+        assert_eq!(describe.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            describe
+                .output
+                .pointer("/descriptor/spec/name")
+                .and_then(serde_json::Value::as_str),
+            Some("read_file")
+        );
+
+        let called = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            2,
+            &AgentToolCall {
+                tool: "tool_call".to_string(),
+                input: serde_json::json!({
+                    "tool": "read_file",
+                    "input": { "path": "Cargo.toml" },
+                    "summary": "read through bridge"
+                }),
+                r#async: false,
+                summary: "call hidden read tool".to_string(),
+            },
+        );
+        assert_eq!(called.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            called
+                .output
+                .get("content")
+                .and_then(serde_json::Value::as_str),
+            Some("workspace evidence")
+        );
+        assert_eq!(
+            called
+                .output
+                .pointer("/_tool_call/target_tool")
+                .and_then(serde_json::Value::as_str),
+            Some("read_file")
+        );
+        assert!(called.evidence.record_value("tool_disclosure").is_some());
+    }
+
+    #[test]
+    fn module_tool_projection_uses_active_loader_state() {
+        let module_id = TaskId::generate();
+        let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "module-test",
+            "sinomo-module-test",
+            "module-test-v1",
+            sinomo_runtime::core::TrustRing::R1TrustedRuntime,
+            "module.test",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_object_rpc_route(
+                sinomo_runtime::module::ModuleObjectRpcRoute::new(
+                    "/module/test/status",
+                    "module-test",
+                    "status",
+                    sinomo_runtime::module::ModuleRouteAuth::LocalOrClusterMember,
+                ),
+            ),
+        );
+        let projection = AgentModuleToolProjection::new()
+            .with_registration(registration)
+            .with_loader_state(sinomo_runtime::core::ModuleLoaderState {
+                module_id: module_id.clone(),
+                active_artifact_id: TaskId::generate(),
+                previous_artifact_id: None,
+                shadow_artifact_id: None,
+                candidate_artifact_id: None,
+                hot_swap_state: sinomo_runtime::core::HotSwapState::Stable,
+            });
+        let plan = AgentToolPlanner::plan(
+            std::iter::empty::<AgentToolDescriptor>(),
+            &projection,
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["discovery"],
+            0,
+        );
+
+        let projected = plan
+            .entries
+            .iter()
+            .find(|entry| entry.descriptor.spec.name == "module_rpc_module_test_status")
+            .expect("module route descriptor");
+        assert_eq!(projected.source, crate::tools::AgentToolPlanSource::Module);
+        assert!(!projected.executable);
+        assert!(!plan.is_model_visible("module_rpc_module_test_status"));
+
+        let registry = AgentToolRegistry::new();
+        let input = agent_input("find module route");
+        let policy = AgentPolicyBundle::default_for_role(AgentRole::Deliberation);
+        let run_context = AgentRunContext::default();
+        let orchestrator = AgentToolOrchestrator::new(&policy, None, &run_context);
+        let search = orchestrator.execute(
+            &registry,
+            &input.session,
+            &plan,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "tool_search".to_string(),
+                input: serde_json::json!({ "query": "status" }),
+                r#async: false,
+                summary: "search modules".to_string(),
+            },
+        );
+        assert_eq!(search.status, AgentToolStatus::Succeeded);
+        assert!(
+            search
+                .output
+                .get("matches")
+                .and_then(serde_json::Value::as_array)
+                .expect("matches")
+                .iter()
+                .any(
+                    |entry| entry.get("name").and_then(serde_json::Value::as_str)
+                        == Some("module_rpc_module_test_status")
+                )
+        );
     }
 
     #[test]
@@ -8230,6 +9141,85 @@ mod tests {
     }
 
     #[test]
+    fn local_workspace_registry_lists_files_with_bounds_and_hidden_filter() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-list-files-{}", TaskId::generate()));
+        fs::create_dir_all(root.join("src")).expect("workspace");
+        fs::write(root.join("README.md"), "hello").expect("readme");
+        fs::write(root.join(".secret"), "hidden").expect("hidden");
+        fs::write(root.join("src").join("lib.rs"), "pub fn sample() {}").expect("source");
+        let registry = AgentToolRegistry::local_workspace(&root);
+        let input = agent_input("list files");
+
+        let shallow = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "list_files".to_string(),
+                input: serde_json::json!({ "path": "." }),
+                r#async: false,
+                summary: "list root".to_string(),
+            },
+        );
+        assert_eq!(shallow.status, AgentToolStatus::Succeeded);
+        let shallow_entries = shallow
+            .output
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .expect("entries");
+        assert!(shallow_entries.iter().any(|entry| {
+            entry.get("path").and_then(serde_json::Value::as_str) == Some("README.md")
+        }));
+        assert!(
+            shallow_entries
+                .iter()
+                .any(|entry| entry.get("path").and_then(serde_json::Value::as_str) == Some("src"))
+        );
+        assert!(
+            !shallow_entries.iter().any(|entry| entry
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                == Some(".secret"))
+        );
+        assert!(!shallow_entries.iter().any(|entry| {
+            entry.get("path").and_then(serde_json::Value::as_str) == Some("src/lib.rs")
+        }));
+
+        let recursive = registry.execute(
+            &input.session,
+            0,
+            1,
+            &AgentToolCall {
+                tool: "list_files".to_string(),
+                input: serde_json::json!({
+                    "path": ".",
+                    "recursive": true,
+                    "include_hidden": true,
+                    "max_entries": 2
+                }),
+                r#async: false,
+                summary: "list recursively".to_string(),
+            },
+        );
+        assert_eq!(recursive.status, AgentToolStatus::Succeeded);
+        assert_eq!(
+            recursive
+                .output
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            recursive
+                .output
+                .get("count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn local_workspace_read_file_supports_one_based_line_ranges() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-agent-read-line-range-{}",
@@ -8313,6 +9303,54 @@ mod tests {
             fs::read_to_string(evidence_ref)
                 .expect("evidence")
                 .contains("name = \"sinomo-agent\"")
+        );
+    }
+
+    #[test]
+    fn local_workspace_registry_can_mirror_evidence_to_sifs_mount() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-sifs-evidence-{}", TaskId::generate()));
+        let mount_dir = root.join("sifs-mount");
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("large.txt"), "alpha\nbeta\ngamma\n").expect("seed file");
+        let input = agent_input("read with sifs evidence");
+        let mut config = LocalWorkspaceAgentConfig::new(&root).with_sifs_evidence_mount(
+            &mount_dir,
+            format!(
+                "/events/agent/evidence/{}",
+                input.session.session_id.as_str()
+            ),
+        );
+        config.max_read_bytes = 5;
+        let registry = AgentToolRegistry::local_workspace_with_config(config);
+
+        let outcome = registry.execute(
+            &input.session,
+            0,
+            0,
+            &AgentToolCall {
+                tool: "read_file".to_string(),
+                input: serde_json::json!({
+                    "path": "large.txt",
+                    "max_bytes": 5
+                }),
+                r#async: false,
+                summary: "read file".to_string(),
+            },
+        );
+
+        assert_eq!(outcome.status, AgentToolStatus::Succeeded);
+        let evidence_ref = outcome.evidence.full_output_ref().expect("full output ref");
+        assert!(evidence_ref.starts_with("sifs://events/agent/evidence/"));
+        assert!(evidence_ref.contains(input.session.session_id.as_str()));
+        let mirrored: Vec<_> = fs::read_dir(&mount_dir)
+            .expect("sifs mirror dir")
+            .map(|entry| entry.expect("mirror entry").path())
+            .collect();
+        assert_eq!(mirrored.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&mirrored[0]).expect("sifs mirror"),
+            "alpha\nbeta\ngamma\n"
         );
     }
 
@@ -10266,6 +11304,119 @@ old
         );
         assert!(!snapshot.tasks[0].event_ids.is_empty());
         assert_eq!(control.drain_events().len(), result.events.len());
+    }
+
+    #[test]
+    fn agent_session_control_plane_persists_progress_and_terminal_result() {
+        let data_dir = SinomoDataDir::new(
+            std::env::temp_dir().join(format!("sinomo-agent-control-store-{}", TaskId::generate())),
+        );
+        let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
+        let task = AgentTaskRef::new("coding", "persisted control-plane task")
+            .with_owner_role(AgentRole::Deliberation);
+        let model = SequencedModel::new([r#"{
+            "response_mode": "answer",
+            "text": "Persisted turn done.",
+            "tool_calls": [],
+            "background_handoff": null,
+            "next_state": "listening"
+        }"#]);
+        let config = AgentConfig::new("fake", "fake").with_task_ref(task.clone());
+        let agent = Agent::new(model, "fake", "fake").with_config(config);
+        let input = agent_input("persist control progress");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let mut control = AgentSessionControlPlane::new(session);
+        let cursor = AgentSessionControlEventCursor {
+            offset: 0,
+            last_event_id: None,
+        };
+
+        let result = control
+            .submit_op(&agent, AgentOp::start_turn(input.clone()))
+            .expect("submit op");
+        result.persist_to_store(&store).expect("persist control");
+
+        let progress = control.progress_since(cursor);
+        assert_eq!(progress.events.len(), result.events.len());
+        assert!(progress.task_updates.iter().any(|snapshot| {
+            snapshot.task.task_id == task.task_id
+                && snapshot.status == AgentTaskLifecycleStatus::Completed
+        }));
+        assert_eq!(progress.terminal_results.len(), 1);
+        assert_eq!(
+            control
+                .terminal_result(&task.task_id)
+                .expect("terminal result")
+                .status,
+            AgentTaskLifecycleStatus::Completed
+        );
+        assert_eq!(
+            result.terminal_results()[0].status,
+            AgentTaskLifecycleStatus::Completed
+        );
+
+        let loaded_snapshot = store
+            .load_control_snapshot(&input.session.session_id)
+            .expect("load control snapshot")
+            .expect("control snapshot");
+        assert_eq!(loaded_snapshot.next_sequence, 1);
+        assert_eq!(loaded_snapshot.tasks[0].task.task_id, task.task_id);
+        assert_eq!(
+            loaded_snapshot.tasks[0].status,
+            AgentTaskLifecycleStatus::Completed
+        );
+        let session_events = fs::read_to_string(
+            AgentStoragePaths::from_data_dir(&data_dir)
+                .session_events_path_for_session(&input.session.session_id),
+        )
+        .expect("session events");
+        assert!(session_events.contains("\"control_event_published\""));
+        assert!(session_events.contains("\"task_status_changed\""));
+        assert!(session_events.contains("\"control_snapshot_saved\""));
+    }
+
+    #[test]
+    fn agent_session_control_snapshot_restores_task_status_for_resume() {
+        let task =
+            AgentTaskRef::new("coding", "resume task").with_owner_role(AgentRole::Deliberation);
+        let session_id = SessionId::from_legacy_named("sess_resume_control").expect("session");
+        let snapshot = AgentSessionControlSnapshot {
+            session_id: session_id.clone(),
+            next_sequence: 7,
+            active_turn: None,
+            tasks: vec![AgentTaskSnapshot::new(
+                task.clone(),
+                AgentTaskLifecycleStatus::Completed,
+            )],
+            buffered_event_count: 3,
+        };
+        let session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
+
+        let control =
+            AgentSessionControlPlane::from_snapshot(session, snapshot).expect("restore snapshot");
+
+        assert_eq!(control.snapshot().next_sequence, 7);
+        assert_eq!(control.tasks().len(), 1);
+        assert_eq!(
+            control
+                .task_snapshot(&task.task_id)
+                .map(|snapshot| snapshot.status.clone()),
+            Some(AgentTaskLifecycleStatus::Completed)
+        );
+        assert_eq!(control.events_since(0), &[]);
+        assert_eq!(control.terminal_task_snapshots().count(), 1);
+
+        let wrong_session = AgentSession::new(
+            SessionId::from_legacy_named("sess_wrong_control").expect("session"),
+            AgentRole::Deliberation,
+        );
+        let wrong_snapshot = control.snapshot();
+        let error = AgentSessionControlPlane::from_snapshot(wrong_session, wrong_snapshot)
+            .expect_err("session mismatch");
+        assert!(matches!(
+            error,
+            AgentSessionControlRestoreError::SessionMismatch { .. }
+        ));
     }
 
     #[test]

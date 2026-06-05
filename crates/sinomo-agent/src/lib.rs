@@ -70,6 +70,7 @@ pub enum AgentToolKind {
     CancelAsyncTask,
     RunShellCommand,
     ReadFile,
+    ListFiles,
     WriteFile,
     SearchFiles,
     ApplyPatch,
@@ -85,6 +86,10 @@ pub enum AgentToolKind {
     WriteCommandStdin,
     CancelCommandSession,
     RequestUserInput,
+    ToolSearch,
+    ToolDescribe,
+    ToolCall,
+    ModuleObjectRpc,
     ReadSifs,
     WriteSifs,
     ListSifs,
@@ -358,6 +363,12 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             false,
         ),
         AgentToolSpec::new(
+            AgentToolKind::ListFiles,
+            "list_files",
+            "List workspace files and directories with bounded recursion; use this before broad shell commands when discovering repository structure.",
+            false,
+        ),
+        AgentToolSpec::new(
             AgentToolKind::SearchFiles,
             "search",
             "Search workspace text files for a literal query.",
@@ -427,6 +438,24 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             AgentToolKind::RequestUserInput,
             "request_user_input",
             "Ask the user for a short clarification through the interactive runtime.",
+            true,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ToolSearch,
+            "tool_search",
+            "Search all planned agent tools, including hidden module/plugin tools, without executing them.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ToolDescribe,
+            "tool_describe",
+            "Describe one planned agent tool, including schema, source, visibility, and execution availability.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ToolCall,
+            "tool_call",
+            "Call a planned tool discovered through tool_search/tool_describe while preserving agent policy and evidence handling.",
             true,
         ),
     ]
@@ -783,6 +812,7 @@ impl<M: InteractionModel> MainAgentLoop<M> {
         } else {
             let tool_plan = AgentToolPlanner::plan(
                 self.tools.descriptors(),
+                &AgentModuleToolProjection::default(),
                 input.tool_specs.clone(),
                 self.definition.tools.clone(),
                 input.tool_specs.is_empty(),
