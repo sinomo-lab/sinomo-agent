@@ -56,7 +56,6 @@ sinomo --local models runtime set --pytorch-endpoint ""
 - `AgentLoopDecision`;
 - `BackgroundHandoffRequest`;
 - `BackgroundHandoffPriority`;
-- `MainAgentLoop`;
 - `Agent`;
 - `AgentSession`;
 - `AgentTranscript`;

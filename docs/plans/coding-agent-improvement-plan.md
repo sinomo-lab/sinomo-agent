@@ -489,7 +489,7 @@ Implemented in `sinomo-agent`:
 - `FileAgentSessionStore::subscribe_records` for clone-shared live delivery of newly appended session store records while retaining JSONL persistence as the durable source of truth.
 - Completed runtime outcomes are addressable by operation id so hosts can submit a turn asynchronously, join or poll it, and retrieve the terminal `AgentRun` without falling back to direct blocking turn calls.
 - The full ratatui chat path and the line-oriented TUI handler construction now use `AgentSessionRuntime` for normal model turns. Model deltas and process output are rendered as live stream text, usage updates are folded into the status bar, and Ctrl+C interrupts an active runtime task before falling back to quit.
-- The explicit `sinomo agent run` main-agent prompt path now submits through `AgentSessionRuntime` instead of calling the legacy `MainAgentLoop` decision helper directly.
+- The explicit `sinomo agent run` main-agent prompt path now submits through `AgentSessionRuntime`; the legacy main-agent decision helper was removed.
 - The old TUI `MainAgentInteractionHandler` implementation was removed from `sinomo-cli`; runtime-backed orchestration is now the only main-agent TUI handler.
 - The SWE-bench coding-agent runner submits initial and repair turns through `AgentSessionRuntime`, then records the completed `AgentRun` through runtime outcome lookup.
 - The self-evolution mutation worker submits evolution turns through `AgentSessionRuntime`, preserving the same orchestration, cancellation, event, and terminal-result path used by TUI and benchmarks.

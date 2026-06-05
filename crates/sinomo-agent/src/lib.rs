@@ -678,170 +678,6 @@ pub enum BackgroundHandoffPriority {
     Emergency,
 }
 
-pub struct MainAgentLoop<M> {
-    model: M,
-    provider: String,
-    model_id: String,
-    definition: AgentDefinition,
-    tools: AgentToolRegistry,
-}
-
-impl<M: InteractionModel> MainAgentLoop<M> {
-    pub fn new(model: M, provider: impl Into<String>, model_id: impl Into<String>) -> Self {
-        Self::with_definition(model, provider, model_id, AgentDefinition::main())
-    }
-
-    pub fn with_definition(
-        model: M,
-        provider: impl Into<String>,
-        model_id: impl Into<String>,
-        definition: AgentDefinition,
-    ) -> Self {
-        Self {
-            model,
-            provider: provider.into(),
-            model_id: model_id.into(),
-            definition,
-            tools: AgentToolRegistry::new(),
-        }
-    }
-
-    pub fn with_tools(mut self, tools: Vec<AgentToolSpec>) -> Self {
-        self.definition.tools = tools;
-        self
-    }
-
-    pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
-        self.definition = definition;
-        self
-    }
-
-    pub fn with_tool_registry(mut self, tools: AgentToolRegistry) -> Self {
-        self.tools = tools;
-        self
-    }
-
-    pub fn tool_registry(&self) -> AgentToolRegistry {
-        self.tools.clone()
-    }
-
-    pub fn definition(&self) -> &AgentDefinition {
-        &self.definition
-    }
-
-    pub fn tool_specs(&self) -> &[AgentToolSpec] {
-        &self.definition.tools
-    }
-
-    pub fn decide(&self, input: &AgentLoopInput) -> Result<AgentLoopDecision, AgentError> {
-        self.decide_with_usage(input).map(|(decision, _)| decision)
-    }
-
-    pub fn decide_with_usage(
-        &self,
-        input: &AgentLoopInput,
-    ) -> Result<(AgentLoopDecision, Option<LanguageModelUsage>), AgentError> {
-        self.decide_with_model(input, |model, request| model.complete(request))
-    }
-
-    pub fn decide_streaming(
-        &self,
-        input: &AgentLoopInput,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<AgentLoopDecision, AgentError> {
-        self.decide_streaming_with_usage(input, on_delta)
-            .map(|(decision, _)| decision)
-    }
-
-    pub fn decide_streaming_with_usage(
-        &self,
-        input: &AgentLoopInput,
-        on_delta: &mut dyn FnMut(&str),
-    ) -> Result<(AgentLoopDecision, Option<LanguageModelUsage>), AgentError> {
-        self.decide_with_model(input, |model, request| {
-            model.complete_streaming(request, on_delta)
-        })
-    }
-
-    fn decide_with_model(
-        &self,
-        input: &AgentLoopInput,
-        complete: impl FnOnce(
-            &M,
-            &LanguageModelRequest,
-        ) -> Result<LanguageModelResponse, LanguageModelError>,
-    ) -> Result<(AgentLoopDecision, Option<LanguageModelUsage>), AgentError> {
-        if let Some(update) = &input.async_update
-            && !update.needs_user_attention
-            && update.next_action_hint == AsyncTaskNextAction::ContinueSilently
-        {
-            return Ok((AgentLoopDecision::silent(), None));
-        }
-        let request = self.request(input)?;
-        let response = complete(&self.model, &request)?;
-        let usage = response.usage.clone();
-        let decision =
-            parse_agent_loop_response(&self.definition.output_format, &response.content)?;
-        Ok((decision, usage))
-    }
-
-    pub fn request(&self, input: &AgentLoopInput) -> Result<LanguageModelRequest, AgentError> {
-        let system_content = if self.tools.is_empty() {
-            let tools = self.definition.resolve_tool_specs(&input.tool_specs);
-            render_agent_system_prompt(&self.definition, tools)
-        } else {
-            let tool_plan = AgentToolPlanner::plan(
-                self.tools.descriptors(),
-                &AgentModuleToolProjection::default(),
-                input.tool_specs.clone(),
-                self.definition.tools.clone(),
-                input.tool_specs.is_empty(),
-                Vec::<String>::new(),
-                self.tools.generation(),
-            );
-            render_agent_system_prompt_with_descriptors(
-                &self.definition,
-                &tool_plan.model_visible_descriptors(),
-            )
-        };
-        Ok(LanguageModelRequest {
-            provider: self.provider.clone(),
-            model: self.model_id.clone(),
-            messages: vec![
-                LanguageModelMessage {
-                    role: LanguageModelRole::System,
-                    content: system_content,
-                },
-                LanguageModelMessage {
-                    role: LanguageModelRole::User,
-                    content: serde_json::to_string_pretty(input).map_err(|source| {
-                        AgentError::ModelRequest {
-                            detail: source.to_string(),
-                        }
-                    })?,
-                },
-            ],
-            items: Vec::new(),
-            tools: Vec::new(),
-            tool_choice: None,
-            parallel_tool_calls: None,
-            temperature: self.definition.temperature,
-            max_output_tokens: self.definition.max_output_tokens,
-            response_format: self
-                .definition
-                .output_format
-                .language_model_response_format(),
-            metadata: serde_json::json!({
-                "loop": self.definition.name,
-                "agent_name": self.definition.name,
-                "agent_role": self.definition.role,
-                "session_id": input.session.session_id,
-                "event_id": input.latest_event.event_id
-            }),
-        })
-    }
-}
-
 pub fn parse_agent_loop_response(
     output_format: &AgentOutputFormat,
     raw: &str,
@@ -1712,50 +1548,27 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_loop_requests_json_tool_decision() {
-        let session = InteractionSession::new(
-            SessionId::from_legacy_named("sess_loop").expect("session"),
-            NodeId::from_legacy_named("node_loop").expect("node"),
-            InteractionSurface::new("surface.loop", InteractionSurfaceKind::CommandLine),
-        );
-        let latest_event = user_interaction_input_event(&session, "check the cluster later");
-        let context = BoundedContext {
-            session_id: session.session_id.clone(),
-            events: Vec::new(),
-            packet: ContextPacket::default(),
-        };
-        let loop_input = AgentLoopInput {
-            session,
-            latest_event,
-            context,
-            async_update: None,
-            context_attachments: Vec::new(),
-            tool_specs: default_main_agent_tools(),
-        };
-        let agent_loop = MainAgentLoop::new(
-            FakeInteractionModel {
-                response: r#"{
-                    "response_mode": "acknowledge",
-                    "text": "I will check that in the background.",
-                    "tool_calls": [{
-                        "tool": "handoff_to_background",
-                        "input": {"reason": "cluster check"},
-                        "async": true,
-                        "summary": "Ask background to inspect cluster health."
-                    }],
-                    "background_handoff": {
-                        "reason": "cluster health check",
-                        "evidence_ref": "sifs:/services/tasks/task_1/input.json",
-                        "priority": "routine"
-                    },
-                    "next_state": "delegating"
-                }"#,
-            },
-            "fake",
-            "fake",
-        );
-
-        let decision = agent_loop.decide(&loop_input).expect("decision");
+    fn parse_agent_loop_response_accepts_json_tool_decision() {
+        let decision = parse_agent_loop_response(
+            &AgentOutputFormat::JsonDecision,
+            r#"{
+                "response_mode": "acknowledge",
+                "text": "I will check that in the background.",
+                "tool_calls": [{
+                    "tool": "handoff_to_background",
+                    "input": {"reason": "cluster check"},
+                    "async": true,
+                    "summary": "Ask background to inspect cluster health."
+                }],
+                "background_handoff": {
+                    "reason": "cluster health check",
+                    "evidence_ref": "sifs:/services/tasks/task_1/input.json",
+                    "priority": "routine"
+                },
+                "next_state": "delegating"
+            }"#,
+        )
+        .expect("decision");
 
         assert_eq!(decision.response_mode, AgentLoopResponseMode::Acknowledge);
         assert_eq!(decision.tool_calls[0].tool, "handoff_to_background");
@@ -1787,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_agent_definition_controls_lightweight_loop_request() {
+    fn custom_agent_definition_controls_agent_request() {
         let session = InteractionSession::new(
             SessionId::from_legacy_named("sess_custom_loop").expect("session"),
             NodeId::from_legacy_named("node_custom_loop").expect("node"),
@@ -1823,13 +1636,16 @@ mod tests {
         ));
         let model = CapturingInteractionModel::new("plain operator answer");
         let requests = model.requests.clone();
-        let agent_loop = MainAgentLoop::with_definition(model, "fake", "fake", definition);
+        let agent = Agent::new(model, "fake", "fake").with_agent_definition(definition);
 
-        let decision = agent_loop.decide(&loop_input).expect("decision");
+        let run = agent.run(&loop_input).expect("run");
         let request = requests.lock().expect("requests")[0].clone();
 
-        assert_eq!(decision.response_mode, AgentLoopResponseMode::Answer);
-        assert_eq!(decision.text, "plain operator answer");
+        assert_eq!(
+            run.final_decision.response_mode,
+            AgentLoopResponseMode::Answer
+        );
+        assert_eq!(run.final_decision.text, "plain operator answer");
         assert_eq!(request.response_format, LanguageModelResponseFormat::Text);
         assert_eq!(request.temperature, Some(0.1));
         assert_eq!(request.max_output_tokens, Some(123));
@@ -1838,7 +1654,6 @@ mod tests {
                 .content
                 .contains("Use the operator playbook.")
         );
-        assert!(request.messages[0].content.contains("custom_status"));
         assert!(
             request.messages[0]
                 .content
@@ -1912,7 +1727,7 @@ mod tests {
             context_attachments: Vec::new(),
             tool_specs: default_main_agent_tools(),
         };
-        let agent_loop = MainAgentLoop::new(
+        let agent = Agent::new(
             FakeInteractionModel {
                 response: "this should not be used",
             },
@@ -1920,7 +1735,8 @@ mod tests {
             "fake",
         );
 
-        let decision = agent_loop.decide(&loop_input).expect("decision");
+        let run = agent.run(&loop_input).expect("run");
+        let decision = run.final_decision;
 
         assert_eq!(decision.response_mode, AgentLoopResponseMode::Silent);
         assert!(decision.tool_calls.is_empty());
