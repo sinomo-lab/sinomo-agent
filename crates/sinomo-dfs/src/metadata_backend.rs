@@ -6103,9 +6103,12 @@ impl LocalSobjMetadataBackend {
             let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
                 continue;
             };
+            let object_path = normalize_path(&object.path);
+            let object_posix_path = normalize_posix_path(&object.path);
             if object.kind == DfsObjectKind::Tombstone
                 || object.file_system_id != *file_system_id
-                || normalize_path(&object.path) != path_record.path
+                || object_posix_path == directory_path
+                || object_path != path_record.path
             {
                 continue;
             }
@@ -6458,9 +6461,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             let Some(object) = tables.objects.get(&path_record.object_id).cloned() else {
                 continue;
             };
+            let object_path = normalize_path(&object.path);
+            let object_posix_path = normalize_posix_path(&object.path);
             if object.kind == DfsObjectKind::Tombstone
                 || object.file_system_id != *file_system_id
-                || normalize_path(&object.path) != path_record.path
+                || object_posix_path == directory_path
+                || object_path != path_record.path
             {
                 continue;
             }
@@ -12857,6 +12863,18 @@ mod tests {
                 .expect("backend");
         backend.put_file_system(&file_system()).expect("filesystem");
 
+        let mut root_dir = object(version("version_1"));
+        root_dir.object_id = DfsObjectId::from_legacy_named("obj_root_dir").expect("object");
+        root_dir.path = "/".to_string();
+        root_dir.kind = DfsObjectKind::Directory;
+        root_dir.content_hash = None;
+        root_dir.content_size_bytes = None;
+        let mut docs_dir = object(version("version_1"));
+        docs_dir.object_id = DfsObjectId::from_legacy_named("obj_docs_dir").expect("object");
+        docs_dir.path = "/docs".to_string();
+        docs_dir.kind = DfsObjectKind::Directory;
+        docs_dir.content_hash = None;
+        docs_dir.content_size_bytes = None;
         let mut readme = object(version("version_1"));
         readme.path = "/docs/readme.md".to_string();
         let mut changelog = object(version("version_1"));
@@ -12868,7 +12886,7 @@ mod tests {
         let mut outside = object(version("version_1"));
         outside.object_id = DfsObjectId::from_legacy_named("obj_lib").expect("object");
         outside.path = "/src/lib.rs".to_string();
-        for object in [&readme, &changelog, &nested, &outside] {
+        for object in [&root_dir, &docs_dir, &readme, &changelog, &nested, &outside] {
             backend.put_object(object).expect("object");
         }
         let mut changelog_tombstone = changelog.clone();
@@ -12886,6 +12904,29 @@ mod tests {
                 .map(|object| object.path.as_str())
                 .collect::<Vec<_>>(),
             vec!["/docs/readme.md"]
+        );
+
+        let root_children = backend
+            .child_objects_for_directory(&file_system_id(), "/")
+            .expect("root children");
+        assert_eq!(
+            root_children
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs"]
+        );
+
+        let root_page = backend
+            .child_objects_for_directory_page(&file_system_id(), "/", None, 10)
+            .expect("root page");
+        assert_eq!(
+            root_page
+                .objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/docs"]
         );
 
         cleanup(&root);
