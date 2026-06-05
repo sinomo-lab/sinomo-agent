@@ -270,6 +270,287 @@ pub enum LanguageModelStreamEvent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LanguageModelToolAdapterOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<LanguageModelToolCall>,
+}
+
+impl LanguageModelToolAdapterOutput {
+    pub fn is_empty(&self) -> bool {
+        self.tool_calls.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LanguageModelToolAdapter {
+    fallback_syntaxes: &'static [LanguageModelVendorToolSyntax],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LanguageModelVendorToolSyntax {
+    Dsml,
+}
+
+const DEFAULT_VENDOR_TOOL_SYNTAXES: &[LanguageModelVendorToolSyntax] =
+    &[LanguageModelVendorToolSyntax::Dsml];
+const DSML_OPEN_PREFIX: &str = "<\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}";
+const DSML_CLOSE_PREFIX: &str = "</\u{ff5c}\u{ff5c}DSML\u{ff5c}\u{ff5c}";
+
+pub fn language_model_tool_adapter(_provider: &str, _model: &str) -> LanguageModelToolAdapter {
+    LanguageModelToolAdapter {
+        fallback_syntaxes: DEFAULT_VENDOR_TOOL_SYNTAXES,
+    }
+}
+
+pub fn collect_language_model_tool_calls(
+    provider: &str,
+    model: &str,
+    response: &LanguageModelResponse,
+    stream_events: &[LanguageModelStreamEvent],
+    tools: &[LanguageModelToolSpec],
+) -> LanguageModelToolAdapterOutput {
+    language_model_tool_adapter(provider, model).collect(response, stream_events, tools)
+}
+
+impl LanguageModelToolAdapter {
+    pub fn collect(
+        &self,
+        response: &LanguageModelResponse,
+        stream_events: &[LanguageModelStreamEvent],
+        tools: &[LanguageModelToolSpec],
+    ) -> LanguageModelToolAdapterOutput {
+        let mut tool_calls = native_language_model_tool_calls(response, stream_events, tools);
+        let mut text = None;
+        if tool_calls.is_empty() {
+            for syntax in self.fallback_syntaxes {
+                let fallback = match syntax {
+                    LanguageModelVendorToolSyntax::Dsml => {
+                        parse_dsml_tool_adapter_output(&response.content)
+                    }
+                };
+                if !fallback.tool_calls.is_empty() {
+                    text = fallback.text;
+                    tool_calls = fallback.tool_calls;
+                    break;
+                }
+            }
+        }
+        LanguageModelToolAdapterOutput { text, tool_calls }
+    }
+}
+
+fn native_language_model_tool_calls(
+    response: &LanguageModelResponse,
+    stream_events: &[LanguageModelStreamEvent],
+    tools: &[LanguageModelToolSpec],
+) -> Vec<LanguageModelToolCall> {
+    let mut calls = Vec::new();
+    for call in &response.tool_calls {
+        push_language_model_tool_call(&mut calls, call, &response.provider, tools);
+    }
+    for item in &response.items {
+        if let LanguageModelResponseItem::ToolCall { call } = item {
+            push_language_model_tool_call(&mut calls, call, &response.provider, tools);
+        }
+    }
+    for event in stream_events {
+        if let LanguageModelStreamEvent::ToolCallCompleted {
+            call_id,
+            name,
+            input,
+        } = event
+        {
+            push_language_model_tool_call(
+                &mut calls,
+                &LanguageModelToolCall {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    summary: None,
+                },
+                &response.provider,
+                tools,
+            );
+        }
+    }
+    calls
+}
+
+fn push_language_model_tool_call(
+    calls: &mut Vec<LanguageModelToolCall>,
+    call: &LanguageModelToolCall,
+    provider: &str,
+    tools: &[LanguageModelToolSpec],
+) {
+    let input = normalize_language_model_tool_call_input(call, provider, tools);
+    if calls
+        .iter()
+        .any(|existing| existing.name == call.name && existing.input == input)
+    {
+        return;
+    }
+    calls.push(LanguageModelToolCall {
+        call_id: call.call_id.clone(),
+        name: call.name.clone(),
+        input,
+        summary: call.summary.clone(),
+    });
+}
+
+fn normalize_language_model_tool_call_input(
+    call: &LanguageModelToolCall,
+    provider: &str,
+    tools: &[LanguageModelToolSpec],
+) -> serde_json::Value {
+    if !call.input.is_string() {
+        return call.input.clone();
+    }
+    let Some(raw_input) = call.input.as_str() else {
+        return call.input.clone();
+    };
+    let Some(raw_input_argument) = tools
+        .iter()
+        .find(|tool| tool.name == call.name)
+        .and_then(|tool| provider_tool_raw_input_argument(tool, provider))
+    else {
+        return call.input.clone();
+    };
+    serde_json::json!({ raw_input_argument: raw_input })
+}
+
+fn provider_tool_raw_input_argument<'a>(
+    tool: &'a LanguageModelToolSpec,
+    provider: &str,
+) -> Option<&'a str> {
+    tool.provider_specs
+        .iter()
+        .find(|spec| spec.provider.eq_ignore_ascii_case(provider))
+        .and_then(|spec| spec.custom.as_ref())
+        .and_then(|custom| custom.raw_input_argument.as_deref())
+}
+
+fn parse_dsml_tool_adapter_output(raw: &str) -> LanguageModelToolAdapterOutput {
+    let tool_calls = parse_dsml_tool_calls(raw);
+    let text = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(remove_dsml_tool_call_blocks(raw).trim().to_string())
+    };
+    LanguageModelToolAdapterOutput { text, tool_calls }
+}
+
+fn parse_dsml_tool_calls(raw: &str) -> Vec<LanguageModelToolCall> {
+    let tool_calls_start = format!("{DSML_OPEN_PREFIX}tool_calls>");
+    let tool_calls_end = format!("{DSML_CLOSE_PREFIX}tool_calls>");
+    let mut calls = Vec::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find(&tool_calls_start) {
+        let after_start = &remaining[start + tool_calls_start.len()..];
+        let Some(end) = after_start.find(&tool_calls_end) else {
+            break;
+        };
+        calls.extend(parse_dsml_invocations(&after_start[..end]));
+        remaining = &after_start[end + tool_calls_end.len()..];
+    }
+    calls
+}
+
+fn parse_dsml_invocations(raw: &str) -> Vec<LanguageModelToolCall> {
+    let invoke_start = format!("{DSML_OPEN_PREFIX}invoke name=\"");
+    let invoke_end = format!("{DSML_CLOSE_PREFIX}invoke>");
+    let mut calls = Vec::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find(&invoke_start) {
+        let after_start = &remaining[start + invoke_start.len()..];
+        let Some(name_end) = after_start.find('"') else {
+            break;
+        };
+        let name = after_start[..name_end].trim();
+        if name.is_empty() {
+            remaining = &after_start[name_end..];
+            continue;
+        }
+        let Some(tag_end) = after_start[name_end..].find('>') else {
+            break;
+        };
+        let body_start = name_end + tag_end + 1;
+        let after_open = &after_start[body_start..];
+        let Some(body_end) = after_open.find(&invoke_end) else {
+            break;
+        };
+        let body = &after_open[..body_end];
+        calls.push(LanguageModelToolCall {
+            call_id: None,
+            name: name.to_string(),
+            input: parse_dsml_parameters(body),
+            summary: Some(format!("Recovered DSML tool call `{name}`.")),
+        });
+        remaining = &after_open[body_end + invoke_end.len()..];
+    }
+    calls
+}
+
+fn parse_dsml_parameters(body: &str) -> serde_json::Value {
+    let parameter_start = format!("{DSML_OPEN_PREFIX}parameter name=\"");
+    let parameter_end = format!("{DSML_CLOSE_PREFIX}parameter>");
+    let mut map = serde_json::Map::new();
+    let mut remaining = body;
+    while let Some(start) = remaining.find(&parameter_start) {
+        let after_start = &remaining[start + parameter_start.len()..];
+        let Some(name_end) = after_start.find('"') else {
+            break;
+        };
+        let name = after_start[..name_end].trim();
+        let Some(tag_end) = after_start[name_end..].find('>') else {
+            break;
+        };
+        let tag_tail = &after_start[name_end..name_end + tag_end];
+        let value_start = name_end + tag_end + 1;
+        let after_open = &after_start[value_start..];
+        let Some(value_end) = after_open.find(&parameter_end) else {
+            break;
+        };
+        if !name.is_empty() {
+            let value_text = &after_open[..value_end];
+            map.insert(
+                name.to_string(),
+                parse_dsml_parameter_value(tag_tail, value_text),
+            );
+        }
+        remaining = &after_open[value_end + parameter_end.len()..];
+    }
+    serde_json::Value::Object(map)
+}
+
+fn parse_dsml_parameter_value(tag_tail: &str, value: &str) -> serde_json::Value {
+    if tag_tail.contains("string=\"false\"") {
+        serde_json::from_str(value.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(value.to_string()))
+    } else {
+        serde_json::Value::String(value.to_string())
+    }
+}
+
+fn remove_dsml_tool_call_blocks(raw: &str) -> String {
+    let tool_calls_start = format!("{DSML_OPEN_PREFIX}tool_calls>");
+    let tool_calls_end = format!("{DSML_CLOSE_PREFIX}tool_calls>");
+    let mut output = String::new();
+    let mut remaining = raw;
+    while let Some(start) = remaining.find(&tool_calls_start) {
+        output.push_str(&remaining[..start]);
+        let after_start = &remaining[start + tool_calls_start.len()..];
+        let Some(end) = after_start.find(&tool_calls_end) else {
+            return output;
+        };
+        remaining = &after_start[end + tool_calls_end.len()..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelProviderUsage {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2411,6 +2692,92 @@ mod tests {
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::json!({ "job_id": "task_test" }),
         }
+    }
+
+    #[test]
+    fn tool_adapter_wraps_provider_custom_raw_input() {
+        let tool = LanguageModelToolSpec {
+            name: "apply_patch".to_string(),
+            description: "Apply a patch.".to_string(),
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: vec![LanguageModelProviderToolSpec {
+                provider: "openai".to_string(),
+                custom: Some(LanguageModelCustomToolSpec {
+                    format: LanguageModelCustomToolFormat::Grammar {
+                        syntax: "lark".to_string(),
+                        definition: "start: /.+/".to_string(),
+                    },
+                    raw_input_argument: Some("patch".to_string()),
+                }),
+            }],
+        };
+        let response = LanguageModelResponse {
+            provider: "openai".to_string(),
+            model: "gpt-5.2-codex".to_string(),
+            content: String::new(),
+            items: Vec::new(),
+            tool_calls: vec![LanguageModelToolCall {
+                call_id: Some("call_patch".to_string()),
+                name: "apply_patch".to_string(),
+                input: serde_json::json!("*** Begin Patch\n*** End Patch\n"),
+                summary: None,
+            }],
+            usage: None,
+        };
+
+        let output =
+            collect_language_model_tool_calls("openai", "gpt-5.2-codex", &response, &[], &[tool]);
+
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(
+            output.tool_calls[0].input,
+            serde_json::json!({ "patch": "*** Begin Patch\n*** End Patch\n" })
+        );
+    }
+
+    #[test]
+    fn tool_adapter_recovers_dsml_tool_calls_from_text() {
+        let content = format!(
+            "I found it.\n{open}tool_calls>\n\
+             {open}invoke name=\"run_command\">\n\
+             {open}parameter name=\"command\" string=\"true\">python -m py_compile a.py{close}parameter>\n\
+             {open}parameter name=\"timeout_ms\" string=\"false\">15000{close}parameter>\n\
+             {close}invoke>\n\
+             {close}tool_calls>",
+            open = DSML_OPEN_PREFIX,
+            close = DSML_CLOSE_PREFIX,
+        );
+        let response = LanguageModelResponse {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            content,
+            items: Vec::new(),
+            tool_calls: Vec::new(),
+            usage: None,
+        };
+
+        let output =
+            collect_language_model_tool_calls("deepseek", "deepseek-v4-pro", &response, &[], &[]);
+
+        assert_eq!(output.text.as_deref(), Some("I found it."));
+        assert_eq!(output.tool_calls.len(), 1);
+        assert_eq!(output.tool_calls[0].name, "run_command");
+        assert_eq!(
+            output.tool_calls[0]
+                .input
+                .get("command")
+                .and_then(serde_json::Value::as_str),
+            Some("python -m py_compile a.py")
+        );
+        assert_eq!(
+            output.tool_calls[0]
+                .input
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_i64),
+            Some(15000)
+        );
     }
 
     #[test]

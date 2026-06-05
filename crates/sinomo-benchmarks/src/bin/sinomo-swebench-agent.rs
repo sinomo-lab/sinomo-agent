@@ -18,8 +18,9 @@ use sinomo_runtime::node::NodeId;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -333,6 +334,7 @@ fn benchmark_agent(
 ) -> Agent<ConfiguredBenchmarkModel> {
     let config = AgentConfig::new(provider.to_string(), model_id.to_string())
         .with_workspace_root(workspace)
+        .with_prompt_reference_expansion(false)
         .with_context_budget(AgentContextBudget::for_loaded_model(
             provider, model_id, None,
         ))
@@ -501,6 +503,7 @@ Hints:
 Work only in regular source files. Do not edit tests or generated lock/config files unless the issue explicitly requires it.
 Use the workspace tools to inspect files, edit with apply_patch, and run focused checks when practical. Workspace commands already start in the repository root; do not cd to /workspace, /home/user, benchmark artifact paths, or guessed checkout paths.
 Failed command stderr/stdout are returned in the next tool_result; use that output as the command diagnostic instead of repeating the same command blindly.
+The benchmark checkout usually does not have the target project's Python dependencies installed. Prefer source inspection plus the harness post-patch `python -m py_compile` check. Run import-heavy tests only when dependencies are already present; if stderr mentions missing modules, incompatible local Python tooling, or package installation requirements, stop using local validation and finish once the diff is minimal.
 For apply_patch, submit one minimal patch as raw tool input or as a patch string field. Patch format: `*** Begin Patch`, one or more `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` hunks, then `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` and lines prefixed with space, `-`, or `+`; do not use git unified range headers or dangling empty hunks.
 Example update hunk:
 *** Begin Patch
@@ -542,19 +545,8 @@ fn run_post_patch_check(
     if python_files.is_empty() {
         return Ok(None);
     }
-    let mut command = Command::new("python");
-    command
-        .arg("-m")
-        .arg("py_compile")
-        .args(&python_files)
-        .current_dir(workspace);
-    let output = command.output().map_err(|source| {
-        format!(
-            "failed to run post-patch syntax check in {}: {source}",
-            workspace.display()
-        )
-    })?;
-    let command_text = format!("python -m py_compile {}", python_files.join(" "));
+    let (python, output) = run_python_compile(workspace, &python_files)?;
+    let command_text = format!("{python} -m py_compile {}", python_files.join(" "));
     Ok(Some(SweBenchPostPatchCheck {
         command: command_text,
         passed: output.status.success(),
@@ -562,6 +554,38 @@ fn run_post_patch_check(
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     }))
+}
+
+fn run_python_compile(
+    workspace: &Path,
+    python_files: &[String],
+) -> Result<(String, Output), String> {
+    let mut missing = Vec::new();
+    for python in ["python", "python3"] {
+        let mut command = Command::new(python);
+        command
+            .arg("-m")
+            .arg("py_compile")
+            .args(python_files)
+            .current_dir(workspace);
+        match command.output() {
+            Ok(output) => return Ok((python.to_string(), output)),
+            Err(source) if source.kind() == ErrorKind::NotFound => {
+                missing.push(python);
+            }
+            Err(source) => {
+                return Err(format!(
+                    "failed to run post-patch syntax check with {python} in {}: {source}",
+                    workspace.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "failed to run post-patch syntax check in {}: none of {} are available",
+        workspace.display(),
+        missing.join(", ")
+    ))
 }
 
 fn current_patch(workspace: &Path) -> Result<String, String> {

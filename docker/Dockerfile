@@ -10,9 +10,26 @@
 # `rollout cluster` build the new binary from the managed source repo in-container.
 FROM rust:1.90-bookworm
 
+ARG SINOMO_BENCH_DEPS=0
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates iproute2 procps \
+    && apt-get install -y --no-install-recommends \
+        git \
+        ca-certificates \
+        iproute2 \
+        procps \
     && rm -rf /var/lib/apt/lists/*
+
+RUN if [ "$SINOMO_BENCH_DEPS" = "1" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            docker.io \
+            python3 \
+            python-is-python3 \
+            python3-pip && \
+        rm -rf /var/lib/apt/lists/* && \
+        python -m pip install --break-system-packages --no-cache-dir swebench; \
+    fi
 
 # Build the daemon binary. The source is copied (target/ excluded via .dockerignore)
 # and committed so the in-container managed source repo + build.rs commit stamp work.

@@ -7,7 +7,9 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
+import shutil
 import shlex
 import subprocess
 import sys
@@ -488,6 +490,24 @@ def evaluate_predictions(
     if not args.dry_run:
         evaluation_dir.mkdir(parents=True, exist_ok=True)
     instance_ids = [item["instance_id"] for item in suite["instances"]]
+    missing = official_evaluation_prerequisite_issues()
+    if missing:
+        blocked = {
+            "requested": True,
+            "blocked": True,
+            "issues": missing,
+            "predictions_path": str(predictions_path),
+            "total_instances": len(instance_ids),
+        }
+        if not args.dry_run:
+            with (evaluation_dir / "blocked.json").open("w", encoding="utf-8") as handle:
+                json.dump(blocked, handle, indent=2)
+                handle.write("\n")
+        progress.emit("evaluation-blocked", issues=missing, results_dir=str(evaluation_dir))
+        print("official evaluation blocked:")
+        for issue in missing:
+            print(f"- {issue}")
+        return
     progress.emit(
         "evaluation-start",
         predictions_path=str(predictions_path),
@@ -522,6 +542,28 @@ def evaluate_predictions(
     progress.emit("evaluation-complete", results_dir=str(evaluation_dir))
 
 
+def official_evaluation_prerequisite_issues() -> list[str]:
+    issues: list[str] = []
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import swebench"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        issues.append(
+            "Python package `swebench` is not importable; install it in the benchmark runtime"
+        )
+    if shutil.which("docker") is None:
+        issues.append("Docker CLI is not available in the benchmark runtime")
+    if not os.environ.get("DOCKER_HOST") and not Path("/var/run/docker.sock").exists():
+        issues.append(
+            "Docker daemon is not reachable; mount /var/run/docker.sock or set DOCKER_HOST"
+        )
+    return issues
+
+
 def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -> dict:
     evaluation_dir = args.results_dir / "evaluation"
     instance_ids = [item["instance_id"] for item in suite["instances"]]
@@ -540,6 +582,20 @@ def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -
         return summary
     if args.dry_run:
         summary["parse_status"] = "dry-run"
+        return summary
+    blocked_path = evaluation_dir / "blocked.json"
+    if blocked_path.exists():
+        try:
+            with blocked_path.open("r", encoding="utf-8") as handle:
+                blocked = json.load(handle)
+        except (OSError, json.JSONDecodeError) as source:
+            summary["parse_status"] = "blocked-unreadable"
+            summary["summary_path"] = str(blocked_path)
+            summary["issues"] = [f"failed to read blocked evaluation marker: {source}"]
+            return summary
+        summary["parse_status"] = "blocked"
+        summary["summary_path"] = str(blocked_path)
+        summary["issues"] = blocked.get("issues", [])
         return summary
     if not evaluation_dir.exists():
         summary["parse_status"] = "missing-results-dir"

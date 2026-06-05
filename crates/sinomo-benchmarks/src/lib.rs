@@ -463,7 +463,7 @@ pub fn docker_smoke_command(plan: &BenchmarkHarnessPlan) -> Result<String, Bench
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn terminalbench_plan_uses_harbor_custom_agent_shape() {
@@ -494,11 +494,21 @@ mod tests {
             .iter()
             .map(|instance| instance.repo.as_str())
             .collect();
+        let mut difficulties = BTreeMap::new();
+        for instance in &suite.instances {
+            *difficulties
+                .entry(instance.difficulty.as_str())
+                .or_insert(0) += 1;
+        }
         assert_eq!(instance_ids.len(), 10);
         assert_eq!(repos.len(), 10);
-        assert!(instance_ids.contains("astropy__astropy-12907"));
-        assert!(instance_ids.contains("django__django-10097"));
-        assert!(instance_ids.contains("scikit-learn__scikit-learn-10297"));
+        assert_eq!(difficulties.get("<15 min fix"), Some(&4));
+        assert_eq!(difficulties.get("15 min - 1 hour"), Some(&5));
+        assert_eq!(difficulties.get("1-4 hours"), Some(&1));
+        assert!(instance_ids.contains("django__django-14752"));
+        assert!(instance_ids.contains("sympy__sympy-19495"));
+        assert!(instance_ids.contains("sphinx-doc__sphinx-7462"));
+        assert!(instance_ids.contains("pylint-dev__pylint-8898"));
     }
 
     #[test]
@@ -525,6 +535,14 @@ mod tests {
         assert!(
             include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
                 .contains("swebench.harness.run_evaluation")
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
+                .contains("official_evaluation_prerequisite_issues")
+        );
+        assert!(
+            include_str!("../../sinomo-benchmarks/swebench/run_swebench_verified.py")
+                .contains("evaluation-blocked")
         );
     }
 

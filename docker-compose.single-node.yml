@@ -9,6 +9,8 @@ x-single-node: &single-node
   build:
     context: .
     dockerfile: docker/Dockerfile
+    args:
+      SINOMO_BENCH_DEPS: "1"
   entrypoint: ["/usr/local/bin/sinomo-single-node-entrypoint"]
   environment:
     CLUSTER_NAME: single-node-evolution
@@ -29,6 +31,7 @@ services:
       - "21354:21354"
     volumes:
       - single-node-data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
 
   sinomo-single-smoke:
     <<: *single-node

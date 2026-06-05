@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelMessage,
     LanguageModelProviderToolSpec, LanguageModelRequest, LanguageModelRequestItem,
-    LanguageModelResponse, LanguageModelResponseItem, LanguageModelRole, LanguageModelStreamEvent,
-    LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
+    LanguageModelResponse, LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall,
+    LanguageModelToolChoice, LanguageModelToolSpec, collect_language_model_tool_calls,
     inferred_model_context_window_tokens,
 };
 use sinomo_runtime::core::{
@@ -965,6 +965,9 @@ fn resolve_prompt_references(
     Vec<ContextSource>,
     Vec<ContextOmission>,
 ) {
+    if !config.expand_prompt_references {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
     let labels = extract_prompt_reference_labels(&latest_event_prompt_text(input));
     if labels.is_empty() {
         return (Vec::new(), Vec::new(), Vec::new());
@@ -2591,6 +2594,8 @@ pub struct AgentConfig {
     pub visible_toolsets: Vec<String>,
     #[serde(default = "default_workspace_instruction_files")]
     pub workspace_instruction_files: Vec<PathBuf>,
+    #[serde(default = "default_expand_prompt_references")]
+    pub expand_prompt_references: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_reference_max_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2621,6 +2626,7 @@ impl AgentConfig {
             run_context: AgentRunContext::default(),
             visible_toolsets: Vec::new(),
             workspace_instruction_files: default_workspace_instruction_files(),
+            expand_prompt_references: default_expand_prompt_references(),
             prompt_reference_max_bytes: None,
             prompt_reference_max_entries: None,
             context_budget: AgentContextBudget::default(),
@@ -2683,6 +2689,11 @@ impl AgentConfig {
         self
     }
 
+    pub fn with_prompt_reference_expansion(mut self, enabled: bool) -> Self {
+        self.expand_prompt_references = enabled;
+        self
+    }
+
     pub fn with_visible_toolsets(
         mut self,
         toolsets: impl IntoIterator<Item = impl Into<String>>,
@@ -2716,6 +2727,10 @@ fn default_agent_config_definition() -> AgentDefinition {
 
 fn default_workspace_instruction_files() -> Vec<PathBuf> {
     vec![PathBuf::from("AGENTS.md")]
+}
+
+fn default_expand_prompt_references() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -5713,14 +5728,30 @@ fn parse_agent_model_decision(
     available_tool_specs: &[AgentToolDescriptor],
     output_format: &AgentOutputFormat,
 ) -> Result<AgentLoopDecision, AgentError> {
-    let tool_calls = native_agent_tool_calls(response, stream_events, available_tool_specs);
+    let language_model_tools: Vec<_> = available_tool_specs
+        .iter()
+        .map(language_model_tool_spec_from_agent_tool)
+        .collect();
+    let tool_output = collect_language_model_tool_calls(
+        &response.provider,
+        &response.model,
+        response,
+        stream_events,
+        &language_model_tools,
+    );
+    let tool_calls = agent_tool_calls_from_language_model(&tool_output.tool_calls);
     if !tool_calls.is_empty() {
+        let text = tool_output
+            .text
+            .as_deref()
+            .unwrap_or(&response.content)
+            .trim();
         return Ok(AgentLoopDecision {
             response_mode: crate::AgentLoopResponseMode::Defer,
-            text: if response.content.trim().is_empty() {
+            text: if text.is_empty() {
                 "The model requested tool execution.".to_string()
             } else {
-                response.content.clone()
+                text.to_string()
             },
             tool_calls,
             background_handoff: None,
@@ -5733,91 +5764,19 @@ fn parse_agent_model_decision(
     }
 }
 
-fn native_agent_tool_calls(
-    response: &LanguageModelResponse,
-    stream_events: &[LanguageModelStreamEvent],
-    available_tool_specs: &[AgentToolDescriptor],
-) -> Vec<AgentToolCall> {
-    let mut calls = Vec::new();
-    for call in &response.tool_calls {
-        push_native_agent_tool_call(&mut calls, call, available_tool_specs);
-    }
-    for item in &response.items {
-        if let LanguageModelResponseItem::ToolCall { call } = item {
-            push_native_agent_tool_call(&mut calls, call, available_tool_specs);
-        }
-    }
-    for event in stream_events {
-        if let LanguageModelStreamEvent::ToolCallCompleted {
-            call_id,
-            name,
-            input,
-        } = event
-        {
-            push_native_agent_tool_call(
-                &mut calls,
-                &LanguageModelToolCall {
-                    call_id: call_id.clone(),
-                    name: name.clone(),
-                    input: input.clone(),
-                    summary: None,
-                },
-                available_tool_specs,
-            );
-        }
-    }
+fn agent_tool_calls_from_language_model(calls: &[LanguageModelToolCall]) -> Vec<AgentToolCall> {
     calls
-}
-
-fn push_native_agent_tool_call(
-    calls: &mut Vec<AgentToolCall>,
-    call: &LanguageModelToolCall,
-    available_tool_specs: &[AgentToolDescriptor],
-) {
-    let input = normalize_native_tool_call_input(call, available_tool_specs);
-    if calls
         .iter()
-        .any(|existing| existing.tool == call.name && existing.input == input)
-    {
-        return;
-    }
-    calls.push(AgentToolCall {
-        tool: call.name.clone(),
-        input,
-        r#async: false,
-        summary: call
-            .summary
-            .clone()
-            .unwrap_or_else(|| format!("Native model tool call `{}`.", call.name)),
-    });
-}
-
-fn normalize_native_tool_call_input(
-    call: &LanguageModelToolCall,
-    available_tool_specs: &[AgentToolDescriptor],
-) -> serde_json::Value {
-    if !call.input.is_string() {
-        return call.input.clone();
-    }
-    let Some(raw_input) = call.input.as_str() else {
-        return call.input.clone();
-    };
-    let Some(raw_input_argument) = available_tool_specs
-        .iter()
-        .find(|descriptor| descriptor.spec.name == call.name)
-        .and_then(native_tool_raw_input_argument)
-    else {
-        return call.input.clone();
-    };
-    serde_json::json!({ raw_input_argument: raw_input })
-}
-
-fn native_tool_raw_input_argument(descriptor: &AgentToolDescriptor) -> Option<&str> {
-    descriptor
-        .provider_specs
-        .iter()
-        .filter_map(|spec| spec.custom.as_ref())
-        .find_map(|custom| custom.raw_input_argument.as_deref())
+        .map(|call| AgentToolCall {
+            tool: call.name.clone(),
+            input: call.input.clone(),
+            r#async: false,
+            summary: call
+                .summary
+                .clone()
+                .unwrap_or_else(|| format!("Native model tool call `{}`.", call.name)),
+        })
+        .collect()
 }
 
 fn parse_agent_loop_decision_strict(raw: &str) -> Result<AgentLoopDecision, AgentError> {
@@ -6405,6 +6364,7 @@ mod tests {
         assert_eq!(config.max_tool_calls_per_step, None);
         assert_eq!(config.max_model_repair_attempts, None);
         assert_eq!(config.max_output_tokens, None);
+        assert!(config.expand_prompt_references);
         assert_eq!(config.prompt_reference_max_bytes, None);
         assert_eq!(config.prompt_reference_max_entries, None);
         assert_eq!(config.context_budget.max_context_bytes, None);
@@ -7825,12 +7785,25 @@ mod tests {
             summary: None,
         };
 
-        let mut calls = Vec::new();
-        push_native_agent_tool_call(&mut calls, &call, &[descriptor]);
+        let response = LanguageModelResponse {
+            provider: "openai".to_string(),
+            model: "gpt-5.2-codex".to_string(),
+            content: String::new(),
+            items: Vec::new(),
+            tool_calls: vec![call],
+            usage: None,
+        };
+        let decision = parse_agent_model_decision(
+            &response,
+            &[],
+            &[descriptor],
+            &AgentOutputFormat::JsonDecision,
+        )
+        .expect("decision");
 
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool, "apply_patch");
-        assert_eq!(calls[0].input["patch"], raw_patch);
+        assert_eq!(decision.tool_calls.len(), 1);
+        assert_eq!(decision.tool_calls[0].tool, "apply_patch");
+        assert_eq!(decision.tool_calls[0].input["patch"], raw_patch);
     }
 
     #[test]
@@ -8052,6 +8025,42 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("\"prompt_references\"")
                     && message.content.contains("important context"))
+        );
+    }
+
+    #[test]
+    fn context_assembler_can_disable_prompt_reference_expansion() {
+        let root =
+            std::env::temp_dir().join(format!("sinomo-agent-no-prompt-ref-{}", TaskId::generate()));
+        fs::create_dir_all(&root).expect("workspace");
+        fs::write(root.join("note.txt"), "important context\n").expect("note");
+        let input = agent_input("inspect @note.txt and @missing.txt");
+        let config = AgentConfig::new("fake", "fake")
+            .with_workspace_root(&root)
+            .with_prompt_reference_expansion(false);
+        let agent = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "fake",
+            "fake",
+        )
+        .with_config(config);
+
+        let context = agent.assemble_context(&input, &[], 0).expect("context");
+
+        assert!(context.prompt_references.is_empty());
+        assert!(
+            !context
+                .report
+                .included
+                .iter()
+                .any(|source| source.kind.starts_with("prompt_reference"))
+        );
+        assert!(
+            !context
+                .report
+                .omitted
+                .iter()
+                .any(|omission| omission.kind == "prompt_reference")
         );
     }
 

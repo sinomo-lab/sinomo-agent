@@ -2,7 +2,7 @@
 
 This directory contains the initial SWE-bench support for Sinomo's coding agent harness.
 
-The checked-in `verified_10.json` suite selects 10 tasks from SWE-bench Verified by taking the first task from each of the first 10 distinct repositories in the official `princeton-nlp/SWE-bench_Verified` test split. This avoids a one-repository smoke test while staying small enough for provider and harness iteration.
+The checked-in `verified_10.json` suite selects 10 representative tasks from SWE-bench Verified. It keeps 10 distinct repositories, covers Django, SymPy, Sphinx, scientific Python, testing/linting, and HTTP-client behavior, and mirrors the Verified difficulty distribution at this size with 4 easy tasks, 5 medium tasks, and 1 harder task. The cases were selected on 2026-06-04 from the official `princeton-nlp/SWE-bench_Verified` test split with moderate patch and test sizes where possible, so the suite stays useful for repeated provider and harness iteration rather than only final leaderboard evaluation.
 
 ## Setup
 
@@ -20,6 +20,8 @@ uv pip install --python target/tmp/swebench-venv/bin/python swebench
 ```
 
 Evolution benchmark gates use `SINOMO_SWEBENCH_PYTHON` when it is set. If it is not set, they automatically prefer `target/tmp/swebench-venv/bin/python` when that file exists, then fall back to `python3`.
+
+The single-node compose file builds the Sinomo image with `SINOMO_BENCH_DEPS=1`, which installs the `swebench` Python package and Docker CLI for benchmark evaluation, and mounts `/var/run/docker.sock` so the official harness can launch its per-instance containers. If `--evaluate` is requested without those prerequisites, the runner writes `<results-dir>/evaluation/blocked.json` and records `official_evaluation.parse_status = "blocked"` in the summary instead of failing with an ambiguous import or Docker error.
 
 ## Plan
 
