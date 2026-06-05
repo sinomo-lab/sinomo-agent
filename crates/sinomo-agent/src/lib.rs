@@ -15,17 +15,40 @@ use sinomo_runtime::events::{
     EntityId, EventId, EventStore, ReplayDirection, ReplayQuery, SessionId, StoredEvent,
 };
 use sinomo_runtime::node::NodeId;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 mod agent;
+mod process;
 mod session_store;
 pub mod tools;
 
 pub use agent::*;
+pub use process::*;
 pub use session_store::*;
 pub use tools::*;
 
 pub type TaskId = Id;
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AgentCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
 
 pub fn register_storage_paths(
     layout: &mut sinomo_runtime::storage::StorageLayout,
@@ -79,10 +102,6 @@ pub enum AgentToolKind {
     ConfigSearch,
     ConfigGet,
     ConfigSet,
-    StartCommandSession,
-    InspectCommandSession,
-    WriteCommandStdin,
-    CancelCommandSession,
     RequestUserInput,
     ToolSearch,
     ToolDescribe,
@@ -382,30 +401,6 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
             AgentToolKind::RunShellCommand,
             "run_command",
             "Run a bounded workspace command in the current sandbox. Commands start in the workspace root; omit cwd unless using a workspace subdirectory. If validation fails because dependencies are missing or package installation is blocked, do not loop on environment setup unless the task is dependency setup.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::StartCommandSession,
-            "start_command_session",
-            "Start a workspace command session with incremental output, stdin, timeout, and cancellation support.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::InspectCommandSession,
-            "inspect_command_session",
-            "Inspect incremental output and status for a workspace command session.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::WriteCommandStdin,
-            "write_command_stdin",
-            "Write stdin to a running workspace command session.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::CancelCommandSession,
-            "cancel_command_session",
-            "Cancel a running workspace command session.",
             true,
         ),
         AgentToolSpec::new(
@@ -1006,6 +1001,21 @@ pub trait InteractionModel {
         request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError>;
 
+    fn complete_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "before request"));
+        }
+        let response = self.complete(request)?;
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "after response"));
+        }
+        Ok(response)
+    }
+
     fn complete_streaming(
         &self,
         request: &LanguageModelRequest,
@@ -1013,6 +1023,26 @@ pub trait InteractionModel {
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let _ = on_delta;
         self.complete(request)
+    }
+
+    fn complete_streaming_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_delta: &mut dyn FnMut(&str),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "before request"));
+        }
+        let response = self.complete_streaming(request, &mut |delta| {
+            if !cancellation_token.is_cancelled() {
+                on_delta(delta);
+            }
+        })?;
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "during response"));
+        }
+        Ok(response)
     }
 
     fn complete_streaming_events(
@@ -1045,6 +1075,37 @@ pub trait InteractionModel {
             finish_reason: None,
         });
         Ok(response)
+    }
+
+    fn complete_streaming_events_with_cancellation(
+        &self,
+        request: &LanguageModelRequest,
+        cancellation_token: &AgentCancellationToken,
+        on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+    ) -> Result<LanguageModelResponse, LanguageModelError> {
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "before request"));
+        }
+        let response = self.complete_streaming_events(request, &mut |event| {
+            if !cancellation_token.is_cancelled() {
+                on_event(event);
+            }
+        })?;
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_language_model_error(request, "during response"));
+        }
+        Ok(response)
+    }
+}
+
+fn cancelled_language_model_error(
+    request: &LanguageModelRequest,
+    phase: &'static str,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: request.provider.clone(),
+        model: request.model.clone(),
+        detail: format!("model invocation cancelled {phase}"),
     }
 }
 
@@ -1431,6 +1492,8 @@ pub enum AgentError {
     TraceStore { detail: String },
     #[error("agent session store failed: {detail}")]
     SessionStore { detail: String },
+    #[error("agent runtime failed: {detail}")]
+    Runtime { detail: String },
 }
 
 #[cfg(test)]

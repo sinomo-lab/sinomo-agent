@@ -24,10 +24,10 @@ use crate::{
 use serde::{Deserialize, Deserializer, Serialize};
 use sinomo_agent::{
     Agent, AgentConfig, AgentContextAttachment, AgentContextBudget, AgentLoopInput,
-    AgentModelEvent, AgentPolicyBundle, AgentRole, AgentStoragePaths, AgentToolRegistry,
-    BoundedContext, FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
-    user_interaction_input_event,
+    AgentModelEvent, AgentOp, AgentPolicyBundle, AgentRole, AgentSession, AgentSessionRuntime,
+    AgentStoragePaths, AgentToolRegistry, BoundedContext, FileAgentTraceStore, InteractionModel,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
+    default_coding_agent_tools, user_interaction_input_event,
 };
 use sinomo_lm::{
     AnthropicConfig, AnthropicProvider, CLAUDE_CODE_DEFAULT_MODEL, CODEX_CLI_DEFAULT_MODEL,
@@ -4447,7 +4447,7 @@ impl<M> AgentMutationWorker<M> {
 
 impl<M> MutationModel for AgentMutationWorker<M>
 where
-    M: InteractionModel + Clone,
+    M: InteractionModel + Clone + Send + Sync + 'static,
 {
     fn mutate(
         &self,
@@ -4509,10 +4509,43 @@ where
             context_attachments: vec![evolution_agent_context_attachment(packet, bundle)],
             tool_specs: default_coding_agent_tools(),
         };
-        let run = agent
-            .run(&input)
+        let runtime = AgentSessionRuntime::new(
+            agent,
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Evolution),
+        );
+        let op = AgentOp::start_turn(input);
+        let op_id = op.op_id.clone();
+        let submit = runtime
+            .submit_op(op)
             .map_err(|source| MutationModelError::Agent {
                 detail: source.to_string(),
+            })?;
+        if !submit.accepted {
+            let detail = submit
+                .events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    sinomo_agent::AgentEventPayload::OperationRejected { reason, .. } => {
+                        Some(reason.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "evolution agent turn was rejected".to_string());
+            return Err(MutationModelError::Agent { detail });
+        }
+        runtime
+            .join_active_turn()
+            .map_err(|source| MutationModelError::Agent {
+                detail: source.to_string(),
+            })?;
+        let run = runtime
+            .turn_result(&op_id)
+            .map_err(|source| MutationModelError::Agent {
+                detail: source.to_string(),
+            })?
+            .and_then(|outcome| outcome.run)
+            .ok_or_else(|| MutationModelError::Agent {
+                detail: format!("agent runtime turn `{op_id}` completed without a run"),
             })?;
         let final_text = run.final_decision.text.clone();
         let (input_tokens, output_tokens) = agent_model_usage_totals(&run.model_events);

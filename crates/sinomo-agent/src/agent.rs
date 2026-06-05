@@ -6,12 +6,13 @@ use crate::tools::{
     AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentModuleToolProjection, AgentTool,
     AgentToolCapability, AgentToolCustomFormat, AgentToolCustomSpec, AgentToolDescriptor,
     AgentToolEvidence, AgentToolOutcome, AgentToolPlan, AgentToolPlanner, AgentToolPolicyDecision,
-    AgentToolProviderSpec, AgentToolRegistry, AgentToolStatus, is_tool_disclosure_bridge_name,
+    AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry,
+    AgentToolStatus, is_tool_disclosure_bridge_name,
 };
 use crate::{
-    AgentDefinition, AgentError, AgentLoopDecision, AgentLoopInput, AgentOutputFormat,
-    AgentToolCall, AsyncTaskNextAction, InteractionModel, InteractionSession, TaskId,
-    parse_agent_loop_response, render_agent_system_prompt_with_descriptors,
+    AgentCancellationToken, AgentDefinition, AgentError, AgentLoopDecision, AgentLoopInput,
+    AgentOutputFormat, AgentToolCall, AsyncTaskNextAction, InteractionModel, InteractionSession,
+    TaskId, parse_agent_loop_response, render_agent_system_prompt_with_descriptors,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
@@ -31,6 +32,8 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO: f32 = 0.80;
 const CONTEXT_ESTIMATE_BYTES_PER_TOKEN: usize = 4;
@@ -1586,6 +1589,81 @@ pub enum AgentModelEvent {
 }
 
 impl AgentModelEvent {
+    fn from_stream_event(
+        step_index: usize,
+        provider: &str,
+        model: &str,
+        stream_event: &LanguageModelStreamEvent,
+    ) -> Option<Self> {
+        match stream_event {
+            LanguageModelStreamEvent::Started { provider, model } => Some(Self::Started {
+                step_index,
+                provider: provider.clone(),
+                model: model.clone(),
+            }),
+            LanguageModelStreamEvent::TextDelta { delta } => {
+                (!delta.is_empty()).then(|| Self::AssistantTextDelta {
+                    step_index,
+                    delta: delta.clone(),
+                })
+            }
+            LanguageModelStreamEvent::ReasoningSummary { summary } => {
+                Some(Self::AssistantReasoningSummary {
+                    step_index,
+                    summary: summary.clone(),
+                })
+            }
+            LanguageModelStreamEvent::ToolCallStarted { call_id, name } => {
+                Some(Self::ToolCallStarted {
+                    step_index,
+                    call_index: None,
+                    call_id: call_id.clone(),
+                    tool: name.clone(),
+                })
+            }
+            LanguageModelStreamEvent::ToolCallDelta {
+                call_id,
+                name,
+                arguments_delta,
+            } => Some(Self::ToolCallDelta {
+                step_index,
+                call_id: call_id.clone(),
+                tool: name.clone(),
+                arguments_delta: arguments_delta.clone(),
+            }),
+            LanguageModelStreamEvent::ToolCallCompleted {
+                call_id,
+                name,
+                input,
+            } => Some(Self::ToolCallCompleted {
+                step_index,
+                call_index: None,
+                call_id: call_id.clone(),
+                call: AgentToolCall {
+                    tool: name.clone(),
+                    input: input.clone(),
+                    r#async: false,
+                    summary: String::new(),
+                },
+            }),
+            LanguageModelStreamEvent::Usage { usage } => Some(Self::Usage {
+                step_index,
+                provider: provider.to_string(),
+                model: model.to_string(),
+                usage: Some(usage.clone()),
+            }),
+            LanguageModelStreamEvent::Finished { .. } => None,
+            LanguageModelStreamEvent::Error { detail } => Some(Self::Error {
+                step_index,
+                category: classify_language_model_error_detail(detail),
+                detail: detail.clone(),
+            }),
+            LanguageModelStreamEvent::Aborted { reason } => Some(Self::Aborted {
+                reason: reason.clone(),
+            }),
+        }
+    }
+
     fn from_model_response(
         step_index: usize,
         response: &LanguageModelResponse,
@@ -2830,6 +2908,7 @@ pub enum AgentStopReason {
     CodingStopRecommended,
     MaxStepsReached,
     Aborted,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -3085,6 +3164,8 @@ pub struct AgentActiveTurn {
     pub timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cancel_requested: bool,
 }
 
 impl AgentActiveTurn {
@@ -3100,6 +3181,7 @@ impl AgentActiveTurn {
             started_at: time::OffsetDateTime::now_utc(),
             timeout_ms,
             task_id,
+            cancel_requested: false,
         }
     }
 }
@@ -3161,6 +3243,107 @@ pub struct AgentSessionControlEventBatch {
     pub terminal_results: Vec<AgentTaskTerminalResult>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentRuntimeEventCursor {
+    pub offset: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event_id: Option<TaskId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentRuntimeEventBatch {
+    pub cursor: AgentRuntimeEventCursor,
+    pub next_cursor: AgentRuntimeEventCursor,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<AgentRuntimeEvent>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentRuntimeEvent {
+    pub event_id: TaskId,
+    pub session_id: SessionId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub emitted_at: time::OffsetDateTime,
+    pub payload: AgentRuntimeEventPayload,
+}
+
+impl AgentRuntimeEvent {
+    pub fn new(session_id: SessionId, payload: AgentRuntimeEventPayload) -> Self {
+        Self {
+            event_id: TaskId::generate(),
+            session_id,
+            emitted_at: time::OffsetDateTime::now_utc(),
+            payload,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentRuntimeEventPayload {
+    WorkerStarted {
+        sequence: u64,
+        op_id: TaskId,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
+    },
+    WorkerCompleted {
+        sequence: u64,
+        op_id: TaskId,
+        action: String,
+        stop_reason: AgentStopReason,
+    },
+    WorkerFailed {
+        sequence: u64,
+        op_id: TaskId,
+        action: String,
+        detail: String,
+    },
+    TurnFinalDecision {
+        sequence: u64,
+        op_id: TaskId,
+        decision: AgentLoopDecision,
+        stop_reason: AgentStopReason,
+    },
+    ModelProgress {
+        sequence: u64,
+        op_id: TaskId,
+        event: AgentModelEvent,
+    },
+    ToolProgress {
+        sequence: u64,
+        op_id: TaskId,
+        event: AgentToolProgressEvent,
+    },
+    ControlEvent {
+        event: AgentEvent,
+    },
+}
+
+#[derive(Clone, Default)]
+pub struct AgentModelProgressSink {
+    callback: Option<Arc<dyn Fn(AgentModelEvent) + Send + Sync>>,
+}
+
+impl AgentModelProgressSink {
+    pub fn new(callback: impl Fn(AgentModelEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Some(Arc::new(callback)),
+        }
+    }
+
+    pub fn emit(&self, event: AgentModelEvent) {
+        if let Some(callback) = &self.callback {
+            callback(event);
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.callback.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentTaskTerminalResult {
     pub task: AgentTaskRef,
@@ -3180,6 +3363,7 @@ pub struct AgentSessionControlPlane {
     session: AgentSession,
     next_sequence: u64,
     active_turn: Option<AgentActiveTurn>,
+    active_turn_cancellation: Option<AgentCancellationToken>,
     tasks: Vec<AgentTaskSnapshot>,
     events: Vec<AgentEvent>,
 }
@@ -3190,6 +3374,7 @@ impl AgentSessionControlPlane {
             session,
             next_sequence: 0,
             active_turn: None,
+            active_turn_cancellation: None,
             tasks: Vec::new(),
             events: Vec::new(),
         }
@@ -3209,6 +3394,7 @@ impl AgentSessionControlPlane {
             session,
             next_sequence: snapshot.next_sequence,
             active_turn: snapshot.active_turn,
+            active_turn_cancellation: None,
             tasks: snapshot.tasks,
             events: Vec::new(),
         })
@@ -3354,6 +3540,7 @@ impl AgentSessionControlPlane {
         let action = op.action.kind().to_string();
         let is_turn = op.action.is_turn();
         let timeout_ms = op.timeout_ms;
+        let cancellation_token = is_turn.then(AgentCancellationToken::new);
         let mut events = vec![agent_session_event(
             &op_id,
             &self.session.session_id,
@@ -3407,6 +3594,7 @@ impl AgentSessionControlPlane {
                 timeout_ms,
                 task.as_ref().map(|task| task.task_id.clone()),
             ));
+            self.active_turn_cancellation = cancellation_token.clone();
             if let Some(task) = task.clone() {
                 let event = self.set_task_status(
                     &op_id,
@@ -3422,11 +3610,16 @@ impl AgentSessionControlPlane {
         }
 
         let started = std::time::Instant::now();
-        let outcome = agent.handle_op(&mut self.session, op)?;
+        let outcome = agent.handle_op_with_cancellation(
+            &mut self.session,
+            op,
+            cancellation_token.unwrap_or_else(AgentCancellationToken::new),
+        )?;
         events.extend(outcome.events.iter().cloned());
 
         if is_turn {
             self.active_turn = None;
+            self.active_turn_cancellation = None;
             if let Some(task) = task {
                 let timed_out = timeout_ms
                     .map(|timeout_ms| {
@@ -3510,6 +3703,10 @@ impl AgentSessionControlPlane {
         if elapsed_ms < timeout_ms {
             return None;
         }
+        if let Some(token) = &self.active_turn_cancellation {
+            token.cancel();
+        }
+        self.active_turn_cancellation = None;
         self.active_turn = None;
         let op_id = active_turn.op_id.clone();
         let reason = reason.into();
@@ -3559,6 +3756,13 @@ impl AgentSessionControlPlane {
         reason: String,
         mut events: Vec<AgentEvent>,
     ) -> AgentSessionControlResult {
+        if let Some(token) = &self.active_turn_cancellation {
+            token.cancel();
+        }
+        self.active_turn_cancellation = None;
+        if let Some(active_turn) = self.active_turn.as_mut() {
+            active_turn.cancel_requested = true;
+        }
         let Some(active_turn) = self.active_turn.take() else {
             events.push(agent_session_event(
                 op_id,
@@ -3648,6 +3852,488 @@ impl AgentSessionControlPlane {
     }
 }
 
+pub struct AgentSessionRuntime<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    agent: Arc<Agent<M>>,
+    state: Arc<Mutex<AgentSessionRuntimeState>>,
+}
+
+struct AgentSessionRuntimeState {
+    control: AgentSessionControlPlane,
+    runtime_events: Vec<AgentRuntimeEvent>,
+    completed_turns: Vec<AgentOpOutcome>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl<M> AgentSessionRuntime<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    pub fn new(agent: Agent<M>, session: AgentSession) -> Self {
+        Self::from_arc(Arc::new(agent), session)
+    }
+
+    pub fn from_arc(agent: Arc<Agent<M>>, session: AgentSession) -> Self {
+        Self {
+            agent,
+            state: Arc::new(Mutex::new(AgentSessionRuntimeState {
+                control: AgentSessionControlPlane::new(session),
+                runtime_events: Vec::new(),
+                completed_turns: Vec::new(),
+                worker: None,
+            })),
+        }
+    }
+
+    pub fn submit_op(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError> {
+        if op.action.is_turn() {
+            return self.submit_turn_op(op);
+        }
+        let mut state = self.lock_state()?;
+        let result = state.control.submit_op(self.agent.as_ref(), op)?;
+        state.append_control_runtime_events(&result.events);
+        Ok(result)
+    }
+
+    pub fn interrupt_active_turn(
+        &self,
+        reason: impl Into<String>,
+    ) -> Result<AgentSessionControlResult, AgentError> {
+        self.submit_op(AgentOp::cancel_active_turn(reason))
+    }
+
+    pub fn join_active_turn(&self) -> Result<(), AgentError> {
+        let worker = {
+            let mut state = self.lock_state()?;
+            state.worker.take()
+        };
+        if let Some(worker) = worker {
+            join_agent_session_worker(worker)?;
+        }
+        Ok(())
+    }
+
+    pub fn session_snapshot(&self) -> Result<AgentSession, AgentError> {
+        Ok(self.lock_state()?.control.session.clone())
+    }
+
+    pub fn control_snapshot(&self) -> Result<AgentSessionControlSnapshot, AgentError> {
+        Ok(self.lock_state()?.control.snapshot())
+    }
+
+    pub fn active_turn(&self) -> Result<Option<AgentActiveTurn>, AgentError> {
+        Ok(self.lock_state()?.control.active_turn.clone())
+    }
+
+    pub fn event_cursor(&self) -> Result<AgentSessionControlEventCursor, AgentError> {
+        Ok(self.lock_state()?.control.event_cursor())
+    }
+
+    pub fn runtime_event_cursor(&self) -> Result<AgentRuntimeEventCursor, AgentError> {
+        Ok(self.lock_state()?.runtime_event_cursor())
+    }
+
+    pub fn progress_since(
+        &self,
+        cursor: AgentSessionControlEventCursor,
+    ) -> Result<AgentSessionControlEventBatch, AgentError> {
+        Ok(self.lock_state()?.control.progress_since(cursor))
+    }
+
+    pub fn runtime_events_since(
+        &self,
+        cursor: AgentRuntimeEventCursor,
+    ) -> Result<AgentRuntimeEventBatch, AgentError> {
+        Ok(self.lock_state()?.runtime_events_since(cursor))
+    }
+
+    pub fn terminal_result(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Option<AgentTaskTerminalResult>, AgentError> {
+        Ok(self.lock_state()?.control.terminal_result(task_id))
+    }
+
+    pub fn turn_result(&self, op_id: &TaskId) -> Result<Option<AgentOpOutcome>, AgentError> {
+        Ok(self
+            .lock_state()?
+            .completed_turns
+            .iter()
+            .find(|outcome| &outcome.op_id == op_id)
+            .cloned())
+    }
+
+    fn submit_turn_op(&self, op: AgentOp) -> Result<AgentSessionControlResult, AgentError> {
+        self.reap_finished_worker()?;
+        let mut state = self.lock_state()?;
+        let sequence = state.control.next_sequence;
+        state.control.next_sequence = state.control.next_sequence.saturating_add(1);
+        let op_id = op.op_id.clone();
+        let action = op.action.kind().to_string();
+        let timeout_ms = op.timeout_ms;
+        let mut events = vec![agent_session_event(
+            &op_id,
+            &state.control.session.session_id,
+            AgentEventPayload::OperationQueued {
+                sequence,
+                action: action.clone(),
+                timeout_ms,
+            },
+        )];
+
+        if state.control.active_turn.is_some() {
+            events.push(agent_session_event(
+                &op_id,
+                &state.control.session.session_id,
+                AgentEventPayload::OperationRejected {
+                    sequence,
+                    action,
+                    reason: "session already has an active turn".to_string(),
+                },
+            ));
+            state.control.events.extend(events.iter().cloned());
+            state.append_control_runtime_events(&events);
+            return Ok(AgentSessionControlResult {
+                sequence,
+                accepted: false,
+                events,
+                outcome: None,
+                snapshot: state.control.snapshot(),
+            });
+        }
+
+        let task = self.agent.config.run_context.task.clone();
+        let cancellation_token = AgentCancellationToken::new();
+        state.control.active_turn = Some(AgentActiveTurn::new(
+            op_id.clone(),
+            sequence,
+            timeout_ms,
+            task.as_ref().map(|task| task.task_id.clone()),
+        ));
+        state.control.active_turn_cancellation = Some(cancellation_token.clone());
+        if let Some(task) = task.clone() {
+            let event = state.control.set_task_status(
+                &op_id,
+                task,
+                AgentTaskLifecycleStatus::Running,
+                Some("turn running".to_string()),
+                Some(op_id.clone()),
+                None,
+                Vec::new(),
+            );
+            events.push(event);
+        }
+        let session_for_turn = state.control.session.clone();
+        state.control.session.steering_queue.clear();
+        state.control.session.follow_up_queue.clear();
+        state.control.events.extend(events.iter().cloned());
+        state.append_control_runtime_events(&events);
+        state.push_runtime_event(AgentRuntimeEventPayload::WorkerStarted {
+            sequence,
+            op_id: op_id.clone(),
+            action: action.clone(),
+            timeout_ms,
+        });
+        let result = AgentSessionControlResult {
+            sequence,
+            accepted: true,
+            events,
+            outcome: None,
+            snapshot: state.control.snapshot(),
+        };
+
+        let worker_state = Arc::clone(&self.state);
+        let progress_state = Arc::clone(&self.state);
+        let model_progress_state = Arc::clone(&self.state);
+        let worker_agent = Arc::clone(&self.agent);
+        let worker_op_id = op_id.clone();
+        let progress_op_id = op_id.clone();
+        let model_progress_op_id = op_id.clone();
+        let worker_action = action;
+        let worker_task = task;
+        let worker_started = std::time::Instant::now();
+        let progress_sink = AgentToolProgressSink::new(move |event| {
+            if let Ok(mut state) = progress_state.lock() {
+                state.push_runtime_event(AgentRuntimeEventPayload::ToolProgress {
+                    sequence,
+                    op_id: progress_op_id.clone(),
+                    event,
+                });
+            }
+        });
+        let model_progress_sink = AgentModelProgressSink::new(move |event| {
+            if let Ok(mut state) = model_progress_state.lock() {
+                state.push_runtime_event(AgentRuntimeEventPayload::ModelProgress {
+                    sequence,
+                    op_id: model_progress_op_id.clone(),
+                    event,
+                });
+            }
+        });
+        let worker = thread::spawn(move || {
+            let mut completed_session = session_for_turn;
+            let outcome = worker_agent.handle_op_with_cancellation_and_progress(
+                &mut completed_session,
+                op,
+                cancellation_token,
+                progress_sink,
+                model_progress_sink,
+            );
+            let mut state = worker_state
+                .lock()
+                .expect("agent session runtime lock poisoned");
+            state.finish_turn(AgentSessionRuntimeTurnCompletion {
+                sequence,
+                op_id: worker_op_id,
+                action: worker_action,
+                task: worker_task,
+                timeout_ms,
+                started: worker_started,
+                completed_session,
+                outcome,
+            });
+        });
+        state.worker = Some(worker);
+        Ok(result)
+    }
+
+    fn reap_finished_worker(&self) -> Result<(), AgentError> {
+        let worker = {
+            let mut state = self.lock_state()?;
+            if state
+                .worker
+                .as_ref()
+                .is_some_and(|worker| worker.is_finished())
+            {
+                state.worker.take()
+            } else {
+                None
+            }
+        };
+        if let Some(worker) = worker {
+            join_agent_session_worker(worker)?;
+        }
+        Ok(())
+    }
+
+    fn lock_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, AgentSessionRuntimeState>, AgentError> {
+        self.state.lock().map_err(|_| AgentError::Runtime {
+            detail: "agent session runtime lock poisoned".to_string(),
+        })
+    }
+}
+
+struct AgentSessionRuntimeTurnCompletion {
+    sequence: u64,
+    op_id: TaskId,
+    action: String,
+    task: Option<AgentTaskRef>,
+    timeout_ms: Option<u64>,
+    started: std::time::Instant,
+    completed_session: AgentSession,
+    outcome: Result<AgentOpOutcome, AgentError>,
+}
+
+impl AgentSessionRuntimeState {
+    fn runtime_event_cursor(&self) -> AgentRuntimeEventCursor {
+        AgentRuntimeEventCursor {
+            offset: self.runtime_events.len(),
+            last_event_id: self
+                .runtime_events
+                .last()
+                .map(|event| event.event_id.clone()),
+        }
+    }
+
+    fn runtime_events_since(&self, cursor: AgentRuntimeEventCursor) -> AgentRuntimeEventBatch {
+        let start = cursor.offset.min(self.runtime_events.len());
+        let events = self.runtime_events[start..].to_vec();
+        AgentRuntimeEventBatch {
+            cursor,
+            next_cursor: self.runtime_event_cursor(),
+            events,
+        }
+    }
+
+    fn push_runtime_event(&mut self, payload: AgentRuntimeEventPayload) {
+        self.runtime_events.push(AgentRuntimeEvent::new(
+            self.control.session.session_id.clone(),
+            payload,
+        ));
+    }
+
+    fn append_control_runtime_events(&mut self, events: &[AgentEvent]) {
+        self.runtime_events
+            .extend(events.iter().cloned().map(|event| {
+                AgentRuntimeEvent::new(
+                    event.session_id.clone(),
+                    AgentRuntimeEventPayload::ControlEvent { event },
+                )
+            }));
+    }
+
+    fn finish_turn(&mut self, completion: AgentSessionRuntimeTurnCompletion) {
+        self.control.active_turn = None;
+        self.control.active_turn_cancellation = None;
+        let mut events = Vec::new();
+        match completion.outcome {
+            Ok(outcome) => {
+                self.replace_session_preserving_live_inputs(completion.completed_session);
+                events.extend(outcome.events.iter().cloned());
+                let stop_reason = outcome
+                    .run
+                    .as_ref()
+                    .map(|run| run.stop_reason.clone())
+                    .unwrap_or(AgentStopReason::Aborted);
+                if let Some(run) = &outcome.run {
+                    self.push_runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+                        sequence: completion.sequence,
+                        op_id: completion.op_id.clone(),
+                        decision: run.final_decision.clone(),
+                        stop_reason: stop_reason.clone(),
+                    });
+                }
+                if let Some(task) = completion.task {
+                    self.append_terminal_task_status(
+                        &mut events,
+                        &completion.op_id,
+                        completion.sequence,
+                        completion.timeout_ms,
+                        completion.started,
+                        task,
+                        &outcome,
+                    );
+                }
+                self.completed_turns.push(outcome.clone());
+                self.push_runtime_event(AgentRuntimeEventPayload::WorkerCompleted {
+                    sequence: completion.sequence,
+                    op_id: completion.op_id.clone(),
+                    action: completion.action.clone(),
+                    stop_reason,
+                });
+            }
+            Err(error) => {
+                let detail = error.to_string();
+                events.push(agent_session_event(
+                    &completion.op_id,
+                    &self.control.session.session_id,
+                    AgentEventPayload::OperationRejected {
+                        sequence: completion.sequence,
+                        action: completion.action.clone(),
+                        reason: format!("turn execution failed: {detail}"),
+                    },
+                ));
+                if let Some(task) = completion.task {
+                    events.push(self.control.set_task_status(
+                        &completion.op_id,
+                        task,
+                        AgentTaskLifecycleStatus::Failed,
+                        Some(detail.clone()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ));
+                }
+                self.push_runtime_event(AgentRuntimeEventPayload::WorkerFailed {
+                    sequence: completion.sequence,
+                    op_id: completion.op_id.clone(),
+                    action: completion.action.clone(),
+                    detail,
+                });
+            }
+        }
+        self.control.events.extend(events.iter().cloned());
+        self.append_control_runtime_events(&events);
+    }
+
+    fn replace_session_preserving_live_inputs(&mut self, mut completed_session: AgentSession) {
+        let live_session = &mut self.control.session;
+        let queued_steering = std::mem::take(&mut live_session.steering_queue);
+        let queued_follow_ups = std::mem::take(&mut live_session.follow_up_queue);
+        let live_abort = live_session.abort.clone();
+        completed_session.steering_queue = queued_steering;
+        completed_session.follow_up_queue = queued_follow_ups;
+        if live_abort.is_some() {
+            completed_session.abort = live_abort;
+        }
+        self.control.session = completed_session;
+    }
+
+    fn append_terminal_task_status(
+        &mut self,
+        events: &mut Vec<AgentEvent>,
+        op_id: &TaskId,
+        sequence: u64,
+        timeout_ms: Option<u64>,
+        started: std::time::Instant,
+        task: AgentTaskRef,
+        outcome: &AgentOpOutcome,
+    ) {
+        let timed_out = timeout_ms
+            .map(|timeout_ms| started.elapsed() >= std::time::Duration::from_millis(timeout_ms))
+            .unwrap_or(false);
+        if timed_out && let Some(timeout_ms) = timeout_ms {
+            events.push(agent_session_event(
+                op_id,
+                &self.control.session.session_id,
+                AgentEventPayload::TurnTimedOut {
+                    sequence,
+                    active_op_id: op_id.clone(),
+                    timeout_ms,
+                    reason: "turn exceeded configured timeout".to_string(),
+                },
+            ));
+        }
+        let status = if timed_out {
+            AgentTaskLifecycleStatus::TimedOut
+        } else {
+            task_status_for_run(&outcome.run)
+        };
+        let progress_summary = outcome.run.as_ref().map(|run| {
+            format!(
+                "turn completed with {:?} after {} model turn(s) and {} tool result(s)",
+                run.stop_reason,
+                run.model_turns.len(),
+                run.tool_results.len()
+            )
+        });
+        let result_ref = outcome
+            .run
+            .as_ref()
+            .and_then(|run| run.candidate_evidence_bundle.as_ref())
+            .map(|bundle| bundle.bundle_id.as_str().to_string());
+        let event_ids = outcome
+            .run
+            .as_ref()
+            .map(|run| {
+                run.events
+                    .iter()
+                    .map(|event| event.event_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        events.push(self.control.set_task_status(
+            op_id,
+            task,
+            status,
+            progress_summary,
+            None,
+            result_ref,
+            event_ids,
+        ));
+    }
+}
+
+fn join_agent_session_worker(worker: thread::JoinHandle<()>) -> Result<(), AgentError> {
+    worker.join().map_err(|_| AgentError::Runtime {
+        detail: "agent session runtime worker panicked".to_string(),
+    })
+}
+
 impl AgentTaskTerminalResult {
     fn from_snapshot(snapshot: &AgentTaskSnapshot) -> Option<Self> {
         if !is_terminal_task_status(&snapshot.status) {
@@ -3725,7 +4411,9 @@ pub enum AgentSessionControlRestoreError {
 
 fn task_status_for_run(run: &Option<AgentRun>) -> AgentTaskLifecycleStatus {
     match run.as_ref().map(|run| &run.stop_reason) {
-        Some(AgentStopReason::Aborted) => AgentTaskLifecycleStatus::Cancelled,
+        Some(AgentStopReason::Aborted | AgentStopReason::Cancelled) => {
+            AgentTaskLifecycleStatus::Cancelled
+        }
         Some(AgentStopReason::MaxStepsReached) => AgentTaskLifecycleStatus::Failed,
         Some(
             AgentStopReason::FinalDecision
@@ -4038,6 +4726,50 @@ impl<'a> AgentToolOrchestrator<'a> {
         call_index: usize,
         call: &AgentToolCall,
     ) -> AgentToolOutcome {
+        self.execute_with_cancellation(
+            registry,
+            session,
+            tool_plan,
+            step_index,
+            call_index,
+            call,
+            AgentCancellationToken::new(),
+        )
+    }
+
+    pub fn execute_with_cancellation(
+        &self,
+        registry: &AgentToolRegistry,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        cancellation_token: AgentCancellationToken,
+    ) -> AgentToolOutcome {
+        self.execute_with_cancellation_and_progress(
+            registry,
+            session,
+            tool_plan,
+            step_index,
+            call_index,
+            call,
+            cancellation_token,
+            AgentToolProgressSink::default(),
+        )
+    }
+
+    pub fn execute_with_cancellation_and_progress(
+        &self,
+        registry: &AgentToolRegistry,
+        session: &InteractionSession,
+        tool_plan: &AgentToolPlan,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+    ) -> AgentToolOutcome {
         let descriptor = tool_plan.descriptor(&call.tool);
         let descriptor_visible = tool_plan.is_model_visible(&call.tool);
         let executor_available = tool_plan.is_executable(&call.tool);
@@ -4149,13 +4881,27 @@ impl<'a> AgentToolOrchestrator<'a> {
         } else if is_tool_disclosure_bridge_name(&call.tool) {
             (
                 self.execute_tool_disclosure_bridge(
-                    registry, session, tool_plan, step_index, call_index, call,
+                    registry,
+                    session,
+                    tool_plan,
+                    step_index,
+                    call_index,
+                    call,
+                    cancellation_token.clone(),
+                    progress_sink.clone(),
                 ),
                 None,
             )
         } else {
             (
-                registry.execute(session, step_index, call_index, call),
+                registry.execute_with_cancellation_and_progress(
+                    session,
+                    step_index,
+                    call_index,
+                    call,
+                    cancellation_token,
+                    progress_sink,
+                ),
                 None,
             )
         };
@@ -4186,6 +4932,8 @@ impl<'a> AgentToolOrchestrator<'a> {
         step_index: usize,
         call_index: usize,
         call: &AgentToolCall,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
     ) -> AgentToolOutcome {
         match call.tool.as_str() {
             "tool_search" => {
@@ -4195,7 +4943,14 @@ impl<'a> AgentToolOrchestrator<'a> {
                 self.execute_tool_describe(session, tool_plan, step_index, call_index, call)
             }
             "tool_call" => self.execute_tool_call_bridge(
-                registry, session, tool_plan, step_index, call_index, call,
+                registry,
+                session,
+                tool_plan,
+                step_index,
+                call_index,
+                call,
+                cancellation_token,
+                progress_sink,
             ),
             _ => unreachable!("tool disclosure bridge names are matched by caller"),
         }
@@ -4331,6 +5086,8 @@ impl<'a> AgentToolOrchestrator<'a> {
         step_index: usize,
         call_index: usize,
         call: &AgentToolCall,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
     ) -> AgentToolOutcome {
         let Some(target_tool) = json_input_string(call, "tool") else {
             return bridge_failed_outcome(
@@ -4420,7 +5177,14 @@ impl<'a> AgentToolOrchestrator<'a> {
                 }),
             );
         }
-        let target_outcome = registry.execute(session, step_index, call_index, &target_call);
+        let target_outcome = registry.execute_with_cancellation_and_progress(
+            session,
+            step_index,
+            call_index,
+            &target_call,
+            cancellation_token,
+            progress_sink,
+        );
         let target_record = AgentToolOrchestrationRecord {
             policy_id: self.policy.policy_id.clone(),
             policy_allowed: target_policy.allowed,
@@ -4528,6 +5292,32 @@ fn bridge_blocked_outcome(
         output: output.clone(),
         event_id: None,
         evidence: AgentToolEvidence::policy_only(false, summary).with_output_value(&output, false),
+    }
+}
+
+fn cancelled_tool_outcome(
+    step_index: usize,
+    call_index: usize,
+    call: &AgentToolCall,
+    reason: impl Into<String>,
+) -> AgentToolOutcome {
+    let reason = reason.into();
+    let output = serde_json::json!({
+        "error": "tool_cancelled",
+        "tool": call.tool.clone(),
+        "reason": reason,
+    });
+    AgentToolOutcome {
+        call_id: TaskId::generate(),
+        step_index,
+        call_index,
+        call: call.clone(),
+        status: AgentToolStatus::Cancelled,
+        summary: format!("tool `{}` cancelled", call.tool),
+        output: output.clone(),
+        event_id: None,
+        evidence: AgentToolEvidence::policy_only(false, "turn cancellation requested")
+            .with_output_value(&output, false),
     }
 }
 
@@ -4691,6 +5481,32 @@ impl<M: InteractionModel> Agent<M> {
         session: &mut AgentSession,
         op: AgentOp,
     ) -> Result<AgentOpOutcome, AgentError> {
+        self.handle_op_with_cancellation(session, op, AgentCancellationToken::new())
+    }
+
+    pub fn handle_op_with_cancellation(
+        &self,
+        session: &mut AgentSession,
+        op: AgentOp,
+        cancellation_token: AgentCancellationToken,
+    ) -> Result<AgentOpOutcome, AgentError> {
+        self.handle_op_with_cancellation_and_progress(
+            session,
+            op,
+            cancellation_token,
+            AgentToolProgressSink::default(),
+            AgentModelProgressSink::default(),
+        )
+    }
+
+    pub fn handle_op_with_cancellation_and_progress(
+        &self,
+        session: &mut AgentSession,
+        op: AgentOp,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+    ) -> Result<AgentOpOutcome, AgentError> {
         let op_id = op.op_id;
         let session_id = session.session_id.clone();
         let mut events = Vec::new();
@@ -4711,7 +5527,13 @@ impl<M: InteractionModel> Agent<M> {
                         run_context: self.config.run_context.clone(),
                     },
                 ));
-                let completed_run = self.start_turn(session, &input)?;
+                let completed_run = self.start_turn_with_cancellation_and_progress(
+                    session,
+                    &input,
+                    cancellation_token.clone(),
+                    progress_sink.clone(),
+                    model_progress_sink.clone(),
+                )?;
                 events.push(turn_completed_agent_event(
                     &op_id,
                     &session_id,
@@ -4733,7 +5555,13 @@ impl<M: InteractionModel> Agent<M> {
                         run_context: self.config.run_context.clone(),
                     },
                 ));
-                let completed_run = self.continue_turn(session, &input)?;
+                let completed_run = self.continue_turn_with_cancellation_and_progress(
+                    session,
+                    &input,
+                    cancellation_token.clone(),
+                    progress_sink.clone(),
+                    model_progress_sink.clone(),
+                )?;
                 events.push(turn_completed_agent_event(
                     &op_id,
                     &session_id,
@@ -4862,6 +5690,32 @@ impl<M: InteractionModel> Agent<M> {
         session: &mut AgentSession,
         input: &AgentLoopInput,
     ) -> Result<AgentRun, AgentError> {
+        self.start_turn_with_cancellation(session, input, AgentCancellationToken::new())
+    }
+
+    pub fn start_turn_with_cancellation(
+        &self,
+        session: &mut AgentSession,
+        input: &AgentLoopInput,
+        cancellation_token: AgentCancellationToken,
+    ) -> Result<AgentRun, AgentError> {
+        self.start_turn_with_cancellation_and_progress(
+            session,
+            input,
+            cancellation_token,
+            AgentToolProgressSink::default(),
+            AgentModelProgressSink::default(),
+        )
+    }
+
+    pub fn start_turn_with_cancellation_and_progress(
+        &self,
+        session: &mut AgentSession,
+        input: &AgentLoopInput,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+    ) -> Result<AgentRun, AgentError> {
         if session.is_aborted() {
             return Ok(AgentRun {
                 final_decision: AgentLoopDecision::silent(),
@@ -4903,12 +5757,15 @@ impl<M: InteractionModel> Agent<M> {
                 run_context: self.config.run_context.clone(),
             },
         )?;
-        let run = self.run_with_session_context(
+        let run = self.run_with_session_context_and_cancellation(
             input,
             transcript_prefix,
             session_projection,
             &steering,
             &follow_ups,
+            cancellation_token,
+            progress_sink,
+            model_progress_sink,
         )?;
         session.steering_queue.clear();
         session.follow_up_queue.clear();
@@ -4934,7 +5791,33 @@ impl<M: InteractionModel> Agent<M> {
         session: &mut AgentSession,
         input: &AgentLoopInput,
     ) -> Result<AgentRun, AgentError> {
-        self.start_turn(session, input)
+        self.continue_turn_with_cancellation(session, input, AgentCancellationToken::new())
+    }
+
+    pub fn continue_turn_with_cancellation(
+        &self,
+        session: &mut AgentSession,
+        input: &AgentLoopInput,
+        cancellation_token: AgentCancellationToken,
+    ) -> Result<AgentRun, AgentError> {
+        self.start_turn_with_cancellation(session, input, cancellation_token)
+    }
+
+    pub fn continue_turn_with_cancellation_and_progress(
+        &self,
+        session: &mut AgentSession,
+        input: &AgentLoopInput,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
+    ) -> Result<AgentRun, AgentError> {
+        self.start_turn_with_cancellation_and_progress(
+            session,
+            input,
+            cancellation_token,
+            progress_sink,
+            model_progress_sink,
+        )
     }
 
     pub fn steer(
@@ -5039,9 +5922,32 @@ impl<M: InteractionModel> Agent<M> {
         &self,
         input: &AgentLoopInput,
         transcript_prefix: Vec<AgentTranscriptItem>,
+        session_projection: Option<AgentSessionProjection>,
+        steering: &[AgentSteeringMessage],
+        follow_ups: &[AgentFollowUpMessage],
+    ) -> Result<AgentRun, AgentError> {
+        self.run_with_session_context_and_cancellation(
+            input,
+            transcript_prefix,
+            session_projection,
+            steering,
+            follow_ups,
+            AgentCancellationToken::new(),
+            AgentToolProgressSink::default(),
+            AgentModelProgressSink::default(),
+        )
+    }
+
+    fn run_with_session_context_and_cancellation(
+        &self,
+        input: &AgentLoopInput,
+        transcript_prefix: Vec<AgentTranscriptItem>,
         mut session_projection: Option<AgentSessionProjection>,
         steering: &[AgentSteeringMessage],
         follow_ups: &[AgentFollowUpMessage],
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+        model_progress_sink: AgentModelProgressSink,
     ) -> Result<AgentRun, AgentError> {
         if let Some(update) = &input.async_update
             && !update.needs_user_attention
@@ -5179,7 +6085,16 @@ impl<M: InteractionModel> Agent<M> {
         let mut step_index = 0usize;
         let mut latest_coding_state: Option<CodingRunState> = None;
 
-        loop {
+        'turn_loop: loop {
+            if cancellation_token.is_cancelled() {
+                stop_reason = AgentStopReason::Cancelled;
+                let event = AgentModelEvent::Aborted {
+                    reason: "turn cancellation requested".to_string(),
+                };
+                model_progress_sink.emit(event.clone());
+                model_events.push(event);
+                break;
+            }
             if self
                 .config
                 .max_steps
@@ -5317,11 +6232,41 @@ impl<M: InteractionModel> Agent<M> {
             let (request, response, decision, step_model_events) = loop {
                 let sampled_request = request.clone();
                 let mut language_model_stream_events = Vec::new();
-                let response =
-                    self.model
-                        .complete_streaming_events(&sampled_request, &mut |event| {
-                            language_model_stream_events.push(event);
-                        })?;
+                let response = match self.model.complete_streaming_events_with_cancellation(
+                    &sampled_request,
+                    &cancellation_token,
+                    &mut |event| {
+                        if let Some(model_event) = AgentModelEvent::from_stream_event(
+                            step_index,
+                            &sampled_request.provider,
+                            &sampled_request.model,
+                            &event,
+                        ) {
+                            model_progress_sink.emit(model_event);
+                        }
+                        language_model_stream_events.push(event);
+                    },
+                ) {
+                    Ok(response) => response,
+                    Err(error) if cancellation_token.is_cancelled() => {
+                        stop_reason = AgentStopReason::Cancelled;
+                        let event = AgentModelEvent::Aborted {
+                            reason: format!(
+                                "turn cancellation requested during model response: {error}"
+                            ),
+                        };
+                        self.trace(
+                            &input.session.session_id,
+                            AgentTraceRecordKind::ModelEvent {
+                                event: event.clone(),
+                            },
+                        )?;
+                        model_progress_sink.emit(event.clone());
+                        model_events.push(event);
+                        break 'turn_loop;
+                    }
+                    Err(error) => return Err(AgentError::Model(error)),
+                };
                 let assistant_item = AgentItem::AssistantText {
                     item_id: TaskId::generate(),
                     step_index,
@@ -5399,6 +6344,15 @@ impl<M: InteractionModel> Agent<M> {
                     }
                 }
             };
+            if cancellation_token.is_cancelled() {
+                stop_reason = AgentStopReason::Cancelled;
+                let event = AgentModelEvent::Aborted {
+                    reason: "turn cancellation requested after model response".to_string(),
+                };
+                model_progress_sink.emit(event.clone());
+                model_events.push(event);
+                break;
+            }
             transcript.push(AgentTranscriptItem::assistant(
                 step_index,
                 response.content.clone(),
@@ -5484,14 +6438,25 @@ impl<M: InteractionModel> Agent<M> {
                     },
                 )?;
                 items.push(tool_call_item);
-                let mut outcome = tool_orchestrator.execute(
-                    &self.tools,
-                    &input.session,
-                    &tool_plan,
-                    step_index,
-                    call_index,
-                    call,
-                );
+                let mut outcome = if cancellation_token.is_cancelled() {
+                    cancelled_tool_outcome(
+                        step_index,
+                        call_index,
+                        call,
+                        "turn cancellation requested before tool execution",
+                    )
+                } else {
+                    tool_orchestrator.execute_with_cancellation_and_progress(
+                        &self.tools,
+                        &input.session,
+                        &tool_plan,
+                        step_index,
+                        call_index,
+                        call,
+                        cancellation_token.clone(),
+                        progress_sink.clone(),
+                    )
+                };
                 let event = caused_by_latest_event(
                     agent_event(
                         &input.session,
@@ -5558,6 +6523,9 @@ impl<M: InteractionModel> Agent<M> {
                     items.push(verification_item);
                 }
                 step_results.push(outcome.clone());
+                if outcome.status == AgentToolStatus::Cancelled {
+                    stop_reason = AgentStopReason::Cancelled;
+                }
                 tool_results.push(outcome);
             }
             let tool_message_id = step_results
@@ -5614,6 +6582,9 @@ impl<M: InteractionModel> Agent<M> {
                     break;
                 }
                 latest_coding_state = Some(coding_state);
+            }
+            if stop_reason == AgentStopReason::Cancelled {
+                break;
             }
             step_index = step_index.saturating_add(1);
         }
@@ -6964,6 +7935,62 @@ mod tests {
                 items: Vec::new(),
                 tool_calls: Vec::new(),
                 usage: None,
+            })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CancellationAwareModel {
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl CancellationAwareModel {
+        fn started(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+            self.started.clone()
+        }
+    }
+
+    impl InteractionModel for CancellationAwareModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            Ok(LanguageModelResponse {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                content: r#"{
+                    "response_mode": "answer",
+                    "text": "not cancelled",
+                    "tool_calls": [],
+                    "background_handoff": null,
+                    "next_state": "listening"
+                }"#
+                .to_string(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: None,
+            })
+        }
+
+        fn complete_streaming_events_with_cancellation(
+            &self,
+            request: &LanguageModelRequest,
+            cancellation_token: &AgentCancellationToken,
+            on_event: &mut dyn FnMut(LanguageModelStreamEvent),
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            on_event(LanguageModelStreamEvent::Started {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+            });
+            while !cancellation_token.is_cancelled() {
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(LanguageModelError::ProviderInvocationFailed {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                detail: "cancelled by test token".to_string(),
             })
         }
     }
@@ -8837,10 +9864,6 @@ mod tests {
             "changed_files",
             "git_diff",
             "run_command",
-            "start_command_session",
-            "inspect_command_session",
-            "write_command_stdin",
-            "cancel_command_session",
             "request_user_input",
         ] {
             assert!(names.contains(&expected), "{expected}");
@@ -8890,10 +9913,6 @@ mod tests {
             .collect();
 
         assert!(!visible_tools.contains(&"run_command"));
-        assert!(!visible_tools.contains(&"start_command_session"));
-        assert!(!visible_tools.contains(&"inspect_command_session"));
-        assert!(!visible_tools.contains(&"write_command_stdin"));
-        assert!(!visible_tools.contains(&"cancel_command_session"));
         assert!(
             context
                 .report
@@ -9734,358 +10753,6 @@ mod tests {
             Some("file_writes_disabled")
         );
         assert!(!outcome.evidence.policy.allowed);
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn local_workspace_command_session_streams_stdin_and_incremental_output() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-command-session-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
-        );
-        let input = agent_input("command session");
-        let start = registry.execute(
-            &input.session,
-            0,
-            0,
-            &AgentToolCall {
-                tool: "start_command_session".to_string(),
-                input: serde_json::json!({
-                    "command": "read line; echo got:$line; sleep 0.05; echo done",
-                    "timeout_ms": 5_000
-                }),
-                r#async: true,
-                summary: "start interactive command".to_string(),
-            },
-        );
-        assert_eq!(start.status, AgentToolStatus::Succeeded);
-        let session_id = start
-            .output
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("session id")
-            .to_string();
-
-        let write = registry.execute(
-            &input.session,
-            0,
-            1,
-            &AgentToolCall {
-                tool: "write_command_stdin".to_string(),
-                input: serde_json::json!({
-                    "session_id": session_id,
-                    "input": "hello\n",
-                    "close": true
-                }),
-                r#async: false,
-                summary: "write stdin".to_string(),
-            },
-        );
-        assert_eq!(write.status, AgentToolStatus::Succeeded);
-
-        let mut stdout_offset = 0usize;
-        let mut stderr_offset = 0usize;
-        let mut stdout = String::new();
-        let mut final_status = String::new();
-        for _ in 0..50 {
-            let inspect = registry.execute(
-                &input.session,
-                0,
-                2,
-                &AgentToolCall {
-                    tool: "inspect_command_session".to_string(),
-                    input: serde_json::json!({
-                        "session_id": session_id,
-                        "stdout_offset": stdout_offset,
-                        "stderr_offset": stderr_offset
-                    }),
-                    r#async: false,
-                    summary: "inspect output".to_string(),
-                },
-            );
-            assert_eq!(inspect.status, AgentToolStatus::Succeeded);
-            stdout.push_str(
-                inspect
-                    .output
-                    .get("stdout")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            );
-            stdout_offset = inspect
-                .output
-                .get("stdout_offset")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .expect("stdout offset");
-            stderr_offset = inspect
-                .output
-                .get("stderr_offset")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .expect("stderr offset");
-            final_status = inspect
-                .output
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if final_status != "running" {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-
-        assert_eq!(final_status, "completed");
-        assert!(stdout.contains("got:hello"));
-        assert!(stdout.contains("done"));
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn local_workspace_command_session_truncated_offsets_can_be_paged() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-command-session-paging-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
-        let mut config = LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true);
-        config.max_command_output_bytes = 4;
-        let registry = AgentToolRegistry::local_workspace_with_config(config);
-        let input = agent_input("command paging");
-        let start = registry.execute(
-            &input.session,
-            0,
-            0,
-            &AgentToolCall {
-                tool: "start_command_session".to_string(),
-                input: serde_json::json!({
-                    "command": "printf abcdefgh",
-                    "timeout_ms": 5_000
-                }),
-                r#async: true,
-                summary: "start output command".to_string(),
-            },
-        );
-        let session_id = start
-            .output
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("session id")
-            .to_string();
-
-        let mut first_page = None;
-        for _ in 0..50 {
-            let inspect = registry.execute(
-                &input.session,
-                0,
-                1,
-                &AgentToolCall {
-                    tool: "inspect_command_session".to_string(),
-                    input: serde_json::json!({ "session_id": session_id }),
-                    r#async: false,
-                    summary: "inspect first page".to_string(),
-                },
-            );
-            if inspect
-                .output
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                != Some("running")
-                && inspect
-                    .output
-                    .get("stdout_total_bytes")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or_default()
-                    >= 8
-            {
-                first_page = Some(inspect);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        let first_page = first_page.expect("first page");
-        assert_eq!(
-            first_page
-                .output
-                .get("stdout")
-                .and_then(serde_json::Value::as_str),
-            Some("abcd")
-        );
-        assert_eq!(
-            first_page
-                .output
-                .get("stdout_offset")
-                .and_then(serde_json::Value::as_u64),
-            Some(4)
-        );
-        assert_eq!(
-            first_page
-                .output
-                .get("stdout_truncated")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-
-        let second_page = registry.execute(
-            &input.session,
-            0,
-            2,
-            &AgentToolCall {
-                tool: "inspect_command_session".to_string(),
-                input: serde_json::json!({
-                    "session_id": session_id,
-                    "stdout_offset": 4
-                }),
-                r#async: false,
-                summary: "inspect second page".to_string(),
-            },
-        );
-        assert_eq!(
-            second_page
-                .output
-                .get("stdout")
-                .and_then(serde_json::Value::as_str),
-            Some("efgh")
-        );
-        assert_eq!(
-            second_page
-                .output
-                .get("stdout_offset")
-                .and_then(serde_json::Value::as_u64),
-            Some(8)
-        );
-        assert_eq!(
-            second_page
-                .output
-                .get("stdout_truncated")
-                .and_then(serde_json::Value::as_bool),
-            Some(false)
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn local_workspace_command_session_supports_timeout_and_cancellation() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-command-control-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
-        );
-        let input = agent_input("command control");
-
-        let timeout_start = registry.execute(
-            &input.session,
-            0,
-            0,
-            &AgentToolCall {
-                tool: "start_command_session".to_string(),
-                input: serde_json::json!({
-                    "command": "sleep 1",
-                    "timeout_ms": 40
-                }),
-                r#async: true,
-                summary: "start timeout command".to_string(),
-            },
-        );
-        let timeout_session_id = timeout_start
-            .output
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("timeout session id")
-            .to_string();
-        let mut timed_out = false;
-        for _ in 0..50 {
-            let inspect = registry.execute(
-                &input.session,
-                0,
-                1,
-                &AgentToolCall {
-                    tool: "inspect_command_session".to_string(),
-                    input: serde_json::json!({ "session_id": timeout_session_id }),
-                    r#async: false,
-                    summary: "inspect timeout".to_string(),
-                },
-            );
-            timed_out = inspect
-                .output
-                .get("timed_out")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if timed_out {
-                assert_eq!(
-                    inspect
-                        .output
-                        .get("status")
-                        .and_then(serde_json::Value::as_str),
-                    Some("failed")
-                );
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(timed_out);
-
-        let cancel_start = registry.execute(
-            &input.session,
-            0,
-            2,
-            &AgentToolCall {
-                tool: "start_command_session".to_string(),
-                input: serde_json::json!({ "command": "sleep 5" }),
-                r#async: true,
-                summary: "start cancellable command".to_string(),
-            },
-        );
-        let cancel_session_id = cancel_start
-            .output
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .expect("cancel session id")
-            .to_string();
-        let cancel = registry.execute(
-            &input.session,
-            0,
-            3,
-            &AgentToolCall {
-                tool: "cancel_command_session".to_string(),
-                input: serde_json::json!({ "session_id": cancel_session_id }),
-                r#async: false,
-                summary: "cancel command".to_string(),
-            },
-        );
-        assert_eq!(cancel.status, AgentToolStatus::Succeeded);
-        let inspect = registry.execute(
-            &input.session,
-            0,
-            4,
-            &AgentToolCall {
-                tool: "inspect_command_session".to_string(),
-                input: serde_json::json!({ "session_id": cancel_session_id }),
-                r#async: false,
-                summary: "inspect cancelled command".to_string(),
-            },
-        );
-        assert_eq!(
-            inspect
-                .output
-                .get("status")
-                .and_then(serde_json::Value::as_str),
-            Some("cancelled")
-        );
-        assert_eq!(
-            inspect
-                .output
-                .get("cancel_requested")
-                .and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
     }
 
     #[test]
@@ -11460,6 +12127,189 @@ old
         assert_eq!(
             control.snapshot().tasks[0].status,
             AgentTaskLifecycleStatus::TimedOut
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn agent_session_runtime_interrupts_active_command_turn() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-runtime-cancel-{}",
+            TaskId::generate()
+        ));
+        fs::create_dir_all(&root).expect("workspace");
+        let task = AgentTaskRef::new("coding", "runtime cancellable command")
+            .with_owner_role(AgentRole::Deliberation);
+        let marker = root.join("started.txt");
+        let command_turn = serde_json::json!({
+            "response_mode": "defer",
+            "text": "I will run a long command.",
+            "tool_calls": [{
+                "tool": "run_command",
+                "input": {"command": "printf started > started.txt; sleep 5"},
+                "async": false,
+                "summary": "Run a long command."
+            }],
+            "background_handoff": null,
+            "next_state": "waiting"
+        })
+        .to_string();
+        let model = SequencedModel::new([command_turn]);
+        let agent_config = AgentConfig::new("fake", "fake")
+            .with_task_ref(task.clone())
+            .with_max_steps(4);
+        let workspace_config = LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true);
+        let agent = Agent::new(model, "fake", "fake")
+            .with_config(agent_config)
+            .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+                workspace_config,
+            ));
+        let input = agent_input("run a cancellable command");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let runtime = AgentSessionRuntime::new(agent, session);
+        let cursor = runtime.event_cursor().expect("cursor");
+        let runtime_cursor = runtime.runtime_event_cursor().expect("runtime cursor");
+
+        let queued = runtime
+            .submit_op(AgentOp::start_turn(input))
+            .expect("submit turn");
+        assert!(queued.accepted);
+        assert!(queued.outcome.is_none());
+        assert!(runtime.active_turn().expect("active turn").is_some());
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(marker.exists());
+
+        let cancelled = runtime
+            .interrupt_active_turn("user stopped command")
+            .expect("cancel turn");
+        assert!(cancelled.accepted);
+        runtime.join_active_turn().expect("join runtime worker");
+
+        let progress = runtime.progress_since(cursor).expect("progress");
+        let runtime_events = runtime
+            .runtime_events_since(runtime_cursor)
+            .expect("runtime events");
+        assert!(runtime_events.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentRuntimeEventPayload::WorkerStarted { action, .. }
+                    if action == "start_turn"
+            )
+        }));
+        assert!(runtime_events.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentRuntimeEventPayload::WorkerCompleted {
+                    stop_reason: AgentStopReason::Cancelled,
+                    ..
+                }
+            )
+        }));
+        assert!(progress.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::TurnCompleted {
+                    stop_reason: AgentStopReason::Cancelled,
+                    ..
+                }
+            )
+        }));
+        assert!(progress.task_updates.iter().any(|snapshot| {
+            snapshot.task.task_id == task.task_id
+                && snapshot.status == AgentTaskLifecycleStatus::Cancelled
+        }));
+        assert_eq!(
+            runtime
+                .terminal_result(&task.task_id)
+                .expect("terminal result lookup")
+                .expect("terminal result")
+                .status,
+            AgentTaskLifecycleStatus::Cancelled
+        );
+        let session = runtime.session_snapshot().expect("session snapshot");
+        assert!(session.raw_transcript.items.iter().any(|item| {
+            matches!(
+                item,
+                AgentItem::ToolResult {
+                    status: AgentToolStatus::Cancelled,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn agent_session_runtime_interrupts_active_model_turn() {
+        let task = AgentTaskRef::new("coding", "runtime cancellable model")
+            .with_owner_role(AgentRole::Deliberation);
+        let model = CancellationAwareModel::default();
+        let started = model.started();
+        let agent_config = AgentConfig::new("fake", "fake").with_task_ref(task.clone());
+        let agent = Agent::new(model, "fake", "fake").with_config(agent_config);
+        let input = agent_input("run a cancellable model turn");
+        let session = AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation);
+        let runtime = AgentSessionRuntime::new(agent, session);
+        let cursor = runtime.event_cursor().expect("cursor");
+        let runtime_cursor = runtime.runtime_event_cursor().expect("runtime cursor");
+
+        let queued = runtime
+            .submit_op(AgentOp::start_turn(input))
+            .expect("submit turn");
+        assert!(queued.accepted);
+        for _ in 0..100 {
+            if started.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started.load(std::sync::atomic::Ordering::SeqCst));
+
+        let cancelled = runtime
+            .interrupt_active_turn("user stopped model")
+            .expect("cancel turn");
+        assert!(cancelled.accepted);
+        runtime.join_active_turn().expect("join runtime worker");
+
+        let progress = runtime.progress_since(cursor).expect("progress");
+        let runtime_events = runtime
+            .runtime_events_since(runtime_cursor)
+            .expect("runtime events");
+        assert!(runtime_events.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentRuntimeEventPayload::WorkerCompleted {
+                    stop_reason: AgentStopReason::Cancelled,
+                    ..
+                }
+            )
+        }));
+        assert!(!runtime_events.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentRuntimeEventPayload::WorkerFailed { .. }
+            )
+        }));
+        assert!(progress.events.iter().any(|event| {
+            matches!(
+                &event.payload,
+                AgentEventPayload::TurnCompleted {
+                    stop_reason: AgentStopReason::Cancelled,
+                    ..
+                }
+            )
+        }));
+        assert_eq!(
+            runtime
+                .terminal_result(&task.task_id)
+                .expect("terminal result lookup")
+                .expect("terminal result")
+                .status,
+            AgentTaskLifecycleStatus::Cancelled
         );
     }
 

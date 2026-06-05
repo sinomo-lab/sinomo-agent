@@ -44,7 +44,7 @@ const TUI_MOUSE_SCROLL_LINES: isize = 4;
 pub fn run_tui() -> Result<(), CliError> {
     if io::stdin().is_terminal() && io::stdout().is_terminal() {
         let daemon = tui_default_daemon_status()?;
-        let (handler, daemon) = main_agent_handler_for_tui(daemon)?;
+        let (handler, daemon) = runtime_main_agent_handler_for_tui(daemon)?;
         return run_tui_with_handler_and_daemon(handler, daemon);
     }
 
@@ -78,7 +78,7 @@ fn main_agent_handler_for_tui(
     daemon: Option<DaemonStatus>,
 ) -> Result<
     (
-        MainAgentInteractionHandler<DefaultMainAgentChatModel>,
+        RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
         Option<DaemonStatus>,
     ),
     CliError,
@@ -87,18 +87,45 @@ fn main_agent_handler_for_tui(
     main_agent_handler_for_tui_with_data_dir(daemon, &data_dir)
 }
 
+fn runtime_main_agent_handler_for_tui(
+    daemon: Option<DaemonStatus>,
+) -> Result<
+    (
+        RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+        Option<DaemonStatus>,
+    ),
+    CliError,
+> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    runtime_main_agent_handler_for_tui_with_data_dir(daemon, &data_dir)
+}
+
 pub(crate) fn main_agent_handler_for_tui_with_data_dir(
     daemon: Option<DaemonStatus>,
     data_dir: &SinomoDataDir,
 ) -> Result<
     (
-        MainAgentInteractionHandler<DefaultMainAgentChatModel>,
+        RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+        Option<DaemonStatus>,
+    ),
+    CliError,
+> {
+    runtime_main_agent_handler_for_tui_with_data_dir(daemon, data_dir)
+}
+
+pub(crate) fn runtime_main_agent_handler_for_tui_with_data_dir(
+    daemon: Option<DaemonStatus>,
+    data_dir: &SinomoDataDir,
+) -> Result<
+    (
+        RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
         Option<DaemonStatus>,
     ),
     CliError,
 > {
     let (runtime_config, _) = load_tui_model_runtime_config(data_dir, daemon.is_some())?;
-    let handler = MainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
+    let handler =
+        RuntimeMainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
     Ok((handler, daemon))
 }
 
@@ -259,6 +286,9 @@ fn run_tui_with_handler_and_daemon<H: TuiAgentRuntimeControl>(
         if state.exit_requested {
             break;
         }
+        if refresh_tui_runtime_events(&mut runtime, &mut state, &session_store)? {
+            terminal.draw(&state)?;
+        }
         if !event::poll(Duration::from_millis(250)).map_err(CliError::stdio)? {
             continue;
         }
@@ -333,6 +363,19 @@ fn handle_tui_input_action<H: TuiAgentRuntimeControl>(
                 daemon,
                 line,
             )?;
+        }
+        TuiInputAction::InterruptAgent => {
+            if runtime
+                .handler
+                .interrupt_tui_agent("user interrupted from TUI")?
+            {
+                state.mark_agent_interrupt_requested();
+            } else {
+                state.apply_output(InteractionOutput::Line(
+                    "no active interruptible agent turn".to_string(),
+                ));
+            }
+            session_store.save_state(runtime.session(), state)?;
         }
         TuiInputAction::OpenFiles(target) => {
             state.open_files_target(data_dir, target);
@@ -434,6 +477,25 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
     Ok(())
 }
 
+fn refresh_tui_runtime_events<H: TuiAgentRuntimeControl>(
+    runtime: &mut InteractionRuntime<JsonlEventStore, H>,
+    state: &mut TuiState,
+    session_store: &TuiSessionStore,
+) -> Result<bool, CliError> {
+    let events = runtime.handler.drain_tui_runtime_events()?;
+    if events.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    for event in events {
+        changed |= state.apply_runtime_event(event);
+    }
+    if changed {
+        session_store.save_state(runtime.session(), state)?;
+    }
+    Ok(changed)
+}
+
 struct TuiTerminalSession {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
 }
@@ -484,6 +546,7 @@ impl Drop for TuiTerminalSession {
 enum TuiInputAction {
     None,
     Submit(String),
+    InterruptAgent,
     OpenFiles(TuiFilesTarget),
     OpenSessions,
     OpenSettings,
@@ -964,6 +1027,14 @@ impl Default for TuiAgentRuntimeInfo {
 trait TuiAgentRuntimeControl: InteractionEventHandler {
     fn tui_agent_runtime_info(&self) -> TuiAgentRuntimeInfo;
 
+    fn drain_tui_runtime_events(&mut self) -> Result<Vec<AgentRuntimeEvent>, CliError> {
+        Ok(Vec::new())
+    }
+
+    fn interrupt_tui_agent(&mut self, _reason: &str) -> Result<bool, CliError> {
+        Ok(false)
+    }
+
     fn switch_tui_model(
         &mut self,
         data_dir: &SinomoDataDir,
@@ -988,12 +1059,19 @@ struct TuiMessage {
     text: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TuiRuntimeActivity {
+    active: bool,
+    active_command: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct TuiState {
     session_id: String,
     daemon_connected: bool,
     cluster_label: Option<String>,
     runtime_info: TuiAgentRuntimeInfo,
+    runtime_activity: TuiRuntimeActivity,
     last_model_usage: Option<TuiTokenUsage>,
     session_token_usage: TuiTokenUsage,
     view_mode: TuiViewMode,
@@ -1026,6 +1104,7 @@ impl TuiState {
             daemon_connected: daemon.is_some(),
             cluster_label,
             runtime_info,
+            runtime_activity: TuiRuntimeActivity::default(),
             last_model_usage: None,
             session_token_usage: TuiTokenUsage::default(),
             view_mode: TuiViewMode::Chat,
@@ -1054,7 +1133,11 @@ impl TuiState {
 
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                TuiInputAction::Exit
+                if self.runtime_activity.active {
+                    TuiInputAction::InterruptAgent
+                } else {
+                    TuiInputAction::Exit
+                }
             }
             KeyCode::F(1) => {
                 self.open_chat_tab();
@@ -2059,6 +2142,7 @@ impl TuiState {
         }
         self.session_id = session.session_id.to_string();
         self.runtime_info = runtime_info;
+        self.runtime_activity = TuiRuntimeActivity::default();
         self.last_model_usage = last_model_usage;
         self.session_token_usage = session_token_usage;
         self.view_mode = TuiViewMode::Chat;
@@ -2221,6 +2305,233 @@ impl TuiState {
         }
     }
 
+    fn mark_agent_interrupt_requested(&mut self) {
+        self.runtime_activity.active = true;
+        self.status = "interrupt requested".to_string();
+        self.stream_message = None;
+        self.push_message(TuiMessageKind::System, "agent interrupt requested");
+    }
+
+    fn apply_runtime_event(&mut self, event: AgentRuntimeEvent) -> bool {
+        match event.payload {
+            AgentRuntimeEventPayload::WorkerStarted { action, .. } => {
+                self.runtime_activity.active = true;
+                self.status = "working".to_string();
+                self.stream_message = None;
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("agent task started: {action}"),
+                );
+                true
+            }
+            AgentRuntimeEventPayload::WorkerCompleted {
+                action,
+                stop_reason,
+                ..
+            } => {
+                self.runtime_activity = TuiRuntimeActivity::default();
+                self.stream_message = None;
+                self.status = "listening".to_string();
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("agent task completed: {action} ({stop_reason:?})"),
+                );
+                true
+            }
+            AgentRuntimeEventPayload::WorkerFailed { action, detail, .. } => {
+                self.runtime_activity = TuiRuntimeActivity::default();
+                self.stream_message = None;
+                self.status = "agent task failed".to_string();
+                self.push_message(
+                    TuiMessageKind::Error,
+                    format!("agent task failed: {action}: {detail}"),
+                );
+                true
+            }
+            AgentRuntimeEventPayload::TurnFinalDecision {
+                decision,
+                stop_reason,
+                ..
+            } => {
+                self.apply_turn_final_decision(decision, stop_reason);
+                true
+            }
+            AgentRuntimeEventPayload::ModelProgress { event, .. } => {
+                self.apply_model_progress_event(event);
+                true
+            }
+            AgentRuntimeEventPayload::ToolProgress { event, .. } => {
+                self.apply_tool_progress_event(event);
+                true
+            }
+            AgentRuntimeEventPayload::ControlEvent { event } => {
+                if matches!(
+                    event.payload,
+                    AgentEventPayload::CancellationRequested { .. }
+                ) {
+                    self.status = "interrupt requested".to_string();
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    fn apply_turn_final_decision(
+        &mut self,
+        decision: AgentLoopDecision,
+        stop_reason: sinomo_agent::AgentStopReason,
+    ) {
+        let text = decision.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(index) = self.stream_message.take()
+            && let Some(message) = self.messages.get_mut(index)
+            && message.kind == TuiMessageKind::Agent
+        {
+            let streamed = message.text.trim();
+            if streamed == text {
+                return;
+            }
+            if text.starts_with(streamed) {
+                message.text = text.to_string();
+                return;
+            }
+        }
+        let kind = if stop_reason == sinomo_agent::AgentStopReason::Cancelled {
+            TuiMessageKind::System
+        } else {
+            TuiMessageKind::Agent
+        };
+        self.push_message(kind, text);
+    }
+
+    fn apply_model_progress_event(&mut self, event: AgentModelEvent) {
+        match event {
+            AgentModelEvent::Started {
+                step_index,
+                provider,
+                model,
+            } => {
+                self.runtime_activity.active = true;
+                self.status = "streaming".to_string();
+                self.stream_message = None;
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("model started: {provider}/{model} step {step_index}"),
+                );
+            }
+            AgentModelEvent::AssistantTextDelta { delta, .. } => {
+                self.runtime_activity.active = true;
+                self.append_streamed_message(TuiMessageKind::Agent, &delta, "streaming");
+            }
+            AgentModelEvent::AssistantReasoningSummary { summary, .. } => {
+                self.runtime_activity.active = true;
+                self.append_streamed_message(TuiMessageKind::Thinking, &summary, "streaming");
+            }
+            AgentModelEvent::ToolCallStarted { tool, .. } => {
+                self.stream_message = None;
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("model requested tool: {tool}"),
+                );
+            }
+            AgentModelEvent::ToolCallDelta { .. } => {}
+            AgentModelEvent::ToolCallCompleted { call, .. } => {
+                self.stream_message = None;
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("model completed tool call: {}", call.tool),
+                );
+            }
+            AgentModelEvent::Usage {
+                usage: Some(usage), ..
+            } => {
+                self.apply_model_usage(&usage);
+            }
+            AgentModelEvent::Usage { usage: None, .. } => {}
+            AgentModelEvent::Finished { .. } => {
+                self.status = "working".to_string();
+                self.stream_message = None;
+            }
+            AgentModelEvent::Error { detail, .. } => {
+                self.stream_message = None;
+                self.status = "model failed".to_string();
+                self.push_message(TuiMessageKind::Error, format!("model failed: {detail}"));
+            }
+            AgentModelEvent::Aborted { reason } => {
+                self.stream_message = None;
+                self.status = "interrupt requested".to_string();
+                self.push_message(TuiMessageKind::System, format!("model aborted: {reason}"));
+            }
+        }
+    }
+
+    fn apply_tool_progress_event(&mut self, event: AgentToolProgressEvent) {
+        match event {
+            AgentToolProgressEvent::ProcessStarted { process } => {
+                self.runtime_activity.active = true;
+                self.runtime_activity.active_command = Some(process.command.clone());
+                self.stream_message = None;
+                self.status = "running command".to_string();
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!("command started: {}", process.command),
+                );
+            }
+            AgentToolProgressEvent::ProcessOutput { process } => {
+                self.runtime_activity.active = true;
+                self.status = "running command".to_string();
+                self.append_runtime_process_output("stdout", &process.stdout);
+                self.append_runtime_process_output("stderr", &process.stderr);
+            }
+            AgentToolProgressEvent::ProcessCompleted { process } => {
+                self.runtime_activity.active = false;
+                self.runtime_activity.active_command = None;
+                self.stream_message = None;
+                self.status = if process.cancel_requested {
+                    "command cancelled".to_string()
+                } else if process.timed_out {
+                    "command timed out".to_string()
+                } else {
+                    "working".to_string()
+                };
+                self.push_message(
+                    TuiMessageKind::System,
+                    format!(
+                        "command finished: {} ({}, exit {:?})",
+                        process.command,
+                        process.status.as_str(),
+                        process.exit_code
+                    ),
+                );
+            }
+            AgentToolProgressEvent::Message { summary, .. } => {
+                self.push_message(TuiMessageKind::System, summary);
+            }
+        }
+    }
+
+    fn append_runtime_process_output(&mut self, stream: &str, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let mut formatted = String::new();
+        for line in text.lines() {
+            formatted.push_str(stream);
+            formatted.push_str("> ");
+            formatted.push_str(line);
+            formatted.push('\n');
+        }
+        if formatted.is_empty() {
+            formatted.push_str(stream);
+            formatted.push_str("> ");
+            formatted.push_str(text);
+        }
+        self.append_streamed_message(TuiMessageKind::Command, &formatted, "running command");
+    }
+
     fn apply_model_usage(&mut self, usage: &sinomo_lm::LanguageModelUsage) {
         let Some(usage) = TuiTokenUsage::from_language_model_usage(usage) else {
             return;
@@ -2240,6 +2551,10 @@ impl TuiState {
         } else {
             (TuiMessageKind::Thinking, chunk)
         };
+        self.append_streamed_message(kind, text, "streaming");
+    }
+
+    fn append_streamed_message(&mut self, kind: TuiMessageKind, text: &str, status: &str) {
         let index = match self.stream_message {
             Some(index)
                 if self
@@ -2259,7 +2574,7 @@ impl TuiState {
         };
         self.messages[index].text.push_str(text);
         self.stream_message = Some(index);
-        self.status = "streaming".to_string();
+        self.status = status.to_string();
         self.scrollback = 0;
     }
 
@@ -3852,7 +4167,11 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Style::default().fg(Color::Red)
         } else {
             match state.status.as_str() {
-                "working" | "streaming" => Style::default().fg(Color::Yellow),
+                "working" | "streaming" | "running command" | "interrupt requested" => {
+                    Style::default().fg(Color::Yellow)
+                }
+                "agent task failed" | "command timed out" | "command cancelled"
+                | "model failed" => Style::default().fg(Color::Red),
                 _ => Style::default().fg(Color::Green),
             }
         };
@@ -3970,6 +4289,8 @@ fn render_tui_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::raw(" accept   "),
         Span::styled("Esc", Style::default().fg(Color::DarkGray)),
         Span::raw(" quit   "),
+        Span::styled("Ctrl+C", Style::default().fg(Color::DarkGray)),
+        Span::raw(" interrupt/quit   "),
         Span::styled("F3", Style::default().fg(Color::DarkGray)),
         Span::raw(" sessions   "),
         Span::styled("PgUp/PgDn", Style::default().fg(Color::DarkGray)),
@@ -4129,6 +4450,70 @@ mod tui_tests {
         }
     }
 
+    fn runtime_event(payload: AgentRuntimeEventPayload) -> AgentRuntimeEvent {
+        AgentRuntimeEvent::new(SessionId::generate(), payload)
+    }
+
+    fn process_snapshot(
+        status: sinomo_agent::AgentProcessLifecycleStatus,
+        stdout: &str,
+        stderr: &str,
+    ) -> sinomo_agent::AgentProcessSnapshot {
+        sinomo_agent::AgentProcessSnapshot {
+            process_id: sinomo_agent::TaskId::generate().to_string(),
+            command: "printf progress".to_string(),
+            program: "printf".to_string(),
+            args: vec!["progress".to_string()],
+            cwd: ".".to_string(),
+            status,
+            exit_code: Some(0),
+            timed_out: false,
+            cancel_requested: false,
+            error: None,
+            elapsed_ms: 12,
+            timeout_ms: None,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+            stdout_offset: stdout.len(),
+            stderr_offset: stderr.len(),
+            stdout_total_bytes: stdout.len(),
+            stderr_total_bytes: stderr.len(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
+    }
+
+    struct StaticTuiModel {
+        content: String,
+    }
+
+    impl StaticTuiModel {
+        fn new(content: impl Into<String>) -> Self {
+            Self {
+                content: content.into(),
+            }
+        }
+    }
+
+    impl InteractionModel for StaticTuiModel {
+        fn complete(
+            &self,
+            request: &sinomo_lm::LanguageModelRequest,
+        ) -> Result<sinomo_lm::LanguageModelResponse, sinomo_lm::LanguageModelError> {
+            Ok(sinomo_lm::LanguageModelResponse {
+                provider: request.provider.clone(),
+                model: request.model.clone(),
+                content: self.content.clone(),
+                items: Vec::new(),
+                tool_calls: Vec::new(),
+                usage: Some(sinomo_lm::LanguageModelUsage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(3),
+                }),
+            })
+        }
+    }
+
     #[test]
     fn tui_state_edits_input_at_cursor() {
         let mut state = fixture_tui_state();
@@ -4160,6 +4545,152 @@ mod tui_tests {
         assert_eq!(state.messages[3].kind, TuiMessageKind::Agent);
         assert_eq!(state.messages[3].text, "done");
         assert_eq!(state.status, "listening");
+    }
+
+    #[test]
+    fn tui_state_renders_runtime_command_progress_and_interrupts_active_turn() {
+        let mut state = fixture_tui_state();
+
+        assert_eq!(
+            state.apply_key_event(press_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            TuiInputAction::Exit
+        );
+        assert!(state.apply_runtime_event(runtime_event(
+            AgentRuntimeEventPayload::WorkerStarted {
+                sequence: 1,
+                op_id: sinomo_agent::TaskId::generate(),
+                action: "start_turn".to_string(),
+                timeout_ms: None,
+            },
+        )));
+        assert_eq!(
+            state.apply_key_event(press_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            TuiInputAction::InterruptAgent
+        );
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::ModelProgress {
+            sequence: 1,
+            op_id: sinomo_agent::TaskId::generate(),
+            event: AgentModelEvent::AssistantTextDelta {
+                step_index: 0,
+                delta: "thinking out loud".to_string(),
+            },
+        }));
+
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.kind == TuiMessageKind::Agent
+                    && message.text.contains("thinking out loud"))
+        );
+
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::ToolProgress {
+            sequence: 1,
+            op_id: sinomo_agent::TaskId::generate(),
+            event: AgentToolProgressEvent::ProcessStarted {
+                process: process_snapshot(
+                    sinomo_agent::AgentProcessLifecycleStatus::Running,
+                    "",
+                    "",
+                ),
+            },
+        }));
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::ToolProgress {
+            sequence: 1,
+            op_id: sinomo_agent::TaskId::generate(),
+            event: AgentToolProgressEvent::ProcessOutput {
+                process: process_snapshot(
+                    sinomo_agent::AgentProcessLifecycleStatus::Running,
+                    "hello\n",
+                    "warn\n",
+                ),
+            },
+        }));
+
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.kind == TuiMessageKind::Command
+                    && message.text.contains("stdout> hello")
+                    && message.text.contains("stderr> warn"))
+        );
+
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::ToolProgress {
+            sequence: 1,
+            op_id: sinomo_agent::TaskId::generate(),
+            event: AgentToolProgressEvent::ProcessCompleted {
+                process: process_snapshot(
+                    sinomo_agent::AgentProcessLifecycleStatus::Completed,
+                    "",
+                    "",
+                ),
+            },
+        }));
+        state.apply_runtime_event(runtime_event(AgentRuntimeEventPayload::WorkerCompleted {
+            sequence: 1,
+            op_id: sinomo_agent::TaskId::generate(),
+            action: "start_turn".to_string(),
+            stop_reason: sinomo_agent::AgentStopReason::FinalDecision,
+        }));
+
+        assert!(!state.runtime_activity.active);
+        assert_eq!(
+            state.apply_key_event(press_mod(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            TuiInputAction::Exit
+        );
+    }
+
+    #[test]
+    fn runtime_tui_handler_queues_chat_turn_and_streams_terminal_decision() {
+        let session = InteractionSession::new(
+            SessionId::generate(),
+            NodeId::from_legacy_named("node_runtime_tui").expect("node"),
+            InteractionSurface::new("surface.runtime-tui", InteractionSurfaceKind::CommandLine),
+        );
+        let mut store = InMemoryEventStore::new();
+        let mut handler = RuntimeMainAgentInteractionHandler::with_thinking(
+            StaticTuiModel::new("runtime hello"),
+            "fake",
+            "fake-model",
+            ThinkingControl::default(),
+        );
+        let event = user_interaction_input_event(&session, "hello");
+        store.append(event.clone()).expect("append input");
+
+        let outputs = handler
+            .handle_event(&mut store, &session, &event)
+            .expect("submit");
+
+        assert!(outputs.is_empty());
+        let runtime = handler.ready_runtime().expect("runtime");
+        runtime.join_active_turn().expect("join");
+        let batch = runtime
+            .runtime_events_since(AgentRuntimeEventCursor {
+                offset: 0,
+                last_event_id: None,
+            })
+            .expect("events");
+        assert!(batch.events.iter().any(|event| matches!(
+            event.payload,
+            AgentRuntimeEventPayload::WorkerStarted { .. }
+        )));
+        assert!(batch.events.iter().any(|event| matches!(
+            &event.payload,
+            AgentRuntimeEventPayload::ModelProgress {
+                event: AgentModelEvent::AssistantTextDelta { delta, .. },
+                ..
+            } if delta == "runtime hello"
+        )));
+        assert!(batch.events.iter().any(|event| matches!(
+            &event.payload,
+            AgentRuntimeEventPayload::TurnFinalDecision { decision, .. }
+                if decision.text == "runtime hello"
+        )));
+        assert!(batch.events.iter().any(|event| matches!(
+            event.payload,
+            AgentRuntimeEventPayload::WorkerCompleted { .. }
+        )));
     }
 
     #[test]
@@ -5163,7 +5694,7 @@ mod tui_tests {
     fn tui_model_switch_replaces_active_handler_model() {
         let root = temp_file_browser_root("model-switch");
         let data_dir = SinomoDataDir::new(root.clone());
-        let mut handler = MainAgentInteractionHandler::from_runtime_config(
+        let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
             &data_dir,
             ModelRuntimeConfig::default(),
         )
@@ -5257,6 +5788,11 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    #[cfg(test)]
+    pub(crate) fn handler_mut(&mut self) -> &mut H {
+        &mut self.handler
     }
 
     pub fn session(&self) -> &InteractionSession {
@@ -5409,9 +5945,22 @@ impl ThinkingControl {
     }
 }
 
-pub struct MainAgentInteractionHandler<M> {
-    agent: MainAgentLoop<M>,
-    agent_definition: sinomo_agent::AgentDefinition,
+enum RuntimeMainAgentSlot<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    Pending(M),
+    Ready(AgentSessionRuntime<M>),
+}
+
+pub(crate) struct RuntimeMainAgentInteractionHandler<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    runtime: Option<RuntimeMainAgentSlot<M>>,
+    runtime_cursor: AgentRuntimeEventCursor,
+    agent_definition: AgentDefinition,
+    tool_registry: sinomo_agent::AgentToolRegistry,
     thinking: ThinkingControl,
     provider: String,
     model_name: String,
@@ -5420,6 +5969,7 @@ pub struct MainAgentInteractionHandler<M> {
     reasoning_budget_tokens: Option<u32>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct ThinkingStreamDisplay {
     content: String,
@@ -5428,6 +5978,7 @@ pub(crate) struct ThinkingStreamDisplay {
     prompt_started_thinking: bool,
 }
 
+#[cfg(test)]
 impl ThinkingStreamDisplay {
     pub(crate) fn new(prompt_started_thinking: bool) -> Self {
         Self {
@@ -5459,12 +6010,14 @@ impl ThinkingStreamDisplay {
     }
 }
 
+#[cfg(test)]
 fn progress_stream_delta(delta: &str) -> Option<&str> {
     delta
         .strip_prefix("<sinomo_progress>")
         .and_then(|value| value.strip_suffix("</sinomo_progress>"))
 }
 
+#[cfg(test)]
 fn visible_thinking_prefix(content: &str, prompt_started_thinking: bool) -> Option<&str> {
     if prompt_started_thinking {
         if content.trim_start().starts_with('{') {
@@ -5479,62 +6032,36 @@ fn visible_thinking_prefix(content: &str, prompt_started_thinking: bool) -> Opti
     Some(&after_start[..end])
 }
 
-impl<M: InteractionModel> MainAgentInteractionHandler<M> {
-    pub fn new(model: M, provider: impl Into<String>, model_name: impl Into<String>) -> Self {
-        let provider = provider.into();
-        let model_name = model_name.into();
-        let agent_definition = sinomo_agent::AgentDefinition::main();
-        Self {
-            agent: MainAgentLoop::with_definition(
-                model,
-                provider.clone(),
-                model_name.clone(),
-                agent_definition.clone(),
-            ),
-            agent_definition,
-            thinking: ThinkingControl::default(),
-            provider,
-            model_name,
-            account: None,
-            reasoning_effort: None,
-            reasoning_budget_tokens: None,
-        }
-    }
-
+impl<M> RuntimeMainAgentInteractionHandler<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
     pub fn with_thinking(
         model: M,
         provider: impl Into<String>,
         model_name: impl Into<String>,
         thinking: ThinkingControl,
     ) -> Self {
-        let provider = provider.into();
-        let model_name = model_name.into();
-        let agent_definition = sinomo_agent::AgentDefinition::main();
         Self {
-            agent: MainAgentLoop::with_definition(
-                model,
-                provider.clone(),
-                model_name.clone(),
-                agent_definition.clone(),
-            ),
-            agent_definition,
+            runtime: Some(RuntimeMainAgentSlot::Pending(model)),
+            runtime_cursor: AgentRuntimeEventCursor {
+                offset: 0,
+                last_event_id: None,
+            },
+            agent_definition: AgentDefinition::main()
+                .with_output_format(sinomo_agent::AgentOutputFormat::Text),
+            tool_registry: sinomo_agent::AgentToolRegistry::new(),
             thinking,
-            provider,
-            model_name,
+            provider: provider.into(),
+            model_name: model_name.into(),
             account: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
         }
     }
 
-    pub fn with_agent_definition(mut self, definition: sinomo_agent::AgentDefinition) -> Self {
-        self.agent = self.agent.with_agent_definition(definition.clone());
-        self.agent_definition = definition;
-        self
-    }
-
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
-        self.agent = self.agent.with_tool_registry(registry);
+        self.tool_registry = registry;
         self
     }
 
@@ -5549,6 +6076,64 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         }
     }
 
+    fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
+        let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
+            .with_agent_definition(self.agent_definition.clone())
+            .with_tool_registry(self.tool_registry.clone());
+        AgentSessionRuntime::new(agent, session)
+    }
+
+    fn ensure_runtime(
+        &mut self,
+        session: &InteractionSession,
+    ) -> Result<&AgentSessionRuntime<M>, CliError> {
+        if !matches!(self.runtime, Some(RuntimeMainAgentSlot::Ready(_))) {
+            let Some(RuntimeMainAgentSlot::Pending(model)) = self.runtime.take() else {
+                return Err(CliError::Parse {
+                    detail: "agent runtime is not initialized".to_string(),
+                });
+            };
+            let agent_session = AgentSession::new(session.session_id.clone(), AgentRole::Main);
+            let runtime = self.build_runtime(model, agent_session);
+            self.runtime = Some(RuntimeMainAgentSlot::Ready(runtime));
+            self.runtime_cursor = AgentRuntimeEventCursor {
+                offset: 0,
+                last_event_id: None,
+            };
+        }
+        match self.runtime.as_ref() {
+            Some(RuntimeMainAgentSlot::Ready(runtime)) => Ok(runtime),
+            _ => Err(CliError::Parse {
+                detail: "agent runtime is not ready".to_string(),
+            }),
+        }
+    }
+
+    fn ready_runtime(&self) -> Option<&AgentSessionRuntime<M>> {
+        match self.runtime.as_ref() {
+            Some(RuntimeMainAgentSlot::Ready(runtime)) => Some(runtime),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn join_active_tui_turn(&self) -> Result<(), CliError> {
+        let Some(runtime) = self.ready_runtime() else {
+            return Ok(());
+        };
+        runtime.join_active_turn()?;
+        Ok(())
+    }
+
+    pub(crate) fn drain_runtime_events(&mut self) -> Result<Vec<AgentRuntimeEvent>, CliError> {
+        let Some(runtime) = self.ready_runtime() else {
+            return Ok(Vec::new());
+        };
+        let batch = runtime.runtime_events_since(self.runtime_cursor.clone())?;
+        self.runtime_cursor = batch.next_cursor;
+        Ok(batch.events)
+    }
+
     fn replace_model(
         &mut self,
         model: M,
@@ -5556,25 +6141,38 @@ impl<M: InteractionModel> MainAgentInteractionHandler<M> {
         model_name: String,
         account: Option<String>,
         options: LanguageModelProviderOptions,
-    ) -> TuiAgentRuntimeInfo {
-        let tool_registry = self.agent.tool_registry();
-        self.agent = MainAgentLoop::with_definition(
-            model,
-            provider.clone(),
-            model_name.clone(),
-            self.agent_definition.clone(),
-        )
-        .with_tool_registry(tool_registry);
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        let previous = self.runtime.take();
+        let preserved_session = match previous {
+            Some(RuntimeMainAgentSlot::Ready(runtime)) => {
+                if runtime.active_turn()?.is_some() {
+                    let _ =
+                        runtime.interrupt_active_turn("model switched while turn was active")?;
+                    runtime.join_active_turn()?;
+                }
+                Some(runtime.session_snapshot()?)
+            }
+            Some(RuntimeMainAgentSlot::Pending(_)) | None => None,
+        };
+
         self.provider = provider;
         self.model_name = model_name;
         self.account = account;
         self.reasoning_effort = options.reasoning_effort;
         self.reasoning_budget_tokens = options.reasoning_budget_tokens;
-        self.runtime_info()
+        self.runtime = Some(match preserved_session {
+            Some(session) => RuntimeMainAgentSlot::Ready(self.build_runtime(model, session)),
+            None => RuntimeMainAgentSlot::Pending(model),
+        });
+        self.runtime_cursor = AgentRuntimeEventCursor {
+            offset: 0,
+            last_event_id: None,
+        };
+        Ok(self.runtime_info())
     }
 }
 
-impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
+impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
     pub fn from_runtime_config(
         data_dir: &SinomoDataDir,
         runtime_config: ModelRuntimeConfig,
@@ -5608,13 +6206,13 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         runtime_config,
                         self.thinking.clone(),
                     );
-                    Ok(self.replace_model(
+                    self.replace_model(
                         model,
                         info.provider,
                         info.model,
                         info.account,
                         LanguageModelProviderOptions::default(),
-                    ))
+                    )
                 }
                 MINICPM_PROVIDER_ID => {
                     let model_name = if selection.model == sinomo_lm::PROVIDER_DEFAULT_MODEL {
@@ -5629,13 +6227,13 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         None,
                         runtime_config,
                     );
-                    Ok(self.replace_model(
+                    self.replace_model(
                         model,
                         MINICPM_PROVIDER_ID.to_string(),
                         model_name,
                         None,
                         LanguageModelProviderOptions::default(),
-                    ))
+                    )
                 }
                 provider => {
                     let (config, _) = load_model_config_for_node(data_dir)?;
@@ -5650,22 +6248,37 @@ impl MainAgentInteractionHandler<DefaultMainAgentChatModel> {
                         account,
                         runtime_config,
                     );
-                    Ok(self.replace_model(
+                    self.replace_model(
                         model,
                         provider.to_string(),
                         selection.model,
                         Some(selection.account),
                         options,
-                    ))
+                    )
                 }
             }
         })
     }
 }
 
-impl TuiAgentRuntimeControl for MainAgentInteractionHandler<DefaultMainAgentChatModel> {
+impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
     fn tui_agent_runtime_info(&self) -> TuiAgentRuntimeInfo {
         self.runtime_info()
+    }
+
+    fn drain_tui_runtime_events(&mut self) -> Result<Vec<AgentRuntimeEvent>, CliError> {
+        self.drain_runtime_events()
+    }
+
+    fn interrupt_tui_agent(&mut self, reason: &str) -> Result<bool, CliError> {
+        let Some(runtime) = self.ready_runtime() else {
+            return Ok(false);
+        };
+        if runtime.active_turn()?.is_none() {
+            return Ok(false);
+        }
+        let result = runtime.interrupt_active_turn(reason)?;
+        Ok(result.accepted)
     }
 
     fn switch_tui_model(
@@ -5675,6 +6288,116 @@ impl TuiAgentRuntimeControl for MainAgentInteractionHandler<DefaultMainAgentChat
         daemon_connected: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
         self.switch_to_selection(data_dir, selection, daemon_connected)
+    }
+}
+
+impl<M> InteractionEventHandler for RuntimeMainAgentInteractionHandler<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    fn handle_event<S: EventStore>(
+        &mut self,
+        store: &mut S,
+        session: &InteractionSession,
+        event: &EventEnvelope,
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        self.handle_runtime_main_agent_event(store, session, event)
+    }
+}
+
+impl<M> RuntimeMainAgentInteractionHandler<M>
+where
+    M: InteractionModel + Send + Sync + 'static,
+{
+    fn handle_runtime_main_agent_event<S: EventStore>(
+        &mut self,
+        store: &mut S,
+        session: &InteractionSession,
+        event: &EventEnvelope,
+    ) -> Result<Vec<InteractionOutput>, CliError> {
+        let text = event
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        if let Some(args) = parse_slash_command(text)? {
+            if let Some(output) =
+                handle_thinking_command(store, session, event, &args, &self.thinking)?
+            {
+                return Ok(output);
+            }
+            return handle_slash_command(store, session, event, args);
+        }
+
+        let message = interaction_event(
+            session,
+            "interaction.message.received",
+            serde_json::json!({
+                "input_event_id": event.event_id,
+                "text": text,
+                "state": "received",
+                "delivery": "event-stream"
+            }),
+        )
+        .caused_by(&event.event_id);
+        store.append(message.clone())?;
+
+        let context = BoundedContextBuilder::new(12).build(store, session.session_id.clone())?;
+        let input = AgentLoopInput {
+            session: session.clone(),
+            latest_event: message.clone(),
+            context,
+            async_update: None,
+            context_attachments: Vec::new(),
+            tool_specs: Vec::new(),
+        };
+        let requested = interaction_event(
+            session,
+            "interaction.main_agent.requested",
+            serde_json::json!({
+                "message_event_id": message.event_id,
+                "input_event_id": event.event_id,
+                "runtime": "agent-session-runtime"
+            }),
+        )
+        .caused_by(&message.event_id);
+        store.append(requested.clone())?;
+
+        let runtime = self.ensure_runtime(session)?;
+        let result = runtime.submit_op(AgentOp::start_turn(input))?;
+        let queued = interaction_event(
+            session,
+            "interaction.main_agent.queued",
+            serde_json::json!({
+                "message_event_id": message.event_id,
+                "request_event_id": requested.event_id,
+                "sequence": result.sequence,
+                "accepted": result.accepted,
+                "op_id": result
+                    .events
+                    .first()
+                    .map(|event| event.op_id.to_string())
+            }),
+        )
+        .caused_by(&requested.event_id);
+        store.append(queued)?;
+
+        if result.accepted {
+            Ok(Vec::new())
+        } else {
+            let reason = result
+                .events
+                .iter()
+                .find_map(|event| match &event.payload {
+                    AgentEventPayload::OperationRejected { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| "agent turn was rejected".to_string());
+            Ok(vec![InteractionOutput::Line(format!(
+                "agent task rejected: {reason}"
+            ))])
+        }
     }
 }
 
@@ -5730,146 +6453,6 @@ impl CliInteractionHandler {
             model.provider.clone(),
             model.model.clone(),
         ))
-    }
-}
-
-impl<M: InteractionModel> InteractionEventHandler for MainAgentInteractionHandler<M> {
-    fn handle_event<S: EventStore>(
-        &mut self,
-        store: &mut S,
-        session: &InteractionSession,
-        event: &EventEnvelope,
-    ) -> Result<Vec<InteractionOutput>, CliError> {
-        self.handle_main_agent_event(store, session, event, None)
-    }
-
-    fn handle_event_streaming<S: EventStore>(
-        &mut self,
-        store: &mut S,
-        session: &InteractionSession,
-        event: &EventEnvelope,
-        emit: &mut dyn FnMut(InteractionOutput),
-    ) -> Result<Vec<InteractionOutput>, CliError> {
-        self.handle_main_agent_event(store, session, event, Some(emit))
-    }
-}
-
-impl<M: InteractionModel> MainAgentInteractionHandler<M> {
-    fn handle_main_agent_event<S: EventStore>(
-        &mut self,
-        store: &mut S,
-        session: &InteractionSession,
-        event: &EventEnvelope,
-        mut emit: Option<&mut dyn FnMut(InteractionOutput)>,
-    ) -> Result<Vec<InteractionOutput>, CliError> {
-        let text = event
-            .payload
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-
-        if let Some(args) = parse_slash_command(text)? {
-            if let Some(output) =
-                handle_thinking_command(store, session, event, &args, &self.thinking)?
-            {
-                return Ok(output);
-            }
-            return handle_slash_command(store, session, event, args);
-        }
-
-        let message = interaction_event(
-            session,
-            "interaction.message.received",
-            serde_json::json!({
-                "input_event_id": event.event_id,
-                "text": text,
-                "state": "received",
-                "delivery": "event-stream"
-            }),
-        )
-        .caused_by(&event.event_id);
-        store.append(message.clone())?;
-
-        let context = BoundedContextBuilder::new(12).build(store, session.session_id.clone())?;
-        let input = AgentLoopInput {
-            session: session.clone(),
-            latest_event: message.clone(),
-            context,
-            async_update: None,
-            context_attachments: Vec::new(),
-            tool_specs: Vec::new(),
-        };
-        let requested = interaction_event(
-            session,
-            "interaction.main_agent.requested",
-            serde_json::json!({
-                "message_event_id": message.event_id,
-                "input_event_id": event.event_id
-            }),
-        )
-        .caused_by(&message.event_id);
-        store.append(requested.clone())?;
-
-        let mut thinking_stream = ThinkingStreamDisplay::new(self.thinking.is_enabled());
-        let decision_result = if let Some(emit) = emit.as_deref_mut() {
-            self.agent
-                .decide_streaming_with_usage(&input, &mut |delta| {
-                    for chunk in thinking_stream.push(delta) {
-                        emit(InteractionOutput::Chunk(chunk));
-                    }
-                })
-        } else {
-            self.agent.decide_with_usage(&input)
-        };
-
-        match decision_result {
-            Ok((decision, usage)) => {
-                let response_event = interaction_event(
-                    session,
-                    "interaction.main_agent.responded",
-                    serde_json::json!({
-                        "message_event_id": message.event_id,
-                        "request_event_id": requested.event_id,
-                        "response_mode": decision.response_mode,
-                        "text": decision.text,
-                        "tool_calls": decision.tool_calls,
-                        "background_handoff": decision.background_handoff,
-                        "next_state": decision.next_state,
-                        "usage": usage.clone()
-                    }),
-                )
-                .caused_by(&requested.event_id);
-                store.append(response_event.clone())?;
-                let text = response_event
-                    .payload
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default();
-                let mut outputs = vec![InteractionOutput::Line(format!("sinomo: {text}"))];
-                if let Some(usage) = usage {
-                    outputs.push(InteractionOutput::ModelUsage {
-                        provider: self.provider.clone(),
-                        model: self.model_name.clone(),
-                        usage,
-                    });
-                }
-                Ok(outputs)
-            }
-            Err(error) => {
-                let failure = interaction_event(
-                    session,
-                    "interaction.main_agent.failed",
-                    serde_json::json!({
-                        "message_event_id": message.event_id,
-                        "request_event_id": requested.event_id,
-                        "error": error.to_string()
-                    }),
-                )
-                .caused_by(&requested.event_id);
-                store.append(failure)?;
-                Err(error.into())
-            }
-        }
     }
 }
 

@@ -790,6 +790,19 @@ def write_summary(
         "official_empty_patch_instances": official_evaluation.get("empty_patch_instances"),
         "agent_model_turns": sum(int(report.get("model_turns", 0)) for report in reports),
         "agent_tool_results": sum(int(report.get("tool_results", 0)) for report in reports),
+        "command_observation_turns": sum(
+            int(report.get("command_observation_turns", 0)) for report in reports
+        ),
+        "command_tool_results": sum(
+            int(report.get("command_tool_results", 0)) for report in reports
+        ),
+        "cancelled_tool_results": sum(
+            int(report.get("cancelled_tool_results", 0)) for report in reports
+        ),
+        "cancelled_runs": sum(int(report.get("cancelled_runs", 0)) for report in reports),
+        "extra_turns_after_patch": sum(
+            int(report.get("extra_turns_after_patch", 0)) for report in reports
+        ),
         "agent_input_tokens": sum(int(report.get("agent_input_tokens", 0)) for report in reports),
         "agent_output_tokens": sum(int(report.get("agent_output_tokens", 0)) for report in reports),
     }

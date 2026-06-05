@@ -6,12 +6,12 @@ use super::{
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
     DfsExposeCliCommand, DfsFilterOptions, DfsPinCliCommand, EvolutionJobStatus, EvolutionPaths,
     InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
-    InteractionSurface, InteractionSurfaceKind, MainAgentInteractionHandler,
-    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
-    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, SandboxCliCommand,
+    InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutOptions, RolloutProgressExpectation,
+    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SandboxCliCommand,
     SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
     SandboxToolchainVerifyTccOptions, SelfRolloutPaths, UninstallOptions,
     advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
@@ -15607,10 +15607,11 @@ fn slash_command_returns_captured_cli_output_as_interaction_lines() {
     );
     let mut runtime = InteractionRuntime::new(
         InMemoryEventStore::new(),
-        MainAgentInteractionHandler::new(
+        RuntimeMainAgentInteractionHandler::with_thinking(
             MainAgentFixtureModel,
             "fixture-provider",
             "fixture-model",
+            super::ThinkingControl::default(),
         ),
         session,
     );
@@ -15640,10 +15641,11 @@ fn files_slash_command_is_tui_only() {
     );
     let mut runtime = InteractionRuntime::new(
         InMemoryEventStore::new(),
-        MainAgentInteractionHandler::new(
+        RuntimeMainAgentInteractionHandler::with_thinking(
             MainAgentFixtureModel,
             "fixture-provider",
             "fixture-model",
+            super::ThinkingControl::default(),
         ),
         session,
     );
@@ -15720,10 +15722,11 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
     );
     let mut runtime = InteractionRuntime::new(
         InMemoryEventStore::new(),
-        MainAgentInteractionHandler::new(
+        RuntimeMainAgentInteractionHandler::with_thinking(
             MainAgentFixtureModel,
             "fixture-provider",
             "fixture-model",
+            super::ThinkingControl::default(),
         ),
         session,
     );
@@ -15732,12 +15735,17 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
         .ingest_user_input("what is the cluster doing?")
         .expect("input");
 
-    assert_eq!(
-        outputs,
-        vec![super::InteractionOutput::Line(
-            "sinomo: cluster-aware reply".to_string()
-        )]
-    );
+    assert!(outputs.is_empty());
+    runtime.handler_mut().join_active_tui_turn().expect("join");
+    let runtime_events = runtime
+        .handler_mut()
+        .drain_runtime_events()
+        .expect("runtime events");
+    assert!(runtime_events.iter().any(|event| matches!(
+        &event.payload,
+        sinomo_agent::AgentRuntimeEventPayload::TurnFinalDecision { decision, .. }
+            if decision.text == "cluster-aware reply"
+    )));
     let events = runtime.store().replay(ReplayQuery::all()).expect("replay");
     assert_eq!(events.len(), 4);
     assert_eq!(
@@ -15746,7 +15754,7 @@ fn main_agent_handler_routes_plain_input_through_agent_loop() {
     );
     assert_eq!(
         events[3].event.kind.as_str(),
-        "interaction.main_agent.responded"
+        "interaction.main_agent.queued"
     );
 }
 
@@ -15759,10 +15767,11 @@ fn main_agent_handler_streams_visible_thinking_chunks() {
     );
     let mut runtime = InteractionRuntime::new(
         InMemoryEventStore::new(),
-        MainAgentInteractionHandler::new(
+        RuntimeMainAgentInteractionHandler::with_thinking(
             StreamingMainAgentFixtureModel,
             "fixture-provider",
             "fixture-model",
+            super::ThinkingControl::default(),
         ),
         session,
     );
@@ -15774,20 +15783,25 @@ fn main_agent_handler_streams_visible_thinking_chunks() {
         })
         .expect("input");
 
-    assert_eq!(
-        streamed,
-        vec![
-            super::InteractionOutput::Chunk("thinking> ".to_string()),
-            super::InteractionOutput::Chunk("checking quorum".to_string()),
-            super::InteractionOutput::Chunk(" and rollout state\n".to_string()),
-        ]
-    );
-    assert_eq!(
-        outputs,
-        vec![super::InteractionOutput::Line(
-            "sinomo: streamed reply".to_string()
-        )]
-    );
+    assert!(streamed.is_empty());
+    assert!(outputs.is_empty());
+    runtime.handler_mut().join_active_tui_turn().expect("join");
+    let runtime_events = runtime
+        .handler_mut()
+        .drain_runtime_events()
+        .expect("runtime events");
+    assert!(runtime_events.iter().any(|event| matches!(
+        &event.payload,
+        sinomo_agent::AgentRuntimeEventPayload::ModelProgress {
+            event: sinomo_agent::AgentModelEvent::AssistantTextDelta { delta, .. },
+            ..
+        } if delta.contains("checking quorum")
+    )));
+    assert!(runtime_events.iter().any(|event| matches!(
+        &event.payload,
+        sinomo_agent::AgentRuntimeEventPayload::TurnFinalDecision { decision, .. }
+            if decision.text == "streamed reply"
+    )));
 }
 
 #[test]
@@ -15816,10 +15830,11 @@ fn main_agent_handler_toggles_thinking_with_slash_command() {
     );
     let mut runtime = InteractionRuntime::new(
         InMemoryEventStore::new(),
-        MainAgentInteractionHandler::new(
+        RuntimeMainAgentInteractionHandler::with_thinking(
             MainAgentFixtureModel,
             "fixture-provider",
             "fixture-model",
+            super::ThinkingControl::default(),
         ),
         session,
     );
@@ -16093,7 +16108,7 @@ impl InteractionModel for MainAgentFixtureModel {
         assert_eq!(request.model, "fixture-model");
         assert_eq!(
             request.response_format,
-            sinomo_lm::LanguageModelResponseFormat::JsonObject
+            sinomo_lm::LanguageModelResponseFormat::Text
         );
         assert!(
             request.messages[0]
@@ -16101,21 +16116,15 @@ impl InteractionModel for MainAgentFixtureModel {
                 .contains("user-facing main agent")
         );
         assert!(
-            request.messages[1]
-                .content
-                .contains("what is the cluster doing?")
+            request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("what is the cluster doing?"))
         );
         Ok(LanguageModelResponse {
             provider: request.provider.clone(),
             model: request.model.clone(),
-            content: serde_json::json!({
-                "response_mode": "answer",
-                "text": "cluster-aware reply",
-                "tool_calls": [],
-                "background_handoff": null,
-                "next_state": "listening"
-            })
-            .to_string(),
+            content: "cluster-aware reply".to_string(),
             items: Vec::new(),
             tool_calls: Vec::new(),
             usage: None,
@@ -16151,14 +16160,7 @@ fn main_agent_fixture_response(
     LanguageModelResponse {
         provider: request.provider.clone(),
         model: request.model.clone(),
-        content: serde_json::json!({
-            "response_mode": "answer",
-            "text": text,
-            "tool_calls": [],
-            "background_handoff": null,
-            "next_state": "listening"
-        })
-        .to_string(),
+        content: text.to_string(),
         items: Vec::new(),
         tool_calls: Vec::new(),
         usage: None,

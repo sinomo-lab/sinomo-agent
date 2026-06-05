@@ -10,6 +10,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 
 pub const AGENT_SESSION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 
@@ -220,14 +221,24 @@ impl AgentSessionStore for NoopAgentSessionStore {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct FileAgentSessionStore {
     paths: AgentStoragePaths,
+    live_streams: Arc<Mutex<Vec<FileAgentSessionStoreLiveStream>>>,
+}
+
+#[derive(Clone)]
+struct FileAgentSessionStoreLiveStream {
+    session_id: SessionId,
+    sender: mpsc::Sender<AgentSessionStoreRecord>,
 }
 
 impl FileAgentSessionStore {
     pub fn new(paths: AgentStoragePaths) -> Self {
-        Self { paths }
+        Self {
+            paths,
+            live_streams: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     pub fn for_data_dir(data_dir: &SinomoDataDir) -> Self {
@@ -236,6 +247,34 @@ impl FileAgentSessionStore {
 
     pub fn paths(&self) -> &AgentStoragePaths {
         &self.paths
+    }
+
+    pub fn subscribe_records(
+        &self,
+        session_id: &SessionId,
+    ) -> mpsc::Receiver<AgentSessionStoreRecord> {
+        let (sender, receiver) = mpsc::channel();
+        self.live_streams
+            .lock()
+            .expect("agent session store live stream lock poisoned")
+            .push(FileAgentSessionStoreLiveStream {
+                session_id: session_id.clone(),
+                sender,
+            });
+        receiver
+    }
+
+    fn publish_record(&self, record: &AgentSessionStoreRecord) {
+        let mut streams = self
+            .live_streams
+            .lock()
+            .expect("agent session store live stream lock poisoned");
+        streams.retain(|stream| {
+            if stream.session_id != record.session_id {
+                return true;
+            }
+            stream.sender.send(record.clone()).is_ok()
+        });
     }
 }
 
@@ -340,7 +379,9 @@ impl AgentSessionStore for FileAgentSessionStore {
         let path = self
             .paths
             .session_events_path_for_session(&record.session_id);
-        append_jsonl_record(&path, record)
+        append_jsonl_record(&path, record)?;
+        self.publish_record(record);
+        Ok(())
     }
 
     fn load_control_snapshot(
@@ -376,6 +417,51 @@ impl AgentSessionStore for FileAgentSessionStore {
             }
         }
         Ok(latest)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn file_session_store_live_streams_appended_records_for_matching_session() {
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-agent-live-session-store-{}",
+            TaskId::generate()
+        )));
+        let store = FileAgentSessionStore::for_data_dir(&data_dir);
+        let session_id = SessionId::from_legacy_named("sess_live_store").expect("session");
+        let other_session_id =
+            SessionId::from_legacy_named("sess_other_live_store").expect("session");
+        let receiver = store.subscribe_records(&session_id);
+        let other_receiver = store.subscribe_records(&other_session_id);
+        let appender = store.clone();
+        let record = AgentSessionStoreRecord::new(
+            session_id.clone(),
+            AgentSessionStoreRecordKind::SnapshotSaved {
+                item_count: 1,
+                steering_count: 0,
+                follow_up_count: 0,
+                aborted: false,
+            },
+        );
+
+        appender.append_record(&record).expect("append record");
+
+        let received = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("live record");
+        assert_eq!(received.record_id, record.record_id);
+        assert_eq!(received.session_id, session_id);
+        assert!(other_receiver.try_recv().is_err());
+        let events = fs::read_to_string(
+            AgentStoragePaths::from_data_dir(&data_dir)
+                .session_events_path_for_session(&session_id),
+        )
+        .expect("events");
+        assert!(events.contains("\"snapshot_saved\""));
     }
 }
 

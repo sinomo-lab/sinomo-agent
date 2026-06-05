@@ -213,10 +213,6 @@ pub fn swebench_verified_10_plan() -> BenchmarkHarnessPlan {
                         | AgentToolKind::SearchFiles
                         | AgentToolKind::ApplyPatch
                         | AgentToolKind::RunShellCommand
-                        | AgentToolKind::StartCommandSession
-                        | AgentToolKind::InspectCommandSession
-                        | AgentToolKind::WriteCommandStdin
-                        | AgentToolKind::CancelCommandSession
                         | AgentToolKind::RequestUserInput
                 )
             })

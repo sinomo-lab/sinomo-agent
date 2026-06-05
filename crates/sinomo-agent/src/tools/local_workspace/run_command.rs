@@ -17,7 +17,12 @@ impl AgentTool for RunCommandTool {
     }
 
     fn execute(&self, request: super::super::AgentToolRequest<'_>) -> AgentToolResult {
-        local_run_command_from_call(&self.config, request.call)
+        local_run_command_from_call(
+            &self.config,
+            request.call,
+            request.cancellation_token,
+            request.progress_sink,
+        )
     }
 }
 

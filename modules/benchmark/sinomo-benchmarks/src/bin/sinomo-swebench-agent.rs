@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use sinomo_agent::{
-    Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentModelEvent, AgentPolicyBundle,
-    AgentRole, AgentRun, AgentSession, AgentStoragePaths, AgentToolRegistry, BoundedContext,
-    FileAgentTraceStore, InteractionModel, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, LocalWorkspaceAgentConfig, default_coding_agent_tools,
-    user_interaction_input_event,
+    Agent, AgentConfig, AgentContextBudget, AgentLoopInput, AgentModelEvent, AgentOp,
+    AgentPolicyBundle, AgentRole, AgentRun, AgentSession, AgentSessionRuntime, AgentStopReason,
+    AgentStoragePaths, AgentToolRegistry, AgentToolStatus, BoundedContext, FileAgentTraceStore,
+    InteractionModel, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    LocalWorkspaceAgentConfig, default_coding_agent_tools, user_interaction_input_event,
 };
 use sinomo_lm::{
     LanguageModelError, LanguageModelRequest, LanguageModelResponse, ModelPaths,
@@ -105,6 +105,11 @@ struct SweBenchAgentReport {
     stop_reason: String,
     model_turns: usize,
     tool_results: usize,
+    command_observation_turns: usize,
+    command_tool_results: usize,
+    cancelled_tool_results: usize,
+    cancelled_runs: usize,
+    extra_turns_after_patch: usize,
     agent_input_tokens: u64,
     agent_output_tokens: u64,
     final_text: String,
@@ -199,10 +204,11 @@ fn run() -> Result<(), String> {
         &agent_trace_path,
     );
     let input = agent_loop_input(&session, &task_prompt(&task, options.max_steps));
-    let mut agent_session = AgentSession::new(session.session_id.clone(), AgentRole::Deliberation);
-    let run = agent
-        .start_turn(&mut agent_session, &input)
-        .map_err(|source| source.to_string())?;
+    let runtime = AgentSessionRuntime::new(
+        agent,
+        AgentSession::new(session.session_id.clone(), AgentRole::Deliberation),
+    );
+    let run = submit_runtime_turn(&runtime, AgentOp::start_turn(input.clone()))?;
     let mut runs = vec![run];
     add_untracked_to_diff(&options.workspace)?;
     let mut patch = current_patch(&options.workspace)?;
@@ -240,16 +246,21 @@ fn run() -> Result<(), String> {
             options.repair_steps,
             &agent_trace_path,
         );
-        repair_agent
-            .follow_up(&mut agent_session, repair_prompt)
+        let repair_runtime = AgentSessionRuntime::new(
+            repair_agent,
+            runtime.session_snapshot().map_err(|source| {
+                format!("failed to snapshot agent session for repair runtime: {source}")
+            })?,
+        );
+        repair_runtime
+            .submit_op(AgentOp::follow_up(repair_prompt))
             .map_err(|source| source.to_string())?;
         let repair_input = agent_loop_input(
             &input.session,
             "Repair the current patch after the post-patch check failure.",
         );
-        let repair_run = repair_agent
-            .continue_turn(&mut agent_session, &repair_input)
-            .map_err(|source| source.to_string())?;
+        let repair_run =
+            submit_runtime_turn(&repair_runtime, AgentOp::continue_turn(repair_input))?;
         repair_model_turns = repair_run.model_turns.len();
         repair_tool_results = repair_run.tool_results.len();
         let path = options.report_out.with_extension("repair.run.json");
@@ -276,6 +287,11 @@ fn run() -> Result<(), String> {
         }
     }
     let (agent_input_tokens, agent_output_tokens) = agent_usage_totals(&runs);
+    let command_observation_turns = command_observation_turns(&runs);
+    let command_tool_results = command_tool_results(&runs);
+    let cancelled_tool_results = cancelled_tool_results(&runs);
+    let cancelled_runs = cancelled_runs(&runs);
+    let extra_turns_after_patch = extra_turns_after_patch(&runs);
     let prediction = SweBenchPrediction {
         instance_id: task.instance_id.clone(),
         model_name_or_path: format!("{provider}/{}", options.model),
@@ -315,12 +331,46 @@ fn run() -> Result<(), String> {
         stop_reason: format!("{:?}", last_run.stop_reason),
         model_turns: runs.iter().map(|run| run.model_turns.len()).sum(),
         tool_results: runs.iter().map(|run| run.tool_results.len()).sum(),
+        command_observation_turns,
+        command_tool_results,
+        cancelled_tool_results,
+        cancelled_runs,
+        extra_turns_after_patch,
         agent_input_tokens,
         agent_output_tokens,
         final_text: last_run.final_decision.text.clone(),
     };
     write_json(&options.report_out, &report)?;
     Ok(())
+}
+
+fn submit_runtime_turn(
+    runtime: &AgentSessionRuntime<ConfiguredBenchmarkModel>,
+    op: AgentOp,
+) -> Result<AgentRun, String> {
+    let op_id = op.op_id.clone();
+    let result = runtime.submit_op(op).map_err(|source| source.to_string())?;
+    if !result.accepted {
+        let reason = result
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                sinomo_agent::AgentEventPayload::OperationRejected { reason, .. } => {
+                    Some(reason.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "turn was rejected".to_string());
+        return Err(reason);
+    }
+    runtime
+        .join_active_turn()
+        .map_err(|source| source.to_string())?;
+    runtime
+        .turn_result(&op_id)
+        .map_err(|source| source.to_string())?
+        .and_then(|outcome| outcome.run)
+        .ok_or_else(|| format!("runtime turn `{op_id}` completed without an agent run"))
 }
 
 fn benchmark_agent(
@@ -384,6 +434,72 @@ fn agent_usage_totals(runs: &[AgentRun]) -> (u64, u64) {
         .fold((0, 0), |(input_total, output_total), (input, output)| {
             (input_total + input, output_total + output)
         })
+}
+
+fn command_observation_turns(runs: &[AgentRun]) -> usize {
+    let mut turns = BTreeSet::new();
+    for (run_index, run) in runs.iter().enumerate() {
+        for outcome in &run.tool_results {
+            if outcome.call.tool == "run_command"
+                && (nonempty_output_field(&outcome.output, "stdout")
+                    || nonempty_output_field(&outcome.output, "stderr")
+                    || nonempty_output_field(&outcome.output, "aggregated_output"))
+            {
+                turns.insert((run_index, outcome.step_index));
+            }
+        }
+    }
+    turns.len()
+}
+
+fn command_tool_results(runs: &[AgentRun]) -> usize {
+    runs.iter()
+        .flat_map(|run| run.tool_results.iter())
+        .filter(|outcome| outcome.call.tool == "run_command")
+        .count()
+}
+
+fn cancelled_tool_results(runs: &[AgentRun]) -> usize {
+    runs.iter()
+        .flat_map(|run| run.tool_results.iter())
+        .filter(|outcome| outcome.status == AgentToolStatus::Cancelled)
+        .count()
+}
+
+fn cancelled_runs(runs: &[AgentRun]) -> usize {
+    runs.iter()
+        .filter(|run| run.stop_reason == AgentStopReason::Cancelled)
+        .count()
+}
+
+fn extra_turns_after_patch(runs: &[AgentRun]) -> usize {
+    runs.iter()
+        .map(|run| {
+            let Some(first_patch_step) = run
+                .tool_results
+                .iter()
+                .filter(|outcome| {
+                    outcome.call.tool == "apply_patch"
+                        && outcome.status == AgentToolStatus::Succeeded
+                })
+                .map(|outcome| outcome.step_index)
+                .min()
+            else {
+                return 0;
+            };
+            run.model_turns
+                .iter()
+                .filter(|turn| turn.step_index > first_patch_step)
+                .count()
+        })
+        .sum()
+}
+
+fn nonempty_output_field(output: &serde_json::Value, key: &str) -> bool {
+    output
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn parse_options(args: Vec<String>) -> Result<Options, String> {

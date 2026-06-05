@@ -1,11 +1,13 @@
 use crate::{
-    AgentToolCall, AgentToolKind, AgentToolSpec, AgentVerificationState, InteractionSession, TaskId,
+    AgentCancellationToken, AgentProcessSnapshot, AgentToolCall, AgentToolKind, AgentToolSpec,
+    AgentVerificationState, InteractionSession, TaskId,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_runtime::core::{HotSwapState, ModuleLoaderState};
 use sinomo_runtime::events::EventId;
 use sinomo_runtime::module::ModuleRegistration;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolDescriptor {
@@ -89,11 +91,7 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::SearchFiles
         | AgentToolKind::WriteFile
         | AgentToolKind::ApplyPatch
-        | AgentToolKind::RunShellCommand
-        | AgentToolKind::StartCommandSession
-        | AgentToolKind::InspectCommandSession
-        | AgentToolKind::WriteCommandStdin
-        | AgentToolKind::CancelCommandSession => vec!["core", "coding", "local"],
+        | AgentToolKind::RunShellCommand => vec!["core", "coding", "local"],
         AgentToolKind::ChangedFiles | AgentToolKind::GitDiff => vec!["version_control"],
         AgentToolKind::ModuleObjectRpc => vec!["module", "object_rpc"],
         AgentToolKind::RequestUserInput => vec!["core", "interactive"],
@@ -925,10 +923,54 @@ pub struct AgentToolRequest<'a> {
     pub step_index: usize,
     pub call_index: usize,
     pub call: &'a AgentToolCall,
+    pub cancellation_token: AgentCancellationToken,
+    pub progress_sink: AgentToolProgressSink,
 }
 
 pub trait AgentTool: Send + Sync {
     fn descriptor(&self) -> AgentToolDescriptor;
 
     fn execute(&self, request: AgentToolRequest<'_>) -> AgentToolResult;
+}
+
+#[derive(Clone, Default)]
+pub struct AgentToolProgressSink {
+    callback: Option<Arc<dyn Fn(AgentToolProgressEvent) + Send + Sync>>,
+}
+
+impl AgentToolProgressSink {
+    pub fn new(callback: impl Fn(AgentToolProgressEvent) + Send + Sync + 'static) -> Self {
+        Self {
+            callback: Some(Arc::new(callback)),
+        }
+    }
+
+    pub fn emit(&self, event: AgentToolProgressEvent) {
+        if let Some(callback) = &self.callback {
+            callback(event);
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.callback.is_some()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentToolProgressEvent {
+    ProcessStarted {
+        process: AgentProcessSnapshot,
+    },
+    ProcessOutput {
+        process: AgentProcessSnapshot,
+    },
+    ProcessCompleted {
+        process: AgentProcessSnapshot,
+    },
+    Message {
+        summary: String,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        payload: serde_json::Value,
+    },
 }

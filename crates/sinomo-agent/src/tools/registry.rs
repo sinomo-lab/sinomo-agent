@@ -1,8 +1,8 @@
 use super::{
-    AgentTool, AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome, AgentToolRequest,
-    AgentToolResult, AgentToolStatus,
+    AgentTool, AgentToolDescriptor, AgentToolEvidence, AgentToolOutcome, AgentToolProgressSink,
+    AgentToolRequest, AgentToolResult, AgentToolStatus,
 };
-use crate::{AgentToolCall, InteractionSession, TaskId};
+use crate::{AgentCancellationToken, AgentToolCall, InteractionSession, TaskId};
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
@@ -133,6 +133,42 @@ impl AgentToolRegistry {
         call_index: usize,
         call: &AgentToolCall,
     ) -> AgentToolOutcome {
+        self.execute_with_cancellation(
+            session,
+            step_index,
+            call_index,
+            call,
+            AgentCancellationToken::new(),
+        )
+    }
+
+    pub fn execute_with_cancellation(
+        &self,
+        session: &InteractionSession,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        cancellation_token: AgentCancellationToken,
+    ) -> AgentToolOutcome {
+        self.execute_with_cancellation_and_progress(
+            session,
+            step_index,
+            call_index,
+            call,
+            cancellation_token,
+            AgentToolProgressSink::default(),
+        )
+    }
+
+    pub fn execute_with_cancellation_and_progress(
+        &self,
+        session: &InteractionSession,
+        step_index: usize,
+        call_index: usize,
+        call: &AgentToolCall,
+        cancellation_token: AgentCancellationToken,
+        progress_sink: AgentToolProgressSink,
+    ) -> AgentToolOutcome {
         let call_id = TaskId::generate();
         let tool = self
             .tools
@@ -149,6 +185,8 @@ impl AgentToolRegistry {
                     step_index,
                     call_index,
                     call,
+                    cancellation_token,
+                    progress_sink,
                 })
             })
             .unwrap_or_else(|| {

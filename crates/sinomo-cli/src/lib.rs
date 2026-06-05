@@ -35,10 +35,12 @@ macro_rules! eprintln {
 #[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sinomo_agent::{
-    AgentLoopInput, BoundedContextBuilder, ConfigAgentToolConfig, EventEnvelopeExt,
-    InteractionModel, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, MainAgentLoop, interaction_event, interaction_model_request,
-    user_interaction_input_event,
+    Agent, AgentDefinition, AgentEventPayload, AgentLoopDecision, AgentLoopInput, AgentModelEvent,
+    AgentOp, AgentRole, AgentRuntimeEvent, AgentRuntimeEventCursor, AgentRuntimeEventPayload,
+    AgentSession, AgentSessionRuntime, AgentToolProgressEvent, BoundedContextBuilder,
+    ConfigAgentToolConfig, EventEnvelopeExt, InteractionModel, InteractionOutput,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, interaction_event,
+    interaction_model_request, user_interaction_input_event,
 };
 use sinomo_evolution::{
     BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
@@ -1269,9 +1271,38 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         runtime_config,
         managed_pytorch: Mutex::new(None),
     };
-    let decision = MainAgentLoop::new(loop_model, provider, model)
+    let agent = Agent::new(loop_model, provider, model)
+        .with_agent_definition(AgentDefinition::main())
         .with_tool_registry(tool_registry)
-        .decide(&input)?;
+        .with_policy(sinomo_agent::AgentPolicyBundle::default_for_role(
+            AgentRole::Main,
+        ));
+    let runtime = AgentSessionRuntime::new(
+        agent,
+        AgentSession::new(input.session.session_id.clone(), AgentRole::Main),
+    );
+    let op = AgentOp::start_turn(input);
+    let op_id = op.op_id.clone();
+    let submit = runtime.submit_op(op)?;
+    if !submit.accepted {
+        let reason = submit
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                AgentEventPayload::OperationRejected { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "main agent turn was rejected".to_string());
+        return Err(CliError::Parse { detail: reason });
+    }
+    runtime.join_active_turn()?;
+    let decision = runtime
+        .turn_result(&op_id)?
+        .and_then(|outcome| outcome.run)
+        .map(|run| run.final_decision)
+        .ok_or_else(|| CliError::Parse {
+            detail: format!("main agent runtime turn `{op_id}` completed without a decision"),
+        })?;
     if decision.text.trim().is_empty() {
         println!("{}", agent_decision_json(&decision)?);
     } else {

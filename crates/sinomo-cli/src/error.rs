@@ -101,6 +101,10 @@ impl From<sinomo_agent::AgentError> for CliError {
                 path: "agent session store".to_string(),
                 detail,
             },
+            sinomo_agent::AgentError::Runtime { detail } => Self::Io {
+                path: "agent runtime".to_string(),
+                detail,
+            },
         }
     }
 }

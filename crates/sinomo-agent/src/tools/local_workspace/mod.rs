@@ -1,6 +1,5 @@
 mod apply_patch;
 mod changed_files;
-mod command_session;
 mod git_diff;
 mod list_files;
 mod read_file;
@@ -11,18 +10,18 @@ mod search;
 use super::{
     AGENT_CODING_EVIDENCE_KIND, AgentCodingToolEvidence, AgentCommandOutput, AgentTool,
     AgentToolArtifactRef, AgentToolCapability, AgentToolDescriptor, AgentToolEvidence,
-    AgentToolProviderSpec, AgentToolRegistry, AgentToolResult, AgentToolStatus,
+    AgentToolProgressEvent, AgentToolProgressSink, AgentToolProviderSpec, AgentToolRegistry,
+    AgentToolResult, AgentToolStatus,
 };
 use crate::{
+    AgentCancellationToken, AgentProcessLifecycleStatus, AgentProcessManager, AgentProcessStart,
     AgentStoragePaths, AgentToolCall, AgentToolKind, AgentToolSpec, TaskId,
     default_coding_agent_tools,
 };
 use sinomo_runtime::events::SessionId;
 use sinomo_runtime::local::SinomoDataDir;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const DEFAULT_LOCAL_MAX_READ_BYTES: usize = 64 * 1024;
@@ -126,7 +125,6 @@ impl LocalWorkspaceAgentConfig {
 }
 
 pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
-    let command_sessions = command_session::CommandSessionStore::new();
     AgentToolRegistry::new()
         .with_tool(read_file::ReadFileTool::new(config.clone()))
         .with_tool(list_files::ListFilesTool::new(config.clone()))
@@ -135,22 +133,6 @@ pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
         .with_tool(changed_files::ChangedFilesTool::new(config.clone()))
         .with_tool(git_diff::GitDiffTool::new(config.clone()))
         .with_tool(run_command::RunCommandTool::new(config.clone()))
-        .with_tool(command_session::StartCommandSessionTool::new(
-            config.clone(),
-            command_sessions.clone(),
-        ))
-        .with_tool(command_session::InspectCommandSessionTool::new(
-            config.clone(),
-            command_sessions.clone(),
-        ))
-        .with_tool(command_session::WriteCommandStdinTool::new(
-            config.clone(),
-            command_sessions.clone(),
-        ))
-        .with_tool(command_session::CancelCommandSessionTool::new(
-            config.clone(),
-            command_sessions,
-        ))
         .with_tool(request_user_input::RequestUserInputTool)
 }
 
@@ -163,10 +145,6 @@ pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
         changed_files::descriptor(),
         git_diff::descriptor(),
         run_command::descriptor(),
-        command_session::start_descriptor(),
-        command_session::inspect_descriptor(),
-        command_session::write_stdin_descriptor(),
-        command_session::cancel_descriptor(),
         request_user_input::descriptor(),
     ]
 }
@@ -209,6 +187,8 @@ struct LocalCommandOptions {
 fn local_run_command_from_call(
     config: &LocalWorkspaceAgentConfig,
     call: &AgentToolCall,
+    cancellation_token: AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
 ) -> AgentToolResult {
     local_shell_command_from_call(
         config,
@@ -216,6 +196,8 @@ fn local_run_command_from_call(
         "run_command",
         None,
         "command execution allowed by local workspace policy",
+        cancellation_token,
+        progress_sink,
     )
 }
 
@@ -225,6 +207,8 @@ fn local_shell_command_from_call(
     tool_name: &str,
     default_command: Option<&str>,
     evidence_reason: &str,
+    cancellation_token: AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
 ) -> AgentToolResult {
     if !config.allow_shell_commands {
         return AgentToolResult::blocked(
@@ -262,6 +246,8 @@ fn local_shell_command_from_call(
             summary_override: Some(command),
             ..LocalCommandOptions::default()
         },
+        cancellation_token,
+        progress_sink,
     )
 }
 
@@ -303,6 +289,8 @@ fn run_local_command_with_options(
     args: Vec<String>,
     stdin: Option<&[u8]>,
     options: LocalCommandOptions,
+    cancellation_token: AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
 ) -> AgentToolResult {
     let execution = match execute_local_command(
         config,
@@ -311,6 +299,8 @@ fn run_local_command_with_options(
         stdin,
         options.timeout_ms,
         options.cwd.as_deref(),
+        &cancellation_token,
+        progress_sink,
     ) {
         Ok(output) => output,
         Err(result) => return result,
@@ -323,6 +313,7 @@ fn run_local_command_with_options(
         &args,
         &execution.output,
         execution.timed_out,
+        execution.cancelled,
         execution.duration_ms,
         options.timeout_ms,
         &options.evidence_tool_name,
@@ -335,9 +326,17 @@ fn run_local_command_with_options(
 struct LocalCommandExecution {
     root: PathBuf,
     cwd: PathBuf,
-    output: Output,
+    output: LocalCommandOutput,
     timed_out: bool,
+    cancelled: bool,
     duration_ms: u64,
+}
+
+struct LocalCommandOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    status_code: Option<i32>,
+    success: bool,
 }
 
 fn execute_local_command(
@@ -347,6 +346,8 @@ fn execute_local_command(
     stdin: Option<&[u8]>,
     timeout_ms: Option<u64>,
     cwd: Option<&str>,
+    cancellation_token: &AgentCancellationToken,
+    progress_sink: AgentToolProgressSink,
 ) -> Result<LocalCommandExecution, AgentToolResult> {
     let (root, cwd) = match resolve_workspace_cwd(config, cwd) {
         Ok(paths) => paths,
@@ -357,76 +358,92 @@ fn execute_local_command(
             ));
         }
     };
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(&cwd)
-        .stdin(if stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    configure_command_process_group(&mut command);
-    let mut child = command.spawn().map_err(|source| {
-        AgentToolResult::failed(
-            format!("failed to run {program}: {source}"),
-            serde_json::json!({ "error": "command_spawn_failed", "detail": source.to_string() }),
+    let command_text = std::iter::once(program.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let manager = AgentProcessManager::new();
+    let process = manager
+        .start(
+            AgentProcessStart::new(command_text, program.to_string(), args.iter().cloned(), &cwd)
+                .with_stdin_piped(stdin.is_some())
+                .with_timeout_ms(timeout_ms)
+                .with_cancellation_token(cancellation_token.clone()),
+            config.max_command_output_bytes,
         )
-    })?;
+        .map_err(|source| {
+            AgentToolResult::failed(
+                format!("failed to run {program}: {source}"),
+                serde_json::json!({ "error": "command_spawn_failed", "detail": source.to_string() }),
+            )
+        })?;
+    progress_sink.emit(AgentToolProgressEvent::ProcessStarted {
+        process: process.clone(),
+    });
     if let Some(stdin) = stdin {
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin).map_err(|source| {
+        manager
+            .write_stdin(&process.process_id, stdin, true)
+            .map_err(|source| {
                 AgentToolResult::failed(
                     format!("failed to write stdin for {program}: {source}"),
                     serde_json::json!({ "error": "command_stdin_failed", "detail": source.to_string() }),
                 )
             })?;
-        }
     }
     let started = Instant::now();
-    let timed_out = if let Some(timeout_ms) = timeout_ms {
-        wait_for_child_or_timeout(&mut child, timeout_ms).map_err(|source| {
-            AgentToolResult::failed(
-                format!("failed to wait for {program}: {source}"),
-                serde_json::json!({ "error": "command_wait_failed", "detail": source.to_string() }),
+    let mut stdout_offset = 0usize;
+    let mut stderr_offset = 0usize;
+    let final_snapshot = loop {
+        let snapshot = manager
+            .snapshot(
+                &process.process_id,
+                stdout_offset,
+                stderr_offset,
+                config.max_command_output_bytes,
             )
-        })?
-    } else {
-        false
+            .map_err(|source| {
+                AgentToolResult::failed(
+                    format!("failed to inspect {program}: {source}"),
+                    serde_json::json!({ "error": "command_inspect_failed", "detail": source.to_string() }),
+                )
+            })?;
+        if !snapshot.stdout.is_empty() || !snapshot.stderr.is_empty() {
+            progress_sink.emit(AgentToolProgressEvent::ProcessOutput {
+                process: snapshot.clone(),
+            });
+        }
+        stdout_offset = snapshot.stdout_offset;
+        stderr_offset = snapshot.stderr_offset;
+        if snapshot.status != AgentProcessLifecycleStatus::Running {
+            progress_sink.emit(AgentToolProgressEvent::ProcessCompleted {
+                process: snapshot.clone(),
+            });
+            break snapshot;
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
-    let output = child.wait_with_output().map_err(|source| {
-        AgentToolResult::failed(
-            format!("failed to wait for {program}: {source}"),
-            serde_json::json!({ "error": "command_wait_failed", "detail": source.to_string() }),
-        )
-    })?;
+    let full_snapshot = manager
+        .snapshot(&process.process_id, 0, 0, usize::MAX)
+        .unwrap_or(final_snapshot);
+    let timed_out = full_snapshot.timed_out;
+    let cancelled = full_snapshot.cancel_requested
+        || full_snapshot.status == AgentProcessLifecycleStatus::Cancelled;
+    let success = full_snapshot.status == AgentProcessLifecycleStatus::Completed;
+    let status_code = full_snapshot.exit_code;
+    let output = LocalCommandOutput {
+        stdout: full_snapshot.stdout.into_bytes(),
+        stderr: full_snapshot.stderr.into_bytes(),
+        status_code,
+        success,
+    };
     Ok(LocalCommandExecution {
         root,
         cwd,
         output,
         timed_out,
+        cancelled,
         duration_ms: duration_ms_from_elapsed(started.elapsed()),
     })
-}
-
-fn wait_for_child_or_timeout(
-    child: &mut std::process::Child,
-    timeout_ms: u64,
-) -> Result<bool, std::io::Error> {
-    let timeout = Duration::from_millis(timeout_ms);
-    let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(false);
-        }
-        if started.elapsed() >= timeout {
-            let _ = terminate_child_process_tree(child);
-            return Ok(true);
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn duration_ms_from_elapsed(elapsed: Duration) -> u64 {
@@ -442,73 +459,15 @@ fn aggregate_command_output(stdout: &str, stderr: &str) -> String {
     }
 }
 
-#[cfg(unix)]
-fn configure_command_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-
-    unsafe {
-        command.pre_exec(|| {
-            if set_process_group(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(unix))]
-fn configure_command_process_group(_command: &mut Command) {}
-
-#[cfg(unix)]
-fn terminate_child_process_tree(child: &mut Child) -> bool {
-    let target_process_group = -(child.id() as i32);
-    if send_signal(target_process_group, 9) == 0 {
-        true
-    } else {
-        child.kill().is_ok()
-    }
-}
-
-#[cfg(windows)]
-fn terminate_child_process_tree(child: &mut Child) -> bool {
-    let pid = child.id().to_string();
-    let killed_tree = Command::new("taskkill")
-        .args(["/PID", pid.as_str(), "/T", "/F"])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-    killed_tree || child.kill().is_ok()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn terminate_child_process_tree(child: &mut Child) -> bool {
-    child.kill().is_ok()
-}
-
-#[cfg(unix)]
-fn send_signal(pid: i32, signal: i32) -> i32 {
-    unsafe extern "C" {
-        fn kill(pid: i32, sig: i32) -> i32;
-    }
-    unsafe { kill(pid, signal) }
-}
-
-#[cfg(unix)]
-fn set_process_group(pid: i32, pgid: i32) -> i32 {
-    unsafe extern "C" {
-        fn setpgid(pid: i32, pgid: i32) -> i32;
-    }
-    unsafe { setpgid(pid, pgid) }
-}
-
 fn local_command_result_from_output(
     config: &LocalWorkspaceAgentConfig,
     root: PathBuf,
     cwd: PathBuf,
     program: &str,
     args: &[String],
-    output: &Output,
+    output: &LocalCommandOutput,
     timed_out: bool,
+    cancelled: bool,
     duration_ms: u64,
     timeout_ms: Option<u64>,
     evidence_tool_name: &str,
@@ -518,8 +477,8 @@ fn local_command_result_from_output(
 ) -> AgentToolResult {
     let stdout = truncate_utf8_lossy(&output.stdout, config.max_command_output_bytes);
     let stderr = truncate_utf8_lossy(&output.stderr, config.max_command_output_bytes);
-    let status = output.status.code();
-    let succeeded = !timed_out && output.status.success();
+    let status = output.status_code;
+    let succeeded = !timed_out && !cancelled && output.success;
     let cwd_display = display_workspace_path(config, &cwd);
     let stdout_ref = if stdout.truncated {
         write_local_evidence(config, evidence_tool_name, "stdout.txt", &output.stdout).map(|uri| {
@@ -559,6 +518,8 @@ fn local_command_result_from_output(
             args.join(" "),
             timeout_ms.unwrap_or_default()
         )
+    } else if cancelled {
+        format!("{} {} cancelled", program, args.join(" "))
     } else {
         summary_override
             .map(|summary| {
@@ -577,6 +538,7 @@ fn local_command_result_from_output(
         "status": status,
         "success": succeeded,
         "timed_out": timed_out,
+        "cancelled": cancelled,
         "duration_ms": duration_ms,
         "timeout_ms": timeout_ms,
         "stdout": stdout.text,
@@ -596,6 +558,7 @@ fn local_command_result_from_output(
             "cwd": cwd_display,
             "duration_ms": duration_ms,
             "timed_out": timed_out,
+            "cancelled": cancelled,
             "timeout_ms": timeout_ms,
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr),
@@ -612,6 +575,7 @@ fn local_command_result_from_output(
         .with_metadata(serde_json::json!({
             "workspace_root": root.display().to_string(),
             "timed_out": timed_out,
+            "cancelled": cancelled,
             "timeout_ms": timeout_ms,
         }));
     if !changed_files.is_empty() {
@@ -635,7 +599,9 @@ fn local_command_result_from_output(
     if let Some(stderr_ref) = command_output.stderr_ref.clone() {
         evidence = evidence.with_artifact(stderr_ref);
     }
-    if succeeded {
+    if cancelled {
+        AgentToolResult::cancelled(summary, payload).with_evidence(evidence)
+    } else if succeeded {
         AgentToolResult::succeeded(summary, payload).with_evidence(evidence)
     } else {
         AgentToolResult::failed(summary, payload).with_evidence(evidence)
@@ -878,15 +844,12 @@ fn collect_workspace_search_matches(
 struct TruncatedText {
     text: String,
     truncated: bool,
-    consumed_bytes: usize,
 }
 
 fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
     let truncated = bytes.len() > max_bytes;
-    let consumed_bytes = bytes.len().min(max_bytes);
     TruncatedText {
-        text: String::from_utf8_lossy(&bytes[..consumed_bytes]).to_string(),
+        text: String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]).to_string(),
         truncated,
-        consumed_bytes,
     }
 }

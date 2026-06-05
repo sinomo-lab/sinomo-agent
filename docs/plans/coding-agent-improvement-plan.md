@@ -29,7 +29,7 @@ Current gaps:
 - The loop still relies too much on model self-control for when to stop. A correct patch can be followed by unnecessary validation and reread turns.
 - Validation state is present in tool output, but it is not yet reduced into a typed coding state machine that can distinguish patch-relevant failures from missing local dependencies or blocked environment setup.
 - Provider output discipline is uneven. A strict generic JSON decision contract is useful as a fallback, but some models need provider-specific rendering, native tool calls, or deterministic repair before consuming repeated full model turns.
-- The session runtime is still weaker than purpose-built coding agents. Codex uses an operation/event session handle, one active interruptible task, structured turn lifecycle events, and provider-native tool calls instead of a prompt-only controller.
+- The session runtime now has a first local operation/event control plane and interruptible worker handle, but host integrations still need to adopt it. TUI, RPC, benchmarks, and self-evolution should use the same async runtime rather than calling blocking turns directly.
 - Tool execution policy is not centralized enough. Coding reliability needs one place for tool visibility, approval, sandbox selection, cancellation, retry, and model-visible output shaping.
 - Repository intelligence is too thin. The model must shell out or search manually for common operations such as file-tree discovery, changed-file inspection, diff review, symbol lookup, and project check selection.
 - Editing ergonomics still favor full patches. Narrow replace-by-range or replace-exact operations would reduce patch parser friction for small changes.
@@ -471,3 +471,37 @@ When a run fails, the durable evidence should be good enough to create a follow-
 16. Rerun the current DeepSeek and Codex benchmark cases and record before/after turn, tool, event, and token deltas.
 
 This batch keeps the core architecture stable: the generic agent session runtime becomes reusable across TUI, RPC, benchmarks, and self-evolution, while coding-specific control becomes explicit, testable, and traceable.
+
+## Current Implementation Status
+
+Implemented in `sinomo-agent`:
+
+- `AgentOp` / `AgentEvent` session operations over the existing session methods.
+- `AgentSessionControlPlane` for ordered operations, one active turn, task status snapshots, progress batches, cancellation requests, timeout cleanup, terminal results, and store persistence.
+- `AgentSessionRuntime` as the first Codex-style orchestration handle: turn operations are queued quickly, executed on an interruptible worker, and observed through the same control-plane events and task snapshots.
+- `AgentRuntimeEvent` as a runtime-level event stream for worker lifecycle markers, live model progress, live tool progress, and wrapped control events.
+- `AgentCancellationToken` threaded through the model-call boundary, tool registry, and orchestrator, including progressive `tool_call` dispatch.
+- Model progress sinks threaded through the provider streaming path so runtime-backed surfaces can render assistant deltas, reasoning summaries, tool-call deltas, usage, provider errors, and aborted model calls before the turn completes.
+- Tool progress sinks threaded through the registry/orchestrator path, including progressive `tool_call`, so runtime-backed surfaces can observe live process progress without scraping stdout.
+- Local `run_command` now runs on `AgentProcessManager`, emits process start/output/completion progress, preserves stdout/stderr evidence, and reports explicit cancelled tool results separate from timeouts.
+- `AgentProcessManager` as the reusable process/session substrate for spawned commands, stdin writes, output snapshots, timeout state, and cancellation.
+- The old command-session compatibility tools were retired; command lifecycle now goes through `run_command` plus runtime/tool progress events and the reusable `AgentProcessManager` substrate.
+- `FileAgentSessionStore::subscribe_records` for clone-shared live delivery of newly appended session store records while retaining JSONL persistence as the durable source of truth.
+- Completed runtime outcomes are addressable by operation id so hosts can submit a turn asynchronously, join or poll it, and retrieve the terminal `AgentRun` without falling back to direct blocking turn calls.
+- The full ratatui chat path and the line-oriented TUI handler construction now use `AgentSessionRuntime` for normal model turns. Model deltas and process output are rendered as live stream text, usage updates are folded into the status bar, and Ctrl+C interrupts an active runtime task before falling back to quit.
+- The explicit `sinomo agent run` main-agent prompt path now submits through `AgentSessionRuntime` instead of calling the legacy `MainAgentLoop` decision helper directly.
+- The old TUI `MainAgentInteractionHandler` implementation was removed from `sinomo-cli`; runtime-backed orchestration is now the only main-agent TUI handler.
+- The SWE-bench coding-agent runner submits initial and repair turns through `AgentSessionRuntime`, then records the completed `AgentRun` through runtime outcome lookup.
+- The self-evolution mutation worker submits evolution turns through `AgentSessionRuntime`, preserving the same orchestration, cancellation, event, and terminal-result path used by TUI and benchmarks.
+- SWE-bench report and suite-summary counters for command-observation turns, command tool calls, cancellations, cancelled runs, and extra model turns after the first successful patch.
+- Fake-model regression coverage for async runtime interruption of an active shell command.
+- Direct process-manager regression coverage for stdin, stdout/stderr observation, and cancellation.
+- File session-store regression coverage for matching-session live record delivery.
+- Runtime regression coverage for cancelling while a model call is active, producing a cancelled turn instead of a worker failure.
+- TUI regression coverage for runtime-backed chat submission, terminal decision rendering, live command/model progress, and interrupt versus quit behavior.
+
+Next-stage hardening after this Codex-style orchestration slice:
+
+- Publish the same runtime task/event/terminal-result surface through daemon RPC so remote clients can inspect, steer, interrupt, and resume agent work without embedding the runtime in-process.
+- Persist active async task handles and resume/inspect metadata across process restarts. The local runtime now has the control-plane shape, but restart recovery still needs a host-owned task registry and reattachment policy.
+- Extend cancellation beyond foreground local commands to remote tools, sandbox execution, and host-provided tool gateways.

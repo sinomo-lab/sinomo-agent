@@ -1,5 +1,6 @@
 use super::*;
 use std::path::Component;
+use std::process::{Command, Output};
 
 #[derive(Clone)]
 pub(super) struct GitDiffTool {
