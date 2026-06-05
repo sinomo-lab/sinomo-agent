@@ -813,6 +813,37 @@ fn iroh_daemon_proxy_restart_backoff_grows_and_caps() {
 }
 
 #[test]
+fn iroh_daemon_proxy_restart_delay_adds_bounded_node_jitter() {
+    let node_a = NodeId::from_legacy_named("node_iroh_restart_jitter_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_iroh_restart_jitter_b").expect("node b");
+    let failures = 3;
+    let base = crate::roaming::iroh_daemon_proxy_restart_backoff(failures);
+    let jitter_max = crate::roaming::IROH_DAEMON_PROXY_RESTART_JITTER_MAX
+        .min(Duration::from_millis((base.as_millis() / 10) as u64));
+
+    let delay_a = crate::roaming::iroh_daemon_proxy_restart_delay(failures, &node_a);
+    let delay_b = crate::roaming::iroh_daemon_proxy_restart_delay(failures, &node_b);
+
+    assert_eq!(
+        delay_a,
+        crate::roaming::iroh_daemon_proxy_restart_delay(failures, &node_a),
+        "restart jitter must be deterministic for a given node and failure count"
+    );
+    assert!(
+        delay_a >= base && delay_a <= base + jitter_max,
+        "restart delay should stay inside the bounded jitter window"
+    );
+    assert!(
+        delay_b >= base && delay_b <= base + jitter_max,
+        "restart delay should stay inside the bounded jitter window"
+    );
+    assert_ne!(
+        delay_a, delay_b,
+        "different nodes should not reconnect in lockstep after proxy failures"
+    );
+}
+
+#[test]
 fn iroh_daemon_proxy_admission_limit_releases_permits() {
     assert!(crate::roaming::IROH_DAEMON_PROXY_MAX_CONNECTIONS >= 2);
     assert!(
@@ -3053,6 +3084,52 @@ fn public_ip_discovery_caches_non_empty_deferred_result() {
         "a successful first public-IP service should be reused even if later DNS work was deferred"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
+fn public_ip_discovery_partial_deferred_cache_expires_quickly() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let partial = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Deferred(vec!["203.0.113.20".parse().expect("ip")])
+        },
+    );
+    let cached = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.21".parse().expect("ip")])
+        },
+    );
+    crate::lan::age_public_ip_discovery_cache_for_test(
+        crate::lan::PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL + Duration::from_millis(1),
+    );
+    let refreshed = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        std::iter::empty(),
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.22".parse().expect("ip")])
+        },
+    );
+
+    assert_eq!(partial, vec!["203.0.113.20".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        cached, partial,
+        "partial public-IP discovery should still be reused briefly to avoid tight retry loops"
+    );
+    assert_eq!(
+        refreshed,
+        vec!["203.0.113.22".parse::<IpAddr>().expect("ip")],
+        "partial discovery should refresh sooner than fully completed public-IP discovery"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     crate::lan::clear_public_ip_discovery_cache();
 }
 

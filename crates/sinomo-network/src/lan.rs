@@ -12,6 +12,7 @@ use std::time::Instant;
 const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(crate) const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30);
+pub(crate) const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
 const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_PUBLIC_IP_DNS_WORKERS: usize = 2;
@@ -32,12 +33,15 @@ struct LocalIpDiscoveryCacheEntry {
 struct PublicIpDiscoveryCacheEntry {
     checked_at: Instant,
     candidates: Vec<IpAddr>,
+    complete: bool,
 }
 
 impl PublicIpDiscoveryCacheEntry {
     fn ttl(&self) -> Duration {
         if self.candidates.is_empty() {
             PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL
+        } else if !self.complete {
+            PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL
         } else {
             PUBLIC_IP_DISCOVERY_CACHE_TTL
         }
@@ -251,12 +255,12 @@ fn cached_default_public_ip_candidates_for_key_with(
         return entry.candidates.clone();
     }
     let result = discover();
-    let candidates = match result {
-        PublicIpDiscoveryResult::Complete(candidates) => candidates,
+    let (candidates, complete) = match result {
+        PublicIpDiscoveryResult::Complete(candidates) => (candidates, true),
         PublicIpDiscoveryResult::Deferred(candidates) if candidates.is_empty() => {
             return candidates;
         }
-        PublicIpDiscoveryResult::Deferred(candidates) => candidates,
+        PublicIpDiscoveryResult::Deferred(candidates) => (candidates, false),
     };
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
         if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES {
@@ -275,6 +279,7 @@ fn cached_default_public_ip_candidates_for_key_with(
             PublicIpDiscoveryCacheEntry {
                 checked_at: now,
                 candidates: candidates.clone(),
+                complete,
             },
         );
     }

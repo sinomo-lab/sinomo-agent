@@ -705,6 +705,12 @@ impl KvWalPaths {
         })
     }
 
+    pub fn has_durable_state(&self) -> Result<bool, KvError> {
+        Ok(path_exists(&self.hard_state)?
+            || path_exists(&self.wal)?
+            || path_exists(&self.snapshot)?)
+    }
+
     /// Reads only the persisted hard state (term/vote/leader/commit) without
     /// opening the full raft node. Opening the node replays the entire WAL — up to
     /// the retained tail, ~MBs — which is wasteful for read-only leadership/term
@@ -784,6 +790,17 @@ fn file_ino(metadata: &fs::Metadata) -> u64 {
     {
         let _ = metadata;
         0
+    }
+}
+
+fn path_exists(path: &Path) -> Result<bool, KvError> {
+    match fs::metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
     }
 }
 
@@ -935,7 +952,7 @@ impl KvMaterializedCache {
         node_id: NodeId,
         paths: KvWalPaths,
     ) -> Result<Arc<KvSnapshot>, KvError> {
-        if paths.root.exists() {
+        if paths.has_durable_state()? {
             if let Some(identity) = raft_view_identity(&paths)
                 && let Some(snapshot) = cache_lookup_raft_view(&paths, identity)
             {
@@ -6675,6 +6692,79 @@ mod tests {
             .expect("open with cache");
         assert_eq!(node.last_log_index(), 1);
         assert!(node.store().get("/cache").is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_current_snapshot_does_not_initialize_empty_raft_root() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-empty-raft-read-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_empty_raft_read_only").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        let wal_paths = cache.raft_wal_paths(&node_id);
+        std::fs::create_dir_all(&wal_paths.root).expect("empty raft root");
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/cached", b"available".to_vec(), None)
+            .expect("seed cache");
+        cache
+            .write_snapshot(&store.snapshot())
+            .expect("write materialized cache");
+
+        let snapshot = cache
+            .current_snapshot_arc(node_id)
+            .expect("read current snapshot");
+        assert_eq!(
+            snapshot.get("/cached").expect("cached value").value,
+            b"available"
+        );
+        assert!(!wal_paths.lock.exists(), "read should not create raft lock");
+        assert!(
+            !wal_paths.hard_state.exists(),
+            "read should not create raft hard state"
+        );
+        assert!(!wal_paths.wal.exists(), "read should not create raft wal");
+        assert!(
+            !wal_paths.snapshot.exists(),
+            "read should not create raft snapshot"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cache_empty_snapshot_does_not_initialize_empty_raft_root() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-empty-raft-empty-read-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_empty_raft_empty_read_only").expect("node");
+        let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
+        let wal_paths = cache.raft_wal_paths(&node_id);
+        std::fs::create_dir_all(&wal_paths.root).expect("empty raft root");
+
+        let snapshot = cache
+            .current_snapshot_arc(node_id)
+            .expect("read empty current snapshot");
+        assert_eq!(snapshot.entries.len(), 0);
+        assert!(!wal_paths.lock.exists(), "read should not create raft lock");
+        assert!(
+            !wal_paths.hard_state.exists(),
+            "read should not create raft hard state"
+        );
+        assert!(!wal_paths.wal.exists(), "read should not create raft wal");
+        assert!(
+            !wal_paths.snapshot.exists(),
+            "read should not create raft snapshot"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
