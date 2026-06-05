@@ -76,6 +76,14 @@ pub struct CloudFilesModuleError {
     pub detail: String,
 }
 
+impl std::fmt::Display for CloudFilesModuleError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for CloudFilesModuleError {}
+
 fn default_provider_name() -> String {
     "Sinomo SIFS".to_string()
 }
