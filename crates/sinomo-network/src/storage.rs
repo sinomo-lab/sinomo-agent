@@ -8,7 +8,7 @@ use crate::{
 };
 use fs2::FileExt;
 use sinomo_kv::cluster_member_key;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -40,7 +40,7 @@ pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_POSITIVE_CACHE_TTL: Duration =
     Duration::from_secs(60);
 pub(crate) const PUBLIC_ENDPOINT_REACHABILITY_NEGATIVE_CACHE_TTL: Duration =
     Duration::from_secs(10);
-const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
+pub(crate) const MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES: usize = 128;
 const CLUSTER_NETWORK_EXPIRY_GRACE_SECONDS: i64 = 600;
 const CLUSTER_CONNECTIVITY_UNAVAILABLE_AFTER_FAILURES: u16 = 3;
 pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
@@ -91,9 +91,11 @@ static CLUSTER_KV_WATCH_ALLOCATOR_PERSIST_FAILURES_FOR_TEST: LazyLock<
 #[cfg(test)]
 static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<
-    Mutex<HashMap<PublicEndpointReachabilityCacheKey, PublicEndpointReachabilityCacheEntry>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PUBLIC_ENDPOINT_REACHABILITY_CACHE: LazyLock<Mutex<PublicEndpointReachabilityCache>> =
+    LazyLock::new(|| Mutex::new(PublicEndpointReachabilityCache::default()));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClusterFileMark {
@@ -130,6 +132,7 @@ struct ClusterKvWatchNotifierEntry {
 #[derive(Clone)]
 struct LocalClusterConnectivityRecordCacheEntry {
     records: Vec<ClusterConnectivityRecord>,
+    earliest_expires_at: Option<OffsetDateTime>,
     last_used: u64,
 }
 
@@ -153,7 +156,13 @@ struct PublicEndpointReachabilityCacheEntry {
     reachable: bool,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Default)]
+struct PublicEndpointReachabilityCache {
+    entries: HashMap<PublicEndpointReachabilityCacheKey, PublicEndpointReachabilityCacheEntry>,
+    expiry_index: BTreeMap<Instant, BTreeSet<PublicEndpointReachabilityCacheKey>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct PublicEndpointReachabilityCacheKey {
     address: SocketAddr,
     local_network: Vec<IpAddr>,
@@ -170,6 +179,114 @@ impl PublicEndpointReachabilityCacheEntry {
 
     fn is_fresh_at(&self, now: Instant) -> bool {
         now.duration_since(self.checked_at) < self.ttl()
+    }
+
+    fn expires_at(&self) -> Instant {
+        self.checked_at
+            .checked_add(self.ttl())
+            .unwrap_or(self.checked_at)
+    }
+}
+
+impl PublicEndpointReachabilityCache {
+    fn get_fresh(&self, key: &PublicEndpointReachabilityCacheKey, now: Instant) -> Option<bool> {
+        let entry = self.entries.get(key)?;
+        entry.is_fresh_at(now).then_some(entry.reachable)
+    }
+
+    fn insert(
+        &mut self,
+        key: PublicEndpointReachabilityCacheKey,
+        entry: PublicEndpointReachabilityCacheEntry,
+        now: Instant,
+    ) {
+        self.remove(&key);
+        self.expire_stale_at(now);
+        while self.entries.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES {
+            if !self.evict_next_expiring() {
+                break;
+            }
+        }
+        self.insert_expiry_index_entry(&key, &entry);
+        self.entries.insert(key, entry);
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.expiry_index.clear();
+    }
+
+    fn expire_stale_at(&mut self, now: Instant) {
+        while let Some((expires_at, _)) = self.expiry_index.first_key_value() {
+            if *expires_at > now {
+                break;
+            }
+            let expires_at = *expires_at;
+            let Some(keys) = self.expiry_index.remove(&expires_at) else {
+                break;
+            };
+            for key in keys {
+                if self
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| entry.expires_at() <= now)
+                {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn evict_next_expiring(&mut self) -> bool {
+        loop {
+            let Some((expires_at, _)) = self.expiry_index.first_key_value() else {
+                return false;
+            };
+            let expires_at = *expires_at;
+            let Some(keys) = self.expiry_index.get_mut(&expires_at) else {
+                return false;
+            };
+            let Some(key) = keys.pop_first() else {
+                self.expiry_index.remove(&expires_at);
+                continue;
+            };
+            if keys.is_empty() {
+                self.expiry_index.remove(&expires_at);
+            }
+            if self.entries.remove(&key).is_some() {
+                return true;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &PublicEndpointReachabilityCacheKey) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.remove_expiry_index_entry(key, entry.expires_at());
+        }
+    }
+
+    fn insert_expiry_index_entry(
+        &mut self,
+        key: &PublicEndpointReachabilityCacheKey,
+        entry: &PublicEndpointReachabilityCacheEntry,
+    ) {
+        self.expiry_index
+            .entry(entry.expires_at())
+            .or_default()
+            .insert(key.clone());
+    }
+
+    fn remove_expiry_index_entry(&mut self, key: &PublicEndpointReachabilityCacheKey, at: Instant) {
+        let should_remove_bucket = if let Some(keys) = self.expiry_index.get_mut(&at) {
+            keys.remove(key);
+            keys.is_empty()
+        } else {
+            false
+        };
+        if should_remove_bucket {
+            self.expiry_index.remove(&at);
+        }
     }
 }
 
@@ -775,6 +892,22 @@ pub(crate) fn local_cluster_connectivity_record_cache_contains_for_test(
         .lock()
         .map(|cache| cache.contains_key(&paths.root))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) {
+    if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
+        passes.remove(&paths.root);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPaths) -> u64 {
+    LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|passes| passes.get(&paths.root).copied())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -4258,17 +4391,19 @@ pub fn read_local_cluster_connectivity_records(
     let Some(entry) = cache.get_mut(&paths.root) else {
         return Ok(Vec::new());
     };
-    entry
-        .records
-        .retain(|record| cluster_network_record_live(record.expires_at, now));
-    if entry.records.is_empty() {
+    prune_expired_local_cluster_connectivity_cache_entry(&paths.root, entry, now);
+    let records = if entry.records.is_empty() {
+        None
+    } else {
+        entry.last_used = local_cluster_connectivity_cache_tick();
+        let mut records = entry.records.clone();
+        sort_cluster_connectivity_records(&mut records);
+        Some(records)
+    };
+    if records.is_none() {
         cache.remove(&paths.root);
-        return Ok(Vec::new());
     }
-    entry.last_used = local_cluster_connectivity_cache_tick();
-    let mut records = entry.records.clone();
-    sort_cluster_connectivity_records(&mut records);
-    Ok(records)
+    Ok(records.unwrap_or_default())
 }
 
 pub fn write_local_cluster_connectivity_records(
@@ -4313,14 +4448,44 @@ fn local_cluster_connectivity_cache_tick() -> u64 {
     LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
+fn earliest_cluster_connectivity_expiry(
+    records: &[ClusterConnectivityRecord],
+) -> Option<OffsetDateTime> {
+    records.iter().map(|record| record.expires_at).min()
+}
+
+#[cfg(test)]
+fn record_local_cluster_connectivity_prune_pass_for_test(path: &PathBuf) {
+    if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
+        *passes.entry(path.clone()).or_default() += 1;
+    }
+}
+
+fn prune_expired_local_cluster_connectivity_cache_entry(
+    _path: &PathBuf,
+    entry: &mut LocalClusterConnectivityRecordCacheEntry,
+    now: OffsetDateTime,
+) {
+    if !entry
+        .earliest_expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return;
+    }
+    #[cfg(test)]
+    record_local_cluster_connectivity_prune_pass_for_test(_path);
+    entry
+        .records
+        .retain(|record| cluster_network_record_live(record.expires_at, now));
+    entry.earliest_expires_at = earliest_cluster_connectivity_expiry(&entry.records);
+}
+
 fn prune_expired_local_cluster_connectivity_cache_entries(
     cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
     now: OffsetDateTime,
 ) {
-    cache.retain(|_, entry| {
-        entry
-            .records
-            .retain(|record| cluster_network_record_live(record.expires_at, now));
+    cache.retain(|path, entry| {
+        prune_expired_local_cluster_connectivity_cache_entry(path, entry, now);
         !entry.records.is_empty()
     });
 }
@@ -4353,6 +4518,7 @@ fn store_local_cluster_connectivity_cache_entry(
     cache.insert(
         key,
         LocalClusterConnectivityRecordCacheEntry {
+            earliest_expires_at: earliest_cluster_connectivity_expiry(&records),
             records,
             last_used: local_cluster_connectivity_cache_tick(),
         },
@@ -4374,10 +4540,17 @@ fn write_local_cluster_connectivity_records_inner(
                 operation: "lock local cluster connectivity cache".to_string(),
                 detail: error.to_string(),
             })?;
-    let existing_records = cache
-        .get(&paths.root)
-        .map(|entry| entry.records.clone())
-        .unwrap_or_default();
+    let existing_records = if let Some(entry) = cache.get_mut(&paths.root) {
+        prune_expired_local_cluster_connectivity_cache_entry(&paths.root, entry, now);
+        if entry.records.is_empty() {
+            cache.remove(&paths.root);
+            Vec::new()
+        } else {
+            entry.records.clone()
+        }
+    } else {
+        Vec::new()
+    };
     let mut merged = existing_records
         .iter()
         .filter(|record| {
@@ -5493,30 +5666,19 @@ pub(crate) fn public_endpoint_is_reachable_for_local_ips_with_probe_at(
         local_network: local_network_cache_key(local_ips),
     };
     if let Ok(cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock()
-        && let Some(entry) = cache.get(&cache_key)
-        && entry.is_fresh_at(now)
+        && let Some(reachable) = cache.get_fresh(&cache_key, now)
     {
-        return entry.reachable;
+        return reachable;
     }
     let reachable = probe(address);
     if let Ok(mut cache) = PUBLIC_ENDPOINT_REACHABILITY_CACHE.lock() {
-        if cache.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES {
-            cache.retain(|_, entry| entry.is_fresh_at(now));
-        }
-        if cache.len() >= MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.checked_at)
-                .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest);
-        }
         cache.insert(
             cache_key,
             PublicEndpointReachabilityCacheEntry {
                 checked_at: now,
                 reachable,
             },
+            now,
         );
     }
     reachable

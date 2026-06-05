@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use crate::storage::{
     MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, MAX_CLUSTER_KV_ACTIVE_WATCHES,
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
+    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
 };
 use crate::*;
 
@@ -1785,14 +1785,25 @@ fn local_connectivity_cache_retains_recent_root_under_path_churn() {
         "hot root should be present before capacity churn"
     );
 
+    reset_local_cluster_connectivity_prune_passes_for_test(&hot_paths);
     assert_eq!(
         read_local_cluster_connectivity_records(&hot_paths).expect("refresh hot root"),
         vec![record.clone()],
         "reading the hot root should refresh its cache recency"
     );
+    assert_eq!(
+        local_cluster_connectivity_prune_passes_for_test(&hot_paths),
+        0,
+        "fresh local connectivity reads should not scan cached records for expiry before the earliest deadline"
+    );
     let extra_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra")));
     write_local_cluster_connectivity_records(&extra_paths, &node_a, std::slice::from_ref(&record))
         .expect("write extra connectivity");
+    assert_eq!(
+        local_cluster_connectivity_prune_passes_for_test(&hot_paths),
+        0,
+        "unrelated local connectivity writes should skip stable cached roots until an expiry deadline is due"
+    );
 
     assert!(
         local_cluster_connectivity_record_cache_contains_for_test(&hot_paths),
@@ -3216,6 +3227,73 @@ fn public_ip_discovery_partial_deferred_cache_expires_quickly() {
 }
 
 #[test]
+fn public_ip_discovery_cache_evicts_soonest_expiring_result_at_capacity() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    for index in 0..crate::lan::MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES.saturating_sub(1) {
+        let local_ip: IpAddr = format!("10.10.0.{}", index + 1).parse().expect("ip");
+        let public_ip: IpAddr = format!("203.0.113.{}", index + 30).parse().expect("ip");
+        let result =
+            crate::lan::cached_default_public_ip_candidates_for_local_ips_with([local_ip], || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::lan::PublicIpDiscoveryResult::Complete(vec![public_ip])
+            });
+        assert_eq!(result, vec![public_ip]);
+    }
+
+    let partial_local: IpAddr = "10.10.1.1".parse().expect("ip");
+    let partial =
+        crate::lan::cached_default_public_ip_candidates_for_local_ips_with([partial_local], || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Deferred(vec!["203.0.113.90".parse().expect("ip")])
+        });
+    assert_eq!(partial, vec!["203.0.113.90".parse::<IpAddr>().expect("ip")]);
+
+    let new_local: IpAddr = "10.10.2.1".parse().expect("ip");
+    let inserted =
+        crate::lan::cached_default_public_ip_candidates_for_local_ips_with([new_local], || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.91".parse().expect("ip")])
+        });
+    assert_eq!(
+        inserted,
+        vec!["203.0.113.91".parse::<IpAddr>().expect("ip")]
+    );
+
+    let retained = crate::lan::cached_default_public_ip_candidates_for_local_ips_with(
+        ["10.10.0.1".parse().expect("ip")],
+        || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.92".parse().expect("ip")])
+        },
+    );
+    let refreshed_partial =
+        crate::lan::cached_default_public_ip_candidates_for_local_ips_with([partial_local], || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::lan::PublicIpDiscoveryResult::Complete(vec!["203.0.113.93".parse().expect("ip")])
+        });
+
+    assert_eq!(
+        retained,
+        vec!["203.0.113.30".parse::<IpAddr>().expect("ip")],
+        "long-lived completed public-IP discovery should stay cached when a shorter-lived partial result can be evicted"
+    );
+    assert_eq!(
+        refreshed_partial,
+        vec!["203.0.113.93".parse::<IpAddr>().expect("ip")],
+        "evicted partial public-IP discovery should be refreshed instead of pinning stale roaming state"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        crate::lan::MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES as u64 + 2
+    );
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
 fn public_ip_discovery_empty_cache_expires_before_positive_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
@@ -3413,6 +3491,76 @@ fn public_endpoint_reachability_cache_refreshes_after_local_network_change() {
         "local network changes should force a fresh public endpoint reachability probe"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    clear_public_endpoint_reachability_cache();
+}
+
+#[test]
+fn public_endpoint_reachability_cache_evicts_soonest_expiring_result_at_capacity() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    clear_public_endpoint_reachability_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let ip = "203.0.113.17".parse().expect("ip");
+    let start = Instant::now();
+    for index in 0..MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES.saturating_sub(1) {
+        assert!(public_endpoint_is_reachable_with_probe_at(
+            ip,
+            20_000 + index as u16,
+            start,
+            |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        ));
+    }
+    assert!(!public_endpoint_is_reachable_with_probe_at(
+        ip,
+        21_000,
+        start + Duration::from_millis(1),
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        },
+    ));
+    assert!(public_endpoint_is_reachable_with_probe_at(
+        ip,
+        22_000,
+        start + Duration::from_millis(2),
+        |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        },
+    ));
+
+    assert!(
+        public_endpoint_is_reachable_with_probe_at(
+            ip,
+            20_000,
+            start + Duration::from_millis(3),
+            |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                false
+            },
+        ),
+        "positive reachability should stay cached when a shorter-lived negative result can be evicted"
+    );
+    assert!(
+        public_endpoint_is_reachable_with_probe_at(
+            ip,
+            21_000,
+            start + Duration::from_millis(4),
+            |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            },
+        ),
+        "evicted negative reachability should be reprobed instead of pinning a stale failure"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES as u64 + 2
+    );
     clear_public_endpoint_reachability_cache();
 }
 
@@ -10701,6 +10849,42 @@ fn mdns_discovery_cache_returns_lan_quic_candidates_and_expires_records() {
     assert_eq!(cache.expire_after_tick(14), 0);
     assert_eq!(cache.expire_after_tick(15), 1);
     assert!(cache.endpoint_candidates_for_node(&node_id).is_empty());
+    assert!(cache.endpoints_for_cluster(&cluster_id).is_empty());
+    assert_eq!(cache.index_record_counts_for_test(), (0, 0));
+}
+
+#[test]
+fn mdns_discovery_cache_reindexes_replaced_records() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_mdns_replace").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_mdns_replace").expect("node");
+    let mut cache = MdnsDiscoveryCache::new();
+    cache.upsert(MdnsDiscoveryRecord::lan_quic(
+        cluster_id.clone(),
+        node_id.clone(),
+        "192.168.55.20:21355",
+        10,
+        5,
+    ));
+    cache.upsert(MdnsDiscoveryRecord::lan_quic(
+        cluster_id.clone(),
+        node_id.clone(),
+        "192.168.55.20:21355",
+        100,
+        5,
+    ));
+
+    assert_eq!(
+        cache.expire_after_tick(15),
+        0,
+        "a refreshed mDNS record must not be expired by its previous deadline index"
+    );
+    assert_eq!(cache.endpoint_candidates_for_node(&node_id).len(), 1);
+    assert_eq!(cache.endpoints_for_cluster(&cluster_id).len(), 1);
+    assert_eq!(cache.index_record_counts_for_test(), (1, 1));
+    assert_eq!(cache.expire_after_tick(105), 1);
+    assert!(cache.endpoint_candidates_for_node(&node_id).is_empty());
+    assert!(cache.endpoints_for_cluster(&cluster_id).is_empty());
+    assert_eq!(cache.index_record_counts_for_test(), (0, 0));
 }
 
 #[test]
@@ -10757,6 +10941,14 @@ fn mdns_discovery_cache_evicts_oldest_records_at_capacity() {
         endpoints.len(),
         crate::lan::MAX_MDNS_DISCOVERY_RECORDS,
         "discovery cache should stay bounded under noisy LAN advertisements"
+    );
+    assert_eq!(
+        cache.index_record_counts_for_test(),
+        (
+            crate::lan::MAX_MDNS_DISCOVERY_RECORDS,
+            crate::lan::MAX_MDNS_DISCOVERY_RECORDS
+        ),
+        "node and cluster indexes must not retain evicted mDNS records"
     );
     assert!(
         endpoints

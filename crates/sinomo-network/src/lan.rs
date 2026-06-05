@@ -2,7 +2,7 @@ use crate::error::NetworkError;
 use crate::object::SinomoObjectCodec;
 use crate::peer::{NetworkFrame, PeerEndpointCandidate};
 use crate::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     LazyLock,
     atomic::{AtomicUsize, Ordering},
@@ -13,14 +13,13 @@ const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
 const PUBLIC_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(300);
 pub(crate) const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
-const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
+pub(crate) const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
 pub(crate) const MAX_PUBLIC_IP_DNS_WORKERS: usize = 2;
 static DEFAULT_LAN_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<LocalIpDiscoveryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
-static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<
-    Mutex<BTreeMap<Vec<IpAddr>, PublicIpDiscoveryCacheEntry>>,
-> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<Mutex<PublicIpDiscoveryCache>> =
+    LazyLock::new(|| Mutex::new(PublicIpDiscoveryCache::default()));
 static PUBLIC_IP_DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
@@ -36,6 +35,12 @@ struct PublicIpDiscoveryCacheEntry {
     complete: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PublicIpDiscoveryCache {
+    entries: BTreeMap<Vec<IpAddr>, PublicIpDiscoveryCacheEntry>,
+    expiry_index: BTreeMap<Instant, BTreeSet<Vec<IpAddr>>>,
+}
+
 impl PublicIpDiscoveryCacheEntry {
     fn ttl(&self) -> Duration {
         if self.candidates.is_empty() {
@@ -49,6 +54,128 @@ impl PublicIpDiscoveryCacheEntry {
 
     fn is_fresh_at(&self, now: Instant) -> bool {
         now.duration_since(self.checked_at) < self.ttl()
+    }
+
+    fn expires_at(&self) -> Instant {
+        self.checked_at
+            .checked_add(self.ttl())
+            .unwrap_or(self.checked_at)
+    }
+}
+
+impl PublicIpDiscoveryCache {
+    fn get_fresh(&self, key: &[IpAddr], now: Instant) -> Option<Vec<IpAddr>> {
+        let entry = self.entries.get(key)?;
+        entry.is_fresh_at(now).then(|| entry.candidates.clone())
+    }
+
+    fn insert(&mut self, key: Vec<IpAddr>, entry: PublicIpDiscoveryCacheEntry, now: Instant) {
+        self.remove(&key);
+        self.expire_stale_at(now);
+        while self.entries.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES {
+            if !self.evict_next_expiring() {
+                break;
+            }
+        }
+        self.insert_expiry_index_entry(&key, &entry);
+        self.entries.insert(key, entry);
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.expiry_index.clear();
+    }
+
+    #[cfg(test)]
+    fn age_for_test(&mut self, age: Duration) {
+        for entry in self.entries.values_mut() {
+            if let Some(checked_at) = entry.checked_at.checked_sub(age) {
+                entry.checked_at = checked_at;
+            }
+        }
+        self.rebuild_expiry_index();
+    }
+
+    fn expire_stale_at(&mut self, now: Instant) {
+        while let Some((expires_at, _)) = self.expiry_index.first_key_value() {
+            if *expires_at > now {
+                break;
+            }
+            let expires_at = *expires_at;
+            let Some(keys) = self.expiry_index.remove(&expires_at) else {
+                break;
+            };
+            for key in keys {
+                if self
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| entry.expires_at() <= now)
+                {
+                    self.entries.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn evict_next_expiring(&mut self) -> bool {
+        loop {
+            let Some((expires_at, _)) = self.expiry_index.first_key_value() else {
+                return false;
+            };
+            let expires_at = *expires_at;
+            let Some(keys) = self.expiry_index.get_mut(&expires_at) else {
+                return false;
+            };
+            let Some(key) = keys.pop_first() else {
+                self.expiry_index.remove(&expires_at);
+                continue;
+            };
+            if keys.is_empty() {
+                self.expiry_index.remove(&expires_at);
+            }
+            if self.entries.remove(&key).is_some() {
+                return true;
+            }
+        }
+    }
+
+    fn remove(&mut self, key: &[IpAddr]) {
+        if let Some(entry) = self.entries.remove(key) {
+            self.remove_expiry_index_entry(key, entry.expires_at());
+        }
+    }
+
+    fn insert_expiry_index_entry(&mut self, key: &[IpAddr], entry: &PublicIpDiscoveryCacheEntry) {
+        self.expiry_index
+            .entry(entry.expires_at())
+            .or_default()
+            .insert(key.to_vec());
+    }
+
+    fn remove_expiry_index_entry(&mut self, key: &[IpAddr], at: Instant) {
+        let should_remove_bucket = if let Some(keys) = self.expiry_index.get_mut(&at) {
+            keys.remove(key);
+            keys.is_empty()
+        } else {
+            false
+        };
+        if should_remove_bucket {
+            self.expiry_index.remove(&at);
+        }
+    }
+
+    #[cfg(test)]
+    fn rebuild_expiry_index(&mut self) {
+        self.expiry_index.clear();
+        let entries = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.expires_at()))
+            .collect::<Vec<_>>();
+        for (key, expires_at) in entries {
+            self.expiry_index.entry(expires_at).or_default().insert(key);
+        }
     }
 }
 
@@ -249,10 +376,9 @@ fn cached_default_public_ip_candidates_for_key_with(
 ) -> Vec<IpAddr> {
     let now = Instant::now();
     if let Ok(cache) = PUBLIC_IP_DISCOVERY_CACHE.lock()
-        && let Some(entry) = cache.get(&cache_key)
-        && entry.is_fresh_at(now)
+        && let Some(candidates) = cache.get_fresh(&cache_key, now)
     {
-        return entry.candidates.clone();
+        return candidates;
     }
     let result = discover();
     let (candidates, complete) = match result {
@@ -263,17 +389,6 @@ fn cached_default_public_ip_candidates_for_key_with(
         PublicIpDiscoveryResult::Deferred(candidates) => (candidates, false),
     };
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
-        if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES {
-            cache.retain(|_, entry| entry.is_fresh_at(now));
-        }
-        if cache.len() >= MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES
-            && let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.checked_at)
-                .map(|(key, _)| key.clone())
-        {
-            cache.remove(&oldest);
-        }
         cache.insert(
             cache_key,
             PublicIpDiscoveryCacheEntry {
@@ -281,6 +396,7 @@ fn cached_default_public_ip_candidates_for_key_with(
                 candidates: candidates.clone(),
                 complete,
             },
+            now,
         );
     }
     candidates
@@ -307,11 +423,7 @@ pub(crate) fn clear_public_ip_discovery_cache() {
 #[cfg(test)]
 pub(crate) fn age_public_ip_discovery_cache_for_test(age: Duration) {
     if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
-        for entry in cache.values_mut() {
-            if let Some(checked_at) = entry.checked_at.checked_sub(age) {
-                entry.checked_at = checked_at;
-            }
-        }
+        cache.age_for_test(age);
     }
 }
 
@@ -486,6 +598,9 @@ pub fn format_ip_port(ip: IpAddr, port: u16) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct MdnsDiscoveryCache {
     records: BTreeMap<String, MdnsDiscoveryRecord>,
+    expiry_index: BTreeMap<u64, BTreeSet<(u64, String)>>,
+    node_index: BTreeMap<NodeId, BTreeSet<String>>,
+    cluster_index: BTreeMap<ClusterId, BTreeSet<String>>,
 }
 
 impl MdnsDiscoveryCache {
@@ -494,56 +609,173 @@ impl MdnsDiscoveryCache {
     }
 
     pub fn upsert(&mut self, record: MdnsDiscoveryRecord) {
+        if let Some(previous) = self.records.get(&record.record_id) {
+            remove_mdns_index_entries(
+                &mut self.expiry_index,
+                &mut self.node_index,
+                &mut self.cluster_index,
+                previous,
+            );
+        }
+        insert_mdns_index_entries(
+            &mut self.expiry_index,
+            &mut self.node_index,
+            &mut self.cluster_index,
+            &record,
+        );
         self.records.insert(record.record_id.clone(), record);
         self.prune_to_capacity();
     }
 
     pub fn expire_after_tick(&mut self, tick: u64) -> usize {
-        let before = self.records.len();
-        self.records
-            .retain(|_, record| record.expires_after_tick > tick);
-        before.saturating_sub(self.records.len())
+        let mut expired = 0_usize;
+        while let Some((expires_after_tick, _)) = self.expiry_index.first_key_value() {
+            if *expires_after_tick > tick {
+                break;
+            }
+            let expires_after_tick = *expires_after_tick;
+            let Some(indexed_records) = self.expiry_index.remove(&expires_after_tick) else {
+                break;
+            };
+            for (_, record_id) in indexed_records {
+                if let Some(record) = self.records.remove(&record_id) {
+                    remove_mdns_node_index_entry(&mut self.node_index, &record);
+                    remove_mdns_cluster_index_entry(&mut self.cluster_index, &record);
+                    expired += 1;
+                }
+            }
+        }
+        expired
     }
 
     pub fn endpoint_candidates_for_node(&self, node_id: &NodeId) -> Vec<PeerEndpointCandidate> {
-        self.records
-            .values()
-            .filter(|record| &record.endpoint.node_id == node_id)
+        self.node_index
+            .get(node_id)
+            .into_iter()
+            .flat_map(|record_ids| record_ids.iter())
+            .filter_map(|record_id| self.records.get(record_id))
             .map(|record| PeerEndpointCandidate::discovered(record.endpoint.clone()))
             .collect()
     }
 
     pub fn endpoints_for_cluster(&self, cluster_id: &ClusterId) -> Vec<ClusterEndpointRecord> {
-        self.records
-            .values()
-            .filter(|record| &record.cluster_id == cluster_id)
+        self.cluster_index
+            .get(cluster_id)
+            .into_iter()
+            .flat_map(|record_ids| record_ids.iter())
+            .filter_map(|record_id| self.records.get(record_id))
             .map(|record| record.endpoint.clone())
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn index_record_counts_for_test(&self) -> (usize, usize) {
+        (
+            self.node_index.values().map(BTreeSet::len).sum(),
+            self.cluster_index.values().map(BTreeSet::len).sum(),
+        )
+    }
+
     fn prune_to_capacity(&mut self) {
         while self.records.len() > MAX_MDNS_DISCOVERY_RECORDS {
-            let Some(oldest) = self
-                .records
-                .iter()
-                .min_by(|(left_id, left), (right_id, right)| {
-                    (
-                        left.expires_after_tick,
-                        left.advertised_tick,
-                        left_id.as_str(),
-                    )
-                        .cmp(&(
-                            right.expires_after_tick,
-                            right.advertised_tick,
-                            right_id.as_str(),
-                        ))
-                })
-                .map(|(record_id, _)| record_id.clone())
-            else {
+            let Some((expires_after_tick, _)) = self.expiry_index.first_key_value() else {
                 return;
             };
-            self.records.remove(&oldest);
+            let expires_after_tick = *expires_after_tick;
+            let Some(indexed_records) = self.expiry_index.get_mut(&expires_after_tick) else {
+                return;
+            };
+            let Some((advertised_tick, record_id)) = indexed_records.pop_first() else {
+                self.expiry_index.remove(&expires_after_tick);
+                continue;
+            };
+            if indexed_records.is_empty() {
+                self.expiry_index.remove(&expires_after_tick);
+            }
+            if let Some(record) = self.records.remove(&record_id) {
+                debug_assert_eq!(record.expires_after_tick, expires_after_tick);
+                debug_assert_eq!(record.advertised_tick, advertised_tick);
+                remove_mdns_node_index_entry(&mut self.node_index, &record);
+                remove_mdns_cluster_index_entry(&mut self.cluster_index, &record);
+            }
         }
+    }
+}
+
+fn insert_mdns_index_entries(
+    expiry_index: &mut BTreeMap<u64, BTreeSet<(u64, String)>>,
+    node_index: &mut BTreeMap<NodeId, BTreeSet<String>>,
+    cluster_index: &mut BTreeMap<ClusterId, BTreeSet<String>>,
+    record: &MdnsDiscoveryRecord,
+) {
+    expiry_index
+        .entry(record.expires_after_tick)
+        .or_default()
+        .insert((record.advertised_tick, record.record_id.clone()));
+    node_index
+        .entry(record.endpoint.node_id.clone())
+        .or_default()
+        .insert(record.record_id.clone());
+    cluster_index
+        .entry(record.cluster_id.clone())
+        .or_default()
+        .insert(record.record_id.clone());
+}
+
+fn remove_mdns_index_entries(
+    expiry_index: &mut BTreeMap<u64, BTreeSet<(u64, String)>>,
+    node_index: &mut BTreeMap<NodeId, BTreeSet<String>>,
+    cluster_index: &mut BTreeMap<ClusterId, BTreeSet<String>>,
+    record: &MdnsDiscoveryRecord,
+) {
+    remove_mdns_expiry_index_entry(expiry_index, record);
+    remove_mdns_node_index_entry(node_index, record);
+    remove_mdns_cluster_index_entry(cluster_index, record);
+}
+
+fn remove_mdns_expiry_index_entry(
+    expiry_index: &mut BTreeMap<u64, BTreeSet<(u64, String)>>,
+    record: &MdnsDiscoveryRecord,
+) {
+    let should_remove_deadline =
+        if let Some(records) = expiry_index.get_mut(&record.expires_after_tick) {
+            records.remove(&(record.advertised_tick, record.record_id.clone()));
+            records.is_empty()
+        } else {
+            false
+        };
+    if should_remove_deadline {
+        expiry_index.remove(&record.expires_after_tick);
+    }
+}
+
+fn remove_mdns_node_index_entry(
+    node_index: &mut BTreeMap<NodeId, BTreeSet<String>>,
+    record: &MdnsDiscoveryRecord,
+) {
+    let should_remove_node = if let Some(records) = node_index.get_mut(&record.endpoint.node_id) {
+        records.remove(&record.record_id);
+        records.is_empty()
+    } else {
+        false
+    };
+    if should_remove_node {
+        node_index.remove(&record.endpoint.node_id);
+    }
+}
+
+fn remove_mdns_cluster_index_entry(
+    cluster_index: &mut BTreeMap<ClusterId, BTreeSet<String>>,
+    record: &MdnsDiscoveryRecord,
+) {
+    let should_remove_cluster = if let Some(records) = cluster_index.get_mut(&record.cluster_id) {
+        records.remove(&record.record_id);
+        records.is_empty()
+    } else {
+        false
+    };
+    if should_remove_cluster {
+        cluster_index.remove(&record.cluster_id);
     }
 }
 
