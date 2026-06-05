@@ -89,15 +89,12 @@ fn default_toolsets_for_kind(kind: &crate::AgentToolKind) -> Vec<&'static str> {
         | AgentToolKind::SearchFiles
         | AgentToolKind::WriteFile
         | AgentToolKind::ApplyPatch
-        | AgentToolKind::ChangedFiles
-        | AgentToolKind::GitDiff
-        | AgentToolKind::ReplaceExact
-        | AgentToolKind::ReplaceRange
         | AgentToolKind::RunShellCommand
         | AgentToolKind::StartCommandSession
         | AgentToolKind::InspectCommandSession
         | AgentToolKind::WriteCommandStdin
         | AgentToolKind::CancelCommandSession => vec!["core", "coding", "local"],
+        AgentToolKind::ChangedFiles | AgentToolKind::GitDiff => vec!["version_control"],
         AgentToolKind::ModuleObjectRpc => vec!["module", "object_rpc"],
         AgentToolKind::RequestUserInput => vec!["core", "interactive"],
         AgentToolKind::ToolSearch | AgentToolKind::ToolDescribe | AgentToolKind::ToolCall => {

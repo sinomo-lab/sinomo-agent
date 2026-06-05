@@ -8814,19 +8814,28 @@ mod tests {
 
     #[test]
     fn default_agent_tools_match_initial_architecture_surface() {
-        let names: Vec<_> = default_agent_tool_descriptors()
+        let default_tool_names = default_coding_agent_tools()
             .into_iter()
-            .map(|descriptor| descriptor.spec.name)
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(!default_tool_names.contains(&"changed_files".to_string()));
+        assert!(!default_tool_names.contains(&"git_diff".to_string()));
+        assert!(!default_tool_names.contains(&"replace_exact".to_string()));
+        assert!(!default_tool_names.contains(&"replace_range".to_string()));
+
+        let descriptors = default_agent_tool_descriptors();
+        let names: Vec<_> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.spec.name.as_str())
             .collect();
 
         for expected in [
             "read_file",
+            "list_files",
             "search",
             "apply_patch",
             "changed_files",
             "git_diff",
-            "replace_exact",
-            "replace_range",
             "run_command",
             "start_command_session",
             "inspect_command_session",
@@ -8834,7 +8843,25 @@ mod tests {
             "cancel_command_session",
             "request_user_input",
         ] {
-            assert!(names.iter().any(|name| name == expected), "{expected}");
+            assert!(names.contains(&expected), "{expected}");
+        }
+
+        assert!(!names.contains(&"replace_exact"));
+        assert!(!names.contains(&"replace_range"));
+
+        for expected_hidden in ["changed_files", "git_diff"] {
+            let descriptor = descriptors
+                .iter()
+                .find(|descriptor| descriptor.spec.name == expected_hidden)
+                .expect(expected_hidden);
+            assert_eq!(
+                descriptor
+                    .toolsets
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["version_control"]
+            );
         }
     }
 
@@ -9707,74 +9734,6 @@ mod tests {
             Some("file_writes_disabled")
         );
         assert!(!outcome.evidence.policy.allowed);
-    }
-
-    #[test]
-    fn local_workspace_registry_applies_exact_and_range_replacements() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-replace-tools-{}", TaskId::generate()));
-        let evidence_dir = root.join("evidence");
-        fs::create_dir_all(&root).expect("workspace");
-        fs::write(root.join("hello.txt"), "one\ntwo\nthree\n").expect("seed file");
-        let registry = AgentToolRegistry::local_workspace_with_config(
-            LocalWorkspaceAgentConfig::new(&root)
-                .allowing_file_writes(true)
-                .with_evidence_dir(&evidence_dir),
-        );
-        let input = agent_input("replace text");
-
-        let exact = registry.execute(
-            &input.session,
-            0,
-            0,
-            &AgentToolCall {
-                tool: "replace_exact".to_string(),
-                input: serde_json::json!({
-                    "path": "hello.txt",
-                    "old": "two",
-                    "new": "TWO"
-                }),
-                r#async: false,
-                summary: "Replace exact text.".to_string(),
-            },
-        );
-        assert_eq!(exact.status, AgentToolStatus::Succeeded);
-        assert_eq!(
-            fs::read_to_string(root.join("hello.txt")).expect("file"),
-            "one\nTWO\nthree\n"
-        );
-        assert_eq!(
-            coding_evidence(&exact.evidence).changed_files,
-            vec!["hello.txt".to_string()]
-        );
-
-        let range = registry.execute(
-            &input.session,
-            0,
-            1,
-            &AgentToolCall {
-                tool: "replace_range".to_string(),
-                input: serde_json::json!({
-                    "path": "hello.txt",
-                    "start_line": 3,
-                    "end_line": 3,
-                    "replacement": "THREE\n"
-                }),
-                r#async: false,
-                summary: "Replace line range.".to_string(),
-            },
-        );
-        assert_eq!(range.status, AgentToolStatus::Succeeded);
-        assert_eq!(
-            fs::read_to_string(root.join("hello.txt")).expect("file"),
-            "one\nTWO\nTHREE\n"
-        );
-        let diff_ref = range
-            .output
-            .get("diff_ref")
-            .and_then(serde_json::Value::as_str)
-            .expect("diff ref");
-        assert!(Path::new(diff_ref).exists());
     }
 
     #[cfg(not(windows))]

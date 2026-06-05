@@ -104,6 +104,16 @@ impl AgentTool for ApplyPatchTool {
 pub(super) fn descriptor() -> AgentToolDescriptor {
     AgentToolDescriptor::new(spec_for_kind(AgentToolKind::ApplyPatch))
         .with_capabilities([AgentToolCapability::WriteWorkspace])
+        .with_input_schema(serde_json::json!({
+            "type": "object",
+            "required": ["patch"],
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "Patch text beginning with *** Begin Patch and ending with *** End Patch. Use Add File, Update File, Delete File, and Move to hunks; update hunks use @@ context plus space/-/+ lines, not git unified range headers."
+                }
+            }
+        }))
         .with_provider_specs([AgentToolProviderSpec::custom_grammar(
             "openai",
             "lark",

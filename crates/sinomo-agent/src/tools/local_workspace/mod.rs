@@ -4,7 +4,6 @@ mod command_session;
 mod git_diff;
 mod list_files;
 mod read_file;
-mod replace;
 mod request_user_input;
 mod run_command;
 mod search;
@@ -135,8 +134,6 @@ pub fn registry(config: LocalWorkspaceAgentConfig) -> AgentToolRegistry {
         .with_tool(apply_patch::ApplyPatchTool::new(config.clone()))
         .with_tool(changed_files::ChangedFilesTool::new(config.clone()))
         .with_tool(git_diff::GitDiffTool::new(config.clone()))
-        .with_tool(replace::ReplaceExactTool::new(config.clone()))
-        .with_tool(replace::ReplaceRangeTool::new(config.clone()))
         .with_tool(run_command::RunCommandTool::new(config.clone()))
         .with_tool(command_session::StartCommandSessionTool::new(
             config.clone(),
@@ -165,8 +162,6 @@ pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
         apply_patch::descriptor(),
         changed_files::descriptor(),
         git_diff::descriptor(),
-        replace::exact_descriptor(),
-        replace::range_descriptor(),
         run_command::descriptor(),
         command_session::start_descriptor(),
         command_session::inspect_descriptor(),
@@ -179,8 +174,26 @@ pub fn default_local_workspace_tool_descriptors() -> Vec<AgentToolDescriptor> {
 fn spec_for_kind(kind: AgentToolKind) -> AgentToolSpec {
     default_coding_agent_tools()
         .into_iter()
+        .chain(hidden_local_workspace_tool_specs())
         .find(|spec| spec.kind == kind)
         .expect("default coding tool spec exists")
+}
+
+fn hidden_local_workspace_tool_specs() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec::new(
+            AgentToolKind::ChangedFiles,
+            "changed_files",
+            "List workspace files changed relative to version control, including staged, unstaged, renamed, deleted, and untracked files.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::GitDiff,
+            "git_diff",
+            "Return a bounded version-control diff summary for the workspace and an evidence ref for the full diff when it is large.",
+            false,
+        ),
+    ]
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

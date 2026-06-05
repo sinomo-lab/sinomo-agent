@@ -282,13 +282,12 @@ The initial deliberation tool set should stay small and auditable:
 - `search`
 - `apply_patch`
 - `run_command`
-- `git_status`
-- `git_diff`
-- `format`
-- `test`
 - `request_user_input`
+- `tool_search`
+- `tool_describe`
+- `tool_call`
 
-Deferred tool discovery can be added later when the cluster has enough tools that exposing every schema wastes context. Until then, direct visibility plus strict runtime policy is simpler and easier to verify.
+Version-control helpers such as `changed_files` and `git_diff` should remain registered but hidden behind progressive tool disclosure. Formatting, testing, and project-specific workflows should usually run through `run_command` until a session-specific extension can provide a better structured contract.
 
 ## Background Wake and Event Aggregation
 

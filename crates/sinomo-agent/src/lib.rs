@@ -76,8 +76,6 @@ pub enum AgentToolKind {
     ApplyPatch,
     ChangedFiles,
     GitDiff,
-    ReplaceExact,
-    ReplaceRange,
     ConfigSearch,
     ConfigGet,
     ConfigSet,
@@ -377,31 +375,7 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
         AgentToolSpec::new(
             AgentToolKind::ApplyPatch,
             "apply_patch",
-            "Apply a scoped workspace patch. Format: `*** Begin Patch`, one or more file hunks (`*** Add File: path`, `*** Update File: path`, or `*** Delete File: path`), then `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` and lines prefixed with space, `-`, or `+`; do not use git unified range headers.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ChangedFiles,
-            "changed_files",
-            "List workspace files changed relative to version control, including staged, unstaged, renamed, deleted, and untracked files.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::GitDiff,
-            "git_diff",
-            "Return a bounded version-control diff summary for the workspace and an evidence ref for the full diff when it is large.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ReplaceExact,
-            "replace_exact",
-            "Replace an exact text snippet in one workspace file, requiring a unique match unless replace_all or occurrence is set.",
-            true,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ReplaceRange,
-            "replace_range",
-            "Replace an inclusive one-based line range in one workspace text file.",
+            "Edit workspace files with a scoped patch. This is the only source-editing tool: begin with `*** Begin Patch`, include one or more `*** Add File: path`, `*** Update File: path`, or `*** Delete File: path` hunks, and end with `*** End Patch`. Update hunks use `@@` or `@@ <exact context>` plus space/`-`/`+` lines; do not use git unified range headers.",
             true,
         ),
         AgentToolSpec::new(
@@ -484,16 +458,23 @@ You operate inside Sinomo's coding-agent loop. The agent owns tool execution,
 policy, event emission, and session state. Use tools when evidence or workspace
 changes are needed, then continue after tool_result messages arrive.
 
-Workspace commands start in the repository root. Do not cd to guessed paths such
-as /workspace or /home/user/project; pass a relative cwd only for a known
-workspace subdirectory. Failed command stderr/stdout are returned in the next
-tool_result; use that output as the command diagnostic instead of repeating the
-same command blindly. Prefer small, source-only patches. If a reasonable patch
-is already present and validation is blocked by environment setup, inspect the
-diff and finish instead of spending turns on dependency installation.
+Workspace commands start in the repository root. Do not cd to guessed paths
+such as /workspace or /home/user/project; pass a relative cwd only for a known
+workspace subdirectory. Prefer read_file, list_files, and search for focused
+inspection; when shell search is needed, prefer rg or rg --files.
 
-apply_patch accepts either raw patch text or an object with a patch string.
-Patch format example:
+Command stdout and stderr are returned in the next tool_result. Treat that
+output as the diagnostic and adjust from it instead of repeating the same
+command blindly. If validation is blocked by missing dependencies or host setup,
+inspect the current diff and finish with the blocker rather than looping on
+environment setup unless the task is dependency setup.
+
+Use apply_patch as the only source-editing tool. Keep patches small and
+source-focused. Do not revert or overwrite user changes you did not make. The
+tool accepts raw patch text; JSON-only providers may pass an object with a
+patch string. Patch failures mean the patch was not applied.
+
+Patch format:
 *** Begin Patch
 *** Update File: src/example.rs
 @@ fn example()
@@ -502,6 +483,10 @@ Patch format example:
 +let value = new_value();
  keep_this_line();
 *** End Patch
+
+Use Add File, Update File, Delete File, and Move to hunks as needed. Do not use
+git unified range headers. Formatting commands and generated output may use the
+normal project tools through run_command.
 
 When the next step is clear and no more tools are needed, return an empty
 tool_calls array. If a tool fails or is blocked, recover from the model-visible

@@ -307,8 +307,7 @@ Near-term tool additions:
 - `changed_files`: return the workspace files changed by the current run and their status.
 - `git_diff`: return a bounded diff summary and artifact ref for the full diff.
 - `list_files`: list files by directory, glob, or repository-root filter with bounded output.
-- `replace_exact`: replace an exact snippet in one file, with before/after evidence.
-- `replace_range`: replace a line range in one file, with before/after evidence.
+- `apply_patch`: remain the single source-editing tool, with a provider-friendly descriptor and clear patch grammar examples. Narrow replace tools were intentionally dropped so editing semantics stay centralized.
 
 Later tool additions:
 
@@ -317,7 +316,7 @@ Later tool additions:
 - structured test result parsing for common runners;
 - dependency and environment probes that report missing tools without mutating the host.
 
-`apply_patch` should remain available for multi-file edits. Its prompt and descriptor should describe the actual Sinomo patch grammar and examples, not call it a Codex patch. Narrow edit tools should reduce friction for one-line and small localized changes.
+`apply_patch` should remain available for one-line, localized, and multi-file edits. Its prompt and descriptor should describe the actual Sinomo patch grammar and examples, not call it a Codex patch. Editing evidence, path checks, and changed-file tracking should stay centralized there.
 
 Tool runtime work:
 

@@ -34,7 +34,7 @@ The code has already implemented more than the older docs assume:
 - `sinomo-evolution` has `GitWorkspaceAdapter`, `LocalCandidateBundleStore`, file-backed job/campaign records, campaign dry-runs, scheduler dry-runs, stage evaluation, and a first `EvolutionOrchestrator`.
 - `sinomo-eval` has a real `LocalCommandRunner`, command control, inactivity notifications, and command-based scorecards.
 - `sinomo-cli` exposes `evolve propose`, `approve`, `reject`, `restore`, `status`, `show`, `verify`, `schedule`, `iterate`, `evaluate`, and `tick`.
-- `sinomo-agent` now has the stronger coding harness: dynamic tools, standalone Codex patch parser, provider-aware native tool support, session store, compaction, tool evidence, sanitized model-visible tool results, and benchmark-proven local workspace behavior.
+- `sinomo-agent` now has the stronger coding harness: dynamic tools, standalone Sinomo patch parser, provider-aware native tool support, session store, compaction, tool evidence, sanitized model-visible tool results, and benchmark-proven local workspace behavior.
 - `sinomo-benchmarks` has a SWE-bench Verified 10-task suite, mini-SWE-agent baseline path, official SWE-bench evaluation integration, and traced Sinomo runs.
 
 The main mismatch is that `sinomo-evolution` still has its own smaller mutation bridge and tool registry. That bridge was useful for bootstrap, but it duplicates and lags the real agent loop. The serious implementation should make `sinomo-agent` the canonical mutation worker.

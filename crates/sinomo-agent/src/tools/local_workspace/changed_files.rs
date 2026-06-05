@@ -86,6 +86,7 @@ impl AgentTool for ChangedFilesTool {
 
 pub(super) fn descriptor() -> AgentToolDescriptor {
     AgentToolDescriptor::new(spec_for_kind(AgentToolKind::ChangedFiles))
+        .with_toolsets(["version_control"])
         .with_capabilities([
             AgentToolCapability::ReadWorkspace,
             AgentToolCapability::InspectVersionControl,
