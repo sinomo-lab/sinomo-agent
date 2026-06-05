@@ -17,7 +17,14 @@ import urllib.request
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+def find_repo_root(start: Path) -> Path:
+    for directory in (start.parent, *start.parents):
+        if (directory / "Cargo.toml").exists() and (directory / "crates" / "sinomo").exists():
+            return directory
+    raise SystemExit(f"failed to find Sinomo workspace root from {start}")
+
+
+REPO_ROOT = find_repo_root(Path(__file__).resolve())
 DEFAULT_SUITE = Path(__file__).with_name("verified_10.json")
 DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmark-results" / "swebench"
 DEFAULT_AGENT_BIN = REPO_ROOT / "target" / "debug" / "sinomo-swebench-agent"
@@ -583,6 +590,15 @@ def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -
     if args.dry_run:
         summary["parse_status"] = "dry-run"
         return summary
+    if not evaluation_dir.exists():
+        summary["parse_status"] = "missing-results-dir"
+        return summary
+
+    parsed = parse_official_evaluation_results(evaluation_dir, instance_ids)
+    if parsed.get("parse_status") == "parsed":
+        summary.update(parsed)
+        return summary
+
     blocked_path = evaluation_dir / "blocked.json"
     if blocked_path.exists():
         try:
@@ -597,11 +613,7 @@ def collect_official_evaluation_summary(args: argparse.Namespace, suite: dict) -
         summary["summary_path"] = str(blocked_path)
         summary["issues"] = blocked.get("issues", [])
         return summary
-    if not evaluation_dir.exists():
-        summary["parse_status"] = "missing-results-dir"
-        return summary
 
-    parsed = parse_official_evaluation_results(evaluation_dir, instance_ids)
     summary.update(parsed)
     return summary
 

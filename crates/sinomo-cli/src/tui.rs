@@ -955,11 +955,19 @@ enum TuiFilesTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TuiSlashCommand {
+    Agent(TuiAgentCommand),
     Files { target: TuiFilesTarget },
     Model(TuiModelCommand),
     Settings,
     Sessions,
     Resume { session_id: SessionId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TuiAgentCommand {
+    Status,
+    List,
+    Use(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1040,6 +1048,13 @@ trait TuiAgentRuntimeControl: InteractionEventHandler {
         data_dir: &SinomoDataDir,
         selection: TuiModelSelection,
         daemon_connected: bool,
+    ) -> Result<TuiAgentRuntimeInfo, CliError>;
+
+    fn switch_tui_agent(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        daemon_connected: bool,
+        definition: AgentDefinition,
     ) -> Result<TuiAgentRuntimeInfo, CliError>;
 }
 
@@ -2841,6 +2856,7 @@ fn parse_tui_slash_command(line: &str) -> Result<Option<TuiSlashCommand>, CliErr
         });
     }
     match args.as_slice() {
+        [command, rest @ ..] if command == "agent" => parse_tui_agent_command(rest),
         [command] if command == "files" => Ok(Some(TuiSlashCommand::Files {
             target: default_tui_files_target(),
         })),
@@ -2921,6 +2937,49 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
     command: TuiSlashCommand,
 ) -> Result<Vec<InteractionOutput>, CliError> {
     match command {
+        TuiSlashCommand::Agent(TuiAgentCommand::Status) => {
+            let info = runtime.handler.tui_agent_runtime_info();
+            state.update_runtime_info(info.clone());
+            Ok(tui_agent_status_outputs(&info))
+        }
+        TuiSlashCommand::Agent(TuiAgentCommand::List) => {
+            let catalog = load_tui_agent_catalog(data_dir)?;
+            let mut outputs = Vec::new();
+            for definition in catalog.list() {
+                outputs.push(InteractionOutput::Line(format!(
+                    "{} [{}] - {}",
+                    definition.key(),
+                    tui_agent_role_label(&definition.role),
+                    if definition.description.is_empty() {
+                        definition.name.as_str()
+                    } else {
+                        definition.description.as_str()
+                    }
+                )));
+            }
+            if outputs.is_empty() {
+                outputs.push(InteractionOutput::Line("no agents registered".to_string()));
+            }
+            Ok(outputs)
+        }
+        TuiSlashCommand::Agent(TuiAgentCommand::Use(agent_id)) => {
+            let catalog = load_tui_agent_catalog(data_dir)?;
+            let definition = catalog
+                .get(&agent_id)
+                .cloned()
+                .ok_or_else(|| CliError::Parse {
+                    detail: format!("unknown agent `{agent_id}`"),
+                })?;
+            let info =
+                runtime
+                    .handler
+                    .switch_tui_agent(data_dir, state.daemon_connected, definition)?;
+            state.update_runtime_info(info.clone());
+            Ok(vec![InteractionOutput::Line(format!(
+                "agent switched: {}",
+                info.agent
+            ))])
+        }
         TuiSlashCommand::Files { target } => {
             state.open_files_target(data_dir, target);
             Ok(vec![InteractionOutput::Line(
@@ -2960,6 +3019,14 @@ fn apply_tui_slash_command<H: TuiAgentRuntimeControl>(
             resume_tui_session(runtime, state, session_store, data_dir, daemon, session_id)
         }
     }
+}
+
+fn load_tui_agent_catalog(
+    data_dir: &SinomoDataDir,
+) -> Result<sinomo_agent::AgentCatalog, CliError> {
+    sinomo_agent::AgentCatalog::load_from_data_dir(data_dir).map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })
 }
 
 fn open_tui_session_list_view<H: TuiAgentRuntimeControl>(
@@ -3090,7 +3157,7 @@ fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
             .clone()
             .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
     };
-    match handler.switch_tui_model(data_dir, selection, daemon_connected) {
+    let restored = match handler.switch_tui_model(data_dir, selection, daemon_connected) {
         Ok(info) => info,
         Err(error) => {
             outputs.push(InteractionOutput::Line(format!(
@@ -3098,7 +3165,29 @@ fn restore_tui_session_runtime_info<H: TuiAgentRuntimeControl>(
             )));
             handler.tui_agent_runtime_info()
         }
+    };
+    if let Ok(catalog) = load_tui_agent_catalog(data_dir)
+        && let Some(definition) = catalog.get(&info.agent).cloned()
+    {
+        return match handler.switch_tui_agent(data_dir, daemon_connected, definition) {
+            Ok(info) => info,
+            Err(error) => {
+                outputs.push(InteractionOutput::Line(format!(
+                    "agent restore failed: {error}"
+                )));
+                restored
+            }
+        };
     }
+    restored
+}
+
+fn tui_agent_status_outputs(info: &TuiAgentRuntimeInfo) -> Vec<InteractionOutput> {
+    vec![
+        InteractionOutput::Line(format!("agent: {}", info.agent)),
+        InteractionOutput::Line(format!("model: {}", info.model_label())),
+        InteractionOutput::Line(format!("reasoning: {}", info.reasoning_label())),
+    ]
 }
 
 fn tui_model_status_outputs(info: &TuiAgentRuntimeInfo) -> Vec<InteractionOutput> {
@@ -3112,6 +3201,42 @@ fn tui_model_status_outputs(info: &TuiAgentRuntimeInfo) -> Vec<InteractionOutput
         )),
         InteractionOutput::Line(format!("reasoning: {}", info.reasoning_label())),
     ]
+}
+
+fn parse_tui_agent_command(args: &[String]) -> Result<Option<TuiSlashCommand>, CliError> {
+    match args {
+        [] => Ok(Some(TuiSlashCommand::Agent(TuiAgentCommand::Status))),
+        [command] if command == "status" => {
+            Ok(Some(TuiSlashCommand::Agent(TuiAgentCommand::Status)))
+        }
+        [command] if command == "list" => Ok(Some(TuiSlashCommand::Agent(TuiAgentCommand::List))),
+        [command, agent_id] if command == "use" => Ok(Some(TuiSlashCommand::Agent(
+            TuiAgentCommand::Use(agent_id.clone()),
+        ))),
+        [command] if command == "use" => Err(tui_agent_usage_error()),
+        [command, ..] if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Err(tui_agent_usage_error())
+        }
+        [agent_id] => Ok(Some(TuiSlashCommand::Agent(TuiAgentCommand::Use(
+            agent_id.clone(),
+        )))),
+        _ => Err(tui_agent_usage_error()),
+    }
+}
+
+fn tui_agent_usage_error() -> CliError {
+    CliError::Parse {
+        detail: "usage: /agent [status|list|use <agent-id>]".to_string(),
+    }
+}
+
+fn tui_agent_role_label(role: &sinomo_agent::AgentRole) -> &'static str {
+    match role {
+        sinomo_agent::AgentRole::Main => "main",
+        sinomo_agent::AgentRole::Background => "background",
+        sinomo_agent::AgentRole::Deliberation => "deliberation",
+        sinomo_agent::AgentRole::Evolution => "evolution",
+    }
 }
 
 fn parse_tui_model_command(args: &[String]) -> Result<Option<TuiSlashCommand>, CliError> {
@@ -5679,6 +5804,36 @@ mod tui_tests {
     }
 
     #[test]
+    fn tui_agent_command_accepts_status_list_and_switch_forms() {
+        assert_eq!(
+            parse_tui_slash_command("/agent")
+                .expect("parse")
+                .expect("status"),
+            TuiSlashCommand::Agent(TuiAgentCommand::Status)
+        );
+        assert_eq!(
+            parse_tui_slash_command("/agent list")
+                .expect("parse")
+                .expect("list"),
+            TuiSlashCommand::Agent(TuiAgentCommand::List)
+        );
+        assert_eq!(
+            parse_tui_slash_command("/agent use coding-agent")
+                .expect("parse")
+                .expect("use"),
+            TuiSlashCommand::Agent(TuiAgentCommand::Use("coding-agent".to_string()))
+        );
+        assert_eq!(
+            parse_tui_slash_command("/agent background-agent")
+                .expect("parse")
+                .expect("quick use"),
+            TuiSlashCommand::Agent(TuiAgentCommand::Use("background-agent".to_string()))
+        );
+        assert!(parse_tui_slash_command("/agent use").is_err());
+        assert!(parse_tui_slash_command("/agent use coding-agent extra").is_err());
+    }
+
+    #[test]
     fn tui_model_command_rejects_malformed_quick_switches() {
         assert!(parse_tui_slash_command("/model list").is_err());
         assert!(parse_tui_slash_command("/model runtime").is_err());
@@ -5717,6 +5872,28 @@ mod tui_tests {
         assert_eq!(info.model, "gpt-5");
         assert_eq!(info.account.as_deref(), Some("default"));
         assert_eq!(handler.tui_agent_runtime_info(), info);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn tui_agent_switch_replaces_active_handler_definition() {
+        let root = temp_file_browser_root("agent-switch");
+        let data_dir = SinomoDataDir::new(root.clone());
+        let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
+            &data_dir,
+            ModelRuntimeConfig::default(),
+        )
+        .expect("handler");
+        let definition =
+            AgentDefinition::custom("ops-agent", AgentRole::Background, "Handle ops status.");
+
+        let info = handler
+            .switch_tui_agent(&data_dir, false, definition)
+            .expect("switch");
+
+        assert_eq!(info.agent, "ops-agent");
+        assert_eq!(handler.tui_agent_runtime_info().agent, "ops-agent");
 
         fs::remove_dir_all(root).ok();
     }
@@ -6067,7 +6244,7 @@ where
 
     fn runtime_info(&self) -> TuiAgentRuntimeInfo {
         TuiAgentRuntimeInfo {
-            agent: self.agent_definition.name.clone(),
+            agent: self.agent_definition.key().to_string(),
             provider: self.provider.clone(),
             model: self.model_name.clone(),
             account: self.account.clone(),
@@ -6077,6 +6254,8 @@ where
     }
 
     fn build_runtime(&self, model: M, session: AgentSession) -> AgentSessionRuntime<M> {
+        let mut session = session;
+        session.role = self.agent_definition.role.clone();
         let agent = Agent::new(model, self.provider.clone(), self.model_name.clone())
             .with_agent_definition(self.agent_definition.clone())
             .with_tool_registry(self.tool_registry.clone());
@@ -6093,7 +6272,10 @@ where
                     detail: "agent runtime is not initialized".to_string(),
                 });
             };
-            let agent_session = AgentSession::new(session.session_id.clone(), AgentRole::Main);
+            let agent_session = AgentSession::new(
+                session.session_id.clone(),
+                self.agent_definition.role.clone(),
+            );
             let runtime = self.build_runtime(model, agent_session);
             self.runtime = Some(RuntimeMainAgentSlot::Ready(runtime));
             self.runtime_cursor = AgentRuntimeEventCursor {
@@ -6169,6 +6351,18 @@ where
             last_event_id: None,
         };
         Ok(self.runtime_info())
+    }
+
+    fn set_agent_definition(&mut self, definition: AgentDefinition) -> Result<(), CliError> {
+        let mut definition = definition.with_output_format(sinomo_agent::AgentOutputFormat::Text);
+        if definition.id.is_empty() {
+            definition.id = definition.name.clone();
+        }
+        definition.validate().map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })?;
+        self.agent_definition = definition;
+        Ok(())
     }
 }
 
@@ -6287,6 +6481,24 @@ impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAg
         selection: TuiModelSelection,
         daemon_connected: bool,
     ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.switch_to_selection(data_dir, selection, daemon_connected)
+    }
+
+    fn switch_tui_agent(
+        &mut self,
+        data_dir: &SinomoDataDir,
+        daemon_connected: bool,
+        definition: AgentDefinition,
+    ) -> Result<TuiAgentRuntimeInfo, CliError> {
+        self.set_agent_definition(definition)?;
+        let selection = TuiModelSelection {
+            provider: self.provider.clone(),
+            model: self.model_name.clone(),
+            account: self
+                .account
+                .clone()
+                .unwrap_or_else(|| sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+        };
         self.switch_to_selection(data_dir, selection, daemon_connected)
     }
 }

@@ -172,6 +172,18 @@ pub fn rollout_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::Admin,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
+            ROLLOUT_RPC_CATEGORY,
+            "rollout.binary-upload.chunk",
+            ModuleRouteAuth::Admin,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            ROLLOUT_RPC_CATEGORY,
+            "rollout.binary-upload.finalize",
+            ModuleRouteAuth::Admin,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             ROLLOUT_BUILD_ROUTE,
             ROLLOUT_RPC_CATEGORY,
             "rollout.build.apply",

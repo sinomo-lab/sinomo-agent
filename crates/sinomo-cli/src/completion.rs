@@ -175,6 +175,25 @@ const TUI_FILE_TARGET_CHOICES: &[ValueChoice] = &[
     },
 ];
 
+const TUI_AGENT_CHOICES: &[ValueChoice] = &[
+    ValueChoice {
+        value: "main-agent",
+        detail: "user-facing interactive agent",
+    },
+    ValueChoice {
+        value: "background-agent",
+        detail: "silent maintenance and cluster-support agent",
+    },
+    ValueChoice {
+        value: "coding-agent",
+        detail: "workspace coding and verification agent",
+    },
+    ValueChoice {
+        value: "evolution-agent",
+        detail: "supervised self-evolution mutation agent",
+    },
+];
+
 const NODE_ROLE_CHOICES: &[ValueChoice] = &[
     ValueChoice {
         value: "workstation",
@@ -1274,6 +1293,32 @@ fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
         model.options.clear();
         model.values = vec![value("provider", "available model provider", &[])];
     }
+    if let Some(agent) = registry
+        .children
+        .iter_mut()
+        .find(|command| command.word == "agent")
+    {
+        agent.detail = "switch the active TUI chat agent";
+        agent.children = vec![
+            cmd(
+                "status",
+                "show the active TUI agent",
+                vec![],
+                vec![],
+                vec![],
+            ),
+            cmd("list", "list available TUI agents", vec![], vec![], vec![]),
+            cmd(
+                "use",
+                "switch the active TUI agent",
+                vec![],
+                vec![],
+                vec![value("agent-id", "available agent", TUI_AGENT_CHOICES)],
+            ),
+        ];
+        agent.options.clear();
+        agent.values = vec![value("agent-id", "available agent", TUI_AGENT_CHOICES)];
+    }
 }
 
 fn tui_slash_command_layer() -> Vec<CommandSpec> {
@@ -2313,6 +2358,19 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.label == "local:.")
+        );
+
+        let agent_choices = slash_completions_for_layer(
+            "/agent use ",
+            "/agent use ".len(),
+            SlashCommandCompletionLayer::Tui,
+        )
+        .expect("agent choices");
+        assert!(
+            agent_choices
+                .items
+                .iter()
+                .any(|item| item.label == "coding-agent")
         );
     }
 

@@ -2746,10 +2746,25 @@ impl AgentConfig {
 
     pub fn with_agent_definition(mut self, definition: AgentDefinition) -> Self {
         let previous_default_toolsets = default_visible_toolsets_for_role(&self.definition.role);
-        self.temperature = definition.temperature;
-        self.max_output_tokens = definition.max_output_tokens;
-        if self.visible_toolsets == previous_default_toolsets {
+        self.temperature = definition
+            .temperature
+            .or(definition.model_policy.temperature);
+        self.max_output_tokens = definition
+            .max_output_tokens
+            .or(definition.model_policy.max_output_tokens);
+        if !definition.tool_surface.visible_toolsets.is_empty() {
+            self.visible_toolsets = definition.tool_surface.visible_toolsets.clone();
+        } else if self.visible_toolsets == previous_default_toolsets {
             self.visible_toolsets = default_visible_toolsets_for_role(&definition.role);
+        }
+        if self.max_steps.is_none() {
+            self.max_steps = definition.runtime_limits.max_steps;
+        }
+        if self.max_tool_calls_per_step.is_none() {
+            self.max_tool_calls_per_step = definition.runtime_limits.max_tool_calls_per_step;
+        }
+        if self.max_model_repair_attempts.is_none() {
+            self.max_model_repair_attempts = definition.runtime_limits.max_model_repair_attempts;
         }
         self.definition = definition;
         self
@@ -5413,6 +5428,9 @@ impl<M: InteractionModel> Agent<M> {
             AgentPolicyBundle::default_for_role(self.config.definition.role.clone());
         if self.policy == previous_default_policy {
             self.policy = AgentPolicyBundle::default_for_role(definition.role.clone());
+        }
+        if self.compactor == AgentCompactor::default() {
+            self.compactor.retained_tail_count = definition.compaction.retained_tail_items;
         }
         self.config = self.config.with_agent_definition(definition);
         self

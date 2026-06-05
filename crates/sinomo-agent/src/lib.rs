@@ -15,6 +15,9 @@ use sinomo_runtime::events::{
     EntityId, EventId, EventStore, ReplayDirection, ReplayQuery, SessionId, StoredEvent,
 };
 use sinomo_runtime::node::NodeId;
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
@@ -58,6 +61,12 @@ pub fn register_storage_paths(
         sinomo_runtime::storage::StorageRing::R2,
         "events/agent",
         "agent sessions, traces, context assembly reports, model events, and tool evidence artifacts",
+    )?;
+    layout.register_escape_path(
+        "sinomo-agent",
+        sinomo_runtime::storage::StorageRing::R2,
+        "agents",
+        "local user-defined agent definitions",
     )
 }
 
@@ -115,6 +124,12 @@ pub enum AgentToolKind {
     ObserveVision,
 }
 
+impl AgentToolKind {
+    pub fn from_identifier(value: &str) -> Option<Self> {
+        serde_json::from_value::<Self>(serde_json::Value::String(value.to_string())).ok()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentOutputFormat {
@@ -139,17 +154,203 @@ impl AgentOutputFormat {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentDefinition {
+    #[serde(default = "default_agent_definition_schema_version")]
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
     pub role: AgentRole,
     pub system_prompt: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<AgentToolSpec>,
+    #[serde(
+        default,
+        skip_serializing_if = "AgentToolSurfaceDefinition::is_default"
+    )]
+    pub tool_surface: AgentToolSurfaceDefinition,
+    #[serde(default)]
+    pub context: AgentContextDefinition,
+    #[serde(default)]
+    pub compaction: AgentCompactionDefinition,
+    #[serde(default, skip_serializing_if = "AgentModelPolicy::is_default")]
+    pub model_policy: AgentModelPolicy,
+    #[serde(
+        default,
+        skip_serializing_if = "AgentRuntimeLimitsDefinition::is_default"
+    )]
+    pub runtime_limits: AgentRuntimeLimitsDefinition,
     #[serde(default)]
     pub output_format: AgentOutputFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+}
+
+pub const AGENT_DEFINITION_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_AGENT_CONTEXT_PIPELINE_ID: &str = "context.pipeline.default";
+pub const DEFAULT_AGENT_COMPACTION_STRATEGY_ID: &str = "compaction.strategy.default";
+
+fn default_agent_definition_schema_version() -> u32 {
+    AGENT_DEFINITION_SCHEMA_VERSION
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentToolSurfaceDefinition {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_tools: Vec<String>,
+}
+
+impl AgentToolSurfaceDefinition {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentContextDefinition {
+    pub pipeline_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<String>,
+}
+
+impl Default for AgentContextDefinition {
+    fn default() -> Self {
+        Self {
+            pipeline_id: DEFAULT_AGENT_CONTEXT_PIPELINE_ID.to_string(),
+            providers: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentCompactionDefinition {
+    pub strategy_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_tail_items: Option<usize>,
+}
+
+impl Default for AgentCompactionDefinition {
+    fn default() -> Self {
+        Self {
+            strategy_id: DEFAULT_AGENT_COMPACTION_STRATEGY_ID.to_string(),
+            retained_tail_items: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentModelPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub vendor_options: serde_json::Value,
+}
+
+impl AgentModelPolicy {
+    pub fn is_default(&self) -> bool {
+        self.provider.is_none()
+            && self.model.is_none()
+            && self.temperature.is_none()
+            && self.max_output_tokens.is_none()
+            && self.vendor_options.is_null()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentRuntimeLimitsDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls_per_step: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_repair_attempts: Option<usize>,
+}
+
+impl AgentRuntimeLimitsDefinition {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentContextStrategyDescriptor {
+    pub id: String,
+    pub description: String,
+    pub built_in: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentCompactionStrategyDescriptor {
+    pub id: String,
+    pub description: String,
+    pub built_in: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentContextStrategyRegistry {
+    strategies: BTreeMap<String, AgentContextStrategyDescriptor>,
+}
+
+impl AgentContextStrategyRegistry {
+    pub fn built_in() -> Self {
+        let mut registry = Self::default();
+        registry.register(AgentContextStrategyDescriptor {
+            id: DEFAULT_AGENT_CONTEXT_PIPELINE_ID.to_string(),
+            description:
+                "assemble the standard session, workspace, tools, and prompt-reference context"
+                    .to_string(),
+            built_in: true,
+        });
+        registry
+    }
+
+    pub fn register(&mut self, descriptor: AgentContextStrategyDescriptor) {
+        self.strategies.insert(descriptor.id.clone(), descriptor);
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.strategies.contains_key(id)
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentCompactionStrategyRegistry {
+    strategies: BTreeMap<String, AgentCompactionStrategyDescriptor>,
+}
+
+impl AgentCompactionStrategyRegistry {
+    pub fn built_in() -> Self {
+        let mut registry = Self::default();
+        registry.register(AgentCompactionStrategyDescriptor {
+            id: DEFAULT_AGENT_COMPACTION_STRATEGY_ID.to_string(),
+            description:
+                "retain the current transcript unless the runtime budget forces summary compaction"
+                    .to_string(),
+            built_in: true,
+        });
+        registry
+    }
+
+    pub fn register(&mut self, descriptor: AgentCompactionStrategyDescriptor) {
+        self.strategies.insert(descriptor.id.clone(), descriptor);
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.strategies.contains_key(id)
+    }
 }
 
 impl Default for AgentDefinition {
@@ -185,11 +386,20 @@ impl AgentDefinition {
         role: AgentRole,
         system_prompt: impl Into<String>,
     ) -> Self {
+        let name = name.into();
         Self {
-            name: name.into(),
+            schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            id: name.clone(),
+            name,
+            description: String::new(),
             role,
             system_prompt: system_prompt.into(),
             tools: Vec::new(),
+            tool_surface: AgentToolSurfaceDefinition::default(),
+            context: AgentContextDefinition::default(),
+            compaction: AgentCompactionDefinition::default(),
+            model_policy: AgentModelPolicy::default(),
+            runtime_limits: AgentRuntimeLimitsDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
             temperature: None,
             max_output_tokens: None,
@@ -197,51 +407,117 @@ impl AgentDefinition {
     }
 
     pub fn main() -> Self {
+        let temperature = Some(0.2);
+        let max_output_tokens = Some(900);
         Self {
+            schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            id: "main-agent".to_string(),
             name: "main-agent".to_string(),
+            description: "user-facing interactive agent".to_string(),
             role: AgentRole::Main,
             system_prompt: main_agent_base_prompt().to_string(),
             tools: default_main_agent_tools(),
+            tool_surface: AgentToolSurfaceDefinition::default(),
+            context: AgentContextDefinition::default(),
+            compaction: AgentCompactionDefinition::default(),
+            model_policy: AgentModelPolicy {
+                temperature,
+                max_output_tokens,
+                ..AgentModelPolicy::default()
+            },
+            runtime_limits: AgentRuntimeLimitsDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature: Some(0.2),
-            max_output_tokens: Some(900),
+            temperature,
+            max_output_tokens,
         }
     }
 
     pub fn background() -> Self {
+        let temperature = Some(0.2);
+        let max_output_tokens = Some(700);
         Self {
+            schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            id: "background-agent".to_string(),
             name: "background-agent".to_string(),
+            description: "silent maintenance and cluster-support agent".to_string(),
             role: AgentRole::Background,
             system_prompt: background_agent_base_prompt().to_string(),
             tools: default_background_agent_tools(),
+            tool_surface: AgentToolSurfaceDefinition::default(),
+            context: AgentContextDefinition::default(),
+            compaction: AgentCompactionDefinition::default(),
+            model_policy: AgentModelPolicy {
+                temperature,
+                max_output_tokens,
+                ..AgentModelPolicy::default()
+            },
+            runtime_limits: AgentRuntimeLimitsDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature: Some(0.2),
-            max_output_tokens: Some(700),
+            temperature,
+            max_output_tokens,
         }
     }
 
     pub fn coding() -> Self {
+        let temperature = Some(0.2);
         Self {
+            schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            id: "coding-agent".to_string(),
             name: "coding-agent".to_string(),
+            description: "workspace coding and verification agent".to_string(),
             role: AgentRole::Deliberation,
             system_prompt: coding_agent_base_prompt().to_string(),
             tools: default_coding_agent_tools(),
+            tool_surface: AgentToolSurfaceDefinition::default(),
+            context: AgentContextDefinition::default(),
+            compaction: AgentCompactionDefinition::default(),
+            model_policy: AgentModelPolicy {
+                temperature,
+                max_output_tokens: None,
+                ..AgentModelPolicy::default()
+            },
+            runtime_limits: AgentRuntimeLimitsDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature: Some(0.2),
+            temperature,
             max_output_tokens: None,
         }
     }
 
     pub fn evolution() -> Self {
+        let temperature = Some(0.2);
         Self {
+            schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
+            id: "evolution-agent".to_string(),
             name: "evolution-agent".to_string(),
+            description: "supervised self-evolution mutation agent".to_string(),
             role: AgentRole::Evolution,
             system_prompt: evolution_agent_base_prompt().to_string(),
             tools: default_coding_agent_tools(),
+            tool_surface: AgentToolSurfaceDefinition::default(),
+            context: AgentContextDefinition::default(),
+            compaction: AgentCompactionDefinition::default(),
+            model_policy: AgentModelPolicy {
+                temperature,
+                max_output_tokens: None,
+                ..AgentModelPolicy::default()
+            },
+            runtime_limits: AgentRuntimeLimitsDefinition::default(),
             output_format: AgentOutputFormat::JsonDecision,
-            temperature: Some(0.2),
+            temperature,
             max_output_tokens: None,
         }
+    }
+
+    pub fn key(&self) -> &str {
+        if self.id.is_empty() {
+            &self.name
+        } else {
+            &self.id
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), AgentDefinitionValidationError> {
+        AgentDefinitionValidator::built_in().validate(self)
     }
 
     pub fn with_tools(mut self, tools: impl IntoIterator<Item = AgentToolSpec>) -> Self {
@@ -261,11 +537,13 @@ impl AgentDefinition {
 
     pub fn with_temperature(mut self, temperature: Option<f32>) -> Self {
         self.temperature = temperature;
+        self.model_policy.temperature = temperature;
         self
     }
 
     pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
         self.max_output_tokens = max_output_tokens;
+        self.model_policy.max_output_tokens = max_output_tokens;
         self
     }
 
@@ -278,6 +556,335 @@ impl AgentDefinition {
         } else {
             turn_tools
         }
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum AgentDefinitionValidationError {
+    #[error("agent definition id is required")]
+    MissingId,
+    #[error("agent definition id `{id}` contains unsupported characters")]
+    InvalidId { id: String },
+    #[error("agent definition `{id}` has an empty name")]
+    MissingName { id: String },
+    #[error("agent definition `{id}` has an empty system prompt")]
+    MissingSystemPrompt { id: String },
+    #[error("agent definition `{id}` references unknown context pipeline `{pipeline_id}`")]
+    UnknownContextPipeline { id: String, pipeline_id: String },
+    #[error("agent definition `{id}` references unknown compaction strategy `{strategy_id}`")]
+    UnknownCompactionStrategy { id: String, strategy_id: String },
+    #[error("module agent export `{id}` references unknown role `{role}`")]
+    UnknownRole { id: String, role: String },
+    #[error("module agent export `{id}` references unknown tool kind `{kind}`")]
+    UnknownToolKind { id: String, kind: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentDefinitionValidator {
+    context_strategies: AgentContextStrategyRegistry,
+    compaction_strategies: AgentCompactionStrategyRegistry,
+}
+
+impl AgentDefinitionValidator {
+    pub fn built_in() -> Self {
+        Self {
+            context_strategies: AgentContextStrategyRegistry::built_in(),
+            compaction_strategies: AgentCompactionStrategyRegistry::built_in(),
+        }
+    }
+
+    pub fn validate(
+        &self,
+        definition: &AgentDefinition,
+    ) -> Result<(), AgentDefinitionValidationError> {
+        let id = definition.key();
+        if id.trim().is_empty() {
+            return Err(AgentDefinitionValidationError::MissingId);
+        }
+        if !is_valid_agent_definition_id(id) {
+            return Err(AgentDefinitionValidationError::InvalidId { id: id.to_string() });
+        }
+        if definition.name.trim().is_empty() {
+            return Err(AgentDefinitionValidationError::MissingName { id: id.to_string() });
+        }
+        if definition.system_prompt.trim().is_empty() {
+            return Err(AgentDefinitionValidationError::MissingSystemPrompt { id: id.to_string() });
+        }
+        if !self
+            .context_strategies
+            .contains(&definition.context.pipeline_id)
+        {
+            return Err(AgentDefinitionValidationError::UnknownContextPipeline {
+                id: id.to_string(),
+                pipeline_id: definition.context.pipeline_id.clone(),
+            });
+        }
+        if !self
+            .compaction_strategies
+            .contains(&definition.compaction.strategy_id)
+        {
+            return Err(AgentDefinitionValidationError::UnknownCompactionStrategy {
+                id: id.to_string(),
+                strategy_id: definition.compaction.strategy_id.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn is_valid_agent_definition_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentCatalog {
+    definitions: BTreeMap<String, AgentDefinition>,
+}
+
+impl AgentCatalog {
+    pub fn built_ins() -> Self {
+        let mut catalog = Self::default();
+        for definition in AgentDefinition::built_ins() {
+            catalog
+                .upsert(definition)
+                .expect("built-in agent definition should validate");
+        }
+        catalog
+    }
+
+    pub fn load_from_data_dir(
+        data_dir: &sinomo_runtime::local::SinomoDataDir,
+    ) -> Result<Self, AgentCatalogError> {
+        let mut catalog = Self::built_ins();
+        let store = FileAgentDefinitionStore::for_data_dir(data_dir);
+        for definition in store.load_definitions()? {
+            catalog.upsert(definition)?;
+        }
+        if let Ok(registry) = sinomo_runtime::modules::internal_module_registry() {
+            catalog.merge_module_registry(&registry)?;
+        }
+        Ok(catalog)
+    }
+
+    pub fn upsert(
+        &mut self,
+        mut definition: AgentDefinition,
+    ) -> Result<Option<AgentDefinition>, AgentDefinitionValidationError> {
+        if definition.id.is_empty() {
+            definition.id = definition.name.clone();
+        }
+        definition.validate()?;
+        Ok(self
+            .definitions
+            .insert(definition.key().to_string(), definition))
+    }
+
+    pub fn get(&self, id: &str) -> Option<&AgentDefinition> {
+        self.definitions.get(id)
+    }
+
+    pub fn list(&self) -> impl Iterator<Item = &AgentDefinition> {
+        self.definitions.values()
+    }
+
+    pub fn merge_module_registry(
+        &mut self,
+        registry: &sinomo_runtime::module::ModuleRegistry,
+    ) -> Result<(), AgentCatalogError> {
+        for registration in registry.registrations() {
+            for export in &registration.surfaces.agent_definitions {
+                let definition = AgentDefinition::try_from_module_export(export)?;
+                self.upsert(definition)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum AgentCatalogError {
+    #[error(transparent)]
+    Store(#[from] AgentDefinitionStoreError),
+    #[error(transparent)]
+    Validation(#[from] AgentDefinitionValidationError),
+}
+
+pub trait AgentDefinitionStore {
+    fn load_definitions(&self) -> Result<Vec<AgentDefinition>, AgentDefinitionStoreError>;
+    fn save_definition(
+        &self,
+        definition: &AgentDefinition,
+    ) -> Result<PathBuf, AgentDefinitionStoreError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileAgentDefinitionStore {
+    root: PathBuf,
+}
+
+impl FileAgentDefinitionStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn for_data_dir(data_dir: &sinomo_runtime::local::SinomoDataDir) -> Self {
+        Self::new(data_dir.root().join("agents"))
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn definition_path(&self, definition: &AgentDefinition) -> PathBuf {
+        self.root.join(format!("{}.json", definition.key()))
+    }
+}
+
+impl AgentDefinitionStore for FileAgentDefinitionStore {
+    fn load_definitions(&self) -> Result<Vec<AgentDefinition>, AgentDefinitionStoreError> {
+        if !self.root.exists() {
+            return Ok(Vec::new());
+        }
+        let entries = fs::read_dir(&self.root).map_err(|source| AgentDefinitionStoreError::Io {
+            path: self.root.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| AgentDefinitionStoreError::Io {
+                path: self.root.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+
+        let mut definitions = Vec::new();
+        for path in paths {
+            let content =
+                fs::read_to_string(&path).map_err(|source| AgentDefinitionStoreError::Io {
+                    path: path.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+            let mut definition: AgentDefinition =
+                serde_json::from_str(&content).map_err(|source| {
+                    AgentDefinitionStoreError::Json {
+                        path: path.display().to_string(),
+                        detail: source.to_string(),
+                    }
+                })?;
+            if definition.id.is_empty() {
+                definition.id = definition.name.clone();
+            }
+            definition.validate()?;
+            definitions.push(definition);
+        }
+        Ok(definitions)
+    }
+
+    fn save_definition(
+        &self,
+        definition: &AgentDefinition,
+    ) -> Result<PathBuf, AgentDefinitionStoreError> {
+        let mut definition = definition.clone();
+        if definition.id.is_empty() {
+            definition.id = definition.name.clone();
+        }
+        definition.validate()?;
+        fs::create_dir_all(&self.root).map_err(|source| AgentDefinitionStoreError::Io {
+            path: self.root.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let path = self.definition_path(&definition);
+        let bytes = serde_json::to_vec_pretty(&definition).map_err(|source| {
+            AgentDefinitionStoreError::Json {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            }
+        })?;
+        let tmp_path = path.with_extension("json.tmp");
+        fs::write(&tmp_path, bytes).map_err(|source| AgentDefinitionStoreError::Io {
+            path: tmp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        fs::rename(&tmp_path, &path).map_err(|source| AgentDefinitionStoreError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(path)
+    }
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum AgentDefinitionStoreError {
+    #[error("agent definition store I/O failed at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error("agent definition JSON failed at {path}: {detail}")]
+    Json { path: String, detail: String },
+    #[error(transparent)]
+    Validation(#[from] AgentDefinitionValidationError),
+}
+
+impl AgentDefinition {
+    pub fn try_from_module_export(
+        export: &sinomo_runtime::module::ModuleAgentDefinitionExport,
+    ) -> Result<Self, AgentDefinitionValidationError> {
+        let role = parse_agent_role(&export.role).ok_or_else(|| {
+            AgentDefinitionValidationError::UnknownRole {
+                id: export.id.clone(),
+                role: export.role.clone(),
+            }
+        })?;
+        let mut definition = AgentDefinition::custom(&export.name, role, &export.system_prompt);
+        definition.id = export.id.clone();
+        definition.description = export.description.clone();
+        definition.tool_surface.visible_toolsets = export.visible_toolsets.clone();
+        definition.context.pipeline_id = export
+            .context_pipeline_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT_CONTEXT_PIPELINE_ID.to_string());
+        definition.compaction.strategy_id = export
+            .compaction_strategy_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT_COMPACTION_STRATEGY_ID.to_string());
+        definition.tools = export
+            .tools
+            .iter()
+            .map(|tool| {
+                let kind = AgentToolKind::from_identifier(&tool.kind).ok_or_else(|| {
+                    AgentDefinitionValidationError::UnknownToolKind {
+                        id: export.id.clone(),
+                        kind: tool.kind.clone(),
+                    }
+                })?;
+                Ok(AgentToolSpec::new(
+                    kind,
+                    tool.name.clone(),
+                    tool.description.clone(),
+                    tool.async_default,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        definition.validate()?;
+        Ok(definition)
+    }
+}
+
+fn parse_agent_role(value: &str) -> Option<AgentRole> {
+    match value {
+        "main" | "main-agent" => Some(AgentRole::Main),
+        "background" | "background-agent" => Some(AgentRole::Background),
+        "deliberation" | "coding" | "coding-agent" | "deliberation-agent" => {
+            Some(AgentRole::Deliberation)
+        }
+        "evolution" | "evolution-agent" => Some(AgentRole::Evolution),
+        _ => None,
     }
 }
 
@@ -1597,6 +2204,118 @@ mod tests {
             assert!(names.iter().any(|name| name == expected), "{expected}");
         }
         assert!(names.iter().any(|name| name == "handoff_to_background"));
+    }
+
+    #[test]
+    fn built_in_agent_definitions_validate() {
+        let catalog = AgentCatalog::built_ins();
+        let ids: Vec<_> = catalog.list().map(AgentDefinition::key).collect();
+
+        assert!(ids.contains(&"main-agent"));
+        assert!(ids.contains(&"background-agent"));
+        assert!(ids.contains(&"coding-agent"));
+        assert!(ids.contains(&"evolution-agent"));
+        for definition in catalog.list() {
+            definition
+                .validate()
+                .expect("built-in definition validates");
+            assert_eq!(
+                definition.context.pipeline_id,
+                DEFAULT_AGENT_CONTEXT_PIPELINE_ID
+            );
+            assert_eq!(
+                definition.compaction.strategy_id,
+                DEFAULT_AGENT_COMPACTION_STRATEGY_ID
+            );
+        }
+    }
+
+    #[test]
+    fn agent_definition_validation_rejects_unknown_strategies() {
+        let mut definition = AgentDefinition::custom("bad-agent", AgentRole::Main, "Be helpful.");
+        definition.context.pipeline_id = "context.pipeline.missing".to_string();
+
+        let error = definition.validate().expect_err("invalid context");
+
+        assert!(matches!(
+            error,
+            AgentDefinitionValidationError::UnknownContextPipeline { .. }
+        ));
+    }
+
+    #[test]
+    fn file_agent_definition_store_round_trips_custom_definition() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-agent-definition-store-{}",
+            TaskId::generate()
+        ));
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
+        let definition =
+            AgentDefinition::custom("docs-agent", AgentRole::Deliberation, "Write docs.")
+                .with_temperature(Some(0.3))
+                .with_max_output_tokens(Some(456));
+
+        let path = store.save_definition(&definition).expect("save definition");
+        let loaded = store.load_definitions().expect("load definitions");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("docs-agent.json")
+        );
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].key(), "docs-agent");
+        assert_eq!(loaded[0].temperature, Some(0.3));
+        assert_eq!(loaded[0].model_policy.max_output_tokens, Some(456));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn agent_catalog_imports_module_agent_exports() {
+        let export = sinomo_runtime::module::ModuleAgentDefinitionExport::new(
+            "module.example.agent",
+            "module-example-agent",
+            "deliberation",
+            "Use module-specific tools.",
+        )
+        .with_tool(sinomo_runtime::module::ModuleAgentToolExport::new(
+            "read_file",
+            "read_file",
+            "Read a workspace file.",
+            false,
+        ))
+        .with_visible_toolset("coding");
+        let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
+            sinomo_runtime::module::ModuleId::from_legacy_named("module.example")
+                .expect("module id"),
+            "0.1.0",
+            "module-example",
+            "module-example",
+            "module-example-v1",
+            sinomo_runtime::core::TrustRing::R2TrustedService,
+            "module-example",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_agent_definition(export),
+        );
+        let registry = sinomo_runtime::module::ModuleRegistry::builder()
+            .register(registration)
+            .expect("register")
+            .build();
+        let mut catalog = AgentCatalog::built_ins();
+
+        catalog
+            .merge_module_registry(&registry)
+            .expect("merge module exports");
+
+        let definition = catalog
+            .get("module.example.agent")
+            .expect("module agent definition");
+        assert_eq!(definition.name, "module-example-agent");
+        assert_eq!(definition.role, AgentRole::Deliberation);
+        assert_eq!(definition.tools[0].kind, AgentToolKind::ReadFile);
+        assert_eq!(definition.tool_surface.visible_toolsets, vec!["coding"]);
     }
 
     #[test]

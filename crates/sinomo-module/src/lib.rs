@@ -687,6 +687,8 @@ pub struct ModuleSurfaces {
     pub event_kinds: Vec<EventKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_owners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_definitions: Vec<ModuleAgentDefinitionExport>,
     #[serde(default, skip_serializing_if = "ModuleCapabilities::is_empty")]
     pub capabilities: ModuleCapabilities,
 }
@@ -696,6 +698,7 @@ impl ModuleSurfaces {
         self.object_rpc_routes.is_empty()
             && self.event_kinds.is_empty()
             && self.storage_owners.is_empty()
+            && self.agent_definitions.is_empty()
             && self.capabilities.is_empty()
     }
 
@@ -724,6 +727,11 @@ impl ModuleSurfaces {
         self
     }
 
+    pub fn with_agent_definition(mut self, definition: ModuleAgentDefinitionExport) -> Self {
+        self.agent_definitions.push(definition);
+        self
+    }
+
     pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
         self.capabilities.imports.push(capability);
         self
@@ -732,6 +740,95 @@ impl ModuleSurfaces {
     pub fn with_capability_export(mut self, capability: CapabilityName) -> Self {
         self.capabilities.exports.push(capability);
         self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleAgentDefinitionExport {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub role: String,
+    pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ModuleAgentToolExport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pipeline_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_strategy_id: Option<String>,
+}
+
+impl ModuleAgentDefinitionExport {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        role: impl Into<String>,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            role: role.into(),
+            system_prompt: system_prompt.into(),
+            tools: Vec::new(),
+            visible_toolsets: Vec::new(),
+            context_pipeline_id: None,
+            compaction_strategy_id: None,
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn with_tool(mut self, tool: ModuleAgentToolExport) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn with_visible_toolset(mut self, toolset: impl Into<String>) -> Self {
+        self.visible_toolsets.push(toolset.into());
+        self
+    }
+
+    pub fn with_context_pipeline(mut self, pipeline_id: impl Into<String>) -> Self {
+        self.context_pipeline_id = Some(pipeline_id.into());
+        self
+    }
+
+    pub fn with_compaction_strategy(mut self, strategy_id: impl Into<String>) -> Self {
+        self.compaction_strategy_id = Some(strategy_id.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleAgentToolExport {
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub async_default: bool,
+}
+
+impl ModuleAgentToolExport {
+    pub fn new(
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        async_default: bool,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+            description: description.into(),
+            async_default,
+        }
     }
 }
 
