@@ -1730,6 +1730,83 @@ fn local_connectivity_records_are_in_memory_not_disk() {
 }
 
 #[test]
+fn local_connectivity_cache_retains_recent_root_under_path_churn() {
+    let _guard = LOCAL_CONNECTIVITY_CACHE_TEST_MUTEX
+        .lock()
+        .expect("connectivity cache mutex");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-cache-churn-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_cache_churn").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_cache_churn_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_cache_churn_b").expect("node b");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity cache churn",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let endpoint_b = daemon_lan_endpoint(&node_b, "10.0.0.63:21353".to_string(), 10);
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    let hot_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("000-hot")));
+
+    for index in 0..local_cluster_connectivity_record_cache_capacity_for_test().saturating_sub(1) {
+        let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
+            root.join(format!("100-quiet-{index:04}")),
+        ));
+        write_local_cluster_connectivity_records(
+            &quiet_paths,
+            &node_a,
+            std::slice::from_ref(&record),
+        )
+        .expect("write quiet connectivity");
+    }
+    write_local_cluster_connectivity_records(&hot_paths, &node_a, std::slice::from_ref(&record))
+        .expect("write hot connectivity");
+    assert!(
+        local_cluster_connectivity_record_cache_contains_for_test(&hot_paths),
+        "hot root should be present before capacity churn"
+    );
+
+    assert_eq!(
+        read_local_cluster_connectivity_records(&hot_paths).expect("refresh hot root"),
+        vec![record.clone()],
+        "reading the hot root should refresh its cache recency"
+    );
+    let extra_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra")));
+    write_local_cluster_connectivity_records(&extra_paths, &node_a, std::slice::from_ref(&record))
+        .expect("write extra connectivity");
+
+    assert!(
+        local_cluster_connectivity_record_cache_contains_for_test(&hot_paths),
+        "recently read local connectivity should survive unrelated root churn"
+    );
+    assert_eq!(
+        read_local_cluster_connectivity_records(&hot_paths).expect("read retained hot root"),
+        vec![record],
+    );
+    remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(&root);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn local_connectivity_cache_rejects_mismatched_source_records() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-connectivity-source-mismatch-{}",
@@ -2914,6 +2991,11 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
 }
 
 static PUBLIC_ENDPOINT_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LOCAL_CONNECTIVITY_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CLUSTER_KV_WATCH_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static CLUSTER_KV_METADATA_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn default_lan_ip_discovery_cache_reuses_recent_result() {
@@ -8808,6 +8890,60 @@ fn cluster_kv_reader_node_id_cache_tracks_state_rewrites_and_removal() {
 }
 
 #[test]
+fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
+    let _guard = CLUSTER_KV_METADATA_CACHE_TEST_MUTEX
+        .lock()
+        .expect("metadata cache mutex");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-metadata-cache-lru-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let hot_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("000-hot-allocator")));
+    for index in 0..cluster_kv_metadata_cache_capacity_for_test().saturating_sub(1) {
+        let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
+            root.join(format!("100-allocator-{index:04}")),
+        ));
+        record_cluster_kv_watch_allocator_trust_for_test(&quiet_paths);
+    }
+    record_cluster_kv_watch_allocator_trust_for_test(&hot_paths);
+    assert!(
+        refresh_cluster_kv_watch_allocator_trust_for_test(&hot_paths),
+        "looking up hot allocator trust should refresh its recency"
+    );
+    let extra_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra-allocator")));
+    record_cluster_kv_watch_allocator_trust_for_test(&extra_paths);
+    assert!(
+        cluster_kv_watch_allocator_trust_contains_for_test(&hot_paths),
+        "recent allocator trust should survive capacity churn"
+    );
+
+    let node_id = NodeId::from_legacy_named("node_metadata_cache_lru").expect("node");
+    let hot_reader_path = root.join("000-hot-reader.sobj");
+    for index in 0..cluster_kv_metadata_cache_capacity_for_test().saturating_sub(1) {
+        record_cluster_kv_reader_node_id_cache_for_test(
+            &root.join(format!("100-reader-{index:04}.sobj")),
+            &node_id,
+        );
+    }
+    record_cluster_kv_reader_node_id_cache_for_test(&hot_reader_path, &node_id);
+    assert!(
+        refresh_cluster_kv_reader_node_id_cache_for_test(&hot_reader_path),
+        "looking up hot reader node id should refresh its recency"
+    );
+    record_cluster_kv_reader_node_id_cache_for_test(&root.join("999-extra-reader.sobj"), &node_id);
+    assert!(
+        cluster_kv_reader_node_id_cache_contains_for_test(&hot_reader_path),
+        "recent reader node id should survive capacity churn"
+    );
+
+    remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(&root);
+    remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test(&root);
+}
+
+#[test]
 fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-wait-fanout-{}",
@@ -8863,6 +8999,67 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         "waiting drain should be notified instead of timing out after {elapsed:?}"
     );
     assert_eq!(drained.events, vec![event]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
+    let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
+        .lock()
+        .expect("notifier mutex");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-notifier-churn-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    touch_cluster_kv_watch_notifier_for_test(&paths);
+    let observed_generation = cluster_kv_watch_notifier_generation_for_test(&paths);
+    let wait_paths = paths.clone();
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        let changed = wait_for_cluster_kv_watch_change_for_test(
+            &wait_paths,
+            observed_generation,
+            Duration::from_secs(5),
+        );
+        (started.elapsed(), changed)
+    });
+
+    let wait_started = Instant::now();
+    while cluster_kv_watch_notifier_waiter_count_for_test(&paths) == 0
+        && wait_started.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cluster_kv_watch_notifier_waiter_count_for_test(&paths),
+        1,
+        "watch waiter should be registered before churning notifier roots"
+    );
+
+    for index in 0..=cluster_kv_watch_notifier_capacity_for_test() {
+        let quiet_data_dir = SinomoDataDir::new(root.join(format!("quiet-{index}")));
+        let quiet_paths = ClusterPaths::new(&quiet_data_dir);
+        touch_cluster_kv_watch_notifier_for_test(&quiet_paths);
+    }
+
+    assert!(
+        cluster_kv_watch_notifier_has_key_for_test(&paths),
+        "active long-poll waiter should not be evicted by unrelated watch roots"
+    );
+    touch_cluster_kv_watch_notifier_for_test(&paths);
+    let (elapsed, changed) = handle.join().expect("waiter thread");
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+
+    assert!(changed, "active waiter should observe the generation bump");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "active waiter should be notified instead of falling back to timeout after {elapsed:?}"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -14257,6 +14454,59 @@ fn cluster_kv_watch_events_cache_reuses_unchanged_event_view() {
 }
 
 #[test]
+fn cluster_kv_watch_caches_retain_recent_entries_at_capacity() {
+    let _guard = CLUSTER_KV_WATCH_CACHE_TEST_MUTEX
+        .lock()
+        .expect("watch cache mutex");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-cache-lru-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+
+    let hot_event_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("000-hot-events")));
+    for index in 0..cluster_kv_watch_event_cache_capacity_for_test().saturating_sub(1) {
+        let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
+            root.join(format!("100-event-{index:04}")),
+        ));
+        record_cluster_kv_watch_event_cache_for_test(&quiet_paths);
+    }
+    record_cluster_kv_watch_event_cache_for_test(&hot_event_paths);
+    assert!(
+        refresh_cluster_kv_watch_event_cache_for_test(&hot_event_paths),
+        "looking up the hot watch-event cache entry should refresh its recency"
+    );
+    let extra_event_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("999-extra-events")));
+    record_cluster_kv_watch_event_cache_for_test(&extra_event_paths);
+    assert!(
+        cluster_kv_watch_event_cache_contains_for_test(&hot_event_paths),
+        "recent watch-event cache entry should survive capacity churn"
+    );
+
+    let hot_registration_path = root.join("000-hot-registration.sobj");
+    for index in 0..cluster_kv_watch_registration_cache_capacity_for_test().saturating_sub(1) {
+        record_cluster_kv_watch_registration_cache_for_test(
+            &root.join(format!("100-registration-{index:04}.sobj")),
+        );
+    }
+    record_cluster_kv_watch_registration_cache_for_test(&hot_registration_path);
+    assert!(
+        refresh_cluster_kv_watch_registration_cache_for_test(&hot_registration_path),
+        "looking up the hot watch-registration cache entry should refresh its recency"
+    );
+    record_cluster_kv_watch_registration_cache_for_test(&root.join("999-extra-registration.sobj"));
+    assert!(
+        cluster_kv_watch_registration_cache_contains_for_test(&hot_registration_path),
+        "recent watch-registration cache entry should survive capacity churn"
+    );
+
+    remove_cluster_kv_watch_event_cache_entries_under_root_for_test(&root);
+    remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(&root);
+}
+
+#[test]
 fn write_cluster_state_observer_counts_actual_then_skipped() {
     // Serialize with any other test that swaps the global I/O observer.
     let _guard = IO_OBSERVER_TEST_MUTEX.lock().expect("test mutex");
@@ -14370,6 +14620,9 @@ fn write_object_file_skips_compare_read_when_length_differs() {
 
 #[test]
 fn write_object_file_skips_identical_and_rewrites_after_external_change() {
+    let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+        .lock()
+        .expect("object mark cache mutex");
     // Unique path so this test is independent of the process-wide I/O observer.
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-objfile-guard-{}",
@@ -14419,6 +14672,37 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn object_file_write_mark_cache_retains_recent_entry_at_capacity() {
+    let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+        .lock()
+        .expect("object mark cache mutex");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-object-mark-lru-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let hot_path = root.join("000-hot.sobj");
+    for index in 0..object_file_write_mark_cache_capacity_for_test().saturating_sub(1) {
+        record_object_file_write_mark_for_test(&root.join(format!("100-quiet-{index:04}.sobj")));
+    }
+    record_object_file_write_mark_for_test(&hot_path);
+    assert!(
+        refresh_object_file_write_mark_for_test(&hot_path),
+        "looking up the hot object write mark should refresh its recency"
+    );
+
+    record_object_file_write_mark_for_test(&root.join("999-extra.sobj"));
+
+    assert!(
+        object_file_write_mark_cache_contains_for_test(&hot_path),
+        "recent object write mark should survive capacity churn"
+    );
+    remove_object_file_write_mark_entries_under_root_for_test(&root);
 }
 
 #[test]

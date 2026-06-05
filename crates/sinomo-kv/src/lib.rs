@@ -52,6 +52,8 @@ const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const RAFT_NODE_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 const RAFT_NODE_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static OBJECT_FILE_WRITE_MARK_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static KV_READ_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 
 /// Per-path record of the last content `write_object_file` wrote (or confirmed
 /// already on disk), used to skip the read-back + compare when nothing changed.
@@ -61,6 +63,7 @@ struct ObjectFileWriteMark {
     len: u64,
     modified: Option<SystemTime>,
     ino: u64,
+    last_used: u64,
 }
 
 /// Cache of last-written object files. The cluster directory holding these WAL /
@@ -71,8 +74,32 @@ struct ObjectFileWriteMark {
 static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn object_file_write_mark_cache_tick() -> u64 {
+    OBJECT_FILE_WRITE_MARK_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_object_file_write_mark_if_needed(
+    cache: &mut HashMap<PathBuf, ObjectFileWriteMark>,
+    protected: &Path,
+) {
+    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| path.as_path() != protected)
+        .min_by_key(|(_, mark)| mark.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
 fn cached_object_file_mark(path: &Path) -> Option<ObjectFileWriteMark> {
-    LAST_WRITTEN_OBJECT_FILES.lock().ok()?.get(path).cloned()
+    let mut cache = LAST_WRITTEN_OBJECT_FILES.lock().ok()?;
+    let mark = cache.get_mut(path)?;
+    mark.last_used = object_file_write_mark_cache_tick();
+    Some(mark.clone())
 }
 
 fn record_object_file_mark(
@@ -83,9 +110,7 @@ fn record_object_file_mark(
     ino: u64,
 ) {
     if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(path) {
-            cache.clear();
-        }
+        evict_object_file_write_mark_if_needed(&mut cache, path);
         cache.insert(
             path.to_path_buf(),
             ObjectFileWriteMark {
@@ -93,6 +118,7 @@ fn record_object_file_mark(
                 len,
                 modified,
                 ino,
+                last_used: object_file_write_mark_cache_tick(),
             },
         );
     }
@@ -730,11 +756,13 @@ impl KvWalPaths {
 struct MaterializedSnapshotCacheEntry {
     identity: FileIdentity,
     snapshot: Arc<KvSnapshot>,
+    last_used: u64,
 }
 
 struct RaftViewCacheEntry {
     identity: RaftViewIdentity,
     snapshot: Arc<KvSnapshot>,
+    last_used: u64,
 }
 
 static MATERIALIZED_SNAPSHOT_CACHE: OnceLock<
@@ -776,9 +804,8 @@ struct RaftViewIdentity {
 
 /// Upper bound on entries kept in each process-global file cache. The live set of
 /// snapshot/object-file paths is tiny in normal operation; this cap only guards
-/// against unbounded growth under pathological path churn. On overflow the whole
-/// map is dropped (cold cache), which is always correct — these caches are pure
-/// memoization validated against the file on every lookup.
+/// against unbounded growth under pathological path churn. Read caches evict the
+/// oldest entry so a noisy set of roots cannot repeatedly cold-start hot roots.
 const FILE_CACHE_CAPACITY: usize = 4096;
 
 fn file_ino(metadata: &fs::Metadata) -> u64 {
@@ -836,12 +863,51 @@ fn raft_view_identity(paths: &KvWalPaths) -> Option<RaftViewIdentity> {
     })
 }
 
+fn kv_read_cache_tick() -> u64 {
+    KV_READ_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_materialized_snapshot_cache_entry_if_needed(
+    guard: &mut HashMap<PathBuf, MaterializedSnapshotCacheEntry>,
+    protected: &Path,
+) {
+    if guard.contains_key(protected) || guard.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = guard
+        .iter()
+        .filter(|(path, _)| path.as_path() != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        guard.remove(&path);
+    }
+}
+
+fn evict_raft_view_cache_entry_if_needed(
+    guard: &mut HashMap<PathBuf, RaftViewCacheEntry>,
+    protected: &Path,
+) {
+    if guard.contains_key(protected) || guard.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = guard
+        .iter()
+        .filter(|(path, _)| path.as_path() != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        guard.remove(&path);
+    }
+}
+
 fn cache_lookup_snapshot(path: &Path, identity: FileIdentity) -> Option<Arc<KvSnapshot>> {
-    let guard = materialized_snapshot_cache().lock().ok()?;
-    let entry = guard.get(path)?;
+    let mut guard = materialized_snapshot_cache().lock().ok()?;
+    let entry = guard.get_mut(path)?;
     // mtime is the primary key; require it to be present so we never serve a hit
     // we cannot validate, then require the full identity (mtime, len, inode).
     if identity.mtime.is_some() && entry.identity == identity {
+        entry.last_used = kv_read_cache_tick();
         Some(entry.snapshot.clone())
     } else {
         None
@@ -853,12 +919,14 @@ fn cache_store_snapshot(path: &Path, identity: FileIdentity, snapshot: Arc<KvSna
         return;
     }
     if let Ok(mut guard) = materialized_snapshot_cache().lock() {
-        if guard.len() >= FILE_CACHE_CAPACITY && !guard.contains_key(path) {
-            guard.clear();
-        }
+        evict_materialized_snapshot_cache_entry_if_needed(&mut guard, path);
         guard.insert(
             path.to_path_buf(),
-            MaterializedSnapshotCacheEntry { identity, snapshot },
+            MaterializedSnapshotCacheEntry {
+                identity,
+                snapshot,
+                last_used: kv_read_cache_tick(),
+            },
         );
     }
 }
@@ -867,11 +935,12 @@ fn cache_lookup_raft_view(
     paths: &KvWalPaths,
     identity: RaftViewIdentity,
 ) -> Option<Arc<KvSnapshot>> {
-    let guard = raft_view_cache().lock().ok()?;
-    let entry = guard.get(&paths.root)?;
+    let mut guard = raft_view_cache().lock().ok()?;
+    let entry = guard.get_mut(&paths.root)?;
     if entry.identity != identity {
         return None;
     }
+    entry.last_used = kv_read_cache_tick();
     let snapshot = entry.snapshot.clone();
     drop(guard);
     // Re-stat after cloning the cached view so a concurrent append/rewrite cannot
@@ -886,12 +955,14 @@ fn cache_store_raft_view(
     snapshot: Arc<KvSnapshot>,
 ) {
     if let Ok(mut guard) = raft_view_cache().lock() {
-        if guard.len() >= FILE_CACHE_CAPACITY && !guard.contains_key(&paths.root) {
-            guard.clear();
-        }
+        evict_raft_view_cache_entry_if_needed(&mut guard, &paths.root);
         guard.insert(
             paths.root.clone(),
-            RaftViewCacheEntry { identity, snapshot },
+            RaftViewCacheEntry {
+                identity,
+                snapshot,
+                last_used: kv_read_cache_tick(),
+            },
         );
     }
 }
@@ -4354,6 +4425,10 @@ mod tests {
 
     type ClusterId = Id;
 
+    static OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX: std::sync::Mutex<()> =
+        std::sync::Mutex::new(());
+    static KV_READ_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
     struct TestRecord {
         name: String,
@@ -4383,6 +4458,9 @@ mod tests {
 
     #[test]
     fn write_object_file_skips_identical_and_rewrites_after_external_change() {
+        let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+            .lock()
+            .expect("object mark cache mutex");
         // Unique path so the test is independent of any shared state.
         let root = std::env::temp_dir().join(format!(
             "sinomo-kv-objfile-guard-{}",
@@ -4433,6 +4511,57 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn object_file_write_mark_cache_retains_recent_entry_at_capacity() {
+        let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+            .lock()
+            .expect("object mark cache mutex");
+        if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+            cache.clear();
+        }
+        OBJECT_FILE_WRITE_MARK_CACHE_CLOCK.store(1, Ordering::Relaxed);
+        let hash = blake3::hash(b"stable");
+        let hot_path = PathBuf::from("/sinomo-kv-object-mark-lru/000-hot.sobj");
+        for index in 0..FILE_CACHE_CAPACITY.saturating_sub(1) {
+            record_object_file_mark(
+                &PathBuf::from(format!(
+                    "/sinomo-kv-object-mark-lru/100-quiet-{index:04}.sobj"
+                )),
+                hash,
+                6,
+                Some(SystemTime::UNIX_EPOCH),
+                index as u64,
+            );
+        }
+        record_object_file_mark(
+            &hot_path,
+            hash,
+            6,
+            Some(SystemTime::UNIX_EPOCH),
+            FILE_CACHE_CAPACITY as u64,
+        );
+        assert!(
+            cached_object_file_mark(&hot_path).is_some(),
+            "looking up the hot object write mark should refresh its recency"
+        );
+
+        record_object_file_mark(
+            &PathBuf::from("/sinomo-kv-object-mark-lru/999-extra.sobj"),
+            hash,
+            6,
+            Some(SystemTime::UNIX_EPOCH),
+            (FILE_CACHE_CAPACITY + 1) as u64,
+        );
+
+        assert!(
+            cached_object_file_mark(&hot_path).is_some(),
+            "recent object write mark should survive capacity churn"
+        );
+        if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+            cache.retain(|path, _| !path.starts_with("/sinomo-kv-object-mark-lru"));
+        }
     }
 
     #[test]
@@ -8926,6 +9055,7 @@ mod tests {
 
     #[test]
     fn snapshot_cache_validates_full_identity_and_stays_bounded() {
+        let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
         // Inode discrimination: a same-(mtime, len) rewrite lands on a fresh inode
         // (temp + atomic rename), so it must miss rather than serve a stale parse.
         let path = temp_raft_root("kv-snapshot-cache-identity").join("snap.sobj");
@@ -8978,6 +9108,99 @@ mod tests {
             len <= FILE_CACHE_CAPACITY,
             "materialized snapshot cache must stay within capacity, got {len}"
         );
+        materialized_snapshot_cache()
+            .lock()
+            .expect("cache")
+            .retain(|path, _| !path.starts_with("/sinomo-kv-cap-test"));
+    }
+
+    #[test]
+    fn kv_read_caches_retain_recent_entries_at_capacity() {
+        let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
+        materialized_snapshot_cache().lock().expect("cache").clear();
+        raft_view_cache().lock().expect("raft cache").clear();
+        KV_READ_CACHE_CLOCK.store(1, Ordering::Relaxed);
+
+        let snapshot = Arc::new(InProcessKvStore::new().snapshot());
+        let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000));
+        for index in 0..FILE_CACHE_CAPACITY.saturating_sub(1) {
+            cache_store_snapshot(
+                &PathBuf::from(format!("/sinomo-kv-lru-test/100-quiet-{index:04}.sobj")),
+                FileIdentity {
+                    mtime,
+                    len: 1,
+                    ino: (index + 1) as u64,
+                },
+                snapshot.clone(),
+            );
+            let quiet_paths =
+                KvWalPaths::new(format!("/sinomo-kv-lru-test/100-quiet-raft-{index:04}"));
+            cache_store_raft_view(
+                &quiet_paths,
+                RaftViewIdentity {
+                    hard_state: None,
+                    wal: None,
+                    snapshot: None,
+                },
+                snapshot.clone(),
+            );
+        }
+
+        let hot_snapshot_path = PathBuf::from("/sinomo-kv-lru-test/000-hot.sobj");
+        let hot_snapshot_identity = FileIdentity {
+            mtime,
+            len: 1,
+            ino: (FILE_CACHE_CAPACITY + 1) as u64,
+        };
+        cache_store_snapshot(&hot_snapshot_path, hot_snapshot_identity, snapshot.clone());
+        let hot_raft_paths = KvWalPaths::new("/sinomo-kv-lru-test/000-hot-raft");
+        let hot_raft_identity = RaftViewIdentity {
+            hard_state: None,
+            wal: None,
+            snapshot: None,
+        };
+        cache_store_raft_view(&hot_raft_paths, hot_raft_identity, snapshot.clone());
+
+        assert!(
+            cache_lookup_snapshot(&hot_snapshot_path, hot_snapshot_identity).is_some(),
+            "looking up the hot materialized snapshot should refresh its recency"
+        );
+        assert!(
+            cache_lookup_raft_view(&hot_raft_paths, hot_raft_identity).is_some(),
+            "looking up the hot raft view should refresh its recency"
+        );
+
+        cache_store_snapshot(
+            &PathBuf::from("/sinomo-kv-lru-test/999-extra.sobj"),
+            FileIdentity {
+                mtime,
+                len: 1,
+                ino: (FILE_CACHE_CAPACITY + 2) as u64,
+            },
+            snapshot.clone(),
+        );
+        cache_store_raft_view(
+            &KvWalPaths::new("/sinomo-kv-lru-test/999-extra-raft"),
+            hot_raft_identity,
+            snapshot,
+        );
+
+        assert!(
+            cache_lookup_snapshot(&hot_snapshot_path, hot_snapshot_identity).is_some(),
+            "recent materialized snapshot cache entry should survive capacity churn"
+        );
+        assert!(
+            cache_lookup_raft_view(&hot_raft_paths, hot_raft_identity).is_some(),
+            "recent raft-view cache entry should survive capacity churn"
+        );
+        materialized_snapshot_cache()
+            .lock()
+            .expect("cache")
+            .retain(|path, _| !path.starts_with("/sinomo-kv-lru-test"));
+        raft_view_cache()
+            .lock()
+            .expect("raft cache")
+            .retain(|path, _| !path.starts_with("/sinomo-kv-lru-test"));
     }
 
     #[test]

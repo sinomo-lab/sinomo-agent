@@ -48,11 +48,18 @@ pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static OBJECT_FILE_WRITE_MARK_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_KV_WATCH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_KV_WATCH_NOTIFIER_CLOCK: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_KV_METADATA_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static LOCAL_CLUSTER_CONNECTIVITY_RECORDS: LazyLock<
-    Mutex<BTreeMap<PathBuf, Vec<ClusterConnectivityRecord>>>,
-> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
-static CLUSTER_KV_WATCH_NOTIFIERS: LazyLock<(Mutex<HashMap<PathBuf, u64>>, Condvar)> =
-    LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
+    Mutex<HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLUSTER_KV_WATCH_NOTIFIERS: LazyLock<(
+    Mutex<HashMap<PathBuf, ClusterKvWatchNotifierEntry>>,
+    Condvar,
+)> = LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
 static CLUSTER_KV_WATCH_EVENT_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvWatchEventCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -103,24 +110,41 @@ struct ClusterKvWatchEventCacheEntry {
     events: Arc<Vec<KvEvent>>,
     log_records: usize,
     append_safe: bool,
+    last_used: u64,
 }
 
 #[derive(Clone)]
 struct ClusterKvWatchRegistrationCacheEntry {
     mark: ClusterFileMark,
     registration: ClusterKvWatchRegistration,
+    last_used: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ClusterKvWatchNotifierEntry {
+    generation: u64,
+    last_used: u64,
+    waiters: usize,
+}
+
+#[derive(Clone)]
+struct LocalClusterConnectivityRecordCacheEntry {
+    records: Vec<ClusterConnectivityRecord>,
+    last_used: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ClusterKvWatchAllocatorTrustEntry {
     allocator_mark: ClusterFileMark,
     watch_dir_mark: ClusterFileMark,
+    last_used: u64,
 }
 
 #[derive(Clone)]
 struct ClusterKvReaderNodeIdCacheEntry {
     mark: ClusterFileMark,
     node_id: NodeId,
+    last_used: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -157,6 +181,7 @@ struct ObjectFileWriteMark {
     len: u64,
     modified: Option<SystemTime>,
     ino: u64,
+    last_used: u64,
 }
 
 /// Cache of last-written object files. The cluster directory can be shared by the
@@ -167,8 +192,32 @@ struct ObjectFileWriteMark {
 static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+fn object_file_write_mark_cache_tick() -> u64 {
+    OBJECT_FILE_WRITE_MARK_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_object_file_write_mark_if_needed(
+    cache: &mut HashMap<PathBuf, ObjectFileWriteMark>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, mark)| mark.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
 fn cached_object_file_mark(path: &PathBuf) -> Option<ObjectFileWriteMark> {
-    LAST_WRITTEN_OBJECT_FILES.lock().ok()?.get(path).cloned()
+    let mut cache = LAST_WRITTEN_OBJECT_FILES.lock().ok()?;
+    let mark = cache.get_mut(path)?;
+    mark.last_used = object_file_write_mark_cache_tick();
+    Some(mark.clone())
 }
 
 fn record_object_file_mark(
@@ -179,9 +228,7 @@ fn record_object_file_mark(
     ino: u64,
 ) {
     if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(path) {
-            cache.clear();
-        }
+        evict_object_file_write_mark_if_needed(&mut cache, path);
         cache.insert(
             path.clone(),
             ObjectFileWriteMark {
@@ -189,6 +236,7 @@ fn record_object_file_mark(
                 len,
                 modified,
                 ino,
+                last_used: object_file_write_mark_cache_tick(),
             },
         );
     }
@@ -240,6 +288,46 @@ fn cluster_kv_watch_event_cache_marks(
     ))
 }
 
+fn cluster_kv_watch_cache_tick() -> u64 {
+    CLUSTER_KV_WATCH_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_cluster_kv_watch_event_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterKvWatchEventCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
+fn evict_cluster_kv_watch_registration_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterKvWatchRegistrationCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected)
+        || cache.len() < MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES
+    {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
 fn cached_cluster_kv_watch_events_arc(
     paths: &ClusterPaths,
     checkpoint: ClusterFileMark,
@@ -254,9 +342,14 @@ fn cached_cluster_kv_watch_event_cache_entry(
     log: ClusterFileMark,
 ) -> Option<ClusterKvWatchEventCacheEntry> {
     let key = cluster_kv_watch_notify_key(paths);
-    let cache = CLUSTER_KV_WATCH_EVENT_CACHE.lock().ok()?;
-    let entry = cache.get(&key)?;
-    (entry.checkpoint == checkpoint && entry.log == log).then(|| entry.clone())
+    let mut cache = CLUSTER_KV_WATCH_EVENT_CACHE.lock().ok()?;
+    let entry = cache.get_mut(&key)?;
+    if entry.checkpoint == checkpoint && entry.log == log {
+        entry.last_used = cluster_kv_watch_cache_tick();
+        Some(entry.clone())
+    } else {
+        None
+    }
 }
 
 fn record_cluster_kv_watch_event_cache(
@@ -287,9 +380,7 @@ fn record_cluster_kv_watch_event_cache_arc(
 ) {
     let key = cluster_kv_watch_notify_key(paths);
     if let Ok(mut cache) = CLUSTER_KV_WATCH_EVENT_CACHE.lock() {
-        if cache.len() >= MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES && !cache.contains_key(&key) {
-            cache.clear();
-        }
+        evict_cluster_kv_watch_event_cache_entry_if_needed(&mut cache, &key);
         cache.insert(
             key,
             ClusterKvWatchEventCacheEntry {
@@ -298,6 +389,7 @@ fn record_cluster_kv_watch_event_cache_arc(
                 events,
                 log_records,
                 append_safe,
+                last_used: cluster_kv_watch_cache_tick(),
             },
         );
     }
@@ -332,9 +424,14 @@ fn cached_cluster_kv_watch_registration(
     path: &PathBuf,
     mark: ClusterFileMark,
 ) -> Option<ClusterKvWatchRegistration> {
-    let cache = CLUSTER_KV_WATCH_REGISTRATION_CACHE.lock().ok()?;
-    let entry = cache.get(path)?;
-    (entry.mark == mark).then(|| entry.registration.clone())
+    let mut cache = CLUSTER_KV_WATCH_REGISTRATION_CACHE.lock().ok()?;
+    let entry = cache.get_mut(path)?;
+    if entry.mark == mark {
+        entry.last_used = cluster_kv_watch_cache_tick();
+        Some(entry.registration.clone())
+    } else {
+        None
+    }
 }
 
 fn record_cluster_kv_watch_registration_cache(
@@ -343,14 +440,14 @@ fn record_cluster_kv_watch_registration_cache(
     registration: ClusterKvWatchRegistration,
 ) {
     if let Ok(mut cache) = CLUSTER_KV_WATCH_REGISTRATION_CACHE.lock() {
-        if cache.len() >= MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES
-            && !cache.contains_key(path)
-        {
-            cache.clear();
-        }
+        evict_cluster_kv_watch_registration_cache_entry_if_needed(&mut cache, path);
         cache.insert(
             path.clone(),
-            ClusterKvWatchRegistrationCacheEntry { mark, registration },
+            ClusterKvWatchRegistrationCacheEntry {
+                mark,
+                registration,
+                last_used: cluster_kv_watch_cache_tick(),
+            },
         );
     }
 }
@@ -372,6 +469,23 @@ fn invalidate_cluster_kv_watch_registration_cache(path: &PathBuf) {
     }
 }
 
+fn evict_cluster_kv_watch_allocator_trust_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterKvWatchAllocatorTrustEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
 fn cluster_kv_watch_allocator_trusted(paths: &ClusterPaths) -> bool {
     let Some(allocator_mark) = cluster_file_mark(&paths.kv_watches_next_id) else {
         return false;
@@ -385,13 +499,18 @@ fn cluster_kv_watch_allocator_trusted(paths: &ClusterPaths) -> bool {
     if !watch_dir_mark.exists {
         return false;
     }
-    CLUSTER_KV_WATCH_ALLOCATOR_TRUST
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&paths.kv_watches_next_id).copied())
-        .is_some_and(|entry| {
-            entry.allocator_mark == allocator_mark && entry.watch_dir_mark == watch_dir_mark
-        })
+    let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() else {
+        return false;
+    };
+    let Some(entry) = cache.get_mut(&paths.kv_watches_next_id) else {
+        return false;
+    };
+    if entry.allocator_mark == allocator_mark && entry.watch_dir_mark == watch_dir_mark {
+        entry.last_used = cluster_kv_watch_cache_tick();
+        true
+    } else {
+        false
+    }
 }
 
 fn record_current_cluster_kv_watch_allocator_trust(paths: &ClusterPaths) {
@@ -408,33 +527,63 @@ fn record_current_cluster_kv_watch_allocator_trust(paths: &ClusterPaths) {
         return;
     }
     if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
-        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(&paths.kv_watches_next_id) {
-            cache.clear();
-        }
+        evict_cluster_kv_watch_allocator_trust_entry_if_needed(
+            &mut cache,
+            &paths.kv_watches_next_id,
+        );
         cache.insert(
             paths.kv_watches_next_id.clone(),
             ClusterKvWatchAllocatorTrustEntry {
                 allocator_mark,
                 watch_dir_mark,
+                last_used: cluster_kv_watch_cache_tick(),
             },
         );
     }
 }
 
+fn cluster_kv_metadata_cache_tick() -> u64 {
+    CLUSTER_KV_METADATA_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_cluster_kv_reader_node_id_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterKvReaderNodeIdCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
 fn cached_cluster_kv_reader_node_id(path: &PathBuf, mark: ClusterFileMark) -> Option<NodeId> {
-    let cache = CLUSTER_KV_READER_NODE_ID_CACHE.lock().ok()?;
-    let entry = cache.get(path)?;
-    (entry.mark == mark).then(|| entry.node_id.clone())
+    let mut cache = CLUSTER_KV_READER_NODE_ID_CACHE.lock().ok()?;
+    let entry = cache.get_mut(path)?;
+    if entry.mark == mark {
+        entry.last_used = cluster_kv_metadata_cache_tick();
+        Some(entry.node_id.clone())
+    } else {
+        None
+    }
 }
 
 fn record_cluster_kv_reader_node_id_cache(path: &PathBuf, mark: ClusterFileMark, node_id: NodeId) {
     if let Ok(mut cache) = CLUSTER_KV_READER_NODE_ID_CACHE.lock() {
-        if cache.len() >= FILE_CACHE_CAPACITY && !cache.contains_key(path) {
-            cache.clear();
-        }
+        evict_cluster_kv_reader_node_id_cache_entry_if_needed(&mut cache, path);
         cache.insert(
             path.clone(),
-            ClusterKvReaderNodeIdCacheEntry { mark, node_id },
+            ClusterKvReaderNodeIdCacheEntry {
+                mark,
+                node_id,
+                last_used: cluster_kv_metadata_cache_tick(),
+            },
         );
     }
 }
@@ -628,6 +777,283 @@ pub(crate) fn local_cluster_connectivity_record_cache_contains_for_test(
         .unwrap_or(false)
 }
 
+#[cfg(test)]
+pub(crate) fn object_file_write_mark_cache_capacity_for_test() -> usize {
+    FILE_CACHE_CAPACITY
+}
+
+#[cfg(test)]
+pub(crate) fn object_file_write_mark_cache_contains_for_test(path: &PathBuf) -> bool {
+    LAST_WRITTEN_OBJECT_FILES
+        .lock()
+        .map(|cache| cache.contains_key(path))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn record_object_file_write_mark_for_test(path: &PathBuf) {
+    record_object_file_mark(
+        path,
+        blake3::hash(b"stable"),
+        6,
+        Some(SystemTime::UNIX_EPOCH),
+        1,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_object_file_write_mark_for_test(path: &PathBuf) -> bool {
+    cached_object_file_mark(path).is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn remove_object_file_write_mark_entries_under_root_for_test(root: &std::path::Path) {
+    if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
+        cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_event_cache_capacity_for_test() -> usize {
+    MAX_CLUSTER_KV_WATCH_EVENT_CACHE_ENTRIES
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_registration_cache_capacity_for_test() -> usize {
+    MAX_CLUSTER_KV_WATCH_REGISTRATION_CACHE_ENTRIES
+}
+
+#[cfg(test)]
+pub(crate) fn record_cluster_kv_watch_event_cache_for_test(paths: &ClusterPaths) {
+    record_cluster_kv_watch_event_cache(
+        paths,
+        ClusterFileMark {
+            exists: false,
+            len: 0,
+            modified: None,
+            ino: 0,
+        },
+        ClusterFileMark {
+            exists: false,
+            len: 0,
+            modified: None,
+            ino: 0,
+        },
+        Vec::new(),
+        0,
+        true,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_cluster_kv_watch_event_cache_for_test(paths: &ClusterPaths) -> bool {
+    cached_cluster_kv_watch_event_cache_entry(
+        paths,
+        ClusterFileMark {
+            exists: false,
+            len: 0,
+            modified: None,
+            ino: 0,
+        },
+        ClusterFileMark {
+            exists: false,
+            len: 0,
+            modified: None,
+            ino: 0,
+        },
+    )
+    .is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_event_cache_contains_for_test(paths: &ClusterPaths) -> bool {
+    let key = cluster_kv_watch_notify_key(paths);
+    CLUSTER_KV_WATCH_EVENT_CACHE
+        .lock()
+        .map(|cache| cache.contains_key(&key))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_cluster_kv_watch_event_cache_entries_under_root_for_test(
+    root: &std::path::Path,
+) {
+    if let Ok(mut cache) = CLUSTER_KV_WATCH_EVENT_CACHE.lock() {
+        cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_cluster_kv_watch_registration_cache_for_test(path: &PathBuf) {
+    record_cluster_kv_watch_registration_cache(
+        path,
+        ClusterFileMark {
+            exists: true,
+            len: 1,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            ino: 1,
+        },
+        ClusterKvWatchRegistration {
+            watch_id: WatchId(1),
+            prefix: "/cache/test/".to_string(),
+            next_revision: KvRevision(1),
+        },
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_cluster_kv_watch_registration_cache_for_test(path: &PathBuf) -> bool {
+    cached_cluster_kv_watch_registration(
+        path,
+        ClusterFileMark {
+            exists: true,
+            len: 1,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            ino: 1,
+        },
+    )
+    .is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_registration_cache_contains_for_test(path: &PathBuf) -> bool {
+    CLUSTER_KV_WATCH_REGISTRATION_CACHE
+        .lock()
+        .map(|cache| cache.contains_key(path))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_cluster_kv_watch_registration_cache_entries_under_root_for_test(
+    root: &std::path::Path,
+) {
+    if let Ok(mut cache) = CLUSTER_KV_WATCH_REGISTRATION_CACHE.lock() {
+        cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_metadata_cache_capacity_for_test() -> usize {
+    FILE_CACHE_CAPACITY
+}
+
+#[cfg(test)]
+pub(crate) fn record_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterPaths) {
+    if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
+        evict_cluster_kv_watch_allocator_trust_entry_if_needed(
+            &mut cache,
+            &paths.kv_watches_next_id,
+        );
+        cache.insert(
+            paths.kv_watches_next_id.clone(),
+            ClusterKvWatchAllocatorTrustEntry {
+                allocator_mark: ClusterFileMark {
+                    exists: true,
+                    len: 1,
+                    modified: Some(SystemTime::UNIX_EPOCH),
+                    ino: 1,
+                },
+                watch_dir_mark: ClusterFileMark {
+                    exists: true,
+                    len: 1,
+                    modified: Some(SystemTime::UNIX_EPOCH),
+                    ino: 1,
+                },
+                last_used: cluster_kv_watch_cache_tick(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_cluster_kv_watch_allocator_trust_for_test(paths: &ClusterPaths) -> bool {
+    CLUSTER_KV_WATCH_ALLOCATOR_TRUST
+        .lock()
+        .ok()
+        .and_then(|mut cache| {
+            cache.get_mut(&paths.kv_watches_next_id).map(|entry| {
+                entry.last_used = cluster_kv_watch_cache_tick();
+            })
+        })
+        .is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_allocator_trust_contains_for_test(paths: &ClusterPaths) -> bool {
+    CLUSTER_KV_WATCH_ALLOCATOR_TRUST
+        .lock()
+        .map(|cache| cache.contains_key(&paths.kv_watches_next_id))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_cluster_kv_watch_allocator_trust_entries_under_root_for_test(
+    root: &std::path::Path,
+) {
+    if let Ok(mut cache) = CLUSTER_KV_WATCH_ALLOCATOR_TRUST.lock() {
+        cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_cluster_kv_reader_node_id_cache_for_test(path: &PathBuf, node_id: &NodeId) {
+    record_cluster_kv_reader_node_id_cache(
+        path,
+        ClusterFileMark {
+            exists: true,
+            len: 1,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            ino: 1,
+        },
+        node_id.clone(),
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn refresh_cluster_kv_reader_node_id_cache_for_test(path: &PathBuf) -> bool {
+    cached_cluster_kv_reader_node_id(
+        path,
+        ClusterFileMark {
+            exists: true,
+            len: 1,
+            modified: Some(SystemTime::UNIX_EPOCH),
+            ino: 1,
+        },
+    )
+    .is_some()
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_reader_node_id_cache_contains_for_test(path: &PathBuf) -> bool {
+    CLUSTER_KV_READER_NODE_ID_CACHE
+        .lock()
+        .map(|cache| cache.contains_key(path))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_cluster_kv_reader_node_id_cache_entries_under_root_for_test(
+    root: &std::path::Path,
+) {
+    if let Ok(mut cache) = CLUSTER_KV_READER_NODE_ID_CACHE.lock() {
+        cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn local_cluster_connectivity_record_cache_capacity_for_test() -> usize {
+    MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES
+}
+
+#[cfg(test)]
+pub(crate) fn remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(
+    root: &std::path::Path,
+) {
+    if let Ok(mut cache) = LOCAL_CLUSTER_CONNECTIVITY_RECORDS.lock() {
+        cache.retain(|path, _| !path.starts_with(root));
+    }
+}
+
 /// Receives notifications about disk and network I/O performed by the network
 /// layer: object-file and KV-snapshot writes (op counts), the byte volume of
 /// those reads/writes, and the byte volume of framed RPC traffic. Used by
@@ -708,12 +1134,61 @@ fn cluster_kv_watch_notify_key(paths: &ClusterPaths) -> PathBuf {
     paths.root.clone()
 }
 
+fn cluster_kv_watch_notifier_tick() -> u64 {
+    CLUSTER_KV_WATCH_NOTIFIER_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_cluster_kv_watch_notifier_entry_if_needed(
+    guard: &mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    protected: &PathBuf,
+) {
+    if guard.contains_key(protected) || guard.len() < MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES {
+        return;
+    }
+    let eviction_candidate = guard
+        .iter()
+        .filter(|(path, entry)| *path != protected && entry.waiters == 0)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .or_else(|| {
+            guard
+                .iter()
+                .filter(|(path, _)| *path != protected)
+                .min_by_key(|(_, entry)| entry.last_used)
+        })
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        guard.remove(&path);
+    }
+}
+
+fn ensure_cluster_kv_watch_notifier_entry<'a>(
+    guard: &'a mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    key: PathBuf,
+) -> &'a mut ClusterKvWatchNotifierEntry {
+    evict_cluster_kv_watch_notifier_entry_if_needed(guard, &key);
+    guard.entry(key).or_default()
+}
+
+fn finish_cluster_kv_watch_wait(
+    guard: &mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    key: &PathBuf,
+) {
+    if let Some(entry) = guard.get_mut(key) {
+        entry.waiters = entry.waiters.saturating_sub(1);
+        entry.last_used = cluster_kv_watch_notifier_tick();
+    }
+}
+
 fn cluster_kv_watch_generation(paths: &ClusterPaths) -> u64 {
     let (generations, _) = &*CLUSTER_KV_WATCH_NOTIFIERS;
     generations
         .lock()
         .ok()
-        .and_then(|guard| guard.get(&cluster_kv_watch_notify_key(paths)).copied())
+        .and_then(|guard| {
+            guard
+                .get(&cluster_kv_watch_notify_key(paths))
+                .map(|entry| entry.generation)
+        })
         .unwrap_or(0)
 }
 
@@ -723,14 +1198,10 @@ fn notify_cluster_kv_watchers(paths: &ClusterPaths) {
         return;
     };
     let key = cluster_kv_watch_notify_key(paths);
-    if !guard.contains_key(&key)
-        && guard.len() >= MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES
-        && let Some(oldest) = guard.keys().next().cloned()
-    {
-        guard.remove(&oldest);
-    }
-    let generation = guard.entry(key).or_insert(0);
-    *generation = generation.saturating_add(1);
+    let tick = cluster_kv_watch_notifier_tick();
+    let entry = ensure_cluster_kv_watch_notifier_entry(&mut guard, key);
+    entry.generation = entry.generation.saturating_add(1);
+    entry.last_used = tick;
     changed.notify_all();
 }
 
@@ -750,22 +1221,94 @@ fn wait_for_cluster_kv_watch_change(
     let Ok(mut guard) = generations.lock() else {
         return false;
     };
+    {
+        let tick = cluster_kv_watch_notifier_tick();
+        let entry = ensure_cluster_kv_watch_notifier_entry(&mut guard, key.clone());
+        entry.waiters = entry.waiters.saturating_add(1);
+        entry.last_used = tick;
+    }
     loop {
-        if guard.get(&key).copied().unwrap_or(0) != observed_generation {
+        if guard.get(&key).map(|entry| entry.generation).unwrap_or(0) != observed_generation {
+            finish_cluster_kv_watch_wait(&mut guard, &key);
             return true;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            finish_cluster_kv_watch_wait(&mut guard, &key);
             return false;
         }
-        let Ok((next_guard, wait)) = changed.wait_timeout(guard, remaining) else {
-            return false;
+        let (next_guard, wait) = match changed.wait_timeout(guard, remaining) {
+            Ok(result) => result,
+            Err(poisoned) => {
+                let (mut poisoned_guard, _) = poisoned.into_inner();
+                finish_cluster_kv_watch_wait(&mut poisoned_guard, &key);
+                return false;
+            }
         };
         guard = next_guard;
+        if let Some(entry) = guard.get_mut(&key) {
+            entry.last_used = cluster_kv_watch_notifier_tick();
+        }
         if wait.timed_out() {
-            return guard.get(&key).copied().unwrap_or(0) != observed_generation;
+            let changed =
+                guard.get(&key).map(|entry| entry.generation).unwrap_or(0) != observed_generation;
+            finish_cluster_kv_watch_wait(&mut guard, &key);
+            return changed;
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_notifier_capacity_for_test() -> usize {
+    MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_notifier_generation_for_test(paths: &ClusterPaths) -> u64 {
+    cluster_kv_watch_generation(paths)
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_notifier_has_key_for_test(paths: &ClusterPaths) -> bool {
+    let key = cluster_kv_watch_notify_key(paths);
+    let (generations, _) = &*CLUSTER_KV_WATCH_NOTIFIERS;
+    generations
+        .lock()
+        .map(|guard| guard.contains_key(&key))
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+pub(crate) fn cluster_kv_watch_notifier_waiter_count_for_test(paths: &ClusterPaths) -> usize {
+    let key = cluster_kv_watch_notify_key(paths);
+    let (generations, _) = &*CLUSTER_KV_WATCH_NOTIFIERS;
+    generations
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&key).map(|entry| entry.waiters))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+pub(crate) fn remove_cluster_kv_watch_notifier_entries_under_root_for_test(root: &std::path::Path) {
+    let (generations, _) = &*CLUSTER_KV_WATCH_NOTIFIERS;
+    if let Ok(mut guard) = generations.lock() {
+        guard.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn touch_cluster_kv_watch_notifier_for_test(paths: &ClusterPaths) {
+    notify_cluster_kv_watchers(paths);
+}
+
+#[cfg(test)]
+pub(crate) fn wait_for_cluster_kv_watch_change_for_test(
+    paths: &ClusterPaths,
+    observed_generation: u64,
+    timeout: Duration,
+) -> bool {
+    wait_for_cluster_kv_watch_change(paths, observed_generation, timeout)
 }
 
 pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkError> {
@@ -3712,14 +4255,18 @@ pub fn read_local_cluster_connectivity_records(
                 operation: "lock local cluster connectivity cache".to_string(),
                 detail: error.to_string(),
             })?;
-    let Some(local_records) = cache.get_mut(&paths.root) else {
+    let Some(entry) = cache.get_mut(&paths.root) else {
         return Ok(Vec::new());
     };
-    local_records.retain(|record| cluster_network_record_live(record.expires_at, now));
-    let mut records = local_records.clone();
-    if local_records.is_empty() {
+    entry
+        .records
+        .retain(|record| cluster_network_record_live(record.expires_at, now));
+    if entry.records.is_empty() {
         cache.remove(&paths.root);
+        return Ok(Vec::new());
     }
+    entry.last_used = local_cluster_connectivity_cache_tick();
+    let mut records = entry.records.clone();
     sort_cluster_connectivity_records(&mut records);
     Ok(records)
 }
@@ -3762,6 +4309,56 @@ fn validate_cluster_connectivity_records_for_source(
     Ok(())
 }
 
+fn local_cluster_connectivity_cache_tick() -> u64 {
+    LOCAL_CLUSTER_CONNECTIVITY_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn prune_expired_local_cluster_connectivity_cache_entries(
+    cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
+    now: OffsetDateTime,
+) {
+    cache.retain(|_, entry| {
+        entry
+            .records
+            .retain(|record| cluster_network_record_live(record.expires_at, now));
+        !entry.records.is_empty()
+    });
+}
+
+fn evict_local_cluster_connectivity_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
+fn store_local_cluster_connectivity_cache_entry(
+    cache: &mut HashMap<PathBuf, LocalClusterConnectivityRecordCacheEntry>,
+    key: PathBuf,
+    records: Vec<ClusterConnectivityRecord>,
+    now: OffsetDateTime,
+) {
+    prune_expired_local_cluster_connectivity_cache_entries(cache, now);
+    evict_local_cluster_connectivity_cache_entry_if_needed(cache, &key);
+    cache.insert(
+        key,
+        LocalClusterConnectivityRecordCacheEntry {
+            records,
+            last_used: local_cluster_connectivity_cache_tick(),
+        },
+    );
+}
+
 fn write_local_cluster_connectivity_records_inner(
     paths: &ClusterPaths,
     source_node_id: &NodeId,
@@ -3777,7 +4374,10 @@ fn write_local_cluster_connectivity_records_inner(
                 operation: "lock local cluster connectivity cache".to_string(),
                 detail: error.to_string(),
             })?;
-    let existing_records = cache.get(&paths.root).cloned().unwrap_or_default();
+    let existing_records = cache
+        .get(&paths.root)
+        .map(|entry| entry.records.clone())
+        .unwrap_or_default();
     let mut merged = existing_records
         .iter()
         .filter(|record| {
@@ -3825,13 +4425,7 @@ fn write_local_cluster_connectivity_records_inner(
     if merged.is_empty() {
         cache.remove(&paths.root);
     } else {
-        if !cache.contains_key(&paths.root)
-            && cache.len() >= MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES
-            && let Some(oldest) = cache.keys().next().cloned()
-        {
-            cache.remove(&oldest);
-        }
-        cache.insert(paths.root.clone(), merged);
+        store_local_cluster_connectivity_cache_entry(&mut cache, paths.root.clone(), merged, now);
     }
     Ok(())
 }
