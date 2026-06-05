@@ -8345,6 +8345,48 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
 }
 
 #[test]
+fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-no-snapshot-probe-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    assert!(
+        !paths.kv_snapshot.exists(),
+        "test setup should not create a materialized snapshot"
+    );
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/no-snapshot-probe".to_string(),
+        kind: KvEventKind::Put {
+            value: b"value".to_vec(),
+        },
+    };
+
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+            .expect("append watch event"),
+        1
+    );
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        0,
+        "watch appends without a materialized snapshot should not take the required snapshot read path"
+    );
+    assert_eq!(
+        cluster_kv_watch_events(&paths).expect("read watch events"),
+        vec![event]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-events-large-direct-checkpoint-{}",
@@ -9156,6 +9198,164 @@ fn cluster_kv_reader_node_id_cache_tracks_state_rewrites_and_removal() {
         cached_cluster_kv_reader_node_id_for_test(&paths).is_none(),
         "state removal should invalidate the cached reader node id"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-metadata-no-snapshot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    assert!(
+        !paths.kv_snapshot.exists(),
+        "test setup should not create a materialized snapshot"
+    );
+
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+    assert!(
+        read_cluster_members_from_kv(&paths)
+            .expect("members")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_endpoints_from_kv(&paths)
+            .expect("endpoints")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_node_statuses_from_kv(&paths)
+            .expect("statuses")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_module_rollout_statuses_from_kv(&paths)
+            .expect("rollout statuses")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_module_rollout_desired_from_kv(&paths)
+            .expect("rollout desired")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_module_rollout_reconciliations_from_kv(&paths)
+            .expect("rollout reconciliations")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_network_info_from_kv(&paths)
+            .expect("network info")
+            .is_empty()
+    );
+    assert!(
+        read_cluster_connectivity_graph_from_kv(&paths)
+            .expect("connectivity")
+            .is_empty()
+    );
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_metadata_no_snapshot").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_metadata_no_snapshot").expect("node");
+    let status = ClusterNodeStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        process: "daemon-main".to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-05-04T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    assert!(
+        !stored_cluster_node_status_matches(&paths, &status).expect("missing status match"),
+        "missing materialized snapshots should make status no-op checks miss, not error"
+    );
+    let info = ClusterNetworkInfoRecord {
+        cluster_id,
+        node_id,
+        environment_id: "env_metadata_no_snapshot".to_string(),
+        observed_addresses: vec!["192.0.2.10".to_string()],
+        endpoints: Vec::new(),
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(300),
+    };
+    assert!(
+        !stored_cluster_network_info_matches(&paths, &info).expect("missing network-info match"),
+        "missing materialized snapshots should make network-info no-op checks miss, not error"
+    );
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        0,
+        "missing materialized snapshots should not be counted as cached snapshot reads"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_put_sync_skips_noop_probe_without_materialized_snapshot() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-put-no-snapshot-probe-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_put_no_snapshot_probe").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_put_no_snapshot_probe").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "put no snapshot probe",
+        node_id.clone(),
+        "network node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    assert!(
+        !paths.kv_snapshot.exists(),
+        "state bootstrap should not create a materialized KV snapshot"
+    );
+
+    let cert = certificate(
+        cluster_id,
+        node_id.clone(),
+        node_id,
+        "certificate-public-key",
+        now + time::Duration::seconds(86_400),
+    );
+
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+    sync_cluster_certificate_to_kv(&paths, &cert).expect("sync certificate");
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        0,
+        "single-key put no-op checks should not take the required snapshot read path when the materialized snapshot is absent"
+    );
+    assert!(
+        paths.kv_snapshot.exists(),
+        "the actual raft append should still materialize the snapshot"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -15489,6 +15689,49 @@ fn write_object_file_skips_compare_read_when_length_differs() {
     );
 
     let _ = set_io_observer(previous);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_optional_object_file_treats_only_missing_file_as_absent() {
+    #[derive(Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct OptionalObjectFixture {
+        value: u64,
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-optional-object-read-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+
+    let missing = root.join("missing.sobj");
+    assert_eq!(
+        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&missing)
+            .expect("missing optional object"),
+        None,
+        "a missing optional object should be absent without a pre-open exists probe"
+    );
+
+    let object = root.join("present.sobj");
+    crate::storage::write_object_file(&object, &OptionalObjectFixture { value: 42 })
+        .expect("write object");
+    assert_eq!(
+        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&object)
+            .expect("present optional object"),
+        Some(OptionalObjectFixture { value: 42 })
+    );
+
+    let directory = root.join("directory.sobj");
+    std::fs::create_dir_all(&directory).expect("directory");
+    assert!(
+        crate::storage::read_optional_object_file::<OptionalObjectFixture>(&directory).is_err(),
+        "a directory at an optional object path is a storage error, not absence"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
 }
 

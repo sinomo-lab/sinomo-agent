@@ -1445,21 +1445,23 @@ pub(crate) fn wait_for_cluster_kv_watch_change_for_test(
 }
 
 pub fn remove_local_cluster_state(paths: &ClusterPaths) -> Result<(), NetworkError> {
-    if !paths.state.exists() {
+    if !remove_optional_file(&paths.state)? {
         return Err(NetworkError::ClusterOrphan);
     }
-    fs::remove_file(&paths.state).map_err(|source| NetworkError::StorageIo {
-        path: paths.state.display().to_string(),
-        detail: source.to_string(),
-    })?;
     invalidate_cluster_kv_reader_node_id_cache(&paths.state);
-    if paths.kv_snapshot.exists() {
-        fs::remove_file(&paths.kv_snapshot).map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_snapshot.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
+    remove_optional_file(&paths.kv_snapshot)?;
     Ok(())
+}
+
+fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(NetworkError::StorageIo {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2393,10 +2395,7 @@ pub fn cluster_raft_quorum_size(state: &ClusterBootstrapState) -> usize {
 }
 
 pub fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, NetworkError> {
-    if !paths.state.exists() {
-        return Err(NetworkError::ClusterOrphan);
-    }
-    let mut state: ClusterBootstrapState = read_object_file(&paths.state)?;
+    let mut state = read_cluster_state_without_kv(paths)?;
     let local_member = state
         .members
         .iter()
@@ -2634,20 +2633,25 @@ pub fn read_cluster_kv_snapshot_store(
         .map_err(Into::into)
 }
 
-fn read_cluster_kv_cached_snapshot_entry(
-    paths: &ClusterPaths,
-    key: &str,
-) -> Result<Option<KvEntry>, NetworkError> {
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
-    Ok(snapshot.get(key).cloned())
-}
-
 fn read_cluster_kv_cached_snapshot(paths: &ClusterPaths) -> Result<Arc<KvSnapshot>, NetworkError> {
     #[cfg(test)]
     record_cluster_kv_cached_snapshot_read_for_test(paths);
     cluster_kv_local_cache(paths)
         .cached_snapshot_arc()
         .map_err(NetworkError::from)
+}
+
+fn read_cluster_kv_cached_snapshot_if_present(
+    paths: &ClusterPaths,
+) -> Result<Option<Arc<KvSnapshot>>, NetworkError> {
+    let snapshot = cluster_kv_local_cache(paths)
+        .cached_snapshot_arc_if_present()
+        .map_err(NetworkError::from)?;
+    #[cfg(test)]
+    if snapshot.is_some() {
+        record_cluster_kv_cached_snapshot_read_for_test(paths);
+    }
+    Ok(snapshot)
 }
 
 fn cluster_kv_local_cache(paths: &ClusterPaths) -> KvLocalCache {
@@ -3513,10 +3517,12 @@ fn cached_cluster_kv_snapshot_events_contain_all(
     paths: &ClusterPaths,
     incoming: &[KvEvent],
 ) -> bool {
-    read_cluster_kv_cached_snapshot(paths).is_ok_and(|snapshot| {
-        incoming
-            .iter()
-            .all(|event| cluster_kv_events_contain(&snapshot.events, event))
+    read_cluster_kv_cached_snapshot_if_present(paths).is_ok_and(|snapshot| {
+        snapshot.is_some_and(|snapshot| {
+            incoming
+                .iter()
+                .all(|event| cluster_kv_events_contain(&snapshot.events, event))
+        })
     })
 }
 
@@ -3554,10 +3560,7 @@ fn cluster_kv_watch_events_arc(paths: &ClusterPaths) -> Result<Arc<Vec<KvEvent>>
 fn read_cluster_kv_watch_event_checkpoint(
     paths: &ClusterPaths,
 ) -> Result<Vec<KvEvent>, NetworkError> {
-    if !paths.kv_watch_events.exists() {
-        return Ok(Vec::new());
-    }
-    read_object_file(&paths.kv_watch_events)
+    read_optional_object_file(&paths.kv_watch_events).map(|events| events.unwrap_or_default())
 }
 
 fn write_cluster_kv_watch_event_checkpoint(
@@ -3587,16 +3590,21 @@ struct ClusterKvWatchEventLogRead {
 fn read_cluster_kv_watch_event_log(
     paths: &ClusterPaths,
 ) -> Result<ClusterKvWatchEventLogRead, NetworkError> {
-    if !paths.kv_watch_events_log.exists() {
-        return Ok(ClusterKvWatchEventLogRead::default());
-    }
-    let mut file = fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .read(true)
         .open(&paths.kv_watch_events_log)
-        .map_err(|source| NetworkError::StorageIo {
-            path: paths.kv_watch_events_log.display().to_string(),
-            detail: source.to_string(),
-        })?;
+    {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClusterKvWatchEventLogRead::default());
+        }
+        Err(source) => {
+            return Err(NetworkError::StorageIo {
+                path: paths.kv_watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
     file.lock_shared()
         .map_err(|source| NetworkError::StorageIo {
             path: paths.kv_watch_events_log.display().to_string(),
@@ -3906,12 +3914,11 @@ fn read_cluster_kv_watch_registration_from_file(
     path: &PathBuf,
     watch_id: WatchId,
 ) -> Result<ClusterKvWatchRegistration, NetworkError> {
-    let registration: ClusterKvWatchRegistration = match read_object_file(path) {
-        Ok(registration) => registration,
-        Err(NetworkError::StorageIo { .. }) if !path.exists() => {
+    let registration: ClusterKvWatchRegistration = match read_optional_object_file(path)? {
+        Some(registration) => registration,
+        None => {
             return Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }));
         }
-        Err(error) => return Err(error),
     };
     if registration.watch_id != watch_id {
         remove_cluster_kv_watch_file(path);
@@ -3954,20 +3961,9 @@ fn remove_cluster_kv_watch_file(path: &PathBuf) {
 }
 
 fn remove_cluster_kv_watch_file_if_exists(path: &PathBuf) -> Result<bool, NetworkError> {
-    match fs::remove_file(path) {
-        Ok(()) => {
-            invalidate_cluster_kv_watch_registration_cache(path);
-            Ok(true)
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            invalidate_cluster_kv_watch_registration_cache(path);
-            Ok(false)
-        }
-        Err(source) => Err(NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
+    let removed = remove_optional_file(path)?;
+    invalidate_cluster_kv_watch_registration_cache(path);
+    Ok(removed)
 }
 
 fn remove_cluster_kv_watch_registration_with_allocator(
@@ -4002,17 +3998,21 @@ fn scan_cluster_kv_watches(
     paths: &ClusterPaths,
     compacted_revision: KvRevision,
 ) -> Result<ClusterKvWatchScanResult, NetworkError> {
-    if !paths.kv_watches.exists() {
-        return Ok(ClusterKvWatchScanResult::default());
-    }
+    let mut result = ClusterKvWatchScanResult::default();
+    let entries = match fs::read_dir(&paths.kv_watches) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(source) => {
+            return Err(NetworkError::StorageIo {
+                path: paths.kv_watches.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
     #[cfg(test)]
     record_cluster_kv_watch_dir_scan_for_test(paths);
 
-    let mut result = ClusterKvWatchScanResult::default();
-    for entry in fs::read_dir(&paths.kv_watches).map_err(|source| NetworkError::StorageIo {
-        path: paths.kv_watches.display().to_string(),
-        detail: source.to_string(),
-    })? {
+    for entry in entries {
         let entry = entry.map_err(|source| NetworkError::StorageIo {
             path: paths.kv_watches.display().to_string(),
             detail: source.to_string(),
@@ -4084,11 +4084,9 @@ fn cluster_kv_watch_allocator_needs_scan(
 fn read_cluster_kv_watch_allocator_state(
     paths: &ClusterPaths,
 ) -> Result<ClusterKvWatchAllocatorState, NetworkError> {
-    let state = if paths.kv_watches_next_id.exists() {
-        read_object_file::<ClusterKvWatchAllocatorState>(&paths.kv_watches_next_id)?
-    } else {
-        ClusterKvWatchAllocatorState::legacy(1)
-    };
+    let state =
+        read_optional_object_file::<ClusterKvWatchAllocatorState>(&paths.kv_watches_next_id)?
+            .unwrap_or_else(|| ClusterKvWatchAllocatorState::legacy(1));
     Ok(ClusterKvWatchAllocatorState {
         next_watch_id: state.next_watch_id.max(1),
         active_watch_count: state.active_watch_count,
@@ -4115,19 +4113,15 @@ fn persist_cluster_kv_watch_allocator_state(
 pub fn read_cluster_state_without_kv(
     paths: &ClusterPaths,
 ) -> Result<ClusterBootstrapState, NetworkError> {
-    if !paths.state.exists() {
-        return Err(NetworkError::ClusterOrphan);
-    }
-    read_object_file(&paths.state)
+    read_optional_object_file(&paths.state)?.ok_or(NetworkError::ClusterOrphan)
 }
 
 pub fn read_cluster_members_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut members: Vec<ClusterMemberRecord> = Vec::new();
     for entry in
         snapshot.range_prefix_limited("/cluster/members/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
@@ -4158,10 +4152,9 @@ pub fn read_cluster_members_from_kv(
 pub fn read_cluster_endpoints_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut endpoints = read_cluster_endpoints_from_snapshot(&snapshot)?
         .into_values()
         .flatten()
@@ -4228,10 +4221,9 @@ fn read_cluster_capability_policies_from_snapshot(
 pub fn read_cluster_node_statuses_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNodeStatusRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut statuses: Vec<ClusterNodeStatusRecord> = Vec::new();
     for entry in snapshot
         .range_prefix_limited("/cluster/node-status/", CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)?
@@ -4245,10 +4237,9 @@ pub fn read_cluster_node_statuses_from_kv(
 pub fn read_cluster_module_rollout_statuses_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutStatusRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut statuses: Vec<ClusterModuleRolloutStatusRecord> = Vec::new();
     let prefix = cluster_module_rollout_node_prefix();
     for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
@@ -4266,10 +4257,9 @@ pub fn read_cluster_module_rollout_statuses_from_kv(
 pub fn read_cluster_module_rollout_desired_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutDesiredRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut desired: Vec<ClusterModuleRolloutDesiredRecord> = Vec::new();
     let prefix = cluster_module_rollout_desired_prefix();
     for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
@@ -4291,10 +4281,9 @@ pub fn read_cluster_module_rollout_desired_from_kv(
 pub fn read_cluster_module_rollout_reconciliations_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutReconciliationRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let mut reconciliations: Vec<ClusterModuleRolloutReconciliationRecord> = Vec::new();
     let prefix = cluster_module_rollout_reconcile_prefix();
     for entry in snapshot.range_prefix_limited(&prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)? {
@@ -4312,10 +4301,9 @@ pub fn read_cluster_module_rollout_reconciliations_from_kv(
 pub fn read_cluster_network_info_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterNetworkInfoRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterNetworkInfoRecord> = Vec::new();
     for entry in snapshot.range_prefix_limited(
@@ -4334,10 +4322,9 @@ pub fn read_cluster_network_info_from_kv(
 pub fn read_cluster_connectivity_graph_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
-    if !paths.kv_snapshot.exists() {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
         return Ok(Vec::new());
-    }
-    let snapshot = read_cluster_kv_cached_snapshot(paths)?;
+    };
     let now = OffsetDateTime::now_utc();
     let mut records: Vec<ClusterConnectivityRecord> = Vec::new();
     for entry in snapshot.range_prefix_limited(
@@ -5926,9 +5913,10 @@ pub fn stored_cluster_node_status_matches(
     paths: &ClusterPaths,
     status: &ClusterNodeStatusRecord,
 ) -> Result<bool, NetworkError> {
-    let Some(entry) =
-        read_cluster_kv_cached_snapshot_entry(paths, &cluster_node_status_key(&status.node_id))?
-    else {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
+        return Ok(false);
+    };
+    let Some(entry) = snapshot.get(&cluster_node_status_key(&status.node_id)) else {
         return Ok(false);
     };
     let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
@@ -5940,8 +5928,9 @@ pub fn stored_cluster_node_status_matches(
     if !cluster_node_status_stable_eq(&existing, status) {
         return Ok(false);
     }
-    let rollout_entry =
-        read_cluster_kv_cached_snapshot_entry(paths, &cluster_rollout_node_key(&status.node_id))?;
+    let rollout_entry = snapshot
+        .get(&cluster_rollout_node_key(&status.node_id))
+        .cloned();
     Ok(match (&status.rollout, rollout_entry) {
         (Some(expected), Some(entry)) => entry
             .decode::<sinomo_core::ClusterNodeRolloutStatus>()
@@ -5974,9 +5963,10 @@ pub fn stored_cluster_network_info_matches(
     paths: &ClusterPaths,
     info: &ClusterNetworkInfoRecord,
 ) -> Result<bool, NetworkError> {
-    let Some(entry) =
-        read_cluster_kv_cached_snapshot_entry(paths, &cluster_network_info_key(&info.node_id))?
-    else {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
+        return Ok(false);
+    };
+    let Some(entry) = snapshot.get(&cluster_network_info_key(&info.node_id)) else {
         return Ok(false);
     };
     let Ok(existing) = entry.decode::<ClusterNetworkInfoRecord>() else {
@@ -6946,7 +6936,10 @@ fn cluster_kv_put_value_is_noop(paths: &ClusterPaths, op: &KvOp) -> Result<bool,
     else {
         return Ok(false);
     };
-    let Some(entry) = read_cluster_kv_entry(paths, key)? else {
+    let Some(snapshot) = read_cluster_kv_cached_snapshot_if_present(paths)? else {
+        return Ok(false);
+    };
+    let Some(entry) = snapshot.get(key) else {
         return Ok(false);
     };
     Ok(entry.value.as_slice() == value.as_slice() && entry.lease_id == *lease_id)
@@ -7246,11 +7239,44 @@ pub(crate) fn read_object_file<T: serde::de::DeserializeOwned>(
     SinomoObjectCodec::default().decode(&bytes)
 }
 
+pub(crate) fn read_optional_object_file<T: serde::de::DeserializeOwned>(
+    path: &PathBuf,
+) -> Result<Option<T>, NetworkError> {
+    let Some(bytes) = read_optional_object_file_bytes(path)? else {
+        return Ok(None);
+    };
+    if let Some(observer) = io_observer() {
+        observer.on_disk_read(bytes.len() as u64);
+    }
+    SinomoObjectCodec::default().decode(&bytes).map(Some)
+}
+
+fn read_optional_object_file_bytes(path: &PathBuf) -> Result<Option<Vec<u8>>, NetworkError> {
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(NetworkError::StorageIo {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    read_object_file_bytes_from_open_file(path, file).map(Some)
+}
+
 fn read_object_file_bytes(path: &PathBuf) -> Result<Vec<u8>, NetworkError> {
     let file = fs::File::open(path).map_err(|source| NetworkError::StorageIo {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;
+    read_object_file_bytes_from_open_file(path, file)
+}
+
+fn read_object_file_bytes_from_open_file(
+    path: &PathBuf,
+    file: fs::File,
+) -> Result<Vec<u8>, NetworkError> {
     let len = file
         .metadata()
         .map_err(|source| NetworkError::StorageIo {
