@@ -13755,6 +13755,37 @@ fn delivery_ledger_limited_ready_batch_keeps_realtime_priority() {
 }
 
 #[test]
+fn delivery_ledger_zero_ready_limit_does_not_scan_or_select_work() {
+    let node_a = NodeId::from_legacy_named("node_ready_zero_source").expect("node");
+    let node_b = NodeId::from_legacy_named("node_ready_zero_target").expect("node");
+    let mut ledger = DeliveryLedger::with_capacity(RetryPolicy::default(), 2);
+    for index in 1..=2 {
+        let event = fixture_event(&format!("evt_ready_zero_{index}"), node_a.clone());
+        let delivery = RouteDelivery {
+            delivery_id: RouteDeliveryId(index),
+            event_sequence: EventSequence(index),
+            event_id: event.event_id.clone(),
+            target_node_id: node_b.clone(),
+            latency_class: LatencyClass::Reactive,
+            status: DeliveryStatus::Queued,
+        };
+        ledger.enqueue(delivery, event).expect("enqueue");
+    }
+
+    let mut inspected = 0;
+    assert!(
+        ledger
+            .ready_delivery_ids_limited_at_counting(Instant::now(), 0, &mut inspected)
+            .is_empty(),
+        "a zero-capacity pump should not select work"
+    );
+    assert_eq!(
+        inspected, 0,
+        "zero-capacity pumps should not scan queued deliveries"
+    );
+}
+
+#[test]
 fn delivery_ledger_stops_ready_scan_after_full_realtime_batch() {
     let node_a = NodeId::from_legacy_named("node_ready_scan_source").expect("node");
     let node_b = NodeId::from_legacy_named("node_ready_scan_target").expect("node");

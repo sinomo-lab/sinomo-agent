@@ -7365,7 +7365,7 @@ pub(crate) fn write_object_file<T: Serialize>(
                 path: temp_path.display().to_string(),
                 detail: source.to_string(),
             })?;
-        file.sync_all().map_err(|source| NetworkError::StorageIo {
+        file.sync_data().map_err(|source| NetworkError::StorageIo {
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -7419,7 +7419,7 @@ fn write_object_file_create_new<T: Serialize>(
             path: path.display().to_string(),
             detail: source.to_string(),
         })?;
-    file.sync_all().map_err(|source| NetworkError::StorageIo {
+    file.sync_data().map_err(|source| NetworkError::StorageIo {
         path: path.display().to_string(),
         detail: source.to_string(),
     })?;

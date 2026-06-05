@@ -926,11 +926,14 @@ impl<T: NetworkTransport> NetworkService<T> {
     }
 
     fn pump_outbound_limited(&mut self, max_deliveries: usize) -> Result<usize, NetworkError> {
+        if max_deliveries == 0 {
+            return Ok(0);
+        }
         self.ledger.expire_ack_deadlines_at(Instant::now());
         let mut sent = 0;
         let delivery_ids = self
             .ledger
-            .ready_delivery_ids_limited(max_deliveries.max(1))
+            .ready_delivery_ids_limited(max_deliveries)
             .into_iter();
 
         for delivery_id in delivery_ids {
@@ -1520,7 +1523,9 @@ impl DeliveryLedger {
         max_deliveries: usize,
         mut on_inspect: impl FnMut(RouteDeliveryId),
     ) -> Vec<RouteDeliveryId> {
-        let max_deliveries = max_deliveries.max(1);
+        if max_deliveries == 0 {
+            return Vec::new();
+        }
         let mut ready = Vec::with_capacity(max_deliveries.min(self.records.len()));
         'priorities: for priority in 0..LATENCY_CLASS_READY_PRIORITY_COUNT {
             for delivery_id in self.queued_record_ids_by_priority[priority].iter().copied() {

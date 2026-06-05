@@ -3043,6 +3043,20 @@ impl InProcessRaftKvCluster {
     }
 }
 
+enum CommitEntries {
+    Single(KvLogEntry),
+    Batch(Vec<KvLogEntry>),
+}
+
+impl CommitEntries {
+    fn as_slice(&self) -> &[KvLogEntry] {
+        match self {
+            CommitEntries::Single(entry) => std::slice::from_ref(entry),
+            CommitEntries::Batch(entries) => entries,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ReplicatedKvNode {
     store: InProcessKvStore,
@@ -3338,16 +3352,26 @@ impl ReplicatedKvNode {
             return Ok(());
         }
         let entries = self.entries_to_commit(commit_index)?;
-        self.preflight_commit_entries(&entries)?;
+        self.preflight_commit_entries(entries.as_slice())?;
         self.apply_preflighted_commit(entries, commit_index)
     }
 
-    fn entries_to_commit(&self, commit_index: u64) -> Result<Vec<KvLogEntry>, KvError> {
+    fn entries_to_commit(&self, commit_index: u64) -> Result<CommitEntries, KvError> {
         let last_log_index = self.last_log_index();
         if commit_index > last_log_index {
             return Err(KvError::MissingCommittedEntry {
                 index: last_log_index.saturating_add(1),
             });
+        }
+        let first_unapplied_index = self.applied_index.saturating_add(1);
+        if commit_index == first_unapplied_index {
+            let entry =
+                self.log_entry_at(commit_index)
+                    .cloned()
+                    .ok_or(KvError::MissingCommittedEntry {
+                        index: commit_index,
+                    })?;
+            return Ok(CommitEntries::Single(entry));
         }
         let start = self
             .log
@@ -3370,7 +3394,7 @@ impl ReplicatedKvNode {
                 index: expected_index,
             });
         }
-        Ok(entries)
+        Ok(CommitEntries::Batch(entries))
     }
 
     fn preflight_commit_entries(&self, entries: &[KvLogEntry]) -> Result<(), KvError> {
@@ -3389,20 +3413,30 @@ impl ReplicatedKvNode {
 
     fn apply_preflighted_commit(
         &mut self,
-        entries: Vec<KvLogEntry>,
+        entries: CommitEntries,
         commit_index: u64,
     ) -> Result<(), KvError> {
-        for entry in entries {
-            let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
-            if let Some(log_entry) = self.log_entry_at_mut(entry.index) {
-                log_entry.revision = revision;
+        match entries {
+            CommitEntries::Single(entry) => self.apply_preflighted_commit_entry(entry)?,
+            CommitEntries::Batch(entries) => {
+                for entry in entries {
+                    self.apply_preflighted_commit_entry(entry)?;
+                }
             }
-            if let Some(response) = txn_response {
-                self.txn_responses.insert(entry.index, response);
-            }
-            self.applied_index = entry.index;
         }
         self.hard_state.commit_index = commit_index;
+        Ok(())
+    }
+
+    fn apply_preflighted_commit_entry(&mut self, entry: KvLogEntry) -> Result<(), KvError> {
+        let (revision, txn_response) = self.store.apply_command_with_response(entry.command)?;
+        if let Some(log_entry) = self.log_entry_at_mut(entry.index) {
+            log_entry.revision = revision;
+        }
+        if let Some(response) = txn_response {
+            self.txn_responses.insert(entry.index, response);
+        }
+        self.applied_index = entry.index;
         Ok(())
     }
 
@@ -3700,7 +3734,7 @@ impl DurableRaftKvNode {
             Some(commit_index) if commit_index > self.node.applied_index => {
                 match self.node.entries_to_commit(commit_index) {
                     Ok(entries) => {
-                        if let Err(error) = self.node.preflight_commit_entries(&entries) {
+                        if let Err(error) = self.node.preflight_commit_entries(entries.as_slice()) {
                             self.restore_after_append_entries_persist_failure(
                                 None,
                                 hard_state_before,
@@ -3890,7 +3924,7 @@ impl DurableRaftKvNode {
         }
 
         let entries = self.node.entries_to_commit(commit_index)?;
-        self.node.preflight_commit_entries(&entries)?;
+        self.node.preflight_commit_entries(entries.as_slice())?;
         self.node.hard_state.commit_index = commit_index;
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
             self.node.hard_state = hard_state_before;
@@ -4200,7 +4234,7 @@ fn rewrite_wal_entries(path: &Path, entries: &[KvLogEntry]) -> Result<(), KvErro
         for entry in entries {
             write_wal_record(&mut file, entry, &temp_path)?;
         }
-        file.sync_all().map_err(|source| KvError::Io {
+        file.sync_data().map_err(|source| KvError::Io {
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -4349,7 +4383,7 @@ fn write_object_file_bytes_if_changed(path: &Path, content: &[u8]) -> Result<boo
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
-        file.sync_all().map_err(|source| KvError::Io {
+        file.sync_data().map_err(|source| KvError::Io {
             path: temp_path.display().to_string(),
             detail: source.to_string(),
         })?;
@@ -8437,6 +8471,55 @@ mod tests {
         assert_eq!(node.store.revision(), KvRevision::ZERO);
         assert!(node.store.get("/gap/one").is_none());
         assert!(node.store.get("/gap/three").is_none());
+    }
+
+    #[test]
+    fn replicated_node_single_entry_commit_uses_single_entry_plan() {
+        let node = ReplicatedKvNode {
+            store: InProcessKvStore::new(),
+            log: vec![
+                KvLogEntry {
+                    index: 1,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/commit-plan/one".to_string(),
+                        value: b"one".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+                KvLogEntry {
+                    index: 2,
+                    term: 1,
+                    command: KvCommand::Op(KvOp::Put {
+                        key: "/commit-plan/two".to_string(),
+                        value: b"two".to_vec(),
+                        lease_id: None,
+                    }),
+                    revision: KvRevision::ZERO,
+                },
+            ],
+            hard_state: RaftHardState::default(),
+            applied_index: 0,
+            snapshot_index: 0,
+            snapshot_term: 0,
+            txn_responses: BTreeMap::new(),
+        };
+
+        assert!(
+            matches!(
+                node.entries_to_commit(1).expect("single commit plan"),
+                CommitEntries::Single(_)
+            ),
+            "the common next-entry commit should avoid allocating a one-entry batch"
+        );
+        assert!(
+            matches!(
+                node.entries_to_commit(2).expect("batch commit plan"),
+                CommitEntries::Batch(entries) if entries.len() == 2
+            ),
+            "catch-up commits still need the contiguous batch path"
+        );
     }
 
     #[test]
