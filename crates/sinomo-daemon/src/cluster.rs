@@ -3915,12 +3915,16 @@ pub(crate) fn relay_request_to_endpoint(
             Ok(auth) => auth,
             Err(error) => return Some(Err(error)),
         };
+        let Some(remaining) = deadline.checked_remaining() else {
+            failures.push(format!("relay budget expired after {timeout:?}"));
+            break;
+        };
         match sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             &next_hop,
             &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
             Some(&outer_auth),
             &outer,
-            deadline.remaining(),
+            remaining,
         ) {
             Ok(response) if relay_response_is_routing_error(&response) => failures.push(format!(
                 "{} ({:?}) returned routing error",

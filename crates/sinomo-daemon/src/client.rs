@@ -130,24 +130,26 @@ pub fn send_daemon_rpc_to_endpoint(
     // caller's patience -- and relay straight away. Unprobed peers (no route known) still try a
     // direct dial first.
     if !crate::cluster::cluster_endpoint_prefers_relay(endpoint) {
+        let Some(remaining) = deadline.checked_remaining() else {
+            return Err(deadline.timeout_error(&endpoint.address));
+        };
         match sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             endpoint,
             &command,
             Some(&signed),
             request,
-            deadline.remaining(),
+            remaining,
         ) {
             Ok(response) => return Ok(response),
             Err(direct_error) => {
                 // Direct dial failed. If the connectivity graph offers a multi-hop route to the
                 // target node through a reachable bridge, relay the (already signed) request one
                 // hop closer; otherwise surface the original error.
+                let Some(remaining) = deadline.checked_remaining() else {
+                    return Err(DaemonError::from(direct_error));
+                };
                 return match crate::cluster::relay_request_to_endpoint(
-                    endpoint,
-                    request,
-                    &signed,
-                    &command,
-                    deadline.remaining(),
+                    endpoint, request, &signed, &command, remaining,
                 ) {
                     Some(result) => result,
                     None => Err(DaemonError::from(direct_error)),
@@ -155,13 +157,11 @@ pub fn send_daemon_rpc_to_endpoint(
             }
         }
     }
-    match crate::cluster::relay_request_to_endpoint(
-        endpoint,
-        request,
-        &signed,
-        &command,
-        deadline.remaining(),
-    ) {
+    let Some(remaining) = deadline.checked_remaining() else {
+        return Err(deadline.timeout_error(&endpoint.address));
+    };
+    match crate::cluster::relay_request_to_endpoint(endpoint, request, &signed, &command, remaining)
+    {
         Some(result) => result,
         None => Err(DaemonError::Network {
             address: endpoint.address.clone(),
@@ -192,6 +192,19 @@ impl DaemonRpcAttemptDeadline {
             .checked_sub(self.started.elapsed())
             .unwrap_or_else(|| Duration::from_millis(1))
     }
+
+    pub(crate) fn checked_remaining(&self) -> Option<Duration> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+    }
+
+    pub(crate) fn timeout_error(&self, address: &str) -> DaemonError {
+        DaemonError::Network {
+            address: address.to_string(),
+            detail: format!("timed out after {}ms", self.timeout.as_millis()),
+        }
+    }
 }
 
 fn route_endpoint_request_via_local_daemon(
@@ -204,7 +217,7 @@ fn route_endpoint_request_via_local_daemon(
     if request.route == sinomo_network::CLUSTER_RELAY_ROUTE {
         return None;
     }
-    let status = match crate::default_main_daemon_status(deadline.remaining()) {
+    let status = match crate::default_main_daemon_status(deadline.checked_remaining()?) {
         Ok(Some(status)) => status,
         Ok(None) | Err(_) => return None,
     };
@@ -233,7 +246,7 @@ fn route_endpoint_request_via_local_daemon(
         Ok(outer) => outer,
         Err(error) => return Some(Err(DaemonError::from(error))),
     };
-    match send_daemon_rpc(&status.address, &outer, deadline.remaining()) {
+    match send_daemon_rpc(&status.address, &outer, deadline.checked_remaining()?) {
         Ok(response) if is_relay_routing_error(&response) => None,
         Ok(response) => Some(Ok(response)),
         Err(_) => None,
@@ -1019,6 +1032,15 @@ mod tests {
         };
 
         assert_eq!(deadline.remaining(), Duration::from_millis(1));
+        assert_eq!(deadline.checked_remaining(), None);
+        let error = deadline.timeout_error("iroh://example");
+        match error {
+            crate::DaemonError::Network { address, detail } => {
+                assert_eq!(address, "iroh://example");
+                assert_eq!(detail, "timed out after 10ms");
+            }
+            error => panic!("unexpected error: {error}"),
+        }
     }
 
     #[test]

@@ -13127,6 +13127,75 @@ fn rollout_cluster_targets_include_shadow_only_repair_route() {
 }
 
 #[test]
+fn rollout_cluster_targets_keep_one_route_per_main_node() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-rollout-one-route-per-main-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_rollout_one_route_per_main").expect("cluster");
+    let local_node_id =
+        NodeId::from_legacy_named("node_rollout_one_route_per_main_local").expect("local node");
+    let remote_main_id =
+        NodeId::from_legacy_named("node_rollout_one_route_per_main_main").expect("main node");
+    let remote_shadow_id = shadow_daemon_node_id(&remote_main_id);
+    let now = OffsetDateTime::now_utc();
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "rollout one route per main",
+        local_node_id,
+        "local",
+        "local-key",
+        now,
+    );
+    let mut remote_main = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        remote_main_id.clone(),
+        "remote main",
+        "remote-main-key",
+        now,
+    );
+    remote_main.role = ClusterMemberRole::Learner;
+    remote_main.state = ClusterMemberState::Learner;
+    remote_main.capabilities = main_daemon_capabilities(&ClusterMemberRole::Learner);
+    remote_main.allowed_capabilities = remote_main.capabilities.clone();
+    let main_tcp = invite_introducer_endpoint(&remote_main_id, "10.0.0.42:21353".to_string());
+    let main_iroh = invite_introducer_endpoint(
+        &remote_main_id,
+        "iroh://rollout_main_duplicate?relay=https://relay.example./".to_string(),
+    );
+    remote_main.endpoints.push(main_tcp.clone());
+    remote_main.endpoints.push(main_iroh);
+    let mut remote_shadow = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        remote_shadow_id.clone(),
+        "remote shadow",
+        "remote-shadow-key",
+        now,
+    );
+    remote_shadow.endpoints.push(invite_introducer_endpoint(
+        &remote_shadow_id,
+        "iroh://rollout_shadow_duplicate?relay=https://relay.example./".to_string(),
+    ));
+    state.members.push(remote_main);
+    state.members.push(remote_shadow);
+
+    let targets = rollout_cluster_targets_from_state(&paths, &state, None);
+
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].address, main_tcp.address);
+    assert_eq!(targets[0].rollout_node_id.as_ref(), Some(&remote_main_id));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn rollout_endpoint_candidates_include_remote_shadow_members() {
     let cluster_id =
         ClusterId::from_legacy_named("cluster_rollout_endpoint_candidates").expect("cluster");

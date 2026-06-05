@@ -1288,7 +1288,7 @@ pub(crate) fn rollout_cluster_targets_from_state(
         {
             target_endpoints.push(command_endpoint.clone());
         }
-        for rollout_endpoint in target_endpoints {
+        if let Some(rollout_endpoint) = target_endpoints.into_iter().next() {
             push_unique_rollout_target(
                 &mut targets,
                 RolloutTarget::endpoint_for_node(rollout_endpoint, main_node_id.clone()),
