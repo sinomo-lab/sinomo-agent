@@ -410,6 +410,9 @@ impl CloudFilesProvider {
                 dfs.posix_stat_distributed(&child.path)
                     .map_err(ntstatus_for_posix_error)?
             };
+            if !is_visible_placeholder_kind(&stat.kind) {
+                continue;
+            }
             payloads.push(PlaceholderPayload::new(child.name, stat, self.read_only));
         }
         Ok(payloads)
@@ -429,7 +432,12 @@ fn child_prepopulate_depth(depth: u32) -> Option<u32> {
     depth.checked_sub(1).filter(|child_depth| *child_depth > 0)
 }
 
+fn is_visible_placeholder_kind(kind: &DfsObjectKind) -> bool {
+    *kind != DfsObjectKind::Tombstone
+}
+
 struct PlaceholderPayload {
+    display_name: String,
     relative_name: Vec<u16>,
     identity: Vec<u8>,
     metadata: CF_FS_METADATA,
@@ -453,6 +461,7 @@ impl PlaceholderPayload {
             stat.size_bytes.unwrap_or(0) as i64
         };
         Self {
+            display_name: relative_name.clone(),
             relative_name: wide_str(&relative_name),
             identity: stat.path.into_bytes(),
             metadata: CF_FS_METADATA {
@@ -506,11 +515,29 @@ fn create_placeholders(
     .map_err(|source| CloudFilesModuleError {
         code: "create-placeholders".to_string(),
         detail: format!(
-            "create Cloud Files placeholders under {}: {source}",
-            base.display()
+            "create Cloud Files placeholders under {}: {source}; entries_processed={}; {}",
+            base.display(),
+            entries_processed,
+            placeholder_results_detail(&payloads, &infos)
         ),
     })?;
     Ok(entries_processed as u64)
+}
+
+fn placeholder_results_detail(
+    payloads: &[PlaceholderPayload],
+    infos: &[CF_PLACEHOLDER_CREATE_INFO],
+) -> String {
+    let results = payloads
+        .iter()
+        .zip(infos.iter())
+        .map(|(payload, info)| format!("{}=0x{:08X}", payload.display_name, info.Result.0 as u32))
+        .collect::<Vec<_>>();
+    if results.is_empty() {
+        "placeholder_results=[]".to_string()
+    } else {
+        format!("placeholder_results=[{}]", results.join(", "))
+    }
 }
 
 fn register_sync_root(request: &CloudFilesMountRequest) -> Result<(), CloudFilesModuleError> {
@@ -917,5 +944,12 @@ mod tests {
         assert_eq!(child_prepopulate_depth(1), None);
         assert_eq!(child_prepopulate_depth(2), Some(1));
         assert_eq!(child_prepopulate_depth(3), Some(2));
+    }
+
+    #[test]
+    fn tombstones_are_not_cloud_files_placeholders() {
+        assert!(is_visible_placeholder_kind(&DfsObjectKind::File));
+        assert!(is_visible_placeholder_kind(&DfsObjectKind::Directory));
+        assert!(!is_visible_placeholder_kind(&DfsObjectKind::Tombstone));
     }
 }
