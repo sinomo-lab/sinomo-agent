@@ -1246,8 +1246,11 @@ impl KvMaterializedCache {
             let node =
                 match DurableRaftKvNode::try_open_with_materialized_cache(node_id, paths, self) {
                     Ok(node) => node,
-                    Err(KvError::Busy { .. }) if self.exists() => {
-                        return self.read_snapshot_arc();
+                    Err(error @ KvError::Busy { .. }) => {
+                        return match self.read_snapshot_arc_if_present()? {
+                            Some(snapshot) => Ok(snapshot),
+                            None => Err(error),
+                        };
                     }
                     Err(error) => return Err(error),
                 };
@@ -1259,8 +1262,8 @@ impl KvMaterializedCache {
             }
             return Ok(snapshot);
         }
-        if self.exists() {
-            return self.read_snapshot_arc();
+        if let Some(snapshot) = self.read_snapshot_arc_if_present()? {
+            return Ok(snapshot);
         }
         let snapshot = Arc::new(InProcessKvStore::new().snapshot().canonicalized());
         Ok(snapshot)
@@ -3842,6 +3845,7 @@ impl DurableRaftKvNode {
         discard_uncommitted_tail: bool,
         lock_wait: Duration,
     ) -> Result<Self, KvError> {
+        let mut fallback_snapshot = None;
         let mut node = match Self::open_inner(
             node_id.clone(),
             paths.clone(),
@@ -3849,17 +3853,28 @@ impl DurableRaftKvNode {
             lock_wait,
         ) {
             Ok(node) => node,
-            Err(error) if cache.exists() && !kv_error_is_busy(&error) => {
+            Err(error) if !kv_error_is_busy(&error) => {
+                let Some(snapshot) = cache.read_snapshot_arc_if_present()? else {
+                    return Err(error);
+                };
+                fallback_snapshot = Some(snapshot);
                 quarantine_unreadable_raft_view(&paths);
                 Self::open_inner(node_id, paths, discard_uncommitted_tail, lock_wait)?
             }
             Err(error) => return Err(error),
         };
-        if node.applied_index() == 0 && node.last_log_index() == 0 && cache.exists() {
+        if node.applied_index() == 0 && node.last_log_index() == 0 {
+            let snapshot = match fallback_snapshot {
+                Some(snapshot) => Some(snapshot),
+                None => cache.read_snapshot_arc_if_present()?,
+            };
+            let Some(snapshot) = snapshot else {
+                return Ok(node);
+            };
             node.restore_snapshot(RaftSnapshot {
                 last_included_index: 0,
                 last_included_term: 0,
-                kv: cache.read_snapshot()?,
+                kv: (*snapshot).clone(),
             })?;
         }
         Ok(node)
@@ -7642,6 +7657,95 @@ mod tests {
         assert!(
             !wal_paths.snapshot.exists(),
             "read should not create raft snapshot"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_raft_view_reports_invalid_snapshot_without_initializing_empty_raft() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-empty-raft-invalid-cache-read-only-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id = NodeId::from_legacy_named("node_invalid_cache_read_only").expect("node");
+        let cache = KvMaterializedCache::new(root.join("cache.sobj"));
+        let wal_paths = KvWalPaths::new(root.join("raft"));
+        std::fs::create_dir_all(&wal_paths.root).expect("empty raft root");
+        std::fs::create_dir_all(cache.path()).expect("invalid materialized cache path");
+
+        let error = cache
+            .read_snapshot_with_raft_view(node_id, wal_paths.clone())
+            .expect_err("invalid materialized cache should stay an error");
+
+        assert!(
+            error.to_string().contains("cache.sobj"),
+            "error should identify the invalid materialized cache path, got {error}"
+        );
+        assert!(!wal_paths.lock.exists(), "read should not create raft lock");
+        assert!(
+            !wal_paths.hard_state.exists(),
+            "read should not create raft hard state"
+        );
+        assert!(!wal_paths.wal.exists(), "read should not create raft wal");
+        assert!(
+            !wal_paths.snapshot.exists(),
+            "read should not create raft snapshot"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn materialized_cache_open_validates_fallback_before_quarantining_raft() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-invalid-fallback-before-quarantine-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let node_id =
+            NodeId::from_legacy_named("node_invalid_fallback_before_quarantine").expect("node");
+        let wal_paths = KvWalPaths::new(root.join("raft"));
+        std::fs::create_dir_all(&wal_paths.snapshot).expect("invalid raft snapshot");
+        let cache = KvMaterializedCache::new(root.join("cache.sobj"));
+        std::fs::create_dir_all(cache.path()).expect("invalid materialized cache path");
+
+        let error =
+            DurableRaftKvNode::open_with_materialized_cache(node_id, wal_paths.clone(), &cache)
+                .expect_err("invalid fallback cache should prevent raft quarantine");
+
+        assert!(
+            error.to_string().contains("cache.sobj"),
+            "fallback cache should be validated before quarantine, got {error}"
+        );
+        assert!(
+            wal_paths.root.exists(),
+            "unreadable raft state should remain in place when fallback cache is invalid"
+        );
+        let quarantine_prefix = format!(
+            "{}.corrupt-{}-",
+            wal_paths
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("raft"),
+            std::process::id()
+        );
+        let quarantined = std::fs::read_dir(&root)
+            .expect("read root")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&quarantine_prefix))
+            });
+        assert!(
+            !quarantined,
+            "invalid fallback cache must not create a raft quarantine directory"
         );
         std::fs::remove_dir_all(root).ok();
     }
