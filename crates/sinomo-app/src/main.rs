@@ -15,7 +15,6 @@ use sinomo_lm::{
     PROVIDER_DEFAULT_MODEL,
 };
 use sinomo_memory::{MemoryManager, MemoryPolicy};
-use sinomo_runtime::api::ApiService;
 use sinomo_runtime::core::{
     ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, CapabilityName,
     Confidence, DeviceCapability, DfsObjectPolicy, DfsWriteRequest, EvaluationGate, EventEnvelope,
@@ -63,15 +62,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry_capability = CapabilityName::new("registry.artifact.durable")?;
     let action_capability = CapabilityName::new("action.desktop.local")?;
     let voice_capability = CapabilityName::new("voice.output.local")?;
-    let api_capability = CapabilityName::new("api.operator.local")?;
-
     let mut workstation = NodeProfile::local("local workstation")?
         .with_capability(NodeCapability::new(event_service_capability.clone()))
         .with_capability(NodeCapability::new(evolution_capability))
         .with_capability(NodeCapability::new(module_loader_capability.clone()))
         .with_capability(NodeCapability::new(action_capability.clone()))
         .with_capability(NodeCapability::new(voice_capability.clone()))
-        .with_capability(NodeCapability::new(api_capability.clone()))
         .with_service(HostedService::new(event_service_capability));
     workstation.node_id = NodeId::from_legacy_named("node_desktop")?;
 
@@ -497,14 +493,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     store.append(rollout_controller.decision_event(&rollout_decision))?;
-    let api = ApiService::new(workstation.node_id.clone());
-    let health = api.health(&[workstation.clone(), home_server.clone()]);
-    let api_replay = api.replay(
-        &store,
-        ReplayQuery::by_session(stored_event.event.session_id.clone().expect("session id"))
-            .limit(5),
-    )?;
-    let supervision_snapshot = api.supervision_snapshot(&store)?;
+    let mut supervision_index = sinomo_runtime::supervision::SupervisionIndex::new();
+    for event in store.replay(ReplayQuery::all())? {
+        supervision_index.ingest(event);
+    }
+    let supervision_snapshot = supervision_index.snapshot().clone();
 
     println!(
         "sinomo-app: appended {} sequence={} kind=evolution.job.scoped",
@@ -524,11 +517,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         trigger_decision.action, turn.response.text, action_target
     );
     println!(
-        "sinomo-app: action status={:?}; voice status={:?}; api health={:?}; api replay={}",
+        "sinomo-app: action status={:?}; voice status={:?}; session replay={}",
         action_record.as_ref().map(|record| record.status.clone()),
         voice_record.status,
-        health.status,
-        api_replay.len()
+        replayed.len()
     );
     println!(
         "sinomo-app: hot memory={} warm memory={} deliberation completed={}",

@@ -693,6 +693,64 @@ impl NativeRustBackendRegistration {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct NativeRustModuleBinding {
+    pub registration_key: &'static str,
+    pub register_cli_command: Option<
+        fn(sinomo_cli_registry::CliCommandRegistry) -> sinomo_cli_registry::CliCommandRegistry,
+    >,
+    pub register_config_definitions: Option<
+        fn(
+            sinomo_config::ConfigRegistryBuilder,
+        ) -> Result<sinomo_config::ConfigRegistryBuilder, String>,
+    >,
+    pub register_storage_paths: Option<
+        fn(&mut sinomo_storage::StorageLayout) -> Result<(), sinomo_storage::StorageContractError>,
+    >,
+}
+
+impl NativeRustModuleBinding {
+    pub const fn new(registration_key: &'static str) -> Self {
+        Self {
+            registration_key,
+            register_cli_command: None,
+            register_config_definitions: None,
+            register_storage_paths: None,
+        }
+    }
+
+    pub const fn with_cli_command(
+        mut self,
+        register_cli_command: fn(
+            sinomo_cli_registry::CliCommandRegistry,
+        ) -> sinomo_cli_registry::CliCommandRegistry,
+    ) -> Self {
+        self.register_cli_command = Some(register_cli_command);
+        self
+    }
+
+    pub const fn with_config_definitions(
+        mut self,
+        register_config_definitions: fn(
+            sinomo_config::ConfigRegistryBuilder,
+        )
+            -> Result<sinomo_config::ConfigRegistryBuilder, String>,
+    ) -> Self {
+        self.register_config_definitions = Some(register_config_definitions);
+        self
+    }
+
+    pub const fn with_storage_paths(
+        mut self,
+        register_storage_paths: fn(
+            &mut sinomo_storage::StorageLayout,
+        ) -> Result<(), sinomo_storage::StorageContractError>,
+    ) -> Self {
+        self.register_storage_paths = Some(register_storage_paths);
+        self
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ModuleSurfaces {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

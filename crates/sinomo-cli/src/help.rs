@@ -17,7 +17,6 @@ pub fn print_usage() {
     println!("  sinomo models");
     println!("  sinomo usage");
     println!("  sinomo providers");
-    println!("  sinomo evolve");
     println!();
     println!("Global flags:");
     println!(
@@ -432,68 +431,4 @@ pub(super) fn print_providers_help() {
     println!("  deepseek");
     println!("  gemini");
     println!("  nvidia");
-}
-
-pub(super) fn print_evolve_help() {
-    println!("Evolution:");
-    println!("  sinomo evolve");
-    println!("      Show evolution commands.");
-    println!(
-        "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"] [--benchmark swebench:<instance_id>] [--module-replay-report [name=]<path>] [--no-model]"
-    );
-    println!(
-        "      With --dry-run or --pause-after-proposal, write a phase-0 campaign bundle under $SINOMO_DATA_DIR/evolution/campaigns/."
-    );
-    println!(
-        "      With --no-model, skip model mutation but still materialize a candidate bundle and run verification/benchmark gates."
-    );
-    println!(
-        "      Campaign flags: --objective <text> --horizon <duration> --budget-policy <policy> --reserve <resource:percent%> --approval <policy> --max-wall-time <duration> [--approve]"
-    );
-    println!(
-        "  sinomo evolve schedule <campaign> --dry-run [--resource <resource:used/total[:window]>] [--estimate <resource:units>]"
-    );
-    println!(
-        "      Write phase-1 resource-ledger, lease request/decision, scheduler dry-run, and pause/schedule decision artifacts."
-    );
-    println!(
-        "  sinomo evolve iterate <campaign>|--campaign <id> [--dry-run] [--task <task_id>] [--repo <path>] [--provider <provider>] [--model <model>] [--path <glob>] [--verify \"<command>\"] [--benchmark <spec>] [--module-replay-report [name=]<path>]"
-    );
-    println!(
-        "      Without --dry-run, dispatch the selected task through the agent mutation worker, verify it, and attach stage/iteration evidence to the campaign."
-    );
-    println!(
-        "  sinomo evolve evaluate <campaign> --job <evojob_...> --task <task_id> [--failure-class <class>] [--root-cause <text>] [--learned <text>] [--usage <resource:estimated[:actual]>]"
-    );
-    println!(
-        "      Write phase-3 stage scorecard/adaptation artifacts and update campaign state after candidate evaluation."
-    );
-    println!("  sinomo evolve campaign approve|reject <campaign> [--note <note>]");
-    println!(
-        "      Record the human checkpoint decision that lets approved background campaigns reach scheduler-gated dispatch."
-    );
-    println!(
-        "  sinomo evolve tick --dry-run|--dispatch-approved [--scheduler-service <service_id>] [--campaign <campaign>] [--opportunity-policy <policy.json>] [--opportunity-events <events.json|jsonl>] [--opportunity-event-log <path|local>] [--opportunity-event-limit <n>] [--workload <system:id:status[:title]>] [--workload-estimate <system:id:resource:units>] [--resource <resource:used/total[:window]>] [--estimate <task:resource:units>] [--max-concurrent <n>] [--max-concurrent-workloads <n>] [--idle-window-open] [--reset-window-open]"
-    );
-    println!(
-        "      Write phase-4 background scheduler artifacts; --dispatch-approved may run approved agent-backed iterations, but never rollout."
-    );
-    println!("  sinomo evolve approve [--job evojob_...] [--note <note>] [--override]");
-    println!("      --override requires a non-empty --note and records failed preflight checks.");
-    println!("  sinomo evolve reject [--job evojob_...] [--note <note>]");
-    println!("  sinomo evolve restore [--job evojob_...] [--note <note>]");
-    println!("  sinomo evolve status [--job evojob_...]");
-    println!(
-        "  sinomo evolve show [--diff|--scorecard|--decision|--packet|--regression-evidence|--lesson|--evidence-summary] [--job evojob_...]"
-    );
-    println!("  sinomo evolve verify [--job evojob_...]");
-    println!("  sinomo evolve packet [--job evojob_...]");
-    println!("  sinomo evolve cleanup [--job evojob_...]");
-    println!("  sinomo evolve job create \"<objective>\" [--repo <path>]");
-    println!("  sinomo evolve trusted-signers list [--json] | publish | hydrate");
-    println!(
-        "      Manage registry trusted artifact signers; clustered nodes use cluster KV unless --local is set."
-    );
-    println!("  sinomo evolve models ...");
-    println!("      Compatibility alias for `sinomo models ...`.");
 }

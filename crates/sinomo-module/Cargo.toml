@@ -21,6 +21,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
+sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
 sinomo-local = { path = "../sinomo-local" }

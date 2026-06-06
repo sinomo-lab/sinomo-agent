@@ -349,11 +349,25 @@ impl CliCommandRegistry {
 pub struct CliCommandContext<'a> {
     stdout: &'a mut dyn Write,
     stderr: &'a mut dyn Write,
+    force_local: bool,
 }
 
 impl<'a> CliCommandContext<'a> {
     pub fn new(stdout: &'a mut dyn Write, stderr: &'a mut dyn Write) -> Self {
-        Self { stdout, stderr }
+        Self {
+            stdout,
+            stderr,
+            force_local: false,
+        }
+    }
+
+    pub fn with_force_local(mut self, force_local: bool) -> Self {
+        self.force_local = force_local;
+        self
+    }
+
+    pub fn force_local(&self) -> bool {
+        self.force_local
     }
 
     pub fn stdout(&mut self) -> &mut dyn Write {

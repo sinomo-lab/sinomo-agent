@@ -16,7 +16,6 @@ default = []
 sandbox = ["dep:sinomo-sandbox-wasix-host", "sinomo-daemon/sandbox"]
 
 [dependencies]
-sinomo-api = { path = "../sinomo-api" }
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }

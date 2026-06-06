@@ -14,6 +14,7 @@ use sinomo_runtime::module::{
 };
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type ScorecardId = Id;
@@ -5465,15 +5466,13 @@ impl MutationModel for FakeAgentArtifactMutationModel {
 
 #[derive(Clone, Debug)]
 struct FakeInteractionModel {
-    responses: Rc<RefCell<Vec<String>>>,
+    responses: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeInteractionModel {
     fn new(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self {
-            responses: Rc::new(RefCell::new(
-                responses.into_iter().map(Into::into).collect(),
-            )),
+            responses: Arc::new(Mutex::new(responses.into_iter().map(Into::into).collect())),
         }
     }
 }
@@ -5483,7 +5482,13 @@ impl InteractionModel for FakeInteractionModel {
         &self,
         _request: &LanguageModelRequest,
     ) -> Result<LanguageModelResponse, LanguageModelError> {
-        let mut responses = self.responses.borrow_mut();
+        let mut responses = self.responses.lock().map_err(|source| {
+            LanguageModelError::ProviderInvocationFailed {
+                provider: "fake".to_string(),
+                model: "fake".to_string(),
+                detail: format!("fake response queue lock failed: {source}"),
+            }
+        })?;
         if responses.is_empty() {
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: "fake".to_string(),

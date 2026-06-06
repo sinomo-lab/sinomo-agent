@@ -27,7 +27,6 @@ ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
-sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-dfs-fuse = { path = "../sinomo-dfs-fuse", optional = true, default-features = false }
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-models = { path = "../sinomo-models", optional = true }

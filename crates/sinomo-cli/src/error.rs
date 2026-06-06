@@ -49,7 +49,6 @@ pub enum CliError {
     DfsExpose(sinomo_runtime::dfs::DfsExposeStoreError),
     Kv(KvError),
     LanguageModel(LanguageModelError),
-    Evolution(sinomo_evolution::EvolutionError),
     Eval(sinomo_runtime::eval::EvalError),
     DaemonAlreadyRunning {
         lock_file: String,
@@ -360,76 +359,10 @@ impl From<LanguageModelError> for CliError {
     }
 }
 
-impl From<sinomo_evolution::EvolutionError> for CliError {
-    fn from(error: sinomo_evolution::EvolutionError) -> Self {
-        Self::Evolution(error)
-    }
-}
-
 impl From<sinomo_runtime::registry::RegistryError> for CliError {
     fn from(error: sinomo_runtime::registry::RegistryError) -> Self {
         Self::Parse {
             detail: error.to_string(),
-        }
-    }
-}
-
-impl From<sinomo_evolution::EvolutionPersistenceError> for CliError {
-    fn from(error: sinomo_evolution::EvolutionPersistenceError) -> Self {
-        match error {
-            sinomo_evolution::EvolutionPersistenceError::Io { path, detail } => {
-                Self::Io { path, detail }
-            }
-            sinomo_evolution::EvolutionPersistenceError::Json { path, detail } => {
-                Self::Json { path, detail }
-            }
-            sinomo_evolution::EvolutionPersistenceError::Config { key, detail } => Self::Parse {
-                detail: format!("evolution config `{key}`: {detail}"),
-            },
-            sinomo_evolution::EvolutionPersistenceError::Sifs { path, detail } => Self::Parse {
-                detail: format!("evolution SIFS artifact mirror error at {path}: {detail}"),
-            },
-            sinomo_evolution::EvolutionPersistenceError::MissingArtifact { artifact } => {
-                Self::MissingArtifact { artifact }
-            }
-        }
-    }
-}
-
-impl From<sinomo_evolution::EvolutionJobSelectionError> for CliError {
-    fn from(error: sinomo_evolution::EvolutionJobSelectionError) -> Self {
-        match error {
-            sinomo_evolution::EvolutionJobSelectionError::NoActiveJob => Self::NoActiveJob,
-            sinomo_evolution::EvolutionJobSelectionError::AmbiguousJob { job_ids } => {
-                Self::AmbiguousJob { job_ids }
-            }
-            sinomo_evolution::EvolutionJobSelectionError::Persistence(error) => error.into(),
-        }
-    }
-}
-
-impl From<sinomo_evolution::EvolutionJobStateError> for CliError {
-    fn from(error: sinomo_evolution::EvolutionJobStateError) -> Self {
-        match error {
-            sinomo_evolution::EvolutionJobStateError::UnexpectedStatus {
-                job_id,
-                status,
-                expected,
-            } => Self::InvalidJobState {
-                job_id,
-                status,
-                expected,
-            },
-        }
-    }
-}
-
-impl From<sinomo_evolution::EvolutionInputParseError> for CliError {
-    fn from(error: sinomo_evolution::EvolutionInputParseError) -> Self {
-        match error {
-            sinomo_evolution::EvolutionInputParseError::Invalid { detail } => {
-                Self::Parse { detail }
-            }
         }
     }
 }
@@ -518,7 +451,6 @@ impl std::fmt::Display for CliError {
             Self::DfsExpose(error) => write!(formatter, "{error}"),
             Self::Kv(error) => write!(formatter, "{error}"),
             Self::LanguageModel(error) => write!(formatter, "{error}"),
-            Self::Evolution(error) => write!(formatter, "{error}"),
             Self::Eval(error) => write!(formatter, "{error}"),
             Self::DaemonAlreadyRunning { lock_file, detail } => {
                 write!(

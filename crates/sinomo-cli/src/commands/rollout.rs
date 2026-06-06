@@ -757,11 +757,98 @@ fn read_rollout_module_replay_scorecard(
             .or_else(|| state.loader_state.shadow_artifact_id.clone())
             .or_else(|| Some(state.plan.artifact_id.clone()))
     });
-    Ok(module_replay_report_scorecard(
+    Ok(rollout_module_replay_report_scorecard(
         &report,
         baseline_artifact_id,
         candidate_artifact_id,
     ))
+}
+
+fn rollout_module_replay_report_scorecard(
+    report: &ModuleReplayReport,
+    baseline_artifact_id: Option<sinomo_runtime::module::ArtifactId>,
+    candidate_artifact_id: Option<sinomo_runtime::module::ArtifactId>,
+) -> EvaluationScorecard {
+    let outcome = rollout_module_replay_report_outcome(report);
+    EvaluationScorecard {
+        scorecard_id: sinomo_runtime::core::Id::generate(),
+        baseline_artifact_id,
+        candidate_artifact_id,
+        outcome: outcome.clone(),
+        gates: vec![
+            sinomo_runtime::core::EvaluationGateResult {
+                gate: sinomo_runtime::core::EvaluationGate::ReplayTests,
+                outcome: if report.missing_route_count == 0 && !report.cases.is_empty() {
+                    sinomo_runtime::core::EvaluationOutcome::Passed
+                } else {
+                    sinomo_runtime::core::EvaluationOutcome::Failed
+                },
+                summary: format!(
+                    "{} replay cases, {} missing routes",
+                    report.cases.len(),
+                    report.missing_route_count
+                ),
+            },
+            sinomo_runtime::core::EvaluationGateResult {
+                gate: sinomo_runtime::core::EvaluationGate::ShadowMode,
+                outcome,
+                summary: format!(
+                    "{} primary errors, {} shadow errors, {} shadow mismatches",
+                    report.primary_error_count,
+                    report.shadow_error_count,
+                    report.shadow_mismatch_count
+                ),
+            },
+        ],
+        metrics: vec![
+            rollout_module_replay_metric("module_replay_case_count", report.cases.len() as i64),
+            rollout_module_replay_metric(
+                "module_replay_event_count",
+                report.replay_event_count as i64,
+            ),
+            rollout_module_replay_metric(
+                "module_replay_missing_route_count",
+                report.missing_route_count as i64,
+            ),
+            rollout_module_replay_metric(
+                "module_replay_primary_error_count",
+                report.primary_error_count as i64,
+            ),
+            rollout_module_replay_metric(
+                "module_replay_shadow_error_count",
+                report.shadow_error_count as i64,
+            ),
+            rollout_module_replay_metric(
+                "module_replay_shadow_mismatch_count",
+                report.shadow_mismatch_count as i64,
+            ),
+        ],
+    }
+}
+
+fn rollout_module_replay_report_outcome(
+    report: &ModuleReplayReport,
+) -> sinomo_runtime::core::EvaluationOutcome {
+    if report.cases.is_empty() {
+        return sinomo_runtime::core::EvaluationOutcome::Inconclusive;
+    }
+    if report.missing_route_count == 0
+        && report.primary_error_count == 0
+        && report.shadow_error_count == 0
+        && report.shadow_mismatch_count == 0
+    {
+        sinomo_runtime::core::EvaluationOutcome::Passed
+    } else {
+        sinomo_runtime::core::EvaluationOutcome::Failed
+    }
+}
+
+fn rollout_module_replay_metric(name: &str, value: i64) -> sinomo_runtime::core::EvaluationMetric {
+    sinomo_runtime::core::EvaluationMetric {
+        name: name.to_string(),
+        value: sinomo_runtime::core::MetricValue::Integer(value),
+        sample_count: None,
+    }
 }
 
 fn read_rollout_shadow_telemetry_scorecard(

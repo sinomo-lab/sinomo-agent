@@ -114,8 +114,10 @@ fn cli_data_dir_layout()
 -> Result<sinomo_runtime::storage::StorageLayout, sinomo_runtime::storage::StorageContractError> {
     let mut layout = sinomo_runtime::storage::sinomo_data_dir_layout()?;
     sinomo_agent::register_storage_paths(&mut layout)?;
-    sinomo_evolution::register_storage_paths(&mut layout)?;
     sinomo_pytorch::register_storage_paths(&mut layout)?;
+    for hook in &crate::cli_runtime_config().storage_layout_hooks {
+        hook(&mut layout)?;
+    }
     Ok(layout)
 }
 

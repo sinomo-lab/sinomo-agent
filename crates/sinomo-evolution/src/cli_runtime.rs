@@ -1,855 +1,477 @@
 use super::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::cell::Cell;
 use std::collections::BTreeSet;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+use sinomo_lm::{
+    LM_PROVIDER_CONFIG_KEY, LanguageModelError, ModelConfig, model_config_definition,
+    model_config_from_cluster_kv_snapshot, model_config_store, normalize_model_id_for_provider,
+    normalize_model_provider, resolve_default_model,
+};
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue, CliCommand,
+    CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp, CliCommandMetadata,
+    CliCommandPolicy, CliParseError,
+};
+use sinomo_runtime::core::{EvaluationOutcome, EventEnvelope};
+#[cfg(test)]
+use sinomo_runtime::daemon::{
+    DaemonPaths,
+    handle_daemon_cluster_kv_txn_request as daemon_handle_daemon_cluster_kv_txn_request,
+};
+use sinomo_runtime::daemon::{
+    default_main_daemon_status as daemon_default_main_daemon_status,
+    fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
+};
+use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
+use sinomo_runtime::events::{EventStore, JsonlEventStore, ReplayDirection, ReplayQuery};
+#[cfg(not(test))]
+use sinomo_runtime::kv::KvTxnResponse;
+use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvSnapshot, KvTxn};
+use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::node::NodeId;
+use sinomo_runtime::rollout::{
+    SelfRolloutPaths, ensure_rollout_layout, ensure_rollout_source_repo,
+};
+
+const EVOLVE_POLICY: CliCommandPolicy = CliCommandPolicy::cluster_required();
+const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+#[cfg(not(test))]
+const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(15);
 
 const EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT: usize = 8;
 
-#[derive(Debug, Clone)]
-pub(crate) enum EvolveCliCommand {
-    Help,
-    Propose(Vec<String>),
-    Schedule(Vec<String>),
-    Iterate(Vec<String>),
-    Evaluate(Vec<String>),
-    Campaign(CampaignCliCommand),
-    Tick(Vec<String>),
-    Decide(CandidateDecisionOutcome, Vec<String>),
-    Status(Vec<String>),
-    Show(Vec<String>),
-    Verify(Vec<String>),
-    Packet(Vec<String>),
-    Cleanup(Vec<String>),
-    Job(Vec<String>),
-    TrustedSigners(TrustedSignersCliCommand),
-    Models(ModelsCliCommand),
+thread_local! {
+    static EVOLUTION_CLI_FORCE_LOCAL_MODE: Cell<bool> = const { Cell::new(false) };
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum CampaignCliCommand {
-    Approve(CampaignDecisionCliOptions),
-    Reject(CampaignDecisionCliOptions),
+#[derive(Debug, Error)]
+pub enum EvolutionCliError {
+    #[error("invalid command usage")]
+    Usage,
+    #[error("{detail}")]
+    Parse { detail: String },
+    #[error("I/O error at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error("JSON error at {path}: {detail}")]
+    Json { path: String, detail: String },
+    #[error("daemon is not running: {detail}")]
+    DaemonNotRunning { detail: String },
+    #[error(transparent)]
+    LocalData(#[from] sinomo_runtime::local::LocalDataError),
+    #[error(transparent)]
+    Config(#[from] sinomo_runtime::config::ConfigError),
+    #[error(transparent)]
+    Events(#[from] sinomo_runtime::events::EventStoreError),
+    #[error(transparent)]
+    Registry(#[from] sinomo_runtime::registry::RegistryError),
+    #[error(transparent)]
+    Network(#[from] sinomo_runtime::network::NetworkError),
+    #[error(transparent)]
+    Daemon(#[from] sinomo_runtime::daemon::DaemonError),
+    #[error(transparent)]
+    Rollout(#[from] sinomo_runtime::rollout::RolloutError),
+    #[error(transparent)]
+    LanguageModel(#[from] LanguageModelError),
+    #[error(transparent)]
+    Evolution(#[from] EvolutionError),
+    #[error(transparent)]
+    Persistence(#[from] EvolutionPersistenceError),
+    #[error(transparent)]
+    JobSelection(#[from] EvolutionJobSelectionError),
+    #[error(transparent)]
+    JobState(#[from] EvolutionJobStateError),
+    #[error(transparent)]
+    InputParse(#[from] EvolutionInputParseError),
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CampaignDecisionCliOptions {
-    pub(crate) campaign_id: String,
-    pub(crate) note: Option<String>,
+pub type CliError = EvolutionCliError;
+
+impl From<CliParseError> for EvolutionCliError {
+    fn from(error: CliParseError) -> Self {
+        match error {
+            CliParseError::Usage => Self::Usage,
+            CliParseError::Parse { detail } => Self::Parse { detail },
+        }
+    }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum TrustedSignersCliCommand {
-    Help,
-    List(TrustedSignersListOptions),
-    Publish,
-    Hydrate,
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub(crate) struct TrustedSignersListOptions {
-    pub(crate) json: bool,
-}
-
-pub(crate) fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(EvolveCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(EvolveCliCommand::Help)
-        }
-        Some((command, rest)) if command == "propose" => {
-            Ok(EvolveCliCommand::Propose(rest.to_vec()))
-        }
-        Some((command, rest)) if command == "schedule" => {
-            Ok(EvolveCliCommand::Schedule(rest.to_vec()))
-        }
-        Some((command, rest)) if command == "iterate" => {
-            Ok(EvolveCliCommand::Iterate(rest.to_vec()))
-        }
-        Some((command, rest)) if command == "evaluate" => {
-            Ok(EvolveCliCommand::Evaluate(rest.to_vec()))
-        }
-        Some((command, rest)) if command == "campaign" => {
-            Ok(EvolveCliCommand::Campaign(parse_campaign_command(rest)?))
-        }
-        Some((command, rest)) if matches!(command.as_str(), "tick" | "run-background") => {
-            Ok(EvolveCliCommand::Tick(rest.to_vec()))
-        }
-        Some((command, rest)) if command == "approve" => Ok(EvolveCliCommand::Decide(
-            CandidateDecisionOutcome::Approved,
-            rest.to_vec(),
-        )),
-        Some((command, rest)) if command == "reject" => Ok(EvolveCliCommand::Decide(
-            CandidateDecisionOutcome::Rejected,
-            rest.to_vec(),
-        )),
-        Some((command, rest)) if command == "restore" => Ok(EvolveCliCommand::Decide(
-            CandidateDecisionOutcome::Restored,
-            rest.to_vec(),
-        )),
-        Some((command, rest)) if command == "status" => Ok(EvolveCliCommand::Status(rest.to_vec())),
-        Some((command, rest)) if command == "show" => Ok(EvolveCliCommand::Show(rest.to_vec())),
-        Some((command, rest)) if command == "verify" => Ok(EvolveCliCommand::Verify(rest.to_vec())),
-        Some((command, rest)) if command == "packet" => Ok(EvolveCliCommand::Packet(rest.to_vec())),
-        Some((command, rest)) if command == "cleanup" => {
-            Ok(EvolveCliCommand::Cleanup(rest.to_vec()))
-        }
-        Some((command, rest)) if command == "job" => Ok(EvolveCliCommand::Job(rest.to_vec())),
-        Some((command, rest))
-            if matches!(command.as_str(), "trusted-signers" | "trust-signers") =>
-        {
-            Ok(EvolveCliCommand::TrustedSigners(
-                parse_trusted_signers_command(rest)?,
-            ))
-        }
-        Some((command, rest)) if command == "models" => {
-            Ok(EvolveCliCommand::Models(parse_models_command(rest)?))
-        }
-        _ => Err(CliError::Usage),
+impl From<EvolutionCliError> for CliCommandError {
+    fn from(error: EvolutionCliError) -> Self {
+        CliCommandError::new(error.to_string())
     }
 }
 
-pub(crate) fn parse_campaign_command(args: &[String]) -> Result<CampaignCliCommand, CliError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "approve" => Ok(CampaignCliCommand::Approve(
-            parse_campaign_decision_options(rest)?,
-        )),
-        Some((command, rest)) if command == "reject" => Ok(CampaignCliCommand::Reject(
-            parse_campaign_decision_options(rest)?,
-        )),
-        _ => Err(CliError::Usage),
+struct EvolutionCliLocalModeGuard {
+    previous: bool,
+}
+
+impl Drop for EvolutionCliLocalModeGuard {
+    fn drop(&mut self) {
+        EVOLUTION_CLI_FORCE_LOCAL_MODE.with(|mode| mode.set(self.previous));
     }
 }
 
-pub(crate) fn parse_campaign_decision_options(
-    args: &[String],
-) -> Result<CampaignDecisionCliOptions, CliError> {
-    let mut campaign_id = None;
-    let mut note = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--campaign" => {
-                index += 1;
-                campaign_id = args.get(index).cloned();
-                if campaign_id.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--note" => {
-                index += 1;
-                note = args.get(index).cloned();
-                if note.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            value if value.starts_with("--") => return Err(CliError::Usage),
-            value => {
-                if campaign_id.is_some() {
-                    return Err(CliError::Usage);
-                }
-                campaign_id = Some(value.to_string());
-            }
-        }
-        index += 1;
-    }
-    Ok(CampaignDecisionCliOptions {
-        campaign_id: campaign_id.ok_or(CliError::Usage)?,
-        note,
-    })
+fn enter_evolution_cli_force_local_mode(force_local: bool) -> EvolutionCliLocalModeGuard {
+    let previous = cli_force_local_mode();
+    EVOLUTION_CLI_FORCE_LOCAL_MODE.with(|mode| mode.set(previous || force_local));
+    EvolutionCliLocalModeGuard { previous }
 }
 
-pub(crate) fn parse_trusted_signers_command(
-    args: &[String],
-) -> Result<TrustedSignersCliCommand, CliError> {
-    match args.split_first() {
-        None => Ok(TrustedSignersCliCommand::Help),
-        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
-            Ok(TrustedSignersCliCommand::Help)
-        }
-        Some((command, rest)) if command == "list" => Ok(TrustedSignersCliCommand::List(
-            parse_trusted_signers_list_options(rest)?,
-        )),
-        Some((command, [])) if matches!(command.as_str(), "publish" | "push" | "sync") => {
-            Ok(TrustedSignersCliCommand::Publish)
-        }
-        Some((command, [])) if matches!(command.as_str(), "hydrate" | "pull") => {
-            Ok(TrustedSignersCliCommand::Hydrate)
-        }
-        _ => Err(CliError::Usage),
+fn cli_force_local_mode() -> bool {
+    EVOLUTION_CLI_FORCE_LOCAL_MODE.with(Cell::get)
+}
+
+#[derive(Debug, Default)]
+pub struct EvolveCliCommandHandler;
+
+pub fn evolve_cli_command_handler() -> EvolveCliCommandHandler {
+    EvolveCliCommandHandler
+}
+
+impl CliCommandHandler for EvolveCliCommandHandler {
+    fn metadata(&self) -> CliCommandMetadata {
+        evolve_cli_metadata()
+    }
+
+    fn help(&self) -> CliCommandHelp {
+        evolve_cli_help()
+    }
+
+    fn autocomplete(&self) -> CliAutocompleteSpec {
+        evolve_cli_autocomplete()
+    }
+
+    fn parse(&self, args: &[String]) -> Result<Box<dyn CliCommand>, CliParseError> {
+        Ok(Box::new(EvolveCliCommandRunner {
+            command: parse_evolve_command(args)?,
+        }))
     }
 }
 
-pub(crate) fn parse_trusted_signers_list_options(
-    args: &[String],
-) -> Result<TrustedSignersListOptions, CliError> {
-    let mut options = TrustedSignersListOptions::default();
-    for arg in args {
-        match arg.as_str() {
-            "--json" => options.json = true,
-            _ => return Err(CliError::Usage),
+#[derive(Debug)]
+struct EvolveCliCommandRunner {
+    command: EvolveCliCommand,
+}
+
+impl CliCommand for EvolveCliCommandRunner {
+    fn name(&self) -> &'static str {
+        "evolve"
+    }
+
+    fn policy(&self) -> CliCommandPolicy {
+        EVOLVE_POLICY
+    }
+
+    fn help(&self) -> CliCommandHelp {
+        evolve_cli_help()
+    }
+
+    fn autocomplete(&self) -> CliAutocompleteSpec {
+        evolve_cli_autocomplete()
+    }
+
+    fn run(self: Box<Self>, context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {
+        let _guard = enter_evolution_cli_force_local_mode(context.force_local());
+        if matches!(
+            &self.command,
+            EvolveCliCommand::Help
+                | EvolveCliCommand::TrustedSigners(TrustedSignersCliCommand::Help)
+        ) {
+            return self.help().write(context);
         }
+        run_evolve_cli_command(self.command).map_err(Into::into)
     }
-    Ok(options)
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ProposeOptions {
-    pub(crate) objective: String,
-    pub(crate) provider: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) repo: Option<PathBuf>,
-    pub(crate) allow: Vec<String>,
-    pub(crate) verify: Vec<String>,
-    pub(crate) benchmark: Vec<String>,
-    pub(crate) module_replay_report: Vec<String>,
-    pub(crate) target_ring: TrustRing,
-    pub(crate) dry_run: bool,
-    pub(crate) no_model: bool,
-    pub(crate) horizon: Option<String>,
-    pub(crate) budget_policy: Option<String>,
-    pub(crate) reserve_floors: Vec<String>,
-    pub(crate) approval_policy: Option<String>,
-    pub(crate) max_wall_time: Option<String>,
-    pub(crate) pause_after_proposal: bool,
-    pub(crate) approve_campaign: bool,
+fn evolve_cli_metadata() -> CliCommandMetadata {
+    CliCommandMetadata::new(
+        "evolve",
+        &[],
+        "Run self-evolution workflows.",
+        EVOLVE_POLICY,
+    )
 }
 
-pub(crate) fn parse_propose_options(args: &[String]) -> Result<ProposeOptions, CliError> {
-    let mut objective = None;
-    let mut provider = None;
-    let mut model = None;
-    let mut repo = None;
-    let mut allow = Vec::new();
-    let mut verify = Vec::new();
-    let mut benchmark = Vec::new();
-    let mut module_replay_report = Vec::new();
-    let mut target_ring = TrustRing::R1TrustedRuntime;
-    let mut dry_run = false;
-    let mut no_model = false;
-    let mut horizon = None;
-    let mut budget_policy = None;
-    let mut reserve_floors = Vec::new();
-    let mut approval_policy = None;
-    let mut max_wall_time = None;
-    let mut pause_after_proposal = false;
-    let mut approve_campaign = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--objective" => {
-                index += 1;
-                objective = args.get(index).cloned();
-            }
-            "--provider" => {
-                index += 1;
-                provider = args.get(index).cloned();
-            }
-            "--model" => {
-                index += 1;
-                model = args.get(index).cloned();
-            }
-            "--repo" => {
-                index += 1;
-                repo = args.get(index).map(PathBuf::from);
-            }
-            "--allow" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    allow.push(value.clone());
-                }
-            }
-            "--verify" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    verify.push(value.clone());
-                }
-            }
-            "--benchmark" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    benchmark.push(value.clone());
-                }
-            }
-            "--module-replay-report" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    module_replay_report.push(value.clone());
-                }
-            }
-            "--target-ring" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    target_ring = parse_trust_ring(value)?;
-                }
-            }
-            "--horizon" => {
-                index += 1;
-                horizon = args.get(index).cloned();
-            }
-            "--budget-policy" => {
-                index += 1;
-                budget_policy = args.get(index).cloned();
-            }
-            "--reserve" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    reserve_floors.push(value.clone());
-                }
-            }
-            "--approval" => {
-                index += 1;
-                approval_policy = args.get(index).cloned();
-            }
-            "--max-wall-time" => {
-                index += 1;
-                max_wall_time = args.get(index).cloned();
-            }
-            "--pause-after-proposal" => {
-                pause_after_proposal = true;
-            }
-            "--approve" => {
-                approve_campaign = true;
-            }
-            "--dry-run" => {
-                dry_run = true;
-            }
-            "--no-model" => {
-                no_model = true;
-            }
-            value if value.starts_with("--") => return Err(CliError::Usage),
-            value => {
-                objective = Some(value.to_string());
-            }
-        }
-        index += 1;
-    }
-    Ok(ProposeOptions {
-        objective: objective.ok_or(CliError::Usage)?,
-        provider,
-        model,
-        repo,
-        allow,
-        verify,
-        benchmark,
-        module_replay_report,
-        target_ring,
-        dry_run,
-        no_model,
-        horizon,
-        budget_policy,
-        reserve_floors,
-        approval_policy,
-        max_wall_time,
-        pause_after_proposal,
-        approve_campaign,
-    })
+fn evolve_cli_help() -> CliCommandHelp {
+    CliCommandHelp::new(
+        "Evolve:",
+        [
+            "  sinomo evolve",
+            "      Show evolution commands.",
+            "  sinomo evolve propose \"<objective>\" [--repo <path>] [--provider <provider>] [--model <model>] [--verify \"<command>\"] [--benchmark swebench:<instance_id>] [--module-replay-report [name=]<path>] [--no-model]",
+            "      Create an evolution job, candidate bundle, diff, and evaluation report.",
+            "  sinomo evolve propose \"<objective>\" --dry-run [--horizon <text>] [--budget-policy <policy>] [--reserve <resource:floor>] [--approval <policy>] [--pause-after-proposal] [--approve]",
+            "      Create and persist a long-horizon campaign proposal without running a mutation model.",
+            "  sinomo evolve schedule <campaign> --dry-run [--resource <resource:used/total[:window]>] [--estimate <resource:units>]",
+            "      Preview resource-aware scheduling decisions for a campaign.",
+            "  sinomo evolve iterate <campaign>|--campaign <id> [--dry-run] [--task <task_id>] [--repo <path>] [--provider <provider>] [--model <model>] [--path <glob>] [--verify \"<command>\"] [--benchmark <spec>] [--module-replay-report [name=]<path>]",
+            "      Prepare or execute the next scheduled campaign iteration.",
+            "  sinomo evolve evaluate <campaign> --job <evojob_...> --task <task_id> [--failure-class <class>] [--root-cause <text>] [--learned <text>] [--usage <resource:estimated[:actual]>]",
+            "      Record stage-level evaluation and lesson memory for a campaign iteration.",
+            "  sinomo evolve campaign approve|reject <campaign> [--note <note>]",
+            "      Record the human checkpoint for a campaign proposal.",
+            "  sinomo evolve tick --dry-run|--dispatch-approved [--scheduler-service <service_id>] [--campaign <campaign>] [--opportunity-policy <policy.json>] [--opportunity-events <events.json|jsonl>] [--opportunity-event-log <path|local>] [--opportunity-event-limit <n>] [--workload <system:id:status[:title]>] [--workload-estimate <system:id:resource:units>] [--resource <resource:used/total[:window]>] [--estimate <task:resource:units>] [--max-concurrent <n>] [--max-concurrent-workloads <n>] [--idle-window-open] [--reset-window-open]",
+            "      Run the background scheduler tick and optionally dispatch approved work.",
+            "  sinomo evolve approve [--job evojob_...] [--note <note>] [--override]",
+            "      Approve the selected candidate after human review.",
+            "  sinomo evolve reject [--job evojob_...] [--note <note>]",
+            "      Reject the selected candidate.",
+            "  sinomo evolve restore [--job evojob_...] [--note <note>]",
+            "      Record that the operator restored from the selected candidate.",
+            "  sinomo evolve status [--job evojob_...]",
+            "      Show one job or all stored jobs.",
+            "  sinomo evolve show [--diff|--scorecard|--decision|--packet|--regression-evidence|--lesson|--evidence-summary] [--job evojob_...]",
+            "      Print a stored job artifact.",
+            "  sinomo evolve verify [--job evojob_...]",
+            "      Rerun verification for a stored job.",
+            "  sinomo evolve packet [--job evojob_...]",
+            "      Print the stored mutation packet.",
+            "  sinomo evolve cleanup [--job evojob_...]",
+            "      Remove a stored evolution job and its worktree.",
+            "  sinomo evolve job create \"<objective>\" [--repo <path>]",
+            "      Alias for proposal dry-run creation.",
+            "  sinomo evolve trusted-signers list [--json] | publish | hydrate",
+            "      Inspect or synchronize trusted artifact signers between local registry and cluster KV.",
+        ],
+    )
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct ScheduleOptions {
-    pub(crate) campaign_id: String,
-    pub(crate) resources: Vec<String>,
-    pub(crate) estimates: Vec<String>,
-    pub(crate) dry_run: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct BackgroundTickOptions {
-    pub(crate) scheduler_service_id: String,
-    pub(crate) campaign_ids: Vec<String>,
-    pub(crate) opportunity_event_files: Vec<PathBuf>,
-    pub(crate) opportunity_event_log: Option<PathBuf>,
-    pub(crate) opportunity_event_limit: usize,
-    pub(crate) opportunity_policy: Option<PathBuf>,
-    pub(crate) opportunity_planner_node_id: Option<NodeId>,
-    pub(crate) external_workloads: Vec<String>,
-    pub(crate) external_workload_estimates: Vec<String>,
-    pub(crate) external_human_checkpoints: Vec<String>,
-    pub(crate) resources: Vec<String>,
-    pub(crate) estimates: Vec<String>,
-    pub(crate) max_concurrent_campaigns: usize,
-    pub(crate) max_concurrent_workloads: usize,
-    pub(crate) idle_window_open: bool,
-    pub(crate) reset_window_open: bool,
-    pub(crate) dispatch_approved: bool,
-    pub(crate) dry_run: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct IterationOptions {
-    pub(crate) campaign_id: String,
-    pub(crate) task_id: Option<String>,
-    pub(crate) provider: Option<String>,
-    pub(crate) model: Option<String>,
-    pub(crate) repo: Option<PathBuf>,
-    pub(crate) intended_paths: Vec<String>,
-    pub(crate) verification_commands: Vec<String>,
-    pub(crate) benchmark: Vec<String>,
-    pub(crate) module_replay_report: Vec<String>,
-    pub(crate) dry_run: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct StageEvaluationOptions {
-    pub(crate) campaign_id: String,
-    pub(crate) job_id: EvolutionJobId,
-    pub(crate) task_id: String,
-    pub(crate) failure_class: Option<EvolutionFailureClass>,
-    pub(crate) root_cause_summary: Option<String>,
-    pub(crate) what_was_learned: Vec<String>,
-    pub(crate) resource_usage: Vec<ResourceUsageEstimate>,
-}
-
-pub(crate) fn parse_stage_evaluation_options(
-    args: &[String],
-) -> Result<StageEvaluationOptions, CliError> {
-    let mut campaign_id = None;
-    let mut job_id = None;
-    let mut task_id = None;
-    let mut failure_class = None;
-    let mut root_cause_summary = None;
-    let mut what_was_learned = Vec::new();
-    let mut resource_usage = Vec::new();
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--job" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                job_id =
-                    Some(
-                        value
-                            .parse::<EvolutionJobId>()
-                            .map_err(|source| CliError::Parse {
-                                detail: format!("invalid evolution job id `{value}`: {source}"),
-                            })?,
-                    );
-            }
-            "--task" => {
-                index += 1;
-                task_id = args.get(index).cloned();
-                if task_id.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--failure-class" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                failure_class = Some(parse_failure_class(value)?);
-            }
-            "--root-cause" => {
-                index += 1;
-                root_cause_summary = args.get(index).cloned();
-                if root_cause_summary.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--learned" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    what_was_learned.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--usage" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    resource_usage.push(parse_stage_resource_usage(value, task_id.as_deref())?);
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            value if value.starts_with("--") => return Err(CliError::Usage),
-            value => {
-                if campaign_id.is_some() {
-                    return Err(CliError::Usage);
-                }
-                campaign_id = Some(value.to_string());
-            }
-        }
-        index += 1;
-    }
-    Ok(StageEvaluationOptions {
-        campaign_id: campaign_id.ok_or(CliError::Usage)?,
-        job_id: job_id.ok_or(CliError::Usage)?,
-        task_id: task_id.ok_or(CliError::Usage)?,
-        failure_class,
-        root_cause_summary,
-        what_was_learned,
-        resource_usage,
-    })
-}
-
-pub(crate) fn parse_iteration_options(args: &[String]) -> Result<IterationOptions, CliError> {
-    let mut campaign_id = None;
-    let mut task_id = None;
-    let mut provider = None;
-    let mut model = None;
-    let mut repo = None;
-    let mut intended_paths = Vec::new();
-    let mut verification_commands = Vec::new();
-    let mut benchmark = Vec::new();
-    let mut module_replay_report = Vec::new();
-    let mut dry_run = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--campaign" => {
-                index += 1;
-                campaign_id = args.get(index).cloned();
-                if campaign_id.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--task" => {
-                index += 1;
-                task_id = args.get(index).cloned();
-                if task_id.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--provider" => {
-                index += 1;
-                provider = args.get(index).cloned();
-                if provider.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--model" => {
-                index += 1;
-                model = args.get(index).cloned();
-                if model.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--repo" => {
-                index += 1;
-                repo = args.get(index).map(PathBuf::from);
-                if repo.is_none() {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--path" | "--allow" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    intended_paths.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--verify" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    verification_commands.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--benchmark" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    benchmark.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--module-replay-report" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    module_replay_report.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--dry-run" | "--preview" => {
-                dry_run = true;
-            }
-            value if value.starts_with("--") => return Err(CliError::Usage),
-            value => {
-                if campaign_id.is_some() {
-                    return Err(CliError::Usage);
-                }
-                campaign_id = Some(value.to_string());
-            }
-        }
-        index += 1;
-    }
-    Ok(IterationOptions {
-        campaign_id: campaign_id.ok_or(CliError::Usage)?,
-        task_id,
-        provider,
-        model,
-        repo,
-        intended_paths,
-        verification_commands,
-        benchmark,
-        module_replay_report,
-        dry_run,
-    })
-}
-
-pub(crate) fn parse_background_tick_options(
-    args: &[String],
-) -> Result<BackgroundTickOptions, CliError> {
-    let mut scheduler_service_id = "sinomo-cluster-scheduler".to_string();
-    let mut campaign_ids = Vec::new();
-    let mut opportunity_event_files = Vec::new();
-    let mut opportunity_event_log = None;
-    let mut opportunity_event_limit = 200usize;
-    let mut opportunity_policy = None;
-    let mut opportunity_planner_node_id = None;
-    let mut external_workloads = Vec::new();
-    let mut external_workload_estimates = Vec::new();
-    let mut external_human_checkpoints = Vec::new();
-    let mut resources = Vec::new();
-    let mut estimates = Vec::new();
-    let mut max_concurrent_campaigns = 1usize;
-    let mut max_concurrent_workloads = 1usize;
-    let mut idle_window_open = false;
-    let mut reset_window_open = false;
-    let mut dispatch_approved = false;
-    let mut dry_run = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--cluster" | "--cluster-id" => {
-                return Err(CliError::Parse {
-                    detail: "cluster identifiers are not supported; scheduler operations always target the current cluster".to_string(),
-                });
-            }
-            "--scheduler-service" | "--scheduler-service-id" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                if value.trim().is_empty() {
-                    return Err(CliError::Parse {
-                        detail: "scheduler service id must not be empty".to_string(),
-                    });
-                }
-                scheduler_service_id = value.clone();
-            }
-            "--campaign" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    campaign_ids.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--opportunity-events" | "--opportunity-event-file" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    opportunity_event_files.push(PathBuf::from(value));
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--opportunity-event-log" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    opportunity_event_log = Some(PathBuf::from(value));
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--opportunity-event-limit" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                opportunity_event_limit =
-                    value.parse::<usize>().map_err(|source| CliError::Parse {
-                        detail: format!("invalid opportunity event limit `{value}`: {source}"),
-                    })?;
-                if opportunity_event_limit == 0 {
-                    return Err(CliError::Parse {
-                        detail: "opportunity event limit must be at least 1".to_string(),
-                    });
-                }
-            }
-            "--opportunity-policy" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    opportunity_policy = Some(PathBuf::from(value));
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--opportunity-planner-node" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                opportunity_planner_node_id = Some(parse_node_id_cli(value)?);
-            }
-            "--workload" | "--external-workload" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    external_workloads.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--workload-estimate" | "--external-estimate" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    external_workload_estimates.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--workload-human-checkpoint" | "--external-human-checkpoint" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    external_human_checkpoints.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--resource" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    resources.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--estimate" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    estimates.push(value.clone());
-                } else {
-                    return Err(CliError::Usage);
-                }
-            }
-            "--max-concurrent" | "--max-concurrent-campaigns" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                max_concurrent_campaigns =
-                    value.parse::<usize>().map_err(|source| CliError::Parse {
-                        detail: format!(
-                            "invalid max concurrent campaign count `{value}`: {source}"
-                        ),
-                    })?;
-                if max_concurrent_campaigns == 0 {
-                    return Err(CliError::Parse {
-                        detail: "max concurrent campaign count must be at least 1".to_string(),
-                    });
-                }
-                max_concurrent_workloads = max_concurrent_workloads.max(max_concurrent_campaigns);
-            }
-            "--max-concurrent-workloads" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliError::Usage);
-                };
-                max_concurrent_workloads =
-                    value.parse::<usize>().map_err(|source| CliError::Parse {
-                        detail: format!(
-                            "invalid max concurrent workload count `{value}`: {source}"
-                        ),
-                    })?;
-                if max_concurrent_workloads == 0 {
-                    return Err(CliError::Parse {
-                        detail: "max concurrent workload count must be at least 1".to_string(),
-                    });
-                }
-            }
-            "--idle-window-open" => idle_window_open = true,
-            "--reset-window-open" => reset_window_open = true,
-            "--dispatch-approved" => dispatch_approved = true,
-            "--dry-run" | "--preview" => dry_run = true,
-            value if value.starts_with("--") => return Err(CliError::Usage),
-            value => campaign_ids.push(value.to_string()),
-        }
-        index += 1;
-    }
-    if dry_run && dispatch_approved {
-        return Err(CliError::Parse {
-            detail: "--dry-run and --dispatch-approved are mutually exclusive".to_string(),
-        });
-    }
-    Ok(BackgroundTickOptions {
-        scheduler_service_id,
-        campaign_ids,
-        opportunity_event_files,
-        opportunity_event_log,
-        opportunity_event_limit,
-        opportunity_policy,
-        opportunity_planner_node_id,
-        external_workloads,
-        external_workload_estimates,
-        external_human_checkpoints,
-        resources,
-        estimates,
-        max_concurrent_campaigns,
-        max_concurrent_workloads,
-        idle_window_open,
-        reset_window_open,
-        dispatch_approved,
-        dry_run,
-    })
-}
-
-fn parse_node_id_cli(value: &str) -> Result<NodeId, CliError> {
-    value.parse::<NodeId>().or_else(|parse_error| {
-        NodeId::from_legacy_named(value).map_err(|legacy_error| CliError::Parse {
-            detail: format!(
-                "invalid opportunity planner node id `{value}`: {parse_error}; legacy name fallback failed: {legacy_error}"
+fn evolve_cli_autocomplete() -> CliAutocompleteSpec {
+    CliAutocompleteSpec::new("evolve", "run self-evolution workflows").with_children([
+        CliAutocompleteSpec::new("propose", "create an evolution proposal").with_options([
+            CliAutocompleteOption::with_value(
+                "--objective",
+                "proposal objective",
+                CliAutocompleteValue::new("text", "objective text", []),
             ),
-        })
-    })
+            CliAutocompleteOption::with_value(
+                "--repo",
+                "source repository",
+                CliAutocompleteValue::new("path", "repository path", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--allow",
+                "allowed path glob",
+                CliAutocompleteValue::new("glob", "allowed path glob", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--verify",
+                "verification command",
+                CliAutocompleteValue::new("command", "verification command", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--provider",
+                "model provider",
+                CliAutocompleteValue::new("provider", "language model provider", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--model",
+                "model id",
+                CliAutocompleteValue::new("model", "model id", []),
+            ),
+            CliAutocompleteOption::flag("--dry-run", "persist a campaign proposal only"),
+            CliAutocompleteOption::flag("--no-model", "create a candidate without model mutation"),
+            CliAutocompleteOption::flag("--approve", "mark campaign proposal approved"),
+            CliAutocompleteOption::flag("--pause-after-proposal", "pause after campaign proposal"),
+        ]),
+        CliAutocompleteSpec::new("approve", "approve a proposed job").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--note",
+                "decision note",
+                CliAutocompleteValue::new("text", "decision note", []),
+            ),
+            CliAutocompleteOption::flag("--override", "override failed approval preflight"),
+        ]),
+        CliAutocompleteSpec::new("reject", "reject a proposed job").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--note",
+                "decision note",
+                CliAutocompleteValue::new("text", "decision note", []),
+            ),
+        ]),
+        CliAutocompleteSpec::new("restore", "record restoration").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--note",
+                "decision note",
+                CliAutocompleteValue::new("text", "decision note", []),
+            ),
+        ]),
+        CliAutocompleteSpec::new("status", "show evolution status").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+        ]),
+        CliAutocompleteSpec::new("show", "show stored job artifacts").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+            CliAutocompleteOption::flag("--diff", "show candidate diff"),
+            CliAutocompleteOption::flag("--scorecard", "show scorecard"),
+            CliAutocompleteOption::flag("--decision", "show decision"),
+            CliAutocompleteOption::flag("--packet", "show mutation packet"),
+            CliAutocompleteOption::flag("--regression-evidence", "show regression evidence"),
+            CliAutocompleteOption::flag("--lesson", "show evolution lesson"),
+            CliAutocompleteOption::flag("--evidence-summary", "show evidence summary"),
+        ]),
+        CliAutocompleteSpec::new("verify", "rerun verification").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+        ]),
+        CliAutocompleteSpec::new("packet", "show mutation packet").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+        ]),
+        CliAutocompleteSpec::new("cleanup", "clean stored evolution artifacts").with_options([
+            CliAutocompleteOption::with_value(
+                "--job",
+                "evolution job id",
+                CliAutocompleteValue::new("job", "evolution job id", []),
+            ),
+        ]),
+        CliAutocompleteSpec::new("job", "job utilities").with_children([CliAutocompleteSpec::new(
+            "create",
+            "create a dry-run proposal",
+        )
+        .with_values([CliAutocompleteValue::new("objective", "objective text", [])])]),
+        CliAutocompleteSpec::new("schedule", "schedule evolution work").with_options([
+            CliAutocompleteOption::with_value(
+                "--resource",
+                "resource ledger value",
+                CliAutocompleteValue::new("resource", "resource:used/total[:window]", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--estimate",
+                "task estimate",
+                CliAutocompleteValue::new("estimate", "resource:units", []),
+            ),
+            CliAutocompleteOption::flag("--dry-run", "preview scheduling"),
+        ]),
+        CliAutocompleteSpec::new("iterate", "prepare or execute an iteration").with_options([
+            CliAutocompleteOption::with_value(
+                "--campaign",
+                "campaign id",
+                CliAutocompleteValue::new("campaign", "campaign id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--task",
+                "task id",
+                CliAutocompleteValue::new("task", "task id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--repo",
+                "source repository",
+                CliAutocompleteValue::new("path", "repository path", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--provider",
+                "model provider",
+                CliAutocompleteValue::new("provider", "language model provider", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--model",
+                "model id",
+                CliAutocompleteValue::new("model", "model id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--path",
+                "allowed path glob",
+                CliAutocompleteValue::new("glob", "allowed path glob", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--verify",
+                "verification command",
+                CliAutocompleteValue::new("command", "verification command", []),
+            ),
+            CliAutocompleteOption::flag("--dry-run", "preview iteration only"),
+        ]),
+        CliAutocompleteSpec::new("campaign", "manage campaigns").with_children([
+            CliAutocompleteSpec::new("approve", "approve campaign").with_options([
+                CliAutocompleteOption::with_value(
+                    "--campaign",
+                    "campaign id",
+                    CliAutocompleteValue::new("campaign", "campaign id", []),
+                ),
+                CliAutocompleteOption::with_value(
+                    "--note",
+                    "decision note",
+                    CliAutocompleteValue::new("text", "decision note", []),
+                ),
+            ]),
+            CliAutocompleteSpec::new("reject", "reject campaign").with_options([
+                CliAutocompleteOption::with_value(
+                    "--campaign",
+                    "campaign id",
+                    CliAutocompleteValue::new("campaign", "campaign id", []),
+                ),
+                CliAutocompleteOption::with_value(
+                    "--note",
+                    "decision note",
+                    CliAutocompleteValue::new("text", "decision note", []),
+                ),
+            ]),
+        ]),
+        CliAutocompleteSpec::new("trusted-signers", "manage trusted signers").with_children([
+            CliAutocompleteSpec::new("list", "list trusted signers")
+                .with_options([CliAutocompleteOption::flag("--json", "emit JSON")]),
+            CliAutocompleteSpec::new("publish", "publish local signers to cluster"),
+            CliAutocompleteSpec::new("hydrate", "hydrate local signers from cluster"),
+        ]),
+        CliAutocompleteSpec::new("tick", "run background scheduler tick").with_options([
+            CliAutocompleteOption::flag("--dry-run", "preview tick"),
+            CliAutocompleteOption::flag("--dispatch-approved", "dispatch approved work"),
+            CliAutocompleteOption::with_value(
+                "--campaign",
+                "campaign id",
+                CliAutocompleteValue::new("campaign", "campaign id", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--resource",
+                "resource ledger value",
+                CliAutocompleteValue::new("resource", "resource:used/total[:window]", []),
+            ),
+            CliAutocompleteOption::with_value(
+                "--estimate",
+                "task estimate",
+                CliAutocompleteValue::new("estimate", "task:resource:units", []),
+            ),
+        ]),
+    ])
 }
-
-pub(crate) fn parse_schedule_options(args: &[String]) -> Result<ScheduleOptions, CliError> {
-    let mut campaign_id = None;
-    let mut resources = Vec::new();
-    let mut estimates = Vec::new();
-    let mut dry_run = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--resource" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    resources.push(value.clone());
-                }
-            }
-            "--estimate" => {
-                index += 1;
-                if let Some(value) = args.get(index) {
-                    estimates.push(value.clone());
-                }
-            }
-            "--dry-run" | "--preview" => {
-                dry_run = true;
-            }
-            value if value.starts_with("--") => return Err(CliError::Usage),
-            value => {
-                if campaign_id.is_some() {
-                    return Err(CliError::Usage);
-                }
-                campaign_id = Some(value.to_string());
-            }
-        }
-        index += 1;
-    }
-    Ok(ScheduleOptions {
-        campaign_id: campaign_id.ok_or(CliError::Usage)?,
-        resources,
-        estimates,
-        dry_run,
-    })
-}
-
 pub(crate) fn resolve_job_from_args(
     args: &[String],
     waiting_only: bool,
@@ -966,15 +588,21 @@ fn attach_persisted_memory_to_background_plan(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
+pub fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
     run_evolve_cli_command(parse_evolve_command(args)?)
 }
 
 pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
     match command {
         EvolveCliCommand::Help => {
-            print_evolve_help();
+            evolve_cli_help()
+                .write(&mut CliCommandContext::new(
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                ))
+                .map_err(|error| CliError::Parse {
+                    detail: error.to_string(),
+                })?;
             Ok(())
         }
         EvolveCliCommand::Propose(args) => evolve_propose(&args),
@@ -991,7 +619,10 @@ pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), Cl
         EvolveCliCommand::Cleanup(args) => evolve_cleanup(&args),
         EvolveCliCommand::Job(args) => evolve_job(&args),
         EvolveCliCommand::TrustedSigners(command) => evolve_trusted_signers(command),
-        EvolveCliCommand::Models(command) => run_models_command(command),
+        EvolveCliCommand::Models(_) => Err(CliError::Parse {
+            detail: "model configuration is handled by `sinomo models`; use `sinomo models ...`"
+                .to_string(),
+        }),
     }
 }
 
@@ -1003,16 +634,23 @@ struct TrustedSignersListView {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct TrustedSignersSyncReport {
-    pub(crate) source: String,
-    pub(crate) destination: String,
-    pub(crate) count: usize,
+pub struct TrustedSignersSyncReport {
+    pub source: String,
+    pub destination: String,
+    pub count: usize,
 }
 
 fn evolve_trusted_signers(command: TrustedSignersCliCommand) -> Result<(), CliError> {
     match command {
         TrustedSignersCliCommand::Help => {
-            print_evolve_help();
+            evolve_cli_help()
+                .write(&mut CliCommandContext::new(
+                    &mut std::io::stdout(),
+                    &mut std::io::stderr(),
+                ))
+                .map_err(|error| CliError::Parse {
+                    detail: error.to_string(),
+                })?;
             Ok(())
         }
         TrustedSignersCliCommand::List(options) => {
@@ -1061,14 +699,14 @@ fn evolve_trusted_signers(command: TrustedSignersCliCommand) -> Result<(), CliEr
     }
 }
 
-pub(crate) fn registry_trust_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+pub fn registry_trust_uses_cluster(data_dir: &SinomoDataDir) -> bool {
     if cli_force_local_mode() {
         return false;
     }
     network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
 }
 
-pub(crate) fn read_trusted_signers_for_node(
+pub fn read_trusted_signers_for_node(
     data_dir: &SinomoDataDir,
 ) -> Result<(String, Vec<sinomo_runtime::registry::TrustedArtifactSigner>), CliError> {
     if registry_trust_uses_cluster(data_dir) {
@@ -1084,7 +722,7 @@ pub(crate) fn read_trusted_signers_for_node(
     Ok((path.display().to_string(), signers))
 }
 
-pub(crate) fn publish_trusted_signers_to_cluster(
+pub fn publish_trusted_signers_to_cluster(
     data_dir: &SinomoDataDir,
 ) -> Result<TrustedSignersSyncReport, CliError> {
     if !registry_trust_uses_cluster(data_dir) {
@@ -1106,7 +744,7 @@ pub(crate) fn publish_trusted_signers_to_cluster(
     })
 }
 
-pub(crate) fn hydrate_trusted_signers_from_cluster(
+pub fn hydrate_trusted_signers_from_cluster(
     data_dir: &SinomoDataDir,
 ) -> Result<TrustedSignersSyncReport, CliError> {
     if !registry_trust_uses_cluster(data_dir) {
@@ -1216,6 +854,227 @@ fn resolve_requested_evolution_model(
     })?;
     let model = normalize_model_id_for_provider(&provider, &model.unwrap_or(default_model));
     Ok((provider, model))
+}
+
+fn default_main_daemon_status() -> Result<Option<sinomo_runtime::daemon::DaemonStatus>, CliError> {
+    daemon_default_main_daemon_status(DAEMON_PROBE_TIMEOUT).map_err(Into::into)
+}
+
+fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+    if cli_force_local_mode() {
+        return false;
+    }
+    network::read_cluster_state(&ClusterPaths::new(data_dir)).is_ok()
+}
+
+fn load_model_config_for_node(
+    data_dir: &SinomoDataDir,
+) -> Result<(ModelConfig, PathBuf), CliError> {
+    if model_config_uses_cluster(data_dir) {
+        let paths = ClusterPaths::new(data_dir);
+        let snapshot = model_config_cluster_snapshot(&paths)?;
+        let config = model_config_from_cluster_kv_snapshot(&snapshot)?.unwrap_or_default();
+        return Ok((config, paths.kv_snapshot));
+    }
+    let store = model_config_store()?;
+    let config = store.get_typed(data_dir, None, LM_PROVIDER_CONFIG_KEY)?;
+    Ok((config, model_config_definition()?.local_path(data_dir)))
+}
+
+fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
+    let _ = paths;
+    if let Some(status) = default_main_daemon_status()?
+        && let Ok(snapshot) =
+            daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
+    {
+        return Ok(snapshot);
+    }
+    #[cfg(test)]
+    {
+        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+    }
+    #[cfg(not(test))]
+    {
+        Err(CliError::DaemonNotRunning {
+            detail: "clustered model config requires the local daemon".to_string(),
+        })
+    }
+}
+
+fn print_json<T: Serialize>(label: &str, value: &T) -> Result<(), CliError> {
+    let output = serde_json::to_string_pretty(value).map_err(|source| CliError::Json {
+        path: label.to_string(),
+        detail: source.to_string(),
+    })?;
+    println!("{output}");
+    Ok(())
+}
+
+fn println_stage_evaluation(update: &StageEvaluationUpdate, bundle: &CampaignBundlePaths) {
+    println!("campaign: {}", update.stage_scorecard.campaign_id);
+    println!("stage: {}", update.stage_scorecard.stage_id);
+    println!("task: {}", update.stage_scorecard.task_id);
+    println!("outcome: {:?}", update.stage_scorecard.outcome);
+    println!("promotion: {:?}", update.stage_scorecard.promotion);
+    println!("campaign status: {:?}", update.campaign.status);
+    println!("stage scorecard: {}", bundle.stage_scorecard_json.display());
+    println!(
+        "stage scorecards: {}",
+        bundle.stage_scorecards_jsonl.display()
+    );
+    if update.adaptation.is_some() {
+        println!("adaptation: {}", bundle.adaptation_json.display());
+        println!("adaptations: {}", bundle.adaptations_jsonl.display());
+    }
+}
+
+fn println_background_tick(plan: &BackgroundSchedulingPlan, paths: &BackgroundSchedulerPaths) {
+    println!("background tick: {}", plan.tick_id);
+    println!("scheduler service: {}", plan.scheduler_service_id);
+    println!("dry run: {}", plan.dry_run);
+    println!("campaign concurrency cap: {}", plan.concurrency_cap);
+    println!(
+        "workload concurrency cap: {}",
+        plan.workload_concurrency_cap
+    );
+    println!(
+        "cluster resources: {}",
+        plan.cluster_resources_after_tick.len()
+    );
+    println!("campaign updates: {}", plan.campaigns.len());
+    println!(
+        "external workload updates: {}",
+        plan.external_workloads.len()
+    );
+    println!("opportunity intake: {}", plan.opportunity_intake.len());
+    println!(
+        "opportunity events skipped: {}",
+        plan.opportunity_events_skipped.len()
+    );
+    println!("active campaigns: {}", plan.active_campaigns.len());
+    println!("held campaigns: {}", plan.held_campaigns.len());
+    println!("active workloads: {}", plan.active_workloads.len());
+    println!("held workloads: {}", plan.held_workloads.len());
+    println!("human checkpoints: {}", plan.human_checkpoints.len());
+    println!("timer events: {}", plan.timer_events.len());
+    println!("scheduler plan: {}", paths.plan_json.display());
+    println!("scheduler status: {}", paths.status_json.display());
+    println!("scheduler events: {}", paths.events_jsonl.display());
+    if !plan.opportunity_intake.is_empty() {
+        println!(
+            "opportunity intake json: {}",
+            paths.opportunity_intake_json.display()
+        );
+        println!(
+            "opportunity intake log: {}",
+            paths.opportunity_intakes_jsonl.display()
+        );
+    }
+    for update in &plan.campaigns {
+        println!(
+            "campaign {}: {:?} ({})",
+            update.campaign.campaign_id, update.action, update.reason
+        );
+    }
+    for update in &plan.external_workloads {
+        println!(
+            "workload {}:{}: {:?} ({})",
+            update.workload.system, update.workload.workload_id, update.action, update.reason
+        );
+    }
+    for intake in &plan.opportunity_intake {
+        println!(
+            "opportunity {}: {:?} accepted={} dispatch_allowed={} ({})",
+            intake.campaign_id,
+            intake.detection.signal_kind,
+            intake.risk_gate.accepted,
+            intake.risk_gate.dispatch_allowed,
+            intake.risk_gate.reason
+        );
+    }
+}
+
+fn println_report(report: &EvolutionReport) {
+    let verification = report
+        .scorecard
+        .as_ref()
+        .map(|scorecard| outcome_label(&scorecard.outcome))
+        .unwrap_or("not-run");
+    println!("job: {}", report.job.job_id);
+    println!("status: {}", job_status_label(&report.job.status));
+    println!("worktree: {}", report.candidate_workspace.path.display());
+    println!("bundle: {}", report.bundle.bundle_path);
+    if let Some(benchmark_results_path) = &report.bundle.benchmark_results_path {
+        println!("benchmark results: {benchmark_results_path}");
+    }
+    if let Some(resource_usage_path) = &report.bundle.resource_usage_path {
+        println!("resource usage: {resource_usage_path}");
+    }
+    if let Some(sifs_mirror_ref) = report
+        .bundle
+        .artifact_refs
+        .iter()
+        .find(|artifact_ref| artifact_ref.ends_with("/sifs-mirror.json"))
+    {
+        println!("sifs mirror: {sifs_mirror_ref}");
+    }
+    for artifact_ref in report
+        .bundle
+        .artifact_refs
+        .iter()
+        .filter(|artifact_ref| artifact_ref.starts_with("sifs://"))
+        .take(3)
+    {
+        println!("artifact: {artifact_ref}");
+    }
+    println!("verification: {verification}");
+}
+
+fn print_job_status(record: &StoredEvolutionJob) {
+    println!("job: {}", record.job.job_id);
+    println!("status: {}", job_status_label(&record.job.status));
+    println!("objective: {}", record.job.objective);
+    println!("worktree: {}", record.candidate_workspace.path.display());
+    println!("bundle: {}", record.bundle.bundle_path);
+    println!(
+        "verification: {}",
+        record
+            .verification_outcome
+            .as_ref()
+            .map(outcome_label)
+            .unwrap_or("unknown")
+    );
+    if let Some(decision) = &record.decision {
+        println!("decision: {}", decision_outcome_label(&decision.outcome));
+    }
+    println!();
+}
+
+fn job_flag(args: &[String]) -> Result<Option<EvolutionJobId>, CliError> {
+    flag_value(args, "--job")
+        .map(EvolutionJobId::new)
+        .transpose()
+        .map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn outcome_label(outcome: &EvaluationOutcome) -> &'static str {
+    match outcome {
+        EvaluationOutcome::Passed => "passed",
+        EvaluationOutcome::Failed => "failed",
+        EvaluationOutcome::Inconclusive => "inconclusive",
+    }
 }
 
 pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
@@ -1386,7 +1245,7 @@ struct IterationExecutionOverrides {
 fn execute_campaign_iteration_plan(
     data_dir: &SinomoDataDir,
     paths: &EvolutionPaths,
-    config: Option<&sinomo_evolution::EvolutionConfig>,
+    config: Option<&EvolutionConfig>,
     campaign: EvolutionCampaign,
     mut plan: ScheduledIterationPlan,
     overrides: IterationExecutionOverrides,
@@ -1458,9 +1317,9 @@ fn execute_campaign_iteration_plan(
     Ok((report, update, bundle))
 }
 
-pub(crate) fn merge_benchmark_gate_requests(
-    existing: &mut Vec<sinomo_evolution::BenchmarkGateRequest>,
-    additional: Vec<sinomo_evolution::BenchmarkGateRequest>,
+pub fn merge_benchmark_gate_requests(
+    existing: &mut Vec<BenchmarkGateRequest>,
+    additional: Vec<BenchmarkGateRequest>,
 ) {
     let mut seen = existing
         .iter()
@@ -1473,13 +1332,13 @@ pub(crate) fn merge_benchmark_gate_requests(
     }
 }
 
-fn benchmark_gate_request_key(gate: &sinomo_evolution::BenchmarkGateRequest) -> String {
+fn benchmark_gate_request_key(gate: &BenchmarkGateRequest) -> String {
     format!("{}:{}:{:?}", gate.name, gate.expected_exit_code, gate.kind)
 }
 
-pub(crate) fn merge_module_replay_report_refs(
-    existing: &mut Vec<sinomo_evolution::ModuleReplayReportRef>,
-    additional: Vec<sinomo_evolution::ModuleReplayReportRef>,
+pub fn merge_module_replay_report_refs(
+    existing: &mut Vec<ModuleReplayReportRef>,
+    additional: Vec<ModuleReplayReportRef>,
 ) {
     let mut seen = existing
         .iter()
@@ -1492,7 +1351,7 @@ pub(crate) fn merge_module_replay_report_refs(
     }
 }
 
-fn module_replay_report_ref_key(report: &sinomo_evolution::ModuleReplayReportRef) -> String {
+fn module_replay_report_ref_key(report: &ModuleReplayReportRef) -> String {
     report.report_path.clone()
 }
 
@@ -1534,7 +1393,7 @@ pub(crate) fn evolve_campaign(command: CampaignCliCommand) -> Result<(), CliErro
     Ok(())
 }
 
-pub(crate) fn read_background_tick_opportunity_inputs(
+pub fn read_background_tick_opportunity_inputs(
     data_dir: &SinomoDataDir,
     options: &BackgroundTickOptions,
 ) -> Result<
@@ -1748,7 +1607,7 @@ pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
     }
     if options.dispatch_approved {
         for update in &plan.campaigns {
-            if update.action != sinomo_evolution::BackgroundSchedulingAction::DispatchIteration {
+            if update.action != BackgroundSchedulingAction::DispatchIteration {
                 continue;
             }
             let Some(iteration_plan) = &update.scheduled_iteration else {
@@ -1886,8 +1745,7 @@ pub(crate) fn evolve_verify(args: &[String]) -> Result<(), CliError> {
 
 pub(crate) fn evolve_cleanup(args: &[String]) -> Result<(), CliError> {
     let (paths, record) = resolve_job_from_args(args, false)?;
-    let summary = sinomo_evolution::cleanup_stored_evolution_job(&paths, &record)
-        .map_err(sinomo_evolution::EvolutionError::from)?;
+    let summary = cleanup_stored_evolution_job(&paths, &record).map_err(EvolutionError::from)?;
     println!("removed job: {}", summary.job_id);
     println!("removed worktree: {}", summary.worktree_path.display());
     Ok(())

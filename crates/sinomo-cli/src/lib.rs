@@ -42,37 +42,6 @@ use sinomo_agent::{
     InteractionSession, InteractionSurface, InteractionSurfaceKind, interaction_event,
     interaction_model_request, user_interaction_input_event,
 };
-use sinomo_evolution::{
-    BackgroundSchedulerPaths, BackgroundSchedulingPlan, BackgroundSchedulingRequest,
-    CampaignBundlePaths, CampaignCheckpointDecision, CampaignProposalInput,
-    CandidateDecisionOptions, EvolutionAgentMutationModel, EvolutionCampaign,
-    EvolutionFailureClass, EvolutionJobSelectionMode, EvolutionOpportunityDetectionPolicy,
-    EvolutionOrchestrator, EvolutionPaths, EvolutionReport, EvolutionRequestInput,
-    GitWorkspaceAdapter, LocalCandidateBundleStore, ResourceSchedulerDryRun,
-    ResourceSchedulerDryRunRequest, ResourceUsageEstimate, ScheduledIterationPlan,
-    ScheduledIterationRequest, StageEvaluationRequest, StageEvaluationUpdate, StoredEvolutionJob,
-    StoredJobArtifactKind, attach_evolution_memory_to_scheduled_iteration,
-    candidate_resource_usage_estimates_for_report, configured_sifs_artifact_root,
-    decide_campaign_checkpoint, decide_stored_evolution_job,
-    decide_stored_evolution_job_with_options, decision_outcome_label, dry_run_resource_scheduler,
-    ensure_stored_job_awaiting_approval, evaluate_campaign_stage, evolution_report_from_record,
-    job_status_label, list_job_records, mirror_evolution_report_bundle_to_sifs,
-    module_replay_report_scorecard, parse_background_tick_estimates,
-    parse_background_tick_external_workloads, parse_background_tick_resources,
-    parse_benchmark_gate_specs, parse_failure_class, parse_module_replay_report_specs,
-    parse_schedule_estimates, parse_schedule_resources, parse_stage_resource_usage,
-    plan_background_scheduling_tick, prepare_campaign_proposal_request, prepare_evolution_request,
-    prepare_scheduled_iteration, propose_evolution_campaign,
-    read_background_opportunity_intake_event_ids, read_background_tick_campaigns, read_campaign,
-    read_config, read_recent_evolution_lesson_memory, read_recent_proposed_regression_gate_memory,
-    read_stored_job, read_stored_job_artifact, select_stored_job, verify_stored_evolution_job,
-    write_background_scheduling_plan, write_campaign_bundle, write_campaign_iteration_dry_run,
-    write_campaign_iteration_evaluation, write_campaign_schedule_dry_run,
-    write_campaign_stage_evaluation, write_report_record,
-};
-use sinomo_evolution::{CandidateDecisionOutcome, EvolutionJobId};
-#[cfg(test)]
-use sinomo_evolution::{EvolutionJobStatus, is_terminal_status};
 use sinomo_lm::{
     AnthropicProvider, CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CurrentDefaultModel,
     DEFAULT_PROVIDER_ACCOUNT, DeepSeekProvider, GeminiProvider, GitHubCopilotProvider,
@@ -104,8 +73,7 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
     ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
-    ClusterNodeRolloutStatus, EvaluationOutcome, EvaluationScorecard, EventEnvelope,
-    RollbackTrigger, TrustRing,
+    ClusterNodeRolloutStatus, EvaluationScorecard, EventEnvelope, RollbackTrigger,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::read_cluster_kv_snapshot as daemon_read_cluster_kv_snapshot;
@@ -261,12 +229,9 @@ use sinomo_runtime::dfs::{
     open_root_local_metadata_backend, remove_dfs_expose_entry, remove_local_dfs_pin,
     resolve_dfs_metadata_root, resolve_dfs_pin_root, sifs_file_system_id,
 };
-use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
-use sinomo_runtime::events::{EventId, JsonlEventStore, ReplayDirection, ReplayQuery, SessionId};
+use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
-use sinomo_runtime::kv::{
-    InProcessKvStore, KvEntry, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse,
-};
+use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
 use sinomo_runtime::network::ClusterId;
@@ -310,9 +275,9 @@ use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::Arc;
-use std::sync::Mutex;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -343,8 +308,114 @@ thread_local! {
     static CLI_OUTPUT_CAPTURE: RefCell<Option<CliOutputBuffer>> = const { RefCell::new(None) };
 }
 
+static CLI_RUNTIME_CONFIG: OnceLock<CliRuntimeConfig> = OnceLock::new();
+
 #[cfg(unix)]
 static PROCESS_STDIO_CAPTURE_LOCK: Mutex<()> = Mutex::new(());
+
+pub type CliConfigRegistryHook = Box<
+    dyn Fn(
+            sinomo_runtime::config::ConfigRegistryBuilder,
+        ) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String>
+        + Send
+        + Sync,
+>;
+
+pub type CliStorageLayoutHook = Box<
+    dyn Fn(
+            &mut sinomo_runtime::storage::StorageLayout,
+        ) -> Result<(), sinomo_runtime::storage::StorageContractError>
+        + Send
+        + Sync,
+>;
+
+pub struct CliRuntimeConfig {
+    command_registry: CliCommandRegistry,
+    config_registry_hooks: Vec<CliConfigRegistryHook>,
+    storage_layout_hooks: Vec<CliStorageLayoutHook>,
+}
+
+impl CliRuntimeConfig {
+    pub fn with_command_handler(
+        mut self,
+        handler: impl sinomo_runtime::cli_registry::CliCommandHandler + 'static,
+    ) -> Self {
+        self.command_registry = self.command_registry.register(handler);
+        self
+    }
+
+    pub fn with_native_rust_module_binding(
+        mut self,
+        binding: sinomo_runtime::module::NativeRustModuleBinding,
+    ) -> Self {
+        if let Some(register_cli_command) = binding.register_cli_command {
+            self.command_registry = register_cli_command(self.command_registry);
+        }
+        if let Some(register_config_definitions) = binding.register_config_definitions {
+            self.config_registry_hooks
+                .push(Box::new(register_config_definitions));
+        }
+        if let Some(register_storage_paths) = binding.register_storage_paths {
+            self.storage_layout_hooks
+                .push(Box::new(register_storage_paths));
+        }
+        self
+    }
+
+    pub fn with_native_rust_module_bindings(
+        mut self,
+        bindings: &[sinomo_runtime::module::NativeRustModuleBinding],
+    ) -> Self {
+        for binding in bindings {
+            self = self.with_native_rust_module_binding(*binding);
+        }
+        self
+    }
+
+    pub fn with_config_registry_hook(
+        mut self,
+        hook: impl Fn(
+            sinomo_runtime::config::ConfigRegistryBuilder,
+        ) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.config_registry_hooks.push(Box::new(hook));
+        self
+    }
+
+    pub fn with_storage_layout_hook(
+        mut self,
+        hook: impl Fn(
+            &mut sinomo_runtime::storage::StorageLayout,
+        ) -> Result<(), sinomo_runtime::storage::StorageContractError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.storage_layout_hooks.push(Box::new(hook));
+        self
+    }
+}
+
+pub fn default_cli_runtime_config() -> CliRuntimeConfig {
+    CliRuntimeConfig {
+        command_registry: default_cli_command_registry(),
+        config_registry_hooks: Vec::new(),
+        storage_layout_hooks: Vec::new(),
+    }
+}
+
+pub fn install_cli_runtime_config(config: CliRuntimeConfig) -> Result<(), &'static str> {
+    CLI_RUNTIME_CONFIG
+        .set(config)
+        .map_err(|_| "CLI runtime config was already installed")
+}
+
+fn cli_runtime_config() -> &'static CliRuntimeConfig {
+    CLI_RUNTIME_CONFIG.get_or_init(default_cli_runtime_config)
+}
 
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct CliCommandOutput {
@@ -748,7 +819,6 @@ fn join_stdio_capture_reader(
 
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
     match command {
-        CliCommand::Evolve(_) => true,
         CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
         CliCommand::Registered(command) => command.policy().requires_cluster_state,
         _ => false,
@@ -858,7 +928,6 @@ pub(crate) enum CliCommand {
     InstallHelp,
     Install(InstallOptions),
     Uninstall(UninstallOptions),
-    Evolve(EvolveCliCommand),
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
     Dfs(DfsCliCommand),
@@ -870,7 +939,7 @@ pub(crate) enum CliCommand {
     Usage(UsageOptions),
 }
 
-fn cli_command_registry() -> CliCommandRegistry {
+pub fn default_cli_command_registry() -> CliCommandRegistry {
     let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
         .with_toggleable_native_rust_module_name(
             sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
@@ -887,6 +956,10 @@ fn cli_command_registry() -> CliCommandRegistry {
             module_config,
         ))
         .register(sinomo_runtime::observe::observe_cli_command_handler())
+}
+
+fn cli_command_registry() -> &'static CliCommandRegistry {
+    &cli_runtime_config().command_registry
 }
 
 pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, CliError> {
@@ -922,9 +995,6 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         }
         Some((command, rest)) if command == "uninstall" => {
             Ok(CliCommand::Uninstall(parse_uninstall_options(rest)?))
-        }
-        Some((command, rest)) if command == "evolve" => {
-            Ok(CliCommand::Evolve(parse_evolve_command(rest)?))
         }
         Some((command, rest)) if command == "daemon" => {
             Ok(CliCommand::Daemon(parse_daemon_command(rest)?))
@@ -1381,7 +1451,10 @@ pub(crate) fn main_agent_config_store() -> Result<sinomo_runtime::config::Config
     let builder = sinomo_runtime::sandbox::register_config_definitions(builder)?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(CliError::LanguageModel)?;
-    let builder = sinomo_evolution::register_config_definitions(builder).map_err(CliError::from)?;
+    let mut builder = builder;
+    for hook in &cli_runtime_config().config_registry_hooks {
+        builder = hook(builder).map_err(|detail| CliError::Parse { detail })?;
+    }
     Ok(sinomo_runtime::config::ConfigStore::new(builder.build()))
 }
 
@@ -1441,7 +1514,6 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         }
         CliCommand::Install(options) => install(options),
         CliCommand::Uninstall(options) => uninstall(options),
-        CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
@@ -1453,7 +1525,8 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
             let command_name = command.name().to_string();
             let mut stdout = CliStdoutWriter;
             let mut stderr = CliStderrWriter;
-            let mut context = CliCommandContext::new(&mut stdout, &mut stderr);
+            let mut context =
+                CliCommandContext::new(&mut stdout, &mut stderr).with_force_local(force_local);
             command
                 .run(&mut context)
                 .map_err(|error| CliError::ExternalCommand {

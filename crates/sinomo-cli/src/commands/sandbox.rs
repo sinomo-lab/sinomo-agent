@@ -4817,9 +4817,17 @@ fn sandbox_module_artifact_write_rollout_material_if_requested(
     Ok(Some(material_path))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct SandboxModuleCandidateBundleManifest {
+    job_id: sinomo_runtime::core::Id,
+    bundle_path: String,
+    #[serde(default)]
+    bundle_content_hash: Option<String>,
+}
+
 fn read_sandbox_module_candidate_bundle_manifest(
     path: &Path,
-) -> Result<sinomo_evolution::CandidateBundleManifest, CliError> {
+) -> Result<SandboxModuleCandidateBundleManifest, CliError> {
     let manifest_path = if path.is_dir() {
         path.join("manifest.json")
     } else {

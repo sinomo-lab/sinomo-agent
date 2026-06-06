@@ -7451,20 +7451,8 @@ impl CliConversationModel {
     pub fn from_defaults() -> Result<Self, CliError> {
         let data_dir = SinomoDataDir::from_env_or_home()?;
         data_dir.ensure_root_layout()?;
-        let paths = EvolutionPaths::new(&data_dir);
-        paths.ensure()?;
-        let evolution_config = read_config(&paths).ok();
         let (model_config, _) = load_model_config_for_node(&data_dir)?;
-        let evolution_model_config =
-            evolution_config
-                .as_ref()
-                .map(|config| sinomo_lm::ModelConfig {
-                    default_provider: config.default_provider.clone(),
-                    default_account: None,
-                    default_model: config.default_model.clone(),
-                    accounts: Vec::new(),
-                });
-        let resolved = resolve_default_model(Some(&model_config), evolution_model_config.as_ref())?;
+        let resolved = resolve_default_model(Some(&model_config), None)?;
         Ok(Self {
             provider: resolved.provider,
             account: resolved.account,

@@ -18,3 +18,4 @@ dfs-fuse = ["sinomo-cli/dfs-fuse"]
 
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
+sinomo-evolution = { path = "../sinomo-evolution" }
