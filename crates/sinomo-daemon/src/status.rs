@@ -14,7 +14,7 @@ use sinomo_network::ClusterId;
 use sinomo_node::NodeId;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -25,6 +25,7 @@ pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
+pub const SINOMO_DAEMON_ADVERTISE_HOST_ENV: &str = "SINOMO_DAEMON_ADVERTISE_HOST";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DaemonRunOptions {
@@ -176,16 +177,79 @@ pub fn daemon_advertised_endpoints_from_ips(
     route_ips: &[IpAddr],
     allow_public_ip_discovery: bool,
 ) -> Vec<ClusterEndpointRecord> {
-    sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery(
+    let advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV).ok();
+    daemon_advertised_endpoints_from_ips_with_advertise_host(
         node_id,
-        daemon_connect_address(&options.host, options.port),
-        &options.host,
-        options.port,
+        options,
         priority,
         lan_ips,
         route_ips,
         allow_public_ip_discovery,
+        advertise_host.as_deref(),
     )
+}
+
+fn daemon_advertised_endpoints_from_ips_with_advertise_host(
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+    allow_public_ip_discovery: bool,
+    advertise_host: Option<&str>,
+) -> Vec<ClusterEndpointRecord> {
+    let mut endpoints =
+        sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery(
+            node_id,
+            daemon_connect_address(&options.host, options.port),
+            &options.host,
+            options.port,
+            priority,
+            lan_ips,
+            route_ips,
+            allow_public_ip_discovery,
+        );
+    if let Some(address) = daemon_advertise_host_address(advertise_host, options.port)
+        && endpoints.iter().all(|endpoint| endpoint.address != address)
+    {
+        endpoints.push(sinomo_network::daemon_lan_endpoint(
+            node_id,
+            address,
+            priority.saturating_add(5),
+        ));
+    }
+    endpoints
+}
+
+fn daemon_advertise_host_address(host: Option<&str>, port: u16) -> Option<String> {
+    let host = host?.trim();
+    if host.is_empty()
+        || matches!(host, "0.0.0.0" | "::")
+        || host.contains("://")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified())
+    {
+        return None;
+    }
+    let address = if let Ok(socket) = host.parse::<SocketAddr>() {
+        if socket.ip().is_unspecified() {
+            return None;
+        }
+        host.to_string()
+    } else if let Ok(ip) = host.parse::<IpAddr>() {
+        sinomo_network::format_ip_port(ip, port)
+    } else if let Some((name, explicit_port)) = host.rsplit_once(':') {
+        if !name.contains(':') && explicit_port.parse::<u16>().is_ok() {
+            host.to_string()
+        } else {
+            format!("[{host}]:{port}")
+        }
+    } else {
+        format!("{host}:{port}")
+    };
+    if sinomo_network::is_loopback_connect_address(&address) {
+        return None;
+    }
+    Some(address)
 }
 
 pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> DaemonRunOptions {
@@ -657,6 +721,31 @@ mod tests {
                 && endpoint.transport == ClusterTransportKind::LanTcp
                 && endpoint.address == "198.18.0.76:21354"
                 && endpoint.privacy == ClusterEndpointPrivacy::InternetDirect
+        }));
+    }
+
+    #[test]
+    fn advertised_host_adds_stable_hostname_endpoint_for_wildcard_bind() {
+        let node_id = NodeId::from_legacy_named("node_advertise_hostname").expect("node");
+        let endpoints = daemon_advertised_endpoints_from_ips_with_advertise_host(
+            &node_id,
+            &DaemonRunOptions {
+                host: "0.0.0.0".to_string(),
+                port: 21_353,
+            },
+            0,
+            &["172.24.0.4".parse().expect("lan ip")],
+            &[],
+            true,
+            Some("node4"),
+        );
+
+        assert!(endpoints.iter().any(|endpoint| {
+            endpoint.node_id == node_id
+                && endpoint.transport == ClusterTransportKind::LanTcp
+                && endpoint.address == "node4:21353"
+                && endpoint.privacy == ClusterEndpointPrivacy::Lan
+                && endpoint.priority == 5
         }));
     }
 }

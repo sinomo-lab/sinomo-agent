@@ -1,7 +1,8 @@
 use crate::prelude::*;
 use crate::storage::{
-    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, MAX_CLUSTER_KV_ACTIVE_WATCHES,
-    MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
+    CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
+    MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
+    MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
 };
 use crate::*;
 
@@ -15,8 +16,8 @@ use sinomo_core::{
 };
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
-    InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse,
-    KvRevision, KvSnapshot, KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot,
+    DurableRaftKvNode, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp,
+    KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, RaftAppendEntriesRequest, RaftSnapshot,
     cluster_member_key,
 };
 use sinomo_node::NodeId;
@@ -24,6 +25,126 @@ use std::io::Write;
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "iroh-transport")]
+#[test]
+fn iroh_secret_key_creation_is_atomic_under_concurrency() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-iroh-secret-concurrent-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let node_id = NodeId::from_legacy_named("node_iroh_secret_concurrent").expect("node");
+    let key_path = crate::roaming::iroh_endpoint_key_path(&paths, &node_id);
+    crate::storage::reset_write_object_file_create_new_attempts_for_test(&key_path);
+    let threads = 8;
+    let barrier = Arc::new(Barrier::new(threads));
+    let handles = (0..threads)
+        .map(|_| {
+            let paths = paths.clone();
+            let node_id = node_id.clone();
+            let barrier = barrier.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                crate::roaming::load_or_create_iroh_secret_key(&paths, &node_id)
+                    .expect("load or create iroh secret")
+                    .public()
+                    .to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut public_keys = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("iroh secret worker"))
+        .collect::<Vec<_>>();
+    public_keys.sort();
+    public_keys.dedup();
+    assert_eq!(
+        public_keys.len(),
+        1,
+        "concurrent Iroh secret initialization must converge on one persisted endpoint identity"
+    );
+    let persisted_public_key = crate::roaming::load_or_create_iroh_secret_key(&paths, &node_id)
+        .expect("load persisted iroh secret")
+        .public()
+        .to_string();
+    assert_eq!(persisted_public_key, public_keys[0]);
+    assert_eq!(
+        crate::storage::write_object_file_create_new_attempts_for_test(&key_path),
+        1,
+        "concurrent Iroh secret initialization should serialize creation so only one temporary key is written"
+    );
+    let key_lock_path = paths.iroh.join(format!("{}.secret.lock", node_id.as_str()));
+    std::fs::remove_file(&key_lock_path).expect("remove creation lock");
+    let steady_state_public_key = crate::roaming::load_or_create_iroh_secret_key(&paths, &node_id)
+        .expect("load existing iroh secret")
+        .public()
+        .to_string();
+    assert_eq!(steady_state_public_key, public_keys[0]);
+    assert!(
+        !key_lock_path.exists(),
+        "steady-state Iroh secret loads should read the existing key without creating a lock file"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[cfg(feature = "iroh-transport")]
+#[test]
+fn iroh_secret_key_lock_wait_is_bounded() {
+    use fs2::FileExt;
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-iroh-secret-lock-timeout-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let node_id = NodeId::from_legacy_named("node_iroh_secret_lock_timeout").expect("node");
+    std::fs::create_dir_all(&paths.iroh).expect("iroh dir");
+    let key_lock_path = paths.iroh.join(format!("{}.secret.lock", node_id.as_str()));
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = thread::spawn({
+        let key_lock_path = key_lock_path.clone();
+        move || {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&key_lock_path)
+                .expect("open lock");
+            file.lock_exclusive().expect("hold lock");
+            held_tx.send(()).expect("notify lock held");
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    held_rx.recv().expect("wait for lock holder");
+
+    let started = Instant::now();
+    let error =
+        crate::roaming::lock_iroh_secret_key_with_wait(&paths, &node_id, Duration::from_millis(20))
+            .expect_err("busy Iroh secret lock should time out");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "Iroh secret lock timeout should be bounded, elapsed {:?}",
+        started.elapsed()
+    );
+    assert!(
+        matches!(error, NetworkError::StorageIo { ref detail, .. } if detail.contains("timed out waiting for Iroh secret key lock")),
+        "unexpected lock error: {error}"
+    );
+
+    holder.join().expect("join lock holder");
+    std::fs::remove_dir_all(root).ok();
+}
 
 #[test]
 fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
@@ -933,6 +1054,17 @@ fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
 }
 
 #[test]
+fn object_rpc_error_detail_maps_auth_denial() {
+    let response = ObjectRpcResponse::encode_error("/test/auth", "device authorization was denied")
+        .expect("auth error");
+
+    assert!(matches!(
+        response.error_detail(),
+        Err(NetworkError::AuthDenied)
+    ));
+}
+
+#[test]
 fn iroh_daemon_proxy_error_route_hint_falls_back_for_unreadable_payload() {
     assert_eq!(
         crate::roaming::iroh_proxy_route_hint(b"not-a-control-frame"),
@@ -987,6 +1119,98 @@ fn iroh_daemon_response_decode_rejects_trailing_bytes() {
             operation: "read iroh daemon response".to_string(),
             detail: "daemon returned 4 trailing bytes after response frame".to_string(),
         }
+    );
+}
+
+#[test]
+fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
+    let upload_chunk =
+        ObjectRpcRequest::encode_body(ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_RPC_CATEGORY, &())
+            .expect("upload chunk request");
+    assert!(
+        crate::roaming::iroh_daemon_control_request_allows_response_retry(
+            &DaemonControlRequest::rpc(
+                format!("RPC {ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE}"),
+                upload_chunk
+            )
+        )
+    );
+
+    let range =
+        ObjectRpcRequest::encode_body(CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY, &"/")
+            .expect("range request");
+    assert!(
+        crate::roaming::iroh_daemon_control_request_allows_response_retry(
+            &DaemonControlRequest::rpc(format!("RPC {CLUSTER_KV_RANGE_PREFIX_ROUTE}"), range)
+        )
+    );
+
+    for route in [
+        ROLLOUT_BINARY_ROUTE,
+        ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+        ROLLOUT_BUILD_ROUTE,
+        ROLLOUT_FINALIZE_SHADOW_ROUTE,
+    ] {
+        let request =
+            ObjectRpcRequest::encode_body(route, ROLLOUT_RPC_CATEGORY, &()).expect("rpc request");
+        assert!(
+            !crate::roaming::iroh_daemon_control_request_allows_response_retry(
+                &DaemonControlRequest::rpc(format!("RPC {route}"), request)
+            ),
+            "{route} should not be retried after the remote may have accepted the request"
+        );
+    }
+}
+
+#[test]
+fn iroh_daemon_response_retry_classifier_matches_remote_close_only() {
+    assert!(crate::roaming::iroh_daemon_response_error_is_retryable(
+        &NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+        }
+    ));
+    assert!(crate::roaming::iroh_daemon_response_error_is_retryable(
+        &NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "peer closed during object frame body: read 3 of 8 bytes".to_string(),
+        }
+    ));
+    assert!(!crate::roaming::iroh_daemon_response_error_is_retryable(
+        &NetworkError::Io {
+            operation: "read iroh daemon response".to_string(),
+            detail: "timed out after 1000ms".to_string(),
+        }
+    ));
+    assert!(!crate::roaming::iroh_daemon_response_error_is_retryable(
+        &NetworkError::Io {
+            operation: "connect iroh endpoint".to_string(),
+            detail: "peer closed before object frame length (4 bytes expected)".to_string(),
+        }
+    ));
+}
+
+#[test]
+fn iroh_daemon_rpc_retry_delay_is_bounded_by_attempts_and_deadline() {
+    assert_eq!(
+        crate::roaming::iroh_daemon_rpc_retry_delay(1, Duration::from_secs(5)),
+        Some(Duration::from_millis(40))
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_rpc_retry_delay(2, Duration::from_secs(5)),
+        Some(Duration::from_millis(80))
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_rpc_retry_delay(1, Duration::from_millis(10)),
+        Some(Duration::from_millis(9))
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_rpc_retry_delay(3, Duration::from_secs(5)),
+        None
+    );
+    assert_eq!(
+        crate::roaming::iroh_daemon_rpc_retry_delay(1, Duration::from_millis(5)),
+        None
     );
 }
 
@@ -1541,8 +1765,8 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
     );
     assert_eq!(
         cluster_kv_cached_snapshot_reads_for_test(&paths),
-        1,
-        "connectivity no-op check should reuse its cached snapshot view"
+        0,
+        "connectivity no-op checks should use the raft-backed current view without reading the materialized cache"
     );
     let wal_path = cluster_raft_wal_paths(&paths, &node_a).wal;
     let wal_len_before = std::fs::metadata(&wal_path).expect("wal before").len();
@@ -1796,9 +2020,12 @@ fn stable_connectivity_sync_does_not_open_raft_node() {
 }
 
 #[test]
-fn local_connectivity_records_are_in_memory_not_disk() {
+fn local_connectivity_records_persist_across_cache_loss_without_rewrite() {
+    let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
+        .lock()
+        .expect("object mark cache mutex");
     let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-memory-{}",
+        "sinomo-network-connectivity-persist-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -1836,8 +2063,8 @@ fn local_connectivity_records_are_in_memory_not_disk() {
         .expect("write local connectivity");
 
     assert!(
-        !paths.connectivity_local.exists(),
-        "local connectivity observations must not be persisted to disk"
+        paths.connectivity_local.exists(),
+        "local connectivity observations should survive a same-environment restart"
     );
     assert_eq!(
         read_local_cluster_connectivity_records(&paths).expect("read local"),
@@ -1845,7 +2072,176 @@ fn local_connectivity_records_are_in_memory_not_disk() {
     );
     assert_eq!(
         read_cluster_connectivity_graph(&paths).expect("read merged graph"),
+        vec![record.clone()]
+    );
+    let mtime_after_write = std::fs::metadata(&paths.connectivity_local)
+        .expect("local connectivity metadata")
+        .modified()
+        .expect("local connectivity mtime");
+
+    write_local_cluster_connectivity_records(&paths, &node_a, std::slice::from_ref(&record))
+        .expect("stable local connectivity rewrite");
+    assert_eq!(
+        std::fs::metadata(&paths.connectivity_local)
+            .expect("local connectivity metadata after stable write")
+            .modified()
+            .expect("local connectivity mtime after stable write"),
+        mtime_after_write,
+        "stable local connectivity writes should be skipped without touching flash"
+    );
+    let refreshed_record = cluster_connectivity_record(
+        &state,
+        &endpoint_b,
+        ClusterConnectivityState::Healthy,
+        Some(4),
+        0,
+        Some("ok".to_string()),
+        None,
+        now + time::Duration::seconds(5),
+        600,
+    );
+    write_local_cluster_connectivity_records(
+        &paths,
+        &node_a,
+        std::slice::from_ref(&refreshed_record),
+    )
+    .expect("timestamp-only local connectivity rewrite");
+    assert_eq!(
+        std::fs::metadata(&paths.connectivity_local)
+            .expect("local connectivity metadata after timestamp-only write")
+            .modified()
+            .expect("local connectivity mtime after timestamp-only write"),
+        mtime_after_write,
+        "timestamp-only local connectivity refreshes should stay in memory without touching flash"
+    );
+
+    remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(&root);
+    assert!(
+        !local_cluster_connectivity_record_cache_contains_for_test(&paths),
+        "cache removal simulates a daemon restart"
+    );
+    assert_eq!(
+        read_local_cluster_connectivity_records(&paths).expect("read persisted local"),
+        vec![record.clone()],
+        "persisted connectivity should cold-load after cache loss"
+    );
+    assert_eq!(
+        read_cluster_connectivity_graph(&paths).expect("read persisted merged graph"),
         vec![record]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-local-kv-stale-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_conn_local_kv_stale").expect("cluster");
+    let node_a = NodeId::from_legacy_named("node_conn_local_kv_stale_a").expect("node a");
+    let node_b = NodeId::from_legacy_named("node_conn_local_kv_stale_b").expect("node b");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "connectivity local kv stale",
+        node_a.clone(),
+        "node a",
+        "pk-a",
+        now,
+    );
+    let tcp = daemon_lan_endpoint(&node_b, "10.0.0.81:21353".to_string(), 10);
+    let iroh = ClusterEndpointRecord {
+        endpoint_id: stable_iroh_endpoint_id(&node_b, "iroh_public_key_conn_local_kv_stale"),
+        node_id: node_b.clone(),
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key_conn_local_kv_stale?relay=https://relay.example./"
+            .to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    };
+    let mut member_b =
+        ClusterMemberRecord::local_voter(cluster_id, node_b.clone(), "node b", "pk-b", now);
+    member_b.capabilities = main_daemon_capabilities(&member_b.role);
+    member_b.allowed_capabilities = member_b.capabilities.clone();
+    member_b.endpoints = vec![tcp.clone(), iroh.clone()];
+    state.members.push(member_b);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let stale_tcp = cluster_connectivity_record(
+        &state,
+        &tcp,
+        ClusterConnectivityState::Unreachable,
+        None,
+        3,
+        None,
+        Some("old failure".to_string()),
+        now,
+        7200,
+    );
+    let stale_iroh = cluster_connectivity_record(
+        &state,
+        &iroh,
+        ClusterConnectivityState::Healthy,
+        Some(35),
+        0,
+        Some("old success".to_string()),
+        None,
+        now,
+        7200,
+    );
+    sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &node_a,
+        vec![stale_tcp.clone(), stale_iroh.clone()],
+    )
+    .expect("publish old local connectivity");
+
+    remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(&root);
+    let restarted_records =
+        read_local_cluster_connectivity_records(&paths).expect("local connectivity");
+    assert_eq!(
+        restarted_records.len(),
+        2,
+        "cache removal simulates a same-environment daemon restart"
+    );
+    assert!(restarted_records.contains(&stale_tcp));
+    assert!(restarted_records.contains(&stale_iroh));
+    assert!(
+        read_cluster_connectivity_graph(&paths)
+            .expect("merged graph")
+            .iter()
+            .any(|record| record.endpoint_id == stale_tcp.endpoint_id),
+        "the stale self-edge should still exist in the generic KV-backed graph"
+    );
+
+    let graph = ClusterConnectivityGraph::read_for_local(&paths, &state);
+    assert_eq!(
+        graph.state_for_endpoint(&tcp),
+        Some(&ClusterConnectivityState::Unreachable),
+        "same-environment restart should retain the local TCP probe result"
+    );
+    assert_eq!(
+        graph.state_for_endpoint(&iroh),
+        Some(&ClusterConnectivityState::Healthy),
+        "same-environment restart should retain the local fallback probe result"
+    );
+
+    let targets = cluster_raft_command_targets(&paths, &state);
+    assert_eq!(
+        targets.first().map(|endpoint| &endpoint.endpoint_id),
+        Some(&iroh.endpoint_id),
+        "the persisted local route graph should avoid endpoints already known unreachable"
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -4746,8 +5142,258 @@ fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
     let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
     assert!(store.get("/raft-only").is_some());
     assert!(store.get("/stale-cache-only").is_none());
-    let refreshed = read_cluster_kv_snapshot(&paths).expect("read refreshed cache");
-    assert_eq!(refreshed.revision, store.revision());
+    let materialized = read_cluster_kv_snapshot(&paths).expect("read materialized cache");
+    assert_eq!(
+        materialized.revision,
+        stale_store.snapshot().revision,
+        "current reads should not rewrite the materialized cache as a side effect"
+    );
+    assert!(
+        materialized.get("/stale-cache-only").is_some(),
+        "the stale materialized cache remains only a fallback until an explicit flush"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-volatile-deferred-materialized-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_volatile_deferred_materialized").expect("cluster");
+    let local_node =
+        NodeId::from_legacy_named("node_volatile_deferred_materialized_local").expect("local");
+    let remote_node =
+        NodeId::from_legacy_named("node_volatile_deferred_materialized_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "volatile deferred materialized",
+        local_node.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let endpoint = daemon_lan_endpoint(&remote_node, "10.44.0.20:21353".to_string(), 20);
+    let mut remote_member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        remote_node.clone(),
+        "remote",
+        "pk-remote",
+        now,
+    );
+    remote_member.capabilities = main_daemon_capabilities(&remote_member.role);
+    remote_member.allowed_capabilities = remote_member.capabilities.clone();
+    remote_member.endpoints = vec![endpoint.clone()];
+    state.members.push(remote_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync structural state");
+    let materialized_baseline = read_cluster_kv_snapshot(&paths).expect("baseline materialized");
+
+    let info = build_cluster_network_info_record(&state, &local_node, now, 600);
+    let info_snapshot = append_cluster_raft_command(
+        &paths,
+        &local_node,
+        KvCommand::Op(
+            KvOp::put_serde(cluster_network_info_key(&local_node), &info, None)
+                .expect("network info op"),
+        ),
+    )
+    .expect("append network info");
+    assert!(
+        info_snapshot.revision > materialized_baseline.revision,
+        "volatile raft append should advance the current snapshot"
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("materialized after info")
+            .revision,
+        materialized_baseline.revision,
+        "fresh materialized snapshots should not be rewritten for a tiny volatile update"
+    );
+    assert_eq!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("current after info")
+            .revision,
+        info_snapshot.revision,
+        "raft-backed current reads must still observe deferred volatile updates"
+    );
+
+    let connectivity = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(7),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    let connectivity_key = cluster_connectivity_key(
+        &connectivity.source_node_id,
+        &connectivity.target_node_id,
+        &connectivity.endpoint_id,
+    );
+    let connectivity_snapshot = append_cluster_raft_command(
+        &paths,
+        &local_node,
+        KvCommand::Op(
+            KvOp::put_serde(connectivity_key.clone(), &connectivity, None)
+                .expect("connectivity op"),
+        ),
+    )
+    .expect("append connectivity");
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("materialized after connectivity")
+            .revision,
+        materialized_baseline.revision,
+        "multiple volatile updates should coalesce behind the materialized cache"
+    );
+    assert!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("current after connectivity")
+            .get(&connectivity_key)
+            .is_some(),
+        "deferred connectivity should still be visible through the raft view"
+    );
+
+    let mut renamed_local = state.members[0].clone();
+    renamed_local.display_name = "renamed local".to_string();
+    renamed_local.updated_at = now + time::Duration::seconds(1);
+    let structural_snapshot = append_cluster_raft_command(
+        &paths,
+        &local_node,
+        KvCommand::PutClusterMember(renamed_local.clone()),
+    )
+    .expect("append structural member update");
+    assert!(
+        structural_snapshot.revision > connectivity_snapshot.revision,
+        "structural append should advance after volatile updates"
+    );
+    let materialized = read_cluster_kv_snapshot(&paths).expect("materialized after structural");
+    assert_eq!(
+        materialized.revision, structural_snapshot.revision,
+        "structural changes must flush deferred materialized state"
+    );
+    assert!(
+        materialized
+            .get(&cluster_network_info_key(&local_node))
+            .is_some(),
+        "structural flush should include the deferred network-info record"
+    );
+    assert!(
+        materialized.get(&connectivity_key).is_some(),
+        "structural flush should include the deferred connectivity record"
+    );
+    assert_eq!(
+        materialized
+            .get(&cluster_member_key(&local_node))
+            .expect("renamed member")
+            .decode::<ClusterMemberRecord>()
+            .expect("decode member")
+            .display_name,
+        renamed_local.display_name
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structural_import() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-imported-volatile-deferred-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_imported_volatile_deferred").expect("cluster");
+    let local_node =
+        NodeId::from_legacy_named("node_imported_volatile_deferred_local").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "imported volatile deferred",
+        local_node.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync structural state");
+    let materialized_baseline = read_cluster_kv_snapshot(&paths).expect("baseline materialized");
+
+    let mut imported_store = InProcessKvStore::restore(materialized_baseline.clone());
+    let info = build_cluster_network_info_record(&state, &local_node, now, 600);
+    imported_store
+        .put_serde(cluster_network_info_key(&local_node), &info, None)
+        .expect("imported network info");
+    let volatile_snapshot = imported_store.snapshot();
+    assert!(
+        volatile_snapshot.revision > materialized_baseline.revision,
+        "imported volatile snapshot should advance revision"
+    );
+    assert!(
+        !write_imported_cluster_kv_snapshot_if_changed(&paths, &volatile_snapshot)
+            .expect("import volatile snapshot"),
+        "fresh volatile-only imports should not rewrite the materialized snapshot"
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("materialized after volatile import")
+            .revision,
+        materialized_baseline.revision,
+        "volatile-only full snapshot imports should coalesce behind the materialized cache"
+    );
+
+    let mut renamed_local = state.members[0].clone();
+    renamed_local.display_name = "renamed imported local".to_string();
+    renamed_local.updated_at = now + time::Duration::seconds(1);
+    imported_store
+        .put_serde(cluster_member_key(&local_node), &renamed_local, None)
+        .expect("imported member update");
+    let structural_snapshot = imported_store.snapshot();
+    assert!(
+        write_imported_cluster_kv_snapshot_if_changed(&paths, &structural_snapshot)
+            .expect("import structural snapshot"),
+        "structural imports must still rewrite the materialized snapshot"
+    );
+    let materialized = read_cluster_kv_snapshot(&paths).expect("materialized after structural");
+    assert_eq!(
+        materialized.revision, structural_snapshot.revision,
+        "structural imports should flush the imported snapshot"
+    );
+    assert!(
+        materialized
+            .get(&cluster_network_info_key(&local_node))
+            .is_some(),
+        "structural flush should include the previously deferred volatile import"
+    );
+    assert_eq!(
+        materialized
+            .get(&cluster_member_key(&local_node))
+            .expect("renamed member")
+            .decode::<ClusterMemberRecord>()
+            .expect("decode member")
+            .display_name,
+        "renamed imported local"
+    );
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -5928,6 +6574,201 @@ fn cluster_state_sync_txn_diffs_member_endpoint_records() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn merge_cluster_join_registration_preserves_locally_learned_remote_route_endpoints() {
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_merge_preserve_routes").expect("cluster id");
+    let local_node =
+        NodeId::from_legacy_named("node_merge_preserve_routes_bridge").expect("local node");
+    let voter_node =
+        NodeId::from_legacy_named("node_merge_preserve_routes_voter").expect("voter node");
+
+    let mut local = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "merge preserve routes",
+        local_node.clone(),
+        "bridge",
+        "pk-bridge",
+        now,
+    );
+    let learned_voter_endpoint = daemon_lan_endpoint(&voter_node, "node1:21353".to_string(), 0);
+    let mut local_voter = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        voter_node.clone(),
+        "voter",
+        "pk-voter",
+        now,
+    );
+    local_voter.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    local_voter.allowed_capabilities = local_voter.capabilities.clone();
+    local_voter.endpoints = vec![learned_voter_endpoint.clone()];
+    local.members.push(local_voter);
+
+    let mut accepted = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "merge preserve routes",
+        voter_node.clone(),
+        "voter",
+        "pk-voter",
+        now + time::Duration::seconds(1),
+    );
+    accepted.members[0].capabilities =
+        vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    accepted.members[0].allowed_capabilities = accepted.members[0].capabilities.clone();
+    accepted.members[0].endpoints = vec![daemon_lan_endpoint(
+        &voter_node,
+        "10.0.0.10:21353".to_string(),
+        20,
+    )];
+    let mut bridge_member = ClusterMemberRecord::local_non_voting(
+        cluster_id,
+        local_node.clone(),
+        "bridge",
+        "pk-bridge",
+        now,
+    );
+    bridge_member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    bridge_member.allowed_capabilities = bridge_member.capabilities.clone();
+    accepted.members.push(bridge_member);
+
+    merge_cluster_join_registration(&mut local, accepted);
+
+    assert_eq!(local.local_node_id, local_node);
+    let voter = local
+        .members
+        .iter()
+        .find(|member| member.node_id == voter_node)
+        .expect("voter member");
+    assert!(
+        voter.endpoints.iter().any(|endpoint| endpoint.endpoint_id
+            == learned_voter_endpoint.endpoint_id
+            && endpoint.address == "node1:21353"),
+        "accepted voter state imports must preserve local join-channel routes"
+    );
+}
+
+#[test]
+fn cluster_state_sync_txn_deletes_replaced_member_identity_records() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-sync-identity-replace-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_identity_replace").expect("cluster");
+    let old_node = NodeId::from_legacy_named("node_identity_replace_old").expect("old node");
+    let new_node = NodeId::from_legacy_named("node_identity_replace_new").expect("new node");
+    let shared_public_key = "pk-identity-replace";
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "identity replace",
+        new_node.clone(),
+        "new",
+        shared_public_key,
+        now,
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let new_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_identity_replace_new")
+            .expect("endpoint"),
+        node_id: new_node.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.4:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    state.members[0].endpoints = vec![new_endpoint.clone()];
+
+    let mut old_member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        old_node.clone(),
+        "old",
+        shared_public_key,
+        now,
+    );
+    old_member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    old_member.allowed_capabilities = old_member.capabilities.clone();
+    let old_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_identity_replace_old")
+            .expect("endpoint"),
+        node_id: old_node.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "127.0.0.3:21353".to_string(),
+        source: ClusterEndpointSource::Static,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 0,
+        last_observed_latency_ms: None,
+    };
+    old_member.endpoints = vec![old_endpoint.clone()];
+
+    let old_member_key = cluster_member_key(&old_node);
+    let old_policy_key = cluster_capability_policy_key(&old_node);
+    let old_endpoint_key = cluster_endpoint_key(&old_node, &old_endpoint);
+    let new_member_key = cluster_member_key(&new_node);
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(old_member_key.clone(), &old_member, None)
+        .expect("old member");
+    store
+        .put_serde(
+            old_policy_key.clone(),
+            &ClusterCapabilityPolicyRecord::from(&old_member),
+            None,
+        )
+        .expect("old policy");
+    store
+        .put_serde(old_endpoint_key.clone(), &old_endpoint, None)
+        .expect("old endpoint");
+    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("seed duplicate identity");
+
+    let txn = cluster_state_sync_txn(&paths, &state).expect("cluster state sync txn");
+
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &old_member_key)),
+        "old same-key member should be deleted"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &old_policy_key)),
+        "old same-key policy should be deleted"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Delete { key } if key == &old_endpoint_key)),
+        "old same-key endpoint should be deleted"
+    );
+    assert!(
+        txn.success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &new_member_key)),
+        "replacement member should be put"
+    );
+    assert!(
+        txn.success.iter().all(|op| !matches!(
+            op,
+            KvOp::DeletePrefix { prefix } if prefix == &cluster_endpoint_prefix(&old_node)
+        )),
+        "identity replacement should avoid broad endpoint prefix deletes"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn endpoint_limit_fixture(node_id: &NodeId, label: &str, index: usize) -> ClusterEndpointRecord {
     ClusterEndpointRecord {
         endpoint_id: ClusterEndpointId::from_legacy_named(format!("endpoint_{label}_{index:05}"))
@@ -6354,6 +7195,226 @@ fn cluster_member_publish_txn_from_snapshot_skips_stable_member_records() {
             .any(|op| matches!(op, KvOp::Put { key, .. } if key == &policy_key)),
         "changed member capabilities should publish the capability policy"
     );
+}
+
+#[test]
+fn cluster_member_publish_treats_mdns_and_observed_sources_as_stable() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-member-publish-source-stable-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_source_stable").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_source_stable").expect("node");
+    let mut desired = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish source stable",
+        "pk-member-publish-source-stable",
+        now,
+    );
+    desired.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    desired.allowed_capabilities = desired.capabilities.clone();
+    desired.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_source_stable")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "172.23.0.4:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 20,
+        last_observed_latency_ms: None,
+    }];
+    let mut stored = desired.clone();
+    stored.endpoints[0].source = ClusterEndpointSource::Mdns;
+
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(cluster_member_key(&node_id), &stored, None)
+        .expect("member record");
+    store
+        .put_serde(
+            cluster_capability_policy_key(&node_id),
+            &ClusterCapabilityPolicyRecord::from(&stored),
+            None,
+        )
+        .expect("policy record");
+    store
+        .put_serde(
+            cluster_endpoint_key(&node_id, &stored.endpoints[0]),
+            &stored.endpoints[0],
+            None,
+        )
+        .expect("endpoint record");
+    let snapshot = store.snapshot();
+    write_cluster_kv_snapshot(&paths, &snapshot).expect("seed snapshot");
+
+    assert!(
+        cluster_member_publish_matches_kv(&paths, &[desired.clone()]).expect("matches kv"),
+        "member publish should treat mDNS and observed LAN endpoint sources as the same stable route"
+    );
+    let txn = cluster_member_publish_txn_from_snapshot(&snapshot, &[desired])
+        .expect("member publish txn");
+    assert!(
+        txn.success.is_empty(),
+        "source-only member publish should not emit raft writes: {:?}",
+        txn.success
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_member_publish_ignores_stable_endpoint_order() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-member-publish-endpoint-order-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_endpoint_order").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_member_publish_endpoint_order").expect("node");
+    let mut stored = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "member publish endpoint order",
+        "pk-member-publish-endpoint-order",
+        now,
+    );
+    stored.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    stored.allowed_capabilities = stored.capabilities.clone();
+    stored.endpoints = vec![
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_order_lan")
+                .expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::LanTcp,
+            address: "172.23.0.4:21353".to_string(),
+            source: ClusterEndpointSource::Mdns,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 20,
+            last_observed_latency_ms: None,
+        },
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_publish_order_loopback")
+                .expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Loopback,
+            address: "127.0.0.1:21353".to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::LocalOnly,
+            priority: 0,
+            last_observed_latency_ms: None,
+        },
+    ];
+    let mut desired = stored.clone();
+    desired.endpoints.reverse();
+
+    let mut store = InProcessKvStore::new();
+    store
+        .put_serde(cluster_member_key(&node_id), &stored, None)
+        .expect("member record");
+    store
+        .put_serde(
+            cluster_capability_policy_key(&node_id),
+            &ClusterCapabilityPolicyRecord::from(&stored),
+            None,
+        )
+        .expect("policy record");
+    for endpoint in &stored.endpoints {
+        store
+            .put_serde(cluster_endpoint_key(&node_id, endpoint), endpoint, None)
+            .expect("endpoint record");
+    }
+    let snapshot = store.snapshot();
+    write_cluster_kv_snapshot(&paths, &snapshot).expect("seed snapshot");
+
+    assert!(
+        cluster_member_publish_matches_kv(&paths, &[desired.clone()]).expect("matches kv"),
+        "member publish should treat endpoint list order as stable"
+    );
+    let txn = cluster_member_publish_txn_from_snapshot(&snapshot, &[desired])
+        .expect("member publish txn");
+    assert!(
+        txn.success.is_empty(),
+        "endpoint reorder should not emit raft writes: {:?}",
+        txn.success
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_state_sync_treats_mdns_and_observed_sources_as_stable() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-cluster-state-source-stable-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_state_source_stable").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_cluster_state_source_stable").expect("node");
+    let mut stored_state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "cluster state source stable",
+        node_id.clone(),
+        "node",
+        "pk",
+        now,
+    );
+    let member = stored_state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == node_id)
+        .expect("local member");
+    member.capabilities = vec![CapabilityName::new("daemon.main.run").expect("capability")];
+    member.allowed_capabilities = member.capabilities.clone();
+    member.endpoints = vec![ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_state_source_stable")
+            .expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "172.23.0.4:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 20,
+        last_observed_latency_ms: None,
+    }];
+    write_cluster_state(&paths, &stored_state).expect("cluster state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &stored_state).expect("seed raft state");
+
+    let mut desired_state = stored_state;
+    desired_state.members[0].endpoints[0].source = ClusterEndpointSource::Mdns;
+    let txn = cluster_state_sync_txn(&paths, &desired_state).expect("cluster state sync txn");
+    assert!(
+        txn.success.is_empty(),
+        "cluster state sync should skip source-only endpoint changes: {:?}",
+        txn.success
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -8387,6 +9448,304 @@ fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
 }
 
 #[test]
+fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-no-active-watchers-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write empty snapshot");
+    assert!(
+        !paths.kv_watches.exists(),
+        "test setup should not have any watch registrations"
+    );
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/fanout-active/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&event))
+            .expect("fanout without active watchers"),
+        0,
+        "fanout events should not hit disk when no local watch can consume them"
+    );
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        0,
+        "no-active-watch fanout should not probe the materialized snapshot"
+    );
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        0,
+        "no-active-watch fanout should not scan a missing watch directory"
+    );
+    assert!(
+        !paths.kv_watch_events.exists(),
+        "no active watcher should avoid checkpoint writes"
+    );
+    assert!(
+        !paths.kv_watch_events_log.exists(),
+        "no active watcher should avoid log appends"
+    );
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/fanout-active/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create active watch");
+    let unrelated = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/unrelated/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"unrelated".to_vec(),
+        },
+    };
+    reset_cluster_kv_cached_snapshot_reads_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&unrelated))
+            .expect("fanout with no matching active watcher"),
+        0,
+        "fanout events for unrelated prefixes should not be persisted just because some watch exists"
+    );
+    assert_eq!(
+        cluster_kv_cached_snapshot_reads_for_test(&paths),
+        0,
+        "unmatched active-watch fanout should not probe the materialized snapshot"
+    );
+    assert!(
+        !paths.kv_watch_events.exists(),
+        "unmatched active-watch fanout should avoid checkpoint writes"
+    );
+    assert!(
+        !paths.kv_watch_events_log.exists(),
+        "unmatched active-watch fanout should avoid log appends"
+    );
+    let empty = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain after unrelated fanout");
+    assert!(
+        empty.events.is_empty(),
+        "unrelated fanout events must not wake a different prefix watch"
+    );
+    assert_eq!(empty.next_revision, KvRevision(1));
+
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&event))
+            .expect("fanout with active watcher"),
+        1,
+        "active local watchers still require omitted snapshot events to be stored"
+    );
+    assert!(
+        paths.kv_watch_events_log.exists(),
+        "active watcher fanout should append to the watch log"
+    );
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain active watch");
+    assert_eq!(drained.events, vec![event]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-events-active-cache-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write empty snapshot");
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/fanout-cache/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create active watch");
+    let unrelated = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/other/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    let unrelated_two = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/other/two".to_string(),
+        kind: KvEventKind::Put {
+            value: b"two".to_vec(),
+        },
+    };
+
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&unrelated))
+            .expect("first unrelated fanout"),
+        0
+    );
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        1,
+        "first active-watch fanout should scan registrations to build the cache"
+    );
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths,
+            std::slice::from_ref(&unrelated_two)
+        )
+        .expect("second unrelated fanout"),
+        0
+    );
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        1,
+        "repeated fanout should reuse cached active watch registrations"
+    );
+
+    let matching = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/fanout-cache/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(&paths, std::slice::from_ref(&matching))
+            .expect("matching fanout"),
+        1
+    );
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        1,
+        "matching fanout should still use the cached registration list"
+    );
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain matching event");
+    assert_eq!(drained.events, vec![matching]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+
+    let old_matching = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/fanout-cache/old".to_string(),
+        kind: KvEventKind::Put {
+            value: b"old".to_vec(),
+        },
+    };
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths,
+            std::slice::from_ref(&old_matching)
+        )
+        .expect("old matching fanout"),
+        0,
+        "fanout filtering must observe the advanced watch cursor after a drain"
+    );
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        0,
+        "draining a hot watch should refresh the cached registration cursor without rescanning the watch directory"
+    );
+
+    let lag_bound = CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG;
+    let lag_events = (2..=lag_bound)
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/fanout-cache/{revision:04}"),
+            kind: KvEventKind::Put {
+                value: revision.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(&paths, &lag_events)
+            .expect("lag-bound matching fanout"),
+        lag_events.len(),
+        "matching events should be persisted for the active watch"
+    );
+    assert_eq!(
+        cluster_kv_watch_dir_scans_for_test(&paths),
+        0,
+        "hot matching fanout should keep using the cached active registration list"
+    );
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain lag-bound events");
+    assert_eq!(drained.events, lag_events);
+    assert_eq!(drained.next_revision, KvRevision(lag_bound + 1));
+
+    let stale_after_flush = KvEvent {
+        revision: KvRevision(lag_bound),
+        key: "/watch/fanout-cache/stale-after-flush".to_string(),
+        kind: KvEventKind::Put {
+            value: b"stale".to_vec(),
+        },
+    };
+    reset_cluster_kv_watch_dir_scans_for_test(&paths);
+    assert_eq!(
+        append_cluster_kv_watch_events_for_active_watches(
+            &paths,
+            std::slice::from_ref(&stale_after_flush)
+        )
+        .expect("stale fanout after durable cursor flush"),
+        0,
+        "fanout filtering must observe the durable cursor flush"
+    );
+    let durable_flush_scans = cluster_kv_watch_dir_scans_for_test(&paths);
+    assert!(
+        (1..=2).contains(&durable_flush_scans),
+        "durable cursor flush replaces the watch file, so the changed directory mark should force a bounded cache rebuild; got {durable_flush_scans} scans"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-events-large-direct-checkpoint-{}",
@@ -9473,6 +10832,247 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
 }
 
 #[test]
+fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-prefix-notify-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/long-poll-a/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let watch_id = watch.watch_id;
+
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id);
+    let drain_paths = paths.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let unrelated_handle = thread::spawn(move || {
+        let started = Instant::now();
+        let drained = drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id,
+                wait_timeout_millis: 1_000,
+            },
+        )
+        .expect("unrelated long poll");
+        done_tx.send(()).expect("signal unrelated drain done");
+        (started.elapsed(), drained)
+    });
+    let wait_started = Instant::now();
+    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+        && wait_started.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "long poll should enter its first empty drain before the unrelated event is appended"
+    );
+
+    let unrelated = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/long-poll-b/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"unrelated".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&unrelated))
+        .expect("append unrelated watch event");
+    thread::sleep(Duration::from_millis(75));
+    assert!(
+        matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "unrelated prefix event should not wake the waiting watch"
+    );
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "unrelated prefix event should not trigger another empty drain"
+    );
+    assert_eq!(
+        cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id),
+        0,
+        "unrelated prefix event should not wake the waiting watch"
+    );
+
+    let (elapsed, drained) = unrelated_handle.join().expect("unrelated drain thread");
+    assert!(
+        elapsed >= Duration::from_millis(750),
+        "unrelated prefix wait should end by timeout, not an immediate wake after {elapsed:?}"
+    );
+    assert!(drained.events.is_empty());
+    assert_eq!(drained.next_revision, KvRevision(1));
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "unrelated prefix timeout should not reread snapshot/log state"
+    );
+
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    let drain_paths = paths.clone();
+    let matching_handle = thread::spawn(move || {
+        let started = Instant::now();
+        let drained = drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id,
+                wait_timeout_millis: 5_000,
+            },
+        )
+        .expect("matching long poll");
+        (started.elapsed(), drained)
+    });
+    let wait_started = Instant::now();
+    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+        && wait_started.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "matching long poll should enter its first empty drain"
+    );
+
+    let matching = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/long-poll-a/two".to_string(),
+        kind: KvEventKind::Put {
+            value: b"matching".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&matching))
+        .expect("append matching watch event");
+    let (elapsed, drained) = matching_handle.join().expect("matching drain thread");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "matching prefix event should wake the waiting watch before timeout after {elapsed:?}"
+    );
+    assert_eq!(drained.events, vec![matching]);
+    assert_eq!(drained.next_revision, KvRevision(3));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-targeted-notify-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch_a = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/targeted-a/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch a");
+    let _watch_b = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/targeted-b/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch b");
+    let watch_a_id = watch_a.watch_id;
+
+    reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
+    reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id);
+    let drain_paths = paths.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let started = Instant::now();
+        let drained = drain_cluster_kv_watch(
+            &drain_paths,
+            ClusterKvWatchDrainRequest {
+                watch_id: watch_a_id,
+                wait_timeout_millis: 5_000,
+            },
+        )
+        .expect("watch a long poll");
+        done_tx.send(()).expect("signal watch a drain done");
+        (started.elapsed(), drained)
+    });
+    let wait_started = Instant::now();
+    while cluster_kv_watch_drain_once_calls_for_test(&paths) == 0
+        && wait_started.elapsed() < Duration::from_secs(1)
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "watch a long poll should complete its first empty drain before unrelated fanout"
+    );
+
+    let watch_b_event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/targeted-b/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"watch-b".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&watch_b_event))
+        .expect("append watch b event");
+    thread::sleep(Duration::from_millis(75));
+    assert!(
+        matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "an event matching another active watch should not complete watch a's long poll"
+    );
+    assert_eq!(
+        cluster_kv_watch_drain_once_calls_for_test(&paths),
+        1,
+        "an event matching another active watch should not make watch a re-drain"
+    );
+    assert_eq!(
+        cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id),
+        0,
+        "an event matching another active watch should not wake watch a's waiter"
+    );
+
+    let watch_a_event = KvEvent {
+        revision: KvRevision(2),
+        key: "/watch/targeted-a/two".to_string(),
+        kind: KvEventKind::Put {
+            value: b"watch-a".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&watch_a_event))
+        .expect("append watch a event");
+    let (elapsed, drained) = handle.join().expect("watch a drain thread");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "matching watch a event should wake the long poll before timeout after {elapsed:?}"
+    );
+    assert_eq!(drained.events, vec![watch_a_event]);
+    assert_eq!(drained.next_revision, KvRevision(3));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
         .lock()
@@ -9530,6 +11130,41 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
         elapsed < Duration::from_secs(2),
         "active waiter should be notified instead of falling back to timeout after {elapsed:?}"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
+    let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
+        .lock()
+        .expect("notifier mutex");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-notifier-active-capacity-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
+    let active_keys = (0..cluster_kv_watch_notifier_capacity_for_test())
+        .map(|index| root.join(format!("active-{index:04}")))
+        .collect::<Vec<_>>();
+    for key in &active_keys {
+        record_cluster_kv_watch_notifier_waiter_key_for_test(key.clone());
+    }
+
+    let extra_data_dir = SinomoDataDir::new(root.join("extra"));
+    let extra_paths = ClusterPaths::new(&extra_data_dir);
+    touch_cluster_kv_watch_notifier_for_test(&extra_paths);
+
+    for key in &active_keys {
+        assert!(
+            cluster_kv_watch_notifier_has_raw_key_for_test(key),
+            "active notifier waiter {} must not be evicted to enforce the soft cache cap",
+            key.display()
+        );
+    }
+    remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -9753,6 +11388,89 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
         cluster_kv_watch_drain_once_calls_for_test(&paths),
         1,
         "empty long-poll timeout should not reread snapshot/log state when no watch generation changed"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-zero-timeout-empty-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/empty-zero-timeout/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+
+    reset_cluster_kv_current_snapshot_reads_for_test(&paths);
+    let first = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("first empty drain");
+    assert!(first.events.is_empty());
+    assert_eq!(first.next_revision, KvRevision(1));
+    assert_eq!(
+        cluster_kv_current_snapshot_reads_for_test(&paths),
+        1,
+        "the first empty drain must inspect the current snapshot"
+    );
+
+    let second = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("cached empty drain");
+    assert!(second.events.is_empty());
+    assert_eq!(second.next_revision, KvRevision(1));
+    assert_eq!(
+        cluster_kv_current_snapshot_reads_for_test(&paths),
+        1,
+        "repeated empty zero-timeout drains should not reread current snapshot state"
+    );
+
+    let event = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/empty-zero-timeout/one".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&event))
+        .expect("append watch event");
+    let changed = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("changed drain");
+    assert_eq!(changed.events, vec![event]);
+    assert_eq!(changed.next_revision, KvRevision(2));
+    assert_eq!(
+        cluster_kv_current_snapshot_reads_for_test(&paths),
+        2,
+        "watch event generation changes must invalidate the cached empty result"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -10389,6 +12107,105 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
 }
 
 #[test]
+fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-watch-deferred-cursor-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+        .expect("write initial snapshot");
+
+    let watch = create_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchPrefixRequest {
+            prefix: "/watch/deferred-cursor/".to_string(),
+            start_revision: KvRevision(1),
+        },
+    )
+    .expect("create watch");
+    let watch_path = paths
+        .kv_watches
+        .join(format!("watch-{}.sobj", watch.watch_id.0));
+    assert_eq!(
+        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+            .expect("read durable watch")
+            .next_revision,
+        KvRevision(1)
+    );
+
+    let first = KvEvent {
+        revision: KvRevision(1),
+        key: "/watch/deferred-cursor/0001".to_string(),
+        kind: KvEventKind::Put {
+            value: b"one".to_vec(),
+        },
+    };
+    append_cluster_kv_watch_events(&paths, std::slice::from_ref(&first))
+        .expect("append first watch event");
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain first event");
+    assert_eq!(drained.events, vec![first]);
+    assert_eq!(drained.next_revision, KvRevision(2));
+    assert_eq!(
+        cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id)
+            .expect("cached registration")
+            .next_revision,
+        KvRevision(2),
+        "drains must advance the hot in-process cursor immediately"
+    );
+    assert_eq!(
+        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+            .expect("read durable watch after deferred drain")
+            .next_revision,
+        KvRevision(1),
+        "small realtime drains should not fsync the watch cursor on every batch"
+    );
+
+    let lag_bound = CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG;
+    let events = (2..=lag_bound)
+        .map(|revision| KvEvent {
+            revision: KvRevision(revision),
+            key: format!("/watch/deferred-cursor/{revision:04}"),
+            kind: KvEventKind::Put {
+                value: revision.to_string().into_bytes(),
+            },
+        })
+        .collect::<Vec<_>>();
+    append_cluster_kv_watch_events(&paths, &events).expect("append lag-bound events");
+    let drained = drain_cluster_kv_watch(
+        &paths,
+        ClusterKvWatchDrainRequest {
+            watch_id: watch.watch_id,
+            wait_timeout_millis: 0,
+        },
+    )
+    .expect("drain lag-bound events");
+    assert_eq!(drained.events, events);
+    assert_eq!(drained.next_revision, KvRevision(lag_bound + 1));
+    assert_eq!(
+        read_object_file::<ClusterKvWatchRegistration>(&watch_path)
+            .expect("read durable watch after lag-bound drain")
+            .next_revision,
+        KvRevision(lag_bound + 1),
+        "the durable cursor must flush before replay lag can exceed the retained watch-event window"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn create_cluster_kv_watch_enforces_active_registration_limit() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-watch-active-limit-{}",
@@ -10934,6 +12751,81 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
     std::fs::remove_dir_all(root).ok();
 }
 
+struct ClusterRaftSnapshotByteLimitGuard {
+    previous: u64,
+}
+
+impl ClusterRaftSnapshotByteLimitGuard {
+    fn install(limit: u64) -> Self {
+        Self {
+            previous: crate::storage::set_cluster_kv_raft_snapshot_byte_limit_for_test(limit),
+        }
+    }
+}
+
+impl Drop for ClusterRaftSnapshotByteLimitGuard {
+    fn drop(&mut self) {
+        crate::storage::set_cluster_kv_raft_snapshot_byte_limit_for_test(self.previous);
+    }
+}
+
+#[test]
+fn cluster_raft_oversized_snapshot_with_compacted_events_is_idle_on_open() {
+    let _limit_guard = ClusterRaftSnapshotByteLimitGuard::install(1);
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-raft-oversized-snapshot-idle-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let node_id = NodeId::from_legacy_named("node_oversized_snapshot_idle").expect("node");
+    let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
+
+    {
+        let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone()).expect("open");
+        let entry = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/oversized/snapshot/value".to_string(),
+                    value: b"value".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append");
+        node.commit_to(entry.index).expect("commit");
+        node.compact_event_history_to(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
+        node.save_snapshot().expect("snapshot");
+        assert!(
+            node.store().event_history_len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            "fixture should have no compactable event-history tail"
+        );
+    }
+
+    let before = std::fs::metadata(&wal_paths.snapshot).expect("snapshot before");
+    assert!(
+        before.len() > 1,
+        "test threshold should make this ordinary snapshot look oversized"
+    );
+    thread::sleep(Duration::from_millis(20));
+    let reopened = open_cluster_raft_kv_node(&paths, &node_id).expect("open compacted snapshot");
+    assert_eq!(reopened.snapshot_index(), 1);
+    drop(reopened);
+    let after = std::fs::metadata(&wal_paths.snapshot).expect("snapshot after");
+
+    assert_eq!(before.len(), after.len());
+    assert_eq!(
+        before.modified().ok(),
+        after.modified().ok(),
+        "oversized snapshots without compactable event history should not be re-saved on idle open"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 fn node(id: &str) -> NodeProfile {
     let mut profile = NodeProfile::local(id).expect("profile");
     profile.node_id = NodeId::from_legacy_named(id).expect("node id");
@@ -11034,6 +12926,15 @@ fn peer_registry_tracks_cluster_members_and_endpoint_candidates() {
 
     registry.upsert_cluster_member(member.clone());
     assert_eq!(registry.endpoint_candidates(&node_id).len(), 2);
+
+    let failed_lan = registry.endpoint_candidates(&node_id)[0]
+        .clone()
+        .failed("stale LAN route");
+    registry.replace_endpoint_candidates(node_id.clone(), vec![failed_lan]);
+    assert!(
+        registry.best_endpoint_candidate(&node_id).is_none(),
+        "known-failed endpoint candidates should not be selected for reconnect attempts"
+    );
 }
 
 #[test]
@@ -11439,6 +13340,37 @@ fn lan_connection_planner_prefers_lan_quic_over_relays() {
 }
 
 #[test]
+fn lan_connection_planner_skips_failed_direct_candidates() {
+    let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
+    let failed_lan = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_failed_lan").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanQuic,
+        address: "192.168.1.20:21355".to_string(),
+        source: ClusterEndpointSource::Mdns,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 1,
+        last_observed_latency_ms: None,
+    })
+    .failed("stale LAN address after roaming");
+    let relay = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_relay_only").expect("endpoint"),
+        node_id,
+        transport: ClusterTransportKind::TurnRelay,
+        address: "turn://relay".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 10,
+        last_observed_latency_ms: None,
+    });
+
+    assert!(
+        LanConnectionPlanner::select_direct_candidate(&[failed_lan, relay]).is_none(),
+        "failed LAN candidates should not keep a roaming device on a stale direct path"
+    );
+}
+
+#[test]
 fn webrtc_kv_exchange_round_trips_offer_answer_and_ice_candidates() {
     let cluster_id = ClusterId::from_legacy_named("cluster_home").expect("cluster");
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
@@ -11642,6 +13574,44 @@ fn upsert_member_endpoint_replaces_iroh_record_for_same_public_key() {
 }
 
 #[test]
+fn upsert_member_endpoint_ignores_stable_source_refresh() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_endpoint_refresh").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_endpoint_refresh").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id,
+        node_id.clone(),
+        "bridge",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    let endpoint_id =
+        ClusterEndpointId::from_legacy_named("endpoint_source_refresh").expect("endpoint");
+    member.endpoints.push(ClusterEndpointRecord {
+        endpoint_id: endpoint_id.clone(),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanTcp,
+        address: "172.24.0.4:21353".to_string(),
+        source: ClusterEndpointSource::Mdns,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    });
+    let refreshed = ClusterEndpointRecord {
+        endpoint_id,
+        node_id,
+        transport: ClusterTransportKind::LanTcp,
+        address: "172.24.0.4:21353".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+
+    assert!(!upsert_member_endpoint(&mut member, refreshed));
+    assert_eq!(member.endpoints[0].source, ClusterEndpointSource::Mdns);
+}
+
+#[test]
 fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-iroh-kv-cleanup-{}",
@@ -11724,6 +13694,57 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
 }
 
 #[test]
+fn cleanup_member_iroh_endpoints_preserves_equal_rank_stable_record() {
+    let cluster_id = ClusterId::from_legacy_named("cluster_iroh_equal_rank").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_iroh_equal_rank").expect("node");
+    let mut member = ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        node_id.clone(),
+        "iroh equal rank",
+        "public-key",
+        OffsetDateTime::now_utc(),
+    );
+    let first = IrohEndpointRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        endpoint_public_key: "same_public_key".to_string(),
+        direct_addresses: Vec::new(),
+        relay_url: Some("https://relay-a.example/".to_string()),
+        relay_mode: IrohRelayMode::Custom {
+            relay_url: "https://relay-a.example/".to_string(),
+        },
+        expires_after_tick: 50,
+    }
+    .endpoint();
+    let mut second = IrohEndpointRecord {
+        cluster_id,
+        node_id,
+        endpoint_public_key: "same_public_key".to_string(),
+        direct_addresses: Vec::new(),
+        relay_url: Some("https://relay-b.example/".to_string()),
+        relay_mode: IrohRelayMode::Custom {
+            relay_url: "https://relay-b.example/".to_string(),
+        },
+        expires_after_tick: 51,
+    }
+    .endpoint();
+    second.priority = first.priority.saturating_add(1);
+
+    member.endpoints.push(first.clone());
+    member.endpoints.push(second);
+
+    assert!(cleanup_member_iroh_endpoints(&mut member));
+    let iroh: Vec<_> = member
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.transport == ClusterTransportKind::Iroh)
+        .collect();
+    assert_eq!(iroh.len(), 1);
+    assert_eq!(iroh[0].address, first.address);
+    assert_eq!(iroh[0].priority, first.priority);
+}
+
+#[test]
 fn roaming_connection_planner_uses_webrtc_then_turn_fallback_when_lan_missing() {
     let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
     let webrtc = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
@@ -11803,6 +13824,42 @@ fn roaming_connection_planner_prefers_iroh_before_webrtc_and_relay() {
 
     let selected =
         RoamingConnectionPlanner::select_path(&[relay, webrtc, iroh]).expect("roaming path");
+
+    assert!(matches!(
+        selected,
+        RoamingPathSelection::Iroh(PeerEndpointCandidate { endpoint, .. })
+            if endpoint.transport == ClusterTransportKind::Iroh
+    ));
+}
+
+#[test]
+fn roaming_connection_planner_falls_back_after_failed_lan_candidate() {
+    let node_id = NodeId::from_legacy_named("node_mobile").expect("node");
+    let failed_lan = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_roamed_lan").expect("endpoint"),
+        node_id: node_id.clone(),
+        transport: ClusterTransportKind::LanQuic,
+        address: "192.168.1.20:21355".to_string(),
+        source: ClusterEndpointSource::Mdns,
+        privacy: ClusterEndpointPrivacy::Lan,
+        priority: 1,
+        last_observed_latency_ms: None,
+    })
+    .failed("old LAN address timed out");
+    let iroh = PeerEndpointCandidate::discovered(ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_roamed_iroh")
+            .expect("endpoint"),
+        node_id,
+        transport: ClusterTransportKind::Iroh,
+        address: "iroh://iroh_public_key?relay=https://relay.example".to_string(),
+        source: ClusterEndpointSource::Rendezvous,
+        privacy: ClusterEndpointPrivacy::Relayed,
+        priority: 90,
+        last_observed_latency_ms: None,
+    });
+
+    let selected =
+        RoamingConnectionPlanner::select_path(&[failed_lan, iroh]).expect("roaming path");
 
     assert!(matches!(
         selected,
@@ -11967,6 +14024,119 @@ fn in_process_transport_delivers_typed_frames() {
     assert_eq!(inbound.len(), 1);
     assert_eq!(inbound[0].received_by, node_b);
     assert_eq!(inbound[0].frame, frame);
+}
+
+#[test]
+fn in_process_transport_wait_for_incoming_wakes_on_send() {
+    let node_a = NodeId::from_legacy_named("node_wait_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_wait_receiver").expect("node");
+    let network = InProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let waiter_transport = transport_b.clone();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        ready_tx.send(()).expect("signal waiter ready");
+        let started = Instant::now();
+        let woke = waiter_transport
+            .wait_for_incoming(Duration::from_secs(5))
+            .expect("wait for inbound frame");
+        (started.elapsed(), woke)
+    });
+    ready_rx.recv().expect("waiter ready");
+    thread::sleep(Duration::from_millis(50));
+
+    transport_a
+        .send(
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_a,
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_b.clone(),
+                        tick: 1,
+                    }),
+                },
+            },
+        )
+        .expect("send frame");
+
+    let (elapsed, woke) = waiter.join().expect("waiter thread");
+    assert!(woke, "waiter should report queued inbound work");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "waiter should wake on send instead of sleeping until timeout after {elapsed:?}"
+    );
+    assert_eq!(
+        transport_b
+            .drain_incoming()
+            .expect("drain after wake")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn default_transport_wait_for_incoming_uses_pending_count_hint() {
+    #[derive(Clone)]
+    struct CountedPendingTransport {
+        local_node_id: NodeId,
+        pending: Arc<Mutex<usize>>,
+    }
+
+    impl NetworkTransport for CountedPendingTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send(
+            &mut self,
+            target_node_id: &NodeId,
+            _frame: NetworkFrame,
+        ) -> Result<(), NetworkError> {
+            Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })
+        }
+
+        fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+            Ok(Vec::new())
+        }
+
+        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+            Ok(Some(*self.pending.lock().expect("pending count")))
+        }
+    }
+
+    let transport = CountedPendingTransport {
+        local_node_id: NodeId::from_legacy_named("node_default_wait_hint").expect("node"),
+        pending: Arc::new(Mutex::new(1)),
+    };
+
+    let started = Instant::now();
+    assert!(
+        transport
+            .wait_for_incoming(Duration::from_secs(5))
+            .expect("wait with pending hint"),
+        "a transport with queued inbound frames should not report an idle wait"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "pending-count-aware default waits should not sleep before reporting queued work"
+    );
+
+    *transport.pending.lock().expect("pending count") = 0;
+    assert!(
+        !transport
+            .wait_for_incoming(Duration::ZERO)
+            .expect("zero wait without pending hint"),
+        "zero-timeout default waits should remain idle when no frames are queued"
+    );
 }
 
 #[test]
@@ -13085,11 +15255,27 @@ async fn network_service_process_incoming_batches_large_mailboxes() {
 
     assert_eq!(
         service
+            .pending_incoming_count()
+            .await
+            .expect("pending count"),
+        Some(frame_count),
+        "in-process transports should let schedulers avoid empty inbound polling"
+    );
+    assert_eq!(
+        service
             .process_incoming()
             .await
             .expect("first inbound batch")
             .len(),
         crate::peer::NETWORK_SERVICE_INBOUND_BATCH_LIMIT
+    );
+    assert_eq!(
+        service
+            .pending_incoming_count()
+            .await
+            .expect("pending count"),
+        Some(1),
+        "pending count should reflect the residual mailbox after a bounded batch"
     );
     assert_eq!(
         service
@@ -13101,11 +15287,84 @@ async fn network_service_process_incoming_batches_large_mailboxes() {
     );
     assert_eq!(
         service
+            .pending_incoming_count()
+            .await
+            .expect("pending count"),
+        Some(0),
+        "empty in-process mailboxes should be observable without draining"
+    );
+    assert_eq!(
+        service
             .process_incoming()
             .await
             .expect("empty inbound batch")
             .len(),
         0
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn network_service_process_incoming_skips_drain_when_transport_reports_empty() {
+    #[derive(Clone)]
+    struct CountingEmptyTransport {
+        local_node_id: NodeId,
+        drain_calls: Arc<Mutex<usize>>,
+    }
+
+    impl NetworkTransport for CountingEmptyTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send(
+            &mut self,
+            target_node_id: &NodeId,
+            _frame: NetworkFrame,
+        ) -> Result<(), NetworkError> {
+            Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })
+        }
+
+        fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+            *self.drain_calls.lock().expect("drain calls") += 1;
+            Ok(Vec::new())
+        }
+
+        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+            Ok(Some(0))
+        }
+    }
+
+    let node_id = NodeId::from_legacy_named("node_empty_inbound_hint").expect("node");
+    let drain_calls = Arc::new(Mutex::new(0));
+    let transport = CountingEmptyTransport {
+        local_node_id: node_id.clone(),
+        drain_calls: drain_calls.clone(),
+    };
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_empty_inbound_hint"));
+    let service = NetworkService::new(registry, transport).spawn(InMemoryEventStore::new());
+
+    assert_eq!(
+        service
+            .pending_incoming_count()
+            .await
+            .expect("pending count"),
+        Some(0)
+    );
+    assert!(
+        service
+            .process_incoming()
+            .await
+            .expect("empty inbound")
+            .is_empty()
+    );
+    assert_eq!(
+        *drain_calls.lock().expect("drain calls"),
+        0,
+        "empty pending hints should avoid unnecessary transport drain work"
     );
     service.shutdown().await;
 }
@@ -15732,6 +17991,60 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
         "a directory at an optional object path is a storage error, not absence"
     );
 
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
+    #[derive(Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct CreateNewFixture {
+        value: u64,
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-create-new-link-fallback-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let path = root.join("object.sobj");
+
+    crate::storage::force_write_object_file_create_new_unsupported_link_for_test(&path);
+    assert!(
+        crate::storage::write_object_file_create_new_serialized(
+            &path,
+            &CreateNewFixture { value: 42 },
+        )
+        .expect("fallback create-new write"),
+        "missing target should be created when hard links are unsupported"
+    );
+    assert_eq!(
+        crate::storage::read_object_file::<CreateNewFixture>(&path).expect("read created object"),
+        CreateNewFixture { value: 42 }
+    );
+    assert!(
+        !crate::storage::write_object_file_create_new_serialized(
+            &path,
+            &CreateNewFixture { value: 7 },
+        )
+        .expect("fallback existing target"),
+        "existing target should not be replaced in the hard-link fallback"
+    );
+    assert_eq!(
+        crate::storage::read_object_file::<CreateNewFixture>(&path).expect("read original object"),
+        CreateNewFixture { value: 42 }
+    );
+    assert!(
+        std::fs::read_dir(&root)
+            .expect("root entries")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .all(|name| !name.contains(".create-new-tmp-")),
+        "create-new fallback should not leave staged temp files behind"
+    );
+    crate::storage::clear_write_object_file_create_new_unsupported_link_for_test(&path);
     let _ = std::fs::remove_dir_all(&root);
 }
 

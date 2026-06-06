@@ -106,6 +106,56 @@ docker compose ps                  # container state (all Up)
 docker compose down -v             # tear down + wipe volumes
 ```
 
+## Validation gates
+
+The hardening harnesses are designed to fail with useful evidence instead of only printing
+diagnostics:
+
+```bash
+# Full production gate: build/start the 6-node cluster, wait for clean formation,
+# wait for daemon block writes to quiesce, enforce idle budgets, exercise bridge
+# loss/recovery, then re-check final health.
+docker/measure-final.sh 60 90
+
+# Short soak: reuse running containers and repeat the full idle/mobile/bridge cycle.
+SINOMO_GATE_REBUILD=0 SINOMO_GATE_CYCLES=3 docker/measure-final.sh 60 90
+
+# Enforces 0 daemon block-write bytes, <10 KB/s daemon block reads, and <10 KB/s
+# network traffic per container during the idle window. Thresholds can be adjusted
+# with SINOMO_IDLE_MAX_*_BPS and SINOMO_IDLE_MAX_WRITE_BLOCK_BYTES when intentionally
+# testing a noisier environment.
+docker/measure-idle.sh 60
+
+# Changes node5 to `mobile` and node6 to `sensor`, waits for the roles to publish,
+# waits for role-transition block writes to quiesce, enforces the same idle budget,
+# then restores their original roles. Override the assignment with
+# SINOMO_MOBILE_IDLE_ROLES="node5=mobile node6=sensor".
+docker/test-mobile-idle.sh 60
+
+# Disconnects node4 from the node3<->node4 bridge network, verifies the outage is
+# observed, reconnects the bridge, and waits for health/doctor to return clean.
+docker/test-bridge-recovery.sh 90
+```
+
+Rebuild runs reset compose volumes by default so the gate starts from a
+deterministic cluster formation. Set `SINOMO_GATE_REBUILD=0` to reuse
+already-running containers while iterating on the gate scripts themselves, or
+`SINOMO_GATE_RESET_VOLUMES=0` to rebuild the image while intentionally preserving
+existing `/data` volumes. Set `SINOMO_GATE_CYCLES` above `1` for repeated soak
+runs. Set `SINOMO_GATE_SKIP_MOBILE=1` for a shorter bridge/idle run while debugging
+unrelated failures. `docker/measure-final.sh` uses `SINOMO_GATE_QUIESCE_WAIT`
+(default `10`) as the hard stabilization deadline after the preceding operation
+reports ready, then requires zero daemon block writes for
+`SINOMO_GATE_QUIESCE_WINDOW` (default `75`) before each idle measurement. The
+Docker cluster is expected to have the connectivity graph stored and stabilized
+within 10 seconds; any daemon block write after that deadline is treated as a
+bug. Quiescence failures include per-node write deltas for the sampled window.
+`docker/test-mobile-idle.sh` uses `SINOMO_MOBILE_IDLE_QUIESCE_WAIT` (default
+`10`) and `SINOMO_MOBILE_IDLE_QUIESCE_WINDOW` (default `75`) to apply the same
+hard stabilization requirement after role changes. When launched by
+`docker/measure-final.sh`, these values inherit the top-level gate quiescence
+settings.
+
 ## Iterating on code
 
 The image bakes a build of the current source; after host changes, `docker compose up

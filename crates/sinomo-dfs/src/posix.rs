@@ -30,6 +30,8 @@ const POSIX_LINK_COUNT_PAGE_SIZE: usize = 4096;
 const POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS: usize = 512;
 const POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE: usize = 128;
 const POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE: usize = 1024;
+const POSIX_REMOTE_READ_IDLE_WAIT_INITIAL: Duration = Duration::from_millis(2);
+const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Error)]
 pub enum DfsPosixError {
@@ -1042,8 +1044,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             return Ok(initial);
         }
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
         loop {
-            self.process_incoming()?;
+            let events = self.process_incoming()?;
+            if !events.is_empty() {
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            }
             let current = self.read_local_object_with_state(object_id, false)?;
             if !matches!(current, NetworkedDfsReadOutcome::PendingReplication { .. }) {
                 return Ok(current);
@@ -1055,11 +1061,33 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 if self.request_remote_object_read(object_id)?.is_empty() {
                     return Ok(current);
                 }
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+                continue;
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            if now >= deadline {
                 return Ok(current);
             }
-            std::thread::sleep(Duration::from_millis(2));
+            let remaining = deadline.saturating_duration_since(now);
+            let until_retry = self
+                .next_pending_remote_read_retry_for_current_object(object_id)?
+                .map(|next_retry_at| next_retry_at.saturating_duration_since(now))
+                .unwrap_or(remaining);
+            let wait = idle_wait.min(remaining).min(until_retry);
+            if wait.is_zero() {
+                continue;
+            }
+            if self
+                .transport
+                .wait_for_incoming(wait)
+                .map_err(DfsError::from_network)?
+            {
+                idle_wait = POSIX_REMOTE_READ_IDLE_WAIT_INITIAL;
+            } else {
+                idle_wait = idle_wait
+                    .saturating_mul(2)
+                    .min(POSIX_REMOTE_READ_IDLE_WAIT_MAX);
+            }
         }
     }
 

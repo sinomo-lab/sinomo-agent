@@ -3,7 +3,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::digest;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sinomo_core::{ClusterJoinInvite, ClusterMemberRole, ClusterMemberState};
+use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{ClusterInviteId, ClusterPaths};
 use sinomo_node::{
@@ -84,6 +84,7 @@ pub enum DaemonSignerAuthority {
     Voter,
     Member,
     JoinCandidate,
+    StatusProbe,
 }
 
 impl DaemonSignerAuthority {
@@ -615,16 +616,12 @@ fn authorize_daemon_signer(
                 && member.node_public_key == envelope_public_key
                 && member.state.is_authorized()
         }) {
-            return Ok(
-                if matches!(member.state, ClusterMemberState::Voter)
-                    || (matches!(member.state, ClusterMemberState::Active)
-                        && matches!(member.role, ClusterMemberRole::Voter))
-                {
-                    DaemonSignerAuthority::Voter
-                } else {
-                    DaemonSignerAuthority::Member
-                },
-            );
+            return Ok(signer_authority_for_member(member));
+        }
+        if let Some(member) = state.members.iter().find(|member| {
+            member.node_public_key == envelope_public_key && member.state.is_authorized()
+        }) {
+            return Ok(signer_authority_for_member(member));
         }
     }
 
@@ -632,7 +629,21 @@ fn authorize_daemon_signer(
         authorize_cluster_join_rpc_signer(paths, rpc_request, &envelope_public_key)?;
         return Ok(DaemonSignerAuthority::JoinCandidate);
     }
+    if envelope.command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) {
+        return Ok(DaemonSignerAuthority::StatusProbe);
+    }
     Err(DaemonError::AuthDenied)
+}
+
+fn signer_authority_for_member(member: &ClusterMemberRecord) -> DaemonSignerAuthority {
+    if matches!(member.state, ClusterMemberState::Voter)
+        || (matches!(member.state, ClusterMemberState::Active)
+            && matches!(member.role, ClusterMemberRole::Voter))
+    {
+        DaemonSignerAuthority::Voter
+    } else {
+        DaemonSignerAuthority::Member
+    }
 }
 
 fn authorize_cluster_join_rpc_signer(
@@ -989,6 +1000,86 @@ mod tests {
         }
         let authenticated = authenticated_command(command, DaemonSignerAuthority::JoinCandidate);
         assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
+    }
+
+    #[test]
+    fn status_probe_authority_is_limited_to_daemon_status() {
+        let status = authenticated_command(
+            daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE),
+            DaemonSignerAuthority::StatusProbe,
+        );
+        authorize_authenticated_daemon_command(&status)
+            .expect("unknown signed probes may read daemon status");
+
+        let cluster_health = authenticated_command(
+            daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE),
+            DaemonSignerAuthority::StatusProbe,
+        );
+        assert!(authorize_authenticated_daemon_command(&cluster_health).is_err());
+    }
+
+    #[test]
+    fn authorized_same_key_member_survives_node_id_drift() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-same-key-drift");
+        let data_dir = SinomoDataDir::new(&data_root);
+        let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let local_identity = load_or_create_main_node_identity(&data_root).expect("local identity");
+        let peer_root = unique_auth_test_root("sinomo-daemon-auth-same-key-drift-peer");
+        let peer_identity = load_or_create_main_node_identity(&peer_root).expect("peer identity");
+        let peer_public_key =
+            daemon_auth_decode_public_key(&peer_identity.public_key).expect("peer public key");
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_daemon_auth_same_key_drift")
+                .expect("cluster id");
+        let local_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_same_key_local")
+            .expect("local node");
+        let stored_peer = sinomo_core::Id::from_legacy_named("node_daemon_auth_same_key_stored")
+            .expect("stored peer");
+        let drifted_peer = sinomo_core::Id::from_legacy_named("node_daemon_auth_same_key_drifted")
+            .expect("drifted peer");
+        let now = OffsetDateTime::now_utc();
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "auth-same-key-drift",
+            local_node,
+            "local",
+            local_identity.public_key,
+            now,
+        );
+        let mut peer = ClusterMemberRecord::pending_learner(
+            cluster_id,
+            stored_peer,
+            "peer",
+            peer_identity.public_key,
+            now,
+        );
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let envelope = SignedDaemonCommand {
+            protocol: DAEMON_AUTH_PROTOCOL.to_string(),
+            node_id: drifted_peer.to_string(),
+            public_key: peer_public_key,
+            timestamp: now.format(&Rfc3339).expect("timestamp"),
+            nonce: "same-key-drift".to_string(),
+            command: daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE),
+            rpc_body_sha256: None,
+            signature: Vec::new(),
+        };
+
+        state.members.push(peer.clone());
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write pending state");
+        assert!(matches!(
+            authorize_daemon_signer(&daemon_paths, &envelope, None),
+            Err(DaemonError::AuthDenied)
+        ));
+
+        peer.state = ClusterMemberState::Learner;
+        *state.members.last_mut().expect("peer member") = peer;
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write accepted state");
+        assert_eq!(
+            authorize_daemon_signer(&daemon_paths, &envelope, None)
+                .expect("authorize accepted same-key member"),
+            DaemonSignerAuthority::Member
+        );
     }
 
     #[test]
