@@ -5967,8 +5967,11 @@ impl<S: EventStore, H: InteractionEventHandler> InteractionRuntime<S, H> {
         &self.store
     }
 
-    #[cfg(test)]
-    pub(crate) fn handler_mut(&mut self) -> &mut H {
+    pub fn handler(&self) -> &H {
+        &self.handler
+    }
+
+    pub fn handler_mut(&mut self) -> &mut H {
         &mut self.handler
     }
 
@@ -6453,6 +6456,77 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             }
         })
     }
+}
+
+/// Plain-data view of the active runtime selection, for the GUI app.
+pub(crate) struct AppRuntimeInfo {
+    pub agent: String,
+    pub provider: String,
+    pub model: String,
+    pub account: Option<String>,
+    pub reasoning_effort: Option<String>,
+}
+
+impl From<&TuiAgentRuntimeInfo> for AppRuntimeInfo {
+    fn from(info: &TuiAgentRuntimeInfo) -> Self {
+        AppRuntimeInfo {
+            agent: info.agent.clone(),
+            provider: info.provider.clone(),
+            model: info.model.clone(),
+            account: info.account.clone(),
+            reasoning_effort: info
+                .reasoning_effort
+                .map(|e| e.as_config_value().to_string()),
+        }
+    }
+}
+
+/// Build the main-agent chat handler the GUI app drives (mirrors the TUI path).
+pub(crate) fn app_build_chat_handler(
+    data_dir: &SinomoDataDir,
+    daemon: Option<DaemonStatus>,
+) -> Result<RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>, CliError> {
+    let (handler, _) = runtime_main_agent_handler_for_tui_with_data_dir(daemon, data_dir)?;
+    Ok(handler)
+}
+
+/// Switch the active provider/model/account on a GUI chat handler.
+pub(crate) fn app_switch_model(
+    handler: &mut RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+    data_dir: &SinomoDataDir,
+    provider: String,
+    model: String,
+    account: String,
+    daemon_connected: bool,
+) -> Result<AppRuntimeInfo, CliError> {
+    let info = handler.switch_tui_model(
+        data_dir,
+        TuiModelSelection {
+            provider,
+            model,
+            account,
+        },
+        daemon_connected,
+    )?;
+    Ok((&info).into())
+}
+
+/// Switch the active agent definition on a GUI chat handler.
+pub(crate) fn app_switch_agent(
+    handler: &mut RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+    data_dir: &SinomoDataDir,
+    definition: AgentDefinition,
+    daemon_connected: bool,
+) -> Result<AppRuntimeInfo, CliError> {
+    let info = handler.switch_tui_agent(data_dir, daemon_connected, definition)?;
+    Ok((&info).into())
+}
+
+/// Read the current runtime selection of a GUI chat handler.
+pub(crate) fn app_runtime_info(
+    handler: &RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>,
+) -> AppRuntimeInfo {
+    (&handler.runtime_info()).into()
 }
 
 impl TuiAgentRuntimeControl for RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {

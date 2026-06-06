@@ -1,30 +1,37 @@
 [package]
 name = "sinomo-app"
 version.workspace = true
-description = "Local Sinomo application wiring binary"
+description = "Sinomo agent client — graphical desktop app (chat, SIFS files, settings)"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "Cargo.toml", "assets/**/*"]
 
 [package.metadata.sinomo]
 ring = "application"
 
+[[bin]]
+name = "sinomo-app"
+path = "src/main.rs"
+
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tracing.workspace = true
+
+# Graphical toolkit (separate workspace, referenced by path).
+sui = { path = "../../../sui/crates/sui" }
+
+# Application/R2 service crates used directly (allowed by trust-ring rules).
 sinomo-cli = { path = "../sinomo-cli" }
-sinomo-actions = { path = "../sinomo-actions" }
 sinomo-agent = { path = "../sinomo-agent" }
-sinomo-audio = { path = "../sinomo-audio" }
-sinomo-evolution = { path = "../sinomo-evolution" }
-sinomo-fusion = { path = "../sinomo-fusion" }
-sinomo-gateway = { path = "../sinomo-gateway" }
-sinomo-deliberation = { path = "../sinomo-deliberation" }
 sinomo-lm = { path = "../sinomo-lm" }
-sinomo-memory = { path = "../sinomo-memory" }
-sinomo-video = { path = "../sinomo-video" }
-sinomo-voice = { path = "../sinomo-voice" }
+
+# R0/R1 surface is reached only through the runtime facade (ring boundary).
 sinomo-runtime = { path = "../sinomo-runtime" }
+
+[dev-dependencies]
+# Headless rendering harness for visual verification of the widget tree.
+sui-testing = { path = "../../../sui/crates/sui-testing" }
