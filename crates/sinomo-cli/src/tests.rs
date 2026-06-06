@@ -306,6 +306,20 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Rollout(RolloutCliCommand::Status)
     ));
     assert!(matches!(
+        parse_cli_command(&["observe".to_string(), "events".to_string()]).expect("observe"),
+        CliCommand::Registered(command) if command.name() == "observe"
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "module".to_string(),
+            "native-rust".to_string(),
+            "disable".to_string(),
+            "module.observe".to_string()
+        ])
+        .expect("module native-rust disable"),
+        CliCommand::Registered(command) if command.name() == "module"
+    ));
+    assert!(matches!(
         parse_cli_command(&["dfs".to_string(), "status".to_string()]).expect("dfs"),
         CliCommand::Dfs(DfsCliCommand::Status(_))
     ));
@@ -7612,6 +7626,8 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(
         ProviderCliCommand::Help
     )));
+    let observe = parse_cli_command(&["observe".to_string()]).expect("observe");
+    assert!(!cli_command_requires_cluster_state(&observe));
 }
 
 #[test]
@@ -7663,6 +7679,15 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
     assert!(!cli_invocation_force_local_mode(
         CliRuntimeOptions::default(),
         &evolve,
+        false,
+        None
+    ));
+
+    let observe = parse_cli_command(&["observe".to_string()]).expect("observe");
+    assert!(cli_command_supports_degraded_local_mode(&observe));
+    assert!(cli_invocation_force_local_mode(
+        CliRuntimeOptions::default(),
+        &observe,
         false,
         None
     ));
@@ -15773,6 +15798,17 @@ fn captured_cli_command_collects_stdout_for_embedded_callers() {
     let stdout = String::from_utf8_lossy(&captured.output.stdout);
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("sinomo cluster"));
+    assert!(captured.output.stderr.is_empty());
+}
+
+#[test]
+fn captured_cli_command_collects_registered_command_stdout() {
+    let captured = super::execute_cli_command_captured(&["observe".to_string()]);
+
+    assert_eq!(captured.status, super::CliCommandStatus::Completed);
+    let stdout = String::from_utf8_lossy(&captured.output.stdout);
+    assert!(stdout.contains("Observe:"));
+    assert!(stdout.contains("sinomo observe events"));
     assert!(captured.output.stderr.is_empty());
 }
 

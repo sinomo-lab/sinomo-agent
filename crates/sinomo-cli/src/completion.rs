@@ -1,3 +1,9 @@
+use std::borrow::Cow;
+
+use sinomo_runtime::cli_registry::{
+    CliAutocompleteChoice, CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SlashCompletionSet {
     pub replace_start: usize,
@@ -30,8 +36,8 @@ pub(crate) enum SlashCommandCompletionLayer {
 
 #[derive(Clone, Debug)]
 struct CommandSpec {
-    word: &'static str,
-    detail: &'static str,
+    word: Cow<'static, str>,
+    detail: Cow<'static, str>,
     children: Vec<CommandSpec>,
     options: Vec<OptionSpec>,
     values: Vec<ValueSpec>,
@@ -39,22 +45,22 @@ struct CommandSpec {
 
 #[derive(Clone, Debug)]
 struct OptionSpec {
-    name: &'static str,
-    detail: &'static str,
+    name: Cow<'static, str>,
+    detail: Cow<'static, str>,
     value: Option<ValueSpec>,
 }
 
 #[derive(Clone, Debug)]
 struct ValueSpec {
-    placeholder: &'static str,
-    detail: &'static str,
-    choices: &'static [ValueChoice],
+    placeholder: Cow<'static, str>,
+    detail: Cow<'static, str>,
+    choices: Vec<ValueChoice>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ValueChoice {
-    value: &'static str,
-    detail: &'static str,
+    value: Cow<'static, str>,
+    detail: Cow<'static, str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,239 +90,239 @@ static TUI_MODEL_CATALOG_CACHE: std::sync::OnceLock<
 
 const BOOLEAN_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "true",
-        detail: "enable the setting",
+        value: Cow::Borrowed("true"),
+        detail: Cow::Borrowed("enable the setting"),
     },
     ValueChoice {
-        value: "false",
-        detail: "disable the setting",
+        value: Cow::Borrowed("false"),
+        detail: Cow::Borrowed("disable the setting"),
     },
 ];
 
 const REASONING_EFFORT_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "none",
-        detail: "explicitly disable reasoning effort",
+        value: Cow::Borrowed("none"),
+        detail: Cow::Borrowed("explicitly disable reasoning effort"),
     },
     ValueChoice {
-        value: "minimal",
-        detail: "minimal reasoning effort",
+        value: Cow::Borrowed("minimal"),
+        detail: Cow::Borrowed("minimal reasoning effort"),
     },
     ValueChoice {
-        value: "low",
-        detail: "low reasoning effort",
+        value: Cow::Borrowed("low"),
+        detail: Cow::Borrowed("low reasoning effort"),
     },
     ValueChoice {
-        value: "medium",
-        detail: "medium reasoning effort",
+        value: Cow::Borrowed("medium"),
+        detail: Cow::Borrowed("medium reasoning effort"),
     },
     ValueChoice {
-        value: "high",
-        detail: "high reasoning effort",
+        value: Cow::Borrowed("high"),
+        detail: Cow::Borrowed("high reasoning effort"),
     },
     ValueChoice {
-        value: "xhigh",
-        detail: "extra-high reasoning effort",
+        value: Cow::Borrowed("xhigh"),
+        detail: Cow::Borrowed("extra-high reasoning effort"),
     },
     ValueChoice {
-        value: "max",
-        detail: "maximum vendor-supported reasoning effort",
+        value: Cow::Borrowed("max"),
+        detail: Cow::Borrowed("maximum vendor-supported reasoning effort"),
     },
     ValueChoice {
-        value: "clear",
-        detail: "remove this configured override",
+        value: Cow::Borrowed("clear"),
+        detail: Cow::Borrowed("remove this configured override"),
     },
 ];
 
 const TEXT_VERBOSITY_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "low",
-        detail: "low response verbosity",
+        value: Cow::Borrowed("low"),
+        detail: Cow::Borrowed("low response verbosity"),
     },
     ValueChoice {
-        value: "medium",
-        detail: "medium response verbosity",
+        value: Cow::Borrowed("medium"),
+        detail: Cow::Borrowed("medium response verbosity"),
     },
     ValueChoice {
-        value: "high",
-        detail: "high response verbosity",
+        value: Cow::Borrowed("high"),
+        detail: Cow::Borrowed("high response verbosity"),
     },
     ValueChoice {
-        value: "clear",
-        detail: "remove this configured override",
+        value: Cow::Borrowed("clear"),
+        detail: Cow::Borrowed("remove this configured override"),
     },
 ];
 
 const CLEAR_VALUE_CHOICES: &[ValueChoice] = &[ValueChoice {
-    value: "clear",
-    detail: "remove this configured override",
+    value: Cow::Borrowed("clear"),
+    detail: Cow::Borrowed("remove this configured override"),
 }];
 
 const TUI_FILE_TARGET_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "sifs:/",
-        detail: "browse the SIFS root",
+        value: Cow::Borrowed("sifs:/"),
+        detail: Cow::Borrowed("browse the SIFS root"),
     },
     ValueChoice {
-        value: "sifs:/sinomo/nodes",
-        detail: "browse node-owned SIFS files",
+        value: Cow::Borrowed("sifs:/sinomo/nodes"),
+        detail: Cow::Borrowed("browse node-owned SIFS files"),
     },
     ValueChoice {
-        value: "sifs:/services",
-        detail: "browse service-owned SIFS files",
+        value: Cow::Borrowed("sifs:/services"),
+        detail: Cow::Borrowed("browse service-owned SIFS files"),
     },
     ValueChoice {
-        value: "sifs:/users",
-        detail: "browse user-owned SIFS files",
+        value: Cow::Borrowed("sifs:/users"),
+        detail: Cow::Borrowed("browse user-owned SIFS files"),
     },
     ValueChoice {
-        value: "local:.",
-        detail: "browse local files from the current directory",
+        value: Cow::Borrowed("local:."),
+        detail: Cow::Borrowed("browse local files from the current directory"),
     },
 ];
 
 const TUI_AGENT_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "main-agent",
-        detail: "user-facing interactive agent",
+        value: Cow::Borrowed("main-agent"),
+        detail: Cow::Borrowed("user-facing interactive agent"),
     },
     ValueChoice {
-        value: "background-agent",
-        detail: "silent maintenance and cluster-support agent",
+        value: Cow::Borrowed("background-agent"),
+        detail: Cow::Borrowed("silent maintenance and cluster-support agent"),
     },
     ValueChoice {
-        value: "coding-agent",
-        detail: "workspace coding and verification agent",
+        value: Cow::Borrowed("coding-agent"),
+        detail: Cow::Borrowed("workspace coding and verification agent"),
     },
     ValueChoice {
-        value: "evolution-agent",
-        detail: "supervised self-evolution mutation agent",
+        value: Cow::Borrowed("evolution-agent"),
+        detail: Cow::Borrowed("supervised self-evolution mutation agent"),
     },
 ];
 
 const NODE_ROLE_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "workstation",
-        detail: "desktop or laptop node",
+        value: Cow::Borrowed("workstation"),
+        detail: Cow::Borrowed("desktop or laptop node"),
     },
     ValueChoice {
-        value: "mobile",
-        detail: "mobile node",
+        value: Cow::Borrowed("mobile"),
+        detail: Cow::Borrowed("mobile node"),
     },
     ValueChoice {
-        value: "server",
-        detail: "server node",
+        value: Cow::Borrowed("server"),
+        detail: Cow::Borrowed("server node"),
     },
     ValueChoice {
-        value: "sensor",
-        detail: "sensor node",
+        value: Cow::Borrowed("sensor"),
+        detail: Cow::Borrowed("sensor node"),
     },
     ValueChoice {
-        value: "test",
-        detail: "test node",
+        value: Cow::Borrowed("test"),
+        detail: Cow::Borrowed("test node"),
     },
 ];
 
 const RAFT_ROLE_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "voter",
-        detail: "participates in quorum",
+        value: Cow::Borrowed("voter"),
+        detail: Cow::Borrowed("participates in quorum"),
     },
     ValueChoice {
-        value: "learner",
-        detail: "replicates without voting",
+        value: Cow::Borrowed("learner"),
+        detail: Cow::Borrowed("replicates without voting"),
     },
     ValueChoice {
-        value: "non-voting",
-        detail: "non-voting cluster member",
+        value: Cow::Borrowed("non-voting"),
+        detail: Cow::Borrowed("non-voting cluster member"),
     },
 ];
 
 const DFS_PIN_MODE_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "metadata",
-        detail: "pin metadata only",
+        value: Cow::Borrowed("metadata"),
+        detail: Cow::Borrowed("pin metadata only"),
     },
     ValueChoice {
-        value: "content",
-        detail: "pin content data",
+        value: Cow::Borrowed("content"),
+        detail: Cow::Borrowed("pin content data"),
     },
 ];
 
 const SANDBOX_TMP_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "clear",
-        detail: "clear tmp storage",
+        value: Cow::Borrowed("clear"),
+        detail: Cow::Borrowed("clear tmp storage"),
     },
     ValueChoice {
-        value: "retain",
-        detail: "retain tmp storage",
+        value: Cow::Borrowed("retain"),
+        detail: Cow::Borrowed("retain tmp storage"),
     },
 ];
 
 const SANDBOX_TRANSPORT_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "direct",
-        detail: "use direct host networking",
+        value: Cow::Borrowed("direct"),
+        detail: Cow::Borrowed("use direct host networking"),
     },
     ValueChoice {
-        value: "daemon",
-        detail: "route through daemon sandbox service",
+        value: Cow::Borrowed("daemon"),
+        detail: Cow::Borrowed("route through daemon sandbox service"),
     },
 ];
 
 const PROVIDER_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "codex",
-        detail: "Codex CLI provider",
+        value: Cow::Borrowed("codex"),
+        detail: Cow::Borrowed("Codex CLI provider"),
     },
     ValueChoice {
-        value: "github-copilot",
-        detail: "GitHub Copilot provider",
+        value: Cow::Borrowed("github-copilot"),
+        detail: Cow::Borrowed("GitHub Copilot provider"),
     },
     ValueChoice {
-        value: "openai",
-        detail: "OpenAI API provider",
+        value: Cow::Borrowed("openai"),
+        detail: Cow::Borrowed("OpenAI API provider"),
     },
     ValueChoice {
-        value: "anthropic",
-        detail: "Anthropic API provider",
+        value: Cow::Borrowed("anthropic"),
+        detail: Cow::Borrowed("Anthropic API provider"),
     },
     ValueChoice {
-        value: "deepseek",
-        detail: "DeepSeek API provider",
+        value: Cow::Borrowed("deepseek"),
+        detail: Cow::Borrowed("DeepSeek API provider"),
     },
     ValueChoice {
-        value: "gemini",
-        detail: "Gemini API provider",
+        value: Cow::Borrowed("gemini"),
+        detail: Cow::Borrowed("Gemini API provider"),
     },
     ValueChoice {
-        value: "nvidia",
-        detail: "NVIDIA API provider",
+        value: Cow::Borrowed("nvidia"),
+        detail: Cow::Borrowed("NVIDIA API provider"),
     },
     ValueChoice {
-        value: "minicpm",
-        detail: "local MiniCPM runtime",
+        value: Cow::Borrowed("minicpm"),
+        detail: Cow::Borrowed("local MiniCPM runtime"),
     },
 ];
 
 const TELEMETRY_WEIGHT_CHOICES: &[ValueChoice] = &[ValueChoice {
-    value: "unlimited",
-    detail: "remove the numeric cap",
+    value: Cow::Borrowed("unlimited"),
+    detail: Cow::Borrowed("remove the numeric cap"),
 }];
 
 const THINKING_CHOICES: &[ValueChoice] = &[
     ValueChoice {
-        value: "on",
-        detail: "show model thinking stream when available",
+        value: Cow::Borrowed("on"),
+        detail: Cow::Borrowed("show model thinking stream when available"),
     },
     ValueChoice {
-        value: "off",
-        detail: "hide model thinking stream",
+        value: Cow::Borrowed("off"),
+        detail: Cow::Borrowed("hide model thinking stream"),
     },
     ValueChoice {
-        value: "status",
-        detail: "show current thinking-stream mode",
+        value: Cow::Borrowed("status"),
+        detail: Cow::Borrowed("show current thinking-stream mode"),
     },
 ];
 
@@ -366,8 +372,8 @@ pub(crate) fn slash_completions_for_layer(
             for child in &node.children {
                 push_word_item(
                     &mut items,
-                    child.word,
-                    child.detail,
+                    child.word.as_ref(),
+                    child.detail.as_ref(),
                     SlashCompletionKind::Command,
                     &prefix,
                     true,
@@ -379,8 +385,8 @@ pub(crate) fn slash_completions_for_layer(
             for option in &options {
                 push_word_item(
                     &mut items,
-                    option.name,
-                    option.detail,
+                    option.name.as_ref(),
+                    option.detail.as_ref(),
                     SlashCompletionKind::Option,
                     &prefix,
                     true,
@@ -475,7 +481,11 @@ fn resolve_command_node<'a>(
             consumed += 1;
             continue;
         }
-        let Some(child) = node.children.iter().find(|child| child.word == token.text) else {
+        let Some(child) = node
+            .children
+            .iter()
+            .find(|child| child.word.as_ref() == token.text)
+        else {
             break;
         };
         node = child;
@@ -497,7 +507,7 @@ fn expected_value_spec<'a>(
     let previous = tokens_before_current.last()?;
     options
         .iter()
-        .find(|option| option.name == previous)
+        .find(|option| option.name.as_ref() == previous)
         .and_then(|option| option.value.as_ref())
 }
 
@@ -548,7 +558,7 @@ fn positional_count_after_command(
 fn option_expects_value(options: &[OptionSpec], name: &str) -> bool {
     options
         .iter()
-        .any(|option| option.name == name && option.value.is_some())
+        .any(|option| option.name.as_ref() == name && option.value.is_some())
 }
 
 fn push_value_items(items: &mut Vec<SlashCompletionItem>, value: &ValueSpec, prefix: &str) {
@@ -564,11 +574,11 @@ fn push_value_items(items: &mut Vec<SlashCompletionItem>, value: &ValueSpec, pre
         return;
     }
 
-    for choice in value.choices {
+    for choice in &value.choices {
         push_word_item(
             items,
-            choice.value,
-            choice.detail,
+            choice.value.as_ref(),
+            choice.detail.as_ref(),
             SlashCompletionKind::Value,
             prefix,
             true,
@@ -913,13 +923,13 @@ fn push_tui_model_catalog(catalogs: &mut Vec<TuiModelCatalog>, mut catalog: TuiM
 fn tui_model_provider_detail(provider: &str) -> &'static str {
     PROVIDER_CHOICES
         .iter()
-        .find(|choice| choice.value == provider)
-        .map(|choice| choice.detail)
+        .find(|choice| choice.value.as_ref() == provider)
+        .map(|choice| choice.detail.as_ref())
         .unwrap_or("available model provider")
 }
 
 fn slash_command_registry() -> CommandSpec {
-    cmd(
+    let mut registry = cmd(
         "",
         "",
         vec![
@@ -1213,13 +1223,6 @@ fn slash_command_registry() -> CommandSpec {
                 vec![],
             ),
             cmd(
-                "module",
-                "manage local module activation",
-                module_children(),
-                vec![],
-                vec![],
-            ),
-            cmd(
                 "sandbox",
                 "manage local sandbox instances and toolchains",
                 sandbox_children(),
@@ -1277,18 +1280,91 @@ fn slash_command_registry() -> CommandSpec {
         ],
         vec![option("--local", "force local file-backed mode", None)],
         vec![],
-    )
+    );
+    append_registered_slash_commands(&mut registry);
+    registry
+}
+
+fn append_registered_slash_commands(registry: &mut CommandSpec) {
+    for spec in super::cli_command_registry().autocomplete_specs() {
+        registry
+            .children
+            .extend(command_specs_from_autocomplete(spec));
+    }
+}
+
+fn command_specs_from_autocomplete(spec: CliAutocompleteSpec) -> Vec<CommandSpec> {
+    let mut specs = Vec::with_capacity(1 + spec.aliases.len());
+    specs.push(command_spec_from_autocomplete(&spec, spec.word.clone()));
+    for alias in &spec.aliases {
+        specs.push(command_spec_from_autocomplete(&spec, alias.clone()));
+    }
+    specs
+}
+
+fn command_spec_from_autocomplete(spec: &CliAutocompleteSpec, word: String) -> CommandSpec {
+    CommandSpec {
+        word: Cow::Owned(word),
+        detail: Cow::Owned(spec.detail.clone()),
+        children: spec
+            .children
+            .iter()
+            .cloned()
+            .flat_map(command_specs_from_autocomplete)
+            .collect(),
+        options: spec
+            .options
+            .iter()
+            .cloned()
+            .map(option_spec_from_autocomplete)
+            .collect(),
+        values: spec
+            .values
+            .iter()
+            .cloned()
+            .map(value_spec_from_autocomplete)
+            .collect(),
+    }
+}
+
+fn option_spec_from_autocomplete(option: CliAutocompleteOption) -> OptionSpec {
+    OptionSpec {
+        name: Cow::Owned(option.name),
+        detail: Cow::Owned(option.detail),
+        value: option.value.map(value_spec_from_autocomplete),
+    }
+}
+
+fn value_spec_from_autocomplete(value: CliAutocompleteValue) -> ValueSpec {
+    ValueSpec {
+        placeholder: Cow::Owned(value.placeholder),
+        detail: Cow::Owned(value.detail),
+        choices: value
+            .choices
+            .into_iter()
+            .map(choice_from_autocomplete)
+            .collect(),
+    }
+}
+
+fn choice_from_autocomplete(choice: CliAutocompleteChoice) -> ValueChoice {
+    ValueChoice {
+        value: Cow::Owned(choice.value),
+        detail: Cow::Owned(choice.detail),
+    }
 }
 
 fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
-    registry.options.retain(|option| option.name != "--local");
+    registry
+        .options
+        .retain(|option| option.name.as_ref() != "--local");
     registry.children.extend(tui_slash_command_layer());
     if let Some(model) = registry
         .children
         .iter_mut()
-        .find(|command| command.word == "model")
+        .find(|command| command.word.as_ref() == "model")
     {
-        model.detail = "switch the active TUI chat model";
+        model.detail = Cow::Borrowed("switch the active TUI chat model");
         model.children.clear();
         model.options.clear();
         model.values = vec![value("provider", "available model provider", &[])];
@@ -1296,9 +1372,9 @@ fn apply_tui_slash_command_layer(registry: &mut CommandSpec) {
     if let Some(agent) = registry
         .children
         .iter_mut()
-        .find(|command| command.word == "agent")
+        .find(|command| command.word.as_ref() == "agent")
     {
-        agent.detail = "switch the active TUI chat agent";
+        agent.detail = Cow::Borrowed("switch the active TUI chat agent");
         agent.children = vec![
             cmd(
                 "status",
@@ -2113,62 +2189,6 @@ fn evolve_children() -> Vec<CommandSpec> {
     ]
 }
 
-fn module_children() -> Vec<CommandSpec> {
-    vec![
-        cmd(
-            "native-dylib",
-            "manage trusted native-dylib modules",
-            vec![
-                cmd(
-                    "activate",
-                    "install and activate a trusted native module",
-                    vec![],
-                    opts(&[
-                        "--module",
-                        "--artifact",
-                        "--interface",
-                        "--cache-key",
-                        "--library-name",
-                        "--source",
-                    ]),
-                    vec![value("library", "native dynamic library path", &[])],
-                ),
-                cmd(
-                    "unload",
-                    "remove activation state and best-effort unload a native module",
-                    vec![],
-                    opts(&["--module"]),
-                    vec![value("module-id", "native module id", &[])],
-                ),
-            ],
-            vec![],
-            vec![],
-        ),
-        cmd(
-            "wasix",
-            "manage the WASIX sandbox runtime module",
-            vec![
-                cmd(
-                    "activate",
-                    "activate module.sandbox.wasix from a native library",
-                    vec![],
-                    opts(&["--artifact", "--library-name", "--source"]),
-                    vec![value("library", "WASIX native dynamic library path", &[])],
-                ),
-                cmd(
-                    "unload",
-                    "remove module.sandbox.wasix activation state",
-                    vec![],
-                    vec![],
-                    vec![],
-                ),
-            ],
-            vec![],
-            vec![],
-        ),
-    ]
-}
-
 fn cmd(
     word: &'static str,
     detail: &'static str,
@@ -2177,8 +2197,8 @@ fn cmd(
     values: Vec<ValueSpec>,
 ) -> CommandSpec {
     CommandSpec {
-        word,
-        detail,
+        word: Cow::Borrowed(word),
+        detail: Cow::Borrowed(detail),
         children,
         options,
         values,
@@ -2232,8 +2252,8 @@ fn option_for_name(name: &'static str) -> OptionSpec {
 
 fn option(name: &'static str, detail: &'static str, value: Option<ValueSpec>) -> OptionSpec {
     OptionSpec {
-        name,
-        detail,
+        name: Cow::Borrowed(name),
+        detail: Cow::Borrowed(detail),
         value,
     }
 }
@@ -2244,9 +2264,9 @@ fn value(
     choices: &'static [ValueChoice],
 ) -> ValueSpec {
     ValueSpec {
-        placeholder,
-        detail,
-        choices,
+        placeholder: Cow::Borrowed(placeholder),
+        detail: Cow::Borrowed(detail),
+        choices: choices.to_vec(),
     }
 }
 
@@ -2298,7 +2318,8 @@ fn option_placeholder(name: &str) -> &'static str {
         | "--max-output-tokens"
         | "--shadow-telemetry-limit"
         | "--user-corrections"
-        | "--timeout-ms" => "n",
+        | "--timeout-ms"
+        | "--limit" => "n",
         "--filesystem" => "file-system-id",
         "--object" => "object-id",
         "--dfs-path" => "dfs-path",
@@ -2325,6 +2346,9 @@ fn option_placeholder(name: &str) -> &'static str {
         "--job" => "job-id",
         "--campaign" => "campaign-id",
         "--incident" => "event-id",
+        "--kind" | "--kind-prefix" => "kind-prefix",
+        "--component" => "component",
+        "--operation" | "--operation-id" | "--op" => "operation-id",
         _ => "value",
     }
 }
@@ -2358,6 +2382,10 @@ fn option_detail(name: &str) -> &'static str {
         "--docker" => "run in Docker image",
         "--podman" => "run in Podman image",
         "--mode" => "mode value",
+        "--kind" | "--kind-prefix" => "event kind prefix",
+        "--component" => "component filter",
+        "--operation" | "--operation-id" | "--op" => "operation id filter",
+        "--limit" => "maximum records to show",
         _ => option_placeholder(name),
     }
 }
@@ -2555,6 +2583,30 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_uses_registered_command_autocomplete() {
+        let top = slash_completions("/ob", "/ob".len()).expect("registered alias");
+        assert!(top.items.iter().any(|item| item.label == "obs"));
+
+        let commands = slash_completions("/observe ", "/observe ".len()).expect("observe commands");
+        assert!(commands.items.iter().any(|item| item.label == "events"));
+        assert!(commands.items.iter().any(|item| item.label == "logs"));
+
+        let options = slash_completions("/observe events --", "/observe events --".len())
+            .expect("observe event options");
+        assert!(options.items.iter().any(|item| item.label == "--kind"));
+        assert!(options.items.iter().any(|item| item.label == "--json"));
+
+        let value = slash_completions("/observe events --kind ", "/observe events --kind ".len())
+            .expect("observe kind hint");
+        assert!(
+            value
+                .items
+                .iter()
+                .any(|item| { item.kind == SlashCompletionKind::Hint && item.label == "prefix" })
+        );
+    }
+
+    #[test]
     fn slash_completion_lists_module_activation_commands() {
         let completions = slash_completions("/module ", "/module ".len()).expect("module");
 
@@ -2563,6 +2615,12 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.label == "native-dylib")
+        );
+        assert!(
+            completions
+                .items
+                .iter()
+                .any(|item| item.label == "native-rust")
         );
         assert!(completions.items.iter().any(|item| item.label == "wasix"));
 
@@ -2599,6 +2657,28 @@ mod tests {
                 .items
                 .iter()
                 .any(|item| item.label == "--module")
+        );
+
+        let native_rust_commands =
+            slash_completions("/module native-rust ", "/module native-rust ".len())
+                .expect("native-rust commands");
+        assert!(
+            native_rust_commands
+                .items
+                .iter()
+                .any(|item| item.label == "enable")
+        );
+
+        let native_rust_modules = slash_completions(
+            "/module native-rust disable ",
+            "/module native-rust disable ".len(),
+        )
+        .expect("native-rust module choices");
+        assert!(
+            native_rust_modules
+                .items
+                .iter()
+                .any(|item| item.label == "module.observe")
         );
     }
 

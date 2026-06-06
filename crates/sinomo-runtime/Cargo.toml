@@ -17,6 +17,7 @@ sandbox = ["dep:sinomo-sandbox-wasix-host", "sinomo-daemon/sandbox"]
 
 [dependencies]
 sinomo-api = { path = "../sinomo-api" }
+sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
@@ -32,6 +33,7 @@ sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object" }
+sinomo-observe = { path = "../sinomo-observe" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-rollout = { path = "../sinomo-rollout" }

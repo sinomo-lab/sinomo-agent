@@ -235,6 +235,17 @@ impl From<sinomo_rollout::RolloutError> for DaemonError {
     }
 }
 
+impl From<sinomo_observe::ObserveError> for DaemonError {
+    fn from(error: sinomo_observe::ObserveError) -> Self {
+        match error {
+            sinomo_observe::ObserveError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_observe::ObserveError::Json { path, detail } => Self::Json { path, detail },
+            sinomo_observe::ObserveError::Parse { detail }
+            | sinomo_observe::ObserveError::ModuleState { detail } => Self::Parse { detail },
+        }
+    }
+}
+
 impl From<sinomo_module::NativeDylibModuleInstallError> for DaemonError {
     fn from(error: sinomo_module::NativeDylibModuleInstallError) -> Self {
         match error {

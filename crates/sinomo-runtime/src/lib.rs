@@ -25,6 +25,7 @@ pub mod r0 {
 /// must not depend back on R2 service crates.
 pub mod r1 {
     pub use sinomo_api as api;
+    pub use sinomo_cli_registry as cli_registry;
     pub use sinomo_config as config;
     pub use sinomo_daemon as daemon;
     pub use sinomo_device as device;
@@ -38,6 +39,7 @@ pub mod r1 {
     pub use sinomo_module_api as module_api;
     pub use sinomo_network as network;
     pub use sinomo_node as node;
+    pub use sinomo_observe as observe;
     pub use sinomo_policy as policy;
     pub use sinomo_registry as registry;
     pub use sinomo_rollout as rollout;
@@ -127,6 +129,11 @@ pub mod r1 {
                 register_services: Some(sinomo_rollout::register_services),
                 register_storage_paths: Some(sinomo_rollout::register_storage_paths),
             },
+            NativeRustModuleBinding {
+                registration_key: sinomo_observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
+                register_services: Some(sinomo_observe::register_services),
+                register_storage_paths: Some(sinomo_observe::register_storage_paths),
+            },
         ];
 
         pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
@@ -141,6 +148,7 @@ pub mod r1 {
             let registry = sinomo_module::ModuleRegistry::builder()
                 .register(sinomo_dfs::dfs_module_registration())?
                 .register(sinomo_rollout::rollout_module_registration())?
+                .register(sinomo_observe::observe_module_registration())?
                 .build();
             Ok(registry)
         }
@@ -186,9 +194,9 @@ pub use r0::{core, object};
 #[cfg(feature = "sandbox")]
 pub use r1::sandbox_wasix_host;
 pub use r1::{
-    api, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local, module,
-    module_api, modules, network, node, policy, registry, rollout, sandbox, sandbox_wasix_api,
-    service, storage, supervision,
+    api, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
+    module, module_api, modules, network, node, observe, policy, registry, rollout, sandbox,
+    sandbox_wasix_api, service, storage, supervision,
 };
 
 #[cfg(test)]
@@ -197,7 +205,7 @@ mod tests {
         internal_module_registry, internal_module_table, native_rust_binding_for_registration,
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
-    use super::{core, dfs, module, rollout, service};
+    use super::{core, dfs, module, observe, rollout, service};
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {
@@ -225,8 +233,11 @@ mod tests {
                 "sandbox/module-artifacts/artifact_candidate.wasm",
                 "sandbox/module-wasm-artifacts.sobj",
                 "module/loader-state/01kr3d54d45zkm0p0xgps8k7mt.sobj",
+                "module/loader-state/native-rust/01kr3d54d45zkm0p0xgps8k7mt.sobj",
                 "module/lifecycle/unload-records/01kr3d54d45zkm0p0xgps8k7mt.sobj",
                 "module/local-command-artifacts.sobj",
+                "events/ops/operational-events.jsonl",
+                "events/ops/logs/operational-log.jsonl.lock",
                 "configs/rollout/telemetry/gates.json",
                 "rollout/runtime-state.sobj",
                 "rollout/telemetry-advance-state.sobj",
@@ -364,6 +375,56 @@ mod tests {
     }
 
     #[test]
+    fn runtime_internal_module_registry_includes_observe() {
+        let registry = internal_module_registry().expect("module registry");
+        let module_id = observe::observe_module_id();
+        let registration = registry
+            .get(&module_id)
+            .expect("observe module registration");
+
+        assert_eq!(registration.manifest.kind, core::ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.target_ring,
+            core::TrustRing::R1TrustedRuntime
+        );
+        assert_eq!(registration.manifest.api_version, observe::OBSERVE_PROTOCOL);
+        assert!(
+            registration
+                .manifest
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "observe.events.read")
+        );
+        assert_eq!(
+            registration.backend,
+            module::ModuleBackendRegistration::NativeRust {
+                registration: module::NativeRustBackendRegistration::new(
+                    observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
+                    observe::SINOMO_OBSERVE_MODULE_OWNER
+                )
+            }
+        );
+        assert_eq!(
+            registration.surfaces.storage_owners,
+            vec![observe::SINOMO_OBSERVE_MODULE_OWNER.to_string()]
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes.len(),
+            observe::OBSERVE_OBJECT_RPC_ROUTES.len()
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == observe::OBSERVE_EVENTS_ROUTE
+                    && route.category == observe::OBSERVE_RPC_CATEGORY
+                    && route.auth == module::ModuleRouteAuth::LocalCommand)
+        );
+    }
+
+    #[test]
     fn runtime_internal_module_table_binds_dfs_hooks() {
         let table = internal_module_table().expect("module table");
         let module_id = dfs::dfs_module_id();
@@ -377,7 +438,7 @@ mod tests {
             binding.registration_key,
             dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY
         );
-        assert_eq!(table.native_rust_bindings.len(), 2);
+        assert_eq!(table.native_rust_bindings.len(), 3);
         assert!(binding.register_services.is_some());
         assert!(binding.register_storage_paths.is_some());
 
@@ -426,5 +487,38 @@ mod tests {
             panic!("expected rollout runtime state storage contract");
         };
         assert_eq!(rollout_state.module, rollout::SINOMO_ROLLOUT_MODULE_OWNER);
+    }
+
+    #[test]
+    fn runtime_internal_module_table_binds_observe_hooks() {
+        let table = internal_module_table().expect("module table");
+        let module_id = observe::observe_module_id();
+        let registration = table
+            .registry
+            .get(&module_id)
+            .expect("observe module registration");
+        let binding = native_rust_binding_for_registration(registration).expect("observe binding");
+
+        assert_eq!(
+            binding.registration_key,
+            observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY
+        );
+        assert!(binding.register_services.is_some());
+        assert!(binding.register_storage_paths.is_some());
+
+        let registry = binding.register_services.expect("observe services")(
+            service::ServiceRegistry::builder(),
+        )
+        .build();
+        assert!(registry.owns(observe::OBSERVE_EVENTS_ROUTE));
+        assert!(registry.owns(observe::OBSERVE_LOGS_ROUTE));
+
+        let layout = sinomo_data_dir_layout().expect("layout");
+        let Some(StoragePathOwner::File(observe_events)) =
+            layout.owner_for(observe::OPERATIONAL_EVENTS_RELATIVE_PATH)
+        else {
+            panic!("expected observe event log storage contract");
+        };
+        assert_eq!(observe_events.module, observe::SINOMO_OBSERVE_MODULE_OWNER);
     }
 }

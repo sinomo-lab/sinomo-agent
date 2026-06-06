@@ -31,8 +31,10 @@ use sinomo_rollout::{
 };
 use std::env;
 use std::fmt::Display;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -60,6 +62,7 @@ fn write_cluster_rollout_progress(
     progress_current: u32,
     progress_message: impl Into<String>,
 ) -> Result<(), DaemonError> {
+    let progress_message = progress_message.into();
     let status = cluster_rollout_progress_status(ClusterRolloutProgressUpdate::new(
         status,
         mode,
@@ -68,9 +71,39 @@ fn write_cluster_rollout_progress(
         requested_at,
         phase,
         progress_current,
-        progress_message,
+        progress_message.clone(),
     ));
     write_rollout_status(rollout_paths, &status)?;
+    let status_label = status.status.clone();
+    let kind = match status_label.as_str() {
+        "accepted" => "rollout.stage.accepted",
+        "failed" => "rollout.stage.failed",
+        "staged" => "rollout.stage.staged",
+        _ => "rollout.stage.progress",
+    };
+    let severity = if status_label == "failed" {
+        crate::OperationalSeverity::Error
+    } else {
+        crate::OperationalSeverity::Info
+    };
+    crate::append_operational_event_best_effort(
+        daemon_paths,
+        severity,
+        "rollout",
+        kind,
+        progress_message,
+        Some(requested_at),
+        serde_json::json!({
+            "status": status_label,
+            "mode": mode,
+            "detail": status.detail,
+            "source": source,
+            "requested_at": requested_at,
+            "phase": phase,
+            "progress_current": progress_current,
+            "progress_total": CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+        }),
+    );
     publish_rollout_progress_to_cluster(daemon_paths);
     Ok(())
 }
@@ -126,6 +159,12 @@ pub struct ShadowMainRolloutMonitor {
     pub previous_shadow_binary: PathBuf,
     pub diagnostics: CandidateMainDiagnostics,
     pub deadline: Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShadowSupervisorDiagnostics {
+    pub stdout_log: PathBuf,
+    pub stderr_log: PathBuf,
 }
 
 pub enum ShadowMainStart {
@@ -411,6 +450,19 @@ fn complete_pending_shadow_rollout_after_start(
     )?;
     remove_main_activation(rollout_paths);
     remove_shadow_finalize(rollout_paths);
+    crate::append_operational_event_best_effort(
+        paths,
+        crate::OperationalSeverity::Info,
+        "rollout",
+        "rollout.stage.accepted",
+        "shadow rollout finalized",
+        Some(&finalize.requested_at),
+        serde_json::json!({
+            "source": finalize.source,
+            "requested_at": finalize.requested_at,
+            "shadow_binary": finalize.shadow_binary.display().to_string(),
+        }),
+    );
     publish_rollout_progress_to_cluster(paths);
     Ok(())
 }
@@ -471,6 +523,21 @@ where
     let listener = sinomo_network::DaemonControlListener::bind(&bind_address)?;
     listener.set_nonblocking(true)?;
     println!("sinomo shadow daemon listening on {bind_address}");
+    crate::append_operational_event_best_effort(
+        &shadow_paths,
+        crate::OperationalSeverity::Info,
+        "shadow-daemon",
+        "daemon.lifecycle.started",
+        format!("sinomo shadow daemon listening on {bind_address}"),
+        None,
+        serde_json::json!({
+            "label": "shadow-daemon",
+            "address": bind_address,
+            "pid": std::process::id(),
+            "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
+            "main_binary": main_binary.display().to_string(),
+        }),
+    );
     if let Err(error) = start_daemon_iroh_proxy_if_clustered(
         &shadow_paths,
         &options,
@@ -478,12 +545,42 @@ where
         "shadow daemon",
     ) {
         eprintln!("sinomo shadow daemon iroh proxy disabled: {error}");
+        crate::append_operational_log_best_effort(
+            &shadow_paths,
+            crate::OperationalSeverity::Warn,
+            "shadow-daemon",
+            "sinomo shadow daemon iroh proxy disabled",
+            None,
+            serde_json::json!({
+                "error": error.to_string(),
+            }),
+        );
     }
     if let Err(error) = start_shadow_daemon_status_publisher(&shadow_paths) {
         eprintln!("sinomo shadow daemon status publisher disabled: {error}");
+        crate::append_operational_log_best_effort(
+            &shadow_paths,
+            crate::OperationalSeverity::Warn,
+            "shadow-daemon",
+            "sinomo shadow daemon status publisher disabled",
+            None,
+            serde_json::json!({
+                "error": error.to_string(),
+            }),
+        );
     }
     if let Err(error) = complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths) {
         eprintln!("sinomo shadow daemon rollout finalization publish failed: {error}");
+        crate::append_operational_log_best_effort(
+            &shadow_paths,
+            crate::OperationalSeverity::Warn,
+            "shadow-daemon",
+            "sinomo shadow daemon rollout finalization publish failed",
+            None,
+            serde_json::json!({
+                "error": error.to_string(),
+            }),
+        );
     }
 
     let mut supervised_main: Option<Child> = None;
@@ -565,6 +662,19 @@ where
                     &options.host,
                     options.port,
                 )?;
+                crate::append_operational_event_best_effort(
+                    &shadow_paths,
+                    crate::OperationalSeverity::Info,
+                    "shadow-daemon",
+                    "rollout.stage.accepted",
+                    "candidate main became healthy; promoting shadow main rollout",
+                    Some(&pending.activation.requested_at),
+                    serde_json::json!({
+                        "source": pending.activation.source,
+                        "requested_at": pending.activation.requested_at,
+                        "main_binary": main_binary.display().to_string(),
+                    }),
+                );
                 break;
             } else if Instant::now() >= pending.deadline {
                 let detail = "candidate main did not become healthy before rollout timeout";
@@ -576,6 +686,19 @@ where
                     recover_failed_shadow_main_rollout(&rollout_paths, pending, detail, None)?;
                 main_options = pending.main_options.clone();
                 supervised_main = spawn_main_daemon_process(&main_binary, &main_options).ok();
+                crate::append_operational_event_best_effort(
+                    &shadow_paths,
+                    crate::OperationalSeverity::Error,
+                    "shadow-daemon",
+                    "rollout.stage.failed",
+                    detail,
+                    Some(&pending.activation.requested_at),
+                    serde_json::json!({
+                        "source": pending.activation.source,
+                        "requested_at": pending.activation.requested_at,
+                        "recovered_main_binary": main_binary.display().to_string(),
+                    }),
+                );
                 pending_rollout = None;
             }
         }
@@ -600,12 +723,38 @@ where
                     supervised_main = Some(child);
                     supervised_main_started_at = Some(Instant::now());
                     main_restart_backoff.clear_schedule();
+                    crate::append_operational_event_best_effort(
+                        &shadow_paths,
+                        crate::OperationalSeverity::Info,
+                        "shadow-daemon",
+                        "daemon.supervision.main_started",
+                        "shadow daemon started supervised main",
+                        None,
+                        serde_json::json!({
+                            "main_binary": main_binary.display().to_string(),
+                            "main_host": main_options.host,
+                            "main_port": main_options.port,
+                        }),
+                    );
                 }
                 ShadowMainStart::StartFailed { detail } => {
                     let delay = main_restart_backoff.schedule_after_failure(Instant::now());
                     eprintln!(
                         "sinomo shadow daemon could not start supervised main: {detail}; retrying in {}ms",
                         delay.as_millis()
+                    );
+                    crate::append_operational_event_best_effort(
+                        &shadow_paths,
+                        crate::OperationalSeverity::Warn,
+                        "shadow-daemon",
+                        "daemon.supervision.main_start_failed",
+                        "shadow daemon could not start supervised main",
+                        None,
+                        serde_json::json!({
+                            "main_binary": main_binary.display().to_string(),
+                            "detail": detail,
+                            "retry_delay_ms": delay.as_millis(),
+                        }),
                     );
                 }
                 ShadowMainStart::Candidate {
@@ -620,6 +769,21 @@ where
                     pending_rollout = Some(monitor);
                     main_probe_status = DaemonProbeStatus::NotRunning;
                     last_main_probe = Instant::now() - shadow_main_probe_interval(true);
+                    crate::append_operational_event_best_effort(
+                        &shadow_paths,
+                        crate::OperationalSeverity::Info,
+                        "shadow-daemon",
+                        "rollout.stage.progress",
+                        "shadow daemon started candidate main",
+                        pending_rollout
+                            .as_ref()
+                            .map(|pending| pending.activation.requested_at.as_str()),
+                        serde_json::json!({
+                            "phase": "candidate-main-started",
+                            "main_binary": main_binary.display().to_string(),
+                            "source": pending_rollout.as_ref().map(|pending| pending.activation.source.as_str()),
+                        }),
+                    );
                 }
                 ShadowMainStart::Recovered {
                     child,
@@ -631,6 +795,19 @@ where
                     supervised_main = child;
                     supervised_main_started_at = supervised_main.as_ref().map(|_| Instant::now());
                     main_restart_backoff.clear_schedule();
+                    crate::append_operational_event_best_effort(
+                        &shadow_paths,
+                        crate::OperationalSeverity::Warn,
+                        "shadow-daemon",
+                        "daemon.supervision.main_recovered",
+                        "shadow daemon recovered supervised main after failed activation",
+                        None,
+                        serde_json::json!({
+                            "main_binary": main_binary.display().to_string(),
+                            "main_host": main_options.host,
+                            "main_port": main_options.port,
+                        }),
+                    );
                 }
             }
         }
@@ -662,6 +839,19 @@ where
                             supervised_main = None;
                             supervised_main_started_at = None;
                             main_restart_backoff.reset();
+                            crate::append_operational_event_best_effort(
+                                &shadow_paths,
+                                crate::OperationalSeverity::Info,
+                                "shadow-daemon",
+                                "rollout.stage.accepted",
+                                "candidate main was promoted after exit observation",
+                                Some(&pending.activation.requested_at),
+                                serde_json::json!({
+                                    "source": pending.activation.source,
+                                    "requested_at": pending.activation.requested_at,
+                                    "main_binary": main_binary.display().to_string(),
+                                }),
+                            );
                         }
                         PendingShadowMainExit::Recovered {
                             child,
@@ -674,6 +864,19 @@ where
                             supervised_main_started_at =
                                 supervised_main.as_ref().map(|_| Instant::now());
                             main_restart_backoff.clear_schedule();
+                            crate::append_operational_event_best_effort(
+                                &shadow_paths,
+                                crate::OperationalSeverity::Error,
+                                "shadow-daemon",
+                                "rollout.stage.failed",
+                                "candidate main exited during shadow rollout; recovered previous main",
+                                Some(&pending.activation.requested_at),
+                                serde_json::json!({
+                                    "source": pending.activation.source,
+                                    "requested_at": pending.activation.requested_at,
+                                    "recovered_main_binary": main_binary.display().to_string(),
+                                }),
+                            );
                         }
                     }
                     if shadow_reexec_request_path(&rollout_paths).exists() {
@@ -694,6 +897,17 @@ where
                         supervised_main_started_at = None;
                         main_restart_suppressed = false;
                         main_restart_backoff.clear_schedule();
+                        crate::append_operational_event_best_effort(
+                            &shadow_paths,
+                            crate::OperationalSeverity::Info,
+                            "shadow-daemon",
+                            "daemon.supervision.pending_activation",
+                            "supervised main exited for pending activation",
+                            None,
+                            serde_json::json!({
+                                "main_binary": main_binary.display().to_string(),
+                            }),
+                        );
                         thread::sleep(Duration::from_millis(200));
                         continue;
                     }
@@ -705,12 +919,35 @@ where
                             "sinomo shadow daemon supervised main crashed; retrying in {}ms",
                             delay.as_millis()
                         );
+                        crate::append_operational_event_best_effort(
+                            &shadow_paths,
+                            crate::OperationalSeverity::Warn,
+                            "shadow-daemon",
+                            "daemon.supervision.restart_scheduled",
+                            "supervised main exited; restart scheduled",
+                            None,
+                            serde_json::json!({
+                                "main_binary": main_binary.display().to_string(),
+                                "retry_delay_ms": delay.as_millis(),
+                            }),
+                        );
                     }
                     ShadowMainExit::Suppressed => {
                         supervised_main = None;
                         supervised_main_started_at = None;
                         main_restart_suppressed = true;
                         main_restart_backoff.reset();
+                        crate::append_operational_event_best_effort(
+                            &shadow_paths,
+                            crate::OperationalSeverity::Error,
+                            "shadow-daemon",
+                            "daemon.supervision.restart_suppressed",
+                            "supervised main exited too many times; restart suppressed",
+                            None,
+                            serde_json::json!({
+                                "main_binary": main_binary.display().to_string(),
+                            }),
+                        );
                     }
                 }
             }
@@ -746,17 +983,32 @@ where
         }
         #[cfg(not(unix))]
         {
-            spawn_shadow_for_cluster_rollout(
+            let (child, _) = spawn_shadow_for_cluster_rollout(
                 &target,
                 &installed_main_binary,
                 &main_options.host,
                 main_options.port,
                 &options.host,
                 options.port,
+                &rollout_paths,
             )?;
+            reap_detached_shadow_supervisor(child);
         }
     }
 
+    crate::append_operational_event_best_effort(
+        &shadow_paths,
+        crate::OperationalSeverity::Info,
+        "shadow-daemon",
+        "daemon.lifecycle.stopped",
+        "sinomo shadow daemon stopped",
+        None,
+        serde_json::json!({
+            "address": bind_address,
+            "pid": std::process::id(),
+            "main_binary": main_binary.display().to_string(),
+        }),
+    );
     Ok(())
 }
 
@@ -1823,6 +2075,7 @@ fn ensure_shadow_supervisor_running(
     deadline: Duration,
 ) -> Result<(), DaemonError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
     let overall_deadline = Instant::now() + deadline;
     loop {
         if matches!(
@@ -1838,13 +2091,16 @@ fn ensure_shadow_supervisor_running(
             main_port,
             shadow_host,
             shadow_port,
+            &rollout_paths,
         )
-        .and_then(|()| {
+        .and_then(|(child, diagnostics)| {
             wait_for_shadow_rollout_health(
                 data_dir,
                 shadow_host,
                 shadow_port,
                 Duration::from_secs(5),
+                child,
+                diagnostics,
             )
         });
         match attempt {
@@ -2426,10 +2682,27 @@ pub fn spawn_shadow_for_cluster_rollout(
     main_port: u16,
     shadow_host: &str,
     shadow_port: u16,
-) -> Result<(), DaemonError> {
+    rollout_paths: &SelfRolloutPaths,
+) -> Result<(Child, ShadowSupervisorDiagnostics), DaemonError> {
+    let logs_dir = rollout_paths.root.join("logs");
+    fs::create_dir_all(&logs_dir).map_err(|source| DaemonError::Io {
+        path: logs_dir.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let suffix = rollout_artifact_suffix();
+    let stdout_log = logs_dir.join(format!("shadow-supervisor-{suffix}.stdout.log"));
+    let stderr_log = logs_dir.join(format!("shadow-supervisor-{suffix}.stderr.log"));
+    let stdout = File::create(&stdout_log).map_err(|source| DaemonError::Io {
+        path: stdout_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let stderr = File::create(&stderr_log).map_err(|source| DaemonError::Io {
+        path: stderr_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
     let mut command = Command::new(shadow_binary);
     prepare_background_command(&mut command);
-    command
+    let child = command
         .args(["daemon", "shadow", "run"])
         .arg("--host")
         .arg(shadow_host)
@@ -2440,14 +2713,20 @@ pub fn spawn_shadow_for_cluster_rollout(
         .env(SHADOW_MAIN_PORT_ENV, main_port.to_string())
         .env(SHADOW_START_DELAY_MS_ENV, "0")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .map_err(|source| DaemonError::Io {
             path: shadow_binary.display().to_string(),
             detail: source.to_string(),
         })?;
-    Ok(())
+    Ok((
+        child,
+        ShadowSupervisorDiagnostics {
+            stdout_log,
+            stderr_log,
+        },
+    ))
 }
 
 pub fn wait_for_shadow_rollout_health(
@@ -2455,6 +2734,8 @@ pub fn wait_for_shadow_rollout_health(
     shadow_host: &str,
     shadow_port: u16,
     timeout: Duration,
+    mut child: Child,
+    diagnostics: ShadowSupervisorDiagnostics,
 ) -> Result<(), DaemonError> {
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let deadline = Instant::now() + timeout;
@@ -2463,14 +2744,64 @@ pub fn wait_for_shadow_rollout_health(
             probe_daemon_status(&shadow_paths, Duration::from_secs(2)),
             DaemonProbeStatus::Running(_)
         ) {
+            reap_detached_shadow_supervisor(child);
             return Ok(());
+        }
+        if let Some(status) = child.try_wait().map_err(|source| DaemonError::Io {
+            path: diagnostics.stderr_log.display().to_string(),
+            detail: format!("shadow supervisor exit probe failed: {source}"),
+        })? {
+            return Err(DaemonError::Network {
+                address: daemon_connect_address(shadow_host, shadow_port),
+                detail: shadow_supervisor_exit_detail(status, &diagnostics)?,
+            });
         }
         thread::sleep(Duration::from_millis(100));
     }
+    let _ = child.kill();
+    let _ = child.wait();
     Err(DaemonError::Network {
         address: daemon_connect_address(shadow_host, shadow_port),
-        detail: "rolled out shadow daemon did not become ready".to_string(),
+        detail: format!(
+            "rolled out shadow daemon did not become ready; stdout_log={} stderr_log={}",
+            diagnostics.stdout_log.display(),
+            diagnostics.stderr_log.display()
+        ),
     })
+}
+
+fn shadow_supervisor_exit_detail(
+    status: ExitStatus,
+    diagnostics: &ShadowSupervisorDiagnostics,
+) -> Result<String, DaemonError> {
+    let stderr_tail = read_tail_lossy(&diagnostics.stderr_log, ROLLOUT_DIAGNOSTIC_TAIL_BYTES)?;
+    let stdout_tail = read_tail_lossy(&diagnostics.stdout_log, ROLLOUT_DIAGNOSTIC_TAIL_BYTES)?;
+    Ok(format!(
+        "shadow supervisor exited before reporting healthy: {}; stdout_log={} stderr_log={} stdout_tail={:?} stderr_tail={:?}",
+        format_exit_status(status),
+        diagnostics.stdout_log.display(),
+        diagnostics.stderr_log.display(),
+        stdout_tail,
+        stderr_tail
+    ))
+}
+
+fn format_exit_status(status: ExitStatus) -> String {
+    #[cfg(unix)]
+    {
+        if let Some(signal) = status.signal() {
+            return format!("signal={signal}");
+        }
+    }
+    format!("exit_code={:?}", status.code())
+}
+
+fn reap_detached_shadow_supervisor(mut child: Child) {
+    let _ = thread::Builder::new()
+        .name("sinomo-shadow-reaper".to_string())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn daemon_data_dir(paths: &DaemonPaths) -> Result<&Path, DaemonError> {

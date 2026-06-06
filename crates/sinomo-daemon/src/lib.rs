@@ -6,6 +6,7 @@ mod dfs;
 mod error;
 mod idle_stats;
 mod install;
+mod observe;
 mod paths;
 mod process;
 mod rollout;
@@ -125,6 +126,15 @@ pub use install::{
 };
 #[cfg(windows)]
 pub use install::{UserPathUpdate, ensure_windows_user_path_contains};
+pub use observe::{
+    OPERATIONAL_EVENTS_LOCK_RELATIVE_PATH, OPERATIONAL_EVENTS_RELATIVE_PATH,
+    OPERATIONAL_JSONL_MAX_BYTES, OPERATIONAL_JSONL_RETAINED_FILES,
+    OPERATIONAL_LOG_LOCK_RELATIVE_PATH, OPERATIONAL_LOG_RELATIVE_PATH, OperationalEventQuery,
+    OperationalEventRecord, OperationalLogQuery, OperationalLogRecord, OperationalSeverity,
+    append_operational_event, append_operational_event_best_effort, append_operational_log,
+    append_operational_log_best_effort, operational_events_path, operational_logs_path,
+    read_operational_events, read_operational_logs,
+};
 pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
 pub use process::{
     CandidateMainDiagnostics, main_exit_observation_from_status, prepare_background_command,

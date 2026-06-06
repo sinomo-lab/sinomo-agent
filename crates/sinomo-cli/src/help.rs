@@ -9,7 +9,9 @@ pub fn print_usage() {
     println!("  sinomo uninstall");
     println!("  sinomo daemon");
     println!("  sinomo rollout");
-    println!("  sinomo module");
+    for command in cli_command_registry().metadata() {
+        println!("  sinomo {}", command.name);
+    }
     println!("  sinomo dfs");
     println!("  sinomo sandbox");
     println!("  sinomo models");
@@ -165,30 +167,6 @@ pub(super) fn print_rollout_help() {
     );
     println!("  sinomo rollout status");
     println!("      Show source, binary, and rollout state paths.");
-}
-
-pub(super) fn print_module_help() {
-    println!("Module:");
-    println!("  sinomo module");
-    println!("      Show module commands.");
-    println!("  sinomo module help");
-    println!("      Show module commands.");
-    println!(
-        "  sinomo module native-dylib activate [--module <module-id>] [--artifact <artifact-id>] [--interface <version>] [--cache-key <path-key>] [--library-name <file-name>] [--source <text>] <library>"
-    );
-    println!(
-        "      Install a trusted native module into the content-addressed local cache and activate it from descriptor metadata."
-    );
-    println!("  sinomo module native-dylib unload --module <module-id>");
-    println!(
-        "      Remove node-local native module activation state and best-effort release a cached native handle."
-    );
-    println!(
-        "  sinomo module wasix activate [--artifact <artifact-id>] [--library-name <file-name>] [--source <text>] <library>"
-    );
-    println!("      Activate the trusted WASIX sandbox runtime module as module.sandbox.wasix.");
-    println!("  sinomo module wasix unload");
-    println!("      Unload the active trusted WASIX sandbox runtime module state.");
 }
 
 pub(super) fn print_dfs_help() {

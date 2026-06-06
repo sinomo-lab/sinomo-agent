@@ -280,10 +280,35 @@ pub fn run_daemon_control_loop(
     let listener = sinomo_network::DaemonControlListener::bind(&bind_address)?;
     listener.set_nonblocking(false)?;
     println!("sinomo {label} listening on {bind_address}");
+    crate::append_operational_event_best_effort(
+        &paths,
+        crate::OperationalSeverity::Info,
+        "daemon-control",
+        "daemon.lifecycle.started",
+        format!("sinomo {label} listening on {bind_address}"),
+        None,
+        serde_json::json!({
+            "label": label,
+            "address": bind_address,
+            "pid": std::process::id(),
+            "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
+        }),
+    );
     if let Err(error) =
         start_daemon_iroh_proxy_if_clustered(&paths, &options, cluster.as_ref(), label)
     {
         eprintln!("sinomo {label} iroh proxy disabled: {error}");
+        crate::append_operational_log_best_effort(
+            &paths,
+            crate::OperationalSeverity::Warn,
+            "daemon-control",
+            format!("sinomo {label} iroh proxy disabled"),
+            None,
+            serde_json::json!({
+                "label": label,
+                "error": error.to_string(),
+            }),
+        );
     }
 
     if label == "daemon" {
@@ -415,6 +440,19 @@ pub fn run_daemon_control_loop(
             }
         }
     }
+    crate::append_operational_event_best_effort(
+        &paths,
+        crate::OperationalSeverity::Info,
+        "daemon-control",
+        "daemon.lifecycle.stopped",
+        format!("sinomo {label} stopped"),
+        None,
+        serde_json::json!({
+            "label": label,
+            "address": bind_address,
+            "pid": std::process::id(),
+        }),
+    );
     Ok(())
 }
 

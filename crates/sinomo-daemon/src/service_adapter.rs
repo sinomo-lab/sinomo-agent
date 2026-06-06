@@ -188,6 +188,17 @@ impl Service for DaemonControlService {
                 }
                 DAEMON_SHUTDOWN_ROUTE => {
                     let _: () = request.decode_body()?;
+                    crate::append_operational_event_best_effort(
+                        &paths,
+                        crate::OperationalSeverity::Info,
+                        "daemon-control",
+                        "daemon.lifecycle.shutdown_requested",
+                        "daemon shutdown requested",
+                        None,
+                        serde_json::json!({
+                            "route": DAEMON_SHUTDOWN_ROUTE,
+                        }),
+                    );
                     (
                         ObjectRpcResponse::encode_body(
                             DAEMON_SHUTDOWN_ROUTE,
@@ -612,7 +623,10 @@ fn daemon_service_registry(
     paths: &DaemonPaths,
     authenticated: &AuthenticatedDaemonCommand,
 ) -> ServiceRegistry {
-    let builder: ServiceRegistryBuilder = register_dfs_services(ServiceRegistry::builder());
+    let mut builder: ServiceRegistryBuilder = register_dfs_services(ServiceRegistry::builder());
+    if observe_module_should_register(paths) {
+        builder = sinomo_observe::register_services(builder);
+    }
     let config_registry = daemon_config_registry();
     let builder = register_config_services(builder, config_registry);
     let builder = register_rollout_services(builder)
@@ -639,6 +653,13 @@ fn daemon_service_registry(
         }),
     )
     .build()
+}
+
+fn observe_module_should_register(paths: &DaemonPaths) -> bool {
+    daemon_data_dir_path(paths)
+        .ok()
+        .and_then(|data_dir| sinomo_observe::observe_module_enabled(&data_dir).ok())
+        .unwrap_or(true)
 }
 
 fn daemon_config_registry() -> ConfigRegistry {
@@ -779,6 +800,37 @@ fn dispatch_via_registry(
 mod tests {
     use super::*;
     use sinomo_kv::{InProcessKvStore, KvEntry, KvRevision, KvVersion};
+
+    #[test]
+    fn observe_service_registration_tracks_native_rust_enablement() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-observe-module-toggle-{}",
+            std::process::id()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let authenticated = AuthenticatedDaemonCommand {
+            command: "test".to_string(),
+            signer: DaemonSignerAuthority::Local,
+            signer_node_id: "node_local".to_string(),
+            signer_public_key: "local".to_string(),
+        };
+
+        let registry = daemon_service_registry(&paths, &authenticated);
+        assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
+
+        sinomo_observe::set_observe_module_enabled(&root, false, "test", "disable observe")
+            .expect("disable observe");
+        let registry = daemon_service_registry(&paths, &authenticated);
+        assert!(!registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
+
+        sinomo_observe::set_observe_module_enabled(&root, true, "test", "enable observe")
+            .expect("enable observe");
+        let registry = daemon_service_registry(&paths, &authenticated);
+        assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn cluster_kv_snapshot_response_rejects_oversized_body_as_rpc_error() {

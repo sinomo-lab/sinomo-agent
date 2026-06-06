@@ -30,6 +30,10 @@ pub enum CliError {
     Parse {
         detail: String,
     },
+    ExternalCommand {
+        command: String,
+        detail: String,
+    },
     Io {
         path: String,
         detail: String,
@@ -271,6 +275,15 @@ impl From<sinomo_runtime::config::ConfigError> for CliError {
     }
 }
 
+impl From<CliParseError> for CliError {
+    fn from(error: CliParseError) -> Self {
+        match error {
+            CliParseError::Usage => Self::Usage,
+            CliParseError::Parse { detail } => Self::Parse { detail },
+        }
+    }
+}
+
 impl From<KvError> for CliError {
     fn from(error: KvError) -> Self {
         Self::Kv(error)
@@ -493,6 +506,9 @@ impl std::fmt::Display for CliError {
                 write!(formatter, "{artifact} has not been written")
             }
             Self::Parse { detail } => write!(formatter, "failed to parse command: {detail}"),
+            Self::ExternalCommand { command, detail } => {
+                write!(formatter, "command `{command}` failed: {detail}")
+            }
             Self::Io { path, detail } => write!(formatter, "filesystem error at {path}: {detail}"),
             Self::Json { path, detail } => write!(formatter, "json error at {path}: {detail}"),
             Self::LocalData(error) => write!(formatter, "{error}"),

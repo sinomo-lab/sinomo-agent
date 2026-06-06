@@ -5817,6 +5817,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-cli-registry"
+version = "0.1.0"
+
+[[package]]
 name = "sinomo-config"
 version = "0.1.0"
 dependencies = [
@@ -5865,6 +5869,7 @@ dependencies = [
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-observe",
  "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
@@ -6086,8 +6091,10 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sinomo-cli-registry",
  "sinomo-core",
  "sinomo-events",
+ "sinomo-local",
  "sinomo-module-api",
  "sinomo-node",
  "sinomo-object",
@@ -6153,6 +6160,25 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "sinomo-observe"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sinomo-cli-registry",
+ "sinomo-core",
+ "sinomo-local",
+ "sinomo-module",
+ "sinomo-network",
+ "sinomo-service",
+ "sinomo-storage",
+ "thiserror 2.0.18",
+ "time",
+ "tokio",
 ]
 
 [[package]]
@@ -6222,6 +6248,7 @@ name = "sinomo-runtime"
 version = "0.1.0"
 dependencies = [
  "sinomo-api",
+ "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
  "sinomo-daemon",
@@ -6237,6 +6264,7 @@ dependencies = [
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-observe",
  "sinomo-policy",
  "sinomo-registry",
  "sinomo-rollout",

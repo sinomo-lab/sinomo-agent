@@ -358,6 +358,12 @@ pub fn authorize_authenticated_daemon_command(
         command if command == daemon_rpc_command(ROLLOUT_CLEAR_STATUS_ROUTE) => {
             authenticated.signer.can_run_admin_command()
         }
+        command
+            if command == daemon_rpc_command(sinomo_observe::OBSERVE_EVENTS_ROUTE)
+                || command == daemon_rpc_command(sinomo_observe::OBSERVE_LOGS_ROUTE) =>
+        {
+            authenticated.signer.can_run_local_command()
+        }
         command if command == daemon_rpc_command(sinomo_dfs::DFS_EXPOSE_CONFIG_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }

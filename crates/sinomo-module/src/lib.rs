@@ -1,7 +1,12 @@
 //! Module registry, routing, loader state, and native module host glue.
 
+mod cli;
 mod native_host;
 
+pub use cli::{
+    ModuleCliCommandConfig, ModuleCliCommandHandler, ModuleNativeRustToggleTarget,
+    ModuleWasixCliConfig, module_cli_command_handler,
+};
 pub use native_host::*;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -133,6 +138,15 @@ pub struct NativeDylibModuleLoaderState {
     pub interface_version: String,
     pub activated_at: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustModuleRuntimeState {
+    pub module_id: ModuleId,
+    pub enabled: bool,
+    pub updated_at: String,
+    pub source: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -992,6 +1006,14 @@ pub fn native_dylib_module_loader_state_path(
     native_dylib_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
 }
 
+pub fn native_rust_module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join("native-rust")
+}
+
+pub fn native_rust_module_loader_state_path(data_dir_root: &Path, module_id: &ModuleId) -> PathBuf {
+    native_rust_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
+}
+
 pub fn module_lifecycle_dir(data_dir_root: &Path) -> PathBuf {
     data_dir_root.join("module").join("lifecycle")
 }
@@ -1070,6 +1092,55 @@ pub fn remove_native_dylib_module_loader_state(
         }
     }
     Ok(Some(state))
+}
+
+pub fn read_native_rust_module_runtime_state(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> Result<Option<NativeRustModuleRuntimeState>, ModuleLoaderStoreError> {
+    let path = native_rust_module_loader_state_path(data_dir_root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_object(&path).map(Some)
+}
+
+pub fn write_native_rust_module_runtime_state(
+    data_dir_root: &Path,
+    state: &NativeRustModuleRuntimeState,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let path = native_rust_module_loader_state_path(data_dir_root, &state.module_id);
+    write_object(&path, state)?;
+    Ok(path)
+}
+
+pub fn set_native_rust_module_enabled(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+    enabled: bool,
+    source: impl Into<String>,
+    reason: impl Into<String>,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let state = NativeRustModuleRuntimeState {
+        module_id: module_id.clone(),
+        enabled,
+        updated_at: module_loader_applied_at_now(),
+        source: source.into(),
+        reason: reason.into(),
+    };
+    write_native_rust_module_runtime_state(data_dir_root, &state)
+}
+
+pub fn native_rust_module_enabled(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+    default_enabled: bool,
+) -> Result<bool, ModuleLoaderStoreError> {
+    Ok(
+        read_native_rust_module_runtime_state(data_dir_root, module_id)?
+            .map(|state| state.enabled)
+            .unwrap_or(default_enabled),
+    )
 }
 
 pub fn read_module_unload_record(
@@ -2202,6 +2273,12 @@ pub fn register_storage_paths(
     layout.register_escape_path(
         "sinomo-module",
         StorageRing::R1,
+        "module/loader-state/native-rust",
+        "node-local native Rust module enablement records keyed by module id",
+    )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
         "module/cache/native-dylib",
         "content-addressed native dynamic-library module cache",
     )?;
@@ -2229,6 +2306,20 @@ pub fn register_storage_paths(
         .field("interface_version", "String")
         .field("activated_at", "String")
         .field("source", "String"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/loader-state/native-rust/example.sobj",
+        sinomo_storage::ObjectSchema::new(
+            "NativeRustModuleRuntimeState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("module_id", "ModuleId")
+        .field("enabled", "bool")
+        .field("updated_at", "String")
+        .field("source", "String")
+        .field("reason", "String"),
     )?;
     layout.register_sinomo_object(
         "sinomo-module",
@@ -2487,6 +2578,40 @@ mod tests {
             .expect("read unload record")
             .expect("record");
         assert_eq!(read_back, record);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn native_rust_module_enablement_overrides_default() {
+        let root = unique_temp("native-rust-enablement");
+        let module_id = ModuleId::from_legacy_named("module.observe").expect("module");
+
+        assert!(native_rust_module_enabled(&root, &module_id, true).expect("read default enabled"));
+        assert!(
+            !native_rust_module_enabled(&root, &module_id, false).expect("read default disabled")
+        );
+
+        let path = set_native_rust_module_enabled(
+            &root,
+            &module_id,
+            false,
+            "test",
+            "operator disabled observation",
+        )
+        .expect("write disabled");
+        assert_eq!(
+            path,
+            native_rust_module_loader_state_path(&root, &module_id)
+        );
+        assert!(!native_rust_module_enabled(&root, &module_id, true).expect("read disabled"));
+
+        let state = read_native_rust_module_runtime_state(&root, &module_id)
+            .expect("read state")
+            .expect("state");
+        assert_eq!(state.module_id, module_id);
+        assert!(!state.enabled);
+        assert_eq!(state.source, "test");
+
         let _ = fs::remove_dir_all(root);
     }
 

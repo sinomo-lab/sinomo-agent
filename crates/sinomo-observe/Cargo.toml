@@ -1,0 +1,29 @@
+[package]
+name = "sinomo-observe"
+version.workspace = true
+description = "Sinomo operational observation module"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+fs2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sinomo-cli-registry = { path = "../sinomo-cli-registry" }
+sinomo-core = { path = "../sinomo-core" }
+sinomo-local = { path = "../sinomo-local" }
+sinomo-module = { path = "../sinomo-module" }
+sinomo-network = { path = "../sinomo-network" }
+sinomo-service = { path = "../sinomo-service" }
+sinomo-storage = { path = "../sinomo-storage" }
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.44", features = ["macros", "rt"] }

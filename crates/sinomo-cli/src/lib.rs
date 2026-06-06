@@ -98,6 +98,9 @@ use sinomo_pytorch::{
     PytorchDevice, PytorchMode, RemotePytorchRuntime, RemotePytorchRuntimeConfig,
     is_loopback_http_endpoint,
 };
+use sinomo_runtime::cli_registry::{
+    CliCommandContext, CliCommandRegistry, CliParseError, RegisteredCliCommand,
+};
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
     ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
@@ -422,6 +425,32 @@ fn write_cli_output_bytes(stream: CliOutputStream, bytes: &[u8]) -> io::Result<(
     }
 }
 
+struct CliStdoutWriter;
+
+impl Write for CliStdoutWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        write_cli_stdout_bytes(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct CliStderrWriter;
+
+impl Write for CliStderrWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        write_cli_stderr_bytes(bytes)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 pub fn execute_cli_command_captured(args: &[String]) -> CapturedCliCommand {
     let execution = run_cli_command_with_capture(args);
     let status = match execution.result {
@@ -721,6 +750,7 @@ pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
     match command {
         CliCommand::Evolve(_) => true,
         CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
+        CliCommand::Registered(command) => command.policy().requires_cluster_state,
         _ => false,
     }
 }
@@ -732,6 +762,7 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
         | CliCommand::Providers(_)
         | CliCommand::Agent(_) => true,
         CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
+        CliCommand::Registered(command) => command.policy().supports_degraded_local_mode,
         _ => false,
     }
 }
@@ -787,7 +818,7 @@ pub(crate) struct CliRuntimeOptions {
     pub(crate) force_local: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct CliInvocation {
     pub(crate) command: CliCommand,
     pub(crate) options: CliRuntimeOptions,
@@ -819,7 +850,7 @@ pub(crate) fn with_cli_force_local_mode<T>(force_local: bool, f: impl FnOnce() -
     f()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) enum CliCommand {
     Tui,
     Help,
@@ -830,13 +861,32 @@ pub(crate) enum CliCommand {
     Evolve(EvolveCliCommand),
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
-    Module(ModuleCliCommand),
     Dfs(DfsCliCommand),
     Sandbox(SandboxCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Agent(AgentCliCommand),
+    Registered(RegisteredCliCommand),
     Usage(UsageOptions),
+}
+
+fn cli_command_registry() -> CliCommandRegistry {
+    let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
+        .with_toggleable_native_rust_module_name(
+            sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+            "operational observation module",
+        )
+        .expect("observe module id is valid")
+        .with_wasix(sinomo_runtime::module::ModuleWasixCliConfig {
+            module_id: sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID,
+            interface_version:
+                sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION,
+        });
+    CliCommandRegistry::new()
+        .register(sinomo_runtime::module::module_cli_command_handler(
+            module_config,
+        ))
+        .register(sinomo_runtime::observe::observe_cli_command_handler())
 }
 
 pub(crate) fn parse_cli_invocation(args: &[String]) -> Result<CliInvocation, CliError> {
@@ -882,9 +932,6 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         Some((command, rest)) if command == "rollout" => {
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
         }
-        Some((command, rest)) if command == "module" => {
-            Ok(CliCommand::Module(parse_module_command(rest)?))
-        }
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
         Some((command, rest)) if command == "sandbox" => {
             Ok(CliCommand::Sandbox(parse_sandbox_command(rest)?))
@@ -901,7 +948,10 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         Some((command, rest)) if command == "usage" => {
             Ok(CliCommand::Usage(parse_usage_options(rest)?))
         }
-        _ => Err(CliError::Usage),
+        _ => match cli_command_registry().parse(args)? {
+            Some(command) => Ok(CliCommand::Registered(command)),
+            None => Err(CliError::Usage),
+        },
     }
 }
 
@@ -1394,12 +1444,23 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Evolve(command) => run_evolve_cli_command(command),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
-        CliCommand::Module(command) => run_module_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Sandbox(command) => run_sandbox_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
+        CliCommand::Registered(command) => {
+            let command_name = command.name().to_string();
+            let mut stdout = CliStdoutWriter;
+            let mut stderr = CliStderrWriter;
+            let mut context = CliCommandContext::new(&mut stdout, &mut stderr);
+            command
+                .run(&mut context)
+                .map_err(|error| CliError::ExternalCommand {
+                    command: command_name,
+                    detail: error.to_string(),
+                })
+        }
         CliCommand::Usage(options) => usage(options),
     }
 }
