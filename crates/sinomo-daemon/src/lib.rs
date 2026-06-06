@@ -73,7 +73,7 @@ pub use cluster::{
     start_shadow_daemon_status_publisher, sync_cluster_connectivity_records_to_kv,
     sync_cluster_network_info_to_kv, sync_cluster_node_status_to_kv, sync_cluster_state_to_kv,
     update_cluster_node_role, update_cluster_raft_role, write_cluster_kv_snapshot_if_changed,
-    write_local_cluster_state,
+    write_imported_cluster_kv_snapshot_if_changed, write_local_cluster_state,
 };
 pub use control::{
     DAEMON_CLIENT_READ_TIMEOUT, DAEMON_CLIENT_WRITE_TIMEOUT, DAEMON_COMMAND_MAX_BYTES,

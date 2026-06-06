@@ -162,6 +162,12 @@ impl ObjectRpcResponse {
                     detail: detail.to_string(),
                 });
             }
+            if matches!(
+                detail.as_str(),
+                "device authorization was denied" | "network authorization was denied"
+            ) {
+                return Err(NetworkError::AuthDenied);
+            }
             return Err(NetworkError::Serialization { detail });
         }
         Ok(())

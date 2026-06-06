@@ -2,6 +2,7 @@ use super::*;
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::InProcessNetwork;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug)]
@@ -80,6 +81,42 @@ impl NetworkTransport for FailingSendTransport {
     }
 }
 
+#[derive(Clone)]
+struct CountingEmptyTransport {
+    local_node_id: NodeId,
+    drain_calls: Arc<Mutex<usize>>,
+}
+
+impl CountingEmptyTransport {
+    fn new(local_node_id: NodeId, drain_calls: Arc<Mutex<usize>>) -> Self {
+        Self {
+            local_node_id,
+            drain_calls,
+        }
+    }
+}
+
+impl NetworkTransport for CountingEmptyTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    fn send(&mut self, target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
+        Err(NetworkError::UnknownNode {
+            node_id: target_node_id.clone(),
+        })
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
+        *self.drain_calls.lock().expect("drain calls") += 1;
+        Ok(Vec::new())
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(0))
+    }
+}
+
 fn file_system(owner: NodeId) -> DfsFileSystem {
     DfsFileSystem {
         file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
@@ -112,6 +149,53 @@ fn file_metadata(owner: NodeId) -> DfsObjectMetadata {
         created_by_event_id: None,
         last_modified_by_event_id: None,
     }
+}
+
+#[test]
+fn local_owned_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
+    let node = NodeId::from_legacy_named("node_local_owned_empty_hint").expect("node");
+    let drain_calls = Arc::new(Mutex::new(0));
+    let transport = CountingEmptyTransport::new(node, drain_calls.clone());
+    let mut dfs = LocalOwnedDfsService::new(transport);
+
+    assert!(
+        dfs.process_incoming()
+            .expect("process empty incoming")
+            .is_empty()
+    );
+    assert_eq!(
+        *drain_calls.lock().expect("drain calls"),
+        0,
+        "exact empty inbound hints should avoid LocalOwned DFS mailbox drains"
+    );
+}
+
+#[test]
+fn networked_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-dfs-empty-inbound-hint-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let node = NodeId::from_legacy_named("node_networked_empty_hint").expect("node");
+    let drain_calls = Arc::new(Mutex::new(0));
+    let transport = CountingEmptyTransport::new(node, drain_calls.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(transport, content);
+
+    assert!(
+        dfs.process_incoming()
+            .expect("process empty incoming")
+            .is_empty()
+    );
+    assert_eq!(
+        *drain_calls.lock().expect("drain calls"),
+        0,
+        "exact empty inbound hints should avoid Networked DFS mailbox drains"
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

@@ -133,12 +133,14 @@ pub fn send_daemon_rpc_to_endpoint(
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(&endpoint.address));
         };
+        let direct_timeout =
+            crate::cluster::cluster_endpoint_fair_command_timeout(endpoint, remaining, 1);
         match sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             endpoint,
             &command,
             Some(&signed),
             request,
-            remaining,
+            direct_timeout,
         ) {
             Ok(response) => return Ok(response),
             Err(direct_error) => {
@@ -539,7 +541,6 @@ fn send_cluster_join_registration_single_connection(
     );
     configure_daemon_control_stream_deadline(&stream, &deadline, false, true)?;
     sinomo_network::write_object_frame_blocking(&mut stream, &register_control)?;
-    stream.shutdown_write();
     let response = read_join_rpc_response(
         &mut stream,
         address,

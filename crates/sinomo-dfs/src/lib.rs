@@ -1243,6 +1243,14 @@ impl<T: NetworkTransport> LocalOwnedDfsService<T> {
     }
 
     pub fn process_incoming(&mut self) -> Result<Vec<DfsServiceEvent>, DfsError> {
+        if self
+            .transport
+            .pending_incoming_count()
+            .map_err(DfsError::from_network)?
+            == Some(0)
+        {
+            return Ok(Vec::new());
+        }
         let inbound_frames = self
             .transport
             .drain_incoming()
@@ -3892,17 +3900,30 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &self,
         object_id: &DfsObjectId,
     ) -> Result<bool, DfsError> {
+        Ok(self
+            .next_pending_remote_read_retry_for_current_object(object_id)?
+            .is_some_and(|next_retry_at| next_retry_at > Instant::now()))
+    }
+
+    pub(crate) fn next_pending_remote_read_retry_for_current_object(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<Option<Instant>, DfsError> {
         let object = self.current_read_object_metadata(object_id)?;
-        Ok(self.pending_reads.values().any(|pending| {
-            pending.object_id == *object_id
-                && pending.version == object.version
-                && pending.content_hash == object.content_hash
-                && pending.content_size_bytes == object.content_size_bytes
-                && pending.range_offset.is_none()
-                && pending.range_max_bytes.is_none()
-                && object.current_locations.contains(&pending.target_node_id)
-                && pending.next_retry_at > Instant::now()
-        }))
+        Ok(self
+            .pending_reads
+            .values()
+            .filter(|pending| {
+                pending.object_id == *object_id
+                    && pending.version == object.version
+                    && pending.content_hash == object.content_hash
+                    && pending.content_size_bytes == object.content_size_bytes
+                    && pending.range_offset.is_none()
+                    && pending.range_max_bytes.is_none()
+                    && object.current_locations.contains(&pending.target_node_id)
+            })
+            .map(|pending| pending.next_retry_at)
+            .min())
     }
 
     fn pending_remote_read_for_object_target(
@@ -6137,6 +6158,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn process_incoming(&mut self) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         self.prune_idle_chunk_transfers();
+        if self
+            .transport
+            .pending_incoming_count()
+            .map_err(DfsError::from_network)?
+            == Some(0)
+        {
+            return Ok(Vec::new());
+        }
         let inbound_frames = self
             .transport
             .drain_incoming()

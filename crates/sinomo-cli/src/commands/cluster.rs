@@ -749,6 +749,7 @@ pub(crate) fn cluster_join_with_paths(
         &shadow_options,
         timestamp,
     )?;
+    daemon_write_local_cluster_state(paths, &state)?;
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
     daemon_write_local_cluster_state(paths, &state)?;
     println!("cluster join recorded: {}", state.cluster_id);
@@ -806,6 +807,7 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         invite,
         DAEMON_JOIN_TIMEOUT,
         IROH_DAEMON_JOIN_TIMEOUT,
+        paths,
     )?;
     if let Some(snapshot) = reconciliation.kv_snapshot
         && let Some(paths) = paths
@@ -873,14 +875,26 @@ pub(crate) fn cluster_status() -> Result<(), CliError> {
 
 pub(crate) fn cluster_health() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
+    if let Some(status) = default_main_daemon_status()?
+        && let Ok(rows) =
+            daemon_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
+    {
+        print_cluster_health_rows(rows);
+        return Ok(());
+    }
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
     let rows = cluster_health_rows_for_cli(&paths, &state)?;
+    print_cluster_health_rows(rows);
+    Ok(())
+}
+
+fn print_cluster_health_rows(rows: Vec<ClusterHealthRow>) {
     if rows.is_empty() {
         println!(
             "node\tprocess\trole\tmember\thealth\tversion\tcommit\tplatform\tpid\taddress\tlast-seen\trollout"
         );
-        return Ok(());
+        return;
     }
     println!(
         "node\tprocess\trole\tmember\thealth\tversion\tcommit\tplatform\tpid\taddress\tlast-seen\trollout"
@@ -924,7 +938,6 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
             rollout
         );
     }
-    Ok(())
 }
 
 pub(crate) fn format_node_availability(availability: &ClusterNodeAvailability) -> &'static str {
@@ -1244,7 +1257,7 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
     else {
         return Ok(());
     };
-    write_cluster_kv_snapshot(paths, &snapshot)
+    write_imported_cluster_kv_snapshot(paths, &snapshot)
 }
 
 #[cfg(test)]
@@ -1265,6 +1278,15 @@ pub(crate) fn write_cluster_kv_snapshot(
     snapshot: &KvSnapshot,
 ) -> Result<(), CliError> {
     daemon_write_cluster_kv_snapshot_if_changed(paths, snapshot)
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+pub(crate) fn write_imported_cluster_kv_snapshot(
+    paths: &ClusterPaths,
+    snapshot: &KvSnapshot,
+) -> Result<(), CliError> {
+    daemon_write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)
         .map(|_| ())
         .map_err(Into::into)
 }

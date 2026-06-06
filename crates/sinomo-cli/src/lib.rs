@@ -162,6 +162,7 @@ use sinomo_runtime::daemon::{
     wait_for_local_shadow_rollout_completion as daemon_wait_for_local_shadow_rollout_completion,
     wait_for_main_daemon_health as daemon_wait_for_main_daemon_health,
     write_cluster_kv_snapshot_if_changed as daemon_write_cluster_kv_snapshot_if_changed,
+    write_imported_cluster_kv_snapshot_if_changed as daemon_write_imported_cluster_kv_snapshot_if_changed,
     write_install_boot_entries as daemon_write_install_boot_entries,
     write_local_cluster_state as daemon_write_local_cluster_state,
 };

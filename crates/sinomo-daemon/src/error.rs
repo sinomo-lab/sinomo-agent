@@ -59,6 +59,7 @@ impl From<sinomo_node::NodeIdentityError> for DaemonError {
 impl From<sinomo_network::NetworkError> for DaemonError {
     fn from(error: sinomo_network::NetworkError) -> Self {
         match error {
+            sinomo_network::NetworkError::AuthDenied => Self::AuthDenied,
             sinomo_network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             sinomo_network::NetworkError::ClusterReadOnly { detail } => {
                 Self::ClusterReadOnly { detail }

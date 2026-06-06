@@ -32,7 +32,7 @@ use sinomo_rollout::{
 use std::env;
 use std::fmt::Display;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -1306,7 +1306,26 @@ pub fn handle_daemon_rollout_binary_upload_chunk_request(
         })?;
     }
     let current_len = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    if request.offset != 0 && current_len != request.offset {
+    if current_len >= received_bytes {
+        if rollout_upload_existing_chunk_matches(&path, request.offset, &request.bytes)? {
+            return Ok(ClusterRolloutBinaryUploadChunkResponse {
+                accepted: true,
+                detail: format!(
+                    "already stored {} bytes for {}",
+                    request.bytes.len(),
+                    request.artifact_id
+                ),
+                received_bytes,
+            });
+        }
+        return Err(DaemonError::Parse {
+            detail: format!(
+                "rollout upload artifact {} already has different bytes at offset {}",
+                request.artifact_id, request.offset
+            ),
+        });
+    }
+    if current_len != request.offset {
         return Err(DaemonError::Parse {
             detail: format!(
                 "rollout upload artifact {} expected offset {}, current size is {current_len}",
@@ -1341,6 +1360,29 @@ pub fn handle_daemon_rollout_binary_upload_chunk_request(
         ),
         received_bytes,
     })
+}
+
+fn rollout_upload_existing_chunk_matches(
+    path: &Path,
+    offset: u64,
+    expected: &[u8],
+) -> Result<bool, DaemonError> {
+    let mut file = fs::File::open(path).map_err(|source| DaemonError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut existing = vec![0_u8; expected.len()];
+    file.read_exact(&mut existing)
+        .map_err(|source| DaemonError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    Ok(existing == expected)
 }
 
 pub fn handle_daemon_rollout_binary_upload_finalize_request(
@@ -2883,10 +2925,10 @@ mod tests {
             bytes: b"world".to_vec(),
         };
 
-        let response =
-            handle_daemon_rollout_binary_upload_chunk_request(&paths, first).expect("first chunk");
+        let response = handle_daemon_rollout_binary_upload_chunk_request(&paths, first.clone())
+            .expect("first chunk");
         assert_eq!(response.received_bytes, 6);
-        let response = handle_daemon_rollout_binary_upload_chunk_request(&paths, second)
+        let response = handle_daemon_rollout_binary_upload_chunk_request(&paths, second.clone())
             .expect("second chunk");
         assert_eq!(response.received_bytes, 11);
 
@@ -2894,6 +2936,98 @@ mod tests {
         let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
             .expect("upload path");
         assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello world");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rollout_binary_upload_chunks_accept_matching_duplicates_without_rewrite() {
+        let root = temp_rollout_test_root("binary-upload-duplicate-chunks");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).expect("daemon root");
+        let first = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: "upload-test".to_string(),
+            artifact_id: "binary".to_string(),
+            offset: 0,
+            total_bytes: 11,
+            bytes: b"hello ".to_vec(),
+        };
+        let second = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: "upload-test".to_string(),
+            artifact_id: "binary".to_string(),
+            offset: 6,
+            total_bytes: 11,
+            bytes: b"world".to_vec(),
+        };
+
+        handle_daemon_rollout_binary_upload_chunk_request(&paths, first.clone())
+            .expect("first chunk");
+        handle_daemon_rollout_binary_upload_chunk_request(&paths, second.clone())
+            .expect("second chunk");
+
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
+            .expect("upload path");
+        let before = fs::metadata(&uploaded).expect("uploaded metadata before duplicate");
+        thread::sleep(Duration::from_millis(20));
+
+        let duplicate_first = handle_daemon_rollout_binary_upload_chunk_request(&paths, first)
+            .expect("duplicate first chunk");
+        assert!(duplicate_first.accepted);
+        assert_eq!(duplicate_first.received_bytes, 6);
+        assert!(
+            duplicate_first.detail.contains("already stored"),
+            "duplicate responses should distinguish a no-op from a fresh write"
+        );
+        let duplicate_second = handle_daemon_rollout_binary_upload_chunk_request(&paths, second)
+            .expect("duplicate second chunk");
+        assert!(duplicate_second.accepted);
+        assert_eq!(duplicate_second.received_bytes, 11);
+
+        let after = fs::metadata(&uploaded).expect("uploaded metadata after duplicate");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            before.modified().ok(),
+            after.modified().ok(),
+            "matching duplicate chunks should not rewrite low-write-cycle storage"
+        );
+        assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello world");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rollout_binary_upload_chunks_reject_mismatched_overlaps() {
+        let root = temp_rollout_test_root("binary-upload-mismatched-overlap");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+        fs::create_dir_all(&paths.root).expect("daemon root");
+        let first = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: "upload-test".to_string(),
+            artifact_id: "binary".to_string(),
+            offset: 0,
+            total_bytes: 11,
+            bytes: b"hello ".to_vec(),
+        };
+        let mismatch = ClusterRolloutBinaryUploadChunkRequest {
+            upload_id: "upload-test".to_string(),
+            artifact_id: "binary".to_string(),
+            offset: 0,
+            total_bytes: 11,
+            bytes: b"HELLO ".to_vec(),
+        };
+
+        handle_daemon_rollout_binary_upload_chunk_request(&paths, first).expect("first chunk");
+        let error = handle_daemon_rollout_binary_upload_chunk_request(&paths, mismatch)
+            .expect_err("mismatched duplicate");
+        assert!(
+            error
+                .to_string()
+                .contains("already has different bytes at offset 0"),
+            "mismatched duplicate should be rejected without truncating: {error}"
+        );
+
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
+            .expect("upload path");
+        assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello ");
         fs::remove_dir_all(root).ok();
     }
 

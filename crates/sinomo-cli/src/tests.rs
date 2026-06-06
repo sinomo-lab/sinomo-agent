@@ -52,7 +52,7 @@ use super::{
     sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
     stage_rollout_main_activation, sync_cluster_state_to_kv, tui_default_daemon_status,
     uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
-    write_model_runtime_config_for_node, write_rollout_status,
+    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -6617,6 +6617,80 @@ fn cluster_network_expiration_keeps_local_owned_records() {
             .wal
             .exists(),
         "skipping local expiration must not append a raft delete transaction"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-imported-daemon-snapshot-defer-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let baseline = InProcessKvStore::new().snapshot();
+    sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &baseline)
+        .expect("write baseline snapshot");
+    let before_metadata = std::fs::metadata(&paths.kv_snapshot).expect("snapshot metadata");
+    let before_modified = before_metadata.modified().expect("snapshot mtime");
+
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_imported_snapshot_defer").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_imported_snapshot_defer").expect("node");
+    let now = OffsetDateTime::now_utc();
+    let info = sinomo_runtime::network::ClusterNetworkInfoRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        environment_id: "env_imported_snapshot_defer".to_string(),
+        observed_addresses: vec!["192.0.2.20:21353".to_string()],
+        endpoints: Vec::new(),
+        observed_at: now,
+        expires_at: now + time::Duration::hours(1),
+    };
+    let mut imported = InProcessKvStore::restore(baseline.clone());
+    imported
+        .put_serde(
+            sinomo_runtime::network::cluster_network_info_key(&node_id),
+            &info,
+            None,
+        )
+        .expect("volatile network info");
+    let imported = imported.snapshot();
+    assert!(
+        imported.revision > baseline.revision,
+        "test setup must create a newer imported daemon snapshot"
+    );
+
+    write_imported_cluster_kv_snapshot(&paths, &imported).expect("import daemon snapshot");
+
+    let after_metadata = std::fs::metadata(&paths.kv_snapshot).expect("snapshot metadata");
+    assert_eq!(
+        before_metadata.len(),
+        after_metadata.len(),
+        "volatile-only daemon snapshot imports should not rewrite a fresh materialized file"
+    );
+    assert_eq!(
+        before_modified,
+        after_metadata.modified().expect("snapshot mtime"),
+        "volatile-only daemon snapshot imports should leave the materialized file mtime untouched"
+    );
+    let cached =
+        sinomo_runtime::network::read_cluster_kv_snapshot(&paths).expect("cached snapshot");
+    assert_eq!(
+        cached.revision, baseline.revision,
+        "the materialized snapshot should remain a stale-but-fresh fallback until a structural change or checkpoint interval"
+    );
+    assert!(
+        cached
+            .get(&sinomo_runtime::network::cluster_network_info_key(&node_id))
+            .is_none(),
+        "deferred volatile network info should stay out of the materialized fallback"
     );
     std::fs::remove_dir_all(root).ok();
 }

@@ -1,18 +1,19 @@
 use crate::{
     AuthenticatedDaemonCommand, ClusterInviteChallengeRequest, ClusterNetworkMaintenance,
-    DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonDfsEndpointTransport, DaemonError,
-    DaemonLock, DaemonPaths, authenticate_daemon_control_request, cluster_health_rows,
-    cluster_paths_from_daemon_paths, create_cluster_invite_challenge_proof, daemon_connect_address,
-    daemon_paths_are_shadow, daemon_rpc_command, ensure_daemon_status_cluster,
-    ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
-    forward_cluster_invite_challenge_to_voter, handle_daemon_clear_rollout_status,
-    handle_daemon_cluster_invite_publish_request, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_watch_cancel_request, handle_daemon_cluster_kv_watch_drain_request,
-    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
-    handle_daemon_cluster_member_publish_request, handle_daemon_cluster_relay_request,
-    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
-    read_daemon_status, run_daemon_dfs_maintenance_tick, start_daemon_iroh_proxy_if_clustered,
+    DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus,
+    DaemonDfsEndpointTransport, DaemonError, DaemonLock, DaemonPaths,
+    authenticate_daemon_control_request, cluster_health_rows, cluster_paths_from_daemon_paths,
+    create_cluster_invite_challenge_proof, daemon_connect_address, daemon_paths_are_shadow,
+    daemon_rpc_command, ensure_daemon_status_cluster, ensure_default_distributed_dfs,
+    ensure_default_local_dfs_expose, forward_cluster_invite_challenge_to_voter,
+    handle_daemon_clear_rollout_status, handle_daemon_cluster_invite_publish_request,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_range_prefix,
+    handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_watch_cancel_request,
+    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
+    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_member_publish_request,
+    handle_daemon_cluster_relay_request, handle_daemon_finalize_shadow_rollout,
+    prune_local_cluster_raft_uncommitted_tail, read_daemon_status, run_daemon_dfs_maintenance_tick,
+    start_daemon_iroh_proxy_if_clustered,
 };
 use sinomo_events::EventStore;
 use sinomo_node::NodeId;
@@ -20,6 +21,7 @@ use sinomo_rollout::{
     AppliedRolloutTransition, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
     ROLLOUT_RPC_CATEGORY, RolloutController, RolloutTelemetryAdvanceOptions,
     RolloutTelemetryAdvanceStatus, SelfRolloutPaths, read_rollout_status,
+    rollout_main_activation_path, rollout_shadow_finalize_path,
 };
 use sinomo_sandbox::SandboxFileSystem;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +31,7 @@ use std::sync::{Arc, mpsc};
 #[cfg(feature = "sandbox")]
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 pub const DAEMON_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -37,6 +39,8 @@ pub const DAEMON_CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
+pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
+    DAEMON_CLUSTER_PUBLISH_INTERVAL;
 pub(crate) const ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE: Duration = Duration::from_millis(200);
 
 // The sandbox concurrency tracker is only exercised by the sandbox-exec RPC
@@ -49,6 +53,15 @@ static SANDBOX_ACTIVE_EXECUTIONS: OnceLock<Mutex<SandboxActiveExecutions>> = Onc
 #[derive(Default)]
 struct SandboxActiveExecutions {
     counts: BTreeMap<(PathBuf, sinomo_sandbox::SandboxId), u64>,
+}
+
+fn background_dfs_maintenance_enabled() -> bool {
+    matches!(
+        std::env::var("SINOMO_ENABLE_BACKGROUND_DFS_MAINTENANCE")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 #[cfg(feature = "sandbox")]
@@ -199,6 +212,15 @@ where
             if is_cluster_join_register_request(&request) {
                 eprintln!("sinomo daemon client auth failed for {command}: {error}");
             }
+            if let Some(rpc_request) = request.rpc.as_ref()
+                && let Ok(response) = sinomo_network::ObjectRpcResponse::encode_error(
+                    rpc_request.route.clone(),
+                    DaemonError::AuthDenied.to_string(),
+                )
+            {
+                let _ = write_daemon_rpc_response_frame(stream, response);
+                let _ = stream.flush();
+            }
             stream.shutdown_both();
             return Ok(false);
         }
@@ -273,7 +295,7 @@ pub fn run_daemon_control_loop(
     if let Err(error) = prune_local_cluster_raft_uncommitted_tail(&paths) {
         eprintln!("sinomo {label} cluster raft startup repair skipped: {error}");
     }
-    if label == "daemon" {
+    if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
         ensure_default_local_dfs_expose(&paths)?;
     }
     let bind_address = format!("{}:{}", options.host, options.port);
@@ -311,7 +333,7 @@ pub fn run_daemon_control_loop(
         );
     }
 
-    if label == "daemon" {
+    if label == "daemon" && crate::dfs::default_distributed_dfs_enabled() {
         let bootstrap_paths = paths.clone();
         let bootstrap_options = options.clone();
         let bootstrap_label = label.to_string();
@@ -343,9 +365,14 @@ pub fn run_daemon_control_loop(
         .spawn(move || {
             let mut cluster_network =
                 ClusterNetworkMaintenance::with_idle_stats(maintenance_idle_stats);
+            let dfs_maintenance_enabled = background_dfs_maintenance_enabled();
             let maintenance_started = std::time::Instant::now();
             let mut last_dfs_maintenance = maintenance_started
-                .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL)
+                .checked_sub(if dfs_maintenance_enabled {
+                    DAEMON_DFS_MAINTENANCE_INTERVAL
+                } else {
+                    Duration::ZERO
+                })
                 .unwrap_or(maintenance_started);
             let mut last_rollout_telemetry = maintenance_started
                 .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
@@ -365,13 +392,15 @@ pub fn run_daemon_control_loop(
                 if let Err(error) = cluster_network.tick(&maintenance_paths, &maintenance_options) {
                     eprintln!("sinomo {maintenance_label} cluster network tick failed: {error}");
                 }
-                if maintenance_label == "daemon"
+                if dfs_maintenance_enabled
+                    && maintenance_label == "daemon"
                     && last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
                     && let Err(error) = run_daemon_dfs_maintenance_tick(&maintenance_paths)
                 {
                     eprintln!("sinomo {maintenance_label} DFS maintenance tick failed: {error}");
                 }
-                if maintenance_label == "daemon"
+                if dfs_maintenance_enabled
+                    && maintenance_label == "daemon"
                     && last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
                 {
                     last_dfs_maintenance = std::time::Instant::now();
@@ -391,7 +420,16 @@ pub fn run_daemon_control_loop(
                     }
                     last_rollout_telemetry = std::time::Instant::now();
                 }
-                thread::sleep(DAEMON_CLUSTER_TICK_INTERVAL);
+                let sleep_started = Instant::now();
+                let shadow_finalization_due = (maintenance_label == "daemon")
+                    .then(|| shadow_rollout_finalization_poll_due_in(&maintenance_paths));
+                thread::sleep(daemon_maintenance_sleep_duration(
+                    sleep_started,
+                    cluster_network.next_due_duration(sleep_started),
+                    last_dfs_maintenance,
+                    last_rollout_telemetry,
+                    shadow_finalization_due,
+                ));
             }
         })
         .map_err(|source| DaemonError::Io {
@@ -612,14 +650,22 @@ pub fn handle_daemon_connection(
                 Ok(false)
             }
             command if command == daemon_rpc_command(sinomo_network::CLUSTER_HEALTH_ROUTE) => {
-                require_daemon_rpc_request(
+                let request = require_daemon_rpc_request(
                     rpc_request,
                     sinomo_network::CLUSTER_HEALTH_ROUTE,
                     sinomo_network::CLUSTER_KV_RPC_CATEGORY,
                 )?;
                 let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
                 let state = sinomo_network::read_cluster_state(&cluster_paths)?;
-                let rows = cluster_health_rows(&cluster_paths, &state)?;
+                let rows = if request
+                    .metadata
+                    .get(crate::cluster::CLUSTER_HEALTH_SCOPE_METADATA_KEY)
+                    .is_some_and(|scope| scope == crate::cluster::CLUSTER_HEALTH_SCOPE_LOCAL)
+                {
+                    crate::cluster::cluster_health_rows_local(&cluster_paths, &state)?
+                } else {
+                    cluster_health_rows(&cluster_paths, &state)?
+                };
                 let response = sinomo_network::ObjectRpcResponse::encode_body(
                     sinomo_network::CLUSTER_HEALTH_ROUTE,
                     &rows,
@@ -694,6 +740,61 @@ pub(crate) fn accepted_rollout_should_stop_current_daemon(
     response: &sinomo_rollout::ClusterRolloutBinaryResponse,
 ) -> bool {
     response.status == "accepted" && !daemon_paths_are_shadow(paths)
+}
+
+fn daemon_maintenance_interval_remaining(
+    now: Instant,
+    last: Instant,
+    interval: Duration,
+) -> Duration {
+    interval.saturating_sub(now.saturating_duration_since(last))
+}
+
+fn daemon_sleep_duration_or_min(duration: Duration) -> Duration {
+    if duration.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        duration
+    }
+}
+
+fn daemon_maintenance_sleep_duration(
+    now: Instant,
+    cluster_next_due: Duration,
+    last_dfs_maintenance: Instant,
+    last_rollout_telemetry: Instant,
+    shadow_finalization_due: Option<Duration>,
+) -> Duration {
+    let mut next_due = cluster_next_due;
+    if let Some(shadow_finalization_due) = shadow_finalization_due {
+        next_due = next_due
+            .min(daemon_maintenance_interval_remaining(
+                now,
+                last_dfs_maintenance,
+                DAEMON_DFS_MAINTENANCE_INTERVAL,
+            ))
+            .min(daemon_maintenance_interval_remaining(
+                now,
+                last_rollout_telemetry,
+                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
+            ))
+            .min(shadow_finalization_due);
+    }
+    daemon_sleep_duration_or_min(next_due)
+}
+
+fn shadow_rollout_finalization_poll_due_in(paths: &DaemonPaths) -> Duration {
+    let Some(data_dir) = paths.root.parent() else {
+        return DAEMON_CLUSTER_TICK_INTERVAL;
+    };
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    if rollout_shadow_finalize_path(&rollout_paths).exists()
+        || rollout_main_activation_path(&rollout_paths).exists()
+    {
+        DAEMON_CLUSTER_TICK_INTERVAL
+    } else {
+        DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL
+    }
 }
 
 fn require_daemon_rpc_request(
@@ -2971,6 +3072,59 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn authenticated_rpc_auth_failure_returns_framed_error() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-auth-rpc-error-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        let request = sinomo_network::ObjectRpcRequest::encode_body(
+            sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE,
+            ROLLOUT_RPC_CATEGORY,
+            &(),
+        )
+        .expect("request");
+        let control_request = sinomo_network::DaemonControlRequest::authenticated_rpc(
+            daemon_rpc_command(sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE),
+            request,
+            b"not-a-signed-command".to_vec(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let mut stream = sinomo_network::DaemonControlStream::new(stream);
+            handle_authenticated_daemon_connection::<_, DaemonError>(
+                &mut stream,
+                &paths,
+                |_, _, _| panic!("unauthorized request must not reach handler"),
+            )
+            .expect("auth failure is handled as a closed connection");
+        });
+
+        let mut client = TcpStream::connect(address).expect("connect client");
+        sinomo_network::write_object_frame_blocking(&mut client, &control_request)
+            .expect("write request");
+        client.shutdown(std::net::Shutdown::Write).ok();
+        let response: sinomo_network::DaemonControlResponse =
+            sinomo_network::read_object_frame_blocking(&mut client, DAEMON_COMMAND_MAX_BYTES)
+                .expect("framed auth error response");
+        let rpc = response.rpc.expect("rpc error response");
+        assert_eq!(rpc.route, sinomo_rollout::ROLLOUT_DIAGNOSTICS_ROUTE);
+        let error = rpc
+            .error_detail()
+            .expect_err("auth failures are RPC errors");
+        assert!(matches!(error, sinomo_network::NetworkError::AuthDenied));
+        server.join().expect("server thread");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn sandbox_replica_candidates_use_advertised_content_services_and_local_fallback() {
         let local = NodeId::from_legacy_named("node_local").expect("local node");
         let replica = NodeId::from_legacy_named("node_replica").expect("replica node");
@@ -3810,6 +3964,77 @@ mod tests {
             &shadow_paths,
             &accepted
         ));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_maintenance_sleep_uses_next_due_work_instead_of_fixed_tick() {
+        let now = Instant::now();
+        let last_dfs = now
+            .checked_sub(Duration::from_secs(10))
+            .expect("dfs instant");
+        let last_rollout = now
+            .checked_sub(Duration::from_secs(20))
+            .expect("rollout instant");
+
+        assert_eq!(
+            daemon_maintenance_sleep_duration(
+                now,
+                Duration::from_secs(30),
+                last_dfs,
+                last_rollout,
+                Some(DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL),
+            ),
+            Duration::from_secs(30),
+            "quiet main daemons should sleep until cluster discovery/publish/probe work is due"
+        );
+        assert_eq!(
+            daemon_maintenance_sleep_duration(
+                now,
+                Duration::from_secs(30),
+                last_dfs,
+                last_rollout,
+                Some(Duration::from_secs(5)),
+            ),
+            Duration::from_secs(5),
+            "active rollout fallback polling can still wake sooner than cluster maintenance"
+        );
+        assert_eq!(
+            daemon_maintenance_sleep_duration(now, Duration::ZERO, last_dfs, last_rollout, None,),
+            Duration::from_millis(1),
+            "overdue work should not create a zero-duration spin"
+        );
+    }
+
+    #[test]
+    fn shadow_rollout_finalization_poll_backs_off_when_idle() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-shadow-finalization-poll-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("layout");
+        let paths = DaemonPaths::new(&data_dir);
+        let rollout_paths = SelfRolloutPaths::new(&root);
+
+        assert_eq!(
+            shadow_rollout_finalization_poll_due_in(&paths),
+            DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL,
+            "quiet daemons should not wake every tick just to check absent rollout files"
+        );
+
+        std::fs::create_dir_all(&rollout_paths.root).expect("rollout dir");
+        std::fs::write(rollout_shadow_finalize_path(&rollout_paths), b"pending")
+            .expect("pending shadow marker");
+
+        assert_eq!(
+            shadow_rollout_finalization_poll_due_in(&paths),
+            DAEMON_CLUSTER_TICK_INTERVAL,
+            "active shadow finalization keeps the short fallback poll interval"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

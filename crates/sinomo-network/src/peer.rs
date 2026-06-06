@@ -1,5 +1,6 @@
 use crate::error::NetworkError;
 use crate::prelude::*;
+use std::sync::Condvar;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
@@ -89,7 +90,12 @@ impl PeerRegistry {
     pub fn best_endpoint_candidate(&self, node_id: &NodeId) -> Option<&PeerEndpointCandidate> {
         self.endpoint_candidates
             .get(node_id)
-            .and_then(|candidates| candidates.iter().min_by_key(|candidate| candidate.score))
+            .and_then(|candidates| {
+                candidates
+                    .iter()
+                    .filter(|candidate| candidate.status != EndpointCandidateStatus::Failed)
+                    .min_by_key(|candidate| candidate.score)
+            })
     }
 
     pub fn join_session(
@@ -568,6 +574,23 @@ pub trait NetworkTransport {
     fn local_node_id(&self) -> &NodeId;
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(None)
+    }
+    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+        if self
+            .pending_incoming_count()?
+            .is_some_and(|count| count > 0)
+        {
+            return Ok(true);
+        }
+        if !timeout.is_zero() {
+            std::thread::sleep(timeout);
+        }
+        Ok(self
+            .pending_incoming_count()?
+            .is_some_and(|count| count > 0))
+    }
 
     fn drain_incoming_limited(
         &mut self,
@@ -735,7 +758,7 @@ pub trait NetworkStreamTransport: NetworkTransport {
 
 #[derive(Clone, Debug, Default)]
 pub struct InProcessNetwork {
-    inner: Arc<Mutex<InProcessNetworkState>>,
+    inner: Arc<InProcessNetworkInner>,
 }
 
 pub(crate) const IN_PROCESS_MAILBOX_CAPACITY: usize = 4096;
@@ -750,6 +773,7 @@ impl InProcessNetwork {
 
     pub fn add_node(&self, node_id: NodeId) -> InProcessTransport {
         self.inner
+            .state
             .lock()
             .expect("in-process network lock")
             .mailboxes
@@ -763,6 +787,12 @@ impl InProcessNetwork {
     }
 }
 
+#[derive(Debug, Default)]
+struct InProcessNetworkInner {
+    state: Mutex<InProcessNetworkState>,
+    incoming: Condvar,
+}
+
 #[derive(Clone, Debug, Default)]
 struct InProcessNetworkState {
     mailboxes: BTreeMap<NodeId, VecDeque<InboundFrame>>,
@@ -771,7 +801,7 @@ struct InProcessNetworkState {
 #[derive(Clone, Debug)]
 pub struct InProcessTransport {
     local_node_id: NodeId,
-    inner: Arc<Mutex<InProcessNetworkState>>,
+    inner: Arc<InProcessNetworkInner>,
 }
 
 impl NetworkTransport for InProcessTransport {
@@ -794,9 +824,13 @@ impl NetworkTransport for InProcessTransport {
             });
         }
 
-        let mut inner = self.inner.lock().map_err(|_| NetworkError::Serialization {
-            detail: "in-process network lock poisoned".to_string(),
-        })?;
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
         let mailbox =
             inner
                 .mailboxes
@@ -815,13 +849,19 @@ impl NetworkTransport for InProcessTransport {
             received_by: target_node_id.clone(),
             frame,
         });
+        drop(inner);
+        self.inner.incoming.notify_all();
         Ok(())
     }
 
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        let mut inner = self.inner.lock().map_err(|_| NetworkError::Serialization {
-            detail: "in-process network lock poisoned".to_string(),
-        })?;
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
         let mailbox = inner
             .mailboxes
             .get_mut(&self.local_node_id)
@@ -832,13 +872,83 @@ impl NetworkTransport for InProcessTransport {
         Ok(mailbox.drain(..).collect())
     }
 
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        let inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        let mailbox =
+            inner
+                .mailboxes
+                .get(&self.local_node_id)
+                .ok_or_else(|| NetworkError::UnknownNode {
+                    node_id: self.local_node_id.clone(),
+                })?;
+        Ok(Some(mailbox.len()))
+    }
+
+    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        if !inner.mailboxes.contains_key(&self.local_node_id) {
+            return Err(NetworkError::UnknownNode {
+                node_id: self.local_node_id.clone(),
+            });
+        }
+        if inner
+            .mailboxes
+            .get(&self.local_node_id)
+            .is_some_and(|mailbox| !mailbox.is_empty())
+            || timeout.is_zero()
+        {
+            return Ok(inner
+                .mailboxes
+                .get(&self.local_node_id)
+                .is_some_and(|mailbox| !mailbox.is_empty()));
+        }
+        let local_node_id = self.local_node_id.clone();
+        let (guard, _timeout) = self
+            .inner
+            .incoming
+            .wait_timeout_while(inner, timeout, |state| {
+                state
+                    .mailboxes
+                    .get(&local_node_id)
+                    .is_some_and(|mailbox| mailbox.is_empty())
+            })
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
+        inner = guard;
+        let mailbox =
+            inner
+                .mailboxes
+                .get(&self.local_node_id)
+                .ok_or_else(|| NetworkError::UnknownNode {
+                    node_id: self.local_node_id.clone(),
+                })?;
+        Ok(!mailbox.is_empty())
+    }
+
     fn drain_incoming_limited(
         &mut self,
         max_frames: usize,
     ) -> Result<Vec<InboundFrame>, NetworkError> {
-        let mut inner = self.inner.lock().map_err(|_| NetworkError::Serialization {
-            detail: "in-process network lock poisoned".to_string(),
-        })?;
+        let mut inner = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| NetworkError::Serialization {
+                detail: "in-process network lock poisoned".to_string(),
+            })?;
         let mailbox = inner
             .mailboxes
             .get_mut(&self.local_node_id)
@@ -894,6 +1004,10 @@ impl<T: NetworkTransport> NetworkService<T> {
 
     fn next_outbound_wake_at(&self) -> Option<Instant> {
         self.ledger.next_outbound_wake_at()
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        self.transport.pending_incoming_count()
     }
 
     fn enqueue_event(
@@ -974,6 +1088,9 @@ impl<T: NetworkTransport> NetworkService<T> {
         &mut self,
         store: &mut S,
     ) -> Result<Vec<InboundOutcome>, NetworkError> {
+        if self.transport.pending_incoming_count()? == Some(0) {
+            return Ok(Vec::new());
+        }
         let inbound_frames = self
             .transport
             .drain_incoming_limited(NETWORK_SERVICE_INBOUND_BATCH_LIMIT)?;
@@ -1267,6 +1384,14 @@ where
     /// heartbeats, protocol), returning the outcomes in arrival order.
     pub async fn process_incoming(&self) -> Result<Vec<InboundOutcome>, NetworkError> {
         self.run_job(|service, store| service.process_incoming(store))
+            .await?
+    }
+
+    /// Exact pending inbound-frame count when the underlying transport can report
+    /// it cheaply. A `None` result means callers should fall back to their normal
+    /// receive scheduling path.
+    pub async fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        self.run_job(|service, _store| service.pending_incoming_count())
             .await?
     }
 

@@ -1236,6 +1236,23 @@ impl KvMaterializedCache {
         node_id: NodeId,
         paths: KvWalPaths,
     ) -> Result<Arc<KvSnapshot>, KvError> {
+        self.read_snapshot_with_raft_view_inner(node_id, paths, true)
+    }
+
+    pub fn read_snapshot_with_raft_view_without_materialized_refresh(
+        &self,
+        node_id: NodeId,
+        paths: KvWalPaths,
+    ) -> Result<Arc<KvSnapshot>, KvError> {
+        self.read_snapshot_with_raft_view_inner(node_id, paths, false)
+    }
+
+    fn read_snapshot_with_raft_view_inner(
+        &self,
+        node_id: NodeId,
+        paths: KvWalPaths,
+        refresh_materialized: bool,
+    ) -> Result<Arc<KvSnapshot>, KvError> {
         let (has_durable_state, identity) = raft_view_identity_for_read(&paths)?;
         if has_durable_state {
             if let Some(identity) = identity
@@ -1255,7 +1272,9 @@ impl KvMaterializedCache {
                     Err(error) => return Err(error),
                 };
             let snapshot = node.store().snapshot().canonicalized();
-            self.write_snapshot_if_changed(&snapshot)?;
+            if refresh_materialized {
+                self.write_snapshot_if_changed(&snapshot)?;
+            }
             let snapshot = Arc::new(snapshot);
             if let Some(identity) = raft_view_identity(&node.paths) {
                 cache_store_raft_view(&node.paths, identity, snapshot.clone());
@@ -1331,10 +1350,9 @@ impl KvMaterializedCache {
         // source of truth for revision/version/events), so persisting stale bookkeeping
         // there is safe. Check before materializing `snapshot` so the common no-op path
         // avoids cloning the full entry set.
-        if self
-            .read_snapshot_arc()
-            .is_ok_and(|existing| kv_snapshot_durable_eq(existing.as_ref(), snapshot))
-        {
+        if self.read_snapshot_arc_if_present().is_ok_and(|existing| {
+            existing.is_some_and(|existing| kv_snapshot_durable_eq(existing.as_ref(), snapshot))
+        }) {
             return Ok(false);
         }
         let desired = self.materialized(snapshot);
@@ -1472,6 +1490,25 @@ impl KvLocalCache {
     pub fn current_snapshot_arc(&self, node_id: NodeId) -> Result<Arc<KvSnapshot>, KvError> {
         self.materialized
             .read_snapshot_with_raft_view(node_id.clone(), self.raft_wal_paths(&node_id))
+    }
+
+    pub fn current_snapshot_without_materialized_refresh(
+        &self,
+        node_id: NodeId,
+    ) -> Result<KvSnapshot, KvError> {
+        self.current_snapshot_arc_without_materialized_refresh(node_id)
+            .map(|snapshot| (*snapshot).clone())
+    }
+
+    pub fn current_snapshot_arc_without_materialized_refresh(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Arc<KvSnapshot>, KvError> {
+        self.materialized
+            .read_snapshot_with_raft_view_without_materialized_refresh(
+                node_id.clone(),
+                self.raft_wal_paths(&node_id),
+            )
     }
 
     pub fn cached_snapshot(&self) -> Result<KvSnapshot, KvError> {
@@ -2679,8 +2716,8 @@ impl InProcessKvStore {
         }
     }
 
-    fn matching_watch_ids_for_event_key(&self, key: &str) -> BTreeSet<WatchId> {
-        let mut watch_ids = BTreeSet::new();
+    fn matching_watch_ids_for_event_key(&self, key: &str) -> Vec<WatchId> {
+        let mut watch_ids = Vec::new();
         if let Some(prefix_watch_ids) = self.watch_prefixes.get("") {
             watch_ids.extend(prefix_watch_ids.iter().copied());
         }
@@ -2695,9 +2732,9 @@ impl InProcessKvStore {
 
     #[cfg(test)]
     fn matching_watch_ids_for_event_key_for_test(&self, key: &str) -> Vec<WatchId> {
-        self.matching_watch_ids_for_event_key(key)
-            .into_iter()
-            .collect()
+        let mut watch_ids = self.matching_watch_ids_for_event_key(key);
+        watch_ids.sort();
+        watch_ids
     }
 
     fn trim_event_history(&mut self) {
@@ -4249,13 +4286,18 @@ fn read_wal_entries(
     max_index: Option<u64>,
     retain_after_index: u64,
 ) -> Result<WalRead, KvError> {
-    if !path.exists() {
-        return Ok(WalRead::default());
-    }
-    let mut file = File::open(path).map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(WalRead::default());
+        }
+        Err(source) => {
+            return Err(KvError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
     file.lock_shared().map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -4495,6 +4537,38 @@ fn read_object_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, KvEr
     decode_object_file(path, &bytes)
 }
 
+#[cfg(test)]
+static REQUIRED_OBJECT_FILE_READS_FOR_TEST: OnceLock<Mutex<HashMap<PathBuf, u64>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn required_object_file_reads_for_test() -> &'static Mutex<HashMap<PathBuf, u64>> {
+    REQUIRED_OBJECT_FILE_READS_FOR_TEST.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn record_required_object_file_read_for_test(path: &Path) {
+    if let Ok(mut reads) = required_object_file_reads_for_test().lock() {
+        *reads.entry(path.to_path_buf()).or_default() += 1;
+    }
+}
+
+#[cfg(test)]
+fn reset_required_object_file_reads_for_test(path: &Path) {
+    if let Ok(mut reads) = required_object_file_reads_for_test().lock() {
+        reads.remove(path);
+    }
+}
+
+#[cfg(test)]
+fn required_object_file_read_count_for_test(path: &Path) -> u64 {
+    required_object_file_reads_for_test()
+        .lock()
+        .ok()
+        .and_then(|reads| reads.get(path).copied())
+        .unwrap_or_default()
+}
+
 fn decode_object_file<T: for<'de> Deserialize<'de>>(
     path: &Path,
     bytes: &[u8],
@@ -4519,6 +4593,8 @@ fn read_optional_object_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, KvErr
 }
 
 fn read_object_file_bytes(path: &Path) -> Result<Vec<u8>, KvError> {
+    #[cfg(test)]
+    record_required_object_file_read_for_test(path);
     let file = File::open(path).map_err(|source| KvError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -7207,6 +7283,35 @@ mod tests {
     }
 
     #[test]
+    fn materialized_cache_initial_write_skips_required_snapshot_read() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-materialized-cache-initial-write-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
+        let mut store = InProcessKvStore::new();
+        store
+            .put("alpha", b"one".to_vec(), None)
+            .expect("seed cache");
+
+        reset_required_object_file_reads_for_test(cache.path());
+        assert!(
+            cache
+                .write_snapshot_if_changed(&store.snapshot())
+                .expect("initial write")
+        );
+        assert_eq!(
+            required_object_file_read_count_for_test(cache.path()),
+            0,
+            "initial materialized-cache writes should use the optional snapshot read path, not a required missing-file read"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn materialized_cache_optional_snapshot_read_handles_absent_present_and_invalid() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-kv-materialized-optional-{}",
@@ -8533,9 +8638,11 @@ mod tests {
             node.save_snapshot().expect("initial snapshot");
 
             let before = fs::metadata(&paths.wal).expect("wal metadata before");
+            let snapshot_before = fs::metadata(&paths.snapshot).expect("snapshot metadata before");
             thread::sleep(Duration::from_millis(20));
             node.save_snapshot().expect("unchanged snapshot");
             let after = fs::metadata(&paths.wal).expect("wal metadata after");
+            let snapshot_after = fs::metadata(&paths.snapshot).expect("snapshot metadata after");
 
             assert_eq!(before.len(), after.len());
             assert_eq!(file_ino(&before), file_ino(&after));
@@ -8543,6 +8650,13 @@ mod tests {
                 before.modified().ok(),
                 after.modified().ok(),
                 "unchanged snapshot compaction should not rewrite an identical WAL tail"
+            );
+            assert_eq!(snapshot_before.len(), snapshot_after.len());
+            assert_eq!(file_ino(&snapshot_before), file_ino(&snapshot_after));
+            assert_eq!(
+                snapshot_before.modified().ok(),
+                snapshot_after.modified().ok(),
+                "unchanged snapshot save should not rewrite an identical snapshot object"
             );
         }
         std::fs::remove_dir_all(root).ok();

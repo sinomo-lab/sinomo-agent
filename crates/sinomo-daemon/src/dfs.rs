@@ -57,6 +57,15 @@ static DFS_PROTOCOL_METADATA_PUBLISH_PENDING: AtomicBool = AtomicBool::new(false
 #[cfg(not(test))]
 static DFS_PROTOCOL_METADATA_PUBLISH_RUNNING: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn default_distributed_dfs_enabled() -> bool {
+    matches!(
+        std::env::var("SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 #[derive(Clone, Debug)]
 struct DaemonDfsControlPlaneKvClient {
     cluster_paths: ClusterPaths,
@@ -1386,6 +1395,10 @@ impl NetworkTransport for DaemonDfsProtocolTransport {
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
         Ok(std::mem::take(&mut self.inbound_frames))
     }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(self.inbound_frames.len()))
+    }
 }
 
 #[derive(Clone)]
@@ -1532,6 +1545,10 @@ impl NetworkTransport for DaemonDfsEndpointTransport {
 
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
         Ok(self.incoming_frames.drain(..).collect())
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(self.incoming_frames.len()))
     }
 }
 

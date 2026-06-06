@@ -25,13 +25,14 @@ ROLE="${ROLE:-joiner}"
 CLUSTER_NAME="${CLUSTER_NAME:-dev-cluster}"
 NODE_NAME="${NODE_NAME:-$(hostname)}"
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-60}"
-JOIN_ATTEMPTS="${JOIN_ATTEMPTS:-12}"
-JOIN_RETRY_DELAY="${JOIN_RETRY_DELAY:-5}"
+JOIN_ATTEMPTS="${JOIN_ATTEMPTS:-60}"
+JOIN_RETRY_DELAY="${JOIN_RETRY_DELAY:-1}"
 MAIN_PORT="${MAIN_PORT:-21353}"
 
 export SINOMO_DATA_DIR="$DATA"
 # This segmented test cluster runs with iroh off by default so segmentation is real.
 export SINOMO_DISABLE_IROH="${SINOMO_DISABLE_IROH:-1}"
+export SINOMO_DAEMON_ADVERTISE_HOST="${SINOMO_DAEMON_ADVERTISE_HOST:-$NODE_NAME}"
 
 log() { echo "[entrypoint $(hostname)] $*"; }
 
@@ -76,6 +77,23 @@ wait_for_tcp() {
   exec 3>&- 2>/dev/null || true
 }
 
+cluster_join_status() {
+  "$BIN" cluster status 2>/dev/null | awk '/^status:/{print $2; exit}'
+}
+
+cluster_join_already_accepted() {
+  local status
+  [ -f "$DATA/cluster/state.sobj" ] || return 1
+  status="$(cluster_join_status || true)"
+  case "$status" in
+    voter|read-only)
+      log "cluster state already accepted locally (status: $status); stopping join retries"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # Join the cluster in the background AFTER our own daemon is listening, so downstream nodes
 # can reach us as their introducer while we join our own upstream. The CLI join is itself
 # synchronous (it blocks until the introducer -- which forwards to a voter -- confirms the
@@ -95,8 +113,14 @@ join_in_background() {
   fi
   log "joining cluster as '$NODE_NAME' via introducer $INTRODUCER"
   for attempt in $(seq 1 "$JOIN_ATTEMPTS"); do
+    if cluster_join_already_accepted; then
+      return
+    fi
     if "$BIN" cluster join "$JOIN_INVITE" --name "$NODE_NAME"; then
       log "joined cluster (attempt $attempt)"; return
+    fi
+    if cluster_join_already_accepted; then
+      return
     fi
     log "join attempt $attempt/$JOIN_ATTEMPTS via $INTRODUCER failed; retrying in ${JOIN_RETRY_DELAY}s (upstream bridge may still be joining)"
     sleep "$JOIN_RETRY_DELAY"
