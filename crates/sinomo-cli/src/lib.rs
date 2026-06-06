@@ -283,6 +283,9 @@ mod sandbox_host;
 mod tests;
 mod tui;
 
+/// GUI-facing surface over the main-agent chat runtime (used by `sinomo-app`).
+pub mod app_api;
+
 use error::CliError;
 use help::*;
 pub use providers::*;

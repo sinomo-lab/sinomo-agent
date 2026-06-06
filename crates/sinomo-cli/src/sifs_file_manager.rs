@@ -42,6 +42,13 @@ impl SifsFileManagerBackend {
             &self.data_dir,
         ));
     }
+
+    /// The node id objects written here are placed on (the local SIFS node).
+    pub(crate) fn node_label(&self) -> String {
+        self.lock_service()
+            .map(|service| service.node_id().to_string())
+            .unwrap_or_default()
+    }
 }
 
 impl FileManagerBackend for SifsFileManagerBackend {
