@@ -16,12 +16,6 @@ macro_rules! println {
     }};
 }
 
-macro_rules! eprint {
-    ($($arg:tt)*) => {{
-        $crate::write_cli_stderr(format_args!($($arg)*));
-    }};
-}
-
 macro_rules! eprintln {
     () => {{
         $crate::write_cli_stderr(format_args!("\n"));
@@ -273,7 +267,6 @@ use std::io::{self, BufRead, Read, Write};
 #[cfg(unix)]
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -285,6 +278,7 @@ use time::OffsetDateTime;
 mod error;
 mod help;
 mod providers;
+mod sandbox_host;
 #[cfg(test)]
 mod tests;
 mod tui;
@@ -292,6 +286,7 @@ mod tui;
 use error::CliError;
 use help::*;
 pub use providers::*;
+use sandbox_host::SinomoCliSandboxHost;
 use time::format_description::well_known::Rfc3339;
 pub use tui::*;
 
@@ -931,7 +926,6 @@ pub(crate) enum CliCommand {
     Daemon(DaemonCliCommand),
     Rollout(RolloutCliCommand),
     Dfs(DfsCliCommand),
-    Sandbox(SandboxCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
     Agent(AgentCliCommand),
@@ -956,6 +950,9 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
             module_config,
         ))
         .register(sinomo_runtime::observe::observe_cli_command_handler())
+        .register(sinomo_runtime::sandbox::sandbox_cli_command_handler(
+            Arc::new(SinomoCliSandboxHost),
+        ))
 }
 
 fn cli_command_registry() -> &'static CliCommandRegistry {
@@ -1003,9 +1000,6 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
         }
         Some((command, rest)) if command == "dfs" => Ok(CliCommand::Dfs(parse_dfs_command(rest)?)),
-        Some((command, rest)) if command == "sandbox" => {
-            Ok(CliCommand::Sandbox(parse_sandbox_command(rest)?))
-        }
         Some((command, rest)) if matches!(command.as_str(), "models" | "model") => {
             Ok(CliCommand::Models(parse_models_command(rest)?))
         }
@@ -1517,7 +1511,6 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
-        CliCommand::Sandbox(command) => run_sandbox_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
         CliCommand::Agent(command) => run_agent_command(command),

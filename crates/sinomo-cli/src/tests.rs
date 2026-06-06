@@ -11,20 +11,18 @@ use super::{
     ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
     ProviderName, RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
     RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
-    SandboxCliCommand, SandboxToolchainVerifyMakeOptions, SandboxToolchainVerifyMakepkgOptions,
-    SandboxToolchainVerifyTccOptions, SelfRolloutPaths, UninstallOptions,
-    advertised_peer_route_targets, apply_cluster_node_role, apply_cluster_raft_role,
-    authenticate_daemon_control_request, build_cluster_raft_append_request_from_next_index,
-    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_publish_targets,
-    cluster_invite_with_paths, cluster_join_with_paths, cluster_peer_members,
-    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
-    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
-    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version, daemon_remove_cluster_members,
-    daemon_run_toolchain_request, data_dir_storage_contract_findings, decode_cluster_join_invite,
-    elect_cluster_raft_leader, encode_cluster_join_invite, ensure_rollout_layout,
-    expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
+    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    apply_cluster_raft_role, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
+    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
+    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
+    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
+    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
+    daemon_package_version, daemon_remove_cluster_members, data_dir_storage_contract_findings,
+    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
     format_rollout_progress_line, handle_daemon_cluster_join_request,
     handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
     handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
@@ -40,8 +38,8 @@ use super::{
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
-    parse_provider_command, parse_rollout_command, parse_sandbox_command, parse_slash_command,
-    parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
+    parse_provider_command, parse_rollout_command, parse_slash_command, parse_uninstall_options,
+    parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, refresh_daemon_node_status_in_kv,
     require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
@@ -50,22 +48,11 @@ use super::{
     rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
     rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response,
     run_shadow_daemon_with_paths, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    sandbox_cat_with_store, sandbox_checkpoint_with_store, sandbox_config_with_store,
-    sandbox_create_with_store, sandbox_destroy_with_store, sandbox_doctor_findings_with_stores,
-    sandbox_doctor_findings_with_stores_and_events,
-    sandbox_fetch_with_store_transport_and_event_store, sandbox_ls_with_store,
-    sandbox_policy_uses_cluster, sandbox_reboot_with_store, sandbox_resume_with_store,
-    sandbox_run_with_stores, sandbox_status_with_store, sandbox_toolchain_add_artifact_with_store,
-    sandbox_toolchain_add_command_with_store, sandbox_toolchain_bash_plan_text,
-    sandbox_toolchain_build_tools_plan_text, sandbox_toolchain_busybox_plan_text,
-    sandbox_toolchain_import_busybox_with_store, sandbox_toolchain_import_package_with_store,
-    sandbox_toolchain_python_plan_text, sandbox_toolchain_verify_package, sandbox_write_with_store,
-    sandbox_write_with_store_and_event_store, send_cluster_join_registration_over_iroh,
-    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
-    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
-    sync_cluster_state_to_kv, tui_default_daemon_status, uninstall_with_layout,
-    with_cli_force_local_mode, write_daemon_status, write_model_runtime_config_for_node,
-    write_rollout_status, write_sandbox_policy_config_for_node,
+    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
+    sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, tui_default_daemon_status,
+    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
+    write_model_runtime_config_for_node, write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -79,8 +66,7 @@ use super::{
     daemon_handle_daemon_sandbox_toolchain_add_artifact,
     daemon_handle_daemon_sandbox_toolchain_add_command,
     daemon_handle_daemon_sandbox_toolchain_import_package, daemon_handle_daemon_sandbox_update,
-    daemon_handle_daemon_sandbox_write, sandbox_logs_with_store, sandbox_process_plan_with_stores,
-    sandbox_run_with_store, sandbox_shell_with_stores,
+    daemon_handle_daemon_sandbox_write,
 };
 use base64::Engine;
 use sinomo_lm::{
@@ -120,6 +106,7 @@ use sinomo_runtime::rollout::{
     write_rollout_runtime_state,
 };
 use sinomo_runtime::sandbox::SandboxFileSystem;
+use sinomo_runtime::sandbox::*;
 use std::collections::BTreeMap;
 #[cfg(feature = "sandbox")]
 use std::collections::BTreeSet;
@@ -127,9 +114,132 @@ use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(feature = "sandbox")]
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
+
+#[cfg(feature = "sandbox")]
+fn with_test_sandbox_host<T>(
+    f: impl FnOnce() -> Result<T, SandboxCliError>,
+) -> Result<T, SandboxCliError> {
+    sinomo_runtime::sandbox::with_sandbox_cli_host(
+        Arc::new(super::sandbox_host::SinomoCliSandboxHost),
+        f,
+    )
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_doctor_findings_with_stores(
+    options: SandboxDoctorOptions,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+    policy: &sinomo_runtime::sandbox::SandboxPolicy,
+) -> Result<Vec<SandboxDoctorFinding>, SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::sandbox_doctor_findings_with_stores(
+            options,
+            store,
+            toolchain_store,
+            policy,
+        )
+    })
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_doctor_findings_with_stores_and_events(
+    options: SandboxDoctorOptions,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+    policy: &sinomo_runtime::sandbox::SandboxPolicy,
+    resource_events: &[sinomo_runtime::events::StoredEvent],
+) -> Result<Vec<SandboxDoctorFinding>, SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::sandbox_doctor_findings_with_stores_and_events(
+            options,
+            store,
+            toolchain_store,
+            policy,
+            resource_events,
+        )
+    })
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_module_artifact_register_with_data_dir(
+    options: SandboxModuleArtifactRegisterOptions,
+    data_dir_root: &std::path::Path,
+) -> Result<(), SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::sandbox_module_artifact_register_with_data_dir(
+            options,
+            data_dir_root,
+        )
+    })
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_run_with_store(
+    options: SandboxRunOptions,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+) -> Result<(), SandboxCliError> {
+    with_test_sandbox_host(|| sinomo_runtime::sandbox::sandbox_run_with_store(options, store))
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_run_with_stores(
+    options: SandboxRunOptions,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::sandbox_run_with_stores(options, store, toolchain_store)
+    })
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_process_plan_with_stores(
+    options: SandboxProcessPlanOptions,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::sandbox_process_plan_with_stores(options, store, toolchain_store)
+    })
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_shell_with_stores(
+    options: SandboxShellOptions,
+    stdin: Vec<u8>,
+    store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
+    toolchain_store: &sinomo_runtime::sandbox::LocalSandboxToolchainStore,
+) -> Result<(), SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::sandbox_shell_with_stores(options, stdin, store, toolchain_store)
+    })
+}
+
+#[cfg(feature = "sandbox")]
+fn sandbox_policy_uses_cluster(data_dir: &SinomoDataDir) -> bool {
+    with_test_sandbox_host(|| {
+        Ok(sinomo_runtime::sandbox::sandbox_policy_uses_cluster(
+            data_dir,
+        ))
+    })
+    .expect("sandbox policy source")
+}
+
+#[cfg(feature = "sandbox")]
+fn write_sandbox_policy_config_for_node(
+    data_dir: &SinomoDataDir,
+    config: &sinomo_runtime::sandbox::SandboxClusterPolicyConfig,
+) -> Result<PathBuf, SandboxCliError> {
+    with_test_sandbox_host(|| {
+        sinomo_runtime::sandbox::write_sandbox_policy_config_for_node(data_dir, config)
+    })
+}
 
 #[derive(Clone, Copy, Debug)]
 struct TestRegisteredCommandHandler {
@@ -375,11 +485,11 @@ fn top_level_cli_parser_routes_subcommands() {
     ));
     assert!(matches!(
         parse_cli_command(&["sandbox".to_string()]).expect("sandbox help"),
-        CliCommand::Sandbox(SandboxCliCommand::Help)
+        CliCommand::Registered(command) if command.name() == "sandbox"
     ));
     assert!(matches!(
         parse_cli_command(&["sandbox".to_string(), "create".to_string()]).expect("sandbox create"),
-        CliCommand::Sandbox(SandboxCliCommand::Create(_))
+        CliCommand::Registered(command) if command.name() == "sandbox"
     ));
     assert!(matches!(
         parse_cli_command(&[
@@ -388,11 +498,11 @@ fn top_level_cli_parser_routes_subcommands() {
             "01kreqaaaaaaaaaaaaaaaaaaaa".to_string()
         ])
         .expect("sandbox status"),
-        CliCommand::Sandbox(SandboxCliCommand::Status(_))
+        CliCommand::Registered(command) if command.name() == "sandbox"
     ));
     assert!(matches!(
         parse_cli_command(&["sandbox".to_string(), "doctor".to_string()]).expect("sandbox doctor"),
-        CliCommand::Sandbox(SandboxCliCommand::Doctor(_))
+        CliCommand::Registered(command) if command.name() == "sandbox"
     ));
     assert!(matches!(
         parse_cli_command(&[
@@ -467,14 +577,14 @@ fn sandbox_create_parser_accepts_tmp_policy_and_toolchain() {
         options.mounts[0].mode,
         sinomo_runtime::sandbox::SandboxMountMode::ReadOnly
     );
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let command =
         parse_sandbox_command(&["create".to_string(), "--daemon".to_string()]).expect("daemon");
     let SandboxCliCommand::Create(options) = command else {
         panic!("expected create");
     };
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -507,7 +617,7 @@ fn sandbox_status_parser_accepts_daemon_execution() {
         panic!("expected status");
     };
     assert_eq!(options.sandbox_id, sandbox_id);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -535,7 +645,7 @@ fn sandbox_config_parser_accepts_cwd_env_and_daemon() {
         Some("debug")
     );
     assert_eq!(options.env_unset, vec!["OLD_VAR"]);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -550,7 +660,7 @@ fn sandbox_config_parser_rejects_embedded_nul_env_value() {
     .expect_err("embedded NUL env denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("sandbox env `RUST_LOG` contains an embedded NUL byte"))
         }
         other => panic!("unexpected error: {other:?}"),
@@ -579,14 +689,14 @@ fn sandbox_run_parser_accepts_wasm_module_timeout_and_args() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(
         options.target,
-        super::SandboxRunTarget::WasmModule(PathBuf::from("/tmp/hello.wasm"))
+        SandboxRunTarget::WasmModule(PathBuf::from("/tmp/hello.wasm"))
     );
     assert_eq!(options.timeout_ms, 1234);
     assert!(!options.stdin);
     assert!(options.allow_unsigned);
     assert!(options.allowed_capabilities.is_empty());
     assert_eq!(options.argv, vec!["hello.wasm", "one", "two"]);
-    assert_eq!(options.execution, super::SandboxRunExecution::Local);
+    assert_eq!(options.execution, SandboxRunExecution::Local);
 }
 
 #[test]
@@ -608,13 +718,13 @@ fn sandbox_run_parser_accepts_toolchain_command_and_args() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(
         options.target,
-        super::SandboxRunTarget::ToolchainCommand("cat".to_string())
+        SandboxRunTarget::ToolchainCommand("cat".to_string())
     );
     assert_eq!(options.argv, vec!["cat", "/work/main.rs"]);
     assert!(!options.stdin);
     assert!(!options.allow_unsigned);
     assert!(options.allowed_capabilities.is_empty());
-    assert_eq!(options.execution, super::SandboxRunExecution::Daemon);
+    assert_eq!(options.execution, SandboxRunExecution::Daemon);
     assert!(matches!(
         parse_sandbox_command(&[
             "run".to_string(),
@@ -623,7 +733,7 @@ fn sandbox_run_parser_accepts_toolchain_command_and_args() {
             "--wasm".to_string(),
             "/tmp/hello.wasm".to_string(),
         ]),
-        Err(CliError::Parse { .. })
+        Err(SandboxCliError::Parse { .. })
     ));
 }
 
@@ -650,10 +760,10 @@ fn sandbox_run_parser_accepts_container_backend_options() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(
         options.target,
-        super::SandboxRunTarget::ToolchainCommand("sh".to_string())
+        SandboxRunTarget::ToolchainCommand("sh".to_string())
     );
     assert_eq!(options.argv, vec!["sh", "-c", "pwd"]);
-    let super::SandboxRunExecution::Container(config) = options.execution else {
+    let SandboxRunExecution::Container(config) = options.execution else {
         panic!("expected container execution");
     };
     assert_eq!(
@@ -675,7 +785,7 @@ fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
             "--wasm".to_string(),
             "/tmp/hello.wasm".to_string(),
         ]),
-        Err(CliError::Parse { .. })
+        Err(SandboxCliError::Parse { .. })
     ));
     assert!(matches!(
         parse_sandbox_command(&[
@@ -687,7 +797,7 @@ fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
             "wasix.unpinned-child-exec".to_string(),
             "sh".to_string(),
         ]),
-        Err(CliError::Parse { .. })
+        Err(SandboxCliError::Parse { .. })
     ));
     assert!(matches!(
         parse_sandbox_command(&[
@@ -698,7 +808,7 @@ fn sandbox_run_parser_rejects_container_wasm_and_policy_overrides() {
             "alpine:3.20".to_string(),
             "sh".to_string(),
         ]),
-        Err(CliError::Parse { .. })
+        Err(SandboxCliError::Parse { .. })
     ));
 }
 
@@ -724,7 +834,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
     };
     assert_eq!(
         options.target,
-        super::SandboxRunTarget::ToolchainCommand("python".to_string())
+        SandboxRunTarget::ToolchainCommand("python".to_string())
     );
     assert!(options.allow_unsigned);
     assert_eq!(
@@ -732,7 +842,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
         vec!["wasix.unpinned-child-exec"]
     );
     assert_eq!(options.argv, vec!["python", "-m", "pip", "--version"]);
-    assert_eq!(options.execution, super::SandboxRunExecution::Local);
+    assert_eq!(options.execution, SandboxRunExecution::Local);
 
     assert!(matches!(
         parse_sandbox_command(&[
@@ -743,7 +853,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
             "wasix.unpinned-child-exec".to_string(),
             "python".to_string(),
         ]),
-        Err(CliError::Parse { .. })
+        Err(SandboxCliError::Parse { .. })
     ));
     assert!(matches!(
         parse_sandbox_command(&[
@@ -754,7 +864,7 @@ fn sandbox_run_parser_accepts_local_capability_overrides() {
             "--wasm".to_string(),
             "/tmp/hello.wasm".to_string(),
         ]),
-        Err(CliError::Parse { .. })
+        Err(SandboxCliError::Parse { .. })
     ));
 }
 
@@ -777,7 +887,7 @@ fn sandbox_run_parser_accepts_stdin_forwarding() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(
         options.target,
-        super::SandboxRunTarget::ToolchainCommand("xargs".to_string())
+        SandboxRunTarget::ToolchainCommand("xargs".to_string())
     );
     assert!(options.stdin);
     assert!(options.allow_unsigned);
@@ -803,7 +913,7 @@ fn sandbox_process_plan_parser_accepts_plan_path_and_timeout() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(options.plan_path, PathBuf::from("/tmp/plan.json"));
     assert_eq!(options.timeout_ms, 3456);
-    assert_eq!(options.execution, super::SandboxRunExecution::Local);
+    assert_eq!(options.execution, SandboxRunExecution::Local);
     let daemon_command = parse_sandbox_command(&[
         "process-plan".to_string(),
         sandbox_id.to_string(),
@@ -814,7 +924,7 @@ fn sandbox_process_plan_parser_accepts_plan_path_and_timeout() {
     let SandboxCliCommand::ProcessPlan(daemon_options) = daemon_command else {
         panic!("expected process plan");
     };
-    assert_eq!(daemon_options.execution, super::SandboxRunExecution::Daemon);
+    assert_eq!(daemon_options.execution, SandboxRunExecution::Daemon);
 
     let container_command = parse_sandbox_command(&[
         "process-plan".to_string(),
@@ -829,7 +939,7 @@ fn sandbox_process_plan_parser_accepts_plan_path_and_timeout() {
     };
     assert!(matches!(
         container_options.execution,
-        super::SandboxRunExecution::Container(_)
+        SandboxRunExecution::Container(_)
     ));
 }
 
@@ -853,7 +963,7 @@ fn sandbox_shell_parser_accepts_script_and_timeout() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(options.timeout_ms, 2345);
     assert_eq!(options.script.as_deref(), Some("printf hello"));
-    assert_eq!(options.execution, super::SandboxRunExecution::Daemon);
+    assert_eq!(options.execution, SandboxRunExecution::Daemon);
 
     let container_command = parse_sandbox_command(&[
         "shell".to_string(),
@@ -869,7 +979,7 @@ fn sandbox_shell_parser_accepts_script_and_timeout() {
     };
     assert!(matches!(
         container_options.execution,
-        super::SandboxRunExecution::Container(_)
+        SandboxRunExecution::Container(_)
     ));
 }
 
@@ -915,7 +1025,7 @@ fn sandbox_toolchain_add_command_parser_accepts_options() {
     assert_eq!(options.provenance, "unit test");
     assert_eq!(options.command_name, "cat");
     assert_eq!(options.module_path, PathBuf::from("/tmp/cat.wasm"));
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
     assert_eq!(options.required_capabilities, vec!["network.http"]);
     assert_eq!(options.default_limits.memory_mb, 64);
     assert_eq!(options.default_limits.wall_time_ms, 1234);
@@ -955,7 +1065,7 @@ fn sandbox_toolchain_add_command_parser_rejects_invalid_capability_value() {
     .expect_err("embedded NUL capability denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("sandbox toolchain command capability"));
             assert!(detail.contains("embedded NUL byte"));
         }
@@ -989,7 +1099,7 @@ fn sandbox_toolchain_add_artifact_parser_accepts_options() {
     assert_eq!(options.provenance, "unit test");
     assert_eq!(options.relative_path, "lib/python/os.py");
     assert_eq!(options.source_path, PathBuf::from("/tmp/os.py"));
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1011,7 +1121,7 @@ fn sandbox_toolchain_import_busybox_parser_accepts_options() {
     assert_eq!(options.version, "busybox-wasi-test");
     assert_eq!(options.provenance, "unit test build");
     assert_eq!(options.module_path, PathBuf::from("/tmp/busybox.wasm"));
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let command = parse_sandbox_command(&[
         "toolchain".to_string(),
@@ -1025,7 +1135,7 @@ fn sandbox_toolchain_import_busybox_parser_accepts_options() {
     let SandboxCliCommand::ToolchainImportBusyBox(options) = command else {
         panic!("expected toolchain import busybox");
     };
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1051,7 +1161,7 @@ fn sandbox_toolchain_import_package_parser_accepts_options() {
                 .expect("busybox id")
         )
     );
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1116,9 +1226,8 @@ fn sandbox_module_artifact_parser_accepts_component_register() {
     ])
     .expect("module artifact register");
 
-    let SandboxCliCommand::ModuleArtifact(super::SandboxModuleArtifactCliCommand::Register(
-        options,
-    )) = command
+    let SandboxCliCommand::ModuleArtifact(SandboxModuleArtifactCliCommand::Register(options)) =
+        command
     else {
         panic!("expected module artifact register");
     };
@@ -1181,9 +1290,8 @@ fn sandbox_module_artifact_parser_accepts_rollout_material_options() {
     ])
     .expect("module artifact register");
 
-    let SandboxCliCommand::ModuleArtifact(super::SandboxModuleArtifactCliCommand::Register(
-        options,
-    )) = command
+    let SandboxCliCommand::ModuleArtifact(SandboxModuleArtifactCliCommand::Register(options)) =
+        command
     else {
         panic!("expected module artifact register");
     };
@@ -1219,8 +1327,7 @@ fn sandbox_module_replay_parser_accepts_fixture_and_report() {
     ])
     .expect("module replay run");
 
-    let SandboxCliCommand::ModuleReplay(super::SandboxModuleReplayCliCommand::Run(options)) =
-        command
+    let SandboxCliCommand::ModuleReplay(SandboxModuleReplayCliCommand::Run(options)) = command
     else {
         panic!("expected module replay run");
     };
@@ -1289,7 +1396,7 @@ fn sandbox_toolchain_verify_make_parser_accepts_command() {
             )
             .expect("sandbox id"),
             allow_unsigned: true,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         })
     );
 }
@@ -1312,7 +1419,7 @@ fn sandbox_toolchain_verify_makepkg_parser_accepts_command() {
             )
             .expect("sandbox id"),
             allow_unsigned: true,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         })
     );
 }
@@ -1335,7 +1442,7 @@ fn sandbox_toolchain_verify_tcc_parser_accepts_command() {
             )
             .expect("sandbox id"),
             allow_unsigned: true,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         })
     );
 }
@@ -1423,7 +1530,7 @@ fn sandbox_toolchain_verify_bash_parser_accepts_options() {
     };
     assert_eq!(options.sandbox_id, sandbox_id);
     assert!(options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let command = parse_sandbox_command(&[
         "toolchain".to_string(),
@@ -1436,7 +1543,7 @@ fn sandbox_toolchain_verify_bash_parser_accepts_options() {
         panic!("expected toolchain verify bash");
     };
     assert!(!options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1455,7 +1562,7 @@ fn sandbox_toolchain_verify_busybox_parser_accepts_options() {
     };
     assert_eq!(options.sandbox_id, sandbox_id);
     assert!(options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let command = parse_sandbox_command(&[
         "toolchain".to_string(),
@@ -1468,7 +1575,7 @@ fn sandbox_toolchain_verify_busybox_parser_accepts_options() {
         panic!("expected toolchain verify busybox");
     };
     assert!(!options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1487,7 +1594,7 @@ fn sandbox_toolchain_verify_python_parser_accepts_options() {
     };
     assert_eq!(options.sandbox_id, sandbox_id);
     assert!(options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let command = parse_sandbox_command(&[
         "toolchain".to_string(),
@@ -1500,7 +1607,7 @@ fn sandbox_toolchain_verify_python_parser_accepts_options() {
         panic!("expected toolchain verify python");
     };
     assert!(!options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1518,7 +1625,7 @@ fn sandbox_toolchain_verify_coding_parser_accepts_options() {
     };
     assert_eq!(options.sandbox_id, sandbox_id);
     assert!(options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
     assert!(!options.full);
 
     let command = parse_sandbox_command(&[
@@ -1533,7 +1640,7 @@ fn sandbox_toolchain_verify_coding_parser_accepts_options() {
         panic!("expected toolchain verify coding");
     };
     assert!(!options.allow_unsigned);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
     assert!(options.full);
 }
 
@@ -1563,7 +1670,7 @@ fn sandbox_toolchain_verify_parser_rejects_daemon_unsigned_override() {
 
 #[test]
 fn sandbox_verify_coding_workflow_tracks_phase3_acceptance_commands() {
-    let cases: BTreeMap<_, _> = super::CODING_WORKFLOW_BUSYBOX_CASES
+    let cases: BTreeMap<_, _> = CODING_WORKFLOW_BUSYBOX_CASES
         .iter()
         .map(|case| (case.name, case))
         .collect();
@@ -1632,7 +1739,7 @@ fn sandbox_policy_parser_accepts_show_and_set_options() {
         parse_sandbox_command(&["policy".to_string(), "show".to_string()]).expect("policy show");
     assert_eq!(
         show,
-        SandboxCliCommand::Policy(super::SandboxPolicyCliCommand::Show)
+        SandboxCliCommand::Policy(SandboxPolicyCliCommand::Show)
     );
 
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -1675,7 +1782,7 @@ fn sandbox_policy_parser_accepts_show_and_set_options() {
         "Packages.Example".to_string(),
     ])
     .expect("policy set");
-    let SandboxCliCommand::Policy(super::SandboxPolicyCliCommand::Set(options)) = set else {
+    let SandboxCliCommand::Policy(SandboxPolicyCliCommand::Set(options)) = set else {
         panic!("expected policy set");
     };
     assert_eq!(options.allow_unsigned_toolchains, Some(true));
@@ -1704,7 +1811,7 @@ fn sandbox_policy_parser_accepts_show_and_set_options() {
     assert_eq!(options.allowed_http_hosts, vec!["packages.example"]);
 
     let mut policy = sinomo_runtime::sandbox::SandboxPolicy::default();
-    super::apply_sandbox_policy_set_options(&mut policy, options);
+    apply_sandbox_policy_set_options(&mut policy, options);
     assert_eq!(policy.max_limits.max_input_bytes, 3072);
     assert_eq!(policy.max_limits.max_output_bytes, 4096);
 }
@@ -1720,7 +1827,7 @@ fn sandbox_policy_parser_rejects_invalid_allowed_capability() {
     .expect_err("embedded NUL policy capability denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("sandbox capability"));
             assert!(detail.contains("embedded NUL byte"));
         }
@@ -1777,7 +1884,7 @@ fn sandbox_policy_parser_applies_mediated_pip_index_policy_flags() {
         "127.0.0.1".to_string(),
     ])
     .expect("policy set");
-    let SandboxCliCommand::Policy(super::SandboxPolicyCliCommand::Set(options)) = set else {
+    let SandboxCliCommand::Policy(SandboxPolicyCliCommand::Set(options)) = set else {
         panic!("expected policy set");
     };
 
@@ -1785,7 +1892,7 @@ fn sandbox_policy_parser_applies_mediated_pip_index_policy_flags() {
     assert_eq!(options.allowed_http_hosts, vec!["127.0.0.1"]);
 
     let mut policy = sinomo_runtime::sandbox::SandboxPolicy::default();
-    super::apply_sandbox_policy_set_options(&mut policy, options);
+    apply_sandbox_policy_set_options(&mut policy, options);
     assert!(policy.allowed_command_capabilities.contains("network.http"));
     assert!(policy.allowed_http_hosts.contains("127.0.0.1"));
 }
@@ -1799,7 +1906,7 @@ fn sandbox_file_parser_accepts_ls_default_path_and_cat_path() {
     };
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(options.path.as_str(), "/");
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let cat = parse_sandbox_command(&[
@@ -1815,7 +1922,7 @@ fn sandbox_file_parser_accepts_ls_default_path_and_cat_path() {
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(options.path.as_str(), "/work/main.rs");
     assert_eq!(options.range, None);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let cat = parse_sandbox_command(&[
@@ -1838,7 +1945,7 @@ fn sandbox_file_parser_accepts_ls_default_path_and_cat_path() {
             end: Some(6)
         })
     );
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let write = parse_sandbox_command(&[
@@ -1857,9 +1964,9 @@ fn sandbox_file_parser_accepts_ls_default_path_and_cat_path() {
     assert_eq!(options.path.as_str(), "/work/main.rs");
     assert_eq!(
         options.input,
-        super::SandboxWriteInput::HostFile(PathBuf::from("/tmp/main.rs"))
+        SandboxWriteInput::HostFile(PathBuf::from("/tmp/main.rs"))
     );
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let write = parse_sandbox_command(&[
@@ -1872,10 +1979,7 @@ fn sandbox_file_parser_accepts_ls_default_path_and_cat_path() {
     let SandboxCliCommand::Write(options) = write else {
         panic!("expected write");
     };
-    assert_eq!(
-        options.input,
-        super::SandboxWriteInput::Literal(b"hello".to_vec())
-    );
+    assert_eq!(options.input, SandboxWriteInput::Literal(b"hello".to_vec()));
 }
 
 #[test]
@@ -1908,7 +2012,7 @@ fn sandbox_fetch_parser_accepts_url_output_and_limits() {
         options.headers.get("Accept").map(String::as_str),
         Some("application/octet-stream")
     );
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1920,7 +2024,7 @@ fn sandbox_lifecycle_parser_accepts_checkpoint_resume_reboot_and_destroy() {
         panic!("expected checkpoint");
     };
     assert_eq!(options.sandbox_id, sandbox_id);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Local);
+    assert_eq!(options.execution, SandboxMetadataExecution::Local);
 
     let checkpoint_id = sinomo_runtime::sandbox::SandboxCheckpointId::generate();
     let resume = parse_sandbox_command(&[
@@ -1935,7 +2039,7 @@ fn sandbox_lifecycle_parser_accepts_checkpoint_resume_reboot_and_destroy() {
     };
     assert_eq!(options.sandbox_id, sandbox_id);
     assert_eq!(options.checkpoint_id, checkpoint_id);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 
     let reboot = parse_sandbox_command(&[
         "reboot".to_string(),
@@ -1947,7 +2051,7 @@ fn sandbox_lifecycle_parser_accepts_checkpoint_resume_reboot_and_destroy() {
         panic!("expected reboot");
     };
     assert_eq!(options.sandbox_id, sandbox_id);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 
     let destroy = parse_sandbox_command(&[
         "destroy".to_string(),
@@ -1959,7 +2063,7 @@ fn sandbox_lifecycle_parser_accepts_checkpoint_resume_reboot_and_destroy() {
         panic!("expected destroy");
     };
     assert_eq!(options.sandbox_id, sandbox_id);
-    assert_eq!(options.execution, super::SandboxMetadataExecution::Daemon);
+    assert_eq!(options.execution, SandboxMetadataExecution::Daemon);
 }
 
 #[test]
@@ -1976,7 +2080,7 @@ fn sandbox_create_and_status_use_local_store() {
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: toolchain_id.clone(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::RetainAcrossSessions,
@@ -1993,7 +2097,7 @@ fn sandbox_create_and_status_use_local_store() {
                     .expect("mount path"),
                 mode: sinomo_runtime::sandbox::SandboxMountMode::ReadOnly,
             }],
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2013,9 +2117,9 @@ fn sandbox_create_and_status_use_local_store() {
     assert!(layout.work.is_dir());
 
     sandbox_status_with_store(
-        super::SandboxStatusOptions {
+        SandboxStatusOptions {
             sandbox_id: sandbox_id.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2026,12 +2130,12 @@ fn sandbox_create_and_status_use_local_store() {
         .expect("create cwd");
     store.save_manifest(&manifest).expect("save manifest");
     sandbox_config_with_store(
-        super::SandboxConfigOptions {
+        SandboxConfigOptions {
             sandbox_id: sandbox_id.clone(),
             cwd: Some(sinomo_runtime::sandbox::SandboxPath::new("/work/src").expect("config cwd")),
             env_set: BTreeMap::from([("RUST_LOG".to_string(), "debug".to_string())]),
             env_unset: vec!["OLD_VAR".to_string()],
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2043,38 +2147,38 @@ fn sandbox_create_and_status_use_local_store() {
         Some("debug")
     );
     let missing_cwd = sandbox_config_with_store(
-        super::SandboxConfigOptions {
+        SandboxConfigOptions {
             sandbox_id: sandbox_id.clone(),
             cwd: Some(
                 sinomo_runtime::sandbox::SandboxPath::new("/work/missing").expect("missing cwd"),
             ),
             env_set: BTreeMap::new(),
             env_unset: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect_err("missing cwd rejected");
     assert!(format!("{missing_cwd:?}").contains("not found"));
     let invalid_env = sandbox_config_with_store(
-        super::SandboxConfigOptions {
+        SandboxConfigOptions {
             sandbox_id: sandbox_id.clone(),
             cwd: None,
             env_set: BTreeMap::from([("BAD-NAME".to_string(), "value".to_string())]),
             env_unset: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect_err("invalid env rejected");
     assert!(format!("{invalid_env:?}").contains("invalid sandbox env name `BAD-NAME`"));
     let invalid_env_value = sandbox_config_with_store(
-        super::SandboxConfigOptions {
+        SandboxConfigOptions {
             sandbox_id: sandbox_id.clone(),
             cwd: None,
             env_set: BTreeMap::from([("RUST_LOG".to_string(), "bad\0value".to_string())]),
             env_unset: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2097,7 +2201,7 @@ fn sandbox_doctor_reports_missing_toolchain_and_policy_denial() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2114,14 +2218,14 @@ fn sandbox_doctor_reports_missing_toolchain_and_policy_denial() {
                     .expect("mount path"),
                 mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
             }],
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let findings = sandbox_doctor_findings_with_stores(
-        super::SandboxDoctorOptions {
+        SandboxDoctorOptions {
             sandbox_id: Some(sandbox_id),
         },
         &store,
@@ -2130,15 +2234,15 @@ fn sandbox_doctor_reports_missing_toolchain_and_policy_denial() {
     )
     .expect("doctor");
     assert!(findings.iter().any(|finding| {
-        finding.severity == super::SandboxDoctorSeverity::Warning
+        finding.severity == SandboxDoctorSeverity::Warning
             && finding.code == "busybox-toolchain-missing"
     }));
     assert!(findings.iter().any(|finding| {
-        finding.severity == super::SandboxDoctorSeverity::Error
+        finding.severity == SandboxDoctorSeverity::Error
             && finding.code == "sandbox-toolchain-missing"
     }));
     assert!(findings.iter().any(|finding| {
-        finding.severity == super::SandboxDoctorSeverity::Error && finding.code == "policy-denied"
+        finding.severity == SandboxDoctorSeverity::Error && finding.code == "policy-denied"
     }));
 
     std::fs::remove_dir_all(root).ok();
@@ -2162,7 +2266,7 @@ fn sandbox_doctor_warns_when_policy_allows_wasix_unpinned_child_exec() {
         .insert(sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY.to_string());
 
     let findings = sandbox_doctor_findings_with_stores(
-        super::SandboxDoctorOptions { sandbox_id: None },
+        SandboxDoctorOptions { sandbox_id: None },
         &store,
         &toolchain_store,
         &policy,
@@ -2172,7 +2276,7 @@ fn sandbox_doctor_warns_when_policy_allows_wasix_unpinned_child_exec() {
     assert!(
         findings.iter().any(|finding| {
             finding.code == "policy-allows-wasix-unpinned-child-exec"
-                && finding.severity == super::SandboxDoctorSeverity::Warning
+                && finding.severity == SandboxDoctorSeverity::Warning
                 && finding
                     .detail
                     .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY)
@@ -2199,7 +2303,7 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let other_sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2211,7 +2315,7 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2265,7 +2369,7 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
         .expect("replay sandbox events");
 
     let findings = sandbox_doctor_findings_with_stores_and_events(
-        super::SandboxDoctorOptions {
+        SandboxDoctorOptions {
             sandbox_id: Some(sandbox_id),
         },
         &store,
@@ -2302,7 +2406,7 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
     );
 
     let global_findings = sandbox_doctor_findings_with_stores_and_events(
-        super::SandboxDoctorOptions { sandbox_id: None },
+        SandboxDoctorOptions { sandbox_id: None },
         &store,
         &toolchain_store,
         &sinomo_runtime::sandbox::SandboxPolicy::default(),
@@ -2370,7 +2474,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         )
         .expect("grep");
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2382,14 +2486,14 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let findings = sandbox_doctor_findings_with_stores(
-        super::SandboxDoctorOptions {
+        SandboxDoctorOptions {
             sandbox_id: Some(sandbox_id),
         },
         &store,
@@ -2436,7 +2540,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
             required_toolchain_findings
                 .iter()
                 .any(|finding| finding.detail.contains(&format!("`{required}`"))
-                    && finding.severity == super::SandboxDoctorSeverity::Error),
+                    && finding.severity == SandboxDoctorSeverity::Error),
             "doctor should treat missing {required} as an error"
         );
     }
@@ -2454,7 +2558,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         findings
             .iter()
             .any(|finding| finding.code == "process-substrate-missing"
-                && finding.severity == super::SandboxDoctorSeverity::Warning
+                && finding.severity == SandboxDoctorSeverity::Warning
                 && finding
                     .detail
                     .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY)
@@ -2465,7 +2569,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         findings
             .iter()
             .any(|finding| finding.code == "process-substrate-missing"
-                && finding.severity == super::SandboxDoctorSeverity::Warning
+                && finding.severity == SandboxDoctorSeverity::Warning
                 && finding.detail.contains("child-process-exec")
                 && finding.detail.contains("fork/exec"))
     );
@@ -2473,7 +2577,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         findings
             .iter()
             .any(|finding| finding.code == "process-substrate-available"
-                && finding.severity == super::SandboxDoctorSeverity::Info
+                && finding.severity == SandboxDoctorSeverity::Info
                 && finding.detail.contains(
                     sinomo_runtime::sandbox::SANDBOX_PINNED_CHILD_EXEC_CONTAINMENT_CAPABILITY
                 )
@@ -2484,7 +2588,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         findings
             .iter()
             .any(|finding| finding.code == "runtime-budget-supported"
-                && finding.severity == super::SandboxDoctorSeverity::Info
+                && finding.severity == SandboxDoctorSeverity::Info
                 && finding.detail.contains("WASIX")
                 && finding.detail.contains("wall-timeout"))
     );
@@ -2492,7 +2596,7 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         findings
             .iter()
             .any(|finding| finding.code == "runtime-budget-missing"
-                && finding.severity == super::SandboxDoctorSeverity::Warning
+                && finding.severity == SandboxDoctorSeverity::Warning
                 && finding.detail.contains("Wasix")
                 && finding.detail.contains("wall-timeout"))
     );
@@ -2560,14 +2664,14 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
         findings
             .iter()
             .any(|finding| finding.code == "mvp-command-surface-incomplete"
-                && finding.severity == super::SandboxDoctorSeverity::Error
+                && finding.severity == SandboxDoctorSeverity::Error
                 && finding.detail.contains("`sh`"))
     );
     assert!(
         findings
             .iter()
             .any(|finding| finding.code == "shell-command-missing"
-                && finding.severity == super::SandboxDoctorSeverity::Error
+                && finding.severity == SandboxDoctorSeverity::Error
                 && finding.detail.contains("genuine shell/process substrate"))
     );
 
@@ -2606,7 +2710,7 @@ fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
         )
         .expect("sh");
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2618,14 +2722,14 @@ fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let findings = sandbox_doctor_findings_with_stores(
-        super::SandboxDoctorOptions {
+        SandboxDoctorOptions {
             sandbox_id: Some(sandbox_id),
         },
         &store,
@@ -2638,7 +2742,7 @@ fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
         findings
             .iter()
             .any(|finding| finding.code == "shell-process-substrate-missing"
-                && finding.severity == super::SandboxDoctorSeverity::Error
+                && finding.severity == SandboxDoctorSeverity::Error
                 && finding.detail.contains("child-process-exec"))
     );
     assert!(
@@ -2685,7 +2789,7 @@ fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgemen
         )
         .expect("sh");
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2697,14 +2801,14 @@ fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgemen
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let findings = sandbox_doctor_findings_with_stores(
-        super::SandboxDoctorOptions {
+        SandboxDoctorOptions {
             sandbox_id: Some(sandbox_id),
         },
         &store,
@@ -2716,7 +2820,7 @@ fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgemen
     assert!(
         findings.iter().any(|finding| {
             finding.code == "wasix-unpinned-child-exec-acknowledged"
-                && finding.severity == super::SandboxDoctorSeverity::Warning
+                && finding.severity == SandboxDoctorSeverity::Warning
                 && finding
                     .detail
                     .contains(sinomo_runtime::sandbox::SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY)
@@ -2741,7 +2845,7 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2753,7 +2857,7 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2761,11 +2865,11 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
     let mut event_store =
         sinomo_runtime::events::JsonlEventStore::new(root.join("events/event-log.jsonl"));
     sandbox_write_with_store_and_event_store(
-        super::SandboxWriteOptions {
+        SandboxWriteOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("file"),
-            input: super::SandboxWriteInput::Literal(b"fn main() {}\n".to_vec()),
-            execution: super::SandboxMetadataExecution::Local,
+            input: SandboxWriteInput::Literal(b"fn main() {}\n".to_vec()),
+            execution: SandboxMetadataExecution::Local,
         },
         b"fn main() {}\n".to_vec(),
         &store,
@@ -2790,20 +2894,20 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
     assert_eq!(file_events[0].event.payload["bytes_written"], 13);
 
     sandbox_ls_with_store(
-        super::SandboxLsOptions {
+        SandboxLsOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/work").expect("work"),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("ls");
     sandbox_cat_with_store(
-        super::SandboxCatOptions {
+        SandboxCatOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("file"),
             range: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -2825,54 +2929,54 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
         .save_manifest(&manifest)
         .expect("save limited manifest");
     sandbox_ls_with_store(
-        super::SandboxLsOptions {
+        SandboxLsOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/dev").expect("dev"),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("ls dev");
     sandbox_cat_with_store(
-        super::SandboxCatOptions {
+        SandboxCatOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/dev/null").expect("null"),
             range: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("cat null");
     sandbox_cat_with_store(
-        super::SandboxCatOptions {
+        SandboxCatOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/dev/zero").expect("zero"),
             range: Some(sinomo_runtime::sandbox::ByteRange {
                 start: 0,
                 end: Some(4),
             }),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("cat bounded zero");
     sandbox_write_with_store(
-        super::SandboxWriteOptions {
+        SandboxWriteOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/dev/null").expect("null"),
-            input: super::SandboxWriteInput::Literal(b"discarded by device".to_vec()),
-            execution: super::SandboxMetadataExecution::Local,
+            input: SandboxWriteInput::Literal(b"discarded by device".to_vec()),
+            execution: SandboxMetadataExecution::Local,
         },
         b"discarded by device".to_vec(),
         &store,
     )
     .expect("write null ignores workspace quota");
     let _readonly_error = sandbox_write_with_store_and_event_store(
-        super::SandboxWriteOptions {
+        SandboxWriteOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/dev").expect("dev"),
-            input: super::SandboxWriteInput::Literal(b"no".to_vec()),
-            execution: super::SandboxMetadataExecution::Local,
+            input: SandboxWriteInput::Literal(b"no".to_vec()),
+            execution: SandboxMetadataExecution::Local,
         },
         b"no".to_vec(),
         &store,
@@ -2911,11 +3015,11 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
     );
     assert_eq!(mount_events[0].event.payload["phase"], "sandbox-write");
     let error = sandbox_write_with_store_and_event_store(
-        super::SandboxWriteOptions {
+        SandboxWriteOptions {
             sandbox_id: sandbox_id.clone(),
             path: sinomo_runtime::sandbox::SandboxPath::new("/work/main.rs").expect("file"),
-            input: super::SandboxWriteInput::Literal(b"too much content\n".to_vec()),
-            execution: super::SandboxMetadataExecution::Local,
+            input: SandboxWriteInput::Literal(b"too much content\n".to_vec()),
+            execution: SandboxMetadataExecution::Local,
         },
         b"too much content\n".to_vec(),
         &store,
@@ -2986,7 +3090,7 @@ fn sandbox_fetch_uses_mediated_transport_and_persists_output_and_audit() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -2998,7 +3102,7 @@ fn sandbox_fetch_uses_mediated_transport_and_persists_output_and_audit() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3016,14 +3120,14 @@ fn sandbox_fetch_uses_mediated_transport_and_persists_output_and_audit() {
         sinomo_runtime::events::JsonlEventStore::new(root.join("events/event-log.jsonl"));
 
     let result = sandbox_fetch_with_store_transport_and_event_store(
-        super::SandboxFetchOptions {
+        SandboxFetchOptions {
             sandbox_id: sandbox_id.clone(),
             url: "https://packages.example/archive.tar.gz".to_string(),
             output_path: output_path.clone(),
             timeout_ms: 1234,
             max_response_bytes: 4096,
             headers: Default::default(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
         &policy,
@@ -3122,7 +3226,7 @@ fn sandbox_fetch_records_resource_exhaustion_when_output_write_exceeds_quota() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3134,7 +3238,7 @@ fn sandbox_fetch_records_resource_exhaustion_when_output_write_exceeds_quota() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3156,14 +3260,14 @@ fn sandbox_fetch_records_resource_exhaustion_when_output_write_exceeds_quota() {
         sinomo_runtime::events::JsonlEventStore::new(root.join("events/event-log.jsonl"));
 
     let error = sandbox_fetch_with_store_transport_and_event_store(
-        super::SandboxFetchOptions {
+        SandboxFetchOptions {
             sandbox_id: sandbox_id.clone(),
             url: "https://packages.example/archive.tar.gz".to_string(),
             output_path: output_path.clone(),
             timeout_ms: 1234,
             max_response_bytes: 4096,
             headers: Default::default(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
         &policy,
@@ -3249,7 +3353,7 @@ fn sandbox_fetch_audits_failed_post_policy_transport_attempt() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3261,7 +3365,7 @@ fn sandbox_fetch_audits_failed_post_policy_transport_attempt() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3277,7 +3381,7 @@ fn sandbox_fetch_audits_failed_post_policy_transport_attempt() {
         sinomo_runtime::events::JsonlEventStore::new(root.join("events/event-log.jsonl"));
 
     let error = sandbox_fetch_with_store_transport_and_event_store(
-        super::SandboxFetchOptions {
+        SandboxFetchOptions {
             sandbox_id: sandbox_id.clone(),
             url: "https://packages.example/archive.tar.gz".to_string(),
             output_path: sinomo_runtime::sandbox::SandboxPath::new("/work/archive.tar.gz")
@@ -3285,7 +3389,7 @@ fn sandbox_fetch_audits_failed_post_policy_transport_attempt() {
             timeout_ms: 1234,
             max_response_bytes: 4096,
             headers: Default::default(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
         &policy,
@@ -3340,7 +3444,7 @@ fn sandbox_fetch_audits_policy_denial() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3352,7 +3456,7 @@ fn sandbox_fetch_audits_policy_denial() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3365,7 +3469,7 @@ fn sandbox_fetch_audits_policy_denial() {
         sinomo_runtime::events::JsonlEventStore::new(root.join("events/event-log.jsonl"));
 
     let error = sandbox_fetch_with_store_transport_and_event_store(
-        super::SandboxFetchOptions {
+        SandboxFetchOptions {
             sandbox_id: sandbox_id.clone(),
             url: "https://packages.example/archive.tar.gz".to_string(),
             output_path: sinomo_runtime::sandbox::SandboxPath::new("/work/archive.tar.gz")
@@ -3373,7 +3477,7 @@ fn sandbox_fetch_audits_policy_denial() {
             timeout_ms: 1234,
             max_response_bytes: 4096,
             headers: Default::default(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
         &policy,
@@ -3410,7 +3514,7 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3422,7 +3526,7 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3433,9 +3537,9 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
     fs.write(&path, b"before").expect("write");
 
     sandbox_checkpoint_with_store(
-        super::SandboxCheckpointOptions {
+        SandboxCheckpointOptions {
             sandbox_id: sandbox_id.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3453,10 +3557,10 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
 
     fs.write(&path, b"after").expect("overwrite");
     sandbox_resume_with_store(
-        super::SandboxResumeOptions {
+        SandboxResumeOptions {
             sandbox_id: sandbox_id.clone(),
             checkpoint_id,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3467,9 +3571,9 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
 
     std::fs::write(layout.tmp.join("session-cache.txt"), b"tmp").expect("write tmp");
     sandbox_reboot_with_store(
-        super::SandboxRebootOptions {
+        SandboxRebootOptions {
             sandbox_id: sandbox_id.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3477,9 +3581,9 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
     assert!(!layout.tmp.join("session-cache.txt").exists());
 
     sandbox_destroy_with_store(
-        super::SandboxDestroyOptions {
+        SandboxDestroyOptions {
             sandbox_id: sandbox_id.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3501,7 +3605,7 @@ fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::RetainAcrossSessions,
@@ -3513,7 +3617,7 @@ fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3522,9 +3626,9 @@ fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
     std::fs::write(layout.tmp.join("session-cache.txt"), b"tmp").expect("write tmp");
 
     sandbox_reboot_with_store(
-        super::SandboxRebootOptions {
+        SandboxRebootOptions {
             sandbox_id: sandbox_id.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3570,7 +3674,7 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
     .expect("module");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3582,22 +3686,22 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     sandbox_run_with_store(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id: sandbox_id.clone(),
-            target: super::SandboxRunTarget::WasmModule(module_path),
+            target: SandboxRunTarget::WasmModule(module_path),
             argv: vec!["stdout.wasm".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
     )
@@ -3634,19 +3738,19 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
     let command_id = record.command_id.clone();
 
     sandbox_logs_with_store(
-        super::SandboxLogsOptions {
+        SandboxLogsOptions {
             sandbox_id: sandbox_id.clone(),
             command_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("logs");
     sandbox_logs_with_store(
-        super::SandboxLogsOptions {
+        SandboxLogsOptions {
             sandbox_id,
             command_id: Some(command_id),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -3683,7 +3787,7 @@ fn sandbox_run_returns_error_when_guest_exits_nonzero() {
     .expect("module");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3695,28 +3799,28 @@ fn sandbox_run_returns_error_when_guest_exits_nonzero() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let error = sandbox_run_with_store(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id,
-            target: super::SandboxRunTarget::WasmModule(module_path),
+            target: SandboxRunTarget::WasmModule(module_path),
             argv: vec!["exit7.wasm".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
     )
     .expect_err("nonzero guest exit");
     assert!(
-        matches!(error, CliError::Process { status: 7, .. }),
+        matches!(error, SandboxCliError::Process { status: 7, .. }),
         "unexpected error: {error:?}"
     );
 
@@ -3740,7 +3844,7 @@ fn sandbox_run_rejects_mounts_outside_default_policy() {
     std::fs::write(&module_path, r#"(module (func (export "_start")))"#).expect("module");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3757,27 +3861,27 @@ fn sandbox_run_rejects_mounts_outside_default_policy() {
                     .expect("mount path"),
                 mode: sinomo_runtime::sandbox::SandboxMountMode::ReadWrite,
             }],
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let error = sandbox_run_with_store(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id,
-            target: super::SandboxRunTarget::WasmModule(module_path),
+            target: SandboxRunTarget::WasmModule(module_path),
             argv: vec!["noop.wasm".to_string()],
             timeout_ms: 1000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
     )
     .expect_err("mount source denied");
-    assert!(matches!(error, CliError::SandboxPolicyDenied { .. }));
+    assert!(matches!(error, SandboxCliError::SandboxPolicyDenied { .. }));
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -3838,7 +3942,7 @@ fn sandbox_run_uses_pinned_toolchain_command() {
         .expect("put networked command");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3850,37 +3954,37 @@ fn sandbox_run_uses_pinned_toolchain_command() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     sandbox_run_with_stores(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id: sandbox_id.clone(),
-            target: super::SandboxRunTarget::ToolchainCommand("hello".to_string()),
+            target: SandboxRunTarget::ToolchainCommand("hello".to_string()),
             argv: vec!["hello".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
         &toolchain_store,
     )
     .expect("run");
     let mismatch = sandbox_run_with_stores(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id: sandbox_id.clone(),
-            target: super::SandboxRunTarget::ToolchainCommand("hello".to_string()),
+            target: SandboxRunTarget::ToolchainCommand("hello".to_string()),
             argv: vec!["cat".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
         &toolchain_store,
@@ -3888,21 +3992,21 @@ fn sandbox_run_uses_pinned_toolchain_command() {
     .expect_err("argv0 mismatch");
     assert!(matches!(
         mismatch,
-        CliError::Parse { ref detail }
+        SandboxCliError::Parse { ref detail }
             if detail.contains("matching argv[0]")
                 && detail.contains("`hello`")
                 && detail.contains("`cat`")
     ));
     let capability_denied = sandbox_run_with_stores(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id: sandbox_id.clone(),
-            target: super::SandboxRunTarget::ToolchainCommand("networked".to_string()),
+            target: SandboxRunTarget::ToolchainCommand("networked".to_string()),
             argv: vec!["networked".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
         &toolchain_store,
@@ -3910,7 +4014,7 @@ fn sandbox_run_uses_pinned_toolchain_command() {
     .expect_err("capability denied");
     assert!(matches!(
         capability_denied,
-        CliError::SandboxPolicyDenied { ref detail }
+        SandboxCliError::SandboxPolicyDenied { ref detail }
             if detail.contains("command-capability-denied")
                 && detail.contains("network.http")
     ));
@@ -3984,7 +4088,7 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
         .expect("put cat");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -3996,7 +4100,7 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -4031,11 +4135,11 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
     .expect("write plan");
 
     sandbox_process_plan_with_stores(
-        super::SandboxProcessPlanOptions {
+        SandboxProcessPlanOptions {
             sandbox_id: sandbox_id.clone(),
             plan_path,
             timeout_ms: 1_000,
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
         &toolchain_store,
@@ -4094,7 +4198,7 @@ fn sandbox_shell_invokes_pinned_sh_command() {
         .expect("put command");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -4106,18 +4210,18 @@ fn sandbox_shell_invokes_pinned_sh_command() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     sandbox_shell_with_stores(
-        super::SandboxShellOptions {
+        SandboxShellOptions {
             sandbox_id: sandbox_id.clone(),
             script: None,
             timeout_ms: 1_000,
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         b"echo shell\n".to_vec(),
         &store,
@@ -4175,7 +4279,7 @@ fn sandbox_shell_rejects_toolchain_without_real_sh() {
         .expect("put command");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -4187,18 +4291,18 @@ fn sandbox_shell_rejects_toolchain_without_real_sh() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let error = sandbox_shell_with_stores(
-        super::SandboxShellOptions {
+        SandboxShellOptions {
             sandbox_id,
             script: None,
             timeout_ms: 1_000,
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         b"echo shell\n".to_vec(),
         &store,
@@ -4206,7 +4310,7 @@ fn sandbox_shell_rejects_toolchain_without_real_sh() {
     )
     .expect_err("missing shell should fail");
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("sandbox toolchain command not found"));
             assert!(detail.contains(":sh"));
         }
@@ -4249,14 +4353,14 @@ fn sandbox_toolchain_add_command_installs_local_command_module() {
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
 
     sandbox_toolchain_add_command_with_store(
-        super::SandboxToolchainAddCommandOptions {
+        SandboxToolchainAddCommandOptions {
             toolchain_id: toolchain_id.clone(),
             version: "test-1".to_string(),
             target_abi: sinomo_runtime::sandbox::SandboxWasiAbi::Wasix,
             provenance: "unit test".to_string(),
             command_name: "hello".to_string(),
             module_path: module_path.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
             required_capabilities: vec!["network.http".to_string()],
             default_limits: sinomo_runtime::sandbox::SandboxResourceLimits {
                 memory_mb: 64,
@@ -4313,8 +4417,8 @@ fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
         ..sinomo_runtime::sandbox::SandboxResourceLimits::default()
     };
 
-    super::sandbox_module_artifact_register_with_data_dir(
-        super::SandboxModuleArtifactRegisterOptions {
+    sandbox_module_artifact_register_with_data_dir(
+        SandboxModuleArtifactRegisterOptions {
             artifact_id: artifact_id.clone(),
             source_path: source_path.clone(),
             interface_version: Some("custom-v0".to_string()),
@@ -4411,8 +4515,8 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
         sinomo_runtime::module::ModuleId::from_legacy_named("module.trigger.silence_policy")
             .expect("module");
 
-    super::sandbox_module_artifact_register_with_data_dir(
-        super::SandboxModuleArtifactRegisterOptions {
+    sandbox_module_artifact_register_with_data_dir(
+        SandboxModuleArtifactRegisterOptions {
             artifact_id: artifact_id.clone(),
             source_path: source_path.clone(),
             interface_version: Some(
@@ -4426,7 +4530,7 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
             env: BTreeMap::new(),
             limits: sinomo_runtime::sandbox::SandboxResourceLimits::default(),
             timeout_ms: Some(1_500),
-            rollout_material: Some(super::SandboxModuleArtifactRolloutMaterialOptions {
+            rollout_material: Some(SandboxModuleArtifactRolloutMaterialOptions {
                 candidate_bundle_path: bundle_dir.clone(),
                 module_id: module_id.clone(),
                 active_artifact_id: active_artifact_id.clone(),
@@ -4504,13 +4608,13 @@ fn sandbox_toolchain_add_artifact_installs_local_support_file() {
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
 
     sandbox_toolchain_add_artifact_with_store(
-        super::SandboxToolchainAddArtifactOptions {
+        SandboxToolchainAddArtifactOptions {
             toolchain_id: toolchain_id.clone(),
             version: "python-1".to_string(),
             provenance: "unit test".to_string(),
             relative_path: "lib/python/os.py".to_string(),
             source_path: artifact_path.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
@@ -4580,10 +4684,10 @@ fn sandbox_toolchain_import_package_installs_local_commands_and_artifacts() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
@@ -4650,7 +4754,7 @@ fn sandbox_toolchain_verify_package_accepts_valid_package_without_importing() {
     .expect("package");
     let cache_root = root.join("cache");
 
-    sandbox_toolchain_verify_package(super::SandboxToolchainVerifyPackageOptions { package_path })
+    sandbox_toolchain_verify_package(SandboxToolchainVerifyPackageOptions { package_path })
         .expect("verify package");
 
     assert!(
@@ -4699,13 +4803,12 @@ fn sandbox_toolchain_verify_package_rejects_invalid_package_without_importing() 
     .expect("package");
     let cache_root = root.join("cache");
 
-    let error = sandbox_toolchain_verify_package(super::SandboxToolchainVerifyPackageOptions {
-        package_path,
-    })
-    .expect_err("duplicate command denied");
+    let error =
+        sandbox_toolchain_verify_package(SandboxToolchainVerifyPackageOptions { package_path })
+            .expect_err("duplicate command denied");
 
     match error {
-        CliError::Parse { detail } => assert!(detail.contains("duplicate")),
+        SandboxCliError::Parse { detail } => assert!(detail.contains("duplicate")),
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(
@@ -4748,13 +4851,12 @@ fn sandbox_toolchain_verify_package_rejects_invalid_default_env_name() {
     )
     .expect("package");
 
-    let error = sandbox_toolchain_verify_package(super::SandboxToolchainVerifyPackageOptions {
-        package_path,
-    })
-    .expect_err("invalid default env denied");
+    let error =
+        sandbox_toolchain_verify_package(SandboxToolchainVerifyPackageOptions { package_path })
+            .expect_err("invalid default env denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("invalid default environment variable name `BAD-NAME`"))
         }
         other => panic!("unexpected error: {other:?}"),
@@ -4795,13 +4897,12 @@ fn sandbox_toolchain_verify_package_rejects_invalid_default_env_value() {
     )
     .expect("package");
 
-    let error = sandbox_toolchain_verify_package(super::SandboxToolchainVerifyPackageOptions {
-        package_path,
-    })
-    .expect_err("invalid default env value denied");
+    let error =
+        sandbox_toolchain_verify_package(SandboxToolchainVerifyPackageOptions { package_path })
+            .expect_err("invalid default env value denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains(
                 "default environment variable `PYTHONHOME` contains an embedded NUL byte"
             ))
@@ -4842,13 +4943,12 @@ fn sandbox_toolchain_verify_package_rejects_invalid_argv_prefix_value() {
     )
     .expect("package");
 
-    let error = sandbox_toolchain_verify_package(super::SandboxToolchainVerifyPackageOptions {
-        package_path,
-    })
-    .expect_err("invalid argv prefix denied");
+    let error =
+        sandbox_toolchain_verify_package(SandboxToolchainVerifyPackageOptions { package_path })
+            .expect_err("invalid argv prefix denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("argv_prefix[1] contains an embedded NUL byte"))
         }
         other => panic!("unexpected error: {other:?}"),
@@ -4887,13 +4987,12 @@ fn sandbox_toolchain_verify_package_rejects_invalid_required_capability() {
     )
     .expect("package");
 
-    let error = sandbox_toolchain_verify_package(super::SandboxToolchainVerifyPackageOptions {
-        package_path,
-    })
-    .expect_err("invalid capability denied");
+    let error =
+        sandbox_toolchain_verify_package(SandboxToolchainVerifyPackageOptions { package_path })
+            .expect_err("invalid capability denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("sandbox toolchain command capability"));
             assert!(detail.contains("embedded NUL byte"));
         }
@@ -4956,10 +5055,10 @@ fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
         .expect("existing command");
 
     sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: Some(target_toolchain_id.clone()),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
@@ -5053,10 +5152,10 @@ fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
         .expect("existing command");
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path,
             target_toolchain_id: Some(target_toolchain_id.clone()),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
@@ -5103,17 +5202,17 @@ fn sandbox_toolchain_import_package_rejects_host_path_escape() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
     .expect_err("path escape denied");
 
     match error {
-        CliError::Parse { detail } => assert!(detail.contains("cannot escape")),
+        SandboxCliError::Parse { detail } => assert!(detail.contains("cannot escape")),
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(matches!(
@@ -5155,17 +5254,17 @@ fn sandbox_toolchain_import_package_rejects_absolute_module_path() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
     .expect_err("absolute module path denied");
 
     match error {
-        CliError::Parse { detail } => assert!(detail.contains("must be relative")),
+        SandboxCliError::Parse { detail } => assert!(detail.contains("must be relative")),
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(matches!(
@@ -5212,17 +5311,17 @@ fn sandbox_toolchain_import_package_rejects_artifact_file_path_escape() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
     .expect_err("artifact file path escape denied");
 
     match error {
-        CliError::Parse { detail } => assert!(detail.contains("cannot escape")),
+        SandboxCliError::Parse { detail } => assert!(detail.contains("cannot escape")),
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(matches!(
@@ -5271,17 +5370,17 @@ fn sandbox_toolchain_import_package_rejects_invalid_artifact_relative_path() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
     .expect_err("invalid artifact destination path denied");
 
     match error {
-        CliError::Parse { detail } => {
+        SandboxCliError::Parse { detail } => {
             assert!(detail.contains("invalid sandbox toolchain artifact path"))
         }
         other => panic!("unexpected error: {other:?}"),
@@ -5326,17 +5425,17 @@ fn sandbox_toolchain_import_package_rejects_hash_mismatch() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
     .expect_err("hash mismatch denied");
 
     match error {
-        CliError::Parse { detail } => assert!(detail.contains("hash mismatch")),
+        SandboxCliError::Parse { detail } => assert!(detail.contains("hash mismatch")),
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(matches!(
@@ -5387,17 +5486,17 @@ fn sandbox_toolchain_import_package_validates_before_writing_manifest() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     let error = sandbox_toolchain_import_package_with_store(
-        super::SandboxToolchainImportPackageOptions {
+        SandboxToolchainImportPackageOptions {
             package_path: package_path.clone(),
             target_toolchain_id: None,
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
     .expect_err("duplicate command denied");
 
     match error {
-        CliError::Parse { detail } => assert!(detail.contains("duplicate")),
+        SandboxCliError::Parse { detail } => assert!(detail.contains("duplicate")),
         other => panic!("unexpected error: {other:?}"),
     }
     assert!(matches!(
@@ -5440,11 +5539,11 @@ fn sandbox_toolchain_import_busybox_installs_core_applets() {
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
 
     sandbox_toolchain_import_busybox_with_store(
-        super::SandboxToolchainImportBusyBoxOptions {
+        SandboxToolchainImportBusyBoxOptions {
             version: "busybox-wasi-test".to_string(),
             provenance: "unit test build".to_string(),
             module_path: module_path.clone(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &toolchain_store,
     )
@@ -5522,7 +5621,7 @@ fn sandbox_run_applies_toolchain_command_default_limits() {
         )
         .expect("put command");
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id,
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -5534,29 +5633,29 @@ fn sandbox_run_applies_toolchain_command_default_limits() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
     .expect("create");
 
     let error = sandbox_run_with_stores(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id,
-            target: super::SandboxRunTarget::ToolchainCommand("limited".to_string()),
+            target: SandboxRunTarget::ToolchainCommand("limited".to_string()),
             argv: vec!["limited".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
         &toolchain_store,
     )
     .expect_err("command output limit");
 
-    assert!(matches!(error, CliError::Parse { .. }));
+    assert!(matches!(error, SandboxCliError::Parse { .. }));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -5665,7 +5764,7 @@ fn sandbox_run_rejects_written_bytes_over_limit() {
     .expect("module");
 
     sandbox_create_with_store(
-        super::SandboxCreateOptions {
+        SandboxCreateOptions {
             sandbox_id: Some(sandbox_id.clone()),
             toolchain_id: sinomo_runtime::sandbox::SandboxToolchainId::generate(),
             temp_policy: sinomo_runtime::sandbox::SandboxTempPolicy::ClearOnSessionStart,
@@ -5677,7 +5776,7 @@ fn sandbox_run_rejects_written_bytes_over_limit() {
             max_written_bytes_per_command: None,
             max_file_count: None,
             mounts: Vec::new(),
-            execution: super::SandboxMetadataExecution::Local,
+            execution: SandboxMetadataExecution::Local,
         },
         &store,
     )
@@ -5687,15 +5786,15 @@ fn sandbox_run_rejects_written_bytes_over_limit() {
     store.save_manifest(&manifest).expect("save");
 
     let error = sandbox_run_with_store(
-        super::SandboxRunOptions {
+        SandboxRunOptions {
             sandbox_id: sandbox_id.clone(),
-            target: super::SandboxRunTarget::WasmModule(module_path),
+            target: SandboxRunTarget::WasmModule(module_path),
             argv: vec!["write.wasm".to_string()],
             timeout_ms: 1_000,
             stdin: false,
             allow_unsigned: true,
             allowed_capabilities: Vec::new(),
-            execution: super::SandboxRunExecution::Local,
+            execution: SandboxRunExecution::Local,
         },
         &store,
     )
