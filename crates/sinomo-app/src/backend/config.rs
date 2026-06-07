@@ -347,6 +347,40 @@ pub fn cycle_provider_reasoning_effort(
     })
 }
 
+/// The reasoning-effort options offered in the Settings Select, in order. Index 0 (`"default"`)
+/// clears the override; the rest map to a concrete [`ProviderReasoningEffort`].
+pub const REASONING_EFFORT_OPTIONS: &[&str] = &[
+    "default", "minimal", "low", "medium", "high", "xhigh", "max",
+];
+
+/// Resolve a provider form's current reasoning effort to its index into
+/// [`REASONING_EFFORT_OPTIONS`] (0 = default / unset).
+pub fn reasoning_effort_index(effort: Option<&str>) -> usize {
+    match effort {
+        None => 0,
+        Some(value) => REASONING_EFFORT_OPTIONS
+            .iter()
+            .position(|opt| *opt == value)
+            .unwrap_or(0),
+    }
+}
+
+/// Set a provider's reasoning effort to the option at `index` into [`REASONING_EFFORT_OPTIONS`]
+/// (index 0 clears the override). Stored in the provider account options.
+pub fn set_provider_effort(
+    client: &dyn ConfigClient,
+    provider: &str,
+    index: usize,
+) -> Result<(), String> {
+    let effort = match REASONING_EFFORT_OPTIONS.get(index) {
+        Some(&"default") | None => None,
+        Some(value) => Some(value.parse::<ProviderReasoningEffort>()?),
+    };
+    update_provider_account(client, provider, move |account| {
+        account.options.reasoning_effort = effort;
+    })
+}
+
 fn next_reasoning_effort(
     current: Option<ProviderReasoningEffort>,
 ) -> Option<ProviderReasoningEffort> {

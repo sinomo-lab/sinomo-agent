@@ -2,10 +2,32 @@
 //!
 //! Standard file-manager UX (breadcrumb + listing) plus a SIFS inspector that
 //! shows where an object lives and its placement / replication policy.
+//!
+//! Like the Settings tab, this is a fully *composed* `sui-widgets` tree: [`view`]
+//! returns a responsive host ([`FilesView`]) over pre-built pods (wide split with
+//! the inspector, narrow list-only), each assembled from stock `Breadcrumb` /
+//! `IconButton` / `ListView` / `ScrollView` / `Separator` / `PanelSection` /
+//! `PropertyRow` / `Label` widgets. State lives entirely in [`FilesState`]; the
+//! data layer (the SIFS browser + navigation methods) is unchanged.
+//!
+//! The one new wrinkle vs. Settings: the file *listing* changes on navigation, so
+//! the list/breadcrumb items aren't fixed at build time. `ListView::items()` takes
+//! a fixed `Vec<ListItem>` (there is no reactive `items_when` builder), so we wrap
+//! the listing in a small [`RebuildOnChange`] widget keyed on the current path: it
+//! diffs the path on each frame and rebuilds its child pod from the new listing
+//! when it changes. The selection (which only repaints the highlight and updates
+//! the inspector) stays reactive via `ListView::selected_when` + the live-reading
+//! [`InspectorView`] — so selecting a file does *not* rebuild the list (the scroll
+//! position is preserved), only navigation does.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use sui::{
-    ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, MeasureCtx, PaintCtx, Point,
-    PointerButton, PointerEventKind, Rect, ScrollDelta, Size, Widget,
+    Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
+    FontWeight, IconButton, IconGlyph, ListItem, ListView, MeasureCtx, PaintCtx, Rect, ScrollState,
+    ScrollView, Separator, Size, SizedBox, Stack, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
@@ -15,10 +37,20 @@ use crate::state::Shared;
 use crate::theme::Palette;
 use crate::ui::widgets;
 
-const BREADCRUMB_H: f32 = 46.0;
+/// Below this content width the tab collapses to a list-only column (the inspector is hidden).
+const WIDE_THRESHOLD: f32 = 640.0;
 const INSPECTOR_W: f32 = 340.0;
-const ROW_H: f32 = 32.0;
-const PAD: f32 = 16.0;
+const ROW_H: f32 = 34.0;
+const CONTENT_PAD: f32 = 16.0;
+const HEADER_H: f32 = 46.0;
+
+/// A shared closure that resolves the current widget theme — threaded into every control so the
+/// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
+type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
+
+// ---------------------------------------------------------------------------
+// State (data layer) — UNCHANGED from the hand-painted version.
+// ---------------------------------------------------------------------------
 
 /// State backing the files tab.
 pub struct FilesState {
@@ -93,497 +125,48 @@ impl FilesState {
     fn selected_entry(&self) -> Option<&SifsEntry> {
         self.selected.and_then(|i| self.entries.get(i))
     }
-}
 
-#[derive(Clone, PartialEq)]
-enum Hit {
-    Crumb(String),
-    Row(usize),
-    Up,
-}
-
-pub struct FilesView {
-    shared: Shared,
-    breadcrumb_rect: Rect,
-    list_rect: Rect,
-    inspector_rect: Rect,
-    up_rect: Rect,
-    crumb_rects: Vec<(String, Rect)>,
-    crumb_widths: Vec<f32>,
-    hovered: Option<usize>,
-    row_h: f32,
-}
-
-impl FilesView {
-    pub fn new(shared: Shared) -> Self {
-        Self {
-            shared,
-            breadcrumb_rect: Rect::ZERO,
-            list_rect: Rect::ZERO,
-            inspector_rect: Rect::ZERO,
-            up_rect: Rect::ZERO,
-            crumb_rects: Vec::new(),
-            crumb_widths: Vec::new(),
-            hovered: None,
-            row_h: ROW_H,
+    /// Click a listing row: navigate into a directory, otherwise select the file. Returns whether
+    /// the navigation changed the *path* (so the caller can relayout the rebuilt list/breadcrumb).
+    fn activate_row(&mut self, index: usize) -> bool {
+        let is_dir = self.entries.get(index).map(|e| e.is_dir).unwrap_or(false);
+        if is_dir {
+            let target = self.entries[index].path.clone();
+            self.navigate(target);
+            true
+        } else {
+            self.selected = Some(index);
+            false
         }
     }
 
-    fn palette(&self) -> (sui::DefaultTheme, Palette) {
-        let theme = self.shared.theme();
-        let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&self.shared));
-        (theme, pal)
-    }
-
-    fn crumbs(path: &str) -> Vec<(String, String)> {
-        // (label, target_path)
+    /// The breadcrumb path segments as `(label, target_path)` pairs, root first.
+    fn crumbs(&self) -> Vec<(String, String)> {
         let mut out = vec![("SIFS".to_string(), "/".to_string())];
         let mut acc = String::new();
-        for part in path.split('/').filter(|s| !s.is_empty()) {
+        for part in self.path.split('/').filter(|s| !s.is_empty()) {
             acc.push('/');
             acc.push_str(part);
             out.push((part.to_string(), acc.clone()));
         }
         out
     }
-
-    fn row_index_at(&self, p: Point) -> Option<usize> {
-        if !self.list_rect.contains(p) {
-            return None;
-        }
-        let scroll = self.shared.files().scroll;
-        let idx = ((p.y - self.list_rect.y() + scroll) / self.row_h).floor();
-        if idx < 0.0 {
-            return None;
-        }
-        let idx = idx as usize;
-        if idx < self.shared.files().entries.len() {
-            Some(idx)
-        } else {
-            None
-        }
-    }
-
-    fn hit_test(&self, p: Point) -> Option<Hit> {
-        if self.up_rect.contains(p) {
-            return Some(Hit::Up);
-        }
-        for (path, rect) in &self.crumb_rects {
-            if rect.contains(p) {
-                return Some(Hit::Crumb(path.clone()));
-            }
-        }
-        if let Some(i) = self.row_index_at(p) {
-            return Some(Hit::Row(i));
-        }
-        None
-    }
 }
 
-impl Widget for FilesView {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let theme = self.shared.theme();
-        let style = sui::TextStyle {
-            font_size: 13.0,
-            weight: FontWeight::MEDIUM,
-            ..theme.body_text_style()
-        };
-        let crumbs = Self::crumbs(&self.shared.files().path);
-        self.crumb_widths = crumbs
-            .iter()
-            .map(|(label, _)| {
-                ctx.layout()
-                    .measure_text(label.clone(), style.clone())
-                    .map(|m| m.width + 6.0)
-                    .unwrap_or(40.0)
-            })
-            .collect();
-        constraints.max
-    }
+// ---------------------------------------------------------------------------
+// Theme reader + small helpers (mirrors the Settings tab).
+// ---------------------------------------------------------------------------
 
-    fn arrange(&mut self, _ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.breadcrumb_rect = Rect::new(bounds.x(), bounds.y(), bounds.width(), BREADCRUMB_H);
-        let body_y = bounds.y() + BREADCRUMB_H;
-        let body_h = (bounds.height() - BREADCRUMB_H).max(0.0);
-        let list_w = (bounds.width() - INSPECTOR_W).max(120.0);
-        self.list_rect = Rect::new(bounds.x(), body_y, list_w, body_h);
-        self.inspector_rect = Rect::new(bounds.x() + list_w, body_y, INSPECTOR_W, body_h);
-
-        // Up button + breadcrumb segments.
-        self.up_rect = Rect::new(
-            bounds.x() + PAD,
-            bounds.y() + (BREADCRUMB_H - 28.0) / 2.0,
-            28.0,
-            28.0,
-        );
-        let mut x = self.up_rect.x() + self.up_rect.width() + 12.0;
-        let y = bounds.y() + (BREADCRUMB_H - 24.0) / 2.0;
-        self.crumb_rects.clear();
-        for (i, (_, target)) in Self::crumbs(&self.shared.files().path)
-            .into_iter()
-            .enumerate()
-        {
-            let w = self.crumb_widths.get(i).copied().unwrap_or(40.0);
-            self.crumb_rects.push((target, Rect::new(x, y, w, 24.0)));
-            x += w + 16.0; // room for the separator
-        }
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let (theme, pal) = self.palette();
-        ctx.fill_bounds(pal.window);
-        self.paint_breadcrumb(ctx, &theme, &pal);
-        self.paint_list(ctx, &theme, &pal);
-        self.paint_inspector(ctx, &theme, &pal);
-    }
-
-    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if ctx.phase() != EventPhase::Target {
-            return;
-        }
-        if let Event::Pointer(p) = event {
-            match p.kind {
-                PointerEventKind::Move => {
-                    let row = self.row_index_at(p.position);
-                    if row != self.hovered {
-                        self.hovered = row;
-                        ctx.request_paint();
-                    }
-                }
-                PointerEventKind::Down if p.button == Some(PointerButton::Primary) => {
-                    if let Some(hit) = self.hit_test(p.position) {
-                        match hit {
-                            Hit::Up => self.shared.files_mut().go_up(),
-                            Hit::Crumb(path) => self.shared.files_mut().navigate(path),
-                            Hit::Row(i) => {
-                                let is_dir = self
-                                    .shared
-                                    .files()
-                                    .entries
-                                    .get(i)
-                                    .map(|e| e.is_dir)
-                                    .unwrap_or(false);
-                                if is_dir {
-                                    let target = self.shared.files().entries[i].path.clone();
-                                    self.shared.files_mut().navigate(target);
-                                } else {
-                                    self.shared.files_mut().selected = Some(i);
-                                }
-                            }
-                        }
-                        ctx.request_measure();
-                        ctx.request_arrange();
-                        ctx.request_paint();
-                        ctx.set_handled();
-                    }
-                }
-                PointerEventKind::Scroll => {
-                    if self.list_rect.contains(p.position)
-                        && let Some(delta) = p.scroll_delta
-                    {
-                        let dy = match delta {
-                            ScrollDelta::Lines(v) => v.y * 48.0,
-                            ScrollDelta::Pixels(v) => v.y,
-                        };
-                        let mut files = self.shared.files_mut();
-                        let max = (files.entries.len() as f32 * self.row_h
-                            - self.list_rect.height())
-                        .max(0.0);
-                        files.scroll = (files.scroll - dy).clamp(0.0, max);
-                        ctx.request_paint();
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
+/// Clone the shared theme reader into a fresh `Fn() -> DefaultTheme` for one control.
+fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || reader()
 }
 
-impl FilesView {
-    fn paint_breadcrumb(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        ctx.fill_rect(self.breadcrumb_rect, pal.titlebar);
-        widgets::hairline_bottom(ctx, self.breadcrumb_rect, pal.border);
-
-        // Up button.
-        widgets::round_panel(ctx, self.up_rect, pal.field, pal.border, 8.0);
-        let up_style = pal.text_style(theme, 15.0, FontWeight::SEMIBOLD, pal.text_muted);
-        widgets::draw_centered(
-            ctx,
-            "↑",
-            up_style,
-            self.up_rect.x() + self.up_rect.width() / 2.0,
-            self.up_rect.y() + self.up_rect.height() / 2.0,
-        );
-
-        let crumbs = Self::crumbs(&self.shared.files().path);
-        let last = crumbs.len().saturating_sub(1);
-        for (i, ((label, _), (_, rect))) in crumbs.iter().zip(self.crumb_rects.iter()).enumerate() {
-            let active = i == last;
-            let color = if active { pal.text } else { pal.text_muted };
-            let weight = if active {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::MEDIUM
-            };
-            let style = pal.text_style(theme, 13.0, weight, color);
-            widgets::draw_text_in(ctx, *rect, label, style);
-            if i != last {
-                let sep = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(rect.x() + rect.width() + 2.0, rect.y(), 12.0, rect.height()),
-                    "/",
-                    sep,
-                );
-            }
-        }
-    }
-
-    fn paint_list(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        let area = self.list_rect;
-        let files = self.shared.files();
-
-        if let Some(error) = &files.error {
-            let style = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.bad);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    area.x() + PAD,
-                    area.y() + PAD,
-                    area.width() - PAD * 2.0,
-                    24.0,
-                ),
-                &format!("SIFS unavailable: {error}"),
-                style,
-            );
-            return;
-        }
-        if files.entries.is_empty() {
-            let cx = area.x() + area.width() / 2.0;
-            let cy = area.y() + area.height() / 2.0;
-            let mark = pal.text_style(theme, 30.0, FontWeight::BOLD, pal.text_faint);
-            widgets::draw_centered(ctx, "▤", mark, cx, cy - 26.0);
-            let title = pal.text_style(theme, 15.0, FontWeight::MEDIUM, pal.text_muted);
-            widgets::draw_centered(ctx, "Empty directory", title, cx, cy + 4.0);
-            return;
-        }
-
-        ctx.push_clip_rect(area);
-        let scroll = files.scroll;
-        let mut y = area.y() - scroll;
-        for (i, entry) in files.entries.iter().enumerate() {
-            let row = Rect::new(area.x(), y, area.width(), self.row_h);
-            if y + self.row_h >= area.y() && y <= area.y() + area.height() {
-                let selected = files.selected == Some(i);
-                let hovered = self.hovered == Some(i);
-                if selected {
-                    widgets::fill_round_rect(ctx, row.inflate(-6.0, -1.0), pal.selected, 7.0);
-                } else if hovered {
-                    widgets::fill_round_rect(ctx, row.inflate(-6.0, -1.0), pal.hover, 7.0);
-                }
-                let glyph = if entry.is_dir {
-                    "▸"
-                } else if entry.is_link {
-                    "↪"
-                } else {
-                    "•"
-                };
-                let gcolor = if entry.is_dir {
-                    pal.accent
-                } else {
-                    pal.text_faint
-                };
-                let gs = pal.text_style(theme, 13.0, FontWeight::SEMIBOLD, gcolor);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(row.x() + 16.0, row.y(), 18.0, self.row_h),
-                    glyph,
-                    gs,
-                );
-
-                let name_style = pal.text_style(theme, 13.5, FontWeight::MEDIUM, pal.text);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(row.x() + 40.0, row.y(), area.width() - 200.0, self.row_h),
-                    &entry.name,
-                    name_style,
-                );
-
-                let meta = if entry.is_dir {
-                    "folder".to_string()
-                } else {
-                    human_size(entry.size)
-                };
-                let meta_style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(area.x() + area.width() - 150.0, row.y(), 134.0, self.row_h),
-                    &meta,
-                    meta_style,
-                );
-            }
-            y += self.row_h;
-            let _ = i;
-        }
-        ctx.pop_clip();
-    }
-
-    fn paint_inspector(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        let area = self.inspector_rect;
-        ctx.fill_rect(area, pal.sidebar);
-        widgets::hairline_left(ctx, area, pal.border);
-        let files = self.shared.files();
-
-        let x = area.x() + PAD;
-        let w = area.width() - PAD * 2.0;
-        let mut y = area.y() + PAD + 4.0;
-
-        let header = pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
-        y += 30.0;
-
-        let Some(entry) = files.selected_entry() else {
-            let hint = pal.text_style(theme, 13.0, FontWeight::NORMAL, pal.text_faint);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(x, y + 8.0, w, 40.0),
-                "Select a file to see its SIFS placement.",
-                hint,
-            );
-            return;
-        };
-
-        // Name + kind.
-        let name_style = pal.text_style(theme, 16.0, FontWeight::SEMIBOLD, pal.text);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 24.0), &entry.name, name_style);
-        y += 26.0;
-        let kind = if entry.is_dir {
-            "Directory"
-        } else if entry.is_link {
-            "Symlink"
-        } else {
-            "File"
-        };
-        let kind_style = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_muted);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, w, 20.0),
-            &format!("{kind} · {}", human_size(entry.size)),
-            kind_style,
-        );
-        y += 34.0;
-
-        y = self.info_row(ctx, theme, pal, x, y, w, "Path", &entry.path);
-
-        // Placement section.
-        y += 10.0;
-        let sect = pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(ctx, Rect::new(x, y, w, 16.0), "PLACEMENT", sect);
-        y += 24.0;
-
-        // node badge
-        let node_label = if files.node_id.is_empty() {
-            "local".to_string()
-        } else {
-            short(&files.node_id, 18)
-        };
-        let badge_style = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.accent);
-        let badge_w = ctx
-            .measure_text(format!("◉ {node_label}"), badge_style.clone())
-            .map(|m| m.width + 20.0)
-            .unwrap_or(120.0);
-        let badge = Rect::new(x, y, badge_w.min(w), 26.0);
-        widgets::round_panel(ctx, badge, pal.field, pal.border, 13.0);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                badge.x() + 10.0,
-                badge.y(),
-                badge.width() - 14.0,
-                badge.height(),
-            ),
-            &format!("◉ {node_label}"),
-            badge_style,
-        );
-        y += 36.0;
-
-        let row_label = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_muted);
-        let row_val = pal.text_style(theme, 12.5, FontWeight::MEDIUM, pal.text);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, 130.0, 20.0),
-            "Replication",
-            row_label.clone(),
-        );
-        let repl = if files.clustered {
-            "cluster policy"
-        } else {
-            "1 (single node)"
-        };
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x + 130.0, y, w - 130.0, 20.0),
-            repl,
-            row_val.clone(),
-        );
-        y += 24.0;
-        widgets::draw_text_in(ctx, Rect::new(x, y, 130.0, 20.0), "Mode", row_label);
-        let mode = if files.clustered {
-            "replicated"
-        } else {
-            "local-owned"
-        };
-        widgets::draw_text_in(ctx, Rect::new(x + 130.0, y, w - 130.0, 20.0), mode, row_val);
-        y += 34.0;
-
-        if !files.clustered {
-            let note = pal.text_style(theme, 11.5, FontWeight::NORMAL, pal.text_faint);
-            for line in widgets::wrap_lines(
-                "Join a cluster to spread this object across nodes and tune replication.",
-                w,
-                |s| {
-                    ctx.measure_text(s, note.clone())
-                        .map(|m| m.width)
-                        .unwrap_or(0.0)
-                },
-            ) {
-                widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, note.clone());
-                y += 17.0;
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn info_row(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        x: f32,
-        mut y: f32,
-        w: f32,
-        label: &str,
-        value: &str,
-    ) -> f32 {
-        let label_style = pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(x, y, w, 16.0),
-            &label.to_uppercase(),
-            label_style,
-        );
-        y += 18.0;
-        let value_style = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text);
-        for line in widgets::wrap_lines(value, w, |s| {
-            ctx.measure_text(s, value_style.clone())
-                .map(|m| m.width)
-                .unwrap_or(0.0)
-        }) {
-            widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, value_style.clone());
-            y += 17.0;
-        }
-        y + 6.0
-    }
+/// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
+/// `InspectorView` so muted/accent text matches the bespoke chrome).
+fn palette(shared: &Shared) -> Palette {
+    Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
 }
 
 fn human_size(size: Option<u64>) -> String {
@@ -622,7 +205,898 @@ fn short(s: &str, max: usize) -> String {
     }
 }
 
+/// The right-aligned metadata for a listing row: `folder` for directories, else a human size.
+fn entry_meta(entry: &SifsEntry) -> String {
+    if entry.is_dir {
+        "folder".to_string()
+    } else if entry.is_link {
+        "link".to_string()
+    } else {
+        human_size(entry.size)
+    }
+}
+
+/// A leading glyph hint for the row label (folder / link / file). `ListView`/`ListItem` have no
+/// leading-icon slot (and a custom `with_child` row content would suppress the ListView's
+/// click-to-navigate + hover handling), so these rows keep a leading text mark rather than a real
+/// Lucide `Icon` — the bespoke painters in this tab (placeholders, the inspector node badge) DO use
+/// real Folder/File/HardDrive Lucide glyphs.
+fn entry_glyph(entry: &SifsEntry) -> &'static str {
+    if entry.is_dir {
+        "▸"
+    } else if entry.is_link {
+        "↪"
+    } else {
+        "•"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Breadcrumb header (path bar) — rebuilt on navigation by `RebuildOnChange`.
+// ---------------------------------------------------------------------------
+
+/// Build the header: an up `IconButton` + a `Breadcrumb` over the current path segments. Each
+/// segment activates a navigate-to-that-segment; the up button goes to the parent.
+fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let crumbs = shared.files().crumbs();
+    let current = crumbs.len().saturating_sub(1);
+    let targets: Vec<String> = crumbs.iter().map(|(_, target)| target.clone()).collect();
+
+    let up = {
+        let s = shared.clone();
+        IconButton::new(IconGlyph::ChevronUp, "Up")
+            .size(30.0)
+            .theme_when(clone_reader(reader))
+            .on_press(move || {
+                s.files_mut().go_up();
+            })
+    };
+
+    let breadcrumb = {
+        let s = shared.clone();
+        Breadcrumb::new("SIFS path")
+            .items(
+                crumbs
+                    .iter()
+                    .map(|(label, _)| BreadcrumbItem::new(label.clone())),
+            )
+            .current(current)
+            .theme_when(clone_reader(reader))
+            .on_activate(move |index, _label| {
+                if let Some(target) = targets.get(index) {
+                    s.files_mut().navigate(target.clone());
+                }
+            })
+    };
+
+    Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center)
+        .with_child(up)
+        .with_child(breadcrumb)
+}
+
+// ---------------------------------------------------------------------------
+// File listing — rebuilt on navigation by `RebuildOnChange`.
+// ---------------------------------------------------------------------------
+
+/// Build the file-list body for the *current* listing: an error/empty placeholder, or a `ListView`
+/// of the entries wrapped in a `ScrollView`. Directory rows navigate; file rows select.
+fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
+    let (error, is_empty, entries): (Option<String>, bool, Vec<SifsEntry>) = {
+        let files = shared.files();
+        (
+            files.error.clone(),
+            files.entries.is_empty(),
+            files.entries.clone(),
+        )
+    };
+
+    if let Some(error) = error {
+        return WidgetPod::new(
+            centered_note(shared, "▤", "SIFS unavailable", format!("{error}"))
+                .glyph(IconGlyph::Storage),
+        );
+    }
+    if is_empty {
+        return WidgetPod::new(
+            centered_note(shared, "▤", "Empty directory", "Nothing here yet.")
+                .glyph(IconGlyph::Folder),
+        );
+    }
+
+    // Build the row items: a glyph hint + name on the left, metadata as the row detail on the right.
+    let items: Vec<ListItem> = entries
+        .iter()
+        .map(|entry| {
+            ListItem::new(format!("{}  {}", entry_glyph(entry), entry.name))
+                .detail(entry_meta(entry))
+        })
+        .collect();
+
+    let list = {
+        let s = shared.clone();
+        ListView::new("sifs-listing")
+            .items(items)
+            .row_height(ROW_H)
+            .theme_when(clone_reader(reader))
+            // Reflect the current file selection (the highlight is reactive — selecting a file does
+            // NOT rebuild the list, only repaints + updates the inspector).
+            .selected_when({
+                let s = s.clone();
+                move || s.files().selected
+            })
+            .on_change(move |index, _label| {
+                // Directory → navigate (path changes → RebuildOnChange rebuilds the list/breadcrumb);
+                // file → select (handled reactively above). We don't relayout here: the host's
+                // relayout-on-pointer-up (and the redraw diff) drives the rebuild after navigation.
+                s.files_mut().activate_row(index);
+            })
+    };
+
+    // Pad the list off the panel edges, then make it scrollable. `ScrollView` owns the scroll
+    // position (the `FilesState::scroll` field is now vestigial but kept for state compatibility).
+    let inset = InsetX::new(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(SizedBox::new().height(CONTENT_PAD * 0.5))
+            .with_child(list)
+            .with_child(SizedBox::new().height(CONTENT_PAD * 0.5)),
+        CONTENT_PAD * 0.5,
+    );
+    WidgetPod::new(ScrollView::vertical(inset).state(scroll_state.clone()))
+}
+
+/// A centered empty/error placeholder (mark, title, subtitle) themed off the chrome palette.
+fn centered_note(
+    shared: &Shared,
+    mark: impl Into<String>,
+    title: impl Into<String>,
+    subtitle: impl Into<String>,
+) -> widgets::Placeholder {
+    widgets::Placeholder::new(shared.clone(), mark, title, subtitle)
+}
+
+// ---------------------------------------------------------------------------
+// Inspector — a live-reading custom widget (selection changes without a path change).
+// ---------------------------------------------------------------------------
+
+/// Renders the SIFS inspector for the *currently selected* entry, live-reading
+/// `shared.files()` in `paint`. Diffs a summary on each `RedrawRequested` to self-invalidate so a
+/// selection (which the `ListView` reports with only a repaint request) refreshes the inspector
+/// without rebuilding the list. Mirrors the Settings `StatusReflector` pattern.
+///
+/// Kept as a bespoke painter (rather than a `PanelSection`/`PropertyRow` tree) because its content
+/// is fully selection-driven and re-reads live: composing it from reactive `Label`s would still
+/// need a per-frame diff to relayout when the *shape* changes (placement note appears/disappears),
+/// so a single self-invalidating painter is simpler and matches `StatusReflector`.
+struct InspectorView {
+    shared: Shared,
+    last_seen: RefCell<Option<String>>,
+}
+
+impl InspectorView {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            last_seen: RefCell::new(None),
+        }
+    }
+
+    /// A short, single-line summary used for change detection.
+    fn summary(&self) -> String {
+        let files = self.shared.files();
+        match files.selected_entry() {
+            Some(entry) => format!(
+                "{}|{}|{}|{}",
+                entry.path, entry.is_dir, entry.is_link, files.clustered
+            ),
+            None => "none".to_string(),
+        }
+    }
+}
+
+const INSPECTOR_PAD: f32 = CONTENT_PAD;
+
+impl Widget for InspectorView {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if !matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
+            return;
+        }
+        let summary = self.summary();
+        let mut last = self.last_seen.borrow_mut();
+        if last.as_deref() != Some(summary.as_str()) {
+            *last = Some(summary);
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.max
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let files = self.shared.files();
+        let bounds = ctx.bounds();
+
+        // Sidebar surface + left hairline (matches the bespoke chrome).
+        ctx.fill_rect(bounds, pal.sidebar);
+        widgets::hairline_left(ctx, bounds, pal.border);
+
+        let x = bounds.x() + INSPECTOR_PAD;
+        let w = (bounds.width() - INSPECTOR_PAD * 2.0).max(0.0);
+        let mut y = bounds.y() + INSPECTOR_PAD + 4.0;
+
+        let header = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
+        widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), "INSPECTOR", header);
+        y += 30.0;
+
+        let Some(entry) = files.selected_entry() else {
+            let hint = pal.text_style(&theme, 13.0, FontWeight::NORMAL, pal.text_faint);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(x, y + 8.0, w, 40.0),
+                "Select a file to see its SIFS placement.",
+                hint,
+            );
+            return;
+        };
+
+        // Name + kind.
+        let name_style = pal.text_style(&theme, 16.0, FontWeight::SEMIBOLD, pal.text);
+        widgets::draw_text_in(ctx, Rect::new(x, y, w, 24.0), &entry.name, name_style);
+        y += 26.0;
+        let kind = if entry.is_dir {
+            "Directory"
+        } else if entry.is_link {
+            "Symlink"
+        } else {
+            "File"
+        };
+        let kind_style = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, w, 20.0),
+            &format!("{kind} · {}", human_size(entry.size)),
+            kind_style,
+        );
+        y += 34.0;
+
+        y = self.info_row(ctx, &theme, &pal, x, y, w, "Path", &entry.path);
+
+        // Placement section.
+        y += 10.0;
+        let sect = pal.text_style(&theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
+        widgets::draw_text_in(ctx, Rect::new(x, y, w, 16.0), "PLACEMENT", sect);
+        y += 24.0;
+
+        // node badge: a real Lucide HardDrive (Storage) icon + the node label, in a rounded pill.
+        let node_label = if files.node_id.is_empty() {
+            "local".to_string()
+        } else {
+            short(&files.node_id, 18)
+        };
+        let badge_style = pal.text_style(&theme, 12.0, FontWeight::MEDIUM, pal.accent);
+        const BADGE_ICON: f32 = 13.0;
+        const BADGE_ICON_GAP: f32 = 7.0;
+        let label_w = ctx
+            .measure_text(node_label.clone(), badge_style.clone())
+            .map(|m| m.width)
+            .unwrap_or(80.0);
+        // pill = left pad(10) + icon + gap + label + right pad(10)
+        let badge_w = 10.0 + BADGE_ICON + BADGE_ICON_GAP + label_w + 10.0;
+        let badge = Rect::new(x, y, badge_w.min(w), 26.0);
+        widgets::round_panel(ctx, badge, pal.field, pal.border, 13.0);
+        draw_glyph(
+            ctx,
+            IconGlyph::Storage,
+            Rect::new(
+                badge.x() + 10.0,
+                badge.y() + (badge.height() - BADGE_ICON) / 2.0,
+                BADGE_ICON,
+                BADGE_ICON,
+            ),
+            pal.accent,
+        );
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(
+                badge.x() + 10.0 + BADGE_ICON + BADGE_ICON_GAP,
+                badge.y(),
+                (badge.width() - 10.0 - BADGE_ICON - BADGE_ICON_GAP - 6.0).max(0.0),
+                badge.height(),
+            ),
+            &node_label,
+            badge_style,
+        );
+        y += 36.0;
+
+        let row_label = pal.text_style(&theme, 12.5, FontWeight::NORMAL, pal.text_muted);
+        let row_val = pal.text_style(&theme, 12.5, FontWeight::MEDIUM, pal.text);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, 130.0, 20.0),
+            "Replication",
+            row_label.clone(),
+        );
+        let repl = if files.clustered {
+            "cluster policy"
+        } else {
+            "1 (single node)"
+        };
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x + 130.0, y, w - 130.0, 20.0),
+            repl,
+            row_val.clone(),
+        );
+        y += 24.0;
+        widgets::draw_text_in(ctx, Rect::new(x, y, 130.0, 20.0), "Mode", row_label);
+        let mode = if files.clustered {
+            "replicated"
+        } else {
+            "local-owned"
+        };
+        widgets::draw_text_in(ctx, Rect::new(x + 130.0, y, w - 130.0, 20.0), mode, row_val);
+        y += 34.0;
+
+        if !files.clustered {
+            let note = pal.text_style(&theme, 11.5, FontWeight::NORMAL, pal.text_faint);
+            for line in widgets::wrap_lines(
+                "Join a cluster to spread this object across nodes and tune replication.",
+                w,
+                |s| {
+                    ctx.measure_text(s, note.clone())
+                        .map(|m| m.width)
+                        .unwrap_or(0.0)
+                },
+            ) {
+                widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, note.clone());
+                y += 17.0;
+            }
+        }
+    }
+}
+
+impl InspectorView {
+    #[allow(clippy::too_many_arguments)]
+    fn info_row(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        x: f32,
+        mut y: f32,
+        w: f32,
+        label: &str,
+        value: &str,
+    ) -> f32 {
+        let label_style = pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x, y, w, 16.0),
+            &label.to_uppercase(),
+            label_style,
+        );
+        y += 18.0;
+        let value_style = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text);
+        for line in widgets::wrap_lines(value, w, |s| {
+            ctx.measure_text(s, value_style.clone())
+                .map(|m| m.width)
+                .unwrap_or(0.0)
+        }) {
+            widgets::draw_text_in(ctx, Rect::new(x, y, w, 18.0), &line, value_style.clone());
+            y += 17.0;
+        }
+        y + 6.0
+    }
+}
+
+/// The inspector wrapped in a `PanelSection`-less host so it can be a `SizedBox` child. We keep the
+/// inspector as a single painter (above), so this is just the bare widget. A thin wrapper exists so
+/// the composed pod reads cleanly.
+fn inspector(shared: &Shared) -> impl Widget + use<> {
+    InspectorView::new(shared.clone())
+}
+
+// ---------------------------------------------------------------------------
+// RebuildOnChange<K> — a reusable "rebuild my child when a key changes" wrapper.
+// ---------------------------------------------------------------------------
+
+/// Hosts a child [`WidgetPod`] that is *rebuilt from scratch* whenever a watched key changes.
+///
+/// `sui-widgets` collection widgets (`ListView`, `Breadcrumb`, …) take a fixed item vector at build
+/// time — there is no reactive `items_when` builder that re-reads the items each frame. So when the
+/// underlying data set changes (here: the SIFS listing + breadcrumb segments change as the user
+/// navigates), we can't just bind a reader; we have to *rebuild* the subtree. This widget does that:
+///
+/// * It owns a `build: Fn(&K) -> WidgetPod` closure and a `key: Fn() -> K` reader.
+/// * On each `RedrawRequested` it reads the current key; if it differs from the last-built key it
+///   rebuilds the child pod and requests measure + arrange + paint (the diff-on-redraw technique,
+///   like the Settings `StatusReflector`).
+/// * The headless test harness does **not** dispatch `RedrawRequested`, so — exactly like the
+///   Settings host — it ALSO rebuilds on the pointer-up that triggered the navigation. A pointer
+///   release is the only moment a navigation can happen, so this is both sufficient and cheap.
+///
+/// (Chat will reuse this pattern for its streaming transcript: same shape — a key that changes as
+/// messages stream in, a child rebuilt from the current message list.)
+struct RebuildOnChange<K: PartialEq + Clone> {
+    key_fn: Box<dyn Fn() -> K>,
+    build: Box<dyn Fn(&K) -> WidgetPod>,
+    last_key: K,
+    child: WidgetPod,
+}
+
+impl<K: PartialEq + Clone> RebuildOnChange<K> {
+    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
+    where
+        KF: Fn() -> K + 'static,
+        BF: Fn(&K) -> WidgetPod + 'static,
+    {
+        let last_key = key_fn();
+        let child = build(&last_key);
+        Self {
+            key_fn: Box::new(key_fn),
+            build: Box::new(build),
+            last_key,
+            child,
+        }
+    }
+
+    /// Rebuild the child pod if the watched key changed. Returns whether a rebuild happened.
+    fn refresh(&mut self) -> bool {
+        let key = (self.key_fn)();
+        if key != self.last_key {
+            self.child = (self.build)(&key);
+            self.last_key = key;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        // Rebuild on the pointer-up that triggers a navigation (the headless harness never sends
+        // RedrawRequested, so this is the path the tests exercise) …
+        let pointer_up = matches!(
+            event,
+            Event::Pointer(p) if matches!(p.kind, sui::PointerEventKind::Up)
+        );
+        // … and on each redraw, to catch a navigation driven from outside a pointer gesture.
+        let redraw = matches!(event, Event::Window(WindowEvent::RedrawRequested));
+        if (pointer_up || redraw) && self.refresh() {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        // A measure pass is the last chance to rebuild before layout, so refresh here too (keeps the
+        // built child in sync when something else forces a measure, e.g. a resize or tab switch).
+        self.refresh();
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split — left pane fills, right pane fixed width, a vertical separator between.
+// ---------------------------------------------------------------------------
+
+/// A horizontal split: the `left` pane fills the remaining width while the `right` pane keeps a
+/// fixed `right_width`, with a 1px vertical [`Separator`] between them. (A plain horizontal `Stack`
+/// measures children left-to-right and lets the first child consume the full width before the fixed
+/// pane is measured, collapsing the right pane — this reserves the fixed width up front.)
+struct Split {
+    left: WidgetPod,
+    separator: WidgetPod,
+    right: WidgetPod,
+    right_width: f32,
+}
+
+const SPLIT_SEPARATOR_W: f32 = 1.0;
+
+impl Split {
+    fn new<L, R>(left: L, right: R, right_width: f32) -> Self
+    where
+        L: Widget + 'static,
+        R: Widget + 'static,
+    {
+        Self {
+            left: WidgetPod::new(left),
+            separator: WidgetPod::new(Separator::vertical()),
+            right: WidgetPod::new(right),
+            right_width: right_width.max(0.0),
+        }
+    }
+
+    /// (left_width, right_width) for a given total width.
+    fn split_widths(&self, total: f32) -> (f32, f32) {
+        let right = self.right_width.min((total - SPLIT_SEPARATOR_W).max(0.0));
+        let left = (total - right - SPLIT_SEPARATOR_W).max(0.0);
+        (left, right)
+    }
+}
+
+impl Widget for Split {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let total = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            self.right_width + 320.0 + SPLIT_SEPARATOR_W
+        };
+        let height = constraints.max.height;
+        let (left_w, right_w) = self.split_widths(total);
+        self.left
+            .measure(ctx, Constraints::tight(Size::new(left_w, height)));
+        self.separator.measure(
+            ctx,
+            Constraints::tight(Size::new(SPLIT_SEPARATOR_W, height)),
+        );
+        self.right
+            .measure(ctx, Constraints::tight(Size::new(right_w, height)));
+        Size::new(total, height)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let (left_w, right_w) = self.split_widths(bounds.width());
+        self.left.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), left_w, bounds.height()),
+        );
+        self.separator.arrange(
+            ctx,
+            Rect::new(
+                bounds.x() + left_w,
+                bounds.y(),
+                SPLIT_SEPARATOR_W,
+                bounds.height(),
+            ),
+        );
+        self.right.arrange(
+            ctx,
+            Rect::new(
+                bounds.x() + left_w + SPLIT_SEPARATOR_W,
+                bounds.y(),
+                right_w,
+                bounds.height(),
+            ),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.left.paint(ctx);
+        self.separator.paint(ctx);
+        self.right.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.left);
+        visitor.visit(&self.separator);
+        visitor.visit(&self.right);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.left);
+        visitor.visit(&mut self.separator);
+        visitor.visit(&mut self.right);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small layout helper (copied from settings.rs — horizontal inset without Padding).
+// ---------------------------------------------------------------------------
+
+/// Insets a single child horizontally by `pad` on each side (the vertical axis is left to the
+/// caller). Keeps content off the panel edges without pulling in the container `Padding` widget.
+struct InsetX {
+    child: WidgetPod,
+    pad: f32,
+}
+
+impl InsetX {
+    fn new<W>(child: W, pad: f32) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            child: WidgetPod::new(child),
+            pad: pad.max(0.0),
+        }
+    }
+}
+
+impl Widget for InsetX {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let inner_max = Size::new(
+            (constraints.max.width - self.pad * 2.0).max(0.0),
+            constraints.max.height,
+        );
+        let inner = Constraints::new(Size::ZERO, inner_max);
+        let child = self.child.measure(ctx, inner);
+        Size::new(child.width + self.pad * 2.0, child.height)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let inner = Rect::new(
+            bounds.x() + self.pad,
+            bounds.y(),
+            (bounds.width() - self.pad * 2.0).max(0.0),
+            bounds.height(),
+        );
+        self.child.arrange(ctx, inner);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composed pods (wide split / narrow list-only) + responsive host.
+// ---------------------------------------------------------------------------
+
+/// The header bar wrapped so it rebuilds (breadcrumb segments) whenever the path changes. A
+/// fixed-height titlebar surface (up button + breadcrumb) over a hairline separator.
+fn header_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let rebuilt = RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || s.files().path.clone()
+        },
+        move |_path| WidgetPod::new(header(&s, &r)),
+    );
+    InsetX::new(rebuilt, CONTENT_PAD)
+}
+
+/// The file-list column wrapped so it rebuilds (rows) whenever the path changes. A shared
+/// `scroll_state` is threaded so the position is consistent across the wide/narrow swap.
+fn list_column(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    let ss = scroll_state.clone();
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || s.files().path.clone()
+        },
+        move |_path| listing(&s, &r, &ss),
+    )
+}
+
+/// Wide split: header docked on top, body fills with [ list (flex) | vertical separator |
+/// inspector (340) ]. We use the `Dock` helper so the body actually *fills* the remaining vertical
+/// space (a bare vertical `Stack` only sizes children to their natural height, which would collapse
+/// the list/inspector to the listing's content height); and a small [`Split`] so the inspector
+/// keeps its fixed 340px while the list takes the rest (a horizontal `Stack` would let the list
+/// greedily consume the full width before the inspector is measured).
+fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
+    let body = Split::new(
+        list_column(shared, reader, scroll_state),
+        inspector(shared),
+        INSPECTOR_W,
+    );
+    let header = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(
+            SizedBox::new()
+                .height(HEADER_H)
+                .with_child(header_bar(shared, reader)),
+        )
+        .with_child(Separator::horizontal());
+    WidgetPod::new(widgets::Dock::new(body).top(HEADER_H + 1.0, header))
+}
+
+/// Narrow: header docked on top, list-only body fills (the inspector is hidden).
+fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -> WidgetPod {
+    let header = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .with_child(
+            SizedBox::new()
+                .height(HEADER_H)
+                .with_child(header_bar(shared, reader)),
+        )
+        .with_child(Separator::horizontal());
+    WidgetPod::new(
+        widgets::Dock::new(list_column(shared, reader, scroll_state)).top(HEADER_H + 1.0, header),
+    )
+}
+
+/// The files tab: a thin responsive host owning two pre-built pods (wide split / narrow list-only)
+/// and delegating to the one chosen by the available width. The choice is made in `measure`
+/// (constraints-driven) and cached so `arrange`/`paint`/event routing all stay in sync. Mirrors the
+/// Settings `SettingsView` host.
+pub struct FilesView {
+    wide: WidgetPod,
+    narrow: WidgetPod,
+    use_wide: Cell<bool>,
+}
+
+impl FilesView {
+    pub fn new(shared: Shared) -> Self {
+        let theme_reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        // One shared scroll state so the list position is consistent across the wide/narrow swap.
+        let scroll_state = ScrollState::new();
+        let wide = wide_pod(&shared, &theme_reader, &scroll_state);
+        let narrow = narrow_pod(&shared, &theme_reader, &scroll_state);
+        Self {
+            wide,
+            narrow,
+            // Default to wide before the first measure.
+            use_wide: Cell::new(true),
+        }
+    }
+
+    fn active(&self) -> &WidgetPod {
+        if self.use_wide.get() {
+            &self.wide
+        } else {
+            &self.narrow
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut WidgetPod {
+        if self.use_wide.get() {
+            &mut self.wide
+        } else {
+            &mut self.narrow
+        }
+    }
+}
+
+impl Widget for FilesView {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        // Navigation (a directory row / breadcrumb / up button) mutates the path and the inner
+        // `RebuildOnChange` rebuilds the list + breadcrumb, but those nested rebuilds need a fresh
+        // measure+arrange for the host. A pointer release inside the tab is the only moment a
+        // navigation can happen, so request a relayout then (this is the path the headless tests
+        // exercise, since the harness never dispatches RedrawRequested). Matches `SettingsView`.
+        if let Event::Pointer(pointer) = event
+            && matches!(pointer.kind, sui::PointerEventKind::Up)
+        {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let use_wide = constraints.max.width >= WIDE_THRESHOLD;
+        self.use_wide.set(use_wide);
+        self.active_mut().measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.active_mut().arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.active().paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(self.active());
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        // CRITICAL: forward to the active pod so pointer / keyboard / focus reach the controls.
+        if self.use_wide.get() {
+            visitor.visit(&mut self.wide);
+        } else {
+            visitor.visit(&mut self.narrow);
+        }
+    }
+}
+
 /// Build the files tab content.
 pub fn view(shared: Shared) -> impl Widget {
     FilesView::new(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+
+    #[test]
+    fn crumbs_start_at_root_and_split_on_segments() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.path = "/services/sinomo".to_string();
+        let crumbs = state.crumbs();
+        assert_eq!(crumbs[0], ("SIFS".to_string(), "/".to_string()));
+        assert_eq!(crumbs.last().unwrap().1, "/services/sinomo");
+        // Every crumb after root is a progressively deeper absolute path.
+        assert!(
+            crumbs
+                .iter()
+                .skip(1)
+                .all(|(_, target)| target.starts_with('/'))
+        );
+    }
+
+    #[test]
+    fn activate_directory_navigates_file_selects() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        // Seed a known listing so the test is independent of the SIFS backend contents.
+        state.entries = vec![
+            SifsEntry {
+                name: "dir".to_string(),
+                path: "/dir".to_string(),
+                is_dir: true,
+                is_link: false,
+                size: None,
+            },
+            SifsEntry {
+                name: "file.txt".to_string(),
+                path: "/file.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(10),
+            },
+        ];
+        state.selected = None;
+
+        // Activating a file row selects it and reports no path change.
+        let path_changed = state.activate_row(1);
+        assert!(!path_changed, "selecting a file does not change the path");
+        assert_eq!(state.selected, Some(1));
+    }
+
+    #[test]
+    fn selected_entry_tracks_selection() {
+        let backend = Backend::local_fallback();
+        let mut state = FilesState::new(&backend);
+        state.entries = vec![SifsEntry {
+            name: "a.txt".to_string(),
+            path: "/a.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(1),
+        }];
+        assert!(state.selected_entry().is_none());
+        state.selected = Some(0);
+        assert_eq!(
+            state.selected_entry().map(|e| e.name.as_str()),
+            Some("a.txt")
+        );
+    }
 }

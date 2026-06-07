@@ -1,16 +1,48 @@
 //! "Sinomo" tab — the AI chat experience.
 //!
-//! A single self-contained widget owns the whole tab (agents + sessions sidebar,
-//! transcript, and the composer with provider/model/effort selectors). Keeping it
-//! monolithic avoids cross-widget invalidation: when streamed tokens mutate state
-//! we just re-measure/paint this one widget.
+//! Like the Settings and Files tabs, this is a fully *composed* `sui-widgets`
+//! tree: [`view`] returns a responsive host ([`ChatView`]) over pre-built pods
+//! (wide split with the agents/sessions sidebar, narrow transcript-only), each
+//! assembled from stock `ListView` / `ScrollView` / `Select` / `TextArea` /
+//! `Button` / `Spinner` / `Separator` / `Label` widgets, plus a small set of
+//! bespoke painters for the parts whose *shape* changes live.
+//!
+//! The data layer — [`ChatState`] + its methods, the [`ChatHandle`] worker
+//! thread, the provider/model fetch, and send/stream — is UNCHANGED from the
+//! hand-painted version. Only the view is rebuilt.
+//!
+//! Two regions need care:
+//!
+//! * **Streaming transcript.** The message list grows when a turn is sent, and
+//!   the last (agent) message's text grows token-by-token while streaming —
+//!   frequently. Rebuilding the whole transcript per token would be wasteful, so
+//!   the transcript is a single live-reading painter ([`TranscriptView`]) that
+//!   re-reads `ChatState.messages` in `paint` each frame and draws the bubbles
+//!   (the same wrapped-text bubble math the hand-painted UI used). It owns its
+//!   own scroll (auto-stick-to-bottom while streaming) exactly as before, and
+//!   self-invalidates by diffing a content summary on each `RedrawRequested`.
+//!
+//! * **Streaming pump.** A worker thread streams tokens back over a channel. An
+//!   invisible [`ChatPump`] widget keeps the *existing* request-animation-frame
+//!   pump alive: while a reply streams (or there was recent activity) it drains
+//!   the worker each frame, applies events to `ChatState`, and re-requests an
+//!   animation frame — the same wiring the old `ChatView::pump` had.
+//!
+//! The agents/sessions sidebar and the composer's provider/model/effort
+//! selectors are stock widgets. The model `Select` (and the effort selector's
+//! visibility) depend on the current provider + fetched model list, which change
+//! at runtime, so the composer row is wrapped in a [`RebuildOnChange`] keyed on
+//! a small signature of the selection state.
 
 use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use sui::{
-    ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, KeyState, MeasureCtx,
-    PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollDelta, Size, Widget,
+    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconGlyph,
+    KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect, ScrollDelta,
+    Separator, Size, SizedBox, Stack, TextArea, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, draw_glyph,
 };
 
 use sinomo_cli::app_api::{AgentSummary, ProviderSummary, agent_summaries, reasoning_efforts};
@@ -23,11 +55,24 @@ use crate::state::Shared;
 use crate::theme::Palette;
 use crate::ui::widgets;
 
+/// Below this content width the sidebar collapses away (transcript + composer only).
+const WIDE_THRESHOLD: f32 = 620.0;
 const SIDEBAR_W: f32 = 250.0;
 const COMPOSER_H: f32 = 132.0;
 const PAD: f32 = 16.0;
-const ROW_H: f32 = 34.0;
+const SIDEBAR_ROW_H: f32 = 36.0;
 const SELECTOR_H: f32 = 30.0;
+
+/// A shared closure that resolves the current widget theme — threaded into every control so the
+/// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
+type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
+
+// ---------------------------------------------------------------------------
+// State (data layer) — the worker, send/stream, provider/model fetch, and the
+// per-event reducer are UNCHANGED from the hand-painted version. The composed
+// view drives state exclusively through the small action methods at the bottom
+// of this block (so callbacks stay a clean clone-and-mutate).
+// ---------------------------------------------------------------------------
 
 /// One message in the visible transcript.
 pub struct ChatMessage {
@@ -50,7 +95,6 @@ pub struct ChatState {
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
-    pub focused: bool,
     pub streaming: bool,
     pub notice: Option<String>,
     pub scroll: f32,
@@ -83,7 +127,7 @@ impl ChatState {
             })
             .collect();
 
-        Self {
+        let mut state = Self {
             data_dir: backend.data_dir.clone(),
             handle,
             session_id: String::new(),
@@ -91,7 +135,6 @@ impl ChatState {
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
-            focused: false,
             streaming: false,
             notice: None,
             scroll: 0.0,
@@ -104,7 +147,12 @@ impl ChatState {
             effort_idx,
             models_loading: false,
             sessions,
-        }
+        };
+        // Eagerly fetch the default/initial provider's models so the model picker is populated
+        // without requiring a manual provider toggle. (Results arrive async via `ChatEvent::Models`;
+        // a no-op if there is no provider or the list is already populated.)
+        state.maybe_fetch_models();
+        state
     }
 
     /// Title derived from the first user message (for the sidebar).
@@ -190,11 +238,21 @@ impl ChatState {
             .unwrap_or_else(|| self.info.model.clone())
     }
 
-    fn current_effort(&self) -> String {
-        self.efforts
-            .get(self.effort_idx)
-            .cloned()
-            .unwrap_or_else(|| "medium".to_string())
+    /// Whether the reasoning-effort selector should be shown: only for models that take one.
+    fn effort_visible(&self) -> bool {
+        let provider = self
+            .current_provider()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        let model = self.current_model();
+        !provider.is_empty() && sinomo_lm::model_supports_reasoning_effort(&provider, &model)
+    }
+
+    /// The current model list for the active provider (for the composer's model `Select`).
+    fn current_models(&self) -> Vec<String> {
+        self.current_provider()
+            .map(|p| p.models.clone())
+            .unwrap_or_default()
     }
 
     fn apply_event(&mut self, event: ChatEvent) -> bool {
@@ -293,6 +351,10 @@ impl ChatState {
         {
             self.effort_idx = idx;
         }
+        // The runtime just told us which provider is active; if its model list has not been fetched
+        // yet, kick the async fetch now so the model picker populates for the default provider
+        // (without waiting for the user to toggle providers).
+        self.maybe_fetch_models();
     }
 
     fn submit(&mut self) {
@@ -316,711 +378,338 @@ impl ChatState {
         self.notice = Some("thinking…".to_string());
         self.handle.send_command(ChatCommand::Send(text));
     }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Hit {
-    Agent(usize),
-    NewChat,
-    Session(usize),
-    /// One of the three composer selectors (0 = provider, 1 = model, 2 = effort).
-    Selector(usize),
-    /// An item inside the currently-open selector dropdown.
-    MenuItem(usize),
-    Send,
-    Input,
-}
+    // -- Composed-view action methods (mutation entry points for the widgets) --
 
-pub struct ChatView {
-    shared: Shared,
-    sidebar_rect: Rect,
-    messages_rect: Rect,
-    composer_rect: Rect,
-    input_rect: Rect,
-    send_rect: Rect,
-    selector_rects: [Rect; 3],
-    /// Which selector's dropdown is open (`None` = closed), and its painted geometry.
-    open_menu: Option<usize>,
-    menu_rect: Rect,
-    menu_item_rects: Vec<Rect>,
-    /// Whether the reasoning-effort selector is shown (only for models that support it).
-    effort_visible: bool,
-    newchat_rect: Rect,
-    agent_rects: Vec<Rect>,
-    session_rects: Vec<Rect>,
-    sel_w: [f32; 3],
-    content_height: Cell<f32>,
-    viewport_height: Cell<f32>,
-    hovered: Option<Hit>,
-    pump_alive: bool,
-    idle_frames: u32,
-}
+    /// Whether the Send button should be enabled (non-empty draft, not streaming).
+    fn can_send(&self) -> bool {
+        !self.input.trim().is_empty() && !self.streaming
+    }
 
-impl ChatView {
-    pub fn new(shared: Shared) -> Self {
-        Self {
-            shared,
-            sidebar_rect: Rect::ZERO,
-            messages_rect: Rect::ZERO,
-            composer_rect: Rect::ZERO,
-            input_rect: Rect::ZERO,
-            send_rect: Rect::ZERO,
-            selector_rects: [Rect::ZERO; 3],
-            open_menu: None,
-            menu_rect: Rect::ZERO,
-            menu_item_rects: Vec::new(),
-            effort_visible: true,
-            newchat_rect: Rect::ZERO,
-            agent_rects: Vec::new(),
-            session_rects: Vec::new(),
-            sel_w: [120.0, 150.0, 90.0],
-            content_height: Cell::new(0.0),
-            viewport_height: Cell::new(0.0),
-            hovered: None,
-            pump_alive: false,
-            idle_frames: 0,
+    /// Update the composer draft (bound to the composer `TextArea` via its `on_change`).
+    fn set_draft(&mut self, text: String) {
+        self.cursor = text.len();
+        self.input = text;
+    }
+
+    /// Select an agent by sidebar index and tell the worker to switch.
+    fn select_agent(&mut self, index: usize) {
+        if let Some(agent) = self.agents.get(index) {
+            let key = agent.key.clone();
+            self.handle.send_command(ChatCommand::SetAgent(key));
         }
     }
 
-    fn palette(&self) -> (sui::DefaultTheme, Palette) {
-        let theme = self.shared.theme();
-        let pal = Palette::from_theme(&theme, widgets::theme_is_dark(&self.shared));
-        (theme, pal)
+    /// Whether `index` is the currently-active agent (matched by key or display name).
+    fn is_active_agent(&self, index: usize) -> bool {
+        self.agents
+            .get(index)
+            .map(|a| a.name == self.info.agent || a.key == self.info.agent)
+            .unwrap_or(false)
     }
 
-    fn ensure_pump(&mut self, ctx: &mut EventCtx) {
-        if !self.pump_alive {
-            ctx.request_animation_frame();
-            self.pump_alive = true;
+    /// Start a fresh session (the "New chat" sidebar row).
+    fn new_session(&mut self) {
+        self.handle.send_command(ChatCommand::NewSession);
+    }
+
+    /// Push the current provider/model selection to the worker.
+    fn push_model_selection(&mut self) {
+        let provider = self
+            .current_provider()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        let model = self.current_model();
+        if !provider.is_empty() {
+            self.handle.send_command(ChatCommand::SetModel {
+                provider,
+                model,
+                account: "default".to_string(),
+            });
         }
     }
 
-    fn hit_test(&self, p: Point) -> Option<Hit> {
-        // An open dropdown floats above everything, so its items take precedence.
-        if self.open_menu.is_some() {
-            for (i, rect) in self.menu_item_rects.iter().enumerate() {
-                if rect.contains(p) {
-                    return Some(Hit::MenuItem(i));
-                }
-            }
-        }
-        if self.send_rect.contains(p) {
-            return Some(Hit::Send);
-        }
-        for (i, rect) in self.selector_rects.iter().enumerate() {
-            if rect.contains(p) {
-                return Some(Hit::Selector(i));
-            }
-        }
-        if self.input_rect.contains(p) {
-            return Some(Hit::Input);
-        }
-        if self.newchat_rect.contains(p) {
-            return Some(Hit::NewChat);
-        }
-        for (i, rect) in self.agent_rects.iter().enumerate() {
-            if rect.contains(p) {
-                return Some(Hit::Agent(i));
-            }
-        }
-        for (i, rect) in self.session_rects.iter().enumerate() {
-            if rect.contains(p) {
-                return Some(Hit::Session(i));
-            }
-        }
-        None
-    }
-
-    fn handle_click(&mut self, hit: Hit, ctx: &mut EventCtx) {
-        match hit {
-            Hit::Selector(which) => {
-                // Toggle this selector's dropdown (clicking the open one closes it).
-                let opening = self.open_menu != Some(which);
-                self.open_menu = if opening { Some(which) } else { None };
-                // Lazily fetch the model list the first time the model menu is opened.
-                if opening && which == 1 {
-                    self.maybe_fetch_models();
-                }
-                ctx.request_arrange();
-                ctx.request_paint();
-                self.ensure_pump(ctx);
-                return;
-            }
-            Hit::MenuItem(index) => {
-                if let Some(which) = self.open_menu {
-                    self.apply_selector_choice(which, index, ctx);
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        {
-            let mut state = self.shared.chat_mut();
-            match hit {
-                Hit::Input => {
-                    state.focused = true;
-                    ctx.request_focus();
-                }
-                Hit::Send => {
-                    drop(state);
-                    self.shared.chat_mut().submit();
-                }
-                Hit::NewChat => {
-                    state.handle.send_command(ChatCommand::NewSession);
-                }
-                Hit::Agent(i) => {
-                    if let Some(agent) = state.agents.get(i) {
-                        let key = agent.key.clone();
-                        state.handle.send_command(ChatCommand::SetAgent(key));
-                    }
-                }
-                Hit::Session(i) => {
-                    state.open_session(i);
-                }
-                Hit::Selector(_) | Hit::MenuItem(_) => {}
-            }
-        }
-        ctx.request_measure();
-        ctx.request_arrange();
-        ctx.request_paint();
-        self.ensure_pump(ctx);
-    }
-
-    /// Apply a dropdown choice: set the selected index, push the new provider/model to
-    /// the chat worker, and close the menu. (`which`: 0 = provider, 1 = model, 2 = effort.)
-    fn apply_selector_choice(&mut self, which: usize, index: usize, ctx: &mut EventCtx) {
-        {
-            let mut state = self.shared.chat_mut();
-            match which {
-                0 => {
-                    if index < state.providers.len() {
-                        state.provider_idx = index;
-                        state.model_idx = 0;
-                    }
-                }
-                1 => {
-                    let len = state
-                        .current_provider()
-                        .map(|p| p.models.len())
-                        .unwrap_or(0);
-                    if index < len {
-                        state.model_idx = index;
-                    }
-                }
-                _ => {
-                    if index < state.efforts.len() {
-                        state.effort_idx = index;
-                    }
-                }
-            }
-            let provider = state
-                .current_provider()
-                .map(|p| p.id.clone())
-                .unwrap_or_default();
-            let model = state.current_model();
-            if !provider.is_empty() {
-                state.handle.send_command(ChatCommand::SetModel {
-                    provider,
-                    model,
-                    account: "default".to_string(),
-                });
-            }
-        }
-        self.open_menu = None;
-        ctx.request_measure();
-        ctx.request_arrange();
-        ctx.request_paint();
-        self.ensure_pump(ctx);
-    }
-
-    /// Ask the worker to fetch the current provider's models from sinomo-lm, unless they
-    /// are already loaded or a fetch is in flight. Results arrive via `ChatEvent::Models`.
-    fn maybe_fetch_models(&mut self) {
-        let mut state = self.shared.chat_mut();
-        if state.models_loading {
+    /// Select a provider by index: reset the model to the first, fetch its models if needed, and
+    /// push the new selection to the worker.
+    fn set_provider(&mut self, index: usize) {
+        if index >= self.providers.len() {
             return;
         }
-        let needs_fetch = state
+        self.provider_idx = index;
+        self.model_idx = 0;
+        self.maybe_fetch_models();
+        self.push_model_selection();
+    }
+
+    /// Select a model by index within the current provider and push it to the worker.
+    fn set_model(&mut self, index: usize) {
+        let len = self.current_provider().map(|p| p.models.len()).unwrap_or(0);
+        if index < len {
+            self.model_idx = index;
+            self.push_model_selection();
+        }
+    }
+
+    /// Select a reasoning-effort option by index.
+    fn set_effort(&mut self, index: usize) {
+        if index < self.efforts.len() {
+            self.effort_idx = index;
+        }
+    }
+
+    /// Ask the worker to fetch the current provider's models from sinomo-lm, unless they are already
+    /// loaded or a fetch is in flight. Results arrive via [`ChatEvent::Models`].
+    fn maybe_fetch_models(&mut self) {
+        if self.models_loading {
+            return;
+        }
+        let needs_fetch = self
             .current_provider()
             .map(|p| p.models.is_empty())
             .unwrap_or(false);
         if !needs_fetch {
             return;
         }
-        if let Some(provider) = state.current_provider().map(|p| p.id.clone()) {
-            state.models_loading = true;
-            state
-                .handle
+        if let Some(provider) = self.current_provider().map(|p| p.id.clone()) {
+            self.models_loading = true;
+            self.handle
                 .send_command(ChatCommand::FetchModels { provider });
-        }
-    }
-
-    fn handle_key(&mut self, key: &sui::KeyboardEvent, ctx: &mut EventCtx) {
-        let mut state = self.shared.chat_mut();
-        if !state.focused {
-            return;
-        }
-        let ctrl = key.modifiers.control || key.modifiers.meta;
-        match key.key.as_str() {
-            "Enter" | "Return" => {
-                if key.modifiers.shift {
-                    let c = state.cursor;
-                    state.input.insert(c, '\n');
-                    state.cursor += 1;
-                } else {
-                    drop(state);
-                    self.shared.chat_mut().submit();
-                    ctx.request_measure();
-                    ctx.request_arrange();
-                    ctx.request_paint();
-                    self.ensure_pump(ctx);
-                    return;
-                }
-            }
-            "Backspace" => {
-                let c = state.cursor;
-                if c > 0 {
-                    let prev = widgets::prev_char_boundary(&state.input, c);
-                    state.input.replace_range(prev..c, "");
-                    state.cursor = prev;
-                }
-            }
-            "Delete" => {
-                let c = state.cursor;
-                if c < state.input.len() {
-                    let next = widgets::next_char_boundary(&state.input, c);
-                    state.input.replace_range(c..next, "");
-                }
-            }
-            "ArrowLeft" => {
-                state.cursor = widgets::prev_char_boundary(&state.input, state.cursor);
-            }
-            "ArrowRight" => {
-                state.cursor = widgets::next_char_boundary(&state.input, state.cursor);
-            }
-            "Home" => state.cursor = 0,
-            "End" => state.cursor = state.input.len(),
-            _ => {
-                if ctrl {
-                    return;
-                }
-                if let Some(text) = &key.text
-                    && !text.is_empty()
-                    && !text.chars().any(|c| c.is_control())
-                {
-                    let c = state.cursor;
-                    state.input.insert_str(c, text);
-                    state.cursor += text.len();
-                }
-            }
-        }
-        ctx.request_paint();
-    }
-
-    fn pump(&mut self, ctx: &mut EventCtx) {
-        self.pump_alive = false;
-        let events = self.shared.chat().handle.drain();
-        let had = !events.is_empty();
-        if had {
-            let mut state = self.shared.chat_mut();
-            for event in events {
-                state.apply_event(event);
-            }
-        }
-        let streaming = self.shared.chat().streaming;
-        if had {
-            self.idle_frames = 0;
-            ctx.request_measure();
-            ctx.request_arrange();
-            ctx.request_paint();
-        } else {
-            self.idle_frames = self.idle_frames.saturating_add(1);
-        }
-        // Keep pumping while a reply streams or there was recent activity; then
-        // go idle so we don't repaint forever.
-        if streaming || self.idle_frames < 90 {
-            ctx.request_animation_frame();
-            self.pump_alive = true;
         }
     }
 }
 
-impl Widget for ChatView {
-    fn accepts_focus(&self) -> bool {
-        true
-    }
+// ---------------------------------------------------------------------------
+// Theme reader + small helpers (mirrors the Settings / Files tabs).
+// ---------------------------------------------------------------------------
 
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        let theme = self.shared.theme();
-        let style = sui::TextStyle {
-            font_size: 12.5,
-            weight: FontWeight::MEDIUM,
-            ..theme.body_text_style()
-        };
-        let state = self.shared.chat();
-        let labels = [
-            state
-                .current_provider()
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "Provider".to_string()),
-            state.current_model(),
-            state.current_effort(),
-        ];
-        drop(state);
-        for (i, label) in labels.iter().enumerate() {
-            let w = ctx
-                .layout()
-                .measure_text(format!("◇ {label}"), style.clone())
-                .map(|m| m.width + 38.0) // glyph + label + trailing caret
-                .unwrap_or(120.0);
-            self.sel_w[i] = w.clamp(90.0, 280.0);
-        }
-        constraints.max
-    }
+/// Clone the shared theme reader into a fresh `Fn() -> DefaultTheme` for one control.
+fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || reader()
+}
 
-    fn arrange(&mut self, _ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.sidebar_rect = Rect::new(bounds.x(), bounds.y(), SIDEBAR_W, bounds.height());
-        let panel_x = bounds.x() + SIDEBAR_W;
-        let panel_w = bounds.width() - SIDEBAR_W;
+/// Resolve the app chrome palette for the current theme (used by the `Label` color readers and the
+/// bespoke painters so muted/accent text matches the chrome).
+fn palette(shared: &Shared) -> Palette {
+    Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
+}
 
-        self.composer_rect = Rect::new(
-            panel_x,
-            bounds.y() + bounds.height() - COMPOSER_H,
-            panel_w,
-            COMPOSER_H,
-        );
-        self.messages_rect = Rect::new(
-            panel_x,
-            bounds.y(),
-            panel_w,
-            (bounds.height() - COMPOSER_H).max(0.0),
-        );
+/// A small uppercase section heading `Label` (AGENTS / SESSIONS), color tracking the theme.
+fn heading(shared: &Shared, text: &str) -> Label {
+    let s = shared.clone();
+    Label::new(text)
+        .style({
+            let theme = shared.theme();
+            sui::TextStyle {
+                font_size: 11.0,
+                line_height: 18.0,
+                weight: FontWeight::SEMIBOLD,
+                ..theme.body_text_style()
+            }
+        })
+        .color_when(move || palette(&s).text_faint)
+}
 
-        // Composer internals.
-        let cx = self.composer_rect.x() + PAD;
-        let cw = self.composer_rect.width() - PAD * 2.0;
-        let sel_y = self.composer_rect.y() + 14.0;
+// ---------------------------------------------------------------------------
+// Sidebar — agents + sessions ListViews (rebuilt when the lists change).
+// ---------------------------------------------------------------------------
 
-        // The reasoning-effort selector only shows for models that actually take one.
-        self.effort_visible = {
-            let state = self.shared.chat();
-            let provider = state
-                .current_provider()
-                .map(|p| p.id.clone())
-                .unwrap_or_default();
-            let model = state.current_model();
-            !provider.is_empty() && sinomo_lm::model_supports_reasoning_effort(&provider, &model)
-        };
-        let selector_count = if self.effort_visible { 3 } else { 2 };
-        let mut x = cx;
-        for i in 0..3 {
-            if i < selector_count {
-                self.selector_rects[i] = Rect::new(x, sel_y, self.sel_w[i], SELECTOR_H);
-                x += self.sel_w[i] + 8.0;
+/// Build the AGENTS ListView: one row per agent, the active one selected, selecting one switches.
+fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    // NB: `ListView`/`ListItem` have no leading-icon slot, and a custom `with_child` row content
+    // suppresses the ListView's click-to-select + hover handling — so these rows keep a leading text
+    // glyph rather than a real Lucide `Icon` (the bespoke painters elsewhere use real icons). The ✦
+    // marks the "agents" rows like the empty-state Sparkles mark.
+    let items: Vec<ListItem> = shared
+        .chat()
+        .agents
+        .iter()
+        .map(|agent| ListItem::new(format!("✦  {}", agent.name)))
+        .collect();
+    let s = shared.clone();
+    ListView::new("chat-agents")
+        .items(items)
+        .row_height(SIDEBAR_ROW_H)
+        .theme_when(clone_reader(reader))
+        .selected_when({
+            let s = s.clone();
+            move || {
+                let chat = s.chat();
+                (0..chat.agents.len()).find(|i| chat.is_active_agent(*i))
+            }
+        })
+        .on_change(move |index, _label| {
+            s.chat_mut().select_agent(index);
+        })
+}
+
+/// Build the SESSIONS ListView: a "New chat" row followed by session history. Selecting row 0
+/// starts a fresh session; later rows open that stored session.
+fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    // Leading text glyphs (no ListView leading-icon slot — see `agents_list`): the New chat row
+    // reads as a "+" (Plus), session-history rows as a clock-face "◷" (History).
+    let mut items = vec![ListItem::new("+  New chat")];
+    items.extend(
+        shared
+            .chat()
+            .sessions
+            .iter()
+            .map(|session| ListItem::new(format!("◷  {}", session.title))),
+    );
+    let s = shared.clone();
+    ListView::new("chat-sessions")
+        .items(items)
+        // The session list is a drill-in action list, not a persistent selection: never keep a
+        // row highlighted (mirrors the Settings narrow menu).
+        .selected_when(|| None::<usize>)
+        .row_height(SIDEBAR_ROW_H)
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _label| {
+            let mut chat = s.chat_mut();
+            if index == 0 {
+                chat.new_session();
             } else {
-                self.selector_rects[i] = Rect::ZERO;
+                chat.open_session(index - 1);
             }
-        }
-        let input_y = sel_y + SELECTOR_H + 12.0;
-        let input_h =
-            (self.composer_rect.y() + self.composer_rect.height() - 14.0 - input_y).max(0.0);
-        let send_w = 84.0;
-        self.input_rect = Rect::new(cx, input_y, (cw - send_w - 10.0).max(40.0), input_h);
-        self.send_rect = Rect::new(cx + cw - send_w, input_y + input_h - 40.0, send_w, 40.0);
+        })
+}
 
-        // Sidebar internals.
-        let agents_n = self.shared.chat().agents.len();
-        let sessions_n = self.shared.chat().sessions.len();
-        let sx = self.sidebar_rect.x() + 12.0;
-        let sw = SIDEBAR_W - 24.0;
-        let mut y = self.sidebar_rect.y() + 52.0; // below "Agents" header
-        self.agent_rects = (0..agents_n)
-            .map(|_| {
-                let r = Rect::new(sx, y, sw, ROW_H);
-                y += ROW_H + 2.0;
-                r
-            })
-            .collect();
-        y += 40.0; // gap + "Sessions" header
-        self.newchat_rect = Rect::new(sx, y, sw, ROW_H);
-        y += ROW_H + 6.0;
-        self.session_rects = (0..sessions_n)
-            .map(|_| {
-                let r = Rect::new(sx, y, sw, ROW_H);
-                y += ROW_H + 2.0;
-                r
-            })
-            .collect();
+/// The sidebar column: AGENTS heading + list, then SESSIONS heading + list. Wrapped in a
+/// [`RebuildOnChange`] keyed on the agent/session signature so it rebuilds when those lists change
+/// (e.g. a new session is persisted) but not on every token.
+fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new(
+        {
+            let s = s.clone();
+            move || sidebar_signature(&s)
+        },
+        move |_sig| {
+            let column = Stack::vertical()
+                .spacing(4.0)
+                .alignment(Alignment::Stretch)
+                .with_child(SizedBox::new().height(18.0))
+                .with_child(InsetX::new(heading(&s, "AGENTS"), 18.0))
+                .with_child(SizedBox::new().height(2.0))
+                .with_child(InsetX::new(agents_list(&s, &r), 8.0))
+                .with_child(SizedBox::new().height(16.0))
+                .with_child(InsetX::new(heading(&s, "SESSIONS"), 18.0))
+                .with_child(SizedBox::new().height(2.0))
+                .with_child(InsetX::new(sessions_list(&s, &r), 8.0));
+            WidgetPod::new(SidebarSurface::new(s.clone(), column))
+        },
+    )
+}
 
-        // Open-dropdown geometry. The composer sits at the bottom of the tab, so the
-        // selector dropdowns open upward over the transcript.
-        self.menu_item_rects.clear();
-        self.menu_rect = Rect::ZERO;
-        if let Some(which) = self.open_menu {
-            let count = {
-                let state = self.shared.chat();
-                match which {
-                    0 => state.providers.len(),
-                    // Always at least one row, for the "Loading…"/"No models" placeholder.
-                    1 => state
-                        .current_provider()
-                        .map(|p| p.models.len())
-                        .unwrap_or(0)
-                        .max(1),
-                    _ => state.efforts.len(),
-                }
-            };
-            if count > 0 {
-                let anchor = self.selector_rects[which];
-                let item_h = 28.0;
-                let menu_h = count as f32 * item_h + 8.0;
-                let menu_w = anchor.width().max(170.0);
-                let menu_x = anchor.x();
-                let menu_y = (anchor.y() - menu_h - 6.0).max(bounds.y() + 8.0);
-                self.menu_rect = Rect::new(menu_x, menu_y, menu_w, menu_h);
-                let mut iy = menu_y + 4.0;
-                for _ in 0..count {
-                    self.menu_item_rects
-                        .push(Rect::new(menu_x + 4.0, iy, menu_w - 8.0, item_h));
-                    iy += item_h;
-                }
-            }
+/// A signature of the sidebar's list contents (agents are static; sessions + the active agent
+/// change). Used to drive the sidebar [`RebuildOnChange`].
+fn sidebar_signature(shared: &Shared) -> (String, String) {
+    let chat = shared.chat();
+    let active = chat
+        .agents
+        .iter()
+        .enumerate()
+        .find(|(i, _)| chat.is_active_agent(*i))
+        .map(|(_, a)| a.key.clone())
+        .unwrap_or_default();
+    let sessions = chat
+        .sessions
+        .iter()
+        .map(|s| s.title.as_str())
+        .collect::<Vec<_>>()
+        .join("\u{1f}");
+    (active, sessions)
+}
+
+// ---------------------------------------------------------------------------
+// Transcript — a live-reading painter that owns its own scroll (auto-stick to
+// bottom while streaming). Re-reads `ChatState.messages` each `paint`, so a
+// streamed token never rebuilds the widget tree. The repaint each streaming
+// frame is driven by `ChatView`'s pump (which `request_paint`s as it drains
+// tokens); a parent repaint repaints this whole subtree, so the transcript
+// stays in sync without its own self-invalidation. The bubble layout/measure
+// math is the same the hand-painted UI used.
+// ---------------------------------------------------------------------------
+
+struct TranscriptView {
+    shared: Shared,
+    content_height: Cell<f32>,
+    viewport_height: Cell<f32>,
+    bounds: Cell<Rect>,
+}
+
+impl TranscriptView {
+    fn new(shared: Shared) -> Self {
+        Self {
+            shared,
+            content_height: Cell::new(0.0),
+            viewport_height: Cell::new(0.0),
+            bounds: Cell::new(Rect::ZERO),
         }
     }
+}
 
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let (theme, pal) = self.palette();
-        ctx.fill_bounds(pal.window);
-        self.paint_sidebar(ctx, &theme, &pal);
-        self.paint_messages(ctx, &theme, &pal);
-        self.paint_composer(ctx, &theme, &pal);
-        // Painted last so an open selector dropdown floats above the transcript.
-        self.paint_dropdown(ctx, &theme, &pal);
-    }
-
+impl Widget for TranscriptView {
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
-        if let Event::Wake(sui::WakeEvent::AnimationFrame { .. }) = event {
-            self.pump(ctx);
-            return;
-        }
-        if ctx.phase() != EventPhase::Target {
-            return;
-        }
         match event {
-            Event::Pointer(p) => match p.kind {
-                PointerEventKind::Move => {
-                    let h = self.hit_test(p.position);
-                    if h != self.hovered {
-                        self.hovered = h;
-                        ctx.request_paint();
-                    }
-                }
-                PointerEventKind::Down if p.button == Some(PointerButton::Primary) => {
-                    let hit = self.hit_test(p.position);
-                    // A click outside an open dropdown (and not on a selector chip)
-                    // dismisses it without triggering the underlying control.
-                    if self.open_menu.is_some()
-                        && !matches!(hit, Some(Hit::MenuItem(_)) | Some(Hit::Selector(_)))
-                    {
-                        self.open_menu = None;
-                        ctx.set_handled();
-                        ctx.request_paint();
-                        self.ensure_pump(ctx);
-                        return;
-                    }
-                    if !self.composer_rect.contains(p.position)
-                        && !self.input_rect.contains(p.position)
-                    {
-                        self.shared.chat_mut().focused = false;
-                    }
-                    if let Some(hit) = hit {
-                        self.handle_click(hit, ctx);
-                        ctx.set_handled();
-                    } else if self.messages_rect.contains(p.position) {
-                        self.shared.chat_mut().focused = false;
-                        ctx.request_paint();
-                    }
-                    self.ensure_pump(ctx);
-                }
-                PointerEventKind::Scroll => {
-                    if self.messages_rect.contains(p.position)
-                        && let Some(delta) = p.scroll_delta
-                    {
-                        let dy = match delta {
-                            ScrollDelta::Lines(v) => v.y * 48.0,
-                            ScrollDelta::Pixels(v) => v.y,
-                        };
-                        let max = (self.content_height.get() - self.viewport_height.get()).max(0.0);
-                        let mut state = self.shared.chat_mut();
-                        state.scroll = (state.scroll - dy).clamp(0.0, max);
-                        state.stick_bottom = state.scroll >= max - 2.0;
-                        ctx.request_paint();
-                    }
-                }
-                _ => {}
-            },
-            Event::Keyboard(key) if key.state == KeyState::Pressed => {
-                if key.key == "Escape" && self.open_menu.take().is_some() {
-                    ctx.set_handled();
+            Event::Pointer(p)
+                if p.kind == PointerEventKind::Scroll && self.bounds.get().contains(p.position) =>
+            {
+                if let Some(delta) = p.scroll_delta {
+                    let dy = match delta {
+                        ScrollDelta::Lines(v) => v.y * 48.0,
+                        ScrollDelta::Pixels(v) => v.y,
+                    };
+                    let max = (self.content_height.get() - self.viewport_height.get()).max(0.0);
+                    let mut chat = self.shared.chat_mut();
+                    chat.scroll = (chat.scroll - dy).clamp(0.0, max);
+                    chat.stick_bottom = chat.scroll >= max - 2.0;
+                    drop(chat);
                     ctx.request_paint();
-                    self.ensure_pump(ctx);
-                    return;
                 }
-                self.handle_key(key, ctx);
-                self.ensure_pump(ctx);
             }
             _ => {}
         }
     }
-}
 
-impl ChatView {
-    fn paint_sidebar(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        ctx.fill_rect(self.sidebar_rect, pal.sidebar);
-        widgets::hairline_right(ctx, self.sidebar_rect, pal.border);
-        let state = self.shared.chat();
-
-        let header = pal.text_style(theme, 11.0, FontWeight::SEMIBOLD, pal.text_faint);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                self.sidebar_rect.x() + 14.0,
-                self.sidebar_rect.y() + 24.0,
-                200.0,
-                20.0,
-            ),
-            "AGENTS",
-            header.clone(),
-        );
-
-        for (i, rect) in self.agent_rects.iter().enumerate() {
-            let agent = &state.agents[i];
-            let active = agent.name == state.info.agent || agent.key == state.info.agent;
-            self.paint_row(
-                ctx,
-                theme,
-                pal,
-                *rect,
-                &agent.name,
-                active,
-                self.hovered == Some(Hit::Agent(i)),
-                Some("✸"),
-            );
-        }
-
-        // Sessions header (just above new-chat).
-        let sessions_header_y = self.newchat_rect.y() - 28.0;
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(self.sidebar_rect.x() + 14.0, sessions_header_y, 200.0, 20.0),
-            "SESSIONS",
-            header,
-        );
-        self.paint_row(
-            ctx,
-            theme,
-            pal,
-            self.newchat_rect,
-            "New chat",
-            false,
-            self.hovered == Some(Hit::NewChat),
-            Some("+"),
-        );
-        for (i, rect) in self.session_rects.iter().enumerate() {
-            let title = &state.sessions[i].title;
-            self.paint_row(
-                ctx,
-                theme,
-                pal,
-                *rect,
-                title,
-                false,
-                self.hovered == Some(Hit::Session(i)),
-                Some("◷"),
-            );
-        }
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.max
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn paint_row(
-        &self,
-        ctx: &mut PaintCtx,
-        theme: &sui::DefaultTheme,
-        pal: &Palette,
-        rect: Rect,
-        label: &str,
-        active: bool,
-        hovered: bool,
-        glyph: Option<&str>,
-    ) {
-        if active {
-            widgets::fill_round_rect(ctx, rect, pal.selected, 8.0);
-        } else if hovered {
-            widgets::fill_round_rect(ctx, rect, pal.hover, 8.0);
-        }
-        let color = if active { pal.text } else { pal.text_muted };
-        let mut tx = rect.x() + 12.0;
-        if let Some(g) = glyph {
-            let gs = pal.text_style(
-                theme,
-                12.0,
-                FontWeight::MEDIUM,
-                if active { pal.accent } else { pal.text_faint },
-            );
-            widgets::draw_text_in(ctx, Rect::new(tx, rect.y(), 18.0, rect.height()), g, gs);
-            tx += 22.0;
-        }
-        let style = pal.text_style(
-            theme,
-            13.0,
-            if active {
-                FontWeight::SEMIBOLD
-            } else {
-                FontWeight::MEDIUM
-            },
-            color,
-        );
-        let elided = elide(label, 26);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                tx,
-                rect.y(),
-                rect.x() + rect.width() - tx - 8.0,
-                rect.height(),
-            ),
-            &elided,
-            style,
-        );
+    fn arrange(&mut self, _ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.bounds.set(bounds);
     }
 
-    fn paint_messages(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        let area = self.messages_rect;
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let area = ctx.bounds();
+        self.bounds.set(area);
         self.viewport_height.set(area.height());
-        ctx.push_clip_rect(area);
 
-        let state = self.shared.chat();
-        if state.messages.is_empty() {
-            ctx.pop_clip();
-            self.paint_empty_state(ctx, theme, pal, area, &state);
+        let chat = self.shared.chat();
+        if chat.messages.is_empty() {
+            self.paint_empty_state(ctx, &theme, &pal, area, &chat);
             return;
         }
 
+        ctx.push_clip_rect(area);
+
         let max_bubble = (area.width() * 0.74).clamp(200.0, 620.0);
         let inner_w = max_bubble - 24.0;
-        let body = pal.text_style(theme, 14.0, FontWeight::NORMAL, pal.text);
+        let body = pal.text_style(&theme, 14.0, FontWeight::NORMAL, pal.text);
         let line_h = body.line_height;
 
-        // Measure pass: wrap each message and compute its bubble box. Done first
-        // so the immutable `measure` borrow of `ctx` is released before drawing.
+        // Measure pass: wrap each message and compute its bubble box (releases the immutable
+        // `measure` borrow of `ctx` before drawing).
         struct Laid {
             is_user: bool,
             lines: Vec<String>,
             bubble_w: f32,
             bubble_h: f32,
         }
-        let mut laid: Vec<Laid> = Vec::with_capacity(state.messages.len());
+        let mut laid: Vec<Laid> = Vec::with_capacity(chat.messages.len());
         let mut total = PAD;
         {
             let measure = |s: &str| {
@@ -1028,7 +717,7 @@ impl ChatView {
                     .map(|m| m.width)
                     .unwrap_or(0.0)
             };
-            for msg in &state.messages {
+            for msg in &chat.messages {
                 let is_user = msg.role == ChatRole::User;
                 let text = if msg.text.is_empty() {
                     "…".to_string()
@@ -1052,10 +741,10 @@ impl ChatView {
         self.content_height.set(total);
 
         let max_scroll = (total - area.height()).max(0.0);
-        let scroll = if state.stick_bottom {
+        let scroll = if chat.stick_bottom {
             max_scroll
         } else {
-            state.scroll.clamp(0.0, max_scroll)
+            chat.scroll.clamp(0.0, max_scroll)
         };
 
         // Draw pass: only mutable ctx ops here.
@@ -1073,6 +762,11 @@ impl ChatView {
             };
             if y + item.bubble_h >= area.y() && y <= area.y() + area.height() {
                 let bubble = Rect::new(bx, y, item.bubble_w, item.bubble_h);
+                // C4 elevation: a very subtle drop shadow lifts each message bubble off the
+                // transcript background. Drawn BEFORE the fill so it sits behind. We use the toolkit's
+                // smallest box-shadow token (~5% black, 2px blur) so the lift stays on the theme's own
+                // elevation scale — restrained, since the agent bubbles also carry a border.
+                sui::paint_theme_shadow(ctx, bubble, [12.0; 4], &theme.shadows.box_shadow.xs);
                 match border {
                     Some(bc) => widgets::round_panel(ctx, bubble, bubble_color, bc, 12.0),
                     None => widgets::fill_round_rect(ctx, bubble, bubble_color, 12.0),
@@ -1095,11 +789,11 @@ impl ChatView {
         }
         ctx.pop_clip();
 
-        // streaming/typing notice
-        if state.streaming
-            && let Some(notice) = &state.notice
+        // Streaming / typing notice, pinned to the bottom of the transcript.
+        if chat.streaming
+            && let Some(notice) = &chat.notice
         {
-            let ns = pal.text_style(theme, 11.5, FontWeight::MEDIUM, pal.text_faint);
+            let ns = pal.text_style(&theme, 11.5, FontWeight::MEDIUM, pal.text_faint);
             widgets::draw_text_in(
                 ctx,
                 Rect::new(
@@ -1113,284 +807,1077 @@ impl ChatView {
             );
         }
     }
+}
 
+impl TranscriptView {
     fn paint_empty_state(
         &self,
         ctx: &mut PaintCtx,
         theme: &sui::DefaultTheme,
         pal: &Palette,
         area: Rect,
-        state: &ChatState,
+        chat: &ChatState,
     ) {
         let cx = area.x() + area.width() / 2.0;
         let cy = area.y() + area.height() / 2.0;
-        let mark = pal.text_style(theme, 34.0, FontWeight::BOLD, pal.text_faint);
-        widgets::draw_centered(ctx, "✦", mark, cx, cy - 40.0);
+        // A real Lucide Sparkles glyph for the empty-state mark (tinted to the muted chrome color),
+        // replacing the arbitrary ✦ text rune.
+        let mark_side = 40.0;
+        draw_glyph(
+            ctx,
+            IconGlyph::Sparkles,
+            Rect::new(
+                cx - mark_side / 2.0,
+                cy - 40.0 - mark_side / 2.0,
+                mark_side,
+                mark_side,
+            ),
+            pal.text_faint,
+        );
         let title = pal.text_style(theme, 17.0, FontWeight::SEMIBOLD, pal.text_muted);
-        let agent = if state.info.agent.is_empty() {
+        let agent = if chat.info.agent.is_empty() {
             "Sinomo"
         } else {
-            state.info.agent.as_str()
+            chat.info.agent.as_str()
         };
         widgets::draw_centered(ctx, &format!("Chat with {agent}"), title, cx, cy + 2.0);
         let sub = pal.text_style(theme, 12.5, FontWeight::NORMAL, pal.text_faint);
         widgets::draw_centered(ctx, "Type a message below to begin.", sub, cx, cy + 26.0);
     }
+}
 
-    fn paint_composer(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        ctx.fill_rect(self.composer_rect, pal.titlebar);
-        widgets::hairline_top(ctx, self.composer_rect, pal.border);
-        let state = self.shared.chat();
+// ---------------------------------------------------------------------------
+// Composer — provider / model / effort `Select`s, the message `TextArea`, and a
+// Send `Button`. The model `Select` (and effort visibility) depend on the
+// provider + fetched model list, so the selector row is wrapped in a
+// `RebuildOnChange` keyed on the selection signature.
+// ---------------------------------------------------------------------------
 
-        let labels = [
-            state
-                .current_provider()
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| "Provider".into()),
-            state.current_model(),
-            state.current_effort(),
-        ];
-        let glyphs = ["◇", "◆", "✲"];
-        for (i, rect) in self.selector_rects.iter().enumerate() {
-            if i == 2 && !self.effort_visible {
-                continue; // effort selector hidden for non-reasoning models
-            }
-            let active = self.hovered == Some(Hit::Selector(i)) || self.open_menu == Some(i);
-            let border = if active { pal.accent } else { pal.border };
-            widgets::round_panel(ctx, *rect, pal.field, border, SELECTOR_H / 2.0);
-            let gs = pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.accent);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(rect.x() + 10.0, rect.y(), 16.0, rect.height()),
-                glyphs[i],
-                gs,
-            );
-            let ts = pal.text_style(theme, 12.0, FontWeight::MEDIUM, pal.text);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    rect.x() + 26.0,
-                    rect.y(),
-                    (rect.width() - 44.0).max(10.0),
-                    rect.height(),
-                ),
-                &elide(&labels[i], 20),
-                ts,
-            );
-            // Trailing caret signalling the dropdown.
-            let caret = pal.text_style(theme, 9.0, FontWeight::SEMIBOLD, pal.text_muted);
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    rect.x() + rect.width() - 18.0,
-                    rect.y(),
-                    14.0,
-                    rect.height(),
-                ),
-                "▾",
-                caret,
-            );
-        }
+/// The selector row signature: provider index, model index, model count, effort visibility, and a
+/// loading flag — anything that changes the *set* of options or which selectors are shown. (The
+/// selected-index reactivity is handled by each `Select`'s `selected_when`; this only drives the
+/// rebuild when the option lists themselves change.)
+fn selector_signature(shared: &Shared) -> (usize, usize, usize, bool, bool) {
+    let chat = shared.chat();
+    (
+        chat.provider_idx,
+        chat.providers.len(),
+        chat.current_models().len(),
+        chat.effort_visible(),
+        chat.models_loading,
+    )
+}
 
-        // Input field.
-        let focused = state.focused;
-        let border_color = if focused { pal.accent } else { pal.border };
-        widgets::round_panel(ctx, self.input_rect, pal.field, border_color, 10.0);
-        let body = pal.text_style(theme, 13.5, FontWeight::NORMAL, pal.text);
-        let pad = 10.0;
-        let text_area = Rect::new(
-            self.input_rect.x() + pad,
-            self.input_rect.y() + pad,
-            (self.input_rect.width() - pad * 2.0).max(20.0),
-            (self.input_rect.height() - pad * 2.0).max(16.0),
-        );
-        ctx.push_clip_rect(self.input_rect);
-        if state.input.is_empty() && !focused {
-            let ph = pal.text_style(theme, 13.5, FontWeight::NORMAL, pal.text_faint);
-            widgets::draw_text_in(ctx, text_area, "Message Sinomo…  (⏎ to send)", ph);
+/// Build the provider / model / effort selector row for the current selection.
+fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let provider = {
+        let s = shared.clone();
+        let names: Vec<String> = shared
+            .chat()
+            .providers
+            .iter()
+            .map(|p| p.name.clone())
+            .collect();
+        sui::Select::new("chat-provider")
+            .options(names)
+            .placeholder("Provider")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || Some(s.chat().provider_idx)
+            })
+            .on_change(move |index, _label| {
+                s.chat_mut().set_provider(index);
+            })
+    };
+
+    let model = {
+        let s = shared.clone();
+        let models = shared.chat().current_models();
+        let loading = shared.chat().models_loading;
+        let placeholder = if loading {
+            "Loading models…"
+        } else if models.is_empty() {
+            "No models"
         } else {
-            // Measure pass (releases the immutable ctx borrow before drawing).
-            let (lines, caret_x) = {
-                let measure = |s: &str| {
-                    ctx.measure_text(s, body.clone())
-                        .map(|m| m.width)
-                        .unwrap_or(0.0)
-                };
-                let lines = widgets::wrap_lines(&state.input, text_area.width(), measure);
-                let caret_x =
-                    text_area.x() + measure(lines.last().map(String::as_str).unwrap_or(""));
-                (lines, caret_x)
-            };
-            let mut ty = text_area.y();
-            for line in &lines {
-                ctx.draw_text(
-                    Rect::new(text_area.x(), ty, text_area.width(), body.line_height + 2.0),
-                    line,
-                    body.clone(),
-                );
-                ty += body.line_height;
-            }
-            if focused {
-                let caret_y =
-                    text_area.y() + lines.len().saturating_sub(1) as f32 * body.line_height;
-                ctx.fill_rect(
-                    Rect::new(caret_x + 1.0, caret_y, 1.5, body.line_height),
-                    pal.accent,
-                );
-            }
-        }
-        ctx.pop_clip();
-
-        // Send button.
-        let send_hover = self.hovered == Some(Hit::Send);
-        let enabled = !state.input.trim().is_empty() && !state.streaming;
-        let send_color = if !enabled {
-            pal.field
-        } else if send_hover {
-            pal.accent_hover
-        } else {
-            pal.accent
+            "Model"
         };
-        widgets::fill_round_rect(ctx, self.send_rect, send_color, 10.0);
-        let label_color = if enabled {
-            pal.on_accent
-        } else {
-            pal.text_faint
-        };
-        let ls = pal.text_style(theme, 13.0, FontWeight::SEMIBOLD, label_color);
-        let label = if state.streaming { "•••" } else { "Send" };
-        let lw = ctx
-            .measure_text(label, ls.clone())
-            .map(|m| m.width)
-            .unwrap_or(30.0);
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(
-                self.send_rect.x() + (self.send_rect.width() - lw) / 2.0,
-                self.send_rect.y(),
-                lw + 4.0,
-                self.send_rect.height(),
-            ),
-            label,
-            ls,
-        );
+        sui::Select::new("chat-model")
+            .options(models)
+            .placeholder(placeholder)
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || Some(s.chat().model_idx)
+            })
+            .on_change(move |index, _label| {
+                s.chat_mut().set_model(index);
+            })
+    };
+
+    let mut row = Stack::horizontal()
+        .spacing(8.0)
+        .alignment(Alignment::Center)
+        .with_child(SizedBox::new().height(SELECTOR_H).with_child(provider))
+        .with_child(SizedBox::new().height(SELECTOR_H).with_child(model));
+
+    if shared.chat().effort_visible() {
+        let s = shared.clone();
+        let efforts = shared.chat().efforts.clone();
+        let effort = sui::Select::new("chat-effort")
+            .options(efforts)
+            .placeholder("Effort")
+            .theme_when(clone_reader(reader))
+            .selected_when({
+                let s = s.clone();
+                move || Some(s.chat().effort_idx)
+            })
+            .on_change(move |index, _label| {
+                s.chat_mut().set_effort(index);
+            });
+        row = row.with_child(SizedBox::new().height(SELECTOR_H).with_child(effort));
     }
 
-    /// Paint the open selector dropdown (a panel of options anchored above its chip).
-    fn paint_dropdown(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        let Some(which) = self.open_menu else {
-            return;
-        };
-        if self.menu_item_rects.is_empty() {
-            return;
-        }
+    WidgetPod::new(row)
+}
 
-        let state = self.shared.chat();
-        let loading = state.models_loading;
-        let (options, selected): (Vec<String>, usize) = match which {
-            0 => (
-                state.providers.iter().map(|p| p.name.clone()).collect(),
-                state.provider_idx,
-            ),
-            1 => (
-                state
-                    .current_provider()
-                    .map(|p| p.models.clone())
-                    .unwrap_or_default(),
-                state.model_idx,
-            ),
-            _ => (state.efforts.clone(), state.effort_idx),
-        };
-        drop(state);
+/// The composer's bottom row: a flexible message `TextArea` and a fixed-width Send `Button`/
+/// `Spinner`. The input is bound to the draft via `on_change`; the send action is wired to
+/// `ChatState::submit`. The Send control swaps to a `Spinner` while streaming.
+fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let input = {
+        let s = shared.clone();
+        let draft = shared.chat().input.clone();
+        let theme = shared.theme();
+        TextArea::new("chat-input")
+            .value(draft)
+            .placeholder("Message Sinomo…  (⏎ to send, ⇧⏎ for newline)")
+            .text_style(sui::TextStyle {
+                font_size: 13.5,
+                line_height: 19.0,
+                ..theme.body_text_style()
+            })
+            .theme_when(clone_reader(reader))
+            .on_change({
+                let s = s.clone();
+                move |value| {
+                    s.chat_mut().set_draft(value);
+                }
+            })
+            // Enter sends, Shift+Enter inserts a newline (the on_submit only fires while the
+            // TextArea is focused — Enter only reaches a focused input). `submit()` already no-ops
+            // when the draft is empty or a turn is streaming, so this matches `can_send`.
+            .on_submit(move |_text| {
+                s.chat_mut().submit();
+            })
+    };
 
-        widgets::round_panel(ctx, self.menu_rect, pal.panel, pal.border, 10.0);
+    let streaming = shared.chat().streaming;
+    let send: WidgetPod = if streaming {
+        WidgetPod::new(
+            sui::Spinner::new("chat-sending")
+                .size(22.0)
+                .theme_when(clone_reader(reader)),
+        )
+    } else {
+        let s = shared.clone();
+        WidgetPod::new(
+            sui::Button::new("Send")
+                .theme_when(clone_reader(reader))
+                .enabled_when({
+                    let s = s.clone();
+                    move || s.chat().can_send()
+                })
+                .on_press(move || {
+                    s.chat_mut().submit();
+                }),
+        )
+    };
 
-        // Model menu: a placeholder row while fetching, or when nothing is available.
-        if which == 1 && options.is_empty() {
-            if let Some(rect) = self.menu_item_rects.first() {
-                let label = if loading {
-                    "Loading models…"
-                } else {
-                    "No models available"
-                };
-                let style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        rect.x() + 10.0,
-                        rect.y(),
-                        (rect.width() - 20.0).max(10.0),
-                        rect.height(),
-                    ),
-                    label,
-                    style,
-                );
-            }
-            return;
-        }
+    let row = Split::new(
+        SizedBox::new().with_child(PodHost::new(WidgetPod::new(input))),
+        SizedBox::new().with_child(PodHost::new(send)),
+        92.0,
+    );
+    WidgetPod::new(row)
+}
 
-        let item_style = pal.text_style(theme, 12.5, FontWeight::MEDIUM, pal.text);
-        for (i, rect) in self.menu_item_rects.iter().enumerate() {
-            let Some(label) = options.get(i) else {
-                continue;
-            };
-            let is_selected = i == selected;
-            let hovered = self.hovered == Some(Hit::MenuItem(i));
-            if is_selected {
-                widgets::fill_round_rect(ctx, *rect, pal.selected, 7.0);
-            } else if hovered {
-                widgets::fill_round_rect(ctx, *rect, pal.hover, 7.0);
-            }
-            let color = if is_selected {
-                pal.text
-            } else {
-                pal.text_muted
-            };
-            let style = sui::TextStyle {
-                color,
-                ..item_style.clone()
-            };
-            widgets::draw_text_in(
-                ctx,
-                Rect::new(
-                    rect.x() + 10.0,
-                    rect.y(),
-                    (rect.width() - 32.0).max(10.0),
-                    rect.height(),
-                ),
-                &elide(label, 30),
-                style,
-            );
-            if is_selected {
-                let check = pal.text_style(theme, 11.5, FontWeight::SEMIBOLD, pal.accent);
-                widgets::draw_text_in(
-                    ctx,
-                    Rect::new(
-                        rect.x() + rect.width() - 20.0,
-                        rect.y(),
-                        14.0,
-                        rect.height(),
-                    ),
-                    "✓",
-                    check,
-                );
-            }
+/// The full composer: a titlebar-surfaced panel with the selector row above the input row. Wrapped
+/// so the selector row rebuilds when the option lists change. A fixed `COMPOSER_H` tall.
+fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let selector_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || selector_signature(&s)
+            },
+            move |_sig| selectors(&s, &r),
+        )
+    };
+
+    // The input row is rebuilt when the streaming flag flips (Send <-> Spinner). The draft text is
+    // owned by the `TextArea`, so we do NOT rebuild on every keystroke.
+    let input_host = {
+        let s = shared.clone();
+        let r = Rc::clone(reader);
+        RebuildOnChange::new(
+            {
+                let s = s.clone();
+                move || s.chat().streaming
+            },
+            move |_streaming| input_row(&s, &r),
+        )
+    };
+
+    // Fixed-height input row so the composer layout is deterministic:
+    // COMPOSER_H − top(14) − selectors(SELECTOR_H) − gap(12) − bottom(14).
+    let input_h = (COMPOSER_H - 14.0 - SELECTOR_H - 12.0 - 14.0).max(40.0);
+    let body = Stack::vertical()
+        .spacing(12.0)
+        .alignment(Alignment::Stretch)
+        .with_child(SizedBox::new().height(14.0))
+        .with_child(InsetX::new(selector_host, PAD))
+        .with_child(
+            SizedBox::new()
+                .height(input_h)
+                .with_child(InsetX::new(input_host, PAD)),
+        )
+        .with_child(SizedBox::new().height(14.0));
+
+    ComposerSurface::new(shared.clone(), body)
+}
+
+// ---------------------------------------------------------------------------
+// Surfaces — thin painters that fill a chrome surface behind their child.
+// ---------------------------------------------------------------------------
+
+/// Fills the sidebar surface (+ right hairline) behind its child column.
+struct SidebarSurface {
+    shared: Shared,
+    child: WidgetPod,
+}
+
+impl SidebarSurface {
+    fn new<W: Widget + 'static>(shared: Shared, child: W) -> Self {
+        Self {
+            shared,
+            child: WidgetPod::new(child),
         }
     }
 }
 
-fn elide(text: &str, max_chars: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
-        text.to_string()
-    } else {
-        let mut s: String = chars[..max_chars.saturating_sub(1)].iter().collect();
-        s.push('…');
-        s
+impl Widget for SidebarSurface {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints);
+        constraints.max
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let pal = palette(&self.shared);
+        ctx.fill_rect(ctx.bounds(), pal.sidebar);
+        widgets::hairline_right(ctx, ctx.bounds(), pal.border);
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+/// Fills the composer surface (titlebar color + top hairline) behind its child.
+struct ComposerSurface {
+    shared: Shared,
+    child: WidgetPod,
+}
+
+impl ComposerSurface {
+    fn new<W: Widget + 'static>(shared: Shared, child: W) -> Self {
+        Self {
+            shared,
+            child: WidgetPod::new(child),
+        }
+    }
+}
+
+impl Widget for ComposerSurface {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints);
+        constraints.max
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let pal = palette(&self.shared);
+        ctx.fill_rect(ctx.bounds(), pal.titlebar);
+        widgets::hairline_top(ctx, ctx.bounds(), pal.border);
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+/// Fills the window surface behind the whole tab (so the transcript area has a base color).
+struct WindowSurface {
+    shared: Shared,
+    child: WidgetPod,
+}
+
+impl WindowSurface {
+    fn new<W: Widget + 'static>(shared: Shared, child: W) -> Self {
+        Self {
+            shared,
+            child: WidgetPod::new(child),
+        }
+    }
+}
+
+impl Widget for WindowSurface {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints);
+        constraints.max
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let pal = palette(&self.shared);
+        ctx.fill_rect(ctx.bounds(), pal.window);
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Composed pods (wide split / narrow) + responsive host.
+// ---------------------------------------------------------------------------
+
+/// The main column: the transcript fills, with the composer docked at the bottom. The streaming
+/// request-animation-frame pump lives on [`ChatView`] (a reliable ancestor of every control), so no
+/// invisible overlay widget is needed here.
+fn main_column(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    widgets::Dock::new(TranscriptView::new(shared.clone()))
+        .bottom(COMPOSER_H, composer(shared, reader))
+}
+
+fn wide_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let row = Split::left_fixed(
+        sidebar(shared, reader),
+        main_column(shared, reader),
+        SIDEBAR_W,
+    );
+    WidgetPod::new(WindowSurface::new(shared.clone(), row))
+}
+
+fn narrow_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    WidgetPod::new(WindowSurface::new(
+        shared.clone(),
+        main_column(shared, reader),
+    ))
+}
+
+/// The chat tab: a thin responsive host owning two pre-built pods (wide split with sidebar / narrow
+/// transcript-only) and delegating to the one chosen by the available width. The choice is made in
+/// `measure` (constraints-driven) and cached so `arrange`/`paint`/event routing stay in sync.
+/// Mirrors the Settings / Files hosts.
+///
+/// `ChatView` additionally owns the streaming **pump**: it is a reliable ancestor of every control
+/// (the sidebar/composer `RebuildOnChange` hosts and the transcript), and it is reliably on the
+/// event path for the pointer / keyboard gestures that start a turn — so it is the right place to
+/// drive the request-animation-frame loop. (A sibling overlay widget could not: in sui an event
+/// only reaches widgets on the `path_to(target)`, and `RedrawRequested` / external wakes route to
+/// the *root* only, so an off-path overlay would never receive the kick.) While a reply streams (or
+/// there was recent activity) the pump drains the worker each frame, applies events to `ChatState`,
+/// and — when the parts the `RebuildOnChange` hosts key on change — forces a full window relayout so
+/// those hosts rebuild and re-measure (a worker-driven change arrives outside any pointer gesture).
+pub struct ChatView {
+    shared: Shared,
+    wide: WidgetPod,
+    narrow: WidgetPod,
+    use_wide: Cell<bool>,
+    /// Coarse signature of the selection / session / streaming state the inner `RebuildOnChange`
+    /// hosts key on; a change forces a full relayout so they rebuild.
+    last_sig: Cell<u64>,
+    /// Whether an animation frame is currently requested (so we don't stack duplicate requests).
+    pump_alive: Cell<bool>,
+    /// Frames since the last state change; bounds the idle tail so we stop requesting frames.
+    idle_frames: Cell<u32>,
+}
+
+/// Idle-frame budget: once this many frames pass with no state change (and nothing streaming) the
+/// pump stops requesting animation frames, so an idle tab never busy-loops.
+const PUMP_IDLE_BUDGET: u32 = 90;
+
+impl ChatView {
+    pub fn new(shared: Shared) -> Self {
+        let theme_reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let wide = wide_pod(&shared, &theme_reader);
+        let narrow = narrow_pod(&shared, &theme_reader);
+        let last_sig = Cell::new(view_signature(&shared));
+        Self {
+            shared,
+            wide,
+            narrow,
+            use_wide: Cell::new(true),
+            last_sig,
+            pump_alive: Cell::new(false),
+            idle_frames: Cell::new(0),
+        }
+    }
+
+    fn active(&self) -> &WidgetPod {
+        if self.use_wide.get() {
+            &self.wide
+        } else {
+            &self.narrow
+        }
+    }
+
+    fn active_mut(&mut self) -> &mut WidgetPod {
+        if self.use_wide.get() {
+            &mut self.wide
+        } else {
+            &mut self.narrow
+        }
+    }
+
+    /// Ensure the request-animation-frame pump is running (idempotent).
+    fn ensure_pump(&self, ctx: &mut EventCtx) {
+        if !self.pump_alive.get() {
+            ctx.request_animation_frame();
+            self.pump_alive.set(true);
+        }
+        // Any fresh gesture resets the idle tail so a just-dispatched command is drained promptly.
+        self.idle_frames.set(0);
+    }
+
+    /// Force a full window relayout (re-measure + re-arrange + repaint) for this frame.
+    ///
+    /// The streaming worker mutates `ChatState` outside any pointer gesture, and the
+    /// sidebar/composer `RebuildOnChange` hosts only `refresh()` when their `measure()` runs. A
+    /// plain `ctx.request_measure()` here would only invalidate `ChatView`'s own measure path, which
+    /// can short-circuit before reaching those hosts. Targeting the *window* makes sui's
+    /// `build_measure_scope` upgrade the pass to `force_all`, so every pod (including those hosts)
+    /// re-measures and the newly-built option lists / Send<->Spinner swap take effect.
+    fn force_window_relayout(&self, ctx: &mut EventCtx) {
+        use sui::{InvalidationKind, InvalidationRequest, InvalidationTarget};
+        let window = InvalidationTarget::Window(ctx.window_id());
+        ctx.request(InvalidationRequest::new(window, InvalidationKind::Measure));
+        ctx.request(InvalidationRequest::new(window, InvalidationKind::Arrange));
+        ctx.request_paint();
+    }
+
+    /// One pump tick: drain the worker, apply events, and relayout/repaint as needed; keep the loop
+    /// alive while streaming or recently active.
+    fn pump(&self, ctx: &mut EventCtx) {
+        self.pump_alive.set(false);
+        let events = self.shared.chat().handle.drain();
+        let had = !events.is_empty();
+        if had {
+            let mut chat = self.shared.chat_mut();
+            for event in events {
+                chat.apply_event(event);
+            }
+        }
+        let streaming = self.shared.chat().streaming;
+
+        // Recompute the coarse signature each tick: a worker event (RuntimeInfo / Models / TurnDone,
+        // or a token that resolved the selection) may have changed the selector option lists, the
+        // sidebar sessions, or the streaming flag (Send <-> Spinner) — anything the inner
+        // `RebuildOnChange` hosts key on. On a signature change, force a full relayout so those hosts
+        // rebuild; on a bare token (same signature) just repaint the live-reading transcript.
+        let sig = view_signature(&self.shared);
+        let sig_changed = sig != self.last_sig.get();
+        if sig_changed {
+            self.last_sig.set(sig);
+            self.force_window_relayout(ctx);
+        } else if had {
+            ctx.request_paint();
+        }
+
+        if had || sig_changed {
+            self.idle_frames.set(0);
+        } else {
+            self.idle_frames
+                .set(self.idle_frames.get().saturating_add(1));
+        }
+        if streaming || self.idle_frames.get() < PUMP_IDLE_BUDGET {
+            ctx.request_animation_frame();
+            self.pump_alive.set(true);
+        }
+    }
+}
+
+/// A coarse signature of the parts of `ChatState` whose change requires a host relayout (the
+/// session/agent lists, provider/model/effort selection, and the streaming flag — anything the
+/// inner `RebuildOnChange` hosts key on). Cheap to compute each redraw.
+fn view_signature(shared: &Shared) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let chat = shared.chat();
+    let mut h = DefaultHasher::new();
+    chat.provider_idx.hash(&mut h);
+    chat.model_idx.hash(&mut h);
+    chat.effort_idx.hash(&mut h);
+    chat.current_models().len().hash(&mut h);
+    chat.effort_visible().hash(&mut h);
+    chat.streaming.hash(&mut h);
+    chat.models_loading.hash(&mut h);
+    chat.sessions.len().hash(&mut h);
+    for s in &chat.sessions {
+        s.title.hash(&mut h);
+    }
+    chat.info.agent.hash(&mut h);
+    h.finish()
+}
+
+impl Widget for ChatView {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        // The streaming pump: an animation-frame wake drains the worker and relayouts. (The wake
+        // targets `ChatView` because `ChatView` requested it, so it routes here reliably.)
+        if let Event::Wake(sui::WakeEvent::AnimationFrame { .. }) = event {
+            if self.shared.is_ready() {
+                self.pump(ctx);
+            }
+            return;
+        }
+
+        if !self.shared.is_ready() {
+            return;
+        }
+
+        // Any pointer or key activity over the tab is a moment the worker may have pending events:
+        // a turn just started (Send click / Enter submit), a selection changed (sidebar / Select),
+        // or the initial Ready/Models fetch landed in the channel. Make sure the pump is running so
+        // those are drained. (Pointer Move/Enter are plentiful in the live app, so the initial model
+        // fetch is drained promptly without requiring an explicit click.)
+        let pointer_or_key = matches!(event, Event::Pointer(_))
+            || matches!(event, Event::Keyboard(k) if k.state == KeyState::Pressed);
+        if pointer_or_key {
+            self.ensure_pump(ctx);
+        }
+
+        // A pointer release / key press can also have just rebuilt a `RebuildOnChange` host (a
+        // sidebar/Select on-change fired during this gesture); relayout so it re-measures. The
+        // `measure` pass refreshes `last_sig` to the post-change signature, so the next pump tick
+        // does not redundantly relayout for a change this gesture already handled.
+        let commit = matches!(event, Event::Pointer(p) if matches!(p.kind, PointerEventKind::Up))
+            || matches!(event, Event::Keyboard(k) if k.state == KeyState::Pressed);
+        if commit {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let use_wide = constraints.max.width >= WIDE_THRESHOLD;
+        self.use_wide.set(use_wide);
+        self.last_sig.set(view_signature(&self.shared));
+        self.active_mut().measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.active_mut().arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.active().paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(self.active());
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        // CRITICAL: forward to the active pod so pointer / keyboard / focus reach the controls.
+        if self.use_wide.get() {
+            visitor.visit(&mut self.wide);
+        } else {
+            visitor.visit(&mut self.narrow);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RebuildOnChange<K> — rebuild a child subtree when a watched key changes.
+// (Same shape as the Files-tab helper: collection widgets take a fixed item
+// vector at build time, so when the underlying lists change we rebuild rather
+// than bind a reader.)
+// ---------------------------------------------------------------------------
+
+struct RebuildOnChange<K: PartialEq + Clone> {
+    key_fn: Box<dyn Fn() -> K>,
+    build: Box<dyn Fn(&K) -> WidgetPod>,
+    last_key: K,
+    child: WidgetPod,
+}
+
+impl<K: PartialEq + Clone> RebuildOnChange<K> {
+    fn new<KF, BF>(key_fn: KF, build: BF) -> Self
+    where
+        KF: Fn() -> K + 'static,
+        BF: Fn(&K) -> WidgetPod + 'static,
+    {
+        let last_key = key_fn();
+        let child = build(&last_key);
+        Self {
+            key_fn: Box::new(key_fn),
+            build: Box::new(build),
+            last_key,
+            child,
+        }
+    }
+
+    fn refresh(&mut self) -> bool {
+        let key = (self.key_fn)();
+        if key != self.last_key {
+            self.child = (self.build)(&key);
+            self.last_key = key;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        // A pointer release can be the gesture that just changed the watched key (e.g. a `Select`'s
+        // on-change fired during this very gesture). Refresh + relayout immediately so the rebuilt
+        // subtree is measured this frame. (Worker-driven, gesture-less changes are handled by
+        // `ChatView`, which forces a full window relayout — that re-runs our `measure`, which also
+        // refreshes — so we do not depend on the never-delivered `RedrawRequested` here.)
+        let pointer_up = matches!(
+            event,
+            Event::Pointer(p) if matches!(p.kind, PointerEventKind::Up)
+        );
+        if pointer_up && self.refresh() {
+            ctx.request_measure();
+            ctx.request_arrange();
+            ctx.request_paint();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.refresh();
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small layout helpers (Split / PodHost / InsetX) — mirrors the Files tab.
+// ---------------------------------------------------------------------------
+
+/// A horizontal split with one fixed-width pane and one flexible pane, a 1px vertical [`Separator`]
+/// between. Either the left or the right pane may be the fixed one (a plain horizontal `Stack` lets
+/// the first child consume the full width before the fixed pane is measured).
+struct Split {
+    left: WidgetPod,
+    separator: WidgetPod,
+    right: WidgetPod,
+    fixed_width: f32,
+    fixed_is_left: bool,
+}
+
+const SPLIT_SEPARATOR_W: f32 = 1.0;
+
+impl Split {
+    /// Left pane flexible, right pane fixed `right_width`.
+    fn new<L, R>(left: L, right: R, right_width: f32) -> Self
+    where
+        L: Widget + 'static,
+        R: Widget + 'static,
+    {
+        Self {
+            left: WidgetPod::new(left),
+            separator: WidgetPod::new(Separator::vertical()),
+            right: WidgetPod::new(right),
+            fixed_width: right_width.max(0.0),
+            fixed_is_left: false,
+        }
+    }
+
+    /// Left pane fixed `left_width`, right pane flexible.
+    fn left_fixed<L, R>(left: L, right: R, left_width: f32) -> Self
+    where
+        L: Widget + 'static,
+        R: Widget + 'static,
+    {
+        Self {
+            left: WidgetPod::new(left),
+            separator: WidgetPod::new(Separator::vertical()),
+            right: WidgetPod::new(right),
+            fixed_width: left_width.max(0.0),
+            fixed_is_left: true,
+        }
+    }
+
+    /// (left_width, right_width) for a given total width.
+    fn split_widths(&self, total: f32) -> (f32, f32) {
+        let fixed = self.fixed_width.min((total - SPLIT_SEPARATOR_W).max(0.0));
+        let flex = (total - fixed - SPLIT_SEPARATOR_W).max(0.0);
+        if self.fixed_is_left {
+            (fixed, flex)
+        } else {
+            (flex, fixed)
+        }
+    }
+}
+
+impl Widget for Split {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let total = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            self.fixed_width + 320.0 + SPLIT_SEPARATOR_W
+        };
+        let height = constraints.max.height;
+        let (left_w, right_w) = self.split_widths(total);
+        self.left
+            .measure(ctx, Constraints::tight(Size::new(left_w, height)));
+        self.separator.measure(
+            ctx,
+            Constraints::tight(Size::new(SPLIT_SEPARATOR_W, height)),
+        );
+        self.right
+            .measure(ctx, Constraints::tight(Size::new(right_w, height)));
+        Size::new(total, height)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let (left_w, right_w) = self.split_widths(bounds.width());
+        self.left.arrange(
+            ctx,
+            Rect::new(bounds.x(), bounds.y(), left_w, bounds.height()),
+        );
+        self.separator.arrange(
+            ctx,
+            Rect::new(
+                bounds.x() + left_w,
+                bounds.y(),
+                SPLIT_SEPARATOR_W,
+                bounds.height(),
+            ),
+        );
+        self.right.arrange(
+            ctx,
+            Rect::new(
+                bounds.x() + left_w + SPLIT_SEPARATOR_W,
+                bounds.y(),
+                right_w,
+                bounds.height(),
+            ),
+        );
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.left.paint(ctx);
+        self.separator.paint(ctx);
+        self.right.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.left);
+        visitor.visit(&self.separator);
+        visitor.visit(&self.right);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.left);
+        visitor.visit(&mut self.separator);
+        visitor.visit(&mut self.right);
+    }
+}
+
+/// A container that hosts a pre-built [`WidgetPod`] (so a branch-chosen subtree can still be a
+/// single widget). Delegates everything to the pod. (Same as the Settings helper.)
+struct PodHost {
+    child: WidgetPod,
+}
+
+impl PodHost {
+    fn new(child: WidgetPod) -> Self {
+        Self { child }
+    }
+}
+
+impl Widget for PodHost {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+/// Insets a single child horizontally by `pad` on each side (the vertical axis is left to the
+/// caller). Keeps content off the panel edges without pulling in the container `Padding` widget.
+struct InsetX {
+    child: WidgetPod,
+    pad: f32,
+}
+
+impl InsetX {
+    fn new<W>(child: W, pad: f32) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            child: WidgetPod::new(child),
+            pad: pad.max(0.0),
+        }
+    }
+}
+
+impl Widget for InsetX {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let inner_max = Size::new(
+            (constraints.max.width - self.pad * 2.0).max(0.0),
+            constraints.max.height,
+        );
+        let inner = Constraints::new(Size::ZERO, inner_max);
+        let child = self.child.measure(ctx, inner);
+        Size::new(child.width + self.pad * 2.0, child.height)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let inner = Rect::new(
+            bounds.x() + self.pad,
+            bounds.y(),
+            (bounds.width() - self.pad * 2.0).max(0.0),
+            bounds.height(),
+        );
+        self.child.arrange(ctx, inner);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
     }
 }
 
 /// Build the chat tab content.
 pub fn view(shared: Shared) -> impl Widget {
     ChatView::new(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::Backend;
+
+    #[test]
+    fn submit_pushes_user_and_agent_placeholder_and_sets_streaming() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.set_draft("hello there".to_string());
+        state.submit();
+        assert!(state.streaming, "submitting begins a streaming turn");
+        assert_eq!(state.messages.len(), 2, "user message + agent placeholder");
+        assert_eq!(state.messages[0].role, ChatRole::User);
+        assert_eq!(state.messages[0].text, "hello there");
+        assert_eq!(state.messages[1].role, ChatRole::Agent);
+        assert!(
+            state.messages[1].text.is_empty(),
+            "agent placeholder is blank"
+        );
+        assert!(state.input.is_empty(), "the draft is cleared on submit");
+    }
+
+    #[test]
+    fn empty_or_streaming_submit_is_a_noop() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        // Empty draft → nothing happens.
+        state.submit();
+        assert!(!state.streaming);
+        assert!(state.messages.is_empty());
+        // While streaming, a submit is ignored.
+        state.set_draft("queued".to_string());
+        state.streaming = true;
+        state.submit();
+        assert!(
+            state.messages.is_empty(),
+            "a submit while streaming is ignored"
+        );
+        assert_eq!(state.input, "queued", "the draft is preserved");
+    }
+
+    #[test]
+    fn streamed_tokens_append_to_the_last_agent_message() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.set_draft("hi".to_string());
+        state.submit();
+        // Tokens append to the trailing (empty) agent placeholder rather than pushing new bubbles.
+        state.apply_event(ChatEvent::Token("Hel".to_string()));
+        state.apply_event(ChatEvent::Token("lo".to_string()));
+        assert_eq!(state.messages.len(), 2, "tokens append, not push");
+        assert_eq!(state.messages[1].text, "Hello");
+        // TurnDone clears streaming and the notice.
+        state.apply_event(ChatEvent::TurnDone);
+        assert!(!state.streaming, "TurnDone ends the stream");
+        assert!(state.notice.is_none());
+    }
+
+    #[test]
+    fn can_send_requires_nonempty_draft_and_not_streaming() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        assert!(!state.can_send(), "empty draft cannot send");
+        state.set_draft("ok".to_string());
+        assert!(state.can_send(), "a non-empty draft can send");
+        state.streaming = true;
+        assert!(!state.can_send(), "cannot send while streaming");
+    }
+
+    #[test]
+    fn set_provider_resets_model_index() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        if state.providers.len() < 2 {
+            return; // environment without multiple configured providers
+        }
+        state.model_idx = 3;
+        state.set_provider(1);
+        assert_eq!(state.provider_idx, 1);
+        assert_eq!(state.model_idx, 0, "switching providers resets the model");
+    }
+
+    /// Issue 2: the default/initial provider's model list must be fetched eagerly at construction —
+    /// without waiting for the user to toggle providers — so the model picker is never stuck on
+    /// "No models". `cluster_provider_summaries` always seeds providers with empty model lists, so
+    /// when there is a default provider, `ChatState::new` must have kicked the async fetch
+    /// (`models_loading` set; the result lands later via `ChatEvent::Models`).
+    #[test]
+    fn new_fetches_default_provider_models() {
+        let backend = Backend::local_fallback();
+        let state = ChatState::new(&backend);
+        if state.providers.is_empty() {
+            // No configured provider → nothing to fetch (correctly a no-op).
+            assert!(!state.models_loading);
+            return;
+        }
+        assert!(
+            state
+                .current_provider()
+                .is_some_and(|p| p.models.is_empty()),
+            "providers are seeded with empty model lists (fetched on demand)"
+        );
+        assert!(
+            state.models_loading,
+            "the default provider's model fetch is kicked at construction"
+        );
+    }
+
+    /// The runtime resolving a provider (Ready / RuntimeInfo) must also trigger a model fetch for
+    /// the newly-resolved provider when its list is still empty, so the picker populates even if the
+    /// worker reports a provider other than index 0.
+    #[test]
+    fn runtime_info_triggers_model_fetch_for_resolved_provider() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        let Some(provider_id) = state.providers.first().map(|p| p.id.clone()) else {
+            return; // no configured provider in this environment
+        };
+        // Pretend the initial fetch already completed (so we can observe a fresh one being kicked).
+        state.models_loading = false;
+        state.apply_event(ChatEvent::RuntimeInfo(RuntimeInfo {
+            agent: "main".to_string(),
+            provider: provider_id,
+            model: String::new(),
+            account: None,
+            effort: None,
+        }));
+        assert!(
+            state.models_loading,
+            "resolving the provider via RuntimeInfo re-kicks the model fetch when the list is empty"
+        );
+    }
+
+    /// Issue 1: Enter-to-send. The composer wires `TextArea::on_submit` to `ChatState::submit`, so a
+    /// plain Enter starts a turn. `submit()` is the exact entry point that wiring calls; assert it
+    /// begins a streaming turn from a non-empty draft (and is a no-op otherwise — covered above).
+    #[test]
+    fn submit_is_the_enter_to_send_entry_point() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.set_draft("ping".to_string());
+        assert!(state.can_send(), "a non-empty draft is sendable on Enter");
+        // What `on_submit(|_| s.chat_mut().submit())` runs:
+        state.submit();
+        assert!(state.streaming, "Enter-to-send starts a streaming turn");
+        assert_eq!(
+            state.messages.first().map(|m| m.text.as_str()),
+            Some("ping")
+        );
+        assert!(state.input.is_empty(), "the draft is cleared after sending");
+    }
 }

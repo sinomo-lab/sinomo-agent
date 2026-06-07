@@ -2,8 +2,8 @@
 
 use sui::{ArrangeCtx, prelude::Padding};
 use sui::{
-    Color, Constraints, MeasureCtx, PaintCtx, Path, Point, Rect, SingleChild, Size, TextStyle,
-    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    Color, Constraints, IconGlyph, MeasureCtx, PaintCtx, Path, Point, Rect, SingleChild, Size,
+    TextStyle, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
 use crate::state::Shared;
@@ -134,10 +134,12 @@ impl Widget for Dock {
     }
 }
 
-/// A centered empty-state panel (icon mark, title, subtitle).
+/// A centered empty-state panel (icon mark, title, subtitle). The mark is a real Lucide
+/// [`IconGlyph`] when one is supplied via [`Placeholder::glyph`], otherwise a text rune.
 pub struct Placeholder {
     shared: Shared,
     mark: String,
+    glyph: Option<IconGlyph>,
     title: String,
     subtitle: String,
 }
@@ -152,9 +154,16 @@ impl Placeholder {
         Self {
             shared,
             mark: mark.into(),
+            glyph: None,
             title: title.into(),
             subtitle: subtitle.into(),
         }
+    }
+
+    /// Use a real Lucide icon as the centered mark instead of the text rune.
+    pub fn glyph(mut self, glyph: IconGlyph) -> Self {
+        self.glyph = Some(glyph);
+        self
     }
 }
 
@@ -172,8 +181,22 @@ impl Widget for Placeholder {
         let cx = bounds.x() + bounds.width() / 2.0;
         let cy = bounds.y() + bounds.height() / 2.0;
 
-        let mark_style = pal.text_style(&theme, 40.0, sui::FontWeight::BOLD, pal.text_faint);
-        draw_centered(ctx, &self.mark, mark_style, cx, cy - 46.0);
+        match self.glyph {
+            Some(glyph) => {
+                let side = 40.0;
+                draw_glyph(
+                    ctx,
+                    glyph,
+                    Rect::new(cx - side / 2.0, cy - 46.0 - side / 2.0, side, side),
+                    pal.text_faint,
+                );
+            }
+            None => {
+                let mark_style =
+                    pal.text_style(&theme, 40.0, sui::FontWeight::BOLD, pal.text_faint);
+                draw_centered(ctx, &self.mark, mark_style, cx, cy - 46.0);
+            }
+        }
 
         let title_style = pal.text_style(&theme, 18.0, sui::FontWeight::SEMIBOLD, pal.text_muted);
         draw_centered(ctx, &self.title, title_style, cx, cy + 4.0);
