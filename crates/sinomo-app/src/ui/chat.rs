@@ -500,7 +500,10 @@ impl ChatView {
                     }
                 }
                 1 => {
-                    let len = state.current_provider().map(|p| p.models.len()).unwrap_or(0);
+                    let len = state
+                        .current_provider()
+                        .map(|p| p.models.len())
+                        .unwrap_or(0);
                     if index < len {
                         state.model_idx = index;
                     }
@@ -1178,7 +1181,12 @@ impl ChatView {
             let caret = pal.text_style(theme, 9.0, FontWeight::SEMIBOLD, pal.text_muted);
             widgets::draw_text_in(
                 ctx,
-                Rect::new(rect.x() + rect.width() - 18.0, rect.y(), 14.0, rect.height()),
+                Rect::new(
+                    rect.x() + rect.width() - 18.0,
+                    rect.y(),
+                    14.0,
+                    rect.height(),
+                ),
                 "▾",
                 caret,
             );
@@ -1333,7 +1341,11 @@ impl ChatView {
             } else if hovered {
                 widgets::fill_round_rect(ctx, *rect, pal.hover, 7.0);
             }
-            let color = if is_selected { pal.text } else { pal.text_muted };
+            let color = if is_selected {
+                pal.text
+            } else {
+                pal.text_muted
+            };
             let style = sui::TextStyle {
                 color,
                 ..item_style.clone()
@@ -1353,7 +1365,12 @@ impl ChatView {
                 let check = pal.text_style(theme, 11.5, FontWeight::SEMIBOLD, pal.accent);
                 widgets::draw_text_in(
                     ctx,
-                    Rect::new(rect.x() + rect.width() - 20.0, rect.y(), 14.0, rect.height()),
+                    Rect::new(
+                        rect.x() + rect.width() - 20.0,
+                        rect.y(),
+                        14.0,
+                        rect.height(),
+                    ),
                     "✓",
                     check,
                 );

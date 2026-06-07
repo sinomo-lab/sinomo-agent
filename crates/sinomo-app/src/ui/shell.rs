@@ -313,12 +313,7 @@ impl Shell {
         let th = measurement.as_ref().map(|m| m.height).unwrap_or(20.0);
         let tx = self.body_rect.x() + (self.body_rect.width() - tw) / 2.0;
         let ty = self.body_rect.y() + (self.body_rect.height() - th) / 2.0;
-        widgets::draw_text_in(
-            ctx,
-            Rect::new(tx, ty, tw + 4.0, th + 4.0),
-            &status,
-            style,
-        );
+        widgets::draw_text_in(ctx, Rect::new(tx, ty, tw + 4.0, th + 4.0), &status, style);
     }
 
     fn paint_status_pill(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {

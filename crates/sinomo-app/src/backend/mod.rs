@@ -203,7 +203,10 @@ impl Backend {
                         } else {
                             "local"
                         };
-                        format!("Connected to {kind} daemon at {} (mobile node)", status.address)
+                        format!(
+                            "Connected to {kind} daemon at {} (mobile node)",
+                            status.address
+                        )
                     }
                 }
             }
@@ -227,7 +230,10 @@ fn build_config_client(
     data_dir: &Arc<SinomoDataDir>,
 ) -> Arc<dyn ConfigClient> {
     match connection.daemon_address() {
-        Some(address) => Arc::new(RemoteConfigClient::new(address.to_string(), DAEMON_RPC_TIMEOUT)),
+        Some(address) => Arc::new(RemoteConfigClient::new(
+            address.to_string(),
+            DAEMON_RPC_TIMEOUT,
+        )),
         None => {
             let store = config::build_config_store()
                 .map(Arc::new)

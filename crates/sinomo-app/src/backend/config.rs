@@ -258,7 +258,9 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
                 enabled: account.map(|a| a.enabled).unwrap_or(false),
                 supports_reasoning: model_supports_reasoning_effort(provider, &default_model),
                 default_model,
-                api_base_url: account.and_then(|a| a.api_base_url.clone()).unwrap_or_default(),
+                api_base_url: account
+                    .and_then(|a| a.api_base_url.clone())
+                    .unwrap_or_default(),
                 reasoning_effort: account
                     .and_then(|a| a.options.reasoning_effort)
                     .map(|e| e.as_config_value().to_string()),

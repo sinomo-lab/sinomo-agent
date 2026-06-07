@@ -20,8 +20,8 @@ use sinomo_runtime::config::ConfigClient;
 use crate::backend::Backend;
 use crate::backend::config::{
     ConfigEditKind, ConfigItem, ProviderForm, cycle_provider_reasoning_effort, provider_forms,
-    resolve_items, run_provider_device_login, set_bool, set_provider_api_key, set_provider_base_url,
-    set_provider_enabled, set_provider_model, set_value,
+    resolve_items, run_provider_device_login, set_bool, set_provider_api_key,
+    set_provider_base_url, set_provider_enabled, set_provider_model, set_value,
 };
 use crate::state::Shared;
 use crate::theme::{AppThemeMode, Palette};
@@ -653,7 +653,9 @@ impl Widget for SettingsView {
                                 self.shared.settings_mut().toggle_provider(i);
                             }
                             Hit::ProviderEdit(i, field) => {
-                                self.shared.settings_mut().begin_provider_field_edit(i, field);
+                                self.shared
+                                    .settings_mut()
+                                    .begin_provider_field_edit(i, field);
                                 ctx.request_focus();
                             }
                             Hit::ProviderEffort(i) => {
@@ -765,7 +767,13 @@ impl SettingsView {
     }
 
     /// Narrow layout: the full-width menu of sections (title + value + chevron).
-    fn paint_menu(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette, bounds: Rect) {
+    fn paint_menu(
+        &self,
+        ctx: &mut PaintCtx,
+        theme: &sui::DefaultTheme,
+        pal: &Palette,
+        bounds: Rect,
+    ) {
         self.viewport_height.set(bounds.height());
         let card_w = CARD_W.min(bounds.width() - PAD * 2.0).max(0.0);
         let x = bounds.x() + (bounds.width() - card_w) / 2.0;
@@ -776,7 +784,12 @@ impl SettingsView {
         let mut y = bounds.y() + PAD - scroll;
 
         let title_style = pal.text_style(theme, 22.0, FontWeight::BOLD, pal.text);
-        widgets::draw_text_in(ctx, Rect::new(x + 4.0, y, card_w, 30.0), "Settings", title_style);
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(x + 4.0, y, card_w, 30.0),
+            "Settings",
+            title_style,
+        );
         y += 44.0;
 
         let h = SettingsSection::ALL.len() as f32 * MENU_ROW_H;
@@ -864,7 +877,12 @@ impl SettingsView {
                 .unwrap_or(0.0);
             widgets::draw_text_in(
                 ctx,
-                Rect::new(bar.x() + (bar.width() - tw) / 2.0, bar.y(), tw + 4.0, header_h),
+                Rect::new(
+                    bar.x() + (bar.width() - tw) / 2.0,
+                    bar.y(),
+                    tw + 4.0,
+                    header_h,
+                ),
                 section.title(),
                 title_style,
             );
@@ -1296,7 +1314,11 @@ impl SettingsView {
                 widgets::round_panel(ctx, track, pal.field, pal.border, track_h / 2.0);
             }
             let knob = track_h - 6.0;
-            let kx = if on { tx + track_w - knob - 3.0 } else { tx + 3.0 };
+            let kx = if on {
+                tx + track_w - knob - 3.0
+            } else {
+                tx + 3.0
+            };
             widgets::fill_round_rect(
                 ctx,
                 Rect::new(kx, ty + 3.0, knob, knob),
@@ -1311,8 +1333,19 @@ impl SettingsView {
             let mut row_y = cy + ROW_H;
             if form.uses_device_login {
                 self.provider_auth_row(
-                    ctx, pal, x, row_y, w, field_w, &label_style, &value_style, &chip_style,
-                    &tag_style, index, form, device_login,
+                    ctx,
+                    pal,
+                    x,
+                    row_y,
+                    w,
+                    field_w,
+                    &label_style,
+                    &value_style,
+                    &chip_style,
+                    &tag_style,
+                    index,
+                    form,
+                    device_login,
                 );
             } else {
                 let api_key_value = if form.has_api_key {
@@ -1321,19 +1354,58 @@ impl SettingsView {
                     "Not set"
                 };
                 self.provider_field_row(
-                    ctx, pal, x, row_y, w, field_w, "API key", &label_style, api_key_value,
-                    &value_style, &edit_style, index, &form.provider, ProviderField::ApiKey, editing,
+                    ctx,
+                    pal,
+                    x,
+                    row_y,
+                    w,
+                    field_w,
+                    "API key",
+                    &label_style,
+                    api_key_value,
+                    &value_style,
+                    &edit_style,
+                    index,
+                    &form.provider,
+                    ProviderField::ApiKey,
+                    editing,
                 );
             }
             row_y += ROW_H;
             self.provider_field_row(
-                ctx, pal, x, row_y, w, field_w, "Default model", &label_style, &form.default_model,
-                &value_style, &edit_style, index, &form.provider, ProviderField::Model, editing,
+                ctx,
+                pal,
+                x,
+                row_y,
+                w,
+                field_w,
+                "Default model",
+                &label_style,
+                &form.default_model,
+                &value_style,
+                &edit_style,
+                index,
+                &form.provider,
+                ProviderField::Model,
+                editing,
             );
             row_y += ROW_H;
             self.provider_field_row(
-                ctx, pal, x, row_y, w, field_w, "API base URL", &label_style, &form.api_base_url,
-                &value_style, &edit_style, index, &form.provider, ProviderField::BaseUrl, editing,
+                ctx,
+                pal,
+                x,
+                row_y,
+                w,
+                field_w,
+                "API base URL",
+                &label_style,
+                &form.api_base_url,
+                &value_style,
+                &edit_style,
+                index,
+                &form.provider,
+                ProviderField::BaseUrl,
+                editing,
             );
             row_y += ROW_H;
 
@@ -1616,7 +1688,10 @@ mod tests {
             return;
         };
         state.begin_config_edit(idx);
-        assert!(state.editing.is_some(), "begin_edit opens the inline editor");
+        assert!(
+            state.editing.is_some(),
+            "begin_edit opens the inline editor"
+        );
         let before = state.editing.as_ref().unwrap().draft.len();
 
         let outcome = state.edit_key(&press("X", Some("X")));
@@ -1624,7 +1699,11 @@ mod tests {
         let edit = state.editing.as_ref().expect("still editing");
         assert_eq!(edit.draft.len(), before + 1);
         assert!(edit.draft.contains('X'));
-        assert_eq!(edit.cursor, edit.draft.len(), "cursor advances with the insert");
+        assert_eq!(
+            edit.cursor,
+            edit.draft.len(),
+            "cursor advances with the insert"
+        );
     }
 
     #[test]
@@ -1679,7 +1758,10 @@ mod tests {
         let edit = state.editing.as_ref().expect("provider editor open");
         assert!(edit.targets_provider(&provider, ProviderField::ApiKey));
         assert!(!edit.targets_provider(&provider, ProviderField::Model));
-        assert!(edit.draft.is_empty(), "API key starts blank, never surfaced");
+        assert!(
+            edit.draft.is_empty(),
+            "API key starts blank, never surfaced"
+        );
 
         let outcome = state.edit_key(&press("k", Some("k")));
         assert!(matches!(outcome, EditOutcome::Continue));

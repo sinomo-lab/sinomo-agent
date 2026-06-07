@@ -194,8 +194,8 @@ fn worker(
                 thread::Builder::new()
                     .name("sinomo-models".to_string())
                     .spawn(move || {
-                        let models = sinomo_lm::provider_available_model_ids(&provider)
-                            .unwrap_or_default();
+                        let models =
+                            sinomo_lm::provider_available_model_ids(&provider).unwrap_or_default();
                         let _ = tx.send(ChatEvent::Models { provider, models });
                     })
                     .ok();

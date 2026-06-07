@@ -64,7 +64,12 @@ fn capture_settings_responsive() {
         let shot = window.capture_screenshot().expect("capture screenshot");
         let path = dir.join(format!("sinomo-app-{name}.png"));
         shot.write_png(&path).expect("write png");
-        println!("wrote {} ({}x{})", path.display(), shot.width(), shot.height());
+        println!(
+            "wrote {} ({}x{})",
+            path.display(),
+            shot.width(),
+            shot.height()
+        );
     };
 
     // Wide: master/detail — the section menu stays pinned as a sidebar.
@@ -222,7 +227,9 @@ fn capture_providers_device_login() {
     app.run_until_idle().expect("settle providers layout");
     window
         .root()
-        .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(1280.0, 1660.0))))
+        .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+            1280.0, 1660.0,
+        ))))
         .expect("resize tall");
     app.run_until_idle().expect("settle tall layout");
 

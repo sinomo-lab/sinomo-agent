@@ -139,7 +139,11 @@ pub fn provider_signed_in(provider: &str) -> bool {
         "github-copilot" => github_copilot_provider().ok().map(|(_, path)| path),
         _ => None,
     };
-    path.is_some_and(|path| std::fs::metadata(&path).map(|meta| meta.len() > 0).unwrap_or(false))
+    path.is_some_and(|path| {
+        std::fs::metadata(&path)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false)
+    })
 }
 
 /// Run a provider's OAuth device-login flow: start it (calling `on_prompt` with the URL + user
