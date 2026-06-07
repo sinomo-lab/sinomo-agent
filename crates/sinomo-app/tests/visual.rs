@@ -53,6 +53,48 @@ fn capture_tabs() {
     }
 }
 
+#[test]
+fn capture_settings_responsive() {
+    use sui::{Event, Size, WindowEvent};
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let capture = |name: &str, window: &sui_testing::TestWindow| {
+        let shot = window.capture_screenshot().expect("capture screenshot");
+        let path = dir.join(format!("sinomo-app-{name}.png"));
+        shot.write_png(&path).expect("write png");
+        println!("wrote {} ({}x{})", path.display(), shot.width(), shot.height());
+    };
+
+    // Wide: master/detail — the section menu stays pinned as a sidebar.
+    {
+        let runtime = build_runtime(boot(Tab::Settings)).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        capture("settings-wide", &window);
+    }
+
+    // Narrow: collapses to a single drill-down column.
+    {
+        let runtime = build_runtime(boot(Tab::Settings)).expect("build runtime");
+        let app = TestApp::from_runtime(runtime).expect("headless test app");
+        let window = app.main_window().expect("main window");
+        let root = window.root();
+
+        // Settle the initial (wide) frame before resizing so the resize re-measures cleanly.
+        app.run_until_idle().expect("settle initial layout");
+        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(520.0, 720.0))))
+            .expect("resize narrow");
+        app.run_until_idle().expect("settle narrow layout");
+        capture("settings-narrow-menu", &window);
+
+        // Drill into the "Connection" row → detail page with a back affordance.
+        click_at(&root, 260.0, 206.0);
+        capture("settings-narrow-detail", &window);
+    }
+}
+
 fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     use sui::{Event, Point, PointerButton, PointerEvent, PointerEventKind};
     let pos = Point::new(x, y);
@@ -116,6 +158,147 @@ fn capture_typing() {
 
     let shot = window.capture_screenshot().expect("capture screenshot");
     let path = dir.join("sinomo-app-typing.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
+
+#[test]
+fn capture_chat_dropdown() {
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let runtime = build_runtime(boot(Tab::Sinomo)).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle initial layout");
+
+    // Click the provider selector chip to open its dropdown menu.
+    click_at(&root, 300.0, 615.0);
+
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-chat-dropdown.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
+
+/// The Providers settings section: per-provider cards (enabled toggle, API key, default model,
+/// base URL, reasoning effort).
+#[test]
+fn capture_providers_settings() {
+    use sinomo_app::ui::settings::SettingsSection;
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let shared = boot(Tab::Settings);
+    shared.settings_mut().selected = Some(SettingsSection::Providers);
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle providers layout");
+
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-settings-providers.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
+
+/// The device-login providers (codex / github-copilot): captured in a tall window so the
+/// Authentication row (status + Sign-in button) is visible, not just the API-key providers.
+#[test]
+fn capture_providers_device_login() {
+    use sinomo_app::ui::settings::SettingsSection;
+    use sui::{Event, Size, WindowEvent};
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let shared = boot(Tab::Settings);
+    shared.settings_mut().selected = Some(SettingsSection::Providers);
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle providers layout");
+    window
+        .root()
+        .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(1280.0, 1660.0))))
+        .expect("resize tall");
+    app.run_until_idle().expect("settle tall layout");
+
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-providers-devicelogin.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
+
+/// The Advanced settings section: the generic, type-aware editor listing every `sinomo-config`
+/// key (bool → toggle, others → click-to-edit value).
+#[test]
+fn capture_advanced_settings() {
+    use sinomo_app::ui::settings::SettingsSection;
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    let shared = boot(Tab::Settings);
+    shared.settings_mut().selected = Some(SettingsSection::Configuration);
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle advanced layout");
+
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-settings-advanced.png");
+    shot.write_png(&path).expect("write png");
+    println!("wrote {}", path.display());
+}
+
+/// The non-blocking launch: the window opens in a *connecting* state (loading screen), then a
+/// background thread's external wake transitions it to the interactive tabs. Asserts the wake
+/// mechanism actually drives the UI to ready — not just a screenshot dump.
+#[test]
+fn capture_connecting_then_ready() {
+    use sinomo_app::backend::Backend;
+    use sinomo_app::state::{AppState, ConnectEvent, Shared};
+    use sui::{CustomEvent, Event};
+
+    let dir = shots_dir();
+    std::fs::create_dir_all(&dir).expect("create shots dir");
+
+    // Launch in the connecting phase: no backend yet, a live status line on a loading screen.
+    let shared = Shared::new(AppState::connecting());
+    shared.borrow_mut().status = "Starting a local daemon…".to_string();
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle connecting layout");
+    assert!(!shared.is_ready(), "app starts in the connecting phase");
+    {
+        let shot = window.capture_screenshot().expect("capture screenshot");
+        let path = dir.join("sinomo-app-connecting.png");
+        shot.write_png(&path).expect("write png");
+        println!("wrote {}", path.display());
+    }
+
+    // The backend arrives: queue the Connected event and deliver the external wake the connect
+    // thread would send. The shell drains it, builds the tabs, and becomes interactive.
+    let (tx, rx) = std::sync::mpsc::channel();
+    shared.borrow_mut().connect_rx = Some(rx);
+    tx.send(ConnectEvent::Connected(Box::new(Backend::local_fallback())))
+        .expect("queue connected");
+    window
+        .root()
+        .dispatch_event(Event::Custom(CustomEvent::new(sui::EXTERNAL_WAKE_KIND)))
+        .expect("dispatch external wake");
+    app.run_until_idle().expect("settle ready layout");
+
+    assert!(
+        shared.is_ready(),
+        "the external wake should drain the connect channel and make the app ready"
+    );
+    let shot = window.capture_screenshot().expect("capture screenshot");
+    let path = dir.join("sinomo-app-connected.png");
     shot.write_png(&path).expect("write png");
     println!("wrote {}", path.display());
 }

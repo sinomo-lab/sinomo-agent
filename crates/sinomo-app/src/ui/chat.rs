@@ -13,9 +13,7 @@ use sui::{
     PaintCtx, Point, PointerButton, PointerEventKind, Rect, ScrollDelta, Size, Widget,
 };
 
-use sinomo_cli::app_api::{
-    AgentSummary, ProviderSummary, agent_summaries, provider_summaries, reasoning_efforts,
-};
+use sinomo_cli::app_api::{AgentSummary, ProviderSummary, agent_summaries, reasoning_efforts};
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
@@ -63,6 +61,8 @@ pub struct ChatState {
     pub provider_idx: usize,
     pub model_idx: usize,
     pub effort_idx: usize,
+    /// True while a provider's model list is being fetched from sinomo-lm.
+    pub models_loading: bool,
     pub sessions: Vec<SessionRef>,
 }
 
@@ -72,7 +72,7 @@ impl ChatState {
         let handle = ChatHandle::spawn((*backend.data_dir).clone(), daemon_connected);
 
         let agents = agent_summaries(&backend.data_dir);
-        let providers = provider_summaries();
+        let providers = crate::backend::config::cluster_provider_summaries(backend.config.as_ref());
         let efforts = reasoning_efforts();
         let effort_idx = efforts.iter().position(|e| e == "medium").unwrap_or(0);
         let sessions = sessions::list(&backend.data_dir)
@@ -102,6 +102,7 @@ impl ChatState {
             provider_idx: 0,
             model_idx: 0,
             effort_idx,
+            models_loading: false,
             sessions,
         }
     }
@@ -246,6 +247,20 @@ impl ChatState {
                 self.notice = None;
                 self.scroll = 0.0;
             }
+            ChatEvent::Models { provider, models } => {
+                if let Some(idx) = self.providers.iter().position(|p| p.id == provider) {
+                    self.providers[idx].models = models;
+                    // Re-align the model index to the current model if it's in the list.
+                    if idx == self.provider_idx {
+                        self.model_idx = self.providers[idx]
+                            .models
+                            .iter()
+                            .position(|m| *m == self.info.model)
+                            .unwrap_or(0);
+                    }
+                }
+                self.models_loading = false;
+            }
             ChatEvent::Error(error) => {
                 self.streaming = false;
                 self.messages.push(ChatMessage {
@@ -308,7 +323,10 @@ enum Hit {
     Agent(usize),
     NewChat,
     Session(usize),
+    /// One of the three composer selectors (0 = provider, 1 = model, 2 = effort).
     Selector(usize),
+    /// An item inside the currently-open selector dropdown.
+    MenuItem(usize),
     Send,
     Input,
 }
@@ -321,6 +339,12 @@ pub struct ChatView {
     input_rect: Rect,
     send_rect: Rect,
     selector_rects: [Rect; 3],
+    /// Which selector's dropdown is open (`None` = closed), and its painted geometry.
+    open_menu: Option<usize>,
+    menu_rect: Rect,
+    menu_item_rects: Vec<Rect>,
+    /// Whether the reasoning-effort selector is shown (only for models that support it).
+    effort_visible: bool,
     newchat_rect: Rect,
     agent_rects: Vec<Rect>,
     session_rects: Vec<Rect>,
@@ -342,6 +366,10 @@ impl ChatView {
             input_rect: Rect::ZERO,
             send_rect: Rect::ZERO,
             selector_rects: [Rect::ZERO; 3],
+            open_menu: None,
+            menu_rect: Rect::ZERO,
+            menu_item_rects: Vec::new(),
+            effort_visible: true,
             newchat_rect: Rect::ZERO,
             agent_rects: Vec::new(),
             session_rects: Vec::new(),
@@ -368,6 +396,14 @@ impl ChatView {
     }
 
     fn hit_test(&self, p: Point) -> Option<Hit> {
+        // An open dropdown floats above everything, so its items take precedence.
+        if self.open_menu.is_some() {
+            for (i, rect) in self.menu_item_rects.iter().enumerate() {
+                if rect.contains(p) {
+                    return Some(Hit::MenuItem(i));
+                }
+            }
+        }
         if self.send_rect.contains(p) {
             return Some(Hit::Send);
         }
@@ -396,6 +432,29 @@ impl ChatView {
     }
 
     fn handle_click(&mut self, hit: Hit, ctx: &mut EventCtx) {
+        match hit {
+            Hit::Selector(which) => {
+                // Toggle this selector's dropdown (clicking the open one closes it).
+                let opening = self.open_menu != Some(which);
+                self.open_menu = if opening { Some(which) } else { None };
+                // Lazily fetch the model list the first time the model menu is opened.
+                if opening && which == 1 {
+                    self.maybe_fetch_models();
+                }
+                ctx.request_arrange();
+                ctx.request_paint();
+                self.ensure_pump(ctx);
+                return;
+            }
+            Hit::MenuItem(index) => {
+                if let Some(which) = self.open_menu {
+                    self.apply_selector_choice(which, index, ctx);
+                }
+                return;
+            }
+            _ => {}
+        }
+
         {
             let mut state = self.shared.chat_mut();
             match hit {
@@ -419,49 +478,79 @@ impl ChatView {
                 Hit::Session(i) => {
                     state.open_session(i);
                 }
-                Hit::Selector(which) => {
-                    match which {
-                        0 => {
-                            if !state.providers.is_empty() {
-                                state.provider_idx =
-                                    (state.provider_idx + 1) % state.providers.len();
-                                state.model_idx = 0;
-                            }
-                        }
-                        1 => {
-                            let len = state
-                                .current_provider()
-                                .map(|p| p.models.len())
-                                .unwrap_or(0);
-                            if len > 0 {
-                                state.model_idx = (state.model_idx + 1) % len;
-                            }
-                        }
-                        _ => {
-                            if !state.efforts.is_empty() {
-                                state.effort_idx = (state.effort_idx + 1) % state.efforts.len();
-                            }
-                        }
-                    }
-                    let provider = state
-                        .current_provider()
-                        .map(|p| p.id.clone())
-                        .unwrap_or_default();
-                    let model = state.current_model();
-                    if !provider.is_empty() {
-                        state.handle.send_command(ChatCommand::SetModel {
-                            provider,
-                            model,
-                            account: "default".to_string(),
-                        });
-                    }
-                }
+                Hit::Selector(_) | Hit::MenuItem(_) => {}
             }
         }
         ctx.request_measure();
         ctx.request_arrange();
         ctx.request_paint();
         self.ensure_pump(ctx);
+    }
+
+    /// Apply a dropdown choice: set the selected index, push the new provider/model to
+    /// the chat worker, and close the menu. (`which`: 0 = provider, 1 = model, 2 = effort.)
+    fn apply_selector_choice(&mut self, which: usize, index: usize, ctx: &mut EventCtx) {
+        {
+            let mut state = self.shared.chat_mut();
+            match which {
+                0 => {
+                    if index < state.providers.len() {
+                        state.provider_idx = index;
+                        state.model_idx = 0;
+                    }
+                }
+                1 => {
+                    let len = state.current_provider().map(|p| p.models.len()).unwrap_or(0);
+                    if index < len {
+                        state.model_idx = index;
+                    }
+                }
+                _ => {
+                    if index < state.efforts.len() {
+                        state.effort_idx = index;
+                    }
+                }
+            }
+            let provider = state
+                .current_provider()
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+            let model = state.current_model();
+            if !provider.is_empty() {
+                state.handle.send_command(ChatCommand::SetModel {
+                    provider,
+                    model,
+                    account: "default".to_string(),
+                });
+            }
+        }
+        self.open_menu = None;
+        ctx.request_measure();
+        ctx.request_arrange();
+        ctx.request_paint();
+        self.ensure_pump(ctx);
+    }
+
+    /// Ask the worker to fetch the current provider's models from sinomo-lm, unless they
+    /// are already loaded or a fetch is in flight. Results arrive via `ChatEvent::Models`.
+    fn maybe_fetch_models(&mut self) {
+        let mut state = self.shared.chat_mut();
+        if state.models_loading {
+            return;
+        }
+        let needs_fetch = state
+            .current_provider()
+            .map(|p| p.models.is_empty())
+            .unwrap_or(false);
+        if !needs_fetch {
+            return;
+        }
+        if let Some(provider) = state.current_provider().map(|p| p.id.clone()) {
+            state.models_loading = true;
+            state
+                .handle
+                .send_command(ChatCommand::FetchModels { provider });
+        }
     }
 
     fn handle_key(&mut self, key: &sui::KeyboardEvent, ctx: &mut EventCtx) {
@@ -580,9 +669,9 @@ impl Widget for ChatView {
             let w = ctx
                 .layout()
                 .measure_text(format!("◇ {label}"), style.clone())
-                .map(|m| m.width + 22.0)
+                .map(|m| m.width + 38.0) // glyph + label + trailing caret
                 .unwrap_or(120.0);
-            self.sel_w[i] = w.clamp(80.0, 280.0);
+            self.sel_w[i] = w.clamp(90.0, 280.0);
         }
         constraints.max
     }
@@ -609,10 +698,26 @@ impl Widget for ChatView {
         let cx = self.composer_rect.x() + PAD;
         let cw = self.composer_rect.width() - PAD * 2.0;
         let sel_y = self.composer_rect.y() + 14.0;
+
+        // The reasoning-effort selector only shows for models that actually take one.
+        self.effort_visible = {
+            let state = self.shared.chat();
+            let provider = state
+                .current_provider()
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+            let model = state.current_model();
+            !provider.is_empty() && sinomo_lm::model_supports_reasoning_effort(&provider, &model)
+        };
+        let selector_count = if self.effort_visible { 3 } else { 2 };
         let mut x = cx;
         for i in 0..3 {
-            self.selector_rects[i] = Rect::new(x, sel_y, self.sel_w[i], SELECTOR_H);
-            x += self.sel_w[i] + 8.0;
+            if i < selector_count {
+                self.selector_rects[i] = Rect::new(x, sel_y, self.sel_w[i], SELECTOR_H);
+                x += self.sel_w[i] + 8.0;
+            } else {
+                self.selector_rects[i] = Rect::ZERO;
+            }
         }
         let input_y = sel_y + SELECTOR_H + 12.0;
         let input_h =
@@ -644,6 +749,41 @@ impl Widget for ChatView {
                 r
             })
             .collect();
+
+        // Open-dropdown geometry. The composer sits at the bottom of the tab, so the
+        // selector dropdowns open upward over the transcript.
+        self.menu_item_rects.clear();
+        self.menu_rect = Rect::ZERO;
+        if let Some(which) = self.open_menu {
+            let count = {
+                let state = self.shared.chat();
+                match which {
+                    0 => state.providers.len(),
+                    // Always at least one row, for the "Loading…"/"No models" placeholder.
+                    1 => state
+                        .current_provider()
+                        .map(|p| p.models.len())
+                        .unwrap_or(0)
+                        .max(1),
+                    _ => state.efforts.len(),
+                }
+            };
+            if count > 0 {
+                let anchor = self.selector_rects[which];
+                let item_h = 28.0;
+                let menu_h = count as f32 * item_h + 8.0;
+                let menu_w = anchor.width().max(170.0);
+                let menu_x = anchor.x();
+                let menu_y = (anchor.y() - menu_h - 6.0).max(bounds.y() + 8.0);
+                self.menu_rect = Rect::new(menu_x, menu_y, menu_w, menu_h);
+                let mut iy = menu_y + 4.0;
+                for _ in 0..count {
+                    self.menu_item_rects
+                        .push(Rect::new(menu_x + 4.0, iy, menu_w - 8.0, item_h));
+                    iy += item_h;
+                }
+            }
+        }
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
@@ -652,6 +792,8 @@ impl Widget for ChatView {
         self.paint_sidebar(ctx, &theme, &pal);
         self.paint_messages(ctx, &theme, &pal);
         self.paint_composer(ctx, &theme, &pal);
+        // Painted last so an open selector dropdown floats above the transcript.
+        self.paint_dropdown(ctx, &theme, &pal);
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
@@ -672,12 +814,24 @@ impl Widget for ChatView {
                     }
                 }
                 PointerEventKind::Down if p.button == Some(PointerButton::Primary) => {
+                    let hit = self.hit_test(p.position);
+                    // A click outside an open dropdown (and not on a selector chip)
+                    // dismisses it without triggering the underlying control.
+                    if self.open_menu.is_some()
+                        && !matches!(hit, Some(Hit::MenuItem(_)) | Some(Hit::Selector(_)))
+                    {
+                        self.open_menu = None;
+                        ctx.set_handled();
+                        ctx.request_paint();
+                        self.ensure_pump(ctx);
+                        return;
+                    }
                     if !self.composer_rect.contains(p.position)
                         && !self.input_rect.contains(p.position)
                     {
                         self.shared.chat_mut().focused = false;
                     }
-                    if let Some(hit) = self.hit_test(p.position) {
+                    if let Some(hit) = hit {
                         self.handle_click(hit, ctx);
                         ctx.set_handled();
                     } else if self.messages_rect.contains(p.position) {
@@ -704,6 +858,12 @@ impl Widget for ChatView {
                 _ => {}
             },
             Event::Keyboard(key) if key.state == KeyState::Pressed => {
+                if key.key == "Escape" && self.open_menu.take().is_some() {
+                    ctx.set_handled();
+                    ctx.request_paint();
+                    self.ensure_pump(ctx);
+                    return;
+                }
                 self.handle_key(key, ctx);
                 self.ensure_pump(ctx);
             }
@@ -989,8 +1149,11 @@ impl ChatView {
         ];
         let glyphs = ["◇", "◆", "✲"];
         for (i, rect) in self.selector_rects.iter().enumerate() {
-            let hover = self.hovered == Some(Hit::Selector(i));
-            let border = if hover { pal.accent } else { pal.border };
+            if i == 2 && !self.effort_visible {
+                continue; // effort selector hidden for non-reasoning models
+            }
+            let active = self.hovered == Some(Hit::Selector(i)) || self.open_menu == Some(i);
+            let border = if active { pal.accent } else { pal.border };
             widgets::round_panel(ctx, *rect, pal.field, border, SELECTOR_H / 2.0);
             let gs = pal.text_style(theme, 11.0, FontWeight::MEDIUM, pal.accent);
             widgets::draw_text_in(
@@ -1005,11 +1168,19 @@ impl ChatView {
                 Rect::new(
                     rect.x() + 26.0,
                     rect.y(),
-                    rect.width() - 32.0,
+                    (rect.width() - 44.0).max(10.0),
                     rect.height(),
                 ),
-                &elide(&labels[i], 22),
+                &elide(&labels[i], 20),
                 ts,
+            );
+            // Trailing caret signalling the dropdown.
+            let caret = pal.text_style(theme, 9.0, FontWeight::SEMIBOLD, pal.text_muted);
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(rect.x() + rect.width() - 18.0, rect.y(), 14.0, rect.height()),
+                "▾",
+                caret,
             );
         }
 
@@ -1095,6 +1266,99 @@ impl ChatView {
             label,
             ls,
         );
+    }
+
+    /// Paint the open selector dropdown (a panel of options anchored above its chip).
+    fn paint_dropdown(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
+        let Some(which) = self.open_menu else {
+            return;
+        };
+        if self.menu_item_rects.is_empty() {
+            return;
+        }
+
+        let state = self.shared.chat();
+        let loading = state.models_loading;
+        let (options, selected): (Vec<String>, usize) = match which {
+            0 => (
+                state.providers.iter().map(|p| p.name.clone()).collect(),
+                state.provider_idx,
+            ),
+            1 => (
+                state
+                    .current_provider()
+                    .map(|p| p.models.clone())
+                    .unwrap_or_default(),
+                state.model_idx,
+            ),
+            _ => (state.efforts.clone(), state.effort_idx),
+        };
+        drop(state);
+
+        widgets::round_panel(ctx, self.menu_rect, pal.panel, pal.border, 10.0);
+
+        // Model menu: a placeholder row while fetching, or when nothing is available.
+        if which == 1 && options.is_empty() {
+            if let Some(rect) = self.menu_item_rects.first() {
+                let label = if loading {
+                    "Loading models…"
+                } else {
+                    "No models available"
+                };
+                let style = pal.text_style(theme, 12.0, FontWeight::NORMAL, pal.text_faint);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(
+                        rect.x() + 10.0,
+                        rect.y(),
+                        (rect.width() - 20.0).max(10.0),
+                        rect.height(),
+                    ),
+                    label,
+                    style,
+                );
+            }
+            return;
+        }
+
+        let item_style = pal.text_style(theme, 12.5, FontWeight::MEDIUM, pal.text);
+        for (i, rect) in self.menu_item_rects.iter().enumerate() {
+            let Some(label) = options.get(i) else {
+                continue;
+            };
+            let is_selected = i == selected;
+            let hovered = self.hovered == Some(Hit::MenuItem(i));
+            if is_selected {
+                widgets::fill_round_rect(ctx, *rect, pal.selected, 7.0);
+            } else if hovered {
+                widgets::fill_round_rect(ctx, *rect, pal.hover, 7.0);
+            }
+            let color = if is_selected { pal.text } else { pal.text_muted };
+            let style = sui::TextStyle {
+                color,
+                ..item_style.clone()
+            };
+            widgets::draw_text_in(
+                ctx,
+                Rect::new(
+                    rect.x() + 10.0,
+                    rect.y(),
+                    (rect.width() - 32.0).max(10.0),
+                    rect.height(),
+                ),
+                &elide(label, 30),
+                style,
+            );
+            if is_selected {
+                let check = pal.text_style(theme, 11.5, FontWeight::SEMIBOLD, pal.accent);
+                widgets::draw_text_in(
+                    ctx,
+                    Rect::new(rect.x() + rect.width() - 20.0, rect.y(), 14.0, rect.height()),
+                    "✓",
+                    check,
+                );
+            }
+        }
     }
 }
 

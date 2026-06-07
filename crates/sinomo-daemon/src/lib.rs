@@ -21,7 +21,8 @@ pub use auth::{
     sign_daemon_rpc_request_from_data_dir, verify_cluster_invite_challenge_proof,
 };
 pub use client::{
-    fetch_cluster_health_rows, fetch_cluster_kv_snapshot, fetch_cluster_kv_snapshot_from_endpoint,
+    RemoteConfigClient, fetch_cluster_health_rows, fetch_cluster_kv_snapshot,
+    fetch_cluster_kv_snapshot_from_endpoint,
     fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     fetch_dfs_inspection_from_address, fetch_dfs_status_from_endpoint, run_dfs_smoke_via_daemon,
     send_cluster_join_registration, send_cluster_join_registration_to_channel,

@@ -26,10 +26,13 @@ pub fn logo_image_handle() -> ImageHandle {
 pub struct Shell {
     shared: Shared,
     logo: SingleChild,
-    content: WidgetPod,
+    /// The switchable tab content — built only once the backend connection resolves. `None`
+    /// while connecting, when a loading screen is shown in its place.
+    content: Option<WidgetPod>,
     tab_rects: Vec<(Tab, Rect)>,
     tab_widths: Vec<f32>,
     bar_rect: Rect,
+    body_rect: Rect,
     hovered_tab: Option<Tab>,
     pressed_tab: Option<Tab>,
 }
@@ -44,25 +47,36 @@ impl Shell {
                 .corner_radius(0.0),
         );
 
-        let content = SwitchView::new()
-            .with_child(chat::view(shared.clone()))
-            .with_child(files::view(shared.clone()))
-            .with_child(settings::view(shared.clone()))
-            .selected_when({
-                let shared = shared.clone();
-                move || shared.active_tab().index()
-            });
-
-        Self {
+        let mut shell = Self {
             shared,
             logo,
-            content: WidgetPod::new(content),
+            content: None,
             tab_rects: Vec::new(),
             tab_widths: Vec::new(),
             bar_rect: Rect::ZERO,
+            body_rect: Rect::ZERO,
             hovered_tab: None,
             pressed_tab: None,
+        };
+        // Built already-ready (headless tooling / visual tests) → show the tabs immediately. The
+        // interactive app builds content when the connection resolves (see `event`).
+        if shell.shared.is_ready() {
+            shell.build_content();
         }
+        shell
+    }
+
+    /// Build the switchable tab content. Called once the backend is ready.
+    fn build_content(&mut self) {
+        let content = SwitchView::new()
+            .with_child(chat::view(self.shared.clone()))
+            .with_child(files::view(self.shared.clone()))
+            .with_child(settings::view(self.shared.clone()))
+            .selected_when({
+                let shared = self.shared.clone();
+                move || shared.active_tab().index()
+            });
+        self.content = Some(WidgetPod::new(content));
     }
 
     fn tab_text_style(&self) -> sui::TextStyle {
@@ -119,8 +133,9 @@ impl Widget for Shell {
             .measure(ctx, Constraints::tight(Size::new(LOGO_SIZE, LOGO_SIZE)));
 
         let body_h = (size.height - TOPBAR_HEIGHT).max(0.0);
-        self.content
-            .measure(ctx, Constraints::tight(Size::new(size.width, body_h)));
+        if let Some(content) = &mut self.content {
+            content.measure(ctx, Constraints::tight(Size::new(size.width, body_h)));
+        }
 
         size
     }
@@ -148,16 +163,22 @@ impl Widget for Shell {
 
         let body_y = bounds.y() + TOPBAR_HEIGHT;
         let body_h = (bounds.height() - TOPBAR_HEIGHT).max(0.0);
-        self.content
-            .arrange(ctx, Rect::new(bounds.x(), body_y, bounds.width(), body_h));
+        self.body_rect = Rect::new(bounds.x(), body_y, bounds.width(), body_h);
+        if let Some(content) = &mut self.content {
+            content.arrange(ctx, self.body_rect);
+        }
     }
 
     fn paint(&self, ctx: &mut PaintCtx) {
         let (theme, pal) = self.palette();
 
-        // Content area background, then content.
+        // Content area background, then either the tab content or a loading screen.
         ctx.fill_bounds(pal.window);
-        self.content.paint(ctx);
+        if let Some(content) = &self.content {
+            content.paint(ctx);
+        } else {
+            self.paint_loading(ctx, &theme, &pal);
+        }
 
         // Title bar.
         ctx.fill_rect(self.bar_rect, pal.titlebar);
@@ -213,6 +234,26 @@ impl Widget for Shell {
         if ctx.phase() != EventPhase::Target {
             return;
         }
+        // The background connect thread wakes us via the sui external-wake mechanism; drain its
+        // progress/result here. When the backend arrives, build the tab content and relayout.
+        if let Event::Custom(custom) = event {
+            if custom.kind.as_str() == sui::EXTERNAL_WAKE_KIND {
+                let (changed, became_ready) = self.shared.pump_connect();
+                if became_ready {
+                    self.build_content();
+                    ctx.request_measure();
+                    ctx.request_arrange();
+                    ctx.request_semantics();
+                }
+                // Drain any in-progress provider device-login (Settings tab).
+                let device_changed =
+                    self.shared.is_ready() && self.shared.settings_mut().pump_device_login();
+                if changed || device_changed {
+                    ctx.request_paint();
+                }
+            }
+            return;
+        }
         if let Event::Pointer(pointer) = event {
             match pointer.kind {
                 PointerEventKind::Move => {
@@ -249,20 +290,47 @@ impl Widget for Shell {
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         self.logo.visit_children(visitor);
-        visitor.visit(&self.content);
+        if let Some(content) = &self.content {
+            visitor.visit(content);
+        }
     }
 
     fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
         self.logo.visit_children_mut(visitor);
-        visitor.visit(&mut self.content);
+        if let Some(content) = &mut self.content {
+            visitor.visit(content);
+        }
     }
 }
 
 impl Shell {
+    /// Centered status while the backend connection is resolving.
+    fn paint_loading(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
+        let status = self.shared.status_text();
+        let style = pal.text_style(theme, 15.0, FontWeight::MEDIUM, pal.text_muted);
+        let measurement = ctx.measure_text(status.clone(), style.clone()).ok();
+        let tw = measurement.as_ref().map(|m| m.width).unwrap_or(160.0);
+        let th = measurement.as_ref().map(|m| m.height).unwrap_or(20.0);
+        let tx = self.body_rect.x() + (self.body_rect.width() - tw) / 2.0;
+        let ty = self.body_rect.y() + (self.body_rect.height() - th) / 2.0;
+        widgets::draw_text_in(
+            ctx,
+            Rect::new(tx, ty, tw + 4.0, th + 4.0),
+            &status,
+            style,
+        );
+    }
+
     fn paint_status_pill(&self, ctx: &mut PaintCtx, theme: &sui::DefaultTheme, pal: &Palette) {
-        let backend = &self.shared.borrow().backend;
-        let label = backend.mode_label();
-        let dot = if backend.connection.is_daemon() {
+        let label = self.shared.status_text();
+        let connected_daemon = {
+            let state = self.shared.borrow();
+            state
+                .ready
+                .as_ref()
+                .is_some_and(|ready| ready.backend.connection.is_daemon())
+        };
+        let dot = if connected_daemon {
             pal.good
         } else {
             pal.accent

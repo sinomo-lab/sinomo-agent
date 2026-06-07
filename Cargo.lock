@@ -8084,6 +8084,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sui-lucide"
+version = "1.17.0"
+dependencies = [
+ "sui-core",
+ "sui-runtime",
+]
+
+[[package]]
 name = "sui-platform"
 version = "0.1.0"
 dependencies = [
@@ -8184,6 +8192,7 @@ dependencies = [
  "palette",
  "sui-core",
  "sui-layout",
+ "sui-lucide",
  "sui-runtime",
  "sui-scene",
  "sui-text",

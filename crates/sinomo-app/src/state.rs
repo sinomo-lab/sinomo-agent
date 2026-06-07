@@ -1,16 +1,22 @@
 //! Shared, mutable application state.
 //!
-//! Following the SUI reactive idiom, all cross-widget state lives behind a single
-//! `Rc<RefCell<AppState>>`. Widgets read it through `*_when`/`dynamic` closures and
-//! mutate it from `on_press`/event handlers, then ask the runtime to relayout.
+//! All cross-widget state lives behind a single `Rc<RefCell<AppState>>`. The app launches in a
+//! *connecting* phase (no backend yet, UI shown immediately) while a background thread resolves
+//! the daemon connection, pushing progress + the finished [`Backend`] over a channel. The shell
+//! drains that channel whenever the UI is woken (via the sui external-wake mechanism) and, once
+//! the backend arrives, populates [`ReadyState`] and builds the tab content.
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::rc::Rc;
+use std::sync::mpsc::Receiver;
 
 use sui::DefaultTheme;
 
 use crate::backend::Backend;
 use crate::theme::{AppThemeMode, resolve_theme};
+use crate::ui::chat::ChatState;
+use crate::ui::files::FilesState;
+use crate::ui::settings::SettingsState;
 
 /// The three top-level destinations shown in the title bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,34 +49,86 @@ impl Tab {
     }
 }
 
-/// Root application state. Sub-tab state is held in dedicated modules.
-pub struct AppState {
-    pub active_tab: Tab,
-    pub theme_mode: AppThemeMode,
-    pub backend: Backend,
-    pub chat: crate::ui::chat::ChatState,
-    pub files: crate::ui::files::FilesState,
-    pub settings: crate::ui::settings::SettingsState,
+/// Progress + result of the background connection, drained on the UI thread.
+pub enum ConnectEvent {
+    /// Human-readable progress for the status indicator.
+    Status(String),
+    /// The connection resolved; the app can become interactive.
+    Connected(Box<Backend>),
 }
 
-impl AppState {
-    pub fn new(backend: Backend) -> Self {
-        let chat = crate::ui::chat::ChatState::new(&backend);
-        let files = crate::ui::files::FilesState::new(&backend);
-        let settings = crate::ui::settings::SettingsState::new(&backend);
+/// Everything that requires a resolved backend — populated once connected.
+pub struct ReadyState {
+    pub backend: Backend,
+    pub chat: ChatState,
+    pub files: FilesState,
+    pub settings: SettingsState,
+}
+
+impl ReadyState {
+    /// Build all tab sub-states from a resolved backend (spawns the chat worker, opens the file
+    /// browser, loads config). Runs on the UI thread when the connection completes.
+    pub fn build(backend: Backend) -> Self {
+        let chat = ChatState::new(&backend);
+        let files = FilesState::new(&backend);
+        let settings = SettingsState::new(&backend);
         Self {
-            active_tab: Tab::Sinomo,
-            theme_mode: AppThemeMode::System,
             backend,
             chat,
             files,
             settings,
         }
     }
+}
+
+/// Root application state. Sub-tab state is held in dedicated modules.
+pub struct AppState {
+    pub active_tab: Tab,
+    pub theme_mode: AppThemeMode,
+    /// Live status line for the title-bar indicator while connecting.
+    pub status: String,
+    /// `Some` once the backend connection has resolved.
+    pub ready: Option<ReadyState>,
+    /// Channel from the background connect thread (drained by the shell on wake).
+    pub connect_rx: Option<Receiver<ConnectEvent>>,
+    /// Wakes the UI from background threads (set once the event loop is up). Used by long-running
+    /// async work like provider device-login to refresh the UI as it progresses.
+    pub waker: Option<sui::Waker>,
+}
+
+impl AppState {
+    /// The pre-connection state shown immediately at launch. The backend resolves asynchronously.
+    pub fn connecting() -> Self {
+        Self {
+            active_tab: Tab::Sinomo,
+            theme_mode: AppThemeMode::System,
+            status: "Starting…".to_string(),
+            ready: None,
+            connect_rx: None,
+            waker: None,
+        }
+    }
+
+    /// A fully-resolved state built synchronously from a backend — used by headless tooling and
+    /// visual tests, which render the tabs directly without the async connection dance.
+    pub fn ready(backend: Backend) -> Self {
+        Self {
+            active_tab: Tab::Sinomo,
+            theme_mode: AppThemeMode::System,
+            status: backend.mode_label(),
+            ready: Some(ReadyState::build(backend)),
+            connect_rx: None,
+            waker: None,
+        }
+    }
 
     /// The resolved widget theme for the current mode.
     pub fn theme(&self) -> DefaultTheme {
         resolve_theme(self.theme_mode)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.is_some()
     }
 }
 
@@ -83,11 +141,11 @@ impl Shared {
         Self(Rc::new(RefCell::new(state)))
     }
 
-    pub fn borrow(&self) -> std::cell::Ref<'_, AppState> {
+    pub fn borrow(&self) -> Ref<'_, AppState> {
         self.0.borrow()
     }
 
-    pub fn borrow_mut(&self) -> std::cell::RefMut<'_, AppState> {
+    pub fn borrow_mut(&self) -> RefMut<'_, AppState> {
         self.0.borrow_mut()
     }
 
@@ -99,30 +157,106 @@ impl Shared {
         self.0.borrow().active_tab
     }
 
-    /// Borrow the chat sub-state directly.
-    pub fn chat(&self) -> Ref<'_, crate::ui::chat::ChatState> {
-        Ref::map(self.0.borrow(), |state| &state.chat)
+    /// Whether the backend connection has resolved (tabs are interactive).
+    pub fn is_ready(&self) -> bool {
+        self.0.borrow().is_ready()
     }
 
-    pub fn chat_mut(&self) -> RefMut<'_, crate::ui::chat::ChatState> {
-        RefMut::map(self.0.borrow_mut(), |state| &mut state.chat)
+    /// Text for the title-bar status indicator: the daemon mode once connected, otherwise the
+    /// live connection progress.
+    pub fn status_text(&self) -> String {
+        let state = self.0.borrow();
+        match &state.ready {
+            Some(ready) => ready.backend.mode_label(),
+            None => state.status.clone(),
+        }
     }
 
-    /// Borrow the files sub-state directly.
-    pub fn files(&self) -> Ref<'_, crate::ui::files::FilesState> {
-        Ref::map(self.0.borrow(), |state| &state.files)
+    /// One-line connection detail (daemon address/cluster once connected, else progress).
+    pub fn status_detail(&self) -> String {
+        let state = self.0.borrow();
+        match &state.ready {
+            Some(ready) => ready.backend.status_detail(),
+            None => state.status.clone(),
+        }
     }
 
-    pub fn files_mut(&self) -> RefMut<'_, crate::ui::files::FilesState> {
-        RefMut::map(self.0.borrow_mut(), |state| &mut state.files)
+    /// Borrow the chat sub-state directly. Only valid once [`is_ready`](Self::is_ready) — the
+    /// shell builds the tab views only after the connection resolves, so callers (the views)
+    /// never run before then.
+    pub fn chat(&self) -> Ref<'_, ChatState> {
+        Ref::map(self.0.borrow(), |s| {
+            &s.ready.as_ref().expect("app is ready").chat
+        })
     }
 
-    /// Borrow the settings sub-state directly.
-    pub fn settings(&self) -> Ref<'_, crate::ui::settings::SettingsState> {
-        Ref::map(self.0.borrow(), |state| &state.settings)
+    pub fn chat_mut(&self) -> RefMut<'_, ChatState> {
+        RefMut::map(self.0.borrow_mut(), |s| {
+            &mut s.ready.as_mut().expect("app is ready").chat
+        })
     }
 
-    pub fn settings_mut(&self) -> RefMut<'_, crate::ui::settings::SettingsState> {
-        RefMut::map(self.0.borrow_mut(), |state| &mut state.settings)
+    pub fn files(&self) -> Ref<'_, FilesState> {
+        Ref::map(self.0.borrow(), |s| {
+            &s.ready.as_ref().expect("app is ready").files
+        })
+    }
+
+    pub fn files_mut(&self) -> RefMut<'_, FilesState> {
+        RefMut::map(self.0.borrow_mut(), |s| {
+            &mut s.ready.as_mut().expect("app is ready").files
+        })
+    }
+
+    pub fn settings(&self) -> Ref<'_, SettingsState> {
+        Ref::map(self.0.borrow(), |s| {
+            &s.ready.as_ref().expect("app is ready").settings
+        })
+    }
+
+    pub fn settings_mut(&self) -> RefMut<'_, SettingsState> {
+        RefMut::map(self.0.borrow_mut(), |s| {
+            &mut s.ready.as_mut().expect("app is ready").settings
+        })
+    }
+
+    /// Drain pending connect events (called by the shell when the UI is woken). Updates the
+    /// status line and, on `Connected`, builds the ready state. Returns `true` if anything
+    /// changed, and `Some(true)` of that when the app *became* ready (so the caller can build the
+    /// tab content). The tuple is `(changed, became_ready)`.
+    pub fn pump_connect(&self) -> (bool, bool) {
+        // Drain without holding the borrow across ReadyState construction (which itself borrows).
+        let events: Vec<ConnectEvent> = {
+            let state = self.0.borrow();
+            match &state.connect_rx {
+                Some(rx) => rx.try_iter().collect(),
+                None => Vec::new(),
+            }
+        };
+        if events.is_empty() {
+            return (false, false);
+        }
+
+        let mut changed = false;
+        let mut became_ready = false;
+        for event in events {
+            match event {
+                ConnectEvent::Status(status) => {
+                    self.0.borrow_mut().status = status;
+                    changed = true;
+                }
+                ConnectEvent::Connected(backend) => {
+                    // Build the tab sub-states off the borrow (a one-time hitch), then commit.
+                    let ready = ReadyState::build(*backend);
+                    let mut state = self.0.borrow_mut();
+                    state.status = ready.backend.mode_label();
+                    state.ready = Some(ready);
+                    state.connect_rx = None;
+                    changed = true;
+                    became_ready = true;
+                }
+            }
+        }
+        (changed, became_ready)
     }
 }

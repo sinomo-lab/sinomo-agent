@@ -121,17 +121,76 @@ pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), Cl
     }
 }
 
-pub fn auth_github_copilot() -> Result<(), CliError> {
-    let (provider, credentials_path) = github_copilot_provider()?;
-    let device = provider.device_login_start()?;
+/// The user-facing prompt for an OAuth device-login flow.
+pub struct DeviceLoginPrompt {
+    pub verification_uri: String,
+    pub user_code: String,
+}
 
-    println!("Open this URL in your browser:");
-    println!("{}", device.verification_uri);
-    println!();
-    println!("Enter this code:");
-    println!("{}", device.user_code);
-    println!();
-    println!("Waiting for GitHub authorization...");
+/// Whether `provider` authenticates via the OAuth device-login flow rather than an API key.
+pub fn provider_uses_device_login(provider: &str) -> bool {
+    matches!(provider, "codex" | "github-copilot")
+}
+
+/// Whether a device-login provider has stored credentials (cheap local check; no network).
+pub fn provider_signed_in(provider: &str) -> bool {
+    let path = match provider {
+        "codex" => codex_provider().ok().map(|(_, path)| path),
+        "github-copilot" => github_copilot_provider().ok().map(|(_, path)| path),
+        _ => None,
+    };
+    path.is_some_and(|path| std::fs::metadata(&path).map(|meta| meta.len() > 0).unwrap_or(false))
+}
+
+/// Run a provider's OAuth device-login flow: start it (calling `on_prompt` with the URL + user
+/// code the user must enter), then poll until authorized or expired, saving credentials on
+/// success. Blocks while polling — run it off the UI thread.
+pub fn run_device_login(
+    provider: &str,
+    on_prompt: impl FnOnce(DeviceLoginPrompt),
+) -> Result<(), CliError> {
+    match provider {
+        "codex" => run_codex_device_login(on_prompt),
+        "github-copilot" => run_github_copilot_device_login(on_prompt),
+        other => Err(CliError::AuthProvider {
+            detail: format!("provider `{other}` does not use device login"),
+        }),
+    }
+}
+
+fn run_codex_device_login(on_prompt: impl FnOnce(DeviceLoginPrompt)) -> Result<(), CliError> {
+    let (provider, _auth_path) = codex_provider()?;
+    let device = provider.device_login_start()?;
+    on_prompt(DeviceLoginPrompt {
+        verification_uri: device.verification_uri.clone(),
+        user_code: device.user_code.clone(),
+    });
+
+    let started = Instant::now();
+    let expires_in = Duration::from_secs(device.expires_in);
+    let interval = Duration::from_secs(device.interval.max(5));
+    loop {
+        if started.elapsed() >= expires_in {
+            return Err(CliError::AuthExpired);
+        }
+        thread::sleep(interval);
+        let poll = provider.device_login_poll(&device)?;
+        if poll.tokens.is_some() {
+            test_provider_credentials(CODEX_PROVIDER_ID)?;
+            return Ok(());
+        }
+    }
+}
+
+fn run_github_copilot_device_login(
+    on_prompt: impl FnOnce(DeviceLoginPrompt),
+) -> Result<(), CliError> {
+    let (provider, _credentials_path) = github_copilot_provider()?;
+    let device = provider.device_login_start()?;
+    on_prompt(DeviceLoginPrompt {
+        verification_uri: device.verification_uri.clone(),
+        user_code: device.user_code.clone(),
+    });
 
     let started = Instant::now();
     let expires_in = if device.expires_in == 0 {
@@ -140,23 +199,16 @@ pub fn auth_github_copilot() -> Result<(), CliError> {
         Duration::from_secs(device.expires_in)
     };
     let mut interval = Duration::from_secs(device.interval.max(5));
-
     loop {
         if started.elapsed() >= expires_in {
             return Err(CliError::AuthExpired);
         }
-
         thread::sleep(interval);
         let poll = provider.device_login_poll(&device.device_code)?;
         if poll.access_token.is_some() {
             test_provider_credentials(GitHubCopilotProvider::PROVIDER_ID)?;
-            println!(
-                "GitHub Copilot credentials saved to {}",
-                credentials_path.display()
-            );
             return Ok(());
         }
-
         match poll.error.as_deref() {
             Some("authorization_pending") | None => {}
             Some("slow_down") => {
@@ -171,6 +223,22 @@ pub fn auth_github_copilot() -> Result<(), CliError> {
             }
         }
     }
+}
+
+fn print_device_prompt(prompt: DeviceLoginPrompt) {
+    println!("Open this URL in your browser:");
+    println!("{}", prompt.verification_uri);
+    println!();
+    println!("Enter this code:");
+    println!("{}", prompt.user_code);
+    println!();
+    println!("Waiting for authorization...");
+}
+
+pub fn auth_github_copilot() -> Result<(), CliError> {
+    run_github_copilot_device_login(print_device_prompt)?;
+    println!("GitHub Copilot credentials saved.");
+    Ok(())
 }
 
 pub fn test_github_copilot() -> Result<(), CliError> {
@@ -233,34 +301,8 @@ pub fn test_openai() -> Result<(), CliError> {
 }
 
 pub fn auth_codex() -> Result<(), CliError> {
-    let (provider, auth_path) = codex_provider()?;
-    let device = provider.device_login_start()?;
-
-    println!("Open this URL in your browser:");
-    println!("{}", device.verification_uri);
-    println!();
-    println!("Enter this code:");
-    println!("{}", device.user_code);
-    println!();
-    println!("Waiting for ChatGPT authorization...");
-
-    let started = Instant::now();
-    let expires_in = Duration::from_secs(device.expires_in);
-    let interval = Duration::from_secs(device.interval.max(5));
-
-    loop {
-        if started.elapsed() >= expires_in {
-            return Err(CliError::AuthExpired);
-        }
-        thread::sleep(interval);
-        let poll = provider.device_login_poll(&device)?;
-        if poll.tokens.is_some() {
-            println!("Testing Codex provider connection...");
-            test_provider_credentials(CODEX_PROVIDER_ID)?;
-            break;
-        }
-    }
-    println!("Codex credentials saved to {}", auth_path.display());
+    run_codex_device_login(print_device_prompt)?;
+    println!("Codex credentials saved.");
     Ok(())
 }
 
