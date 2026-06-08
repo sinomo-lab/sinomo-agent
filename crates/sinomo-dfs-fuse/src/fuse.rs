@@ -6,13 +6,18 @@ use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use sinomo_runtime::core::ClusterEndpointRecord;
+use sinomo_runtime::core::{ClusterBootstrapState, ClusterEndpointRecord};
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
     self, DfsControlPlaneKvClient, DfsObjectKind, DfsPosixError, DfsProtocolFrameCommand,
     DfsProtocolFrameResponse, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
 };
-use sinomo_runtime::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{
+    ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult, ClusterKvRaftUncommittedAppend,
+    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, KvCommand, KvEntry, KvError,
+    KvEvent, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, RaftRequestVoteRequest,
+    RaftRequestVoteResponse,
+};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
 use sinomo_runtime::node::NodeId;
@@ -25,6 +30,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const ROOT_INO: u64 = 1;
 const DEFAULT_BLOCK_SIZE: u32 = 4096;
 const DEFAULT_FUSE_TIMEOUT: Duration = Duration::from_secs(3);
+const FUSE_CLUSTER_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+const FUSE_CLUSTER_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const FUSE_CLUSTER_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const FUSE_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(1);
+const FUSE_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+const FUSE_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1500);
+const FUSE_CLUSTER_RAFT_APPEND_TIMEOUT: Duration = Duration::from_secs(5);
+const FUSE_CLUSTER_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 
 type SifsService = NetworkedDfsService<DfsFuseEndpointTransport>;
 
@@ -1068,13 +1081,6 @@ impl DfsFuseControlPlaneKvClient {
             detail: source.to_string(),
         }
     }
-
-    fn daemon_error(&self, source: impl std::fmt::Display) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
-            detail: source.to_string(),
-        }
-    }
 }
 
 impl DfsControlPlaneKvClient for DfsFuseControlPlaneKvClient {
@@ -1104,14 +1110,513 @@ impl DfsControlPlaneKvClient for DfsFuseControlPlaneKvClient {
     fn txn(&mut self, txn: KvTxn) -> std::result::Result<KvTxnResponse, KvError> {
         let mut state = network::read_cluster_state(&self.cluster_paths)
             .map_err(|source| self.network_error(source))?;
-        let snapshot =
-            daemon::commit_cluster_kv_txn_with_quorum(&self.cluster_paths, &mut state, txn)
-                .map_err(|source| self.daemon_error(source))?;
-        Ok(KvTxnResponse {
+        let result = network::commit_cluster_kv_txn_with_quorum_response_with_host(
+            &self.cluster_paths,
+            &mut state,
+            txn,
+            dfs_fuse_cluster_kv_txn_quorum_options(true),
+            &mut DfsFuseClusterKvTxnQuorumHost,
+        )
+        .map_err(|source| self.network_error(source))?;
+        Ok(result.txn_response.unwrap_or_else(|| KvTxnResponse {
             succeeded: true,
-            revision: snapshot.revision,
+            revision: result.snapshot.revision,
             responses: Vec::new(),
+        }))
+    }
+}
+
+fn dfs_fuse_network_error(operation: &str, error: impl std::fmt::Display) -> NetworkError {
+    NetworkError::Io {
+        operation: operation.to_string(),
+        detail: error.to_string(),
+    }
+}
+
+fn dfs_fuse_send_daemon_rpc_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ObjectRpcRequest,
+    timeout: Duration,
+    operation: &str,
+) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
+    daemon::send_daemon_rpc_to_endpoint(endpoint, request, timeout)
+        .map_err(|error| dfs_fuse_network_error(operation, error))
+}
+
+fn with_dfs_fuse_cluster_raft_operation<T>(
+    operation: &str,
+    f: impl FnOnce() -> std::result::Result<T, NetworkError>,
+) -> std::result::Result<T, NetworkError> {
+    let _guard = network::lock_cluster_raft_operation()
+        .map_err(|error| dfs_fuse_network_error(operation, error))?;
+    f()
+}
+
+fn dfs_fuse_cluster_raft_append_replication_options(
+    timeout: Duration,
+) -> network::ClusterRaftAppendReplicationOptions {
+    network::ClusterRaftAppendReplicationOptions {
+        max_attempts: FUSE_CLUSTER_RAFT_APPEND_MAX_ATTEMPTS,
+        timeout,
+        tcp_command_timeout: FUSE_CLUSTER_TCP_COMMAND_TIMEOUT,
+        iroh_command_timeout: FUSE_CLUSTER_IROH_COMMAND_TIMEOUT,
+        tcp_foreground_attempt_timeout: FUSE_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+        public_foreground_attempt_timeout: FUSE_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+        iroh_foreground_attempt_timeout: FUSE_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+    }
+}
+
+fn dfs_fuse_cluster_raft_committed_fanout_options() -> network::ClusterRaftCommittedFanoutOptions {
+    network::ClusterRaftCommittedFanoutOptions {
+        raft_append_timeout: FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        watch_event_timeout: FUSE_CLUSTER_RPC_TIMEOUT,
+    }
+}
+
+fn dfs_fuse_cluster_raft_leader_election_options() -> network::ClusterRaftLeaderElectionOptions {
+    network::ClusterRaftLeaderElectionOptions {
+        max_attempts: network::CLUSTER_RAFT_LEADER_ELECTION_ATTEMPTS,
+        timeout: FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        tcp_command_timeout: FUSE_CLUSTER_TCP_COMMAND_TIMEOUT,
+        iroh_command_timeout: FUSE_CLUSTER_IROH_COMMAND_TIMEOUT,
+        tcp_foreground_attempt_timeout: FUSE_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+        public_foreground_attempt_timeout: FUSE_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+        iroh_foreground_attempt_timeout: FUSE_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+    }
+}
+
+fn dfs_fuse_cluster_voter_reachability_options() -> network::ClusterVoterReachabilityOptions {
+    network::ClusterVoterReachabilityOptions {
+        timeout: FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        tcp_command_timeout: FUSE_CLUSTER_TCP_COMMAND_TIMEOUT,
+        iroh_command_timeout: FUSE_CLUSTER_IROH_COMMAND_TIMEOUT,
+        tcp_foreground_attempt_timeout: FUSE_CLUSTER_TCP_FOREGROUND_ATTEMPT_TIMEOUT,
+        public_foreground_attempt_timeout: FUSE_CLUSTER_PUBLIC_FOREGROUND_ATTEMPT_TIMEOUT,
+        iroh_foreground_attempt_timeout: FUSE_CLUSTER_IROH_FOREGROUND_ATTEMPT_TIMEOUT,
+    }
+}
+
+fn dfs_fuse_cluster_kv_txn_quorum_options(
+    allow_forwarding: bool,
+) -> network::ClusterKvTxnQuorumOptions {
+    network::ClusterKvTxnQuorumOptions {
+        allow_forwarding,
+        raft_append_timeout: FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        forward_options: dfs_fuse_cluster_kv_txn_forward_options(),
+        leader_election_options: dfs_fuse_cluster_raft_leader_election_options(),
+        voter_reachability_options: dfs_fuse_cluster_voter_reachability_options(),
+    }
+}
+
+fn dfs_fuse_cluster_kv_txn_forward_options() -> network::ClusterKvTxnForwardOptions {
+    network::ClusterKvTxnForwardOptions {
+        timeout: FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        tcp_command_timeout: FUSE_CLUSTER_TCP_COMMAND_TIMEOUT,
+        iroh_command_timeout: FUSE_CLUSTER_IROH_COMMAND_TIMEOUT,
+    }
+}
+
+fn dfs_fuse_replicate_cluster_raft_to_endpoint_with_timeout_result(
+    paths: &network::ClusterPaths,
+    state: &ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+    watch_events: &[KvEvent],
+) -> std::result::Result<network::ClusterRaftAppendReplicationOutcome, NetworkError> {
+    network::replicate_cluster_raft_to_endpoint_with_host(
+        paths,
+        state,
+        endpoint,
+        watch_events,
+        dfs_fuse_cluster_raft_append_replication_options(timeout),
+        &mut DfsFuseClusterRaftAppendReplicationHost,
+    )
+}
+
+struct DfsFuseClusterKvTxnQuorumHost;
+
+impl network::ClusterKvTxnQuorumHost for DfsFuseClusterKvTxnQuorumHost {
+    fn refresh_current_cluster_kv_store(
+        &mut self,
+        paths: &network::ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> std::result::Result<(), NetworkError> {
+        network::read_cluster_kv_snapshot_store(paths).map(|_| ())
+    }
+
+    fn local_is_raft_leader(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> std::result::Result<bool, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft leader check", || {
+            network::cluster_raft_local_is_leader(paths, state)
         })
+    }
+
+    fn forward_cluster_kv_txn_to_voter(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        txn: &KvTxn,
+        options: network::ClusterKvTxnForwardOptions,
+    ) -> std::result::Result<Option<network::ClusterKvTxnForwardResult>, NetworkError> {
+        network::forward_cluster_kv_txn_to_voter_with_host(
+            paths,
+            state,
+            txn,
+            options,
+            &mut DfsFuseClusterKvTxnForwardHost,
+        )
+    }
+
+    fn elect_cluster_raft_leader(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        options: network::ClusterRaftLeaderElectionOptions,
+    ) -> std::result::Result<bool, NetworkError> {
+        network::elect_cluster_raft_leader_with_host(
+            paths,
+            state,
+            options,
+            &mut DfsFuseClusterRaftLeaderElectionHost,
+        )
+    }
+
+    fn reachable_voter_count(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        options: network::ClusterVoterReachabilityOptions,
+    ) -> usize {
+        network::cluster_reachable_voter_count_with_host(
+            paths,
+            state,
+            options,
+            &mut DfsFuseClusterVoterReachabilityHost,
+        )
+    }
+
+    fn commit_cluster_raft_command_with_quorum(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        command: KvCommand,
+        options: network::ClusterRaftQuorumCommitOptions,
+    ) -> std::result::Result<network::ClusterRaftQuorumCommitResult, NetworkError> {
+        let mut host = DfsFuseClusterRaftQuorumCommitHost {
+            paths,
+            local_node_id: state.local_node_id.clone(),
+        };
+        network::commit_cluster_raft_command_with_quorum_driver(
+            paths, state, command, options, &mut host,
+        )
+    }
+}
+
+struct DfsFuseClusterRaftAppendReplicationHost;
+
+impl network::ClusterRaftAppendReplicationHost for DfsFuseClusterRaftAppendReplicationHost {
+    fn last_local_raft_log_index(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> std::result::Result<u64, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft last-log read", || {
+            Ok(network::open_cluster_raft_kv_node(paths, &state.local_node_id)?.last_log_index())
+        })
+    }
+
+    fn build_raft_append_request(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> std::result::Result<network::ClusterRaftAppendRequest, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft append request build", || {
+            network::build_cluster_raft_append_request_from_next_index(paths, state, next_index)
+        })
+    }
+
+    fn send_raft_append(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> std::result::Result<network::ClusterRaftAppendResponse, NetworkError> {
+        let rpc_request = network::cluster_raft_append_rpc_request(request)?;
+        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            &rpc_request,
+            timeout,
+            "cluster raft append",
+        )?;
+        network::decode_cluster_raft_append_rpc_response(&response)
+    }
+}
+
+struct DfsFuseClusterRaftCommittedFanoutHost;
+
+impl network::ClusterRaftCommittedFanoutHost for DfsFuseClusterRaftCommittedFanoutHost {
+    fn replicate_cluster_raft_to_endpoint(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        watch_events: &[KvEvent],
+        timeout: Duration,
+    ) -> std::result::Result<network::ClusterRaftAppendReplicationOutcome, NetworkError> {
+        dfs_fuse_replicate_cluster_raft_to_endpoint_with_timeout_result(
+            paths,
+            state,
+            endpoint,
+            timeout,
+            watch_events,
+        )
+    }
+
+    fn send_cluster_kv_watch_events(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> std::result::Result<ClusterKvWatchEventsResponse, NetworkError> {
+        if let Some(response) = sinomo_runtime::kv::cluster_kv_watch_events_noop_response(request) {
+            return Ok(response);
+        }
+        let rpc_request = network::cluster_kv_watch_events_rpc_request(request)?;
+        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            &rpc_request,
+            timeout,
+            "cluster kv watch-event fanout",
+        )?;
+        network::decode_cluster_kv_watch_events_rpc_response(&response)
+    }
+}
+
+struct DfsFuseClusterRaftQuorumCommitHost<'a> {
+    paths: &'a network::ClusterPaths,
+    local_node_id: NodeId,
+}
+
+impl ClusterKvRaftCommandStorage for DfsFuseClusterRaftQuorumCommitHost<'_> {
+    type Error = NetworkError;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect(
+        &mut self,
+        command: KvCommand,
+    ) -> std::result::Result<ClusterKvRaftUncommittedAppend, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft uncommitted append", || {
+            network::append_cluster_raft_command_uncommitted_or_no_effect(
+                self.paths,
+                &self.local_node_id,
+                command,
+            )
+        })
+    }
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+        &mut self,
+    ) -> std::result::Result<(), NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft discard uncommitted tail", || {
+            let _ = network::discard_cluster_raft_uncommitted_tail_and_clear_leader(
+                self.paths,
+                &self.local_node_id,
+            );
+            Ok(())
+        })
+    }
+
+    fn commit_cluster_raft_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> std::result::Result<ClusterKvRaftCommitResult, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft index commit", || {
+            network::commit_cluster_raft_index_with_events(self.paths, &self.local_node_id, index)
+        })
+    }
+}
+
+impl network::ClusterRaftQuorumTransportHost for DfsFuseClusterRaftQuorumCommitHost<'_> {
+    fn replicate_cluster_raft_to_endpoint(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> std::result::Result<network::ClusterRaftAppendResponse, NetworkError> {
+        dfs_fuse_replicate_cluster_raft_to_endpoint_with_timeout_result(
+            paths,
+            state,
+            endpoint,
+            timeout,
+            &[],
+        )
+        .map(|outcome| outcome.response)
+    }
+
+    fn fan_out_committed_cluster_raft_command(
+        &mut self,
+        paths: network::ClusterPaths,
+        state: ClusterBootstrapState,
+        events: Vec<KvEvent>,
+        _targets: Vec<ClusterEndpointRecord>,
+    ) {
+        let _ = network::fan_out_committed_cluster_raft_command_with_host(
+            &paths,
+            &state,
+            &events,
+            dfs_fuse_cluster_raft_committed_fanout_options(),
+            &mut DfsFuseClusterRaftCommittedFanoutHost,
+        );
+    }
+}
+
+struct DfsFuseClusterVoterReachabilityHost;
+
+impl network::ClusterVoterReachabilityHost for DfsFuseClusterVoterReachabilityHost {
+    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+        daemon::fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
+    }
+}
+
+struct DfsFuseClusterRaftLeaderElectionHost;
+
+impl network::ClusterRaftLeaderElectionHost for DfsFuseClusterRaftLeaderElectionHost {
+    fn local_vote_metadata(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> std::result::Result<network::ClusterRaftLocalVoteMetadata, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft local vote metadata", || {
+            network::cluster_raft_local_vote_metadata(paths, &state.local_node_id)
+        })
+    }
+
+    fn apply_local_vote(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+        vote: RaftRequestVoteRequest,
+    ) -> std::result::Result<RaftRequestVoteResponse, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft local vote", || {
+            network::apply_cluster_raft_vote(paths, &state.local_node_id, vote)
+        })
+    }
+
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> std::result::Result<network::ClusterRaftVoteResponse, NetworkError> {
+        let rpc_request = network::cluster_raft_vote_rpc_request(request)?;
+        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            &rpc_request,
+            timeout,
+            "cluster raft vote",
+        )?;
+        network::decode_cluster_raft_vote_rpc_response(&response)
+    }
+
+    fn observe_raft_term(
+        &mut self,
+        paths: &network::ClusterPaths,
+        local_node_id: &NodeId,
+        term: u64,
+    ) -> std::result::Result<(), NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft term observation", || {
+            network::observe_cluster_raft_term(paths, local_node_id, term).map(|_| ())
+        })
+    }
+
+    fn set_raft_leader(
+        &mut self,
+        paths: &network::ClusterPaths,
+        local_node_id: &NodeId,
+        term: u64,
+    ) -> std::result::Result<(), NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft leader set", || {
+            network::set_cluster_raft_leader(paths, local_node_id, term).map(|_| ())
+        })
+    }
+}
+
+struct DfsFuseClusterKvTxnForwardHost;
+
+impl network::ClusterKvTxnForwardHost for DfsFuseClusterKvTxnForwardHost {
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> std::result::Result<Option<NodeId>, NetworkError> {
+        with_dfs_fuse_cluster_raft_operation("cluster raft leader lookup", || {
+            network::cluster_raft_known_leader_id(paths, state)
+        })
+    }
+
+    fn send_cluster_kv_txn(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        txn: &KvTxn,
+        timeout: Duration,
+    ) -> std::result::Result<KvTxnResponse, NetworkError> {
+        let rpc_request = network::cluster_kv_txn_rpc_request(txn)?;
+        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            &rpc_request,
+            timeout,
+            "cluster kv txn",
+        )?;
+        network::decode_cluster_kv_txn_rpc_response(&response)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> std::result::Result<KvSnapshot, NetworkError> {
+        let rpc_request = network::cluster_kv_snapshot_rpc_request()?;
+        let response = dfs_fuse_send_daemon_rpc_to_endpoint(
+            endpoint,
+            &rpc_request,
+            timeout,
+            "cluster kv snapshot",
+        )?;
+        network::decode_cluster_kv_snapshot_rpc_response(&response)
+    }
+
+    fn relay_peers(
+        &mut self,
+        paths: &network::ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Vec<ClusterEndpointRecord> {
+        network::cluster_member_publish_targets(paths, state)
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        peer: &ClusterEndpointRecord,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> std::result::Result<network::ObjectRpcResponse, NetworkError> {
+        let signed = daemon::sign_daemon_rpc_request_for_local_node(request)
+            .map_err(|error| dfs_fuse_network_error("cluster relay sign inner", error))?;
+        let inner = network::DaemonControlRequest::authenticated_rpc(
+            daemon::daemon_rpc_command(&request.route),
+            request.clone(),
+            signed,
+        );
+        let outer =
+            network::RelayEnvelope::new(state.cluster_id.clone(), target_node_id.clone(), inner)
+                .into_request()?;
+        daemon::send_daemon_rpc_to_endpoint(peer, &outer, timeout)
+            .map_err(|error| dfs_fuse_network_error("cluster relay", error))
     }
 }
 
@@ -1253,7 +1758,11 @@ fn send_dfs_protocol_frame(
     request: &DfsProtocolFrameCommand,
     timeout: Duration,
 ) -> std::result::Result<DfsProtocolFrameResponse, DfsFuseError> {
-    daemon::send_dfs_protocol_frame_to_endpoint(endpoint, request, timeout)
+    let rpc_request = dfs::dfs_protocol_frame_rpc_request(request)
+        .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
+    let response = daemon::send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
+        .map_err(|source| DfsFuseError::Daemon(source.to_string()))?;
+    dfs::decode_dfs_protocol_frame_rpc_response(&response)
         .map_err(|source| DfsFuseError::Daemon(source.to_string()))
 }
 

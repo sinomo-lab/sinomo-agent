@@ -223,6 +223,20 @@ mod tests {
         };
         assert_eq!(kv_raft_node.module, "sinomo-kv");
 
+        let Some(StoragePathOwner::File(kv_watch_events)) =
+            layout.owner_for("cluster/watch-events.sobj")
+        else {
+            panic!("expected cluster kv watch events contract");
+        };
+        assert_eq!(kv_watch_events.module, "sinomo-kv");
+
+        let Some(StoragePathOwner::Escape(kv_watch_registration)) =
+            layout.owner_for("cluster/watches/watch-7.sobj")
+        else {
+            panic!("expected dynamic cluster kv watch registration escape");
+        };
+        assert_eq!(kv_watch_registration.module, "sinomo-kv");
+
         let report = layout
             .verify_relative_paths([
                 "daemon/status.sobj",

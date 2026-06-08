@@ -44,6 +44,12 @@ pub const ROLLOUT_OBJECT_RPC_ROUTES: &[&str] = &[
     ROLLOUT_CLEAR_STATUS_ROUTE,
 ];
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RolloutActivationStrategy {
+    MainOnlyShadowBootstrap,
+    ShadowSupervised,
+}
+
 pub use artifact::{
     activate_staged_rollout_binary, binary_should_update, current_executable_path,
     current_executable_should_update, install_binary_atomically, install_current_executable,

@@ -666,17 +666,28 @@ fn run_dfs_inspection(
         return run_dfs_inspection_against_metadata_root(metadata_root, request);
     }
     if let Some(status) = default_main_daemon_status()? {
-        return daemon_fetch_dfs_inspection_from_address(
+        return fetch_dfs_inspection_from_daemon_address(
             &status.address,
             &request,
             std::time::Duration::from_secs(10),
-        )
-        .map_err(Into::into);
+        );
     }
 
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
-    daemon_handle_daemon_dfs_inspection(&DaemonPaths::new(&data_dir), request).map_err(Into::into)
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    sinomo_runtime::dfs::inspect_cluster_aware_dfs(&data_dir, &cluster_paths, request)
+        .map_err(Into::into)
+}
+
+fn fetch_dfs_inspection_from_daemon_address(
+    address: &str,
+    request: &DaemonDfsInspectionRequest,
+    timeout: std::time::Duration,
+) -> Result<DaemonDfsInspectionResponse, CliError> {
+    let rpc_request = sinomo_runtime::dfs::dfs_inspection_rpc_request(request)?;
+    let response = daemon_send_daemon_rpc(address, &rpc_request, timeout)?;
+    sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response).map_err(Into::into)
 }
 
 fn run_dfs_inspection_against_metadata_root(
@@ -970,12 +981,12 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
             let report = if let Some(status) = default_main_daemon_status()? {
-                daemon_run_dfs_smoke_via_daemon(
+                run_dfs_smoke_via_daemon_address(
                     &status.address,
                     std::time::Duration::from_secs(30),
                 )?
             } else {
-                daemon_run_daemon_dfs_smoke(&DaemonPaths::new(&data_dir))?
+                run_local_dfs_smoke(&data_dir)?
             };
             if json {
                 print_json("<dfs-smoke>", &report)?;
@@ -1015,16 +1026,20 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         }
         DfsCliCommand::Services { json } => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
-            let daemon_paths = DaemonPaths::new(&data_dir);
+            let cluster_paths = sinomo_runtime::network::ClusterPaths::new(&data_dir);
             let services = DfsServiceAdvertisements {
-                metadata: decode_dfs_advertisements(daemon_handle_daemon_cluster_kv_range_prefix(
-                    &daemon_paths,
-                    sinomo_runtime::dfs::metadata_services_prefix(),
-                )?)?,
-                content: decode_dfs_advertisements(daemon_handle_daemon_cluster_kv_range_prefix(
-                    &daemon_paths,
-                    sinomo_runtime::dfs::content_services_prefix(),
-                )?)?,
+                metadata: decode_dfs_advertisements(
+                    sinomo_runtime::kv::read_cluster_kv_prefix_entries(
+                        &cluster_paths.kv_paths(),
+                        sinomo_runtime::dfs::metadata_services_prefix(),
+                    )?,
+                )?,
+                content: decode_dfs_advertisements(
+                    sinomo_runtime::kv::read_cluster_kv_prefix_entries(
+                        &cluster_paths.kv_paths(),
+                        sinomo_runtime::dfs::content_services_prefix(),
+                    )?,
+                )?,
             };
             if json {
                 print_json("<dfs-services>", &services)?;
@@ -1056,7 +1071,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::MetadataPublish { json } => {
             let data_dir = SinomoDataDir::from_env_or_home()?;
             data_dir.ensure_root_layout()?;
-            let report = daemon_publish_default_dfs_metadata_journal(&DaemonPaths::new(&data_dir))?;
+            let report = publish_dfs_metadata_journal_from_data_dir(&data_dir)?;
             if json {
                 print_json("<dfs-metadata-publish>", &report)?;
             } else if report.outcomes.is_empty() {
@@ -1072,6 +1087,172 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
         DfsCliCommand::Expose(command) => run_dfs_expose_command(command),
     }
+}
+
+fn run_dfs_smoke_via_daemon_address(
+    address: &str,
+    timeout: std::time::Duration,
+) -> Result<sinomo_runtime::dfs::DfsSmokeReport, CliError> {
+    let rpc_request = sinomo_runtime::dfs::dfs_smoke_rpc_request()?;
+    let response = daemon_send_daemon_rpc(address, &rpc_request, timeout)?;
+    sinomo_runtime::dfs::decode_dfs_smoke_rpc_response(&response).map_err(Into::into)
+}
+
+#[derive(Clone, Debug)]
+struct CliDfsControlPlaneKvClient {
+    cluster_paths: ClusterPaths,
+}
+
+impl CliDfsControlPlaneKvClient {
+    fn new(cluster_paths: &ClusterPaths) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+        }
+    }
+
+    fn kv_error(&self, source: impl std::fmt::Display) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            detail: source.to_string(),
+        }
+    }
+}
+
+impl sinomo_runtime::dfs::DfsControlPlaneKvClient for CliDfsControlPlaneKvClient {
+    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
+        sinomo_runtime::kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
+        sinomo_runtime::kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+    }
+
+    fn put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_runtime::kv::KvRevision, KvError> {
+        let response = self.txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key,
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })?;
+        Ok(response.revision)
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        let mut state = network::read_cluster_state(&self.cluster_paths)
+            .map_err(|source| self.kv_error(source))?;
+        let result =
+            cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
+                .map_err(|source| self.kv_error(source))?;
+        Ok(result.txn_response.unwrap_or(KvTxnResponse {
+            succeeded: true,
+            revision: result.snapshot.revision,
+            responses: Vec::new(),
+        }))
+    }
+}
+
+fn run_local_dfs_smoke(
+    data_dir: &SinomoDataDir,
+) -> Result<sinomo_runtime::dfs::DfsSmokeReport, CliError> {
+    data_dir.ensure_root_layout()?;
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let options = DaemonRunOptions::default();
+    let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
+    let control_plane = cluster_paths.kv_snapshot.exists().then(|| {
+        Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths))
+            as Box<dyn sinomo_runtime::dfs::DfsControlPlaneKvClient>
+    });
+    let Some(report) = sinomo_runtime::dfs::run_default_cluster_dfs_smoke(
+        data_dir,
+        &cluster_paths,
+        dfs_protocol_frame_sender(),
+        dfs_metadata_journal_batch_sender(),
+        dfs_metadata_snapshot_install_sender(),
+        Box::new(CliDfsControlPlaneKvClient::new(&cluster_paths)),
+        control_plane,
+        sinomo_runtime::dfs::DfsDefaultClusterSmokeOptions {
+            bootstrap: sinomo_runtime::dfs::DfsDefaultClusterBootstrapOptions {
+                publish_cluster_control: true,
+                local_endpoint,
+            },
+            smoke: sinomo_runtime::dfs::DfsSmokeOptions::default(),
+        },
+    )?
+    else {
+        return Err(CliError::ClusterOrphan);
+    };
+    Ok(report)
+}
+
+fn dfs_protocol_frame_sender() -> sinomo_runtime::dfs::DfsProtocolFrameSender {
+    fn transport_error(
+        error: impl std::fmt::Display,
+    ) -> sinomo_runtime::dfs::DfsPeerTransportError {
+        sinomo_runtime::dfs::DfsPeerTransportError::new(error.to_string())
+    }
+
+    std::sync::Arc::new(|endpoint, command, timeout| {
+        let request = sinomo_runtime::dfs::dfs_protocol_frame_rpc_request(command)
+            .map_err(transport_error)?;
+        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+            .map_err(transport_error)?;
+        sinomo_runtime::dfs::decode_dfs_protocol_frame_rpc_response(&response)
+            .map_err(transport_error)
+    })
+}
+
+fn dfs_metadata_journal_batch_sender() -> sinomo_runtime::dfs::DfsMetadataJournalBatchSender {
+    fn metadata_peer_error(
+        error: impl std::fmt::Display,
+    ) -> sinomo_runtime::dfs::DfsMetadataPeerTransportError {
+        sinomo_runtime::dfs::DfsMetadataPeerTransportError::new(error.to_string())
+    }
+
+    std::sync::Arc::new(|endpoint, command, timeout| {
+        let request = sinomo_runtime::dfs::dfs_metadata_journal_batch_rpc_request(command)
+            .map_err(metadata_peer_error)?;
+        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+            .map_err(metadata_peer_error)?;
+        sinomo_runtime::dfs::decode_dfs_metadata_journal_batch_rpc_response(&response)
+            .map_err(metadata_peer_error)
+    })
+}
+
+fn dfs_metadata_snapshot_install_sender() -> sinomo_runtime::dfs::DfsMetadataSnapshotInstallSender {
+    fn metadata_peer_error(
+        error: impl std::fmt::Display,
+    ) -> sinomo_runtime::dfs::DfsMetadataPeerTransportError {
+        sinomo_runtime::dfs::DfsMetadataPeerTransportError::new(error.to_string())
+    }
+
+    std::sync::Arc::new(|endpoint, command, timeout| {
+        let request = sinomo_runtime::dfs::dfs_metadata_snapshot_install_rpc_request(command)
+            .map_err(metadata_peer_error)?;
+        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+            .map_err(metadata_peer_error)?;
+        sinomo_runtime::dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
+            .map_err(metadata_peer_error)
+    })
+}
+
+fn publish_dfs_metadata_journal_from_data_dir(
+    data_dir: &SinomoDataDir,
+) -> Result<sinomo_runtime::dfs::DfsMetadataJournalReplicationReport, CliError> {
+    let cluster_paths = sinomo_runtime::network::ClusterPaths::new(data_dir);
+    Ok(sinomo_runtime::dfs::publish_cluster_dfs_metadata_journal(
+        data_dir,
+        &cluster_paths,
+        dfs_metadata_journal_batch_sender(),
+        dfs_metadata_snapshot_install_sender(),
+        sinomo_runtime::dfs::DfsMetadataJournalReplicationOptions::default(),
+    )?)
 }
 
 pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
@@ -1243,14 +1424,16 @@ struct DfsClusterNodeStatus {
 fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
-    let daemon_paths = DaemonPaths::new(&data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let state = daemon_read_local_cluster_state(&cluster_paths)?;
+    let state = read_cluster_state(&cluster_paths)?;
     let mut nodes = vec![DfsClusterNodeStatus {
         node_id: state.local_node_id.clone(),
         local: true,
         endpoint: Some("local-daemon".to_string()),
-        status: Some(daemon_handle_daemon_dfs_status(&daemon_paths)?),
+        status: Some(sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(
+            &data_dir,
+            &cluster_paths,
+        )?),
         error: None,
     }];
     let mut endpoints_by_node =
@@ -1266,10 +1449,7 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         let mut failures = Vec::new();
         let mut successful = None;
         for endpoint in endpoints {
-            match daemon_fetch_dfs_status_from_endpoint(
-                &endpoint,
-                std::time::Duration::from_secs(5),
-            ) {
+            match fetch_dfs_status_from_endpoint(&endpoint, std::time::Duration::from_secs(5)) {
                 Ok(status) => {
                     successful = Some((endpoint.address, status));
                     break;
@@ -1295,6 +1475,15 @@ fn inspect_cluster_dfs_status() -> Result<DfsClusterStatusReport, CliError> {
         });
     }
     Ok(DfsClusterStatusReport { nodes })
+}
+
+fn fetch_dfs_status_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: std::time::Duration,
+) -> Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError> {
+    let rpc_request = sinomo_runtime::dfs::dfs_status_rpc_request()?;
+    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    sinomo_runtime::dfs::decode_dfs_status_rpc_response(&response).map_err(Into::into)
 }
 
 fn decode_dfs_advertisements(
@@ -1603,8 +1792,8 @@ pub(crate) fn open_dfs_metadata_for_inspection_with_data_dir(
     let cluster_paths = ClusterPaths::new(data_dir);
     if cluster_paths.state.exists() {
         let file_system_id = sifs_file_system_id();
-        let mut shards = network::read_cluster_kv_prefix_entries(
-            &cluster_paths,
+        let mut shards = sinomo_runtime::kv::read_cluster_kv_prefix_entries(
+            &cluster_paths.kv_paths(),
             &format!("{}/", metadata_shards_prefix(&file_system_id)),
         )?
         .into_iter()

@@ -22,11 +22,6 @@ use sinomo_runtime::cli_registry::{
     CliCommandPolicy, CliParseError,
 };
 use sinomo_runtime::core::{EvaluationOutcome, EventEnvelope};
-#[cfg(test)]
-use sinomo_runtime::daemon::{
-    DaemonPaths,
-    handle_daemon_cluster_kv_txn_request as daemon_handle_daemon_cluster_kv_txn_request,
-};
 use sinomo_runtime::daemon::{
     default_main_daemon_status as daemon_default_main_daemon_status,
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
@@ -795,8 +790,21 @@ fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
 
 #[cfg(test)]
 fn commit_registry_trust_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
-    let daemon_paths = DaemonPaths::new(data_dir);
-    daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
+    let paths = ClusterPaths::new(data_dir);
+    let state = network::read_cluster_state_without_kv(&paths).map_err(|error| match error {
+        network::NetworkError::ClusterOrphan => {
+            CliError::Network(network::NetworkError::ClusterReadOnly {
+                detail: "local node has no cluster state".to_string(),
+            })
+        }
+        other => other.into(),
+    })?;
+    let (snapshot, _) = network::append_cluster_raft_command_with_response(
+        &paths,
+        &state.local_node_id,
+        sinomo_runtime::kv::KvCommand::Txn(txn),
+    )?;
+    network::write_imported_cluster_kv_snapshot_if_changed(&paths, &snapshot)?;
     Ok(())
 }
 
@@ -811,8 +819,8 @@ fn commit_registry_trust_cluster_txn(
         });
     };
     let request = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_KV_TXN_ROUTE,
-        network::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
+        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
         &txn,
     )
     .map_err(CliError::from)?;

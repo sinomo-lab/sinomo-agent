@@ -60,9 +60,13 @@ impl From<sinomo_network::NetworkError> for DaemonError {
     fn from(error: sinomo_network::NetworkError) -> Self {
         match error {
             sinomo_network::NetworkError::AuthDenied => Self::AuthDenied,
+            sinomo_network::NetworkError::AuthExpired => Self::AuthExpired,
             sinomo_network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             sinomo_network::NetworkError::ClusterReadOnly { detail } => {
                 Self::ClusterReadOnly { detail }
+            }
+            sinomo_network::NetworkError::InvalidClusterCommand { detail } => {
+                Self::Parse { detail }
             }
             sinomo_network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             sinomo_network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },

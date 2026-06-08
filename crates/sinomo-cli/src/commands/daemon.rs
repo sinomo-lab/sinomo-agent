@@ -482,8 +482,7 @@ fn print_local_daemon_iroh_endpoint(paths: &DaemonPaths, status: &DaemonStatus) 
         return;
     };
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let Ok(record) = daemon_read_local_iroh_endpoint_record(&cluster_paths, &cluster.node_id)
-    else {
+    let Ok(record) = network::read_iroh_endpoint_record(&cluster_paths, &cluster.node_id) else {
         return;
     };
     println!("  iroh endpoint: {}", record.endpoint().address);
@@ -528,12 +527,462 @@ pub(crate) fn handle_daemon_connection(
     daemon_handle_daemon_connection(stream, paths).map_err(Into::into)
 }
 
+pub(crate) fn cli_current_cluster_kv_store(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<InProcessKvStore, network::NetworkError> {
+    network::refresh_current_cluster_kv_store_with_host(
+        paths,
+        state,
+        cli_cluster_kv_snapshot_refresh_options(),
+        &mut CliClusterKvSnapshotRefreshHost,
+    )
+}
+
+pub(crate) fn cli_commit_cluster_kv_txn_with_quorum(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+) -> Result<KvSnapshot, network::NetworkError> {
+    Ok(cli_commit_cluster_kv_txn_with_quorum_response(paths, state, txn)?.snapshot)
+}
+
+pub(crate) fn cli_commit_cluster_kv_txn_with_quorum_response(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+) -> Result<network::ClusterKvTxnForwardResult, network::NetworkError> {
+    network::commit_cluster_kv_txn_with_quorum_response_with_host(
+        paths,
+        state,
+        txn,
+        cli_cluster_kv_txn_quorum_options(true),
+        &mut CliClusterKvTxnQuorumHost,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn handle_daemon_cluster_kv_txn_request(
     paths: &DaemonPaths,
     txn: KvTxn,
 ) -> Result<KvTxnResponse, CliError> {
-    daemon_handle_daemon_cluster_kv_txn_request(paths, txn).map_err(Into::into)
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let state =
+        network::read_cluster_state_without_kv(&cluster_paths).map_err(|error| match error {
+            network::NetworkError::ClusterOrphan => CliError::ClusterReadOnly {
+                detail: "local node has no cluster state".to_string(),
+            },
+            other => other.into(),
+        })?;
+    let mut state = state;
+    let result = network::commit_cluster_kv_txn_with_quorum_response_with_host(
+        &cluster_paths,
+        &mut state,
+        txn,
+        cli_cluster_kv_txn_quorum_options(true),
+        &mut CliClusterKvTxnQuorumHost,
+    )?;
+    network::write_imported_cluster_kv_snapshot_if_changed(&cluster_paths, &result.snapshot)?;
+    Ok(result.txn_response.unwrap_or(KvTxnResponse {
+        succeeded: true,
+        revision: result.snapshot.revision,
+        responses: Vec::new(),
+    }))
+}
+
+struct CliClusterKvSnapshotRefreshHost;
+
+impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, network::NetworkError> {
+        network::locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, network::NetworkError> {
+        let request = network::cluster_kv_snapshot_rpc_request()?;
+        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+            .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot refresh", error))?;
+        network::decode_cluster_kv_snapshot_rpc_response(&response)
+    }
+
+    fn restore_cluster_raft_from_snapshot_if_newer(
+        &mut self,
+        paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, network::NetworkError> {
+        network::locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+    }
+}
+
+struct CliClusterKvTxnQuorumHost;
+
+impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
+    fn refresh_current_cluster_kv_store(
+        &mut self,
+        paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<(), network::NetworkError> {
+        network::read_cluster_kv_store(paths).map(|_| ())
+    }
+
+    fn local_is_raft_leader(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, network::NetworkError> {
+        network::locked_cluster_raft_local_is_leader(paths, state)
+    }
+
+    fn forward_cluster_kv_txn_to_voter(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        txn: &KvTxn,
+        options: network::ClusterKvTxnForwardOptions,
+    ) -> Result<Option<network::ClusterKvTxnForwardResult>, network::NetworkError> {
+        network::forward_cluster_kv_txn_to_voter_with_host(
+            paths,
+            state,
+            txn,
+            options,
+            &mut CliClusterKvTxnForwardHost,
+        )
+    }
+
+    fn elect_cluster_raft_leader(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        options: network::ClusterRaftLeaderElectionOptions,
+    ) -> Result<bool, network::NetworkError> {
+        network::elect_cluster_raft_leader_with_host(
+            paths,
+            state,
+            options,
+            &mut CliClusterRaftLeaderElectionHost,
+        )
+    }
+
+    fn reachable_voter_count(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        options: network::ClusterVoterReachabilityOptions,
+    ) -> usize {
+        network::cluster_reachable_voter_count_with_host(
+            paths,
+            state,
+            options,
+            &mut CliClusterVoterReachabilityHost,
+        )
+    }
+
+    fn commit_cluster_raft_command_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        command: sinomo_runtime::kv::KvCommand,
+        options: network::ClusterRaftQuorumCommitOptions,
+    ) -> Result<network::ClusterRaftQuorumCommitResult, network::NetworkError> {
+        let mut host = CliClusterRaftQuorumCommitHost {
+            storage: network::LocalClusterRaftCommandStorage::new(
+                paths,
+                state.local_node_id.clone(),
+            ),
+        };
+        network::commit_cluster_raft_command_with_quorum_driver(
+            paths, state, command, options, &mut host,
+        )
+    }
+}
+
+struct CliClusterRaftQuorumCommitHost<'a> {
+    storage: network::LocalClusterRaftCommandStorage<'a>,
+}
+
+impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftQuorumCommitHost<'_> {
+    type Error = network::NetworkError;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect(
+        &mut self,
+        command: sinomo_runtime::kv::KvCommand,
+    ) -> Result<sinomo_runtime::kv::ClusterKvRaftUncommittedAppend, network::NetworkError> {
+        sinomo_runtime::kv::ClusterKvRaftCommandStorage::append_cluster_raft_command_uncommitted_or_no_effect(
+            &mut self.storage,
+            command,
+        )
+    }
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+        &mut self,
+    ) -> Result<(), network::NetworkError> {
+        sinomo_runtime::kv::ClusterKvRaftCommandStorage::discard_cluster_raft_uncommitted_tail_and_clear_leader(
+            &mut self.storage,
+        )
+    }
+
+    fn commit_cluster_raft_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_runtime::kv::ClusterKvRaftCommitResult, network::NetworkError> {
+        sinomo_runtime::kv::ClusterKvRaftCommandStorage::commit_cluster_raft_index_with_events(
+            &mut self.storage,
+            index,
+        )
+    }
+}
+
+impl network::ClusterRaftQuorumTransportHost for CliClusterRaftQuorumCommitHost<'_> {
+    fn replicate_cluster_raft_to_endpoint(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+        network::replicate_cluster_raft_to_endpoint_with_host(
+            paths,
+            state,
+            endpoint,
+            &[],
+            cli_cluster_raft_append_replication_options(timeout),
+            &mut CliClusterRaftAppendReplicationHost,
+        )
+        .map(|outcome| outcome.response)
+    }
+}
+
+struct CliClusterRaftAppendReplicationHost;
+
+impl network::ClusterRaftAppendReplicationHost for CliClusterRaftAppendReplicationHost {
+    fn last_local_raft_log_index(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<u64, network::NetworkError> {
+        Ok(network::open_cluster_raft_kv_node(paths, &state.local_node_id)?.last_log_index())
+    }
+
+    fn build_raft_append_request(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<network::ClusterRaftAppendRequest, network::NetworkError> {
+        network::build_cluster_raft_append_request_from_next_index(paths, state, next_index)
+    }
+
+    fn send_raft_append(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+        cli_send_cluster_raft_append(endpoint, request, timeout)
+    }
+}
+
+struct CliClusterRaftLeaderElectionHost;
+
+impl network::ClusterRaftLeaderElectionHost for CliClusterRaftLeaderElectionHost {
+    fn local_vote_metadata(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<network::ClusterRaftLocalVoteMetadata, network::NetworkError> {
+        network::locked_cluster_raft_local_vote_metadata(paths, &state.local_node_id)
+    }
+
+    fn apply_local_vote(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        vote: sinomo_runtime::kv::RaftRequestVoteRequest,
+    ) -> Result<sinomo_runtime::kv::RaftRequestVoteResponse, network::NetworkError> {
+        network::locked_apply_cluster_raft_vote(paths, &state.local_node_id, vote)
+    }
+
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
+        cli_send_cluster_raft_vote(endpoint, request, timeout)
+    }
+
+    fn observe_raft_term(
+        &mut self,
+        paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        term: u64,
+    ) -> Result<(), network::NetworkError> {
+        network::locked_observe_cluster_raft_term(paths, local_node_id, term).map(|_| ())
+    }
+
+    fn set_raft_leader(
+        &mut self,
+        paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        term: u64,
+    ) -> Result<(), network::NetworkError> {
+        network::locked_set_cluster_raft_leader(paths, local_node_id, term).map(|_| ())
+    }
+}
+
+struct CliClusterKvTxnForwardHost;
+
+impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, network::NetworkError> {
+        network::locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn send_cluster_kv_txn(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        txn: &KvTxn,
+        timeout: Duration,
+    ) -> Result<KvTxnResponse, network::NetworkError> {
+        cli_send_cluster_kv_txn(endpoint, txn, timeout)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, network::NetworkError> {
+        let request = network::cluster_kv_snapshot_rpc_request()?;
+        let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+            .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot", error))?;
+        network::decode_cluster_kv_snapshot_rpc_response(&response)
+    }
+
+    fn relay_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Vec<ClusterEndpointRecord> {
+        network::cluster_member_publish_targets(paths, state)
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        peer: &ClusterEndpointRecord,
+        request: &network::ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+        daemon_send_daemon_rpc_to_endpoint(peer, request, timeout)
+            .map_err(|error| cli_daemon_rpc_network_error("cluster relay", error))
+    }
+}
+
+fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::ClusterKvTxnQuorumOptions {
+    network::ClusterKvTxnQuorumOptions {
+        allow_forwarding,
+        raft_append_timeout: Duration::from_secs(10),
+        forward_options: network::ClusterKvTxnForwardOptions {
+            timeout: Duration::from_secs(10),
+            tcp_command_timeout: Duration::from_secs(8),
+            iroh_command_timeout: Duration::from_secs(6),
+        },
+        leader_election_options: network::ClusterRaftLeaderElectionOptions {
+            max_attempts: network::CLUSTER_RAFT_LEADER_ELECTION_ATTEMPTS,
+            timeout: Duration::from_secs(10),
+            tcp_command_timeout: Duration::from_secs(8),
+            iroh_command_timeout: Duration::from_secs(6),
+            tcp_foreground_attempt_timeout: Duration::from_secs(2),
+            public_foreground_attempt_timeout: Duration::from_secs(5),
+            iroh_foreground_attempt_timeout: Duration::from_secs(3),
+        },
+        voter_reachability_options: cli_cluster_voter_reachability_options(),
+    }
+}
+
+fn cli_cluster_kv_snapshot_refresh_options() -> network::ClusterKvSnapshotRefreshOptions {
+    network::ClusterKvSnapshotRefreshOptions {
+        without_local_snapshot_timeout: Duration::from_secs(10),
+        with_local_snapshot_timeout: Duration::from_secs(5),
+        tcp_command_timeout: Duration::from_secs(5),
+        iroh_command_timeout: Duration::from_secs(5),
+        tcp_foreground_attempt_timeout: Duration::from_secs(2),
+        public_foreground_attempt_timeout: Duration::from_secs(5),
+        iroh_foreground_attempt_timeout: Duration::from_secs(3),
+    }
+}
+
+fn cli_cluster_raft_append_replication_options(
+    timeout: Duration,
+) -> network::ClusterRaftAppendReplicationOptions {
+    network::ClusterRaftAppendReplicationOptions {
+        max_attempts: 3,
+        timeout,
+        tcp_command_timeout: timeout,
+        iroh_command_timeout: timeout,
+        tcp_foreground_attempt_timeout: Duration::from_secs(2).min(timeout),
+        public_foreground_attempt_timeout: Duration::from_secs(5).min(timeout),
+        iroh_foreground_attempt_timeout: Duration::from_secs(3).min(timeout),
+    }
+}
+
+fn cli_send_cluster_kv_txn(
+    endpoint: &ClusterEndpointRecord,
+    txn: &KvTxn,
+    timeout: Duration,
+) -> Result<KvTxnResponse, network::NetworkError> {
+    let request = network::cluster_kv_txn_rpc_request(txn)?;
+    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+        .map_err(|error| cli_daemon_rpc_network_error("cluster kv txn", error))?;
+    network::decode_cluster_kv_txn_rpc_response(&response)
+}
+
+fn cli_send_cluster_raft_append(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ClusterRaftAppendRequest,
+    timeout: Duration,
+) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+    let rpc_request = network::cluster_raft_append_rpc_request(request)?;
+    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
+        .map_err(|error| cli_daemon_rpc_network_error("cluster raft append", error))?;
+    network::decode_cluster_raft_append_rpc_response(&response)
+}
+
+fn cli_send_cluster_raft_vote(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ClusterRaftVoteRequest,
+    timeout: Duration,
+) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
+    let rpc_request = network::cluster_raft_vote_rpc_request(request)?;
+    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
+        .map_err(|error| cli_daemon_rpc_network_error("cluster raft vote", error))?;
+    network::decode_cluster_raft_vote_rpc_response(&response)
+}
+
+fn cli_daemon_rpc_network_error(
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> network::NetworkError {
+    network::NetworkError::Io {
+        operation: operation.to_string(),
+        detail: error.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -541,7 +990,65 @@ pub(crate) fn handle_daemon_cluster_join_request(
     paths: &DaemonPaths,
     request: ClusterJoinRegistrationRequest,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    daemon_handle_daemon_cluster_join_request(paths, request).map_err(Into::into)
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    network::handle_cluster_join_registration_request_with_host(
+        &cluster_paths,
+        request,
+        OffsetDateTime::now_utc(),
+        &mut CliClusterJoinRegistrationHost,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+struct CliClusterJoinRegistrationHost;
+
+#[cfg(test)]
+impl network::ClusterMembershipRpcForwardHost for CliClusterJoinRegistrationHost {
+    fn send_membership_rpc(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &network::ObjectRpcRequest,
+    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+        daemon_send_daemon_rpc_to_endpoint(endpoint, request, DAEMON_JOIN_TIMEOUT)
+            .map_err(|error| cli_daemon_rpc_network_error("cluster membership rpc", error))
+    }
+
+    fn relay_membership_rpc_to_voter_via_peer(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _voter: &ClusterEndpointRecord,
+        _peer: &ClusterEndpointRecord,
+        _request: &network::ObjectRpcRequest,
+    ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+        Err(network::NetworkError::Io {
+            operation: "cluster membership relay".to_string(),
+            detail: "CLI test join host does not relay membership RPCs".to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
+    fn prepare_join_registration_state(
+        &mut self,
+        _paths: &ClusterPaths,
+        state: ClusterBootstrapState,
+    ) -> Result<ClusterBootstrapState, network::NetworkError> {
+        Ok(state)
+    }
+
+    fn commit_join_registration_state(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<KvSnapshot, network::NetworkError> {
+        network::sync_cluster_state_to_local_raft_unchecked(paths, state)
+    }
 }
 
 pub(crate) fn stage_rollout_main_activation(

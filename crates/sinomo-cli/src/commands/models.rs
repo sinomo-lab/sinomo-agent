@@ -1017,7 +1017,7 @@ fn write_local_model_runtime_config(
 #[cfg(test)]
 fn commit_model_config_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
     let daemon_paths = DaemonPaths::new(data_dir);
-    daemon_handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
+    handle_daemon_cluster_kv_txn_request(&daemon_paths, txn)?;
     Ok(())
 }
 
@@ -1029,8 +1029,8 @@ fn commit_model_config_cluster_txn(_data_dir: &SinomoDataDir, txn: KvTxn) -> Res
         });
     };
     let request = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_KV_TXN_ROUTE,
-        network::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
+        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
         &txn,
     )
     .map_err(CliError::from)?;

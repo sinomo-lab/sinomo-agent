@@ -4,7 +4,9 @@ use sinomo_cli_registry::{
     CliCommandHandler, CliCommandHelp, CliCommandMetadata, CliCommandPolicy, CliParseError,
 };
 use sinomo_events::EventStore;
-use sinomo_kv::{KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_kv::{
+    CLUSTER_KV_RPC_CATEGORY, CLUSTER_KV_SNAPSHOT_ROUTE, KvSnapshot, KvTxn, KvTxnResponse,
+};
 use sinomo_local::SinomoDataDir;
 use sinomo_module::ModuleReplayReport;
 use sinomo_network as network;
@@ -287,6 +289,7 @@ impl From<network::NetworkError> for SandboxCliError {
     fn from(error: network::NetworkError) -> Self {
         match error {
             network::NetworkError::AuthDenied => Self::AuthDenied,
+            network::NetworkError::AuthExpired => Self::AuthExpired,
             network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },
@@ -4143,8 +4146,8 @@ fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
         });
     };
     let request = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_KV_TXN_ROUTE,
-        network::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_kv::CLUSTER_KV_TXN_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
         &txn,
     )
     .map_err(CliError::from)?;
@@ -4156,8 +4159,8 @@ fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
 
 fn fetch_daemon_cluster_kv_snapshot(address: &str) -> Result<KvSnapshot, CliError> {
     let request = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_KV_SNAPSHOT_ROUTE,
-        network::CLUSTER_KV_RPC_CATEGORY,
+        CLUSTER_KV_SNAPSHOT_ROUTE,
+        CLUSTER_KV_RPC_CATEGORY,
         &(),
     )
     .map_err(CliError::from)?;

@@ -1844,6 +1844,15 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         status: DfsConflictStatus,
     ) -> Result<Option<DfsConflictRecord>>;
     fn journal_since(&self, after_sequence: u64) -> Result<Vec<DfsMetadataJournalEntry>>;
+    fn journal_last_sequence(&self) -> Result<u64> {
+        Ok(self
+            .metadata_shard_statuses()?
+            .into_iter()
+            .map(|status| status.journal_last_sequence)
+            .max()
+            .unwrap_or(0))
+    }
+    fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot>;
     fn journal_since_limited(
         &self,
         after_sequence: u64,
@@ -1894,6 +1903,12 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     }
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>>;
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize>;
+    fn replace_with_replicated_snapshot(
+        &mut self,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool>;
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription;
     fn poll_subscription(
         &self,
@@ -4714,6 +4729,45 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         )
     }
 
+    fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
+        let mut tables = DfsMetadataTableSnapshotTables::default();
+        for backend in self.shards.values() {
+            if let Some(snapshot_tables) =
+                LocalSobjMetadataBackend::export_table_snapshot(backend).tables
+            {
+                tables.file_systems.extend(snapshot_tables.file_systems);
+                tables.objects.extend(snapshot_tables.objects);
+                tables
+                    .file_system_objects
+                    .extend(snapshot_tables.file_system_objects);
+                tables.paths.extend(snapshot_tables.paths);
+                tables.inodes.extend(snapshot_tables.inodes);
+                tables.dirfrags.extend(snapshot_tables.dirfrags);
+                tables.dentries.extend(snapshot_tables.dentries);
+                tables.hardlinks.extend(snapshot_tables.hardlinks);
+                tables
+                    .compacted_tombstones
+                    .extend(snapshot_tables.compacted_tombstones);
+                tables.versions.extend(snapshot_tables.versions);
+                tables.receipts.extend(snapshot_tables.receipts);
+                tables.intents.extend(snapshot_tables.intents);
+                tables.conflicts.extend(snapshot_tables.conflicts);
+                tables
+                    .visible_commits
+                    .extend(snapshot_tables.visible_commits);
+                tables
+                    .namespace_transactions
+                    .extend(snapshot_tables.namespace_transactions);
+                tables.namespace_jobs.extend(snapshot_tables.namespace_jobs);
+            }
+        }
+        Ok(DfsMetadataTableSnapshot {
+            format_version: METADATA_TABLE_SNAPSHOT_FORMAT_VERSION,
+            tables: Some(tables),
+            ops: Vec::new(),
+        })
+    }
+
     fn metadata_replication_cursor(
         &self,
         target_node_id: &NodeId,
@@ -4768,6 +4822,16 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         self.shard_backend_mut(&batch.shard_id)?
             .apply_journal_batch(batch)
+    }
+
+    fn replace_with_replicated_snapshot(
+        &mut self,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        self.shard_backend_mut(&source_shard_id)?
+            .replace_with_replicated_snapshot(source_shard_id, replayed_through_sequence, snapshot)
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {
@@ -7571,6 +7635,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         )
     }
 
+    fn journal_last_sequence(&self) -> Result<u64> {
+        Ok(LocalSobjMetadataBackend::journal_last_sequence(self))
+    }
+
+    fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
+        Ok(LocalSobjMetadataBackend::export_table_snapshot(self))
+    }
+
     fn metadata_replication_cursor(
         &self,
         target_node_id: &NodeId,
@@ -7618,6 +7690,20 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn apply_journal_batch(&mut self, batch: &DfsMetadataJournalBatch) -> Result<usize> {
         LocalSobjMetadataBackend::apply_journal_batch(self, batch)
+    }
+
+    fn replace_with_replicated_snapshot(
+        &mut self,
+        source_shard_id: DfsMetadataShardId,
+        replayed_through_sequence: u64,
+        snapshot: DfsMetadataTableSnapshot,
+    ) -> Result<bool> {
+        LocalSobjMetadataBackend::replace_with_replicated_snapshot(
+            self,
+            source_shard_id,
+            replayed_through_sequence,
+            snapshot,
+        )
     }
 
     fn subscribe(&self, after_sequence: u64) -> DfsMetadataSubscription {

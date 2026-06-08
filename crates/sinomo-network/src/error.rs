@@ -5,6 +5,8 @@ use crate::prelude::*;
 pub enum NetworkError {
     #[error("network authorization was denied")]
     AuthDenied,
+    #[error("network authorization expired")]
+    AuthExpired,
     #[error("cluster has not been initialized; run `sinomo cluster init` or `sinomo cluster join`")]
     ClusterOrphan,
     #[error("unknown node: {node_id}")]
@@ -60,6 +62,8 @@ pub enum NetworkError {
     },
     #[error("cluster is read-only: {detail}")]
     ClusterReadOnly { detail: String },
+    #[error("invalid cluster command: {detail}")]
+    InvalidClusterCommand { detail: String },
     #[error(
         "cluster connectivity record source mismatch: expected {expected_source_node_id}, got {record_source_node_id}"
     )]

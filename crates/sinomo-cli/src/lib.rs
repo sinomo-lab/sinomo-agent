@@ -67,79 +67,44 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterJoinInvite, ClusterMemberRecord,
     ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
-    ClusterNodeRolloutStatus, EvaluationScorecard, EventEnvelope, RollbackTrigger,
+    ClusterNodeRolloutStatus, ClusterNodeStatusRecord, ClusterTransportKind, EvaluationScorecard,
+    EventEnvelope, RollbackTrigger,
 };
 #[cfg(test)]
-use sinomo_runtime::daemon::read_cluster_kv_snapshot as daemon_read_cluster_kv_snapshot;
-#[cfg(test)]
-use sinomo_runtime::daemon::send_cluster_join_registration_to_endpoint as daemon_send_cluster_join_registration_to_endpoint;
-use sinomo_runtime::daemon::sync_cluster_state_to_kv as daemon_sync_cluster_state_to_kv;
-#[cfg(test)]
 use sinomo_runtime::daemon::{
-    AuthenticatedDaemonCommand, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    DAEMON_MAIN_CLUSTER_ROLE, DaemonError, DaemonSignerAuthority, SignedDaemonCommand,
-    authenticate_daemon_control_request, authorize_authenticated_daemon_command,
-    daemon_advertised_endpoints_for_state, daemon_package_version, elect_cluster_raft_leader,
-    refresh_daemon_node_status_in_kv, sign_daemon_rpc_request_from_data_dir, write_daemon_status,
+    AuthenticatedDaemonCommand, DAEMON_MAIN_CLUSTER_ROLE, DaemonError, DaemonSignerAuthority,
+    SignedDaemonCommand, authenticate_daemon_control_request,
+    authorize_authenticated_daemon_command, daemon_package_version,
+    sign_daemon_rpc_request_from_data_dir, write_daemon_status,
 };
 use sinomo_runtime::daemon::{
-    ClusterDoctorFinding, ClusterHealthRow, DaemonClusterProcess, DaemonClusterRegistration,
-    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DaemonStopBeforeInstallStart, DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus,
-    IdleStatsSnapshot, InstallLayout, InstalledDaemonInstallPlanRequest,
-    InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus, RolloutActivationStrategy,
-    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SINOMO_DAEMON_DEFAULT_HOST,
-    SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
-    activate_boot_entries as daemon_activate_boot_entries,
-    build_cluster_join_invite as daemon_build_cluster_join_invite, cluster_doctor_findings,
-    cluster_has_local_quorum, cluster_health_rows,
-    cluster_peer_members as daemon_cluster_peer_members, cluster_reachable_voter_count,
-    cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
-    daemon_bind_address, daemon_cluster_registration,
-    daemon_cluster_registration_if_initialized as daemon_registration_if_initialized,
-    daemon_cluster_status_from_local_state, daemon_connect_address,
+    DaemonClusterProcess, DaemonClusterRegistration, DaemonClusterStatus, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStopBeforeInstallStart,
+    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, IdleStatsSnapshot, InstallLayout,
+    InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
+    SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT, SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+    activate_boot_entries as daemon_activate_boot_entries, cluster_node_status_from_daemon_status,
+    current_shadow_daemon_options, daemon_advertised_endpoints_for_state, daemon_bind_address,
+    daemon_cluster_registration, daemon_cluster_status, daemon_connect_address,
     daemon_install_start_installed_sinomo_daemon, daemon_install_stop_daemon_before_install,
-    daemon_install_stop_daemon_if_running,
+    daemon_install_stop_daemon_if_running, daemon_options_from_status,
     deactivate_boot_entries as daemon_deactivate_boot_entries,
     default_boot_dir as daemon_default_boot_dir,
-    default_cluster_invite_introducers as daemon_default_cluster_invite_introducers,
     default_main_daemon_status as daemon_default_main_daemon_status,
     ensure_install_layout_dirs as daemon_ensure_install_layout_dirs,
-    ensure_rollout_target_platform_matches_local as daemon_ensure_rollout_target_platform_matches_local,
-    fetch_cluster_health_rows as daemon_fetch_cluster_health_rows,
     fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
+    fetch_cluster_kv_snapshot_from_endpoint as daemon_fetch_cluster_kv_snapshot_from_endpoint,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
-    fetch_dfs_inspection_from_address as daemon_fetch_dfs_inspection_from_address,
-    fetch_dfs_status_from_endpoint as daemon_fetch_dfs_status_from_endpoint,
+    fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
     git_is_available as daemon_git_is_available,
-    handle_daemon_cluster_kv_range_prefix as daemon_handle_daemon_cluster_kv_range_prefix,
     handle_daemon_connection as daemon_handle_daemon_connection,
-    handle_daemon_dfs_inspection as daemon_handle_daemon_dfs_inspection,
-    handle_daemon_dfs_status as daemon_handle_daemon_dfs_status,
-    initialize_local_cluster as daemon_initialize_local_cluster,
-    install_local_rollout_native_dylib_modules as daemon_install_local_rollout_native_dylib_modules,
     install_managed_source_repo as daemon_install_managed_source_repo,
-    installed_daemon_paths as daemon_installed_daemon_paths,
-    local_daemon_cluster_options as daemon_local_daemon_cluster_options,
+    installed_daemon_paths as daemon_installed_daemon_paths, invite_introducers_from_daemon_status,
     managed_source_git_status_lines as daemon_managed_source_git_status_lines,
-    prepare_cluster_join_retry_state as daemon_prepare_cluster_join_retry_state,
     prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
-    prepare_pending_cluster_join_state as daemon_prepare_pending_cluster_join_state,
-    probe_daemon_status, publish_cluster_invitation_to_quorum,
-    publish_default_dfs_metadata_journal as daemon_publish_default_dfs_metadata_journal,
-    read_cluster_connectivity_graph_from_kv as daemon_read_cluster_connectivity_graph_from_kv,
-    read_local_cluster_state as daemon_read_local_cluster_state,
-    read_local_iroh_endpoint_record as daemon_read_local_iroh_endpoint_record,
-    reconcile_cluster_join_with_introducers as daemon_reconcile_cluster_join_with_introducers,
-    register_daemon_cluster_node as daemon_register_daemon_cluster_node,
-    remove_boot_entry as daemon_remove_boot_entry,
-    remove_cluster_members as daemon_remove_cluster_members,
-    remove_local_cluster_state as daemon_remove_local_cluster_state,
-    rollout_target_platform_matches_local as daemon_rollout_target_platform_matches_local,
+    probe_daemon_status, remove_boot_entry as daemon_remove_boot_entry,
     run_daemon_control_loop as daemon_run_daemon_control_loop,
-    run_daemon_dfs_smoke as daemon_run_daemon_dfs_smoke,
-    run_dfs_smoke_via_daemon as daemon_run_dfs_smoke_via_daemon,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_rollout_binary as daemon_send_daemon_rollout_binary,
     send_daemon_rollout_binary_to_endpoint as daemon_send_daemon_rollout_binary_to_endpoint,
@@ -151,31 +116,21 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_build_to_endpoint as daemon_send_daemon_rollout_build_to_endpoint,
     send_daemon_rollout_clear_status as daemon_send_daemon_rollout_clear_status,
     send_daemon_rollout_diagnostics as daemon_send_daemon_rollout_diagnostics,
+    send_daemon_rpc as daemon_send_daemon_rpc,
+    send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_shutdown_request,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,
     sleep_for_shadow_start_delay as daemon_sleep_for_shadow_start_delay,
     stage_rollout_main_activation as daemon_stage_rollout_main_activation,
     start_daemon_command_process as daemon_start_daemon_command_process,
-    update_cluster_node_role as daemon_update_cluster_node_role,
-    update_cluster_raft_role as daemon_update_cluster_raft_role,
     wait_for_local_shadow_rollout_completion as daemon_wait_for_local_shadow_rollout_completion,
     wait_for_main_daemon_health as daemon_wait_for_main_daemon_health,
-    write_cluster_kv_snapshot_if_changed as daemon_write_cluster_kv_snapshot_if_changed,
-    write_imported_cluster_kv_snapshot_if_changed as daemon_write_imported_cluster_kv_snapshot_if_changed,
     write_install_boot_entries as daemon_write_install_boot_entries,
-    write_local_cluster_state as daemon_write_local_cluster_state,
 };
-use sinomo_runtime::daemon::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 #[cfg(test)]
 use sinomo_runtime::daemon::{
     DaemonLock, daemon_rpc_command,
-    handle_daemon_cluster_join_request as daemon_handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn_request as daemon_handle_daemon_cluster_kv_txn_request,
-    handle_daemon_cluster_kv_watch_drain_request, handle_daemon_cluster_kv_watch_events_request,
-    handle_daemon_cluster_kv_watch_prefix_request, handle_daemon_cluster_raft_append_request,
-    handle_daemon_cluster_raft_vote_request,
     handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
     handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
 };
@@ -211,6 +166,7 @@ use sinomo_runtime::daemon::{
     handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
     open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
 };
+use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
     DfsConflictRecord, DfsFileSystemId, DfsMetadataShardConfig, DfsObjectId,
     DfsOperatorInspectionCursor, DfsOperatorInspector, DfsOperatorRepairView,
@@ -229,15 +185,18 @@ use sinomo_runtime::events::{EventStore, InMemoryEventStore};
 use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
-use sinomo_runtime::network::ClusterId;
-#[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationRequest;
-#[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationResponse;
-use sinomo_runtime::network::{self, ClusterPaths};
-#[cfg(test)]
-use sinomo_runtime::node::shadow_daemon_node_id;
-use sinomo_runtime::node::{NodeId, load_or_create_main_node_identity};
+use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
+use sinomo_runtime::network::{
+    CLUSTER_INVITE_CHALLENGE_PROTOCOL, ClusterDoctorFinding, ClusterHealthRow, ClusterId,
+    ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
+    verify_cluster_invite_challenge_proof,
+};
+use sinomo_runtime::node::{
+    NodeId, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
+    shadow_daemon_node_id,
+};
 #[cfg(test)]
 use sinomo_runtime::rollout::read_rollout_status;
 #[cfg(test)]
@@ -250,15 +209,21 @@ use sinomo_runtime::rollout::{
     ClusterRolloutBinaryUploadManifest, ClusterRolloutBuildRequest,
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutUploadArtifactSpec,
     DEFAULT_SHADOW_TELEMETRY_LIMIT, LocalRolloutNativeDylibModuleArtifact, ManagedSourceStatus,
-    RolloutController, RolloutError, RolloutMainActivation, RolloutObservation,
-    RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths, clear_rollout_status,
-    ensure_rollout_layout, ensure_rollout_source_repo, install_current_executable,
+    RolloutActivationStrategy, RolloutController, RolloutError, RolloutMainActivation,
+    RolloutObservation, RolloutRuntimeState, RolloutTelemetryGateConfig, SelfRolloutPaths,
+    clear_rollout_status, ensure_rollout_layout, ensure_rollout_source_repo,
+    install_current_executable,
+    install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
     managed_source_status, prepare_cluster_rollout_binary_request,
     prepare_cluster_rollout_build_request, prepare_local_rollout_artifacts,
     prepare_rollout_dev_artifacts, prepare_rollout_source_bundle, read_rollout_runtime_state,
     read_rollout_telemetry_gate_config, rollout_source_head, rollout_status_view,
     shadow_telemetry_scorecard_from_event_store, source_heads_match,
     sync_external_repo_from_managed, unique_rollout_targets, write_rollout_telemetry_gate_config,
+};
+use sinomo_runtime::rollout::{
+    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
+    cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
 };
 use std::cell::{Cell, RefCell};
 use std::env;
@@ -293,6 +258,166 @@ pub use providers::*;
 use sandbox_host::SinomoCliSandboxHost;
 use time::format_description::well_known::Rfc3339;
 pub use tui::*;
+
+struct CliClusterVoterReachabilityHost;
+
+impl network::ClusterVoterReachabilityHost for CliClusterVoterReachabilityHost {
+    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+        daemon_fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
+    }
+}
+
+fn cli_cluster_voter_reachability_options() -> network::ClusterVoterReachabilityOptions {
+    network::ClusterVoterReachabilityOptions {
+        timeout: Duration::from_secs(5),
+        tcp_command_timeout: Duration::from_secs(5),
+        iroh_command_timeout: Duration::from_secs(3),
+        tcp_foreground_attempt_timeout: Duration::from_secs(1),
+        public_foreground_attempt_timeout: Duration::from_secs(4),
+        iroh_foreground_attempt_timeout: Duration::from_millis(1500),
+    }
+}
+
+fn cluster_has_local_quorum(paths: &ClusterPaths, state: &ClusterBootstrapState) -> bool {
+    network::cluster_has_local_quorum_with_host(
+        paths,
+        state,
+        cli_cluster_voter_reachability_options(),
+        &mut CliClusterVoterReachabilityHost,
+    )
+}
+
+fn cluster_reachable_voter_count(paths: &ClusterPaths, state: &ClusterBootstrapState) -> usize {
+    network::cluster_reachable_voter_count_with_host(
+        paths,
+        state,
+        cli_cluster_voter_reachability_options(),
+        &mut CliClusterVoterReachabilityHost,
+    )
+}
+
+struct CliClusterStatusProbe<'a> {
+    paths: &'a ClusterPaths,
+}
+
+impl network::ClusterStatusProbe for CliClusterStatusProbe<'_> {
+    fn probe_member_status(
+        &self,
+        state: &ClusterBootstrapState,
+        member: &ClusterMemberRecord,
+    ) -> Option<ClusterNodeStatusRecord> {
+        cli_probe_member_daemon_status(self.paths, state, member)
+    }
+
+    fn peer_local_health_rows(
+        &self,
+        state: &ClusterBootstrapState,
+        member: &ClusterMemberRecord,
+    ) -> Option<Vec<ClusterHealthRow>> {
+        cli_fetch_local_cluster_health_rows_from_member(self.paths, state, member)
+    }
+}
+
+fn cli_probe_member_daemon_status(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Option<ClusterNodeStatusRecord> {
+    if network::cluster_member_is_local_process(state, member)
+        && let Some(status) = cli_probe_local_member_daemon_status(paths, state, member)
+    {
+        return Some(status);
+    }
+    for endpoint in
+        network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
+    {
+        let Ok(status) =
+            daemon_fetch_daemon_status_from_endpoint(&endpoint, CLUSTER_HEALTH_PROBE_TIMEOUT)
+        else {
+            continue;
+        };
+        let Some(cluster) = status.cluster.as_ref() else {
+            continue;
+        };
+        if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+            continue;
+        }
+        return Some(cluster_node_status_from_daemon_status(
+            &status,
+            cluster,
+            None,
+            OffsetDateTime::now_utc(),
+        ));
+    }
+    None
+}
+
+fn cli_probe_local_member_daemon_status(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Option<ClusterNodeStatusRecord> {
+    let data_dir = paths.root.parent()?;
+    let target_paths = if member.node_id == state.local_node_id {
+        DaemonPaths::with_root(data_dir.join("daemon"))
+    } else if member.node_id == shadow_daemon_node_id(&state.local_node_id) {
+        DaemonPaths::with_root(data_dir.join("shadow-daemon"))
+    } else {
+        return None;
+    };
+    let status = match probe_daemon_status(&target_paths, CLUSTER_HEALTH_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => status,
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => return None,
+    };
+    let cluster = status.cluster.as_ref()?;
+    if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+        return None;
+    }
+    Some(cluster_node_status_from_daemon_status(
+        &status,
+        cluster,
+        None,
+        OffsetDateTime::now_utc(),
+    ))
+}
+
+fn cli_fetch_local_cluster_health_rows_from_member(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> Option<Vec<ClusterHealthRow>> {
+    for endpoint in
+        network::cluster_member_daemon_status_targets_with_connectivity(paths, state, member)
+    {
+        let Ok(request) = network::cluster_local_health_rpc_request() else {
+            return None;
+        };
+        let Ok(response) = daemon_send_daemon_rpc_to_endpoint(
+            &endpoint,
+            &request,
+            CLUSTER_HEALTH_PEER_ROWS_TIMEOUT,
+        ) else {
+            continue;
+        };
+        let Ok(rows) = network::decode_cluster_health_rpc_response(&response) else {
+            continue;
+        };
+        return Some(rows);
+    }
+    None
+}
+
+fn cli_fetch_cluster_health_rows(
+    address: &str,
+    timeout: Duration,
+) -> Result<Vec<ClusterHealthRow>, CliError> {
+    let request = network::cluster_health_rpc_request()?;
+    let response = daemon_send_daemon_rpc(address, &request, timeout)?;
+    network::decode_cluster_health_rpc_response(&response).map_err(Into::into)
+}
 
 mod commands;
 mod completion;
@@ -1542,6 +1667,7 @@ const DAEMON_CLUSTER_KV_TXN_TIMEOUT: Duration = Duration::from_secs(15);
 const IROH_DAEMON_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLUSTER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const CLUSTER_HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(test)]
 const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;

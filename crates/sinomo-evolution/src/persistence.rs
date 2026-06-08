@@ -17,13 +17,16 @@ use sinomo_runtime::config::{
     ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
     ConfigStore, ConfigValueType, ConfigWriteTarget,
 };
+use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
-use sinomo_runtime::daemon::{DaemonDfsEndpointTransport, DaemonPaths};
 use sinomo_runtime::dfs::{
-    DfsMetadataShardConfig, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
+    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
+    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
+    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
+    DfsProtocolFrameSender, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
     default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
     metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    sifs_file_system_id,
+    publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::local::SinomoDataDir;
@@ -32,6 +35,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -363,8 +367,7 @@ pub fn mirror_candidate_bundle_to_sifs(
         metadata_publish_error: None,
     };
 
-    match sinomo_runtime::daemon::publish_default_dfs_metadata_journal(&DaemonPaths::new(data_dir))
-    {
+    match publish_evolution_sifs_metadata_journal(data_dir) {
         Ok(_) => {}
         Err(error) => report.metadata_publish_error = Some(error.to_string()),
     }
@@ -2557,7 +2560,7 @@ struct SifsWriteDigest {
 
 fn open_evolution_sifs_service(
     data_dir: &SinomoDataDir,
-) -> Result<NetworkedDfsService<DaemonDfsEndpointTransport>, EvolutionPersistenceError> {
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, EvolutionPersistenceError> {
     data_dir
         .ensure_root_layout()
         .map_err(|source| EvolutionPersistenceError::Io {
@@ -2584,7 +2587,11 @@ fn open_evolution_sifs_service(
         }
     })?;
     let service = NetworkedDfsService::new(
-        DaemonDfsEndpointTransport::new(local_node_id, endpoints),
+        DfsEndpointTransport::new(
+            local_node_id,
+            endpoints,
+            evolution_sifs_protocol_frame_sender(),
+        ),
         content,
     );
     let service = if let Some(metadata) =
@@ -2619,6 +2626,56 @@ fn open_evolution_sifs_service(
             detail: source.to_string(),
         })?;
     Ok(service)
+}
+
+fn evolution_sifs_protocol_frame_sender() -> DfsProtocolFrameSender {
+    Arc::new(evolution_send_dfs_protocol_frame)
+}
+
+fn evolution_send_dfs_protocol_frame(
+    endpoint: &ClusterEndpointRecord,
+    command: &DfsProtocolFrameCommand,
+    timeout: std::time::Duration,
+) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
+    let request = sinomo_runtime::dfs::dfs_protocol_frame_rpc_request(command)
+        .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+        .map_err(|error| DfsPeerTransportError::new(error.to_string()))?;
+    sinomo_runtime::dfs::decode_dfs_protocol_frame_rpc_response(&response)
+        .map_err(|error| DfsPeerTransportError::new(error.to_string()))
+}
+
+fn publish_evolution_sifs_metadata_journal(
+    data_dir: &SinomoDataDir,
+) -> Result<(), sinomo_runtime::dfs::DfsError> {
+    let cluster_paths = ClusterPaths::new(data_dir);
+    let sender: DfsMetadataJournalBatchSender = Arc::new(|endpoint, command, timeout| {
+        let request = sinomo_runtime::dfs::dfs_metadata_journal_batch_rpc_request(command)
+            .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
+        let response =
+            sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
+        sinomo_runtime::dfs::decode_dfs_metadata_journal_batch_rpc_response(&response)
+            .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))
+    });
+    let snapshot_sender: DfsMetadataSnapshotInstallSender =
+        Arc::new(|endpoint, command, timeout| {
+            let request = sinomo_runtime::dfs::dfs_metadata_snapshot_install_rpc_request(command)
+                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
+            let response =
+                sinomo_runtime::daemon::send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
+                    .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))?;
+            sinomo_runtime::dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
+                .map_err(|error| DfsMetadataPeerTransportError::new(error.to_string()))
+        });
+    publish_cluster_dfs_metadata_journal(
+        data_dir,
+        &cluster_paths,
+        sender,
+        snapshot_sender,
+        DfsMetadataJournalReplicationOptions::default(),
+    )?;
+    Ok(())
 }
 
 fn open_evolution_sifs_sharded_metadata_backend(
@@ -2707,7 +2764,7 @@ fn should_skip_sifs_bundle_mirror_path(relative: &str) -> bool {
 }
 
 fn write_reader_to_sifs<R: Read>(
-    service: &mut NetworkedDfsService<DaemonDfsEndpointTransport>,
+    service: &mut NetworkedDfsService<DfsEndpointTransport>,
     sifs_path: &str,
     mut reader: R,
 ) -> Result<SifsWriteDigest, EvolutionPersistenceError> {
@@ -2722,7 +2779,7 @@ fn write_reader_to_sifs<R: Read>(
 }
 
 fn write_bytes_to_sifs(
-    service: &mut NetworkedDfsService<DaemonDfsEndpointTransport>,
+    service: &mut NetworkedDfsService<DfsEndpointTransport>,
     sifs_path: &str,
     bytes: &[u8],
 ) -> Result<SifsWriteDigest, EvolutionPersistenceError> {

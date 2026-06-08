@@ -15,19 +15,19 @@ use sinomo_rollout::{
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutProgressUpdate,
     ClusterRolloutUploadArtifactSpec, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
     MainExitObservation, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
-    RolloutFailureDiagnostics, RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV,
-    SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, classify_main_exit,
-    clear_rollout_status, cluster_rollout_progress_status, deploy_managed_source_bundle,
-    ensure_rollout_layout, install_binary_atomically, managed_source_status,
-    read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
-    record_activation_failure, record_main_activation_staged,
+    RolloutActivationStrategy, RolloutFailureDiagnostics, RolloutMainActivation,
+    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV,
+    SelfRolloutPaths, classify_main_exit, clear_rollout_status, cluster_rollout_progress_status,
+    deploy_managed_source_bundle, ensure_rollout_layout, install_binary_atomically,
+    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
+    read_tail_lossy, record_activation_failure, record_main_activation_staged,
     record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
     record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
-    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_diagnostics_report,
-    rollout_main_activation_path, rollout_remote_repo_path, rollout_shadow_finalize_path,
-    rollout_staged_main_binary, rollout_staged_shadow_binary, rollout_timestamp_now,
-    source_heads_match, stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file,
-    write_json, write_main_activation, write_rollout_status,
+    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_main_activation_path,
+    rollout_remote_repo_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
+    rollout_staged_shadow_binary, rollout_timestamp_now, source_heads_match,
+    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file, write_json,
+    write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fmt::Display;
@@ -109,7 +109,7 @@ fn write_cluster_rollout_progress(
 }
 
 fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
-    if let Err(error) = crate::refresh_daemon_node_status_in_kv(daemon_paths) {
+    if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(daemon_paths) {
         eprintln!("sinomo daemon rollout progress publish failed: {error}");
     }
 }
@@ -155,7 +155,6 @@ pub struct ShadowMainRolloutMonitor {
     pub activation: RolloutMainActivation,
     pub main_options: crate::DaemonRunOptions,
     pub previous_main_binary: PathBuf,
-    pub previous_main_backup: Option<PathBuf>,
     pub previous_shadow_binary: PathBuf,
     pub diagnostics: CandidateMainDiagnostics,
     pub deadline: Instant,
@@ -204,20 +203,6 @@ pub enum PendingShadowMainExit {
         main_binary: PathBuf,
         main_options: crate::DaemonRunOptions,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RolloutActivationStrategy {
-    MainOnlyShadowBootstrap,
-    ShadowSupervised,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LocalShadowRolloutRestartPlan {
-    pub shadow_paths: DaemonPaths,
-    pub shadow_options: crate::DaemonRunOptions,
-    pub args: Vec<String>,
-    pub extra_env: Vec<(&'static str, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -338,62 +323,12 @@ pub fn prepare_local_rollout_main_activation(
     }
 }
 
-pub fn install_local_rollout_native_dylib_modules(
+fn install_local_rollout_native_dylib_modules(
     data_dir: &Path,
     artifacts: &[LocalRolloutNativeDylibModuleArtifact],
 ) -> Result<Vec<sinomo_module::NativeDylibModuleInstallResult>, DaemonError> {
     sinomo_rollout::install_local_rollout_native_dylib_modules(data_dir, artifacts)
         .map_err(Into::into)
-}
-
-pub fn prepare_local_shadow_rollout_restart(
-    data_dir: &Path,
-    main_binary: &Path,
-    main_host: &str,
-    main_port: u16,
-    fallback_shadow_host: &str,
-    fallback_shadow_port: u16,
-    probe_timeout: Duration,
-) -> LocalShadowRolloutRestartPlan {
-    let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
-    let shadow_options = match probe_daemon_status(&shadow_paths, probe_timeout) {
-        DaemonProbeStatus::Running(status) => crate::DaemonRunOptions {
-            host: status.host,
-            port: status.port,
-        },
-        DaemonProbeStatus::Locked {
-            status: Some(status),
-        } => crate::DaemonRunOptions {
-            host: status.host,
-            port: status.port,
-        },
-        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
-            crate::DaemonRunOptions {
-                host: fallback_shadow_host.to_string(),
-                port: fallback_shadow_port,
-            }
-        }
-    };
-    let args = vec![
-        "daemon".to_string(),
-        "shadow".to_string(),
-        "run".to_string(),
-        "--host".to_string(),
-        shadow_options.host.clone(),
-        "--port".to_string(),
-        shadow_options.port.to_string(),
-    ];
-    let extra_env = vec![
-        (SHADOW_MAIN_BINARY_ENV, main_binary.display().to_string()),
-        (SHADOW_MAIN_HOST_ENV, main_host.to_string()),
-        (SHADOW_MAIN_PORT_ENV, main_port.to_string()),
-    ];
-    LocalShadowRolloutRestartPlan {
-        shadow_paths,
-        shadow_options,
-        args,
-        extra_env,
-    }
 }
 
 fn shadow_reexec_request_path(rollout_paths: &SelfRolloutPaths) -> PathBuf {
@@ -1046,13 +981,6 @@ pub fn shadow_main_binary_from_env(rollout_paths: &SelfRolloutPaths) -> PathBuf 
         .unwrap_or_else(|| rollout_paths.main_binary.clone())
 }
 
-pub fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
-    sinomo_rollout::rollout_target_platform_matches_local(
-        status.target_os.as_deref(),
-        status.target_arch.as_deref(),
-    )
-}
-
 fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
     if pending_rollout {
         Duration::from_millis(250)
@@ -1076,32 +1004,6 @@ fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) 
     modified_at
         .elapsed()
         .is_ok_and(|age| age >= MAIN_ACTIVATION_SHUTDOWN_GRACE)
-}
-
-pub fn cluster_rollout_should_use_remote_build(
-    address: &str,
-    remote_build_requested: bool,
-    binary_provided: bool,
-    platform_matches_local: Option<bool>,
-) -> bool {
-    sinomo_rollout::cluster_rollout_should_use_remote_build(
-        address,
-        remote_build_requested,
-        binary_provided,
-        platform_matches_local,
-    )
-}
-
-pub fn ensure_rollout_target_platform_matches_local(
-    address: &str,
-    status: &DaemonStatus,
-) -> Result<(), DaemonError> {
-    sinomo_rollout::ensure_rollout_target_platform_matches_local(
-        address,
-        status.target_os.as_deref(),
-        status.target_arch.as_deref(),
-    )
-    .map_err(Into::into)
 }
 
 pub fn handle_daemon_rollout_binary_request(
@@ -1861,11 +1763,6 @@ fn rollout_staged_detail(
     }
 }
 
-pub fn handle_daemon_rollout_diagnostics(paths: &DaemonPaths) -> Result<String, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    rollout_diagnostics_report(&SelfRolloutPaths::new(data_dir)).map_err(Into::into)
-}
-
 fn stop_shadow_supervisor_for_rollout(
     shadow_paths: &DaemonPaths,
     timeout: Duration,
@@ -2080,7 +1977,7 @@ pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String,
     let data_dir = daemon_data_dir(paths)?;
     let rollout_paths = SelfRolloutPaths::new(&data_dir);
     let cleared = clear_rollout_status(&rollout_paths)?;
-    if let Err(error) = crate::refresh_daemon_node_status_in_kv(paths) {
+    if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(paths) {
         eprintln!("sinomo daemon rollout status clear publish failed: {error}");
     }
     if cleared {
@@ -2317,7 +2214,6 @@ pub fn start_shadow_main_if_needed(
             host: activation.main_host.clone(),
             port: activation.main_port,
         };
-        let previous_main_backup = None;
         if let Some(staged_main) = activation
             .staged_main_binary
             .as_ref()
@@ -2344,7 +2240,6 @@ pub fn start_shadow_main_if_needed(
                         activation,
                         main_options: activation_main_options,
                         previous_main_binary,
-                        previous_main_backup,
                         previous_shadow_binary,
                         diagnostics,
                         deadline: Instant::now() + candidate_timeout,
@@ -2866,46 +2761,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn cluster_rollout_remote_build_policy_uses_remote_targets_and_platform() {
-        assert!(cluster_rollout_should_use_remote_build(
-            "10.0.0.2:21353",
-            false,
-            false,
-            Some(false)
-        ));
-        assert!(cluster_rollout_should_use_remote_build(
-            "10.0.0.2:21353",
-            false,
-            false,
-            None
-        ));
-        assert!(!cluster_rollout_should_use_remote_build(
-            "10.0.0.2:21353",
-            false,
-            false,
-            Some(true)
-        ));
-        assert!(!cluster_rollout_should_use_remote_build(
-            "10.0.0.2:21353",
-            false,
-            true,
-            Some(false)
-        ));
-        assert!(!cluster_rollout_should_use_remote_build(
-            "127.0.0.1:21353",
-            false,
-            false,
-            Some(false)
-        ));
-        assert!(cluster_rollout_should_use_remote_build(
-            "127.0.0.1:21353",
-            true,
-            true,
-            Some(true)
-        ));
-    }
-
-    #[test]
     fn rollout_binary_upload_chunks_append_at_expected_offsets() {
         let root = temp_rollout_test_root("binary-upload-chunks");
         let paths = DaemonPaths::with_root(root.join("daemon"));
@@ -3285,7 +3140,6 @@ mod tests {
                 port: activation.main_port,
             },
             previous_main_binary: activation.main_binary.clone(),
-            previous_main_backup: None,
             previous_shadow_binary,
             diagnostics: CandidateMainDiagnostics {
                 stdout_log: root.join("stdout.log"),
@@ -3323,7 +3177,6 @@ mod tests {
                 port: 21353,
             },
             previous_main_binary: rollout_paths.main_binary.clone(),
-            previous_main_backup: None,
             previous_shadow_binary,
             diagnostics: CandidateMainDiagnostics {
                 stdout_log: root.join("stdout.log"),

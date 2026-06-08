@@ -6,6 +6,7 @@ pub(crate) use network::advertised_peer_route_targets;
 pub(crate) use network::build_cluster_raft_append_request_from_next_index;
 #[cfg(test)]
 pub(crate) use network::cluster_connectivity_sync_ops;
+pub(crate) use network::cluster_invite_publish_targets;
 #[cfg(test)]
 pub(crate) use network::cluster_raft_known_leader_id;
 #[cfg(test)]
@@ -516,13 +517,43 @@ pub(crate) fn cluster_init_with_paths(
     options: ClusterInitOptions,
     paths: &ClusterPaths,
 ) -> Result<(), CliError> {
-    let state = daemon_initialize_local_cluster(
-        paths,
-        options.cluster_id,
-        options.node_id,
-        options.name,
-        OffsetDateTime::now_utc(),
-    )?;
+    paths.ensure()?;
+    if paths.state.exists() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster is already initialized at {}; use `sinomo cluster status`",
+                paths.state.display()
+            ),
+        });
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let local_node_id = options.node_id.unwrap_or_else(NodeId::generate);
+    let cluster_id = options.cluster_id.unwrap_or_else(ClusterId::generate);
+    let name = options.name;
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        name.clone(),
+        local_node_id,
+        name,
+        main_public_key.clone(),
+        now,
+    );
+    ensure_local_daemon_cluster_members(
+        &mut state,
+        &DaemonRunOptions::default(),
+        &DaemonRunOptions::shadow_default(),
+        now,
+    );
+    network::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
+    network::write_cluster_state(paths, &state)?;
+    {
+        let _raft_guard = network::lock_cluster_raft_operation()?;
+        network::set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
+    }
+    sync_cluster_state_to_kv(paths, &state)?;
+
     println!("cluster initialized: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("state: {}", paths.state.display());
@@ -601,7 +632,14 @@ pub(crate) fn publish_cluster_invitation(
     state: &ClusterBootstrapState,
     invite: &ClusterJoinInvite,
 ) -> Result<(), CliError> {
-    match publish_cluster_invitation_to_quorum(paths, state, invite).map_err(CliError::from) {
+    match network::publish_cluster_invitation_to_quorum_with_host(
+        paths,
+        state,
+        invite,
+        &mut CliClusterInvitePublishHost,
+    )
+    .map(|_| ())
+    {
         Ok(()) => Ok(()),
         Err(CliError::ClusterReadOnly { .. }) if !cluster_raft_local_is_voter(state) => {
             publish_cluster_invitation_via_voter(paths, state, invite)
@@ -638,21 +676,6 @@ fn cluster_invite_requires_voter_error(
     }
 }
 
-pub(crate) fn cluster_invite_publish_targets(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Vec<ClusterEndpointRecord> {
-    let mut seen_nodes = std::collections::BTreeSet::new();
-    let mut targets = Vec::new();
-    for endpoint in network::cluster_voter_command_targets(paths, state) {
-        if !seen_nodes.insert(endpoint.node_id.clone()) {
-            continue;
-        }
-        targets.push(endpoint);
-    }
-    targets
-}
-
 pub(crate) fn build_cluster_invite(
     state: &ClusterBootstrapState,
     options: &ClusterInviteOptions,
@@ -672,15 +695,53 @@ pub(crate) fn build_cluster_invite(
         path: paths.root.display().to_string(),
         detail: "cluster paths have no data directory parent".to_string(),
     })?;
-    daemon_build_cluster_join_invite(state, data_dir, introducers, options.ttl_seconds, now)
-        .map_err(Into::into)
+    let issuer_identity = load_or_create_main_node_identity(data_dir)?;
+    network::build_cluster_join_invite(
+        state,
+        &issuer_identity,
+        introducers,
+        options.ttl_seconds,
+        now,
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn default_invite_introducers(
     state: &ClusterBootstrapState,
     paths: &ClusterPaths,
 ) -> Vec<ClusterEndpointRecord> {
-    daemon_default_cluster_invite_introducers(paths, state, DAEMON_PROBE_TIMEOUT)
+    let mut introducers = Vec::new();
+    if let Some(data_dir) = paths.root.parent() {
+        let daemon_paths = DaemonPaths::with_root(data_dir.join("daemon"));
+        if let DaemonProbeStatus::Running(status) =
+            probe_daemon_status(&daemon_paths, DAEMON_PROBE_TIMEOUT)
+        {
+            for endpoint in invite_introducers_from_daemon_status(&state.local_node_id, &status) {
+                network::push_unique_introducer(&mut introducers, endpoint);
+            }
+            if let Ok(record) = network::read_iroh_endpoint_record(paths, &state.local_node_id) {
+                network::push_unique_introducer(&mut introducers, record.endpoint());
+            }
+        }
+    }
+
+    for endpoint in state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized()
+                && member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == "daemon.main.run")
+        })
+        .flat_map(|member| member.endpoints.iter().cloned())
+    {
+        network::push_unique_introducer(&mut introducers, endpoint);
+    }
+    network::sort_default_invite_introducers(&mut introducers);
+    network::compact_default_invite_introducers(&mut introducers);
+    introducers
 }
 
 pub(crate) fn cluster_join(options: ClusterJoinOptions) -> Result<(), CliError> {
@@ -736,8 +797,8 @@ pub(crate) fn cluster_join_with_paths(
         .clone()
         .unwrap_or_else(|| invite.cluster_id.clone());
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
-    let mut state = daemon_prepare_pending_cluster_join_state(
-        paths,
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    let mut state = network::prepare_pending_cluster_join_state(
         cluster_id,
         invite
             .cluster_name
@@ -745,13 +806,14 @@ pub(crate) fn cluster_join_with_paths(
             .unwrap_or_else(|| options.name.clone()),
         local_node_id.clone(),
         options.name,
-        &main_options,
-        &shadow_options,
+        main_public_key,
+        shadow_public_key,
         timestamp,
-    )?;
-    daemon_write_local_cluster_state(paths, &state)?;
+    );
+    ensure_local_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
+    network::write_cluster_state(paths, &state)?;
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
-    daemon_write_local_cluster_state(paths, &state)?;
+    network::write_cluster_state(paths, &state)?;
     println!("cluster join recorded: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
@@ -780,16 +842,17 @@ pub(crate) fn cluster_join_retry_with_paths(
         });
     }
     let (main_options, shadow_options) = local_daemon_cluster_options()?;
-    state = daemon_prepare_cluster_join_retry_state(
-        paths,
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    state = network::prepare_cluster_join_retry_state(
         state,
-        &main_options,
-        &shadow_options,
+        main_public_key,
+        shadow_public_key,
         timestamp,
-    )?;
+    );
+    ensure_local_daemon_cluster_members(&mut state, &main_options, &shadow_options, timestamp);
     reconcile_cluster_join_with_introducers(&mut state, &invite, Some(paths))?;
     state.updated_at = timestamp;
-    daemon_write_local_cluster_state(paths, &state)?;
+    network::write_cluster_state(paths, &state)?;
     println!("cluster join reconciled: {}", state.cluster_id);
     println!("local node: {}", state.local_node_id);
     println!("invite: {}", options.invite);
@@ -797,18 +860,90 @@ pub(crate) fn cluster_join_retry_with_paths(
     Ok(())
 }
 
+fn local_daemon_public_keys(paths: &ClusterPaths) -> Result<(String, String), CliError> {
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let main_identity = load_or_create_main_node_identity(data_dir)?;
+    let shadow_identity = load_or_create_shadow_node_identity(data_dir)?;
+    Ok((main_identity.public_key, shadow_identity.public_key))
+}
+
+fn ensure_local_daemon_cluster_members(
+    state: &mut ClusterBootstrapState,
+    main_options: &DaemonRunOptions,
+    shadow_options: &DaemonRunOptions,
+    timestamp: OffsetDateTime,
+) -> bool {
+    let main_node_id = state.local_node_id.clone();
+    let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+    let lan_ips = network::discover_default_lan_ip_candidates();
+    let route_ips = network::discover_peer_route_ip_candidates(state);
+    let main_endpoints = daemon_advertised_endpoints_for_state(
+        state,
+        &main_node_id,
+        main_options,
+        0,
+        &lan_ips,
+        &route_ips,
+    );
+    let shadow_endpoints = daemon_advertised_endpoints_for_state(
+        state,
+        &shadow_node_id,
+        shadow_options,
+        10,
+        &lan_ips,
+        &route_ips,
+    );
+    network::ensure_daemon_cluster_members(state, main_endpoints, shadow_endpoints, timestamp)
+}
+
 pub(crate) fn reconcile_cluster_join_with_introducers(
     state: &mut ClusterBootstrapState,
     invite: &ClusterJoinInvite,
     paths: Option<&ClusterPaths>,
 ) -> Result<(), CliError> {
-    let reconciliation = daemon_reconcile_cluster_join_with_introducers(
+    struct CliClusterJoinReconciliationHost;
+
+    impl network::ClusterJoinReconciliationHost for CliClusterJoinReconciliationHost {
+        fn send_join_registration(
+            &mut self,
+            endpoint: &ClusterEndpointRecord,
+            request: &ClusterJoinRegistrationRequest,
+            tcp_timeout: Duration,
+            iroh_timeout: Duration,
+        ) -> Result<ClusterJoinRegistrationResponse, network::NetworkError> {
+            send_cluster_join_registration_to_channel(endpoint, request, tcp_timeout, iroh_timeout)
+                .map_err(|source| network::NetworkError::Io {
+                    operation: "cluster join registration".to_string(),
+                    detail: source.to_string(),
+                })
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            endpoint: &ClusterEndpointRecord,
+            timeout: Duration,
+        ) -> Result<KvSnapshot, network::NetworkError> {
+            daemon_fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(|source| {
+                network::NetworkError::Io {
+                    operation: "cluster join snapshot fetch".to_string(),
+                    detail: source.to_string(),
+                }
+            })
+        }
+    }
+
+    let reconciliation = network::reconcile_cluster_join_with_introducers_with_host(
         state,
         invite,
         DAEMON_JOIN_TIMEOUT,
         IROH_DAEMON_JOIN_TIMEOUT,
         paths,
-    )?;
+        &mut CliClusterJoinReconciliationHost,
+    )
+    .map_err(CliError::from)?;
     if let Some(snapshot) = reconciliation.kv_snapshot
         && let Some(paths) = paths
     {
@@ -825,8 +960,62 @@ pub(crate) fn send_cluster_join_registration_over_iroh(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterJoinRegistrationRequest,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    daemon_send_cluster_join_registration_to_endpoint(endpoint, request, IROH_DAEMON_JOIN_TIMEOUT)
-        .map_err(Into::into)
+    send_cluster_join_registration_to_endpoint(endpoint, request, IROH_DAEMON_JOIN_TIMEOUT)
+}
+
+fn send_cluster_join_registration_to_channel(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterJoinRegistrationRequest,
+    tcp_timeout: Duration,
+    iroh_timeout: Duration,
+) -> Result<ClusterJoinRegistrationResponse, CliError> {
+    let timeout = match endpoint.transport {
+        ClusterTransportKind::Iroh => iroh_timeout,
+        _ => tcp_timeout,
+    };
+    send_cluster_join_registration_to_endpoint(endpoint, request, timeout)
+}
+
+fn send_cluster_join_registration_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterJoinRegistrationRequest,
+    timeout: Duration,
+) -> Result<ClusterJoinRegistrationResponse, CliError> {
+    let challenge = network::random_url_secret(32)?;
+    let challenge_request = ClusterInviteChallengeRequest {
+        protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
+        invite_id: request.invite.invite_id.clone(),
+        challenge: challenge.clone(),
+    };
+    let challenge_rpc = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_JOIN_CHALLENGE_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        &challenge_request,
+    )?;
+    let proof_response = send_join_rpc(endpoint, &challenge_rpc, timeout)?;
+    let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
+    verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
+
+    let register_rpc = network::ObjectRpcRequest::encode_body(
+        network::CLUSTER_JOIN_REGISTER_ROUTE,
+        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_join_rpc(endpoint, &register_rpc, timeout)?;
+    response.decode_body().map_err(Into::into)
+}
+
+fn send_join_rpc(
+    endpoint: &ClusterEndpointRecord,
+    request: &network::ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<network::ObjectRpcResponse, CliError> {
+    match endpoint.transport {
+        ClusterTransportKind::Iroh => {
+            daemon_send_daemon_rpc_to_endpoint(endpoint, request, timeout).map_err(Into::into)
+        }
+        _ => daemon_send_daemon_rpc(&endpoint.address, request, timeout).map_err(Into::into),
+    }
 }
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
@@ -877,7 +1066,7 @@ pub(crate) fn cluster_health() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     if let Some(status) = default_main_daemon_status()?
         && let Ok(rows) =
-            daemon_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
+            cli_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
     {
         print_cluster_health_rows(rows);
         return Ok(());
@@ -969,7 +1158,7 @@ pub(crate) fn cluster_doctor() -> Result<(), CliError> {
     refresh_cluster_kv_from_local_daemon(&paths)?;
     let state = read_cluster_state(&paths)?;
     let rows = cluster_health_rows_for_cli(&paths, &state)?;
-    let graph = daemon_read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
+    let graph = network::read_cluster_connectivity_graph_from_kv(&paths).unwrap_or_default();
     let mut findings = cluster_doctor_findings(&state, &graph, &rows);
     if let Some(data_dir) = paths.root.parent() {
         findings.extend(data_dir_storage_contract_findings(data_dir)?);
@@ -1001,11 +1190,18 @@ fn cluster_health_rows_for_cli(
 ) -> Result<Vec<ClusterHealthRow>, CliError> {
     if let Some(status) = default_main_daemon_status()?
         && let Ok(rows) =
-            daemon_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
+            cli_fetch_cluster_health_rows(&status.address, CLUSTER_HEALTH_COMMAND_TIMEOUT)
     {
         return Ok(rows);
     }
-    cluster_health_rows(paths, state).map_err(Into::into)
+    network::cluster_health_rows_with_probe(
+        paths,
+        state,
+        &CliClusterStatusProbe { paths },
+        true,
+        OffsetDateTime::now_utc(),
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn cluster_peers() -> Result<(), CliError> {
@@ -1023,14 +1219,38 @@ pub(crate) fn cluster_peers() -> Result<(), CliError> {
     Ok(())
 }
 
+pub(crate) struct CliClusterMemberMutationHost;
+
+impl network::ClusterMemberMutationHost for CliClusterMemberMutationHost {
+    fn current_cluster_kv_store(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<InProcessKvStore, network::NetworkError> {
+        cli_current_cluster_kv_store(paths, state)
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, network::NetworkError> {
+        cli_commit_cluster_kv_txn_with_quorum(paths, state, txn)
+    }
+}
+
 pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
-    let update = daemon_update_cluster_node_role(
+    let state = network::read_cluster_state(&paths)?;
+    let update = network::update_cluster_node_role_with_host(
         &paths,
+        state,
         options.node_id.clone(),
         options.role.clone(),
         OffsetDateTime::now_utc(),
+        &mut CliClusterMemberMutationHost,
     )?;
     if !update.changed {
         println!(
@@ -1053,11 +1273,14 @@ pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> 
 pub(crate) fn cluster_raft_role(options: ClusterRaftRoleOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     refresh_cluster_kv_from_local_daemon(&paths)?;
-    let update = daemon_update_cluster_raft_role(
+    let state = network::read_cluster_state(&paths)?;
+    let update = network::update_cluster_raft_role_with_host(
         &paths,
+        state,
         options.node_id.clone(),
         options.role.clone(),
         OffsetDateTime::now_utc(),
+        &mut CliClusterMemberMutationHost,
     )?;
     if !update.changed {
         println!(
@@ -1179,15 +1402,18 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
         println!("merged {count} cluster endpoint(s) for existing member {node_id}");
     }
     if !endpoint_updates.is_empty() || imported_changed {
-        daemon_sync_cluster_state_to_kv(&paths, &state)?;
+        sync_cluster_state_to_kv(&paths, &state)?;
     }
 
     if let Some(node_id) = options.promote {
-        let update = daemon_update_cluster_raft_role(
+        let state = network::read_cluster_state(&paths)?;
+        let update = network::update_cluster_raft_role_with_host(
             &paths,
+            state,
             node_id,
             ClusterMemberRole::Voter,
             OffsetDateTime::now_utc(),
+            &mut CliClusterMemberMutationHost,
         )?;
         if update.changed {
             println!(
@@ -1211,8 +1437,13 @@ pub(crate) fn cluster_repair_members(options: ClusterRepairMembersOptions) -> Re
 
 pub(crate) fn cluster_remove(options: ClusterRemoveOptions) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    let removal =
-        daemon_remove_cluster_members(&paths, options.node_ids.clone(), OffsetDateTime::now_utc())?;
+    let state = network::read_cluster_state(&paths)?;
+    let removal = network::remove_cluster_members_with_host(
+        &paths,
+        state,
+        options.node_ids.clone(),
+        &mut CliClusterMemberMutationHost,
+    )?;
     for member in removal.removed {
         println!(
             "cluster member {} removed: {} {}",
@@ -1228,25 +1459,47 @@ pub(crate) fn cluster_peer_members(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterMemberRecord>, CliError> {
     refresh_cluster_kv_from_local_daemon(paths)?;
-    let (main_options, shadow_options) = local_daemon_cluster_options()?;
-    daemon_cluster_peer_members(
-        paths,
-        &main_options,
-        &shadow_options,
-        OffsetDateTime::now_utc(),
-    )
-    .map_err(Into::into)
+    let mut state = read_cluster_state(paths)?;
+    if network::cluster_state_needs_join_registration(&state) {
+        let (main_options, shadow_options) = local_daemon_cluster_options()?;
+        ensure_local_daemon_cluster_members(
+            &mut state,
+            &main_options,
+            &shadow_options,
+            OffsetDateTime::now_utc(),
+        );
+        network::write_cluster_state(paths, &state)?;
+    }
+    Ok(state.members)
 }
 
 pub(crate) fn cluster_leave() -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
-    daemon_remove_local_cluster_state(&paths)?;
+    network::remove_local_cluster_state(&paths)?;
     println!("cluster state removed: {}", paths.state.display());
     Ok(())
 }
 
 pub(crate) fn read_cluster_state(paths: &ClusterPaths) -> Result<ClusterBootstrapState, CliError> {
-    daemon_read_local_cluster_state(paths).map_err(Into::into)
+    let mut state = network::read_cluster_state(paths)?;
+    prepare_local_cluster_state_for_cli(paths, &mut state)?;
+    Ok(state)
+}
+
+fn prepare_local_cluster_state_for_cli(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+) -> Result<(), CliError> {
+    ensure_local_daemon_cluster_members(
+        state,
+        &DaemonRunOptions::default(),
+        &DaemonRunOptions::shadow_default(),
+        OffsetDateTime::now_utc(),
+    );
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    network::assign_local_daemon_member_public_keys(state, main_public_key, shadow_public_key);
+    network::refresh_local_iroh_endpoints_from_disk(paths, state, OffsetDateTime::now_utc())?;
+    Ok(())
 }
 
 pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Result<(), CliError> {
@@ -1262,7 +1515,7 @@ pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Resu
 
 #[cfg(test)]
 pub(crate) fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
-    match daemon_read_cluster_kv_snapshot(paths) {
+    match network::read_cluster_kv_snapshot(paths) {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => {
             eprintln!("warning: ignoring unreadable cluster kv snapshot: {error}");
@@ -1277,7 +1530,7 @@ pub(crate) fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), CliError> {
-    daemon_write_cluster_kv_snapshot_if_changed(paths, snapshot)
+    network::write_cluster_kv_snapshot_if_changed(paths, snapshot)
         .map(|_| ())
         .map_err(Into::into)
 }
@@ -1286,17 +1539,17 @@ pub(crate) fn write_imported_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), CliError> {
-    daemon_write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)
+    network::write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)
         .map(|_| ())
         .map_err(Into::into)
 }
 
-#[cfg(test)]
 pub(crate) fn sync_cluster_state_to_kv(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<KvSnapshot, CliError> {
-    daemon_sync_cluster_state_to_kv(paths, state).map_err(Into::into)
+    network::sync_cluster_state_to_kv_with_host(paths, state, &mut CliClusterMemberMutationHost)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -1305,27 +1558,108 @@ pub(crate) fn expire_cluster_network_records_in_kv(
     state: &ClusterBootstrapState,
     now: OffsetDateTime,
 ) -> Result<Option<KvSnapshot>, CliError> {
-    sinomo_runtime::daemon::expire_cluster_network_records_in_kv(paths, state, now)
+    struct CliClusterNetworkRecordExpiryHost;
+
+    impl network::ClusterNetworkRecordExpiryHost for CliClusterNetworkRecordExpiryHost {
+        type Error = CliError;
+
+        fn commit_cluster_kv_txn_with_quorum(
+            &mut self,
+            paths: &ClusterPaths,
+            state: &mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> Result<KvSnapshot, Self::Error> {
+            network::append_cluster_raft_command(
+                paths,
+                &state.local_node_id,
+                sinomo_runtime::kv::KvCommand::Txn(txn),
+            )
+            .map_err(Into::into)
+        }
+    }
+
+    network::expire_cluster_network_records_with_host(
+        paths,
+        state,
+        now,
+        &mut CliClusterNetworkRecordExpiryHost,
+    )
+}
+
+struct CliClusterInvitePublishHost;
+
+impl network::ClusterInvitePublishHost for CliClusterInvitePublishHost {
+    type Error = CliError;
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        network::append_cluster_raft_command(
+            paths,
+            &state.local_node_id,
+            sinomo_runtime::kv::KvCommand::Txn(txn),
+        )
         .map_err(Into::into)
+    }
 }
 
 pub(crate) fn local_daemon_cluster_options()
 -> Result<(DaemonRunOptions, DaemonRunOptions), CliError> {
-    daemon_local_daemon_cluster_options(DAEMON_PROBE_TIMEOUT).map_err(Into::into)
+    let main = match default_main_daemon_status()? {
+        Some(status) => daemon_options_from_status(&status),
+        None => DaemonRunOptions::default(),
+    };
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let data_root = data_dir.root();
+    let shadow = current_shadow_daemon_options(&data_root, DAEMON_PROBE_TIMEOUT);
+    Ok((main, shadow))
 }
 
 pub(crate) fn register_daemon_cluster_node(
     registration: &DaemonClusterRegistration,
 ) -> Result<DaemonClusterStatus, CliError> {
     let paths = cluster_paths_from_defaults()?;
-    daemon_register_daemon_cluster_node(&paths, registration).map_err(Into::into)
+    let mut state = read_cluster_state(&paths)?;
+    ensure_local_daemon_cluster_members(
+        &mut state,
+        &registration.main_options,
+        &registration.shadow_options,
+        OffsetDateTime::now_utc(),
+    );
+    network::write_cluster_state(&paths, &state)?;
+    daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
+        detail: "daemon cluster member could not be registered".to_string(),
+    })
+}
+
+pub(crate) fn daemon_cluster_status_from_local_state(
+    paths: &ClusterPaths,
+    registration: &DaemonClusterRegistration,
+) -> Result<DaemonClusterStatus, CliError> {
+    let mut state = network::read_cluster_state_without_kv(paths)?;
+    ensure_local_daemon_cluster_members(
+        &mut state,
+        &registration.main_options,
+        &registration.shadow_options,
+        OffsetDateTime::now_utc(),
+    );
+    let (main_public_key, shadow_public_key) = local_daemon_public_keys(paths)?;
+    network::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
+    network::refresh_local_iroh_endpoints_from_disk(paths, &mut state, OffsetDateTime::now_utc())?;
+    daemon_cluster_status(&state, registration.process).ok_or_else(|| CliError::Parse {
+        detail: "daemon cluster member could not be resolved from local state".to_string(),
+    })
 }
 
 pub(crate) fn daemon_cluster_registration_if_initialized(
     registration: DaemonClusterRegistration,
 ) -> Result<Option<DaemonClusterRegistration>, CliError> {
     let paths = cluster_paths_from_defaults()?;
-    Ok(daemon_registration_if_initialized(&paths, registration))
+    Ok(paths.state.exists().then_some(registration))
 }
 
 #[cfg(test)]

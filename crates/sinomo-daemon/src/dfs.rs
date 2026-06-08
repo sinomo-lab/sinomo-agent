@@ -1,61 +1,33 @@
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, put_cluster_kv_control_record,
-    send_dfs_metadata_journal_batch_to_endpoint, send_dfs_metadata_snapshot_install_to_endpoint,
-    send_dfs_protocol_frame_to_endpoint,
+    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_metadata_journal_batch_to_endpoint,
+    send_dfs_metadata_snapshot_install_to_endpoint, send_dfs_protocol_frame_to_endpoint,
 };
-use serde::{Deserialize, Serialize};
-use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
-    ClusterMemberRole, ClusterTransportKind, DfsObjectPolicy,
+use sinomo_core::ClusterEndpointRecord;
+#[cfg(test)]
+use sinomo_dfs::DfsFileSystemConfig;
+#[cfg(test)]
+use sinomo_dfs::{
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
+    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallResponse,
+    DfsMetadataSnapshotInstallResult, DfsObjectVersionRecord, LocalContentStore,
+    LocalSobjMetadataBackend, distributed_sifs, distributed_sifs_bootstrap_objects,
+    file_system_config_key, metadata_shard_key, sifs_node_files_path,
 };
 use sinomo_dfs::{
-    DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAntiEntropyOptions,
-    DfsDistributedWriteResult, DfsExposeStore, DfsFileSystemConfig, DfsLifecycleMaintenanceOptions,
-    DfsLifecycleMaintenanceReport, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult, DfsNodeAdvertisement,
-    DfsObjectPageCursor, DfsObjectVersionRecord, DfsOperatorInspector, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsReplicationPolicy, DfsSubtreePolicy, DfsWriteOptions,
-    LocalContentStore, LocalShardedMetadataBackend, LocalSobjMetadataBackend, NetworkedDfsService,
-    NetworkedDfsServiceEvent, content_service_key, content_services_prefix,
-    default_dfs_metadata_shards_root, distributed_sifs, distributed_sifs_bootstrap_objects,
-    fallback_dfs_node_id, file_system_config_key, metadata_service_key, metadata_shard_key,
-    sifs_node_files_path,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsEndpointTransport,
+    DfsMaintenanceTickOptions, DfsMetadataBackend, DfsMetadataJournalBatchSender,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataPeerTransportError, DfsMetadataSnapshotInstallSender, DfsPeerTransportError,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, NetworkedDfsService,
+    NetworkedDfsServiceEvent,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterPaths, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
-use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
-use std::collections::{BTreeMap, VecDeque};
-use std::fs;
+use sinomo_network::{ClusterPaths, NetworkTransport};
 use std::sync::Arc;
-#[cfg(not(test))]
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(test)]
 use time::OffsetDateTime;
-
-const DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
-const DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES: usize =
-    DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT;
-const DFS_METADATA_REPLICATION_MAX_BATCH_BYTES: usize = DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT;
-const DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
-const DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET: usize = 3;
-const DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
-const DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
-const DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
-const DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
-const DFS_ANTI_ENTROPY_MAINTENANCE_MAX_OBJECTS_PER_FILE_SYSTEM: usize = 1024;
-const DFS_ANTI_ENTROPY_MAINTENANCE_MAX_ISSUES_PER_FILE_SYSTEM: usize = 64;
-#[cfg(not(test))]
-const DFS_PROTOCOL_METADATA_PUBLISH_RETRY_ROUNDS: usize = 3;
-#[cfg(not(test))]
-const DFS_PROTOCOL_METADATA_PUBLISH_RETRY_DELAY: Duration = Duration::from_millis(750);
-#[cfg(not(test))]
-static DFS_PROTOCOL_METADATA_PUBLISH_PENDING: AtomicBool = AtomicBool::new(false);
-#[cfg(not(test))]
-static DFS_PROTOCOL_METADATA_PUBLISH_RUNNING: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn default_distributed_dfs_enabled() -> bool {
     matches!(
@@ -78,13 +50,6 @@ impl DaemonDfsControlPlaneKvClient {
         }
     }
 
-    fn network_error(&self, source: NetworkError) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
-            detail: source.to_string(),
-        }
-    }
-
     fn daemon_error(&self, source: DaemonError) -> KvError {
         KvError::Io {
             path: self.cluster_paths.kv_snapshot.display().to_string(),
@@ -95,13 +60,11 @@ impl DaemonDfsControlPlaneKvClient {
 
 impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        sinomo_network::read_cluster_kv_entry(&self.cluster_paths, key)
-            .map_err(|source| self.network_error(source))
+        sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        sinomo_network::read_cluster_kv_prefix_entries(&self.cluster_paths, prefix)
-            .map_err(|source| self.network_error(source))
+        sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -118,19 +81,12 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        let mut state = sinomo_network::read_cluster_state(&self.cluster_paths)
-            .map_err(|source| self.network_error(source))?;
-        let (snapshot, response) = crate::cluster::commit_cluster_kv_txn_with_quorum_response(
+        crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths(
             &self.cluster_paths,
-            &mut state,
             txn,
+            true,
         )
-        .map_err(|source| self.daemon_error(source))?;
-        Ok(response.unwrap_or(KvTxnResponse {
-            succeeded: true,
-            revision: snapshot.revision,
-            responses: Vec::new(),
-        }))
+        .map_err(|source| self.daemon_error(source))
     }
 }
 
@@ -138,662 +94,112 @@ pub(crate) fn with_daemon_dfs_control_plane<T: NetworkTransport>(
     service: NetworkedDfsService<T>,
     cluster_paths: &ClusterPaths,
 ) -> NetworkedDfsService<T> {
-    if cluster_paths.kv_snapshot.exists() {
-        service.with_control_plane(DaemonDfsControlPlaneKvClient::new(cluster_paths))
+    if let Some(control_plane) = daemon_dfs_control_plane_client(cluster_paths) {
+        service.with_boxed_control_plane(control_plane)
     } else {
         service
     }
 }
 
-type DfsProtocolFrameSender = Arc<
-    dyn Fn(
-            &ClusterEndpointRecord,
-            &DfsProtocolFrameCommand,
-            Duration,
-        ) -> Result<DfsProtocolFrameResponse, DaemonError>
-        + Send
-        + Sync,
->;
-
-type DfsMetadataJournalBatchSender = Arc<
-    dyn Fn(
-            &ClusterEndpointRecord,
-            &DfsMetadataJournalBatchCommand,
-            Duration,
-        ) -> Result<DfsMetadataJournalBatchResponse, DaemonError>
-        + Send
-        + Sync,
->;
-
-type DfsMetadataSnapshotInstallSender = Arc<
-    dyn Fn(
-            &ClusterEndpointRecord,
-            &DfsMetadataSnapshotInstallCommand,
-            Duration,
-        ) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError>
-        + Send
-        + Sync,
->;
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsMetadataReplicationReport {
-    pub outcomes: Vec<DaemonDfsMetadataReplicationOutcome>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum DaemonDfsMetadataReplicationOutcome {
-    MissingShard {
-        file_system_id: sinomo_dfs::DfsFileSystemId,
-        shard_id: DfsMetadataShardId,
-    },
-    NotPrimary {
-        file_system_id: sinomo_dfs::DfsFileSystemId,
-        shard_id: DfsMetadataShardId,
-        local_node_id: sinomo_node::NodeId,
-        primary_node_id: sinomo_node::NodeId,
-        epoch: u64,
-    },
-    Applied {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        entries: usize,
-        next_after_sequence: u64,
-    },
-    NoChanges {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-    },
-    MissingEndpoint {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-    },
-    Rejected {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        reason: String,
-    },
-    SnapshotInstalled {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        next_after_sequence: u64,
-        archived_existing: bool,
-    },
-    Failed {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        reason: String,
-    },
-    BacklogRemaining {
-        target_node_id: sinomo_node::NodeId,
-        shard_id: DfsMetadataShardId,
-        after_sequence: u64,
-        max_batches: usize,
-    },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsSmokeReport {
-    pub path: String,
-    pub file_system_id: sinomo_dfs::DfsFileSystemId,
-    pub object_id: sinomo_dfs::DfsObjectId,
-    pub version: sinomo_dfs::DfsVersion,
-    pub content_hash: Option<String>,
-    pub size_bytes: Option<u64>,
-    pub requested_replica_node_ids: Vec<sinomo_node::NodeId>,
-    pub committed_replica_node_ids: Vec<sinomo_node::NodeId>,
-    pub pending_repair_count: usize,
-    pub metadata_replication: DaemonDfsMetadataReplicationReport,
-    pub attempts: Vec<DaemonDfsSmokeAttempt>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsSmokeAttempt {
-    pub replica_node_ids: Vec<sinomo_node::NodeId>,
-    pub path: String,
-    pub committed: bool,
-    pub detail: String,
-}
-
-// `DaemonDfsInspectionRequest` / `DaemonDfsInspectionResponse` now live in `sinomo-dfs`
-// (host-agnostic DFS contract); they are re-exported from this crate for clients.
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct LegacyDaemonDfsMetadataReplicationCursor {
-    target_node_id: sinomo_node::NodeId,
-    shard_id: DfsMetadataShardId,
-    next_after_sequence: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-struct DaemonDfsAntiEntropyCursor {
-    file_system_id: sinomo_dfs::DfsFileSystemId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<DfsObjectPageCursor>,
-}
-
-pub fn ensure_default_local_dfs_expose(paths: &DaemonPaths) -> Result<(), DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let node_id = if cluster_paths.state.exists() {
-        sinomo_network::read_cluster_state_without_kv(&cluster_paths)
-            .map(|state| state.local_node_id)
-            .unwrap_or_else(|_| fallback_dfs_node_id())
-    } else {
-        fallback_dfs_node_id()
-    };
-    DfsExposeStore::new(data_dir.dfs_expose_config_file())
-        .ensure_default(&data_dir.root(), node_id)?;
-    Ok(())
-}
-
-pub fn handle_daemon_dfs_expose_config(paths: &DaemonPaths) -> Result<String, DaemonError> {
-    ensure_default_local_dfs_expose(paths)?;
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    let config_path = data_dir.dfs_expose_config_file();
-    let config = DfsExposeStore::new(&config_path).load()?;
-    serde_json::to_string_pretty(&config).map_err(|source| DaemonError::Json {
-        path: config_path.display().to_string(),
-        detail: source.to_string(),
+fn daemon_dfs_control_plane_client(
+    cluster_paths: &ClusterPaths,
+) -> Option<Box<dyn sinomo_dfs::DfsControlPlaneKvClient>> {
+    cluster_paths.kv_snapshot.exists().then(|| {
+        Box::new(DaemonDfsControlPlaneKvClient::new(cluster_paths))
+            as Box<dyn sinomo_dfs::DfsControlPlaneKvClient>
     })
 }
 
-pub fn handle_daemon_dfs_status(
-    paths: &DaemonPaths,
-) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
+pub(crate) fn daemon_dfs_endpoint_transport(
+    local_node_id: sinomo_node::NodeId,
+    endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+) -> DfsEndpointTransport {
+    DfsEndpointTransport::new(local_node_id, endpoints, daemon_dfs_protocol_frame_sender())
+}
+
+fn daemon_dfs_protocol_frame_sender() -> DfsProtocolFrameSender {
+    Arc::new(|endpoint, command, timeout| {
+        send_dfs_protocol_frame_to_endpoint(endpoint, command, timeout)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+    })
+}
+
+fn daemon_dfs_metadata_journal_batch_sender() -> DfsMetadataJournalBatchSender {
+    Arc::new(|endpoint, command, timeout| {
+        send_dfs_metadata_journal_batch_to_endpoint(endpoint, command, timeout)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+    })
+}
+
+fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
+    Arc::new(|endpoint, command, timeout| {
+        send_dfs_metadata_snapshot_install_to_endpoint(endpoint, command, timeout)
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+    })
+}
+
+// DFS inspection request/response types live in `sinomo-dfs`; this module only
+// adapts them to daemon-local paths and metadata backends.
+
+pub(crate) fn ensure_default_local_dfs_expose(paths: &DaemonPaths) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
-    inspect_daemon_dfs_status(&data_dir, &cluster_paths)
-}
-
-pub fn handle_daemon_dfs_inspection(
-    paths: &DaemonPaths,
-    request: DaemonDfsInspectionRequest,
-) -> Result<DaemonDfsInspectionResponse, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
-    let inspector = DfsOperatorInspector::new(metadata.as_ref());
-    let response = match request {
-        DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
-            status: inspector.status()?,
-        },
-        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
-            DaemonDfsInspectionResponse::FileSystem {
-                file_system: inspector.file_system(&file_system_id)?,
-            }
-        }
-        DaemonDfsInspectionRequest::Path {
-            file_system_id,
-            path,
-        } => DaemonDfsInspectionResponse::Path {
-            object: inspector.object_by_path(&file_system_id, &path)?,
-        },
-        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
-            object: inspector.object(&object_id)?,
-        },
-        DaemonDfsInspectionRequest::Conflicts {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
-        } => {
-            let page = inspector.conflicts_page(
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                limit,
-                cursor.as_ref(),
-            )?;
-            DaemonDfsInspectionResponse::Conflicts {
-                conflicts: page.conflicts,
-                next_cursor: page.next_cursor,
-            }
-        }
-        DaemonDfsInspectionRequest::Repair {
-            file_system_id,
-            object_id,
-            limit,
-            cursor,
-        } => {
-            let page = inspector.repairs_page(
-                file_system_id.as_ref(),
-                object_id.as_ref(),
-                limit,
-                cursor.as_ref(),
-            )?;
-            DaemonDfsInspectionResponse::Repair {
-                repairs: page.repairs,
-                next_cursor: page.next_cursor,
-            }
-        }
-    };
-    Ok(response)
-}
-
-fn inspect_daemon_dfs_status(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-) -> Result<sinomo_dfs::DfsOperatorStatus, DaemonError> {
-    let metadata = open_daemon_dfs_metadata_backend(data_dir, cluster_paths)?;
-    let mut status = DfsOperatorInspector::new(metadata.as_ref())
-        .status()
-        .map_err(DaemonError::from)?;
-    if let Ok(state) = sinomo_network::read_cluster_state_without_kv(cluster_paths) {
-        for shard in &mut status.metadata_shards {
-            if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
-                shard.replay_cursors.clear();
-            } else {
-                shard.replica_lag.clear();
-            }
-        }
-    }
-    Ok(status)
+    sinomo_dfs::ensure_default_cluster_aware_dfs_expose_config(&data_dir, &cluster_paths)?;
+    Ok(())
 }
 
 pub(crate) fn open_daemon_dfs_metadata_backend(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
 ) -> Result<Box<dyn DfsMetadataBackend>, DaemonError> {
-    if cluster_paths.state.exists()
-        && let Some(metadata) = open_daemon_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
-    {
-        return Ok(Box::new(metadata));
-    }
-    sinomo_dfs::open_root_local_metadata_backend(sinomo_dfs::default_dfs_metadata_root(data_dir))
-        .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
-        .map_err(Into::into)
+    sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths).map_err(Into::into)
 }
 
-pub(crate) fn open_daemon_sharded_dfs_metadata_backend(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-) -> Result<Option<LocalShardedMetadataBackend>, DaemonError> {
-    let file_system_id = sinomo_dfs::sifs_file_system_id();
-    let mut shards = sinomo_network::read_cluster_kv_prefix_entries(
-        cluster_paths,
-        &format!("{}/", sinomo_dfs::metadata_shards_prefix(&file_system_id)),
-    )?
-    .into_iter()
-    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-    .collect::<Result<Vec<_>, _>>()?;
-    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
-    if shards.is_empty() {
-        return Ok(None);
-    }
-    sinomo_dfs::open_local_sharded_metadata_backend(
-        default_dfs_metadata_shards_root(data_dir),
-        shards,
-    )
-    .map(Some)
-    .map_err(Into::into)
-}
-
-pub fn handle_daemon_dfs_metadata_journal_batch(
-    paths: &DaemonPaths,
-    command: DfsMetadataJournalBatchCommand,
-) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
-    if let Some(response) = validate_dfs_metadata_journal_batch_source(&data_dir, &command)? {
-        return Ok(response);
-    }
-    let mut backend = LocalSobjMetadataBackend::new(
-        command.batch.shard_id.clone(),
-        data_dir
-            .dfs_dir()
-            .join("metadata")
-            .join(path_safe_segment(&command.batch.shard_id.0)),
-    )?;
-    let shard_id = command.batch.shard_id.clone();
-    let next_after_sequence = command.batch.next_after_sequence;
-    match backend.apply_journal_batch(&command.batch) {
-        Ok(applied_entries) => Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id,
-            shard_id,
-            next_after_sequence,
-            applied_entries,
-            result: DfsMetadataJournalBatchResult::Applied,
-        }),
-        Err(error) => Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id,
-            shard_id,
-            next_after_sequence,
-            applied_entries: 0,
-            result: DfsMetadataJournalBatchResult::Rejected {
-                reason: error.to_string(),
-            },
-        }),
-    }
-}
-
-fn validate_dfs_metadata_journal_batch_source(
-    data_dir: &SinomoDataDir,
-    command: &DfsMetadataJournalBatchCommand,
-) -> Result<Option<DfsMetadataJournalBatchResponse>, DaemonError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let shard = sinomo_network::read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
-        &cluster_paths,
-        &format!(
-            "{}/",
-            sinomo_dfs::metadata_shards_prefix(&sinomo_dfs::sifs_file_system_id())
-        ),
-    )?
-    .into_iter()
-    .find(|shard| shard.shard_id == command.batch.shard_id.0.as_str());
-    let Some(shard) = shard else {
-        return Ok(Some(dfs_metadata_journal_rejection_response(
-            command,
-            "metadata journal batch has no local shard config".to_string(),
-        )));
-    };
-    let Some(source_node_id) = command.source_node_id.as_ref() else {
-        return Ok(Some(dfs_metadata_journal_rejection_response(
-            command,
-            "metadata journal batch is missing source node id".to_string(),
-        )));
-    };
-    if source_node_id != &shard.primary_node_id {
-        return Ok(Some(dfs_metadata_journal_rejection_response(
-            command,
-            format!(
-                "metadata journal source {source_node_id} is not shard {} primary {}",
-                shard.shard_id, shard.primary_node_id
-            ),
-        )));
-    }
-    if shard.primary_node_id == state.local_node_id {
-        return Ok(Some(dfs_metadata_journal_rejection_response(
-            command,
-            "metadata primary must not apply a replica journal batch".to_string(),
-        )));
-    }
-    if !shard.replica_node_ids.contains(&state.local_node_id) {
-        return Ok(Some(dfs_metadata_journal_rejection_response(
-            command,
-            format!(
-                "local node {} is not configured as a replica for metadata shard {}",
-                state.local_node_id, shard.shard_id
-            ),
-        )));
-    }
-    Ok(None)
-}
-
-fn dfs_metadata_journal_rejection_response(
-    command: &DfsMetadataJournalBatchCommand,
-    reason: String,
-) -> DfsMetadataJournalBatchResponse {
-    DfsMetadataJournalBatchResponse {
-        request_id: command.request_id.clone(),
-        shard_id: command.batch.shard_id.clone(),
-        next_after_sequence: command.batch.next_after_sequence,
-        applied_entries: 0,
-        result: DfsMetadataJournalBatchResult::Rejected { reason },
-    }
-}
-
-pub fn handle_daemon_dfs_metadata_snapshot_install(
-    paths: &DaemonPaths,
-    command: DfsMetadataSnapshotInstallCommand,
-) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
-    let data_dir = daemon_data_dir(paths)?;
-    let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let shard = sinomo_network::read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
-        &cluster_paths,
-        &format!(
-            "{}/",
-            sinomo_dfs::metadata_shards_prefix(&sinomo_dfs::sifs_file_system_id())
-        ),
-    )?
-    .into_iter()
-    .find(|shard| shard.shard_id == command.shard_id.0.as_str());
-    let Some(shard) = shard else {
-        return Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Rejected {
-                reason: "metadata snapshot install has no local shard config".to_string(),
-            },
-        });
-    };
-    if shard.primary_node_id != command.source_node_id {
-        return Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Rejected {
-                reason: format!(
-                    "metadata snapshot source {} is not shard {} primary {}",
-                    command.source_node_id, shard.shard_id, shard.primary_node_id
-                ),
-            },
-        });
-    }
-    if shard.primary_node_id == state.local_node_id {
-        return Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Rejected {
-                reason: "metadata primary must not install a replica snapshot".to_string(),
-            },
-        });
-    }
-    if !shard.replica_node_ids.contains(&state.local_node_id) {
-        return Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Rejected {
-                reason: format!(
-                    "local node {} is not configured as a replica for metadata shard {}",
-                    state.local_node_id, shard.shard_id
-                ),
-            },
-        });
-    }
-    let mut backend = LocalSobjMetadataBackend::new(
-        command.shard_id.clone(),
-        data_dir
-            .dfs_dir()
-            .join("metadata")
-            .join(path_safe_segment(&command.shard_id.0)),
-    )?;
-    match backend.replace_with_replicated_snapshot(
-        command.shard_id.clone(),
-        command.next_after_sequence,
-        command.snapshot,
-    ) {
-        Ok(archived_existing) => Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Installed { archived_existing },
-        }),
-        Err(error) => Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Rejected {
-                reason: error.to_string(),
-            },
-        }),
-    }
-}
-
-pub fn handle_daemon_dfs_protocol_frame(
+pub(crate) fn handle_daemon_dfs_protocol_frame(
     paths: &DaemonPaths,
     command: DfsProtocolFrameCommand,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
-    let local_node_id = local_dfs_protocol_node_id(&data_dir)?;
-    if command.frame.target_node_id != local_node_id {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "dfs protocol frame target {} does not match local node {}",
-                command.frame.target_node_id, local_node_id
-            ),
-        });
-    }
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let metadata_backend = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
-    let content_store = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let transport = DaemonDfsProtocolTransport::new(local_node_id, command.frame);
-    let mut service = with_daemon_dfs_control_plane(
-        NetworkedDfsService::new(transport, content_store),
+    let Some(result) = sinomo_dfs::process_cluster_dfs_protocol_frame_command(
+        &data_dir,
         &cluster_paths,
-    )
-    .with_boxed_metadata_backend(metadata_backend)?;
-    let events = service.process_incoming()?;
-    let outbound_frames = service.into_transport().outbound_frames;
-    publish_dfs_metadata_after_mutating_protocol_events(paths, &events);
-    Ok(DfsProtocolFrameResponse {
-        request_id: command.request_id,
-        outbound_frames,
-    })
+        command,
+        daemon_dfs_control_plane_client(&cluster_paths),
+    )?
+    else {
+        return Err(DaemonError::ClusterOrphan);
+    };
+    publish_dfs_metadata_after_mutating_protocol_events(paths, &result.events);
+    Ok(result.response)
 }
 
-pub fn ensure_default_distributed_dfs(
+pub(crate) fn ensure_default_distributed_dfs(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
     publish_cluster_control: bool,
 ) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
-    if !cluster_paths.state.exists() {
-        return Ok(());
-    }
-    let state = if publish_cluster_control {
-        sinomo_network::read_cluster_state(&cluster_paths)?
-    } else {
-        sinomo_network::read_cluster_state_without_kv(&cluster_paths)?
-    };
-    let file_system = default_cluster_sifs(&state);
-    let local_has_primary_metadata_shards = if publish_cluster_control {
-        put_cluster_kv_control_record(
-            &cluster_paths,
-            &state.local_node_id,
-            file_system_config_key(&file_system.file_system_id),
-            &DfsFileSystemConfig::from(&file_system),
-        )?;
-        let metadata_shards =
-            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)?;
-        let local_has_primary_metadata_shards = metadata_shards
-            .iter()
-            .any(|shard| shard.primary_node_id == state.local_node_id);
-        let publishable_shards = metadata_shards.iter().filter(|shard| {
-            local_has_primary_metadata_shards
-                || matches!(shard.assignment, DfsMetadataShardAssignment::Root)
-        });
-        for shard in publishable_shards {
-            put_cluster_kv_control_record(
-                &cluster_paths,
-                &state.local_node_id,
-                metadata_shard_key(&file_system.file_system_id, &shard.shard_id),
-                shard,
-            )?;
-        }
-        if local_has_primary_metadata_shards {
-            materialize_default_cluster_sifs_metadata_with_shards(
-                &data_dir,
-                &state,
-                &file_system,
-                &metadata_shards,
-            )?;
-        }
-        publish_dfs_service_advertisements_for_cluster(&cluster_paths, &state, options)?;
-        local_has_primary_metadata_shards
-    } else {
-        default_cluster_sifs_owner(&state) == state.local_node_id
-    };
-    if local_has_primary_metadata_shards && !publish_cluster_control {
-        materialize_default_cluster_sifs_metadata(&data_dir, &cluster_paths, &state, &file_system)?;
-    }
-    Ok(())
-}
-
-fn materialize_default_cluster_sifs_metadata(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    file_system: &sinomo_dfs::DfsFileSystem,
-) -> Result<(), DaemonError> {
-    let mut backend = open_daemon_dfs_metadata_backend(data_dir, cluster_paths)?;
-    materialize_default_cluster_sifs_metadata_in_backend(backend.as_mut(), state, file_system)
-}
-
-fn materialize_default_cluster_sifs_metadata_with_shards(
-    data_dir: &SinomoDataDir,
-    state: &ClusterBootstrapState,
-    file_system: &sinomo_dfs::DfsFileSystem,
-    shards: &[DfsMetadataShardConfig],
-) -> Result<(), DaemonError> {
-    let mut backend = sinomo_dfs::open_local_sharded_metadata_backend(
-        default_dfs_metadata_shards_root(data_dir),
-        shards.to_vec(),
+    sinomo_dfs::ensure_default_cluster_dfs(
+        &data_dir,
+        &cluster_paths,
+        Box::new(DaemonDfsControlPlaneKvClient::new(&cluster_paths)),
+        DfsDefaultClusterBootstrapOptions {
+            publish_cluster_control,
+            local_endpoint: format!("loopback://{}:{}", options.host, options.port),
+        },
     )?;
-    backend.ensure_file_system_on_all_shards(file_system)?;
-    materialize_default_cluster_sifs_metadata_in_backend(&mut backend, state, file_system)?;
-    backend.migrate_objects_to_configured_shards(&file_system.file_system_id, usize::MAX)?;
     Ok(())
 }
 
-fn materialize_default_cluster_sifs_metadata_in_backend(
-    backend: &mut dyn DfsMetadataBackend,
-    state: &ClusterBootstrapState,
-    file_system: &sinomo_dfs::DfsFileSystem,
-) -> Result<(), DaemonError> {
-    if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
-        backend.put_file_system(file_system)?;
-    }
-    for object in default_cluster_sifs_bootstrap_objects(state) {
-        if backend
-            .get_object_by_path(&object.file_system_id, object.path.trim_matches('/'))?
-            .is_none()
-        {
-            backend.put_object(&object)?;
-            backend.put_version(&DfsObjectVersionRecord {
-                file_system_id: object.file_system_id.clone(),
-                object_id: object.object_id.clone(),
-                version: object.version.clone(),
-                content_hash: object.content_hash.clone(),
-                size_bytes: object.content_size_bytes,
-                locations: object.current_locations.clone(),
-                created_by_event_id: object.created_by_event_id.clone(),
-                created_at: OffsetDateTime::now_utc(),
-                visible: true,
-            })?;
-        }
-    }
-    Ok(())
-}
-
-pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), DaemonError> {
+pub(crate) fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
     if !cluster_paths.state.exists() {
         return Ok(());
@@ -801,1270 +207,94 @@ pub fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), Daemon
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
-    let mut service = with_daemon_dfs_control_plane(
-        NetworkedDfsService::new(
-            DaemonDfsEndpointTransport::new(state.local_node_id, endpoints),
-            content,
-        ),
+    let Some(report) = sinomo_dfs::run_cluster_dfs_maintenance_tick(
+        &data_dir,
         &cluster_paths,
-    )
-    .with_boxed_metadata_backend(metadata)?;
-    let namespace_jobs = service.posix_resume_namespace_jobs_bounded(
-        DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
-        DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
-    )?;
-    log_dfs_namespace_job_maintenance_report(&namespace_jobs);
-    let lifecycle_reports = run_daemon_dfs_lifecycle_maintenance(&data_dir, &mut service)?;
-    log_dfs_lifecycle_maintenance_reports(&lifecycle_reports);
-    let scheduled_repairs = service.retry_pending_repairs()?;
-    if !scheduled_repairs.is_empty() {
-        service.process_incoming()?;
-    }
-    let report = publish_default_dfs_metadata_journal(paths)?;
+        daemon_dfs_protocol_frame_sender(),
+        daemon_dfs_metadata_journal_batch_sender(),
+        daemon_dfs_metadata_snapshot_install_sender(),
+        daemon_dfs_control_plane_client(&cluster_paths),
+        DfsMaintenanceTickOptions::default(),
+    )?
+    else {
+        return Ok(());
+    };
+    let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
     if let Some(stats) = crate::process_idle_stats() {
-        for outcome in &report.outcomes {
-            if matches!(
-                outcome,
-                DaemonDfsMetadataReplicationOutcome::Applied { .. }
-                    | DaemonDfsMetadataReplicationOutcome::SnapshotInstalled { .. }
-            ) {
-                stats.incr_dfs_metadata_replications_sent();
-            }
+        for _ in 0..observations.metadata_replications_sent {
+            stats.incr_dfs_metadata_replications_sent();
         }
     }
-    log_dfs_metadata_replication_report(report);
-    Ok(())
-}
-
-fn run_daemon_dfs_lifecycle_maintenance<T: NetworkTransport>(
-    data_dir: &SinomoDataDir,
-    service: &mut NetworkedDfsService<T>,
-) -> Result<Vec<DfsLifecycleMaintenanceReport>, DaemonError> {
-    let Some(metadata_backend) = service.metadata_backend() else {
-        return Ok(Vec::new());
-    };
-    let file_systems = metadata_backend.list_file_systems()?;
-    let mut reports = Vec::with_capacity(file_systems.len());
-
-    for file_system in file_systems {
-        let cursor_path =
-            daemon_dfs_anti_entropy_cursor_path(data_dir, &file_system.file_system_id);
-        let saved_cursor = read_daemon_dfs_anti_entropy_cursor(&cursor_path)?;
-        if let Some(saved_cursor) = saved_cursor.as_ref()
-            && saved_cursor.file_system_id != file_system.file_system_id
-        {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "DFS anti-entropy cursor {} does not match file system {}",
-                    cursor_path.display(),
-                    file_system.file_system_id,
-                ),
-            });
-        }
-        let after = saved_cursor.and_then(|cursor| cursor.next_cursor);
-        let report = service.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
-            anti_entropy: Some(DfsAntiEntropyOptions {
-                file_system_id: file_system.file_system_id.clone(),
-                after,
-                max_objects: DFS_ANTI_ENTROPY_MAINTENANCE_MAX_OBJECTS_PER_FILE_SYSTEM,
-                max_issues: DFS_ANTI_ENTROPY_MAINTENANCE_MAX_ISSUES_PER_FILE_SYSTEM,
-                repair_metadata: true,
-            }),
-            ..DfsLifecycleMaintenanceOptions::default()
-        })?;
-
-        if let Some(anti_entropy) = report.anti_entropy.as_ref() {
-            if let Some(next_cursor) = anti_entropy.next_cursor.clone() {
-                write_daemon_dfs_anti_entropy_cursor(
-                    &cursor_path,
-                    &DaemonDfsAntiEntropyCursor {
-                        file_system_id: file_system.file_system_id.clone(),
-                        next_cursor: Some(next_cursor),
-                    },
-                )?;
-            } else {
-                clear_daemon_dfs_anti_entropy_cursor(&cursor_path)?;
-            }
-        }
-        reports.push(report);
-    }
-
-    Ok(reports)
-}
-
-fn log_dfs_namespace_job_maintenance_report(report: &sinomo_dfs::DfsNamespaceJobMaintenanceReport) {
-    if report.resumed_job_count == 0 && report.failed_job_count == 0 {
-        return;
-    }
-    eprintln!(
-        "sinomo daemon DFS namespace jobs: scanned={}, resumed={}, completed={}, failed={}, remaining={}",
-        report.scanned_job_count,
-        report.resumed_job_count,
-        report.completed_job_count,
-        report.failed_job_count,
-        report.remaining_running_job_count
-    );
-    for failure in &report.failures {
-        eprintln!(
-            "sinomo daemon DFS namespace job {} ({:?}) failed: {}",
-            failure.job_id, failure.kind, failure.reason
-        );
-    }
-}
-
-fn log_dfs_lifecycle_maintenance_reports(reports: &[DfsLifecycleMaintenanceReport]) {
-    for report in reports {
-        let Some(anti_entropy) = report.anti_entropy.as_ref() else {
-            continue;
-        };
-        if anti_entropy.stale_local_location_count == 0
-            && anti_entropy.repaired_location_count == 0
-            && anti_entropy.issue_count == 0
-            && !anti_entropy.max_issues_reached
-        {
-            continue;
-        }
-        eprintln!(
-            "sinomo daemon DFS anti-entropy {}: scanned={}, checked_local={}, stale_local={}, repaired={}, issues={}, next_cursor={}",
-            anti_entropy.file_system_id,
-            anti_entropy.scanned_object_count,
-            anti_entropy.checked_local_location_count,
-            anti_entropy.stale_local_location_count,
-            anti_entropy.repaired_location_count,
-            anti_entropy.issue_count,
-            anti_entropy.next_cursor.is_some()
-        );
-        for issue in &anti_entropy.issues {
-            eprintln!(
-                "sinomo daemon DFS anti-entropy issue {} {} {}: {} (repaired={})",
-                issue.object_id, issue.version, issue.path, issue.reason, issue.repaired
-            );
-        }
-        if anti_entropy.max_issues_reached {
-            eprintln!(
-                "sinomo daemon DFS anti-entropy {} stopped after reaching the issue limit",
-                anti_entropy.file_system_id
-            );
-        }
-    }
-}
-
-pub fn log_dfs_metadata_replication_report(report: DaemonDfsMetadataReplicationReport) {
-    for outcome in report.outcomes {
-        match outcome {
-            DaemonDfsMetadataReplicationOutcome::Applied {
-                target_node_id,
-                entries,
-                ..
-            } => {
-                eprintln!(
-                    "sinomo daemon replicated {entries} DFS metadata journal entries to {target_node_id}"
-                );
-            }
-            DaemonDfsMetadataReplicationOutcome::SnapshotInstalled {
-                target_node_id,
-                next_after_sequence,
-                ..
-            } => {
-                eprintln!(
-                    "sinomo daemon repaired DFS metadata replica {target_node_id} with snapshot through {next_after_sequence}"
-                );
-            }
-            DaemonDfsMetadataReplicationOutcome::Rejected {
-                target_node_id,
-                reason,
-                ..
-            }
-            | DaemonDfsMetadataReplicationOutcome::Failed {
-                target_node_id,
-                reason,
-                ..
-            } => {
-                eprintln!(
-                    "sinomo daemon DFS metadata replication to {target_node_id} failed: {reason}"
-                );
-            }
-            DaemonDfsMetadataReplicationOutcome::BacklogRemaining {
-                target_node_id,
-                max_batches,
-                ..
-            } => {
-                eprintln!(
-                    "sinomo daemon DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
-                );
-            }
-            DaemonDfsMetadataReplicationOutcome::NoChanges { .. }
-            | DaemonDfsMetadataReplicationOutcome::MissingEndpoint { .. }
-            | DaemonDfsMetadataReplicationOutcome::MissingShard { .. }
-            | DaemonDfsMetadataReplicationOutcome::NotPrimary { .. } => {}
-        }
-    }
-}
-
-fn publish_dfs_service_advertisements_for_cluster(
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    options: &DaemonRunOptions,
-) -> Result<(), DaemonError> {
-    for member in dfs_service_members(state) {
-        let endpoint = dfs_service_endpoint_for_member(state, member, options);
-        let metadata = stable_dfs_advertisement(
-            cluster_paths,
-            metadata_service_key(&member.node_id),
-            DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
-        )?;
-        let content = stable_dfs_advertisement(
-            cluster_paths,
-            content_service_key(&member.node_id),
-            DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
-        )?;
-        put_cluster_kv_control_record(
-            cluster_paths,
-            &state.local_node_id,
-            metadata_service_key(&member.node_id),
-            &metadata,
-        )?;
-        put_cluster_kv_control_record(
-            cluster_paths,
-            &state.local_node_id,
-            content_service_key(&member.node_id),
-            &content,
-        )?;
+    for line in observations.notice_lines {
+        eprintln!("sinomo daemon {line}");
     }
     Ok(())
 }
 
-fn stable_dfs_advertisement(
-    cluster_paths: &ClusterPaths,
-    key: String,
-    desired: DfsNodeAdvertisement,
-) -> Result<DfsNodeAdvertisement, DaemonError> {
-    let Some(current) =
-        sinomo_network::read_cluster_kv_value::<DfsNodeAdvertisement>(cluster_paths, &key)?
-    else {
-        return Ok(desired);
-    };
-    if current.node_id == desired.node_id
-        && current.endpoint == desired.endpoint
-        && current.accepts_metadata == desired.accepts_metadata
-        && current.accepts_content == desired.accepts_content
-        && current.capacity_weight == desired.capacity_weight
-        && current.zone == desired.zone
-    {
-        return Ok(current);
+fn log_dfs_metadata_replication_report(report: DfsMetadataJournalReplicationReport) {
+    for line in sinomo_dfs::dfs_metadata_replication_notice_lines(&report) {
+        eprintln!("sinomo daemon {line}");
     }
-    Ok(desired)
-}
-
-fn default_cluster_sifs(state: &ClusterBootstrapState) -> sinomo_dfs::DfsFileSystem {
-    let owner_node_id = default_cluster_sifs_owner(state);
-    let mut file_system = distributed_sifs(owner_node_id.clone());
-    file_system.owner_node_id = owner_node_id;
-    file_system.subtree_policies = default_cluster_sifs_subtree_policies(state);
-    file_system
-}
-
-fn default_cluster_sifs_owner(state: &ClusterBootstrapState) -> sinomo_node::NodeId {
-    stable_dfs_service_node_ids(state)
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| state.local_node_id.clone())
-}
-
-fn default_cluster_sifs_subtree_policies(state: &ClusterBootstrapState) -> Vec<DfsSubtreePolicy> {
-    let mut policies = stable_dfs_service_node_ids(state)
-        .into_iter()
-        .map(|node_id| DfsSubtreePolicy {
-            path_prefix: sifs_node_files_path(&node_id),
-            policy: DfsObjectPolicy::LocalOwned,
-        })
-        .collect::<Vec<_>>();
-    if policies.is_empty() {
-        policies.push(DfsSubtreePolicy {
-            path_prefix: sifs_node_files_path(&state.local_node_id),
-            policy: DfsObjectPolicy::LocalOwned,
-        });
-    }
-    policies.push(DfsSubtreePolicy {
-        path_prefix: sinomo_dfs::SIFS_USERS_PATH.to_string(),
-        policy: DfsObjectPolicy::ReplicatedEventual,
-    });
-    policies.push(DfsSubtreePolicy {
-        path_prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
-        policy: DfsObjectPolicy::ReplicatedEventual,
-    });
-    policies
-}
-
-fn default_cluster_sifs_bootstrap_objects(
-    state: &ClusterBootstrapState,
-) -> Vec<sinomo_dfs::DfsObjectMetadata> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut objects = Vec::new();
-    let mut node_ids = stable_dfs_service_node_ids(state);
-    if node_ids.is_empty() {
-        node_ids.push(state.local_node_id.clone());
-    }
-    for node_id in node_ids {
-        for object in distributed_sifs_bootstrap_objects(node_id) {
-            if seen.insert(object.path.clone()) {
-                objects.push(object);
-            }
-        }
-    }
-    objects
-}
-
-fn default_cluster_metadata_shards(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    file_system: &sinomo_dfs::DfsFileSystem,
-) -> Result<Vec<DfsMetadataShardConfig>, DaemonError> {
-    Ok(vec![
-        default_cluster_metadata_shard(
-            data_dir,
-            cluster_paths,
-            state,
-            file_system,
-            "root",
-            DfsMetadataShardAssignment::Root,
-            0,
-        )?,
-        default_cluster_metadata_shard(
-            data_dir,
-            cluster_paths,
-            state,
-            file_system,
-            "services",
-            DfsMetadataShardAssignment::PathPrefix {
-                prefix: sinomo_dfs::SIFS_SERVICES_PATH.to_string(),
-            },
-            1,
-        )?,
-        default_cluster_metadata_shard(
-            data_dir,
-            cluster_paths,
-            state,
-            file_system,
-            "users",
-            DfsMetadataShardAssignment::PathPrefix {
-                prefix: sinomo_dfs::SIFS_USERS_PATH.to_string(),
-            },
-            2,
-        )?,
-    ])
-}
-
-#[cfg(test)]
-fn default_cluster_root_metadata_shard(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    file_system: &sinomo_dfs::DfsFileSystem,
-) -> Result<DfsMetadataShardConfig, DaemonError> {
-    default_cluster_metadata_shard(
-        data_dir,
-        cluster_paths,
-        state,
-        file_system,
-        "root",
-        DfsMetadataShardAssignment::Root,
-        0,
-    )
-}
-
-fn default_cluster_metadata_shard(
-    data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    file_system: &sinomo_dfs::DfsFileSystem,
-    shard_id: &str,
-    assignment: DfsMetadataShardAssignment,
-    primary_offset: usize,
-) -> Result<DfsMetadataShardConfig, DaemonError> {
-    let service_node_ids = stable_dfs_service_node_ids(state);
-    let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
-    let target_primary_node_id = default_metadata_shard_primary_node_id(
-        &service_node_ids,
-        &bootstrap_primary_node_id,
-        primary_offset,
-    );
-    let target_replica_node_ids =
-        metadata_shard_replica_node_ids(&service_node_ids, &target_primary_node_id, 2);
-    let key = metadata_shard_key(&file_system.file_system_id, shard_id);
-    let mut desired = DfsMetadataShardConfig {
-        file_system_id: file_system.file_system_id.clone(),
-        shard_id: shard_id.to_string(),
-        primary_node_id: target_primary_node_id,
-        replica_node_ids: target_replica_node_ids,
-        epoch: 1,
-        assignment,
-        default_policy: DfsObjectPolicy::ReplicatedEventual,
-    };
-    let Some(current) =
-        sinomo_network::read_cluster_kv_value::<DfsMetadataShardConfig>(cluster_paths, &key)?
-    else {
-        desired.primary_node_id = bootstrap_primary_node_id.clone();
-        desired.replica_node_ids =
-            metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id, 2);
-        return Ok(desired);
-    };
-    if current.primary_node_id != desired.primary_node_id
-        && !default_metadata_shard_primary_transfer_ready(
-            data_dir,
-            state,
-            &current,
-            &desired.primary_node_id,
-        )?
-    {
-        return Ok(current);
-    }
-    if metadata_shard_layout_matches(&current, &desired) {
-        return Ok(current);
-    }
-    desired.epoch = current.epoch.saturating_add(1);
-    Ok(desired)
-}
-
-fn default_metadata_shard_primary_node_id(
-    service_node_ids: &[sinomo_node::NodeId],
-    fallback_node_id: &sinomo_node::NodeId,
-    primary_offset: usize,
-) -> sinomo_node::NodeId {
-    if service_node_ids.is_empty() {
-        return fallback_node_id.clone();
-    }
-    service_node_ids[primary_offset % service_node_ids.len()].clone()
-}
-
-fn metadata_shard_replica_node_ids(
-    service_node_ids: &[sinomo_node::NodeId],
-    primary_node_id: &sinomo_node::NodeId,
-    max_replicas: usize,
-) -> Vec<sinomo_node::NodeId> {
-    if service_node_ids.len() <= 1 || max_replicas == 0 {
-        return Vec::new();
-    }
-    let primary_index = service_node_ids
-        .iter()
-        .position(|node_id| node_id == primary_node_id)
-        .unwrap_or(0);
-    (1..service_node_ids.len())
-        .map(|offset| service_node_ids[(primary_index + offset) % service_node_ids.len()].clone())
-        .take(max_replicas)
-        .collect()
-}
-
-fn default_metadata_shard_primary_transfer_ready(
-    data_dir: &SinomoDataDir,
-    state: &ClusterBootstrapState,
-    current: &DfsMetadataShardConfig,
-    target_primary_node_id: &sinomo_node::NodeId,
-) -> Result<bool, DaemonError> {
-    if current.primary_node_id == *target_primary_node_id {
-        return Ok(true);
-    }
-    if current.primary_node_id != state.local_node_id {
-        return Ok(false);
-    }
-    if !current
-        .replica_node_ids
-        .iter()
-        .any(|node_id| node_id == target_primary_node_id)
-    {
-        return Ok(false);
-    }
-    let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
-    let backend = LocalSobjMetadataBackend::new(
-        shard_id.clone(),
-        data_dir
-            .dfs_dir()
-            .join("metadata")
-            .join(path_safe_segment(&current.shard_id)),
-    )?;
-    let journal_last_sequence = backend
-        .metadata_shard_statuses()?
-        .into_iter()
-        .find(|status| status.shard_id == shard_id)
-        .map(|status| status.journal_last_sequence)
-        .unwrap_or(0);
-    let target_replayed_through =
-        backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
-    Ok(target_replayed_through >= journal_last_sequence)
-}
-
-fn metadata_shard_layout_matches(
-    left: &DfsMetadataShardConfig,
-    right: &DfsMetadataShardConfig,
-) -> bool {
-    left.file_system_id == right.file_system_id
-        && left.shard_id == right.shard_id
-        && left.primary_node_id == right.primary_node_id
-        && left.replica_node_ids == right.replica_node_ids
-        && left.assignment == right.assignment
-        && left.default_policy == right.default_policy
-}
-
-fn stable_dfs_service_node_ids(state: &ClusterBootstrapState) -> Vec<sinomo_node::NodeId> {
-    let mut node_ids = dfs_service_members(state)
-        .into_iter()
-        .map(|member| member.node_id.clone())
-        .collect::<Vec<_>>();
-    node_ids.sort();
-    node_ids.dedup();
-    node_ids
-}
-
-fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberRecord> {
-    state
-        .members
-        .iter()
-        .filter(|member| {
-            member.state.is_authorized() && !matches!(member.role, ClusterMemberRole::NonVoting)
-        })
-        .collect()
-}
-
-fn dfs_service_endpoint_for_member(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    options: &DaemonRunOptions,
-) -> String {
-    if member.node_id == state.local_node_id {
-        return format!("loopback://{}:{}", options.host, options.port);
-    }
-    member
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-        .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
-        .or_else(|| member.endpoints.first())
-        .map(|endpoint| endpoint.address.clone())
-        .unwrap_or_else(|| format!("cluster-member://{}", member.node_id))
-}
-
-fn dfs_service_endpoint_rank(endpoint: &ClusterEndpointRecord) -> (u8, u16, String) {
-    let privacy_rank = match endpoint.privacy {
-        ClusterEndpointPrivacy::InternetDirect => 0,
-        ClusterEndpointPrivacy::Relayed => 1,
-        ClusterEndpointPrivacy::Lan => 2,
-        ClusterEndpointPrivacy::LocalOnly => 3,
-    };
-    (privacy_rank, endpoint.priority, endpoint.address.clone())
-}
-
-#[derive(Debug)]
-struct DaemonDfsProtocolTransport {
-    local_node_id: sinomo_node::NodeId,
-    inbound_frames: Vec<InboundFrame>,
-    outbound_frames: Vec<NetworkFrame>,
-}
-
-impl DaemonDfsProtocolTransport {
-    fn new(local_node_id: sinomo_node::NodeId, inbound_frame: NetworkFrame) -> Self {
-        Self {
-            local_node_id: local_node_id.clone(),
-            inbound_frames: vec![InboundFrame {
-                received_by: local_node_id,
-                frame: inbound_frame,
-            }],
-            outbound_frames: Vec::new(),
-        }
-    }
-}
-
-impl NetworkTransport for DaemonDfsProtocolTransport {
-    fn local_node_id(&self) -> &sinomo_node::NodeId {
-        &self.local_node_id
-    }
-
-    fn send(
-        &mut self,
-        _target_node_id: &sinomo_node::NodeId,
-        frame: NetworkFrame,
-    ) -> Result<(), NetworkError> {
-        self.outbound_frames.push(frame);
-        Ok(())
-    }
-
-    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        Ok(std::mem::take(&mut self.inbound_frames))
-    }
-
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(self.inbound_frames.len()))
-    }
-}
-
-#[derive(Clone)]
-pub struct DaemonDfsEndpointTransport {
-    local_node_id: sinomo_node::NodeId,
-    endpoints_by_node_id: BTreeMap<sinomo_node::NodeId, Vec<ClusterEndpointRecord>>,
-    incoming_frames: VecDeque<InboundFrame>,
-    timeout: Duration,
-    sender: DfsProtocolFrameSender,
-}
-
-impl std::fmt::Debug for DaemonDfsEndpointTransport {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DaemonDfsEndpointTransport")
-            .field("local_node_id", &self.local_node_id)
-            .field("endpoints_by_node_id", &self.endpoints_by_node_id)
-            .field("incoming_frames", &self.incoming_frames)
-            .field("timeout", &self.timeout)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DaemonDfsEndpointTransport {
-    pub fn new(
-        local_node_id: sinomo_node::NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-    ) -> Self {
-        Self::with_sender(
-            local_node_id,
-            endpoints,
-            DFS_PROTOCOL_FRAME_TIMEOUT,
-            Arc::new(send_dfs_protocol_frame_to_endpoint),
-        )
-    }
-
-    fn with_sender(
-        local_node_id: sinomo_node::NodeId,
-        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
-        timeout: Duration,
-        sender: DfsProtocolFrameSender,
-    ) -> Self {
-        let mut endpoints_by_node_id: BTreeMap<sinomo_node::NodeId, Vec<ClusterEndpointRecord>> =
-            BTreeMap::new();
-        for endpoint in endpoints {
-            if endpoint.node_id != local_node_id {
-                endpoints_by_node_id
-                    .entry(endpoint.node_id.clone())
-                    .or_default()
-                    .push(endpoint);
-            }
-        }
-        Self {
-            local_node_id,
-            endpoints_by_node_id,
-            incoming_frames: VecDeque::new(),
-            timeout,
-            sender,
-        }
-    }
-
-    fn deliver_returned_frame(&mut self, frame: NetworkFrame) -> Result<(), NetworkError> {
-        let target_node_id = frame.target_node_id.clone();
-        if target_node_id == self.local_node_id {
-            self.incoming_frames.push_back(InboundFrame {
-                received_by: self.local_node_id.clone(),
-                frame,
-            });
-            return Ok(());
-        }
-        self.send_frame_to_endpoint(&target_node_id, frame, false)
-    }
-
-    fn send_frame_to_endpoint(
-        &mut self,
-        target_node_id: &sinomo_node::NodeId,
-        frame: NetworkFrame,
-        require_local_source: bool,
-    ) -> Result<(), NetworkError> {
-        if require_local_source && &frame.source_node_id != self.local_node_id() {
-            return Err(NetworkError::FrameSourceMismatch {
-                local_node_id: self.local_node_id.clone(),
-                source_node_id: frame.source_node_id,
-            });
-        }
-        if !require_local_source
-            && frame.source_node_id != self.local_node_id
-            && !self
-                .endpoints_by_node_id
-                .contains_key(&frame.source_node_id)
-        {
-            return Err(NetworkError::UnknownNode {
-                node_id: frame.source_node_id,
-            });
-        }
-        if &frame.target_node_id != target_node_id {
-            return Err(NetworkError::FrameTargetMismatch {
-                requested_target_node_id: target_node_id.clone(),
-                frame_target_node_id: frame.target_node_id,
-            });
-        }
-        let endpoints = self
-            .endpoints_by_node_id
-            .get(target_node_id)
-            .cloned()
-            .ok_or_else(|| NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })?;
-        let command = DfsProtocolFrameCommand {
-            request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
-            frame,
-        };
-        let mut failures = Vec::new();
-        for endpoint in &endpoints {
-            match (self.sender)(endpoint, &command, self.timeout) {
-                Ok(response) => {
-                    for returned_frame in response.outbound_frames {
-                        self.deliver_returned_frame(returned_frame)?;
-                    }
-                    return Ok(());
-                }
-                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
-            }
-        }
-        Err(NetworkError::Io {
-            operation: format!("send DFS protocol frame to {target_node_id}"),
-            detail: failures.join("; "),
-        })
-    }
-}
-
-impl NetworkTransport for DaemonDfsEndpointTransport {
-    fn local_node_id(&self) -> &sinomo_node::NodeId {
-        &self.local_node_id
-    }
-
-    fn send(
-        &mut self,
-        target_node_id: &sinomo_node::NodeId,
-        frame: NetworkFrame,
-    ) -> Result<(), NetworkError> {
-        self.send_frame_to_endpoint(target_node_id, frame, true)
-    }
-
-    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-        Ok(self.incoming_frames.drain(..).collect())
-    }
-
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(Some(self.incoming_frames.len()))
-    }
-}
-
-pub fn publish_default_dfs_metadata_journal(
-    paths: &DaemonPaths,
-) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
-    publish_default_dfs_metadata_journal_with_senders(
-        paths,
-        Arc::new(send_dfs_metadata_journal_batch_to_endpoint),
-        Arc::new(send_dfs_metadata_snapshot_install_to_endpoint),
-    )
 }
 
 #[cfg(test)]
 fn publish_default_dfs_metadata_journal_with_sender(
     paths: &DaemonPaths,
     sender: DfsMetadataJournalBatchSender,
-) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
+) -> Result<DfsMetadataJournalReplicationReport, DaemonError> {
     publish_default_dfs_metadata_journal_with_senders(
         paths,
         sender,
-        Arc::new(send_dfs_metadata_snapshot_install_to_endpoint),
+        daemon_dfs_metadata_snapshot_install_sender(),
     )
 }
 
+#[cfg(test)]
 fn publish_default_dfs_metadata_journal_with_senders(
     paths: &DaemonPaths,
     sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
-) -> Result<DaemonDfsMetadataReplicationReport, DaemonError> {
+) -> Result<DfsMetadataJournalReplicationReport, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    if !cluster_paths.state.exists() {
-        return Ok(DaemonDfsMetadataReplicationReport {
-            outcomes: Vec::new(),
-        });
-    }
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let file_system = distributed_sifs(state.local_node_id.clone());
-    let mut shards = sinomo_network::read_cluster_kv_prefix_entries(
+    Ok(sinomo_dfs::publish_cluster_dfs_metadata_journal(
+        &data_dir,
         &cluster_paths,
-        &format!(
-            "{}/",
-            sinomo_dfs::metadata_shards_prefix(&file_system.file_system_id)
-        ),
-    )?
-    .into_iter()
-    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-    .collect::<Result<Vec<_>, _>>()?;
-    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
-    if shards.is_empty() {
-        return Ok(DaemonDfsMetadataReplicationReport {
-            outcomes: vec![DaemonDfsMetadataReplicationOutcome::MissingShard {
-                file_system_id: file_system.file_system_id,
-                shard_id: DfsMetadataShardId::new("root"),
-            }],
-        });
-    };
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
-    let mut outcomes = Vec::new();
-    for shard in shards {
-        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
-        if shard.primary_node_id != state.local_node_id {
-            outcomes.push(DaemonDfsMetadataReplicationOutcome::NotPrimary {
-                file_system_id: shard.file_system_id,
-                shard_id,
-                local_node_id: state.local_node_id.clone(),
-                primary_node_id: shard.primary_node_id,
-                epoch: shard.epoch,
-            });
-            continue;
-        }
-        let mut backend = LocalSobjMetadataBackend::new(
-            shard_id.clone(),
-            data_dir
-                .dfs_dir()
-                .join("metadata")
-                .join(path_safe_segment(&shard.shard_id)),
-        )?;
-        for target_node_id in shard
-            .replica_node_ids
-            .into_iter()
-            .filter(|target_node_id| target_node_id != &state.local_node_id)
-        {
-            let mut after_sequence = migrate_legacy_dfs_metadata_replication_cursor(
-                &mut backend,
-                &data_dir,
-                &target_node_id,
-                &shard_id,
-            )?;
-            let target_endpoints =
-                dfs_metadata_replication_target_endpoints(&endpoints, &target_node_id);
-
-            let mut sent_batches = 0usize;
-            loop {
-                let Some(batch) = backend.journal_batch_since_limited(
-                    after_sequence,
-                    DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
-                    DFS_METADATA_REPLICATION_MAX_BATCH_BYTES,
-                )?
-                else {
-                    if sent_batches == 0 {
-                        outcomes.push(DaemonDfsMetadataReplicationOutcome::NoChanges {
-                            target_node_id,
-                            shard_id: shard_id.clone(),
-                            after_sequence,
-                        });
-                    }
-                    break;
-                };
-                if target_endpoints.is_empty() {
-                    outcomes.push(DaemonDfsMetadataReplicationOutcome::MissingEndpoint {
-                        target_node_id,
-                        shard_id: shard_id.clone(),
-                        after_sequence,
-                    });
-                    break;
-                }
-                let next_after_sequence = batch.next_after_sequence;
-                let entry_count = batch.entries.len();
-                let command = DfsMetadataJournalBatchCommand {
-                    request_id: format!(
-                        "dfs_meta_{}_{}_{}",
-                        state.local_node_id, target_node_id, next_after_sequence
-                    ),
-                    source_node_id: Some(state.local_node_id.clone()),
-                    batch,
-                };
-                let mut failures = Vec::new();
-                let mut delivered = false;
-                let mut terminal = false;
-                let target_started = Instant::now();
-                for endpoint in &target_endpoints {
-                    let Some(attempt_timeout) = DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT
-                        .checked_sub(target_started.elapsed())
-                    else {
-                        failures.push(format!(
-                            "metadata journal replication target deadline exceeded after {}ms",
-                            DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT.as_millis()
-                        ));
-                        break;
-                    };
-                    let attempt_timeout = attempt_timeout.min(DFS_METADATA_REPLICATION_TIMEOUT);
-                    match sender(endpoint, &command, attempt_timeout) {
-                        Ok(response) => {
-                            if response.request_id != command.request_id
-                                || response.shard_id != shard_id
-                                || response.next_after_sequence != next_after_sequence
-                            {
-                                failures.push(format!(
-                                    "{} returned mismatched metadata journal response",
-                                    endpoint.address
-                                ));
-                                continue;
-                            }
-                            match response.result {
-                                DfsMetadataJournalBatchResult::Applied => {
-                                    backend.put_metadata_replication_cursor(
-                                        &target_node_id,
-                                        &shard_id,
-                                        next_after_sequence,
-                                    )?;
-                                    after_sequence = next_after_sequence;
-                                    sent_batches += 1;
-                                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Applied {
-                                        target_node_id: target_node_id.clone(),
-                                        shard_id: shard_id.clone(),
-                                        entries: entry_count,
-                                        next_after_sequence,
-                                    });
-                                    delivered = true;
-                                    break;
-                                }
-                                DfsMetadataJournalBatchResult::Rejected { reason } => {
-                                    if metadata_journal_rejection_is_sequence_conflict(&reason) {
-                                        let snapshot_next_after_sequence =
-                                            backend.journal_last_sequence();
-                                        let snapshot_command = DfsMetadataSnapshotInstallCommand {
-                                            request_id: format!(
-                                                "dfs_meta_snapshot_{}_{}_{}",
-                                                state.local_node_id,
-                                                target_node_id,
-                                                snapshot_next_after_sequence
-                                            ),
-                                            source_node_id: state.local_node_id.clone(),
-                                            shard_id: shard_id.clone(),
-                                            next_after_sequence: snapshot_next_after_sequence,
-                                            snapshot: backend.export_table_snapshot(),
-                                            reason: reason.clone(),
-                                        };
-                                        match snapshot_sender(
-                                            endpoint,
-                                            &snapshot_command,
-                                            attempt_timeout,
-                                        ) {
-                                            Ok(snapshot_response) => {
-                                                if snapshot_response.request_id
-                                                    != snapshot_command.request_id
-                                                    || snapshot_response.shard_id != shard_id
-                                                    || snapshot_response.next_after_sequence
-                                                        != snapshot_next_after_sequence
-                                                {
-                                                    failures.push(format!(
-                                                        "{} returned mismatched metadata snapshot install response",
-                                                        endpoint.address
-                                                    ));
-                                                    continue;
-                                                }
-                                                match snapshot_response.result {
-                                                    DfsMetadataSnapshotInstallResult::Installed {
-                                                        archived_existing,
-                                                    } => {
-                                                        backend.put_metadata_replication_cursor(
-                                                            &target_node_id,
-                                                            &shard_id,
-                                                            snapshot_next_after_sequence,
-                                                        )?;
-                                                        after_sequence =
-                                                            snapshot_next_after_sequence;
-                                                        sent_batches += 1;
-                                                        outcomes.push(
-                                                            DaemonDfsMetadataReplicationOutcome::SnapshotInstalled {
-                                                                target_node_id: target_node_id.clone(),
-                                                                shard_id: shard_id.clone(),
-                                                                next_after_sequence:
-                                                                    snapshot_next_after_sequence,
-                                                                archived_existing,
-                                                            },
-                                                        );
-                                                        delivered = true;
-                                                        break;
-                                                    }
-                                                    DfsMetadataSnapshotInstallResult::Rejected {
-                                                        reason: snapshot_reason,
-                                                    } => {
-                                                        outcomes.push(
-                                                            DaemonDfsMetadataReplicationOutcome::Rejected {
-                                                                target_node_id: target_node_id.clone(),
-                                                                shard_id: shard_id.clone(),
-                                                                reason: format!(
-                                                                    "{reason}; snapshot repair rejected: {snapshot_reason}"
-                                                                ),
-                                                            },
-                                                        );
-                                                        delivered = true;
-                                                        terminal = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(error) => {
-                                                failures.push(format!(
-                                                    "{} snapshot repair failed: {error}",
-                                                    endpoint.address
-                                                ));
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Rejected {
-                                        target_node_id: target_node_id.clone(),
-                                        shard_id: shard_id.clone(),
-                                        reason,
-                                    });
-                                    delivered = true;
-                                    terminal = true;
-                                    break;
-                                }
-                            }
-                        }
-                        Err(error) => {
-                            failures.push(format!("{} failed: {error}", endpoint.address));
-                        }
-                    }
-                }
-                if !delivered {
-                    outcomes.push(DaemonDfsMetadataReplicationOutcome::Failed {
-                        target_node_id,
-                        shard_id: shard_id.clone(),
-                        reason: failures.join("; "),
-                    });
-                    break;
-                }
-                if terminal {
-                    break;
-                }
-                if sent_batches >= DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET {
-                    if backend
-                        .journal_batch_since_limited(
-                            after_sequence,
-                            DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
-                            DFS_METADATA_REPLICATION_MAX_BATCH_BYTES,
-                        )?
-                        .is_some()
-                    {
-                        outcomes.push(DaemonDfsMetadataReplicationOutcome::BacklogRemaining {
-                            target_node_id,
-                            shard_id: shard_id.clone(),
-                            after_sequence,
-                            max_batches: DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
-                        });
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    Ok(DaemonDfsMetadataReplicationReport { outcomes })
+        sender,
+        snapshot_sender,
+        DfsMetadataJournalReplicationOptions::default(),
+    )?)
 }
 
-fn dfs_metadata_replication_target_endpoints<'a>(
-    endpoints: &'a [ClusterEndpointRecord],
-    target_node_id: &sinomo_node::NodeId,
-) -> Vec<&'a ClusterEndpointRecord> {
-    let mut candidates = endpoints
-        .iter()
-        .filter(|endpoint| endpoint.node_id == *target_node_id)
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|endpoint| dfs_metadata_replication_endpoint_order_key(endpoint));
-    let mut selected = Vec::new();
-    let mut deferred = Vec::new();
-    let mut seen_routes = std::collections::BTreeSet::new();
-    let mut seen_classes = std::collections::BTreeSet::new();
-    for endpoint in candidates {
-        if !seen_routes.insert((
-            format!("{:?}", endpoint.transport),
-            endpoint.address.clone(),
-        )) {
-            continue;
-        }
-        if seen_classes.insert(dfs_metadata_replication_endpoint_class(endpoint)) {
-            selected.push(endpoint);
-        } else {
-            deferred.push(endpoint);
-        }
-        if selected.len() >= DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET {
-            return selected;
-        }
-    }
-    for endpoint in deferred {
-        if selected.len() >= DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET {
-            break;
-        }
-        selected.push(endpoint);
-    }
-    selected
-}
-
-fn dfs_metadata_replication_endpoint_order_key(
-    endpoint: &ClusterEndpointRecord,
-) -> (u8, u16, String) {
-    (
-        dfs_metadata_replication_endpoint_class(endpoint),
-        endpoint.priority,
-        endpoint.address.clone(),
-    )
-}
-
-fn dfs_metadata_replication_endpoint_class(endpoint: &ClusterEndpointRecord) -> u8 {
-    match (&endpoint.transport, &endpoint.privacy) {
-        (
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
-            ClusterEndpointPrivacy::Lan,
-        ) => 0,
-        (
-            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
-            ClusterEndpointPrivacy::InternetDirect,
-        ) => 1,
-        (ClusterTransportKind::Iroh, _) => 2,
-        (ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback, _) => 3,
-        _ => 4,
-    }
-}
-
-fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
-    reason.contains("metadata journal sequence")
-        && reason.contains("already exists with a different entry")
-}
-
-pub fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<DaemonDfsSmokeReport, DaemonError> {
+pub(crate) fn run_daemon_dfs_smoke(
+    paths: &DaemonPaths,
+) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
-    data_dir.ensure_root_layout()?;
     let cluster_paths = ClusterPaths::new(&data_dir);
-    if !cluster_paths.state.exists() {
-        return Err(DaemonError::ClusterOrphan);
-    }
-    ensure_default_distributed_dfs(paths, &DaemonRunOptions::default(), true)?;
-    let state = sinomo_network::read_cluster_state_without_kv(&cluster_paths)?;
-    let mut content_nodes =
-        sinomo_network::read_cluster_kv_prefix_entries(&cluster_paths, content_services_prefix())?
-            .into_iter()
-            .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
-            .filter(|advertisement| advertisement.accepts_content)
-            .map(|advertisement| advertisement.node_id)
-            .collect::<Vec<_>>();
-    content_nodes.sort();
-    content_nodes.dedup();
-
-    let endpoints = sinomo_network::cluster_dfs_protocol_targets(&cluster_paths, &state);
-    let endpoint_node_ids = endpoints
-        .iter()
-        .map(|endpoint| endpoint.node_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let remote_candidates = content_nodes
-        .into_iter()
-        .filter(|node_id| node_id != &state.local_node_id)
-        .filter(|node_id| endpoint_node_ids.contains(node_id))
-        .collect::<Vec<_>>();
-    let replica_candidate_sets = if remote_candidates.is_empty() {
-        vec![vec![state.local_node_id.clone()]]
-    } else {
-        remote_candidates
-            .into_iter()
-            .map(|remote_node_id| vec![state.local_node_id.clone(), remote_node_id])
-            .collect()
-    };
-
-    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
-    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
-    let mut service = with_daemon_dfs_control_plane(
-        NetworkedDfsService::new(
-            DaemonDfsEndpointTransport::new(state.local_node_id.clone(), endpoints),
-            content,
-        ),
+    let options = DaemonRunOptions::default();
+    let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
+    let Some(report) = sinomo_dfs::run_default_cluster_dfs_smoke(
+        &data_dir,
         &cluster_paths,
-    )
-    .with_boxed_metadata_backend(metadata)?;
-    service.bootstrap_distributed_sifs()?;
-    service.posix_mkdir_all("/services/dfs-smoke")?;
-
-    let nonce = OffsetDateTime::now_utc().unix_timestamp_nanos();
-    let mut attempts = Vec::new();
-    let mut successful = None;
-    for replica_candidates in replica_candidate_sets {
-        let target_label = replica_candidates
-            .iter()
-            .map(|node_id| node_id.to_string())
-            .collect::<Vec<_>>()
-            .join("-");
-        let replica_count = replica_candidates.len();
-        let path = format!("/services/dfs-smoke/{nonce}-{target_label}.txt");
-        let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
-        match service.posix_write_file(
-            &path,
-            body.as_bytes(),
-            DfsWriteOptions {
-                policy: DfsReplicationPolicy::new(replica_count, replica_count)?,
-                replica_candidates: replica_candidates.clone(),
-                wait_for_commit: true,
+        daemon_dfs_protocol_frame_sender(),
+        daemon_dfs_metadata_journal_batch_sender(),
+        daemon_dfs_metadata_snapshot_install_sender(),
+        Box::new(DaemonDfsControlPlaneKvClient::new(&cluster_paths)),
+        daemon_dfs_control_plane_client(&cluster_paths),
+        DfsDefaultClusterSmokeOptions {
+            bootstrap: DfsDefaultClusterBootstrapOptions {
+                publish_cluster_control: true,
+                local_endpoint,
             },
-        ) {
-            Ok(stat) => {
-                attempts.push(DaemonDfsSmokeAttempt {
-                    replica_node_ids: replica_candidates.clone(),
-                    path: path.clone(),
-                    committed: true,
-                    detail: "committed".to_string(),
-                });
-                successful = Some((stat, replica_candidates));
-                break;
-            }
-            Err(error) => {
-                let event_detail = dfs_event_summary(service.last_events());
-                let detail = if event_detail.is_empty() {
-                    error.to_string()
-                } else {
-                    format!("{error}; events: {}", event_detail.join("; "))
-                };
-                attempts.push(DaemonDfsSmokeAttempt {
-                    replica_node_ids: replica_candidates,
-                    path,
-                    committed: false,
-                    detail,
-                });
-            }
-        }
-    }
-    let Some((stat, replica_candidates)) = successful else {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "DFS smoke did not commit on any candidate replica set: {}",
-                attempts
-                    .iter()
-                    .map(|attempt| format!(
-                        "{} => {}",
-                        attempt
-                            .replica_node_ids
-                            .iter()
-                            .map(|node_id| node_id.to_string())
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        attempt.detail
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-        });
+            smoke: sinomo_dfs::DfsSmokeOptions::default(),
+        },
+    )?
+    else {
+        return Err(DaemonError::ClusterOrphan);
     };
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let status = inspect_daemon_dfs_status(&data_dir, &cluster_paths)?;
-    let metadata_replication = publish_default_dfs_metadata_journal(paths)?;
-    Ok(DaemonDfsSmokeReport {
-        path: stat.path,
-        file_system_id: stat.file_system_id,
-        object_id: stat.object_id,
-        version: stat.version,
-        content_hash: stat.content_hash,
-        size_bytes: stat.size_bytes,
-        requested_replica_node_ids: replica_candidates,
-        committed_replica_node_ids: stat.current_locations,
-        pending_repair_count: status.pending_repair_count,
-        metadata_replication,
-        attempts,
-    })
+    Ok(report)
 }
 
 fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError> {
@@ -2074,357 +304,77 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
     })
 }
 
-fn dfs_event_summary(events: &[sinomo_dfs::NetworkedDfsServiceEvent]) -> Vec<String> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            sinomo_dfs::NetworkedDfsServiceEvent::BlobStageRejected {
-                replica_node_id,
-                reason,
-                ..
-            } => Some(format!("stage rejected by {replica_node_id}: {reason}")),
-            sinomo_dfs::NetworkedDfsServiceEvent::BlobFetchRejected {
-                source_node_id,
-                reason,
-                ..
-            } => Some(format!("fetch rejected by {source_node_id}: {reason}")),
-            sinomo_dfs::NetworkedDfsServiceEvent::RepairRejected {
-                replica_node_id,
-                reason,
-                ..
-            } => Some(format!("repair rejected by {replica_node_id}: {reason}")),
-            _ => None,
-        })
-        .collect()
-}
-
 fn publish_dfs_metadata_after_mutating_protocol_events(
     paths: &DaemonPaths,
     events: &[NetworkedDfsServiceEvent],
 ) {
-    if !dfs_protocol_events_should_publish_metadata(events) {
-        return;
-    }
-    publish_dfs_metadata_after_protocol_mutation(paths);
+    publish_dfs_metadata_after_protocol_mutation(paths, events);
 }
 
 #[cfg(not(test))]
-fn publish_dfs_metadata_after_protocol_mutation(paths: &DaemonPaths) {
-    DFS_PROTOCOL_METADATA_PUBLISH_PENDING.store(true, Ordering::Release);
-    if DFS_PROTOCOL_METADATA_PUBLISH_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+fn publish_dfs_metadata_after_protocol_mutation(
+    paths: &DaemonPaths,
+    events: &[NetworkedDfsServiceEvent],
+) {
+    if !sinomo_dfs::dfs_events_should_publish_metadata(events) {
         return;
     }
-    let paths = paths.clone();
-    if let Err(source) = std::thread::Builder::new()
-        .name("sinomo-dfs-metadata-publish".to_string())
-        .spawn(move || run_scheduled_dfs_metadata_publish(paths))
-    {
-        DFS_PROTOCOL_METADATA_PUBLISH_RUNNING.store(false, Ordering::Release);
+    let data_dir = match daemon_data_dir(paths) {
+        Ok(data_dir) => SinomoDataDir::new(data_dir),
+        Err(error) => {
+            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+            return;
+        }
+    };
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let result = sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events(
+        data_dir,
+        cluster_paths,
+        daemon_dfs_metadata_journal_batch_sender(),
+        daemon_dfs_metadata_snapshot_install_sender(),
+        events,
+        sinomo_dfs::DfsMetadataPublishScheduleOptions::default(),
+        DfsMetadataJournalReplicationOptions::default(),
+        log_dfs_metadata_replication_report,
+        |error| {
+            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+        },
+    );
+    if let Err(source) = result {
         eprintln!(
             "sinomo daemon failed to spawn DFS metadata publish after protocol mutation: {source}"
         );
     }
 }
 
-#[cfg(not(test))]
-fn run_scheduled_dfs_metadata_publish(paths: DaemonPaths) {
-    let mut retry_rounds = 0usize;
-    loop {
-        DFS_PROTOCOL_METADATA_PUBLISH_PENDING.store(false, Ordering::Release);
-        let needs_retry = match publish_default_dfs_metadata_journal(&paths) {
-            Ok(report) => {
-                let needs_retry = dfs_metadata_replication_report_needs_retry(&report);
-                log_dfs_metadata_replication_report(report);
-                needs_retry
-            }
-            Err(error) => {
-                eprintln!(
-                    "sinomo daemon DFS metadata publish after protocol mutation failed: {error}"
-                );
-                true
-            }
-        };
-        if DFS_PROTOCOL_METADATA_PUBLISH_PENDING.load(Ordering::Acquire) {
-            retry_rounds = 0;
-            continue;
-        }
-        if needs_retry && retry_rounds < DFS_PROTOCOL_METADATA_PUBLISH_RETRY_ROUNDS {
-            retry_rounds += 1;
-            std::thread::sleep(DFS_PROTOCOL_METADATA_PUBLISH_RETRY_DELAY);
-            continue;
-        }
-        DFS_PROTOCOL_METADATA_PUBLISH_RUNNING.store(false, Ordering::Release);
-        if DFS_PROTOCOL_METADATA_PUBLISH_PENDING.load(Ordering::Acquire)
-            && DFS_PROTOCOL_METADATA_PUBLISH_RUNNING
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            retry_rounds = 0;
-            continue;
-        }
-        break;
-    }
-}
-
 #[cfg(test)]
-fn publish_dfs_metadata_after_protocol_mutation(paths: &DaemonPaths) {
-    match publish_default_dfs_metadata_journal(paths) {
-        Ok(report) => log_dfs_metadata_replication_report(report),
+fn publish_dfs_metadata_after_protocol_mutation(
+    paths: &DaemonPaths,
+    events: &[NetworkedDfsServiceEvent],
+) {
+    if !sinomo_dfs::dfs_events_should_publish_metadata(events) {
+        return;
+    }
+    let data_dir = match daemon_data_dir(paths) {
+        Ok(data_dir) => SinomoDataDir::new(data_dir),
         Err(error) => {
             eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+            return;
         }
-    }
-}
-
-fn dfs_protocol_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -> bool {
-    events.iter().any(|event| match event {
-        NetworkedDfsServiceEvent::BlobStaged { .. }
-        | NetworkedDfsServiceEvent::VersionCommitted { .. }
-        | NetworkedDfsServiceEvent::ReplicaRepaired { .. }
-        | NetworkedDfsServiceEvent::WriteConflictCreated { .. }
-        | NetworkedDfsServiceEvent::OwnerHandoffCompleted { .. } => true,
-        NetworkedDfsServiceEvent::RemoteWriteServed { result, .. }
-        | NetworkedDfsServiceEvent::RemoteWriteCompleted { result, .. } => {
-            matches!(result, DfsDistributedWriteResult::Outcome { .. })
-        }
-        NetworkedDfsServiceEvent::BlobStageRejected { .. }
-        | NetworkedDfsServiceEvent::BlobFetched { .. }
-        | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
-        | NetworkedDfsServiceEvent::RemoteReadServed { .. }
-        | NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived { .. }
-        | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
-        | NetworkedDfsServiceEvent::RepairRejected { .. }
-        | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
-        | NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. } => false,
-    })
-}
-
-fn dfs_metadata_replication_report_needs_retry(
-    report: &DaemonDfsMetadataReplicationReport,
-) -> bool {
-    report.outcomes.iter().any(|outcome| {
-        matches!(
-            outcome,
-            DaemonDfsMetadataReplicationOutcome::Failed { .. }
-                | DaemonDfsMetadataReplicationOutcome::BacklogRemaining { .. }
-        )
-    })
-}
-
-fn local_dfs_protocol_node_id(
-    data_dir: &SinomoDataDir,
-) -> Result<sinomo_node::NodeId, DaemonError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    if !cluster_paths.state.exists() {
-        return Err(DaemonError::ClusterOrphan);
-    }
-    Ok(sinomo_network::read_cluster_state_without_kv(&cluster_paths)?.local_node_id)
-}
-
-fn migrate_legacy_dfs_metadata_replication_cursor(
-    backend: &mut LocalSobjMetadataBackend,
-    data_dir: &SinomoDataDir,
-    target_node_id: &sinomo_node::NodeId,
-    shard_id: &DfsMetadataShardId,
-) -> Result<u64, DaemonError> {
-    let mut after_sequence = backend.metadata_replication_cursor(target_node_id, shard_id)?;
-    let legacy_path =
-        legacy_dfs_metadata_replication_cursor_path(data_dir, target_node_id, shard_id);
-    let Some(legacy_cursor) = read_legacy_dfs_metadata_replication_cursor(&legacy_path)? else {
-        return Ok(after_sequence);
     };
-    if legacy_cursor.target_node_id != *target_node_id || legacy_cursor.shard_id != *shard_id {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "legacy DFS metadata replication cursor {} does not match target {target_node_id} shard {}",
-                legacy_path.display(),
-                shard_id.0,
-            ),
-        });
-    }
-    let legacy_after_sequence = legacy_cursor.next_after_sequence;
-    if legacy_after_sequence > after_sequence {
-        backend.put_metadata_replication_cursor(target_node_id, shard_id, legacy_after_sequence)?;
-        after_sequence = legacy_after_sequence;
-    }
-    match fs::remove_file(&legacy_path) {
-        Ok(()) => {}
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(DaemonError::Io {
-                path: legacy_path.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    }
-    Ok(after_sequence)
-}
-
-fn legacy_dfs_metadata_replication_cursor_path(
-    data_dir: &SinomoDataDir,
-    target_node_id: &sinomo_node::NodeId,
-    shard_id: &DfsMetadataShardId,
-) -> std::path::PathBuf {
-    data_dir
-        .dfs_dir()
-        .join("metadata-replication-cursors")
-        .join(path_safe_segment(&target_node_id.to_string()))
-        .join(format!("{}.json", path_safe_segment(&shard_id.0)))
-}
-
-fn read_legacy_dfs_metadata_replication_cursor(
-    path: &std::path::Path,
-) -> Result<Option<LegacyDaemonDfsMetadataReplicationCursor>, DaemonError> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|source| DaemonError::Json {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
-}
-
-#[cfg(test)]
-fn write_legacy_dfs_metadata_replication_cursor(
-    path: &std::path::Path,
-    cursor: &LegacyDaemonDfsMetadataReplicationCursor,
-) -> Result<(), DaemonError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let bytes = serde_json::to_vec_pretty(cursor).map_err(|source| DaemonError::Json {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    fs::write(path, bytes).map_err(|source| DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })
-}
-
-fn daemon_dfs_anti_entropy_cursor_path(
-    data_dir: &SinomoDataDir,
-    file_system_id: &sinomo_dfs::DfsFileSystemId,
-) -> std::path::PathBuf {
-    data_dir
-        .dfs_dir()
-        .join("anti-entropy-cursors")
-        .join(format!(
-            "{}.sobj",
-            path_safe_segment(&file_system_id.to_string())
-        ))
-}
-
-fn legacy_daemon_dfs_anti_entropy_cursor_path(path: &std::path::Path) -> std::path::PathBuf {
-    path.with_extension("json")
-}
-
-fn read_daemon_dfs_anti_entropy_cursor(
-    path: &std::path::Path,
-) -> Result<Option<DaemonDfsAntiEntropyCursor>, DaemonError> {
-    match fs::read(path) {
-        Ok(bytes) => sinomo_object_serde::from_bytes(&bytes)
-            .map(Some)
-            .map_err(|source| DaemonError::Parse {
-                detail: format!(
-                    "DFS anti-entropy cursor object error at {}: {source}",
-                    path.display()
-                ),
-            }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            read_legacy_daemon_dfs_anti_entropy_cursor(&legacy_daemon_dfs_anti_entropy_cursor_path(
-                path,
-            ))
-        }
-        Err(source) => Err(DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
-}
-
-fn read_legacy_daemon_dfs_anti_entropy_cursor(
-    path: &std::path::Path,
-) -> Result<Option<DaemonDfsAntiEntropyCursor>, DaemonError> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|source| DaemonError::Json {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            }),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
-}
-
-fn write_daemon_dfs_anti_entropy_cursor(
-    path: &std::path::Path,
-    cursor: &DaemonDfsAntiEntropyCursor,
-) -> Result<(), DaemonError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let bytes = sinomo_object_serde::to_bytes(cursor, 1, LengthMode::U32).map_err(|source| {
-        DaemonError::Parse {
-            detail: format!(
-                "DFS anti-entropy cursor object error at {}: {source}",
-                path.display()
-            ),
-        }
-    })?;
-    fs::write(path, bytes).map_err(|source| DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    clear_daemon_dfs_cursor_file(&legacy_daemon_dfs_anti_entropy_cursor_path(path))
-}
-
-fn clear_daemon_dfs_anti_entropy_cursor(path: &std::path::Path) -> Result<(), DaemonError> {
-    clear_daemon_dfs_cursor_file(path)?;
-    clear_daemon_dfs_cursor_file(&legacy_daemon_dfs_anti_entropy_cursor_path(path))
-}
-
-fn clear_daemon_dfs_cursor_file(path: &std::path::Path) -> Result<(), DaemonError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
-}
-
-fn path_safe_segment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let _ = sinomo_dfs::run_cluster_dfs_metadata_publish_after_events(
+        &data_dir,
+        &cluster_paths,
+        daemon_dfs_metadata_journal_batch_sender(),
+        daemon_dfs_metadata_snapshot_install_sender(),
+        events,
+        DfsMetadataJournalReplicationOptions::default(),
+        log_dfs_metadata_replication_report,
+        |error| {
+            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+        },
+    );
 }
 
 #[cfg(test)]
@@ -2435,126 +385,42 @@ mod tests {
         DfsObjectPolicy,
     };
     use sinomo_dfs::{
-        DfsBlobTransferResult, DfsNamespaceJobStatus, DfsNetworkMessage, DfsObjectId,
-        DfsObjectKind, DfsObjectMetadata, DfsProtocolFrameCommand, DfsReplicationPolicy,
+        DfsBlobTransferResult, DfsMetadataJournalReplicationOutcome, DfsNamespaceJobStatus,
+        DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsProtocolFrameCommand,
         DfsStageBlobCommand, DfsVersion, DfsWriteOptions,
     };
     use sinomo_network::{
         MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId, ProtocolMessage,
     };
     use sinomo_node::NodeId;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn dfs_protocol_metadata_publish_gate_tracks_mutating_events() {
-        let node = NodeId::from_legacy_named("node_dfs_publish_gate").expect("node");
-        let object_id = DfsObjectId::from_legacy_named("obj_dfs_publish_gate").expect("object");
-        let version = DfsVersion::from_legacy_named("version_dfs_publish_gate").expect("version");
-        let content_hash =
-            "blake3:0000000000000000000000000000000000000000000000000000000000000000".to_string();
-
-        assert!(!dfs_protocol_events_should_publish_metadata(&[]));
-        assert!(!dfs_protocol_events_should_publish_metadata(&[
-            NetworkedDfsServiceEvent::BlobFetched {
-                intent_id: "intent_read_only".to_string(),
-                object_id: object_id.clone(),
-                version: version.clone(),
-                source_node_id: node.clone(),
-                content_hash: content_hash.clone(),
-            },
-            NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived {
-                request_id: "range_read_only".to_string(),
-                object_id: object_id.clone(),
-                source_node_id: node.clone(),
-                version: version.clone(),
-                content_hash: Some(content_hash.clone()),
-                range_offset: 0,
-                range_size_bytes: 4,
-                object_total_size_bytes: 4,
-                chunk_index: 0,
-                total_chunks: 1,
-                bytes: b"read".to_vec(),
-                complete: true,
-            },
-            NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
-                request_id: "metadata_batch".to_string(),
-                source_node_id: node.clone(),
-                shard_id: DfsMetadataShardId::new("root"),
-                applied_entries: 1,
-                next_after_sequence: 1,
-            },
-            NetworkedDfsServiceEvent::RemoteWriteServed {
-                request_id: "remote_write_rejected".to_string(),
-                object_id: object_id.clone(),
-                requester_node_id: node.clone(),
-                result: DfsDistributedWriteResult::Rejected {
-                    reason: "rejected".to_string(),
-                },
-            },
-        ]));
-        assert!(dfs_protocol_events_should_publish_metadata(&[
-            NetworkedDfsServiceEvent::BlobStaged {
-                intent_id: "intent_staged".to_string(),
-                object_id: object_id.clone(),
-                version: version.clone(),
-                replica_node_id: node.clone(),
-                content_hash: content_hash.clone(),
-            },
-        ]));
-        assert!(dfs_protocol_events_should_publish_metadata(&[
-            NetworkedDfsServiceEvent::VersionCommitted {
-                intent_id: "intent_committed".to_string(),
-                object_id,
-                version,
-                content_hash,
-            },
-        ]));
+    fn test_default_cluster_bootstrap_host(
+        data_dir: &SinomoDataDir,
+        cluster_paths: &ClusterPaths,
+        local_node_id: NodeId,
+    ) -> sinomo_dfs::DfsControlPlaneDefaultClusterBootstrapHost {
+        sinomo_dfs::DfsControlPlaneDefaultClusterBootstrapHost::new(
+            data_dir.clone(),
+            cluster_paths.clone(),
+            local_node_id,
+            Box::new(DaemonDfsControlPlaneKvClient::new(cluster_paths)),
+        )
     }
 
-    #[test]
-    fn dfs_metadata_replication_retry_gate_tracks_incomplete_outcomes() {
-        let node = NodeId::from_legacy_named("node_dfs_retry_gate").expect("node");
-        let shard_id = DfsMetadataShardId::new("services");
-
-        assert!(!dfs_metadata_replication_report_needs_retry(
-            &DaemonDfsMetadataReplicationReport {
-                outcomes: vec![
-                    DaemonDfsMetadataReplicationOutcome::Applied {
-                        target_node_id: node.clone(),
-                        shard_id: shard_id.clone(),
-                        entries: 1,
-                        next_after_sequence: 8,
-                    },
-                    DaemonDfsMetadataReplicationOutcome::NoChanges {
-                        target_node_id: node.clone(),
-                        shard_id: shard_id.clone(),
-                        after_sequence: 8,
-                    },
-                ],
-            }
-        ));
-        assert!(dfs_metadata_replication_report_needs_retry(
-            &DaemonDfsMetadataReplicationReport {
-                outcomes: vec![DaemonDfsMetadataReplicationOutcome::Failed {
-                    target_node_id: node.clone(),
-                    shard_id: shard_id.clone(),
-                    reason: "target timed out after applying the batch".to_string(),
-                }],
-            }
-        ));
-        assert!(dfs_metadata_replication_report_needs_retry(
-            &DaemonDfsMetadataReplicationReport {
-                outcomes: vec![DaemonDfsMetadataReplicationOutcome::BacklogRemaining {
-                    target_node_id: node,
-                    shard_id,
-                    after_sequence: 64,
-                    max_batches: 64,
-                }],
-            }
-        ));
+    fn process_test_dfs_metadata_journal_batch(
+        paths: &DaemonPaths,
+        command: DfsMetadataJournalBatchCommand,
+    ) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
+        let data_dir = daemon_data_dir(paths)?;
+        let data_dir = SinomoDataDir::new(data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        sinomo_dfs::process_cluster_dfs_metadata_journal_batch(&data_dir, &cluster_paths, command)
+            .map_err(Into::into)
     }
 
     #[test]
@@ -2591,7 +457,7 @@ mod tests {
             .poll_subscription(&mut subscription)
             .expect("source batch");
 
-        let response = handle_daemon_dfs_metadata_journal_batch(
+        let response = process_test_dfs_metadata_journal_batch(
             &paths,
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_1".to_string(),
@@ -2637,7 +503,7 @@ mod tests {
             .poll_subscription(&mut subscription)
             .expect("source batch");
 
-        let response = handle_daemon_dfs_metadata_journal_batch(
+        let response = process_test_dfs_metadata_journal_batch(
             &paths,
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_safe".to_string(),
@@ -2732,7 +598,7 @@ mod tests {
             .poll_subscription(&mut subscription)
             .expect("source batch");
 
-        let response = handle_daemon_dfs_metadata_journal_batch(
+        let response = process_test_dfs_metadata_journal_batch(
             &paths,
             DfsMetadataJournalBatchCommand {
                 request_id: "dfs_meta_req_stale_source".to_string(),
@@ -2767,9 +633,9 @@ mod tests {
     fn daemon_dfs_status_reads_default_metadata_backend() {
         let root = temp_root("daemon_dfs_status");
         let data_root = root.join("data");
-        let paths = DaemonPaths::with_root(data_root.join("daemon"));
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
         let node_id = NodeId::from_legacy_named("node_daemon_dfs_status").expect("node");
         let file_system = distributed_sifs(node_id.clone());
         let object = distributed_sifs_bootstrap_objects(node_id)
@@ -2797,61 +663,12 @@ mod tests {
             })
             .expect("version");
 
-        let status = handle_daemon_dfs_status(&paths).expect("dfs status");
+        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+            .expect("dfs status");
 
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 1);
         assert_eq!(status.version_count, 1);
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn daemon_dfs_anti_entropy_cursor_migrates_legacy_json() {
-        let root = temp_root("daemon_dfs_anti_entropy_cursor_migrates_legacy_json");
-        let data_root = root.join("data");
-        let data_dir = SinomoDataDir::new(&data_root);
-        let file_system_id =
-            sinomo_dfs::DfsFileSystemId::from_legacy_named("fs_anti_entropy_cursor_migration")
-                .expect("file system");
-        let object_id =
-            DfsObjectId::from_legacy_named("obj_anti_entropy_cursor_migration").expect("object");
-        let cursor = DaemonDfsAntiEntropyCursor {
-            file_system_id: file_system_id.clone(),
-            next_cursor: Some(DfsObjectPageCursor {
-                path: "/services/cursor-migration".to_string(),
-                object_id,
-                shard_id: None,
-            }),
-        };
-        let path = daemon_dfs_anti_entropy_cursor_path(&data_dir, &file_system_id);
-        let legacy_path = legacy_daemon_dfs_anti_entropy_cursor_path(&path);
-        fs::create_dir_all(legacy_path.parent().expect("legacy cursor parent"))
-            .expect("create legacy cursor parent");
-        fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&cursor).expect("legacy cursor json"),
-        )
-        .expect("write legacy cursor");
-
-        let loaded = read_daemon_dfs_anti_entropy_cursor(&path)
-            .expect("read legacy cursor")
-            .expect("legacy cursor");
-        assert_eq!(loaded, cursor);
-        assert!(!path.exists());
-        assert!(legacy_path.exists());
-
-        write_daemon_dfs_anti_entropy_cursor(&path, &loaded).expect("write sobj cursor");
-        assert!(path.exists());
-        assert!(!legacy_path.exists());
-        assert_eq!(
-            read_daemon_dfs_anti_entropy_cursor(&path).expect("read sobj cursor"),
-            Some(cursor)
-        );
-
-        clear_daemon_dfs_anti_entropy_cursor(&path).expect("clear cursor");
-        assert!(!path.exists());
-        assert!(!legacy_path.exists());
 
         cleanup(&root);
     }
@@ -2890,7 +707,7 @@ mod tests {
             let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)
                 .expect("metadata backend");
             let mut service = NetworkedDfsService::new(
-                DaemonDfsEndpointTransport::new(node_id.clone(), Vec::new()),
+                daemon_dfs_endpoint_transport(node_id.clone(), Vec::new()),
                 content,
             )
             .with_boxed_metadata_backend(metadata)
@@ -2915,12 +732,14 @@ mod tests {
             job.job_id
         };
 
-        let status = handle_daemon_dfs_status(&paths).expect("status before maintenance");
+        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+            .expect("status before maintenance");
         assert_eq!(status.pending_namespace_job_count, 1);
 
         run_daemon_dfs_maintenance_tick(&paths).expect("maintenance tick");
 
-        let status = handle_daemon_dfs_status(&paths).expect("status after maintenance");
+        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+            .expect("status after maintenance");
         assert_eq!(status.pending_namespace_job_count, 0);
         assert_eq!(status.failed_namespace_job_count, 0);
         let backend =
@@ -2934,12 +753,10 @@ mod tests {
 
         let content =
             LocalContentStore::new(data_dir.dfs_dir().join("content")).expect("content store");
-        let service = NetworkedDfsService::new(
-            DaemonDfsEndpointTransport::new(node_id, Vec::new()),
-            content,
-        )
-        .with_boxed_metadata_backend(backend)
-        .expect("service backend");
+        let service =
+            NetworkedDfsService::new(daemon_dfs_endpoint_transport(node_id, Vec::new()), content)
+                .with_boxed_metadata_backend(backend)
+                .expect("service backend");
         assert_eq!(
             service.posix_read_file(&new_file).expect("read moved file"),
             b"daemon namespace job"
@@ -2974,7 +791,7 @@ mod tests {
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
             .expect("sync raft");
 
-        let file_system = default_cluster_sifs(&state);
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let object_id =
             DfsObjectId::from_legacy_named("obj_daemon_dfs_anti_entropy_tick").expect("object");
         let version =
@@ -3011,7 +828,7 @@ mod tests {
             let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)
                 .expect("metadata backend");
             let mut service = NetworkedDfsService::new(
-                DaemonDfsEndpointTransport::new(node_id.clone(), Vec::new()),
+                daemon_dfs_endpoint_transport(node_id.clone(), Vec::new()),
                 content,
             )
             .with_boxed_metadata_backend(metadata)
@@ -3045,7 +862,11 @@ mod tests {
             "anti-entropy must remove stale local version locations"
         );
         assert!(
-            !daemon_dfs_anti_entropy_cursor_path(&data_dir, &file_system.file_system_id).exists(),
+            !sinomo_dfs::default_dfs_anti_entropy_cursor_path(
+                &data_dir,
+                &file_system.file_system_id
+            )
+            .exists(),
             "completed scans should clear their cursor"
         );
 
@@ -3056,7 +877,6 @@ mod tests {
     fn daemon_dfs_status_reads_configured_sharded_metadata_backend() {
         let root = temp_root("daemon_dfs_status_sharded");
         let data_root = root.join("data");
-        let paths = DaemonPaths::with_root(data_root.join("daemon"));
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -3126,9 +946,10 @@ mod tests {
             .next()
             .expect("bootstrap object");
         object.path = "/services/status-sharded.txt".to_string();
-        let mut backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
-            .expect("open sharded backend")
-            .expect("configured backend");
+        let mut backend =
+            sinomo_dfs::open_cluster_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("open sharded backend")
+                .expect("configured backend");
         backend.put_file_system(&file_system).expect("filesystem");
         backend.put_object(&object).expect("object");
         backend
@@ -3152,7 +973,8 @@ mod tests {
             )
             .expect("metadata cursor");
 
-        let status = handle_daemon_dfs_status(&paths).expect("dfs status");
+        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+            .expect("dfs status");
 
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 1);
@@ -3176,8 +998,9 @@ mod tests {
         );
         let DaemonDfsInspectionResponse::FileSystem {
             file_system: Some(file_system_view),
-        } = handle_daemon_dfs_inspection(
-            &paths,
+        } = sinomo_dfs::inspect_cluster_aware_dfs(
+            &data_dir,
+            &cluster_paths,
             DaemonDfsInspectionRequest::FileSystem {
                 file_system_id: file_system.file_system_id.clone(),
             },
@@ -3197,7 +1020,6 @@ mod tests {
     fn daemon_dfs_status_reports_replica_lag_only_from_primary() {
         let root = temp_root("daemon_dfs_status_replica_lag_primary_only");
         let data_root = root.join("data");
-        let paths = DaemonPaths::with_root(data_root.join("daemon"));
         let data_dir = SinomoDataDir::new(&data_root);
         data_dir.ensure_root_layout().expect("root layout");
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -3242,12 +1064,14 @@ mod tests {
             ),
         )
         .expect("write shard config");
-        let mut backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
-            .expect("open sharded backend")
-            .expect("configured backend");
+        let mut backend =
+            sinomo_dfs::open_cluster_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("open sharded backend")
+                .expect("configured backend");
         backend.put_file_system(&file_system).expect("filesystem");
 
-        let status = handle_daemon_dfs_status(&paths).expect("dfs status");
+        let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+            .expect("dfs status");
 
         assert_eq!(status.metadata_shards.len(), 1);
         assert!(status.metadata_shards[0].replica_lag.is_empty());
@@ -3342,14 +1166,18 @@ mod tests {
             })
             .expect("version");
         let legacy_path =
-            legacy_dfs_metadata_replication_cursor_path(&data_dir, &remote, &shard_id);
-        write_legacy_dfs_metadata_replication_cursor(
+            sinomo_dfs::legacy_dfs_metadata_replication_cursor_path(&data_dir, &remote, &shard_id);
+        if let Some(parent) = legacy_path.parent() {
+            fs::create_dir_all(parent).expect("legacy cursor parent");
+        }
+        let legacy_cursor = sinomo_dfs::LegacyDfsMetadataReplicationCursor {
+            target_node_id: remote.clone(),
+            shard_id: shard_id.clone(),
+            next_after_sequence: 1,
+        };
+        fs::write(
             &legacy_path,
-            &LegacyDaemonDfsMetadataReplicationCursor {
-                target_node_id: remote.clone(),
-                shard_id: shard_id.clone(),
-                next_after_sequence: 1,
-            },
+            serde_json::to_vec_pretty(&legacy_cursor).expect("legacy cursor json"),
         )
         .expect("legacy cursor");
 
@@ -3375,7 +1203,7 @@ mod tests {
 
         assert_eq!(
             report.outcomes,
-            vec![DaemonDfsMetadataReplicationOutcome::Applied {
+            vec![DfsMetadataJournalReplicationOutcome::Applied {
                 target_node_id: remote.clone(),
                 shard_id: shard_id.clone(),
                 entries: 2,
@@ -3486,12 +1314,9 @@ mod tests {
                 DfsObjectId::from_legacy_named(format!("obj_metadata_shard_{shard_name}"))
                     .expect("object");
             object.path = format!("/{shard_name}/metadata.txt");
-            let mut backend = LocalSobjMetadataBackend::new(
+            let mut backend = sinomo_dfs::open_local_metadata_shard_backend(
+                &data_dir,
                 DfsMetadataShardId::new(shard_name),
-                data_dir
-                    .dfs_dir()
-                    .join("metadata")
-                    .join(path_safe_segment(shard_name)),
             )
             .expect("metadata backend");
             backend.put_file_system(&file_system).expect("filesystem");
@@ -3521,13 +1346,13 @@ mod tests {
         assert_eq!(
             report.outcomes,
             vec![
-                DaemonDfsMetadataReplicationOutcome::Applied {
+                DfsMetadataJournalReplicationOutcome::Applied {
                     target_node_id: remote.clone(),
                     shard_id: DfsMetadataShardId::new("root"),
                     entries: 2,
                     next_after_sequence: 2,
                 },
-                DaemonDfsMetadataReplicationOutcome::Applied {
+                DfsMetadataJournalReplicationOutcome::Applied {
                     target_node_id: remote.clone(),
                     shard_id: DfsMetadataShardId::new("services"),
                     entries: 2,
@@ -3621,7 +1446,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("bootstrap object");
-        let object_count = DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES + 7;
+        let object_count = sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 7;
         for index in 0..object_count {
             let mut object = base_object.clone();
             object.object_id =
@@ -3661,16 +1486,18 @@ mod tests {
         assert_eq!(
             report.outcomes,
             vec![
-                DaemonDfsMetadataReplicationOutcome::Applied {
+                DfsMetadataJournalReplicationOutcome::Applied {
                     target_node_id: remote.clone(),
                     shard_id: shard_id.clone(),
-                    entries: DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
-                    next_after_sequence: DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES as u64,
+                    entries: sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                    next_after_sequence: sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT
+                        as u64,
                 },
-                DaemonDfsMetadataReplicationOutcome::Applied {
+                DfsMetadataJournalReplicationOutcome::Applied {
                     target_node_id: remote.clone(),
                     shard_id: shard_id.clone(),
-                    entries: expected_entries - DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                    entries: expected_entries
+                        - sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
                     next_after_sequence: expected_entries as u64,
                 },
             ]
@@ -3682,8 +1509,8 @@ mod tests {
                 .map(|command| command.batch.entries.len())
                 .collect::<Vec<_>>(),
             vec![
-                DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
-                expected_entries - DFS_METADATA_REPLICATION_MAX_BATCH_ENTRIES,
+                sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+                expected_entries - sinomo_dfs::DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
             ]
         );
         drop(sent);
@@ -3788,7 +1615,7 @@ mod tests {
 
         assert!(matches!(
             report.outcomes.as_slice(),
-            [DaemonDfsMetadataReplicationOutcome::Failed { reason, .. }]
+            [DfsMetadataJournalReplicationOutcome::Failed { reason, .. }]
                 if reason.contains("mismatched metadata journal response")
         ));
         let backend = LocalSobjMetadataBackend::new(
@@ -3903,7 +1730,7 @@ mod tests {
         assert_eq!(*attempts.lock().expect("attempts lock"), 1);
         assert!(matches!(
             report.outcomes.as_slice(),
-            [DaemonDfsMetadataReplicationOutcome::Rejected { reason, .. }]
+            [DfsMetadataJournalReplicationOutcome::Rejected { reason, .. }]
                 if reason.contains("conflicting journal entry")
         ));
         let backend = LocalSobjMetadataBackend::new(
@@ -4031,7 +1858,7 @@ mod tests {
 
         assert_eq!(
             report.outcomes,
-            vec![DaemonDfsMetadataReplicationOutcome::SnapshotInstalled {
+            vec![DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
                 target_node_id: remote.clone(),
                 shard_id: shard_id.clone(),
                 next_after_sequence: 1,
@@ -4154,10 +1981,10 @@ mod tests {
                     .lock()
                     .expect("attempted lock")
                     .push(endpoint.address.clone());
-                Err(DaemonError::Network {
-                    address: endpoint.address.clone(),
-                    detail: "simulated failure".to_string(),
-                })
+                Err(DfsMetadataPeerTransportError::new(format!(
+                    "{} simulated failure",
+                    endpoint.address
+                )))
             });
 
         let report = publish_default_dfs_metadata_journal_with_sender(&paths, sender)
@@ -4165,7 +1992,7 @@ mod tests {
 
         assert!(matches!(
             report.outcomes.as_slice(),
-            [DaemonDfsMetadataReplicationOutcome::Failed { .. }]
+            [DfsMetadataJournalReplicationOutcome::Failed { .. }]
         ));
         assert_eq!(
             attempted.lock().expect("attempted lock").as_slice(),
@@ -4304,9 +2131,10 @@ mod tests {
             .expect("read staged manifest");
         let read = store.read_blob(&manifest.content_hash).expect("read blob");
         assert_eq!(read, bytes);
-        let backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
-            .expect("open sharded backend")
-            .expect("configured backend");
+        let backend =
+            sinomo_dfs::open_cluster_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("open sharded backend")
+                .expect("configured backend");
         assert!(
             backend
                 .get_object(&object_id)
@@ -4350,250 +2178,6 @@ mod tests {
         )
         .expect_err("wrong target rejected");
         assert!(error.to_string().contains("does not match local node"));
-
-        cleanup(&root);
-    }
-
-    #[test]
-    fn daemon_dfs_endpoint_transport_sends_rpc_and_queues_returned_frames() {
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_local").expect("local");
-        let remote = NodeId::from_legacy_named("node_dfs_endpoint_remote").expect("remote");
-        let endpoint = test_endpoint(&remote, "192.0.2.10:21353");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let calls_for_sender = Arc::clone(&calls);
-        let local_for_sender = local.clone();
-        let remote_for_sender = remote.clone();
-        let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
-            calls_for_sender
-                .lock()
-                .expect("calls lock")
-                .push((endpoint.node_id.clone(), command.frame.clone()));
-            Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: vec![NetworkFrame {
-                    frame_id: NetworkFrameId(100),
-                    source_node_id: remote_for_sender.clone(),
-                    target_node_id: local_for_sender.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(100),
-                        origin_node_id: remote_for_sender.clone(),
-                        target_node_id: local_for_sender.clone(),
-                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                            node_id: remote_for_sender.clone(),
-                            tick: 1,
-                        }),
-                    },
-                }],
-            })
-        });
-        let mut transport = DaemonDfsEndpointTransport::with_sender(
-            local.clone(),
-            vec![endpoint],
-            Duration::from_millis(1),
-            sender,
-        );
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(7),
-            source_node_id: local.clone(),
-            target_node_id: remote.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(7),
-                origin_node_id: local.clone(),
-                target_node_id: remote.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: local.clone(),
-                    tick: 7,
-                }),
-            },
-        };
-
-        transport.send(&remote, frame.clone()).expect("send frame");
-        let recorded = calls.lock().expect("calls lock");
-        assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
-        drop(recorded);
-        let incoming = transport.drain_incoming().expect("incoming frames");
-        assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].received_by, local);
-        assert_eq!(incoming[0].frame.source_node_id, remote);
-    }
-
-    #[test]
-    fn daemon_dfs_endpoint_transport_relays_remote_returned_frames_preserving_source() {
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_relay_local").expect("local");
-        let primary =
-            NodeId::from_legacy_named("node_dfs_endpoint_relay_primary").expect("primary");
-        let replica =
-            NodeId::from_legacy_named("node_dfs_endpoint_relay_replica").expect("replica");
-        let primary_endpoint = test_endpoint(&primary, "192.0.2.12:21353");
-        let replica_endpoint = test_endpoint(&replica, "192.0.2.13:21353");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let calls_for_sender = Arc::clone(&calls);
-        let local_for_sender = local.clone();
-        let primary_for_sender = primary.clone();
-        let replica_for_sender = replica.clone();
-        let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
-            calls_for_sender.lock().expect("calls lock").push((
-                endpoint.node_id.clone(),
-                command.frame.source_node_id.clone(),
-                command.frame.target_node_id.clone(),
-            ));
-            if command.frame.target_node_id == primary_for_sender {
-                return Ok(DfsProtocolFrameResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_frames: vec![NetworkFrame {
-                        frame_id: NetworkFrameId(101),
-                        source_node_id: primary_for_sender.clone(),
-                        target_node_id: replica_for_sender.clone(),
-                        message: MeshMessage {
-                            message_id: MeshMessageId(101),
-                            origin_node_id: primary_for_sender.clone(),
-                            target_node_id: replica_for_sender.clone(),
-                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                                node_id: primary_for_sender.clone(),
-                                tick: 1,
-                            }),
-                        },
-                    }],
-                });
-            }
-            if command.frame.target_node_id == replica_for_sender {
-                return Ok(DfsProtocolFrameResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_frames: vec![NetworkFrame {
-                        frame_id: NetworkFrameId(102),
-                        source_node_id: replica_for_sender.clone(),
-                        target_node_id: local_for_sender.clone(),
-                        message: MeshMessage {
-                            message_id: MeshMessageId(102),
-                            origin_node_id: replica_for_sender.clone(),
-                            target_node_id: local_for_sender.clone(),
-                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                                node_id: replica_for_sender.clone(),
-                                tick: 2,
-                            }),
-                        },
-                    }],
-                });
-            }
-            Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: Vec::new(),
-            })
-        });
-        let mut transport = DaemonDfsEndpointTransport::with_sender(
-            local.clone(),
-            vec![primary_endpoint, replica_endpoint],
-            Duration::from_millis(1),
-            sender,
-        );
-        let frame = NetworkFrame {
-            frame_id: NetworkFrameId(9),
-            source_node_id: local.clone(),
-            target_node_id: primary.clone(),
-            message: MeshMessage {
-                message_id: MeshMessageId(9),
-                origin_node_id: local.clone(),
-                target_node_id: primary.clone(),
-                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
-                    node_id: local.clone(),
-                    tick: 9,
-                }),
-            },
-        };
-
-        transport.send(&primary, frame).expect("send through relay");
-
-        assert_eq!(
-            calls.lock().expect("calls lock").as_slice(),
-            &[
-                (primary.clone(), local.clone(), primary.clone()),
-                (replica.clone(), primary.clone(), replica.clone()),
-            ]
-        );
-        let incoming = transport.drain_incoming().expect("incoming frames");
-        assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].received_by, local);
-        assert_eq!(incoming[0].frame.source_node_id, replica);
-    }
-
-    #[test]
-    fn daemon_dfs_endpoint_transport_completes_synchronous_replica_write() {
-        let root = temp_root("daemon_dfs_endpoint_transport_replica_write");
-        let local = NodeId::from_legacy_named("node_dfs_endpoint_write_local").expect("local");
-        let remote = NodeId::from_legacy_named("node_dfs_endpoint_write_remote").expect("remote");
-        let endpoint = test_endpoint(&remote, "192.0.2.11:21353");
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let calls_for_sender = Arc::clone(&calls);
-        let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
-            let MeshMessageBody::Protocol(protocol) = &command.frame.message.body else {
-                panic!("expected protocol frame");
-            };
-            let message: DfsNetworkMessage = protocol.decode().expect("decode dfs message");
-            let DfsNetworkMessage::StageBlob(stage) = message else {
-                return Ok(DfsProtocolFrameResponse {
-                    request_id: command.request_id.clone(),
-                    outbound_frames: Vec::new(),
-                });
-            };
-            calls_for_sender
-                .lock()
-                .expect("calls lock")
-                .push(stage.request_id.clone());
-            let response = DfsNetworkMessage::StageBlobResponse(sinomo_dfs::DfsStageBlobResponse {
-                request_id: stage.request_id,
-                intent_id: stage.intent_id,
-                file_system_id: stage.file_system_id,
-                object_id: stage.object_id,
-                version: stage.version,
-                replica_node_id: command.frame.target_node_id.clone(),
-                result: DfsBlobTransferResult::Durable {
-                    content_hash: stage.content_hash,
-                },
-            });
-            Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id.clone(),
-                outbound_frames: vec![NetworkFrame {
-                    frame_id: NetworkFrameId(100),
-                    source_node_id: command.frame.target_node_id.clone(),
-                    target_node_id: command.frame.source_node_id.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(100),
-                        origin_node_id: command.frame.target_node_id.clone(),
-                        target_node_id: command.frame.source_node_id.clone(),
-                        body: MeshMessageBody::Protocol(
-                            ProtocolMessage::encode(sinomo_dfs::DFS_PROTOCOL, &response)
-                                .expect("encode response"),
-                        ),
-                    },
-                }],
-            })
-        });
-        let transport = DaemonDfsEndpointTransport::with_sender(
-            local.clone(),
-            vec![endpoint],
-            Duration::from_millis(1),
-            sender,
-        );
-        let content = LocalContentStore::new(root.join("content")).expect("content store");
-        let mut dfs = NetworkedDfsService::new(transport, content);
-        dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
-        dfs.posix_mkdir_all("/services").expect("services dir");
-
-        let stat = dfs
-            .posix_write_file(
-                "/services/daemon-endpoint-transport.txt",
-                b"replicated bytes",
-                DfsWriteOptions {
-                    policy: DfsReplicationPolicy::new(2, 2).expect("policy"),
-                    replica_candidates: vec![local.clone(), remote.clone()],
-                    wait_for_commit: true,
-                },
-            )
-            .expect("replicated write");
-
-        assert_eq!(calls.lock().expect("calls lock").len(), 1);
-        assert_eq!(stat.current_locations, vec![local, remote]);
-        assert_eq!(stat.size_bytes, Some(b"replicated bytes".len() as u64));
 
         cleanup(&root);
     }
@@ -4656,7 +2240,7 @@ mod tests {
         removed_member.state = sinomo_core::ClusterMemberState::Removed;
         state.members.push(removed_member);
 
-        let service_nodes = dfs_service_members(&state)
+        let service_nodes = sinomo_dfs::dfs_service_members(&state)
             .into_iter()
             .map(|member| member.node_id.clone())
             .collect::<Vec<_>>();
@@ -4671,9 +2255,9 @@ mod tests {
             "node_dfs_default_local",
             &["node_dfs_default_remote_a", "node_dfs_default_remote_b"],
         );
-        let file_system = default_cluster_sifs(&state);
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
 
-        let expected_node_ids = stable_dfs_service_node_ids(&state);
+        let expected_node_ids = sinomo_dfs::stable_dfs_service_node_ids(&state);
         assert_eq!(file_system.owner_node_id, expected_node_ids[0]);
         for node_id in expected_node_ids {
             assert!(file_system.subtree_policies.iter().any(|policy| {
@@ -4706,8 +2290,8 @@ mod tests {
             ],
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        let file_system = default_cluster_sifs(&state);
-        let expected_primary = stable_dfs_service_node_ids(&state)[0].clone();
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let expected_primary = sinomo_dfs::stable_dfs_service_node_ids(&state)[0].clone();
         let old_shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "root".to_string(),
@@ -4731,9 +2315,20 @@ mod tests {
         )
         .expect("write old shard");
 
-        let migrated =
-            default_cluster_root_metadata_shard(&data_dir, &cluster_paths, &state, &file_system)
-                .expect("default shard");
+        let mut host = test_default_cluster_bootstrap_host(
+            &data_dir,
+            &cluster_paths,
+            state.local_node_id.clone(),
+        );
+        let migrated = sinomo_dfs::default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("default shard");
         assert_eq!(migrated.primary_node_id, expected_primary);
         assert_eq!(migrated.epoch, 10);
 
@@ -4750,9 +2345,15 @@ mod tests {
             ),
         )
         .expect("write migrated shard");
-        let stable =
-            default_cluster_root_metadata_shard(&data_dir, &cluster_paths, &state, &file_system)
-                .expect("stable shard");
+        let stable = sinomo_dfs::default_cluster_metadata_shard_with_host(
+            &mut host,
+            &state,
+            &file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )
+        .expect("stable shard");
         assert_eq!(stable, migrated);
 
         cleanup(&root);
@@ -4773,9 +2374,14 @@ mod tests {
             ],
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        let file_system = default_cluster_sifs(&state);
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let mut host = test_default_cluster_bootstrap_host(
+            &data_dir,
+            &cluster_paths,
+            state.local_node_id.clone(),
+        );
         let shards =
-            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)
+            sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
                 .expect("metadata shards");
         let by_id = shards
             .into_iter()
@@ -4824,12 +2430,12 @@ mod tests {
                 "node_dfs_default_transfer_remote_b",
             ],
         );
-        let service_nodes = stable_dfs_service_node_ids(&state);
+        let service_nodes = sinomo_dfs::stable_dfs_service_node_ids(&state);
         let bootstrap_primary = service_nodes[0].clone();
         let target_primary = service_nodes[1].clone();
         state.local_node_id = bootstrap_primary.clone();
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        let file_system = default_cluster_sifs(&state);
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let services_shard = DfsMetadataShardConfig {
             file_system_id: file_system.file_system_id.clone(),
             shard_id: "services".to_string(),
@@ -4859,18 +2465,18 @@ mod tests {
         )
         .expect("write services shard");
         let shard_id = DfsMetadataShardId::new("services");
-        let mut backend = LocalSobjMetadataBackend::new(
-            shard_id.clone(),
-            data_dir
-                .dfs_dir()
-                .join("metadata")
-                .join(path_safe_segment("services")),
-        )
-        .expect("services backend");
+        let mut backend =
+            sinomo_dfs::open_local_metadata_shard_backend(&data_dir, shard_id.clone())
+                .expect("services backend");
         backend.put_file_system(&file_system).expect("filesystem");
 
+        let mut host = test_default_cluster_bootstrap_host(
+            &data_dir,
+            &cluster_paths,
+            state.local_node_id.clone(),
+        );
         let waiting =
-            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)
+            sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
                 .expect("waiting shards")
                 .into_iter()
                 .find(|shard| shard.shard_id == "services")
@@ -4886,7 +2492,7 @@ mod tests {
             .expect("candidate replay cursor");
 
         let transferred =
-            default_cluster_metadata_shards(&data_dir, &cluster_paths, &state, &file_system)
+            sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
                 .expect("transferred shards")
                 .into_iter()
                 .find(|shard| shard.shard_id == "services")
@@ -4937,7 +2543,7 @@ mod tests {
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
             .expect("sync raft");
-        let file_system = default_cluster_sifs(&state);
+        let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let mut legacy_object = distributed_sifs_bootstrap_objects(local.clone())
             .into_iter()
             .next()
@@ -4962,8 +2568,8 @@ mod tests {
         ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), true)
             .expect("bootstrap dfs");
 
-        let shards = sinomo_network::read_cluster_kv_prefix_entries(
-            &cluster_paths,
+        let shards = sinomo_kv::read_cluster_kv_prefix_entries(
+            &cluster_paths.kv_paths(),
             &format!(
                 "{}/",
                 sinomo_dfs::metadata_shards_prefix(&file_system.file_system_id)
@@ -4976,9 +2582,10 @@ mod tests {
         .expect("decode shards");
         assert_eq!(shards.len(), 3);
 
-        let backend = open_daemon_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
-            .expect("open sharded backend")
-            .expect("configured backend");
+        let backend =
+            sinomo_dfs::open_cluster_sharded_dfs_metadata_backend(&data_dir, &cluster_paths)
+                .expect("open sharded backend")
+                .expect("configured backend");
         assert_eq!(
             backend
                 .get_object_by_path(&file_system.file_system_id, &legacy_object.path)
@@ -5036,7 +2643,7 @@ mod tests {
                 "pk-primary",
                 now,
             ));
-        assert_ne!(default_cluster_sifs_owner(&state), local);
+        assert_ne!(sinomo_dfs::default_cluster_sifs_owner(&state), local);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
 
         ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), false)
@@ -5103,7 +2710,7 @@ mod tests {
                 .iter()
                 .any(|outcome| matches!(
                     outcome,
-                    DaemonDfsMetadataReplicationOutcome::MissingShard { .. }
+                    DfsMetadataJournalReplicationOutcome::MissingShard { .. }
                 ))
         );
 
@@ -5151,7 +2758,11 @@ mod tests {
         ];
 
         assert_eq!(
-            dfs_service_endpoint_for_member(&state, &member, &DaemonRunOptions::default()),
+            sinomo_dfs::dfs_service_endpoint_for_member(
+                &state,
+                &member,
+                "loopback://127.0.0.1:21353"
+            ),
             "198.18.0.76:21353"
         );
     }

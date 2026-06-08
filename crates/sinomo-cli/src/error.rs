@@ -118,6 +118,14 @@ impl From<sinomo_runtime::dfs::MetadataBackendError> for CliError {
     }
 }
 
+impl From<sinomo_runtime::dfs::DfsError> for CliError {
+    fn from(error: sinomo_runtime::dfs::DfsError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
 impl From<sinomo_runtime::dfs::DfsPinStoreError> for CliError {
     fn from(error: sinomo_runtime::dfs::DfsPinStoreError) -> Self {
         Self::DfsPin(error)
@@ -293,6 +301,7 @@ impl From<network::NetworkError> for CliError {
     fn from(error: network::NetworkError) -> Self {
         match error {
             network::NetworkError::AuthDenied => Self::AuthDenied,
+            network::NetworkError::AuthExpired => Self::AuthExpired,
             network::NetworkError::ClusterOrphan => Self::ClusterOrphan,
             network::NetworkError::Json { path, detail } => Self::Json { path, detail },
             network::NetworkError::StorageIo { path, detail } => Self::Io { path, detail },

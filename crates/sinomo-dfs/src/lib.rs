@@ -60,8 +60,8 @@ pub use metadata_backend::{
 use namespace::metadata_path;
 pub use namespace::{
     SIFS_NODES_PATH, SIFS_ROOT_PATH, SIFS_SERVICES_PATH, SIFS_SINOMO_PATH, SIFS_USERS_PATH,
-    directory_object, distributed_sifs, distributed_sifs_bootstrap_objects, sifs_node_files_path,
-    sifs_node_path,
+    directory_object, distributed_sifs, distributed_sifs_bootstrap_objects,
+    distributed_sifs_bootstrap_objects_for_nodes, sifs_node_files_path, sifs_node_path,
 };
 pub use operator::{
     DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsAgentFileSystemSummary,
@@ -95,21 +95,27 @@ pub type DfsVersion = sinomo_core::Id;
 use serde::{Deserialize, Serialize};
 pub use service::{DfsService, register_services};
 use sinomo_core::{
-    CapabilityName, Confidence, DfsObjectPolicy, DfsWriteReceipt, DfsWriteRequest, EventEnvelope,
-    EventKind, FileSystemAccess, LatencyClass, ModuleCapabilities, ModuleResourceLimits,
-    NetworkAccess, PrivacyClass, RoutingMetadata, RoutingScope, Salience, Source, TrustRing,
+    CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
+    ClusterMemberRecord, ClusterMemberRole, ClusterTransportKind, Confidence, DfsObjectPolicy,
+    DfsWriteReceipt, DfsWriteRequest, EventEnvelope, EventKind, FileSystemAccess, LatencyClass,
+    ModuleCapabilities, ModuleResourceLimits, NetworkAccess, PrivacyClass, RoutingMetadata,
+    RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_events::EventId;
 use sinomo_kv::KvError;
 use sinomo_local::{LocalDataError, SinomoDataDir};
 use sinomo_network::{
-    MeshMessage, MeshMessageBody, MeshMessageId, NetworkError, NetworkFrame, NetworkFrameId,
-    NetworkTransport, ProtocolMessage,
+    ClusterPaths, InboundFrame, MeshMessage, MeshMessageBody, MeshMessageId, NetworkError,
+    NetworkFrame, NetworkFrameId, NetworkTransport, ObjectRpcRequest, ObjectRpcResponse,
+    ProtocolMessage,
 };
 use sinomo_node::NodeId;
-use std::collections::{BTreeMap, BTreeSet};
+use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -154,6 +160,79 @@ pub const DFS_OBJECT_RPC_ROUTES: &[&str] = &[
 ];
 pub const DEFAULT_DFS_NODE_ID: &str = "node_local";
 pub const SIFS_FILE_SYSTEM_ID: &str = "sifs";
+
+pub fn dfs_status_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(DFS_STATUS_ROUTE, DFS_RPC_CATEGORY, &())
+}
+
+pub fn decode_dfs_status_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsOperatorStatus, NetworkError> {
+    response.decode_body()
+}
+
+pub fn dfs_inspection_rpc_request(
+    request: &DaemonDfsInspectionRequest,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(DFS_INSPECTION_ROUTE, DFS_RPC_CATEGORY, request)
+}
+
+pub fn decode_dfs_inspection_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DaemonDfsInspectionResponse, NetworkError> {
+    response.decode_body()
+}
+
+pub fn dfs_smoke_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(DFS_SMOKE_ROUTE, DFS_RPC_CATEGORY, &())
+}
+
+pub fn decode_dfs_smoke_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsSmokeReport, NetworkError> {
+    response.decode_body()
+}
+
+pub fn dfs_metadata_journal_batch_rpc_request(
+    command: &DfsMetadataJournalBatchCommand,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_RPC_CATEGORY, command)
+}
+
+pub fn decode_dfs_metadata_journal_batch_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsMetadataJournalBatchResponse, NetworkError> {
+    response.decode_body()
+}
+
+pub fn dfs_metadata_snapshot_install_rpc_request(
+    command: &DfsMetadataSnapshotInstallCommand,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(
+        DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+        DFS_RPC_CATEGORY,
+        command,
+    )
+}
+
+pub fn decode_dfs_metadata_snapshot_install_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsMetadataSnapshotInstallResponse, NetworkError> {
+    response.decode_body()
+}
+
+pub fn dfs_protocol_frame_rpc_request(
+    command: &DfsProtocolFrameCommand,
+) -> Result<ObjectRpcRequest, NetworkError> {
+    ObjectRpcRequest::encode_body(DFS_PROTOCOL_FRAME_ROUTE, DFS_RPC_CATEGORY, command)
+}
+
+pub fn decode_dfs_protocol_frame_rpc_response(
+    response: &ObjectRpcResponse,
+) -> Result<DfsProtocolFrameResponse, NetworkError> {
+    response.decode_body()
+}
+
 const DFS_BLOB_INLINE_LIMIT_BYTES: usize = 64 * 1024;
 const DFS_BLOB_CHUNK_BYTES: usize = 64 * 1024;
 const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 64;
@@ -443,6 +522,20 @@ pub fn ensure_default_dfs_expose_config(
         .ensure_default(data_dir.as_ref(), node_id)
 }
 
+pub fn ensure_default_cluster_aware_dfs_expose_config(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<DfsExposeConfig, DfsExposeStoreError> {
+    let node_id = if cluster_paths.state.exists() {
+        sinomo_network::read_cluster_state_without_kv(cluster_paths)
+            .map(|state| state.local_node_id)
+            .unwrap_or_else(|_| fallback_dfs_node_id())
+    } else {
+        fallback_dfs_node_id()
+    };
+    ensure_default_dfs_expose_config(data_dir.dfs_expose_config_file(), data_dir.root(), node_id)
+}
+
 pub fn load_dfs_expose_config(
     config_path: impl AsRef<Path>,
 ) -> Result<DfsExposeConfig, DfsExposeStoreError> {
@@ -547,6 +640,161 @@ pub fn inspect_dfs_repairs(
 ) -> Result<Vec<DfsOperatorRepairView>, MetadataBackendError> {
     let backend = open_root_local_metadata_backend(root)?;
     DfsOperatorInspector::new(&backend).repairs(file_system_id, object_id)
+}
+
+pub fn open_cluster_aware_dfs_metadata_backend(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Box<dyn DfsMetadataBackend>, DfsError> {
+    if cluster_paths.state.exists()
+        && let Some(metadata) = open_cluster_sharded_dfs_metadata_backend(data_dir, cluster_paths)?
+    {
+        return Ok(Box::new(metadata));
+    }
+    open_root_local_metadata_backend(default_dfs_metadata_root(data_dir))
+        .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
+        .map_err(Into::into)
+}
+
+pub fn open_cluster_sharded_dfs_metadata_backend(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<Option<LocalShardedMetadataBackend>, DfsError> {
+    let file_system_id = sifs_file_system_id();
+    let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system_id)?;
+    if shards.is_empty() {
+        return Ok(None);
+    }
+    open_local_sharded_metadata_backend(default_dfs_metadata_shards_root(data_dir), shards)
+        .map(Some)
+        .map_err(Into::into)
+}
+
+pub fn cluster_dfs_metadata_shards(
+    cluster_paths: &ClusterPaths,
+    file_system_id: &DfsFileSystemId,
+) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+    let mut shards = sinomo_kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        &format!("{}/", metadata_shards_prefix(file_system_id)),
+    )
+    .map_err(DfsError::from)?
+    .into_iter()
+    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+    .collect::<Result<Vec<_>, _>>()?;
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    Ok(shards)
+}
+
+pub fn inspect_cluster_aware_dfs_status(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+) -> Result<DfsOperatorStatus, DfsError> {
+    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let mut status = DfsOperatorInspector::new(metadata.as_ref()).status()?;
+    if let Ok(state) = sinomo_network::read_cluster_state_without_kv(cluster_paths) {
+        for shard in &mut status.metadata_shards {
+            if shard.primary_node_id.as_ref() == Some(&state.local_node_id) {
+                shard.replay_cursors.clear();
+            } else {
+                shard.replica_lag.clear();
+            }
+        }
+    }
+    Ok(status)
+}
+
+pub fn inspect_cluster_aware_dfs(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    request: DaemonDfsInspectionRequest,
+) -> Result<DaemonDfsInspectionResponse, DfsError> {
+    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    let inspector = DfsOperatorInspector::new(metadata.as_ref());
+    Ok(match request {
+        DaemonDfsInspectionRequest::Status => DaemonDfsInspectionResponse::Status {
+            status: inspector.status()?,
+        },
+        DaemonDfsInspectionRequest::FileSystem { file_system_id } => {
+            DaemonDfsInspectionResponse::FileSystem {
+                file_system: inspector.file_system(&file_system_id)?,
+            }
+        }
+        DaemonDfsInspectionRequest::Path {
+            file_system_id,
+            path,
+        } => DaemonDfsInspectionResponse::Path {
+            object: inspector.object_by_path(&file_system_id, &path)?,
+        },
+        DaemonDfsInspectionRequest::Object { object_id } => DaemonDfsInspectionResponse::Object {
+            object: inspector.object(&object_id)?,
+        },
+        DaemonDfsInspectionRequest::Conflicts {
+            file_system_id,
+            object_id,
+            limit,
+            cursor,
+        } => {
+            let page = inspector.conflicts_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Conflicts {
+                conflicts: page.conflicts,
+                next_cursor: page.next_cursor,
+            }
+        }
+        DaemonDfsInspectionRequest::Repair {
+            file_system_id,
+            object_id,
+            limit,
+            cursor,
+        } => {
+            let page = inspector.repairs_page(
+                file_system_id.as_ref(),
+                object_id.as_ref(),
+                limit,
+                cursor.as_ref(),
+            )?;
+            DaemonDfsInspectionResponse::Repair {
+                repairs: page.repairs,
+                next_cursor: page.next_cursor,
+            }
+        }
+    })
+}
+
+pub fn publish_cluster_dfs_metadata_journal(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    if !cluster_paths.state.exists() {
+        return Ok(DfsMetadataJournalReplicationReport {
+            outcomes: Vec::new(),
+        });
+    }
+
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let file_system = distributed_sifs(state.local_node_id.clone());
+    let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
+
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let mut transport = DfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
+    let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    publish_dfs_metadata_journal_with_host(
+        file_system.file_system_id,
+        &state.local_node_id,
+        shards,
+        &mut host,
+        &mut transport,
+        options,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1093,6 +1341,1518 @@ pub struct DfsLifecycleMaintenanceReport {
     pub tombstone_compaction_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone_compaction: Option<DfsTombstoneCompactionReport>,
+}
+
+pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS: usize = 1024;
+pub const DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES: usize = 64;
+pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS: usize = 16;
+pub const DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB: usize = 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsAntiEntropyCursorRecord {
+    pub file_system_id: DfsFileSystemId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<DfsObjectPageCursor>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalDfsMaintenanceHost {
+    data_dir: SinomoDataDir,
+}
+
+impl LocalDfsMaintenanceHost {
+    pub fn new(data_dir: SinomoDataDir) -> Self {
+        Self { data_dir }
+    }
+
+    fn cursor_path(&self, file_system_id: &DfsFileSystemId) -> PathBuf {
+        default_dfs_anti_entropy_cursor_path(&self.data_dir, file_system_id)
+    }
+}
+
+impl DfsMaintenanceHost for LocalDfsMaintenanceHost {
+    fn load_anti_entropy_cursor(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsAntiEntropyCursorRecord>, DfsError> {
+        read_dfs_anti_entropy_cursor(&self.cursor_path(file_system_id))
+    }
+
+    fn store_anti_entropy_cursor(
+        &mut self,
+        cursor: &DfsAntiEntropyCursorRecord,
+    ) -> Result<(), DfsError> {
+        write_dfs_anti_entropy_cursor(&self.cursor_path(&cursor.file_system_id), cursor)
+    }
+
+    fn clear_anti_entropy_cursor(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<(), DfsError> {
+        clear_dfs_anti_entropy_cursor(&self.cursor_path(file_system_id))
+    }
+}
+
+pub fn default_dfs_anti_entropy_cursor_path(
+    data_dir: &SinomoDataDir,
+    file_system_id: &DfsFileSystemId,
+) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("anti-entropy-cursors")
+        .join(format!(
+            "{}.sobj",
+            dfs_path_safe_segment(&file_system_id.to_string())
+        ))
+}
+
+pub fn legacy_dfs_anti_entropy_cursor_path(path: &Path) -> PathBuf {
+    path.with_extension("json")
+}
+
+pub fn read_dfs_anti_entropy_cursor(
+    path: &Path,
+) -> Result<Option<DfsAntiEntropyCursorRecord>, DfsError> {
+    match std::fs::read(path) {
+        Ok(bytes) => sinomo_object_serde::from_bytes(&bytes)
+            .map(Some)
+            .map_err(|source| DfsError::Serialization {
+                message: format!(
+                    "DFS anti-entropy cursor object error at {}: {source}",
+                    path.display()
+                ),
+            }),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            read_legacy_dfs_anti_entropy_cursor(&legacy_dfs_anti_entropy_cursor_path(path))
+        }
+        Err(source) => Err(DfsError::Metadata {
+            message: format!(
+                "could not read DFS anti-entropy cursor {}: {source}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn read_legacy_dfs_anti_entropy_cursor(
+    path: &Path,
+) -> Result<Option<DfsAntiEntropyCursorRecord>, DfsError> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|source| DfsError::Serialization {
+                    message: format!(
+                        "DFS anti-entropy legacy cursor JSON error at {}: {source}",
+                        path.display()
+                    ),
+                })
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DfsError::Metadata {
+            message: format!(
+                "could not read DFS anti-entropy legacy cursor {}: {source}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+pub fn write_dfs_anti_entropy_cursor(
+    path: &Path,
+    cursor: &DfsAntiEntropyCursorRecord,
+) -> Result<(), DfsError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
+            message: format!(
+                "could not create DFS anti-entropy cursor directory {}: {source}",
+                parent.display()
+            ),
+        })?;
+    }
+    let bytes = sinomo_object_serde::to_bytes(cursor, 1, LengthMode::U32).map_err(|source| {
+        DfsError::Serialization {
+            message: format!(
+                "DFS anti-entropy cursor object error at {}: {source}",
+                path.display()
+            ),
+        }
+    })?;
+    std::fs::write(path, bytes).map_err(|source| DfsError::Metadata {
+        message: format!(
+            "could not write DFS anti-entropy cursor {}: {source}",
+            path.display()
+        ),
+    })?;
+    clear_dfs_cursor_file(&legacy_dfs_anti_entropy_cursor_path(path))
+}
+
+pub fn clear_dfs_anti_entropy_cursor(path: &Path) -> Result<(), DfsError> {
+    clear_dfs_cursor_file(path)?;
+    clear_dfs_cursor_file(&legacy_dfs_anti_entropy_cursor_path(path))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LegacyDfsMetadataReplicationCursor {
+    pub target_node_id: NodeId,
+    pub shard_id: DfsMetadataShardId,
+    pub next_after_sequence: u64,
+}
+
+pub fn migrate_legacy_dfs_metadata_replication_cursor(
+    backend: &mut dyn DfsMetadataBackend,
+    data_dir: &SinomoDataDir,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+) -> Result<u64, DfsError> {
+    let mut after_sequence = backend.metadata_replication_cursor(target_node_id, shard_id)?;
+    let legacy_path =
+        legacy_dfs_metadata_replication_cursor_path(data_dir, target_node_id, shard_id);
+    let Some(legacy_cursor) = read_legacy_dfs_metadata_replication_cursor(&legacy_path)? else {
+        return Ok(after_sequence);
+    };
+    if legacy_cursor.target_node_id != *target_node_id || legacy_cursor.shard_id != *shard_id {
+        return Err(DfsError::Metadata {
+            message: format!(
+                "legacy DFS metadata replication cursor {} does not match target {target_node_id} shard {}",
+                legacy_path.display(),
+                shard_id.0,
+            ),
+        });
+    }
+    let legacy_after_sequence = legacy_cursor.next_after_sequence;
+    if legacy_after_sequence > after_sequence {
+        backend.put_metadata_replication_cursor(target_node_id, shard_id, legacy_after_sequence)?;
+        after_sequence = legacy_after_sequence;
+    }
+    clear_dfs_cursor_file(&legacy_path)?;
+    Ok(after_sequence)
+}
+
+pub fn legacy_dfs_metadata_replication_cursor_path(
+    data_dir: &SinomoDataDir,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("metadata-replication-cursors")
+        .join(dfs_path_safe_segment(&target_node_id.to_string()))
+        .join(format!("{}.json", dfs_path_safe_segment(&shard_id.0)))
+}
+
+fn read_legacy_dfs_metadata_replication_cursor(
+    path: &Path,
+) -> Result<Option<LegacyDfsMetadataReplicationCursor>, DfsError> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|source| DfsError::Serialization {
+                    message: format!(
+                        "DFS metadata replication legacy cursor JSON error at {}: {source}",
+                        path.display()
+                    ),
+                })
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(DfsError::Metadata {
+            message: format!(
+                "could not read DFS metadata replication legacy cursor {}: {source}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+#[cfg(test)]
+fn write_legacy_dfs_metadata_replication_cursor(
+    path: &Path,
+    cursor: &LegacyDfsMetadataReplicationCursor,
+) -> Result<(), DfsError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| DfsError::Metadata {
+            message: format!(
+                "could not create DFS metadata replication legacy cursor directory {}: {source}",
+                parent.display()
+            ),
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(cursor).map_err(|source| DfsError::Serialization {
+        message: format!(
+            "DFS metadata replication legacy cursor JSON error at {}: {source}",
+            path.display()
+        ),
+    })?;
+    std::fs::write(path, bytes).map_err(|source| DfsError::Metadata {
+        message: format!(
+            "could not write DFS metadata replication legacy cursor {}: {source}",
+            path.display()
+        ),
+    })
+}
+
+fn clear_dfs_cursor_file(path: &Path) -> Result<(), DfsError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(DfsError::Metadata {
+            message: format!("could not remove DFS cursor {}: {source}", path.display()),
+        }),
+    }
+}
+
+fn dfs_path_safe_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+pub fn local_dfs_metadata_shard_path(
+    data_dir: &SinomoDataDir,
+    shard_id: &DfsMetadataShardId,
+) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("metadata")
+        .join(dfs_path_safe_segment(&shard_id.0))
+}
+
+pub fn open_local_metadata_shard_backend(
+    data_dir: &SinomoDataDir,
+    shard_id: DfsMetadataShardId,
+) -> Result<LocalSobjMetadataBackend, DfsError> {
+    let path = local_dfs_metadata_shard_path(data_dir, &shard_id);
+    Ok(LocalSobjMetadataBackend::new(shard_id, path)?)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DfsMaintenanceRunOptions {
+    pub anti_entropy_max_objects: usize,
+    pub anti_entropy_max_issues: usize,
+    pub repair_metadata: bool,
+}
+
+impl Default for DfsMaintenanceRunOptions {
+    fn default() -> Self {
+        Self {
+            anti_entropy_max_objects: DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_OBJECTS,
+            anti_entropy_max_issues: DEFAULT_DFS_MAINTENANCE_ANTI_ENTROPY_MAX_ISSUES,
+            repair_metadata: true,
+        }
+    }
+}
+
+pub trait DfsMaintenanceHost {
+    fn load_anti_entropy_cursor(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsAntiEntropyCursorRecord>, DfsError>;
+
+    fn store_anti_entropy_cursor(
+        &mut self,
+        cursor: &DfsAntiEntropyCursorRecord,
+    ) -> Result<(), DfsError>;
+
+    fn clear_anti_entropy_cursor(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<(), DfsError>;
+}
+
+pub fn run_dfs_lifecycle_maintenance_with_host<T: NetworkTransport>(
+    service: &mut NetworkedDfsService<T>,
+    host: &mut dyn DfsMaintenanceHost,
+    options: DfsMaintenanceRunOptions,
+) -> Result<Vec<DfsLifecycleMaintenanceReport>, DfsError> {
+    let Some(metadata_backend) = service.metadata_backend() else {
+        return Ok(Vec::new());
+    };
+    let file_systems = metadata_backend.list_file_systems()?;
+    let mut reports = Vec::with_capacity(file_systems.len());
+
+    for file_system in file_systems {
+        let saved_cursor = host.load_anti_entropy_cursor(&file_system.file_system_id)?;
+        if let Some(saved_cursor) = saved_cursor.as_ref()
+            && saved_cursor.file_system_id != file_system.file_system_id
+        {
+            return Err(DfsError::Metadata {
+                message: format!(
+                    "DFS anti-entropy cursor for {} does not match file system {}",
+                    saved_cursor.file_system_id, file_system.file_system_id,
+                ),
+            });
+        }
+        let after = saved_cursor.and_then(|cursor| cursor.next_cursor);
+        let report = service.run_lifecycle_maintenance(DfsLifecycleMaintenanceOptions {
+            anti_entropy: Some(DfsAntiEntropyOptions {
+                file_system_id: file_system.file_system_id.clone(),
+                after,
+                max_objects: options.anti_entropy_max_objects,
+                max_issues: options.anti_entropy_max_issues,
+                repair_metadata: options.repair_metadata,
+            }),
+            ..DfsLifecycleMaintenanceOptions::default()
+        })?;
+
+        if let Some(anti_entropy) = report.anti_entropy.as_ref() {
+            if let Some(next_cursor) = anti_entropy.next_cursor.clone() {
+                host.store_anti_entropy_cursor(&DfsAntiEntropyCursorRecord {
+                    file_system_id: file_system.file_system_id.clone(),
+                    next_cursor: Some(next_cursor),
+                })?;
+            } else {
+                host.clear_anti_entropy_cursor(&file_system.file_system_id)?;
+            }
+        }
+        reports.push(report);
+    }
+
+    Ok(reports)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DfsMaintenanceTickOptions {
+    pub namespace_job_max_jobs: usize,
+    pub namespace_job_max_steps_per_job: usize,
+    pub lifecycle: DfsMaintenanceRunOptions,
+    pub metadata_replication: DfsMetadataJournalReplicationOptions,
+}
+
+impl Default for DfsMaintenanceTickOptions {
+    fn default() -> Self {
+        Self {
+            namespace_job_max_jobs: DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
+            namespace_job_max_steps_per_job:
+                DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
+            lifecycle: DfsMaintenanceRunOptions::default(),
+            metadata_replication: DfsMetadataJournalReplicationOptions::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMaintenanceTickReport {
+    pub namespace_jobs: DfsNamespaceJobMaintenanceReport,
+    pub lifecycle_reports: Vec<DfsLifecycleMaintenanceReport>,
+    pub scheduled_repairs: Vec<DistributedRepairJob>,
+    pub followup_events: Vec<NetworkedDfsServiceEvent>,
+    pub metadata_replication: DfsMetadataJournalReplicationReport,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsMaintenanceTickObservations {
+    pub metadata_replications_sent: usize,
+    pub notice_lines: Vec<String>,
+}
+
+pub fn dfs_maintenance_tick_observations(
+    report: &DfsMaintenanceTickReport,
+) -> DfsMaintenanceTickObservations {
+    let mut notice_lines = dfs_namespace_job_maintenance_notice_lines(&report.namespace_jobs);
+    notice_lines.extend(dfs_lifecycle_maintenance_notice_lines(
+        &report.lifecycle_reports,
+    ));
+    notice_lines.extend(dfs_metadata_replication_notice_lines(
+        &report.metadata_replication,
+    ));
+
+    DfsMaintenanceTickObservations {
+        metadata_replications_sent: dfs_metadata_replication_sent_count(
+            &report.metadata_replication,
+        ),
+        notice_lines,
+    }
+}
+
+pub fn dfs_namespace_job_maintenance_notice_lines(
+    report: &DfsNamespaceJobMaintenanceReport,
+) -> Vec<String> {
+    if report.resumed_job_count == 0 && report.failed_job_count == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![format!(
+        "DFS namespace jobs: scanned={}, resumed={}, completed={}, failed={}, remaining={}",
+        report.scanned_job_count,
+        report.resumed_job_count,
+        report.completed_job_count,
+        report.failed_job_count,
+        report.remaining_running_job_count
+    )];
+    lines.extend(report.failures.iter().map(|failure| {
+        format!(
+            "DFS namespace job {} ({:?}) failed: {}",
+            failure.job_id, failure.kind, failure.reason
+        )
+    }));
+    lines
+}
+
+pub fn dfs_lifecycle_maintenance_notice_lines(
+    reports: &[DfsLifecycleMaintenanceReport],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for report in reports {
+        let Some(anti_entropy) = report.anti_entropy.as_ref() else {
+            continue;
+        };
+        if anti_entropy.stale_local_location_count == 0
+            && anti_entropy.repaired_location_count == 0
+            && anti_entropy.issue_count == 0
+            && !anti_entropy.max_issues_reached
+        {
+            continue;
+        }
+        lines.push(format!(
+            "DFS anti-entropy {}: scanned={}, checked_local={}, stale_local={}, repaired={}, issues={}, next_cursor={}",
+            anti_entropy.file_system_id,
+            anti_entropy.scanned_object_count,
+            anti_entropy.checked_local_location_count,
+            anti_entropy.stale_local_location_count,
+            anti_entropy.repaired_location_count,
+            anti_entropy.issue_count,
+            anti_entropy.next_cursor.is_some()
+        ));
+        lines.extend(anti_entropy.issues.iter().map(|issue| {
+            format!(
+                "DFS anti-entropy issue {} {} {}: {} (repaired={})",
+                issue.object_id, issue.version, issue.path, issue.reason, issue.repaired
+            )
+        }));
+        if anti_entropy.max_issues_reached {
+            lines.push(format!(
+                "DFS anti-entropy {} stopped after reaching the issue limit",
+                anti_entropy.file_system_id
+            ));
+        }
+    }
+    lines
+}
+
+pub fn run_dfs_maintenance_tick_with_host<T: NetworkTransport>(
+    service: &mut NetworkedDfsService<T>,
+    maintenance_host: &mut dyn DfsMaintenanceHost,
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
+    metadata_shards: Vec<DfsMetadataShardConfig>,
+    metadata_publisher_host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsMaintenanceTickOptions,
+) -> Result<DfsMaintenanceTickReport, DfsError> {
+    let namespace_jobs = service
+        .posix_resume_namespace_jobs_bounded(
+            options.namespace_job_max_jobs,
+            options.namespace_job_max_steps_per_job,
+        )
+        .map_err(|error| DfsError::Metadata {
+            message: error.to_string(),
+        })?;
+    let lifecycle_reports =
+        run_dfs_lifecycle_maintenance_with_host(service, maintenance_host, options.lifecycle)?;
+    let scheduled_repairs = service.retry_pending_repairs()?;
+    let followup_events = if scheduled_repairs.is_empty() {
+        Vec::new()
+    } else {
+        service.process_incoming()?
+    };
+    let metadata_replication = publish_dfs_metadata_journal_with_host(
+        file_system_id,
+        local_node_id,
+        metadata_shards,
+        metadata_publisher_host,
+        metadata_transport,
+        options.metadata_replication,
+    )?;
+
+    Ok(DfsMaintenanceTickReport {
+        namespace_jobs,
+        lifecycle_reports,
+        scheduled_repairs,
+        followup_events,
+        metadata_replication,
+    })
+}
+
+pub fn open_cluster_dfs_service(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+    protocol_sender: DfsProtocolFrameSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<NetworkedDfsService<DfsEndpointTransport>, DfsError> {
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let mut service = NetworkedDfsService::new(
+        DfsEndpointTransport::new(local_node_id, endpoints, protocol_sender),
+        content,
+    );
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let metadata = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    service.with_boxed_metadata_backend(metadata)
+}
+
+pub fn run_cluster_dfs_maintenance_tick(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    protocol_sender: DfsProtocolFrameSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let mut service = open_cluster_dfs_service(
+        data_dir,
+        cluster_paths,
+        local_node_id.clone(),
+        endpoints.clone(),
+        protocol_sender,
+        control_plane,
+    )?;
+    let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport =
+        DfsMetadataEndpointTransport::new(endpoints, metadata_sender, snapshot_sender);
+    run_dfs_maintenance_tick_with_host(
+        &mut service,
+        &mut maintenance_host,
+        file_system.file_system_id,
+        &local_node_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        options,
+    )
+    .map(Some)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsSmokeReport {
+    pub path: String,
+    pub file_system_id: DfsFileSystemId,
+    pub object_id: DfsObjectId,
+    pub version: DfsVersion,
+    pub content_hash: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub requested_replica_node_ids: Vec<NodeId>,
+    pub committed_replica_node_ids: Vec<NodeId>,
+    pub pending_repair_count: usize,
+    pub metadata_replication: DfsMetadataJournalReplicationReport,
+    pub attempts: Vec<DfsSmokeAttempt>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsSmokeAttempt {
+    pub replica_node_ids: Vec<NodeId>,
+    pub path: String,
+    pub committed: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsSmokeOptions {
+    pub nonce: Option<i128>,
+    pub metadata_replication: DfsMetadataJournalReplicationOptions,
+}
+
+impl Default for DfsSmokeOptions {
+    fn default() -> Self {
+        Self {
+            nonce: None,
+            metadata_replication: DfsMetadataJournalReplicationOptions::default(),
+        }
+    }
+}
+
+pub trait DfsSmokeHost {
+    fn pending_repair_count(&mut self) -> Result<usize, DfsError>;
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalDfsSmokeHost {
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+}
+
+impl LocalDfsSmokeHost {
+    pub fn new(data_dir: SinomoDataDir, cluster_paths: ClusterPaths) -> Self {
+        Self {
+            data_dir,
+            cluster_paths,
+        }
+    }
+}
+
+impl DfsSmokeHost for LocalDfsSmokeHost {
+    fn pending_repair_count(&mut self) -> Result<usize, DfsError> {
+        inspect_cluster_aware_dfs_status(&self.data_dir, &self.cluster_paths)
+            .map(|status| status.pending_repair_count)
+    }
+}
+
+pub fn run_cluster_dfs_smoke(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    protocol_sender: DfsProtocolFrameSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsSmokeOptions,
+) -> Result<Option<DfsSmokeReport>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let mut content_nodes = sinomo_kv::read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
+        content_services_prefix(),
+    )
+    .map_err(DfsError::from)?
+    .into_iter()
+    .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
+    .filter(|advertisement| advertisement.accepts_content)
+    .map(|advertisement| advertisement.node_id)
+    .collect::<Vec<_>>();
+    content_nodes.sort();
+    content_nodes.dedup();
+
+    let local_node_id = state.local_node_id.clone();
+    let file_system = distributed_sifs(local_node_id.clone());
+    let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let routable_node_ids = endpoints
+        .iter()
+        .map(|endpoint| endpoint.node_id.clone())
+        .collect::<Vec<_>>();
+    let mut service = open_cluster_dfs_service(
+        data_dir,
+        cluster_paths,
+        local_node_id.clone(),
+        endpoints.clone(),
+        protocol_sender,
+        control_plane,
+    )?;
+    let mut smoke_host = LocalDfsSmokeHost::new(data_dir.clone(), cluster_paths.clone());
+    let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
+    let mut metadata_transport =
+        DfsMetadataEndpointTransport::new(endpoints, metadata_sender, snapshot_sender);
+    run_dfs_smoke_with_host(
+        &mut service,
+        &local_node_id,
+        content_nodes,
+        routable_node_ids,
+        &mut smoke_host,
+        file_system.file_system_id,
+        metadata_shards,
+        &mut metadata_publisher_host,
+        &mut metadata_transport,
+        options,
+    )
+    .map(Some)
+}
+
+pub fn run_dfs_smoke_with_host<T: NetworkTransport>(
+    service: &mut NetworkedDfsService<T>,
+    local_node_id: &NodeId,
+    content_node_ids: Vec<NodeId>,
+    routable_node_ids: Vec<NodeId>,
+    smoke_host: &mut impl DfsSmokeHost,
+    file_system_id: DfsFileSystemId,
+    metadata_shards: Vec<DfsMetadataShardConfig>,
+    metadata_publisher_host: &mut impl DfsMetadataJournalPublisherHost,
+    metadata_transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsSmokeOptions,
+) -> Result<DfsSmokeReport, DfsError> {
+    let replica_candidate_sets =
+        dfs_smoke_replica_candidate_sets(local_node_id, content_node_ids, routable_node_ids);
+    service
+        .bootstrap_distributed_sifs()
+        .map_err(dfs_posix_error)?;
+    service
+        .posix_mkdir_all("/services/dfs-smoke")
+        .map_err(dfs_posix_error)?;
+
+    let nonce = options
+        .nonce
+        .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp_nanos());
+    let mut attempts = Vec::new();
+    let mut successful = None;
+    for replica_candidates in replica_candidate_sets {
+        let target_label = replica_candidates
+            .iter()
+            .map(|node_id| node_id.to_string())
+            .collect::<Vec<_>>()
+            .join("-");
+        let replica_count = replica_candidates.len();
+        let path = format!("/services/dfs-smoke/{nonce}-{target_label}.txt");
+        let body = format!("sinomo dfs smoke {nonce} {target_label}\n");
+        match service
+            .posix_write_file(
+                &path,
+                body.as_bytes(),
+                DfsWriteOptions {
+                    policy: DfsReplicationPolicy::new(replica_count, replica_count)?,
+                    replica_candidates: replica_candidates.clone(),
+                    wait_for_commit: true,
+                },
+            )
+            .map_err(dfs_posix_error)
+        {
+            Ok(stat) => {
+                attempts.push(DfsSmokeAttempt {
+                    replica_node_ids: replica_candidates.clone(),
+                    path: path.clone(),
+                    committed: true,
+                    detail: "committed".to_string(),
+                });
+                successful = Some((stat, replica_candidates));
+                break;
+            }
+            Err(error) => {
+                let event_detail = dfs_event_summary(service.last_events());
+                let detail = if event_detail.is_empty() {
+                    error.to_string()
+                } else {
+                    format!("{error}; events: {}", event_detail.join("; "))
+                };
+                attempts.push(DfsSmokeAttempt {
+                    replica_node_ids: replica_candidates,
+                    path,
+                    committed: false,
+                    detail,
+                });
+            }
+        }
+    }
+    let Some((stat, replica_candidates)) = successful else {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "DFS smoke did not commit on any candidate replica set: {}",
+                attempts
+                    .iter()
+                    .map(|attempt| format!(
+                        "{} => {}",
+                        attempt
+                            .replica_node_ids
+                            .iter()
+                            .map(|node_id| node_id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        attempt.detail
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        });
+    };
+    let pending_repair_count = smoke_host.pending_repair_count()?;
+    let metadata_replication = publish_dfs_metadata_journal_with_host(
+        file_system_id,
+        local_node_id,
+        metadata_shards,
+        metadata_publisher_host,
+        metadata_transport,
+        options.metadata_replication,
+    )?;
+
+    Ok(DfsSmokeReport {
+        path: stat.path,
+        file_system_id: stat.file_system_id,
+        object_id: stat.object_id,
+        version: stat.version,
+        content_hash: stat.content_hash,
+        size_bytes: stat.size_bytes,
+        requested_replica_node_ids: replica_candidates,
+        committed_replica_node_ids: stat.current_locations,
+        pending_repair_count,
+        metadata_replication,
+        attempts,
+    })
+}
+
+fn dfs_smoke_replica_candidate_sets(
+    local_node_id: &NodeId,
+    mut content_node_ids: Vec<NodeId>,
+    routable_node_ids: Vec<NodeId>,
+) -> Vec<Vec<NodeId>> {
+    content_node_ids.sort();
+    content_node_ids.dedup();
+    let routable_node_ids = routable_node_ids.into_iter().collect::<BTreeSet<_>>();
+    let remote_candidates = content_node_ids
+        .into_iter()
+        .filter(|node_id| node_id != local_node_id)
+        .filter(|node_id| routable_node_ids.contains(node_id))
+        .collect::<Vec<_>>();
+    if remote_candidates.is_empty() {
+        vec![vec![local_node_id.clone()]]
+    } else {
+        remote_candidates
+            .into_iter()
+            .map(|remote_node_id| vec![local_node_id.clone(), remote_node_id])
+            .collect()
+    }
+}
+
+fn dfs_event_summary(events: &[NetworkedDfsServiceEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            NetworkedDfsServiceEvent::BlobStageRejected {
+                replica_node_id,
+                reason,
+                ..
+            } => Some(format!("stage rejected by {replica_node_id}: {reason}")),
+            NetworkedDfsServiceEvent::BlobFetchRejected {
+                source_node_id,
+                reason,
+                ..
+            } => Some(format!("fetch rejected by {source_node_id}: {reason}")),
+            NetworkedDfsServiceEvent::RepairRejected {
+                replica_node_id,
+                reason,
+                ..
+            } => Some(format!("repair rejected by {replica_node_id}: {reason}")),
+            _ => None,
+        })
+        .collect()
+}
+
+fn dfs_posix_error(error: DfsPosixError) -> DfsError {
+    DfsError::Metadata {
+        message: error.to_string(),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsDefaultClusterBootstrapOptions {
+    pub publish_cluster_control: bool,
+    pub local_endpoint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsDefaultClusterSmokeOptions {
+    pub bootstrap: DfsDefaultClusterBootstrapOptions,
+    pub smoke: DfsSmokeOptions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsDefaultClusterBootstrapReport {
+    pub file_system: DfsFileSystem,
+    pub metadata_shards: Vec<DfsMetadataShardConfig>,
+    pub local_has_primary_metadata_shards: bool,
+}
+
+pub trait DfsDefaultClusterBootstrapHost {
+    fn current_metadata_shard(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, DfsError>;
+
+    fn metadata_shard_primary_transfer_ready(
+        &mut self,
+        current: &DfsMetadataShardConfig,
+        target_primary_node_id: &NodeId,
+    ) -> Result<bool, DfsError>;
+
+    fn put_file_system_config(&mut self, config: &DfsFileSystemConfig) -> Result<(), DfsError>;
+
+    fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), DfsError>;
+
+    fn current_node_advertisement(
+        &self,
+        key: &str,
+    ) -> Result<Option<DfsNodeAdvertisement>, DfsError>;
+
+    fn put_node_advertisement(
+        &mut self,
+        key: String,
+        advertisement: &DfsNodeAdvertisement,
+    ) -> Result<(), DfsError>;
+
+    fn materialize_default_sifs_metadata(
+        &mut self,
+        file_system: &DfsFileSystem,
+        bootstrap_owner_node_ids: Vec<NodeId>,
+        fallback_owner_node_id: NodeId,
+    ) -> Result<(), DfsError>;
+
+    fn materialize_default_sifs_metadata_on_shards(
+        &mut self,
+        file_system: &DfsFileSystem,
+        shards: Vec<DfsMetadataShardConfig>,
+        bootstrap_owner_node_ids: Vec<NodeId>,
+        fallback_owner_node_id: NodeId,
+    ) -> Result<(), DfsError>;
+}
+
+#[derive(Debug)]
+pub struct DfsControlPlaneDefaultClusterBootstrapHost {
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    local_node_id: NodeId,
+    control_plane: Box<dyn DfsControlPlaneKvClient>,
+}
+
+impl DfsControlPlaneDefaultClusterBootstrapHost {
+    pub fn new(
+        data_dir: SinomoDataDir,
+        cluster_paths: ClusterPaths,
+        local_node_id: NodeId,
+        control_plane: Box<dyn DfsControlPlaneKvClient>,
+    ) -> Self {
+        Self {
+            data_dir,
+            cluster_paths,
+            local_node_id,
+            control_plane,
+        }
+    }
+
+    fn put_serde_if_changed<T>(&mut self, key: String, value: &T) -> Result<(), DfsError>
+    where
+        T: Serialize,
+    {
+        let encoded = sinomo_kv::encode_kv_value(value)?;
+        if self
+            .control_plane
+            .get(&key)?
+            .is_some_and(|entry| entry.value == encoded)
+        {
+            return Ok(());
+        }
+        self.control_plane.put(key, encoded)?;
+        Ok(())
+    }
+}
+
+impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHost {
+    fn current_metadata_shard(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, DfsError> {
+        let key = metadata_shard_key(file_system_id, shard_id);
+        self.control_plane
+            .get(&key)?
+            .map(|entry| {
+                entry
+                    .decode::<DfsMetadataShardConfig>()
+                    .map_err(DfsError::from)
+            })
+            .transpose()
+    }
+
+    fn metadata_shard_primary_transfer_ready(
+        &mut self,
+        current: &DfsMetadataShardConfig,
+        target_primary_node_id: &NodeId,
+    ) -> Result<bool, DfsError> {
+        metadata_shard_primary_transfer_ready_from_local_backend(
+            &self.data_dir,
+            &self.local_node_id,
+            current,
+            target_primary_node_id,
+        )
+    }
+
+    fn put_file_system_config(&mut self, config: &DfsFileSystemConfig) -> Result<(), DfsError> {
+        self.put_serde_if_changed(file_system_config_key(&config.file_system_id), config)
+    }
+
+    fn put_metadata_shard(&mut self, shard: &DfsMetadataShardConfig) -> Result<(), DfsError> {
+        self.put_serde_if_changed(
+            metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+            shard,
+        )
+    }
+
+    fn current_node_advertisement(
+        &self,
+        key: &str,
+    ) -> Result<Option<DfsNodeAdvertisement>, DfsError> {
+        self.control_plane
+            .get(key)?
+            .map(|entry| {
+                entry
+                    .decode::<DfsNodeAdvertisement>()
+                    .map_err(DfsError::from)
+            })
+            .transpose()
+    }
+
+    fn put_node_advertisement(
+        &mut self,
+        key: String,
+        advertisement: &DfsNodeAdvertisement,
+    ) -> Result<(), DfsError> {
+        self.put_serde_if_changed(key, advertisement)
+    }
+
+    fn materialize_default_sifs_metadata(
+        &mut self,
+        file_system: &DfsFileSystem,
+        bootstrap_owner_node_ids: Vec<NodeId>,
+        fallback_owner_node_id: NodeId,
+    ) -> Result<(), DfsError> {
+        let mut backend =
+            open_cluster_aware_dfs_metadata_backend(&self.data_dir, &self.cluster_paths)?;
+        materialize_default_sifs_metadata(
+            backend.as_mut(),
+            file_system,
+            bootstrap_owner_node_ids,
+            fallback_owner_node_id,
+            OffsetDateTime::now_utc(),
+        )
+    }
+
+    fn materialize_default_sifs_metadata_on_shards(
+        &mut self,
+        file_system: &DfsFileSystem,
+        shards: Vec<DfsMetadataShardConfig>,
+        bootstrap_owner_node_ids: Vec<NodeId>,
+        fallback_owner_node_id: NodeId,
+    ) -> Result<(), DfsError> {
+        let mut backend = open_local_sharded_metadata_backend(
+            default_dfs_metadata_shards_root(&self.data_dir),
+            shards,
+        )?;
+        materialize_default_sifs_metadata_on_shards(
+            &mut backend,
+            file_system,
+            bootstrap_owner_node_ids,
+            fallback_owner_node_id,
+            OffsetDateTime::now_utc(),
+        )
+    }
+}
+
+pub fn metadata_shard_primary_transfer_ready_from_local_backend(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    current: &DfsMetadataShardConfig,
+    target_primary_node_id: &NodeId,
+) -> Result<bool, DfsError> {
+    if current.primary_node_id == *target_primary_node_id {
+        return Ok(true);
+    }
+    if current.primary_node_id != *local_node_id {
+        return Ok(false);
+    }
+    if !current
+        .replica_node_ids
+        .iter()
+        .any(|node_id| node_id == target_primary_node_id)
+    {
+        return Ok(false);
+    }
+    let shard_id = DfsMetadataShardId::new(current.shard_id.clone());
+    let backend = open_local_metadata_shard_backend(data_dir, shard_id.clone())?;
+    let journal_last_sequence = backend
+        .metadata_shard_statuses()?
+        .into_iter()
+        .find(|status| status.shard_id == shard_id)
+        .map(|status| status.journal_last_sequence)
+        .unwrap_or(0);
+    let target_replayed_through =
+        backend.metadata_replication_cursor(target_primary_node_id, &shard_id)?;
+    Ok(target_replayed_through >= journal_last_sequence)
+}
+
+pub fn ensure_default_distributed_dfs_with_host(
+    state: &ClusterBootstrapState,
+    host: &mut impl DfsDefaultClusterBootstrapHost,
+    options: DfsDefaultClusterBootstrapOptions,
+) -> Result<DfsDefaultClusterBootstrapReport, DfsError> {
+    let file_system = default_cluster_sifs(state);
+    let mut metadata_shards = Vec::new();
+    let local_has_primary_metadata_shards = if options.publish_cluster_control {
+        host.put_file_system_config(&DfsFileSystemConfig::from(&file_system))?;
+        metadata_shards = default_cluster_metadata_shards_with_host(host, state, &file_system)?;
+        let local_has_primary_metadata_shards = metadata_shards
+            .iter()
+            .any(|shard| shard.primary_node_id == state.local_node_id);
+        let publishable_shards = metadata_shards.iter().filter(|shard| {
+            local_has_primary_metadata_shards
+                || matches!(shard.assignment, DfsMetadataShardAssignment::Root)
+        });
+        for shard in publishable_shards {
+            host.put_metadata_shard(shard)?;
+        }
+        if local_has_primary_metadata_shards {
+            host.materialize_default_sifs_metadata_on_shards(
+                &file_system,
+                metadata_shards.clone(),
+                stable_dfs_service_node_ids(state),
+                state.local_node_id.clone(),
+            )?;
+        }
+        publish_dfs_service_advertisements_with_host(host, state, &options.local_endpoint)?;
+        local_has_primary_metadata_shards
+    } else {
+        default_cluster_sifs_owner(state) == state.local_node_id
+    };
+    if local_has_primary_metadata_shards && !options.publish_cluster_control {
+        host.materialize_default_sifs_metadata(
+            &file_system,
+            stable_dfs_service_node_ids(state),
+            state.local_node_id.clone(),
+        )?;
+    }
+
+    Ok(DfsDefaultClusterBootstrapReport {
+        file_system,
+        metadata_shards,
+        local_has_primary_metadata_shards,
+    })
+}
+
+pub fn ensure_default_cluster_dfs(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    control_plane: Box<dyn DfsControlPlaneKvClient>,
+    options: DfsDefaultClusterBootstrapOptions,
+) -> Result<Option<DfsDefaultClusterBootstrapReport>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let state = if options.publish_cluster_control {
+        sinomo_network::read_cluster_state(cluster_paths)
+    } else {
+        sinomo_network::read_cluster_state_without_kv(cluster_paths)
+    }
+    .map_err(DfsError::from_network)?;
+    let mut host = DfsControlPlaneDefaultClusterBootstrapHost::new(
+        data_dir.clone(),
+        cluster_paths.clone(),
+        state.local_node_id.clone(),
+        control_plane,
+    );
+    ensure_default_distributed_dfs_with_host(&state, &mut host, options).map(Some)
+}
+
+pub fn run_default_cluster_dfs_smoke(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    protocol_sender: DfsProtocolFrameSender,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    bootstrap_control_plane: Box<dyn DfsControlPlaneKvClient>,
+    smoke_control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsDefaultClusterSmokeOptions,
+) -> Result<Option<DfsSmokeReport>, DfsError> {
+    if ensure_default_cluster_dfs(
+        data_dir,
+        cluster_paths,
+        bootstrap_control_plane,
+        options.bootstrap,
+    )?
+    .is_none()
+    {
+        return Ok(None);
+    }
+    run_cluster_dfs_smoke(
+        data_dir,
+        cluster_paths,
+        protocol_sender,
+        metadata_sender,
+        snapshot_sender,
+        smoke_control_plane,
+        options.smoke,
+    )
+}
+
+pub fn default_cluster_sifs(state: &ClusterBootstrapState) -> DfsFileSystem {
+    let owner_node_id = default_cluster_sifs_owner(state);
+    let mut file_system = distributed_sifs(owner_node_id.clone());
+    file_system.owner_node_id = owner_node_id;
+    file_system.subtree_policies = default_cluster_sifs_subtree_policies(state);
+    file_system
+}
+
+pub fn default_cluster_sifs_owner(state: &ClusterBootstrapState) -> NodeId {
+    stable_dfs_service_node_ids(state)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| state.local_node_id.clone())
+}
+
+pub fn default_cluster_sifs_subtree_policies(
+    state: &ClusterBootstrapState,
+) -> Vec<DfsSubtreePolicy> {
+    let mut policies = stable_dfs_service_node_ids(state)
+        .into_iter()
+        .map(|node_id| DfsSubtreePolicy {
+            path_prefix: sifs_node_files_path(&node_id),
+            policy: DfsObjectPolicy::LocalOwned,
+        })
+        .collect::<Vec<_>>();
+    if policies.is_empty() {
+        policies.push(DfsSubtreePolicy {
+            path_prefix: sifs_node_files_path(&state.local_node_id),
+            policy: DfsObjectPolicy::LocalOwned,
+        });
+    }
+    policies.push(DfsSubtreePolicy {
+        path_prefix: SIFS_USERS_PATH.to_string(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+    });
+    policies.push(DfsSubtreePolicy {
+        path_prefix: SIFS_SERVICES_PATH.to_string(),
+        policy: DfsObjectPolicy::ReplicatedEventual,
+    });
+    policies
+}
+
+pub fn default_cluster_metadata_shards_with_host(
+    host: &mut impl DfsDefaultClusterBootstrapHost,
+    state: &ClusterBootstrapState,
+    file_system: &DfsFileSystem,
+) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+    Ok(vec![
+        default_cluster_metadata_shard_with_host(
+            host,
+            state,
+            file_system,
+            "root",
+            DfsMetadataShardAssignment::Root,
+            0,
+        )?,
+        default_cluster_metadata_shard_with_host(
+            host,
+            state,
+            file_system,
+            "services",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_SERVICES_PATH.to_string(),
+            },
+            1,
+        )?,
+        default_cluster_metadata_shard_with_host(
+            host,
+            state,
+            file_system,
+            "users",
+            DfsMetadataShardAssignment::PathPrefix {
+                prefix: SIFS_USERS_PATH.to_string(),
+            },
+            2,
+        )?,
+    ])
+}
+
+pub fn default_cluster_metadata_shard_with_host(
+    host: &mut impl DfsDefaultClusterBootstrapHost,
+    state: &ClusterBootstrapState,
+    file_system: &DfsFileSystem,
+    shard_id: &str,
+    assignment: DfsMetadataShardAssignment,
+    primary_offset: usize,
+) -> Result<DfsMetadataShardConfig, DfsError> {
+    let service_node_ids = stable_dfs_service_node_ids(state);
+    let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
+    let target_primary_node_id = default_metadata_shard_primary_node_id(
+        &service_node_ids,
+        &bootstrap_primary_node_id,
+        primary_offset,
+    );
+    let target_replica_node_ids =
+        metadata_shard_replica_node_ids(&service_node_ids, &target_primary_node_id, 2);
+    let mut desired = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.to_string(),
+        primary_node_id: target_primary_node_id,
+        replica_node_ids: target_replica_node_ids,
+        epoch: 1,
+        assignment,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let Some(current) = host.current_metadata_shard(&file_system.file_system_id, shard_id)? else {
+        desired.primary_node_id = bootstrap_primary_node_id.clone();
+        desired.replica_node_ids =
+            metadata_shard_replica_node_ids(&service_node_ids, &bootstrap_primary_node_id, 2);
+        return Ok(desired);
+    };
+    if current.primary_node_id != desired.primary_node_id
+        && !host.metadata_shard_primary_transfer_ready(&current, &desired.primary_node_id)?
+    {
+        return Ok(current);
+    }
+    if metadata_shard_layout_matches(&current, &desired) {
+        return Ok(current);
+    }
+    desired.epoch = current.epoch.saturating_add(1);
+    Ok(desired)
+}
+
+pub fn default_metadata_shard_primary_node_id(
+    service_node_ids: &[NodeId],
+    fallback_node_id: &NodeId,
+    primary_offset: usize,
+) -> NodeId {
+    if service_node_ids.is_empty() {
+        return fallback_node_id.clone();
+    }
+    service_node_ids[primary_offset % service_node_ids.len()].clone()
+}
+
+pub fn metadata_shard_replica_node_ids(
+    service_node_ids: &[NodeId],
+    primary_node_id: &NodeId,
+    max_replicas: usize,
+) -> Vec<NodeId> {
+    if service_node_ids.len() <= 1 || max_replicas == 0 {
+        return Vec::new();
+    }
+    let primary_index = service_node_ids
+        .iter()
+        .position(|node_id| node_id == primary_node_id)
+        .unwrap_or(0);
+    (1..service_node_ids.len())
+        .map(|offset| service_node_ids[(primary_index + offset) % service_node_ids.len()].clone())
+        .take(max_replicas)
+        .collect()
+}
+
+pub fn metadata_shard_layout_matches(
+    left: &DfsMetadataShardConfig,
+    right: &DfsMetadataShardConfig,
+) -> bool {
+    left.file_system_id == right.file_system_id
+        && left.shard_id == right.shard_id
+        && left.primary_node_id == right.primary_node_id
+        && left.replica_node_ids == right.replica_node_ids
+        && left.assignment == right.assignment
+        && left.default_policy == right.default_policy
+}
+
+pub fn stable_dfs_service_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
+    let mut node_ids = dfs_service_members(state)
+        .into_iter()
+        .map(|member| member.node_id.clone())
+        .collect::<Vec<_>>();
+    node_ids.sort();
+    node_ids.dedup();
+    node_ids
+}
+
+pub fn dfs_service_members(state: &ClusterBootstrapState) -> Vec<&ClusterMemberRecord> {
+    state
+        .members
+        .iter()
+        .filter(|member| {
+            member.state.is_authorized() && !matches!(member.role, ClusterMemberRole::NonVoting)
+        })
+        .collect()
+}
+
+pub fn dfs_service_endpoint_for_member(
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+    local_endpoint: &str,
+) -> String {
+    if member.node_id == state.local_node_id {
+        return local_endpoint.to_string();
+    }
+    member
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+        .min_by_key(|endpoint| dfs_service_endpoint_rank(endpoint))
+        .or_else(|| member.endpoints.first())
+        .map(|endpoint| endpoint.address.clone())
+        .unwrap_or_else(|| format!("cluster-member://{}", member.node_id))
+}
+
+pub fn dfs_service_endpoint_rank(endpoint: &ClusterEndpointRecord) -> (u8, u16, String) {
+    let privacy_rank = match endpoint.privacy {
+        ClusterEndpointPrivacy::InternetDirect => 0,
+        ClusterEndpointPrivacy::Relayed => 1,
+        ClusterEndpointPrivacy::Lan => 2,
+        ClusterEndpointPrivacy::LocalOnly => 3,
+    };
+    (privacy_rank, endpoint.priority, endpoint.address.clone())
+}
+
+fn publish_dfs_service_advertisements_with_host(
+    host: &mut impl DfsDefaultClusterBootstrapHost,
+    state: &ClusterBootstrapState,
+    local_endpoint: &str,
+) -> Result<(), DfsError> {
+    for member in dfs_service_members(state) {
+        let endpoint = dfs_service_endpoint_for_member(state, member, local_endpoint);
+        let metadata_key = metadata_service_key(&member.node_id);
+        let content_key = content_service_key(&member.node_id);
+        let metadata = stable_dfs_advertisement(
+            host,
+            &metadata_key,
+            DfsNodeAdvertisement::metadata(member.node_id.clone(), endpoint.clone()),
+        )?;
+        let content = stable_dfs_advertisement(
+            host,
+            &content_key,
+            DfsNodeAdvertisement::content(member.node_id.clone(), endpoint),
+        )?;
+        host.put_node_advertisement(metadata_key, &metadata)?;
+        host.put_node_advertisement(content_key, &content)?;
+    }
+    Ok(())
+}
+
+fn stable_dfs_advertisement(
+    host: &impl DfsDefaultClusterBootstrapHost,
+    key: &str,
+    desired: DfsNodeAdvertisement,
+) -> Result<DfsNodeAdvertisement, DfsError> {
+    let Some(current) = host.current_node_advertisement(key)? else {
+        return Ok(desired);
+    };
+    if current.node_id == desired.node_id
+        && current.endpoint == desired.endpoint
+        && current.accepts_metadata == desired.accepts_metadata
+        && current.accepts_content == desired.accepts_content
+        && current.capacity_weight == desired.capacity_weight
+        && current.zone == desired.zone
+    {
+        return Ok(current);
+    }
+    Ok(desired)
 }
 
 #[derive(Clone, Debug)]
@@ -1891,6 +3651,1639 @@ pub struct NetworkedDfsService<T> {
     next_request_id: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct DfsProtocolFrameProcessResult {
+    pub outbound_frames: Vec<NetworkFrame>,
+    pub events: Vec<NetworkedDfsServiceEvent>,
+}
+
+pub const DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMetadataReplicaShardContext {
+    pub local_node_id: NodeId,
+    pub shard: DfsMetadataShardConfig,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DfsMetadataJournalReplicationOptions {
+    pub batch_entry_limit: usize,
+    pub batch_byte_limit: usize,
+    pub max_batches_per_target: usize,
+    pub attempt_timeout: Duration,
+    pub target_timeout: Duration,
+}
+
+impl Default for DfsMetadataJournalReplicationOptions {
+    fn default() -> Self {
+        Self {
+            batch_entry_limit: DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            batch_byte_limit: DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+            max_batches_per_target: DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
+            attempt_timeout: DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT,
+            target_timeout: DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsMetadataJournalReplicationReport {
+    pub outcomes: Vec<DfsMetadataJournalReplicationOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsMetadataJournalReplicationOutcome {
+    MissingShard {
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+    },
+    NotPrimary {
+        file_system_id: DfsFileSystemId,
+        shard_id: DfsMetadataShardId,
+        local_node_id: NodeId,
+        primary_node_id: NodeId,
+        epoch: u64,
+    },
+    Applied {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        entries: usize,
+        next_after_sequence: u64,
+    },
+    NoChanges {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
+    MissingEndpoint {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+    },
+    Rejected {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        reason: String,
+    },
+    SnapshotInstalled {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        next_after_sequence: u64,
+        archived_existing: bool,
+    },
+    Failed {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        reason: String,
+    },
+    BacklogRemaining {
+        target_node_id: NodeId,
+        shard_id: DfsMetadataShardId,
+        after_sequence: u64,
+        max_batches: usize,
+    },
+}
+
+pub fn dfs_metadata_replication_sent_count(report: &DfsMetadataJournalReplicationReport) -> usize {
+    report
+        .outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome,
+                DfsMetadataJournalReplicationOutcome::Applied { .. }
+                    | DfsMetadataJournalReplicationOutcome::SnapshotInstalled { .. }
+            )
+        })
+        .count()
+}
+
+pub fn dfs_metadata_replication_notice_lines(
+    report: &DfsMetadataJournalReplicationReport,
+) -> Vec<String> {
+    report
+        .outcomes
+        .iter()
+        .filter_map(|outcome| match outcome {
+            DfsMetadataJournalReplicationOutcome::Applied {
+                target_node_id,
+                entries,
+                ..
+            } => Some(format!(
+                "replicated {entries} DFS metadata journal entries to {target_node_id}"
+            )),
+            DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                target_node_id,
+                next_after_sequence,
+                ..
+            } => Some(format!(
+                "repaired DFS metadata replica {target_node_id} with snapshot through {next_after_sequence}"
+            )),
+            DfsMetadataJournalReplicationOutcome::Rejected {
+                target_node_id,
+                reason,
+                ..
+            }
+            | DfsMetadataJournalReplicationOutcome::Failed {
+                target_node_id,
+                reason,
+                ..
+            } => Some(format!(
+                "DFS metadata replication to {target_node_id} failed: {reason}"
+            )),
+            DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                target_node_id,
+                max_batches,
+                ..
+            } => Some(format!(
+                "DFS metadata replication to {target_node_id} still has backlog after {max_batches} batches"
+            )),
+            DfsMetadataJournalReplicationOutcome::NoChanges { .. }
+            | DfsMetadataJournalReplicationOutcome::MissingEndpoint { .. }
+            | DfsMetadataJournalReplicationOutcome::MissingShard { .. }
+            | DfsMetadataJournalReplicationOutcome::NotPrimary { .. } => None,
+        })
+        .collect()
+}
+
+pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -> bool {
+    events.iter().any(|event| match event {
+        NetworkedDfsServiceEvent::BlobStaged { .. }
+        | NetworkedDfsServiceEvent::VersionCommitted { .. }
+        | NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+        | NetworkedDfsServiceEvent::WriteConflictCreated { .. }
+        | NetworkedDfsServiceEvent::OwnerHandoffCompleted { .. } => true,
+        NetworkedDfsServiceEvent::RemoteWriteServed { result, .. }
+        | NetworkedDfsServiceEvent::RemoteWriteCompleted { result, .. } => {
+            matches!(result, DfsDistributedWriteResult::Outcome { .. })
+        }
+        NetworkedDfsServiceEvent::BlobStageRejected { .. }
+        | NetworkedDfsServiceEvent::BlobFetched { .. }
+        | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
+        | NetworkedDfsServiceEvent::RemoteReadServed { .. }
+        | NetworkedDfsServiceEvent::RemoteRangeReadChunkReceived { .. }
+        | NetworkedDfsServiceEvent::RemoteReadCompleted { .. }
+        | NetworkedDfsServiceEvent::RepairRejected { .. }
+        | NetworkedDfsServiceEvent::MetadataJournalBatchApplied { .. }
+        | NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. } => false,
+    })
+}
+
+pub fn dfs_metadata_replication_report_needs_retry(
+    report: &DfsMetadataJournalReplicationReport,
+) -> bool {
+    report.outcomes.iter().any(|outcome| {
+        matches!(
+            outcome,
+            DfsMetadataJournalReplicationOutcome::Failed { .. }
+                | DfsMetadataJournalReplicationOutcome::BacklogRemaining { .. }
+        )
+    })
+}
+
+pub fn run_dfs_metadata_publish_after_events<P, R, E>(
+    events: &[NetworkedDfsServiceEvent],
+    mut publish: P,
+    mut on_report: R,
+    mut on_error: E,
+) -> bool
+where
+    P: FnMut() -> Result<DfsMetadataJournalReplicationReport, String>,
+    R: FnMut(DfsMetadataJournalReplicationReport),
+    E: FnMut(String),
+{
+    if !dfs_events_should_publish_metadata(events) {
+        return false;
+    }
+    match publish() {
+        Ok(report) => on_report(report),
+        Err(error) => on_error(error),
+    }
+    true
+}
+
+pub fn schedule_dfs_metadata_publish_after_events<P, R, E>(
+    scheduler: &'static DfsMetadataPublishScheduler,
+    events: &[NetworkedDfsServiceEvent],
+    options: DfsMetadataPublishScheduleOptions,
+    publish: P,
+    on_report: R,
+    on_error: E,
+) -> Result<Option<DfsMetadataPublishScheduleStart>, std::io::Error>
+where
+    P: FnMut() -> Result<DfsMetadataJournalReplicationReport, String> + Send + 'static,
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    if !dfs_events_should_publish_metadata(events) {
+        return Ok(None);
+    }
+    scheduler
+        .request_publish(options, publish, on_report, on_error)
+        .map(Some)
+}
+
+static DEFAULT_DFS_METADATA_PUBLISH_SCHEDULER: DfsMetadataPublishScheduler =
+    DfsMetadataPublishScheduler::new();
+
+pub fn schedule_default_dfs_metadata_publish_after_events<P, R, E>(
+    events: &[NetworkedDfsServiceEvent],
+    options: DfsMetadataPublishScheduleOptions,
+    publish: P,
+    on_report: R,
+    on_error: E,
+) -> Result<Option<DfsMetadataPublishScheduleStart>, std::io::Error>
+where
+    P: FnMut() -> Result<DfsMetadataJournalReplicationReport, String> + Send + 'static,
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    schedule_dfs_metadata_publish_after_events(
+        &DEFAULT_DFS_METADATA_PUBLISH_SCHEDULER,
+        events,
+        options,
+        publish,
+        on_report,
+        on_error,
+    )
+}
+
+pub fn run_cluster_dfs_metadata_publish_after_events<R, E>(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    events: &[NetworkedDfsServiceEvent],
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> bool
+where
+    R: FnMut(DfsMetadataJournalReplicationReport),
+    E: FnMut(String),
+{
+    run_dfs_metadata_publish_after_events(
+        events,
+        || {
+            publish_cluster_dfs_metadata_journal(
+                data_dir,
+                cluster_paths,
+                Arc::clone(&metadata_sender),
+                Arc::clone(&snapshot_sender),
+                replication_options,
+            )
+            .map_err(|error| error.to_string())
+        },
+        on_report,
+        on_error,
+    )
+}
+
+pub fn schedule_cluster_dfs_metadata_publish_after_events<R, E>(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    metadata_sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+    events: &[NetworkedDfsServiceEvent],
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Result<Option<DfsMetadataPublishScheduleStart>, std::io::Error>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    schedule_default_dfs_metadata_publish_after_events(
+        events,
+        schedule_options,
+        move || {
+            publish_cluster_dfs_metadata_journal(
+                &data_dir,
+                &cluster_paths,
+                Arc::clone(&metadata_sender),
+                Arc::clone(&snapshot_sender),
+                replication_options,
+            )
+            .map_err(|error| error.to_string())
+        },
+        on_report,
+        on_error,
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMetadataPublishScheduleOptions {
+    pub max_retry_rounds: usize,
+    pub retry_delay: Duration,
+    pub thread_name: String,
+}
+
+impl Default for DfsMetadataPublishScheduleOptions {
+    fn default() -> Self {
+        Self {
+            max_retry_rounds: 3,
+            retry_delay: Duration::from_millis(750),
+            thread_name: "sinomo-dfs-metadata-publish".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DfsMetadataPublishScheduleStart {
+    Started,
+    AlreadyRunning,
+}
+
+#[derive(Debug)]
+pub struct DfsMetadataPublishScheduler {
+    pending: AtomicBool,
+    running: AtomicBool,
+}
+
+impl Default for DfsMetadataPublishScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DfsMetadataPublishScheduler {
+    pub const fn new() -> Self {
+        Self {
+            pending: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+        }
+    }
+
+    pub fn request_publish<P, R, E>(
+        &'static self,
+        options: DfsMetadataPublishScheduleOptions,
+        publish: P,
+        on_report: R,
+        on_error: E,
+    ) -> Result<DfsMetadataPublishScheduleStart, std::io::Error>
+    where
+        P: FnMut() -> Result<DfsMetadataJournalReplicationReport, String> + Send + 'static,
+        R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+        E: FnMut(String) + Send + 'static,
+    {
+        self.pending.store(true, Ordering::Release);
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(DfsMetadataPublishScheduleStart::AlreadyRunning);
+        }
+
+        match std::thread::Builder::new()
+            .name(options.thread_name.clone())
+            .spawn(move || self.run_publish_loop(options, publish, on_report, on_error))
+        {
+            Ok(_) => Ok(DfsMetadataPublishScheduleStart::Started),
+            Err(error) => {
+                self.pending.store(false, Ordering::Release);
+                self.running.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn run_publish_loop<P, R, E>(
+        &'static self,
+        options: DfsMetadataPublishScheduleOptions,
+        mut publish: P,
+        mut on_report: R,
+        mut on_error: E,
+    ) where
+        P: FnMut() -> Result<DfsMetadataJournalReplicationReport, String>,
+        R: FnMut(DfsMetadataJournalReplicationReport),
+        E: FnMut(String),
+    {
+        let mut retry_rounds = 0usize;
+        loop {
+            self.pending.store(false, Ordering::Release);
+            let needs_retry = match publish() {
+                Ok(report) => {
+                    let needs_retry = dfs_metadata_replication_report_needs_retry(&report);
+                    on_report(report);
+                    needs_retry
+                }
+                Err(error) => {
+                    on_error(error);
+                    true
+                }
+            };
+            if self.pending.load(Ordering::Acquire) {
+                retry_rounds = 0;
+                continue;
+            }
+            if needs_retry && retry_rounds < options.max_retry_rounds {
+                retry_rounds += 1;
+                std::thread::sleep(options.retry_delay);
+                continue;
+            }
+            self.running.store(false, Ordering::Release);
+            if self.pending.load(Ordering::Acquire)
+                && self
+                    .running
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                retry_rounds = 0;
+                continue;
+            }
+            break;
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsMetadataJournalReplicationTransportError {
+    MissingEndpoint,
+    Failed { reason: String },
+}
+
+pub trait DfsMetadataJournalReplicationTransport {
+    fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool;
+
+    fn send_metadata_journal_batch(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+        timeout: Duration,
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>;
+
+    fn send_metadata_snapshot_install(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataSnapshotInstallCommand,
+        timeout: Duration,
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>;
+}
+
+pub const DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET: usize = 3;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsMetadataPeerTransportError {
+    detail: String,
+}
+
+impl DfsMetadataPeerTransportError {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DfsMetadataPeerTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for DfsMetadataPeerTransportError {}
+
+pub type DfsMetadataJournalBatchSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsMetadataJournalBatchCommand,
+            Duration,
+        ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>
+        + Send
+        + Sync,
+>;
+
+pub type DfsMetadataSnapshotInstallSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsMetadataSnapshotInstallCommand,
+            Duration,
+        ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+pub struct DfsMetadataEndpointTransport {
+    endpoints: Vec<ClusterEndpointRecord>,
+    sender: DfsMetadataJournalBatchSender,
+    snapshot_sender: DfsMetadataSnapshotInstallSender,
+}
+
+impl std::fmt::Debug for DfsMetadataEndpointTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DfsMetadataEndpointTransport")
+            .field("endpoints", &self.endpoints)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DfsMetadataEndpointTransport {
+    pub fn new(
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        sender: DfsMetadataJournalBatchSender,
+        snapshot_sender: DfsMetadataSnapshotInstallSender,
+    ) -> Self {
+        Self {
+            endpoints: endpoints.into_iter().collect(),
+            sender,
+            snapshot_sender,
+        }
+    }
+
+    fn target_endpoints(&self, target_node_id: &NodeId) -> Vec<&ClusterEndpointRecord> {
+        dfs_metadata_replication_target_endpoints(&self.endpoints, target_node_id)
+    }
+}
+
+impl DfsMetadataJournalReplicationTransport for DfsMetadataEndpointTransport {
+    fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool {
+        !self.target_endpoints(target_node_id).is_empty()
+    }
+
+    fn send_metadata_journal_batch(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+        timeout: Duration,
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
+        let endpoints = self.target_endpoints(target_node_id);
+        if endpoints.is_empty() {
+            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+        }
+        let mut failures = Vec::new();
+        let started = Instant::now();
+        for endpoint in endpoints {
+            let Some(attempt_timeout) = timeout.checked_sub(started.elapsed()) else {
+                failures.push(format!(
+                    "metadata journal replication target deadline exceeded after {}ms",
+                    timeout.as_millis()
+                ));
+                break;
+            };
+            match (self.sender)(endpoint, command, attempt_timeout) {
+                Ok(response) => {
+                    if response.request_id != command.request_id
+                        || response.shard_id != command.batch.shard_id
+                        || response.next_after_sequence != command.batch.next_after_sequence
+                    {
+                        failures.push(format!(
+                            "{} returned mismatched metadata journal response",
+                            endpoint.address
+                        ));
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            }
+        }
+        Err(DfsMetadataJournalReplicationTransportError::Failed {
+            reason: failures.join("; "),
+        })
+    }
+
+    fn send_metadata_snapshot_install(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataSnapshotInstallCommand,
+        timeout: Duration,
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
+    {
+        let endpoints = self.target_endpoints(target_node_id);
+        if endpoints.is_empty() {
+            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+        }
+        let mut failures = Vec::new();
+        let started = Instant::now();
+        for endpoint in endpoints {
+            let Some(attempt_timeout) = timeout.checked_sub(started.elapsed()) else {
+                failures.push(format!(
+                    "metadata snapshot install target deadline exceeded after {}ms",
+                    timeout.as_millis()
+                ));
+                break;
+            };
+            match (self.snapshot_sender)(endpoint, command, attempt_timeout) {
+                Ok(response) => {
+                    if response.request_id != command.request_id
+                        || response.shard_id != command.shard_id
+                        || response.next_after_sequence != command.next_after_sequence
+                    {
+                        failures.push(format!(
+                            "{} returned mismatched metadata snapshot install response",
+                            endpoint.address
+                        ));
+                        continue;
+                    }
+                    return Ok(response);
+                }
+                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            }
+        }
+        Err(DfsMetadataJournalReplicationTransportError::Failed {
+            reason: failures.join("; "),
+        })
+    }
+}
+
+fn dfs_metadata_replication_target_endpoints<'a>(
+    endpoints: &'a [ClusterEndpointRecord],
+    target_node_id: &NodeId,
+) -> Vec<&'a ClusterEndpointRecord> {
+    let mut candidates = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.node_id == *target_node_id)
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|endpoint| dfs_metadata_replication_endpoint_order_key(endpoint));
+    let mut selected = Vec::new();
+    let mut deferred = Vec::new();
+    let mut seen_routes = BTreeSet::new();
+    let mut seen_classes = BTreeSet::new();
+    for endpoint in candidates {
+        if !seen_routes.insert((
+            format!("{:?}", endpoint.transport),
+            endpoint.address.clone(),
+        )) {
+            continue;
+        }
+        if seen_classes.insert(dfs_metadata_replication_endpoint_class(endpoint)) {
+            selected.push(endpoint);
+        } else {
+            deferred.push(endpoint);
+        }
+        if selected.len() >= DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET {
+            return selected;
+        }
+    }
+    for endpoint in deferred {
+        if selected.len() >= DFS_METADATA_REPLICATION_MAX_ENDPOINTS_PER_TARGET {
+            break;
+        }
+        selected.push(endpoint);
+    }
+    selected
+}
+
+fn dfs_metadata_replication_endpoint_order_key(
+    endpoint: &ClusterEndpointRecord,
+) -> (u8, u16, String) {
+    (
+        dfs_metadata_replication_endpoint_class(endpoint),
+        endpoint.priority,
+        endpoint.address.clone(),
+    )
+}
+
+fn dfs_metadata_replication_endpoint_class(endpoint: &ClusterEndpointRecord) -> u8 {
+    match (&endpoint.transport, &endpoint.privacy) {
+        (
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
+            ClusterEndpointPrivacy::Lan,
+        ) => 0,
+        (
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback,
+            ClusterEndpointPrivacy::InternetDirect,
+        ) => 1,
+        (ClusterTransportKind::Iroh, _) => 2,
+        (ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback, _) => 3,
+        _ => 4,
+    }
+}
+
+pub trait DfsMetadataJournalPublisherHost {
+    fn open_primary_shard_backend(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Box<dyn DfsMetadataBackend>, DfsError>;
+
+    fn metadata_replication_cursor(
+        &mut self,
+        backend: &mut dyn DfsMetadataBackend,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<u64, DfsError> {
+        Ok(backend.metadata_replication_cursor(target_node_id, shard_id)?)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalDfsMetadataJournalPublisherHost {
+    data_dir: SinomoDataDir,
+}
+
+impl LocalDfsMetadataJournalPublisherHost {
+    pub fn new(data_dir: SinomoDataDir) -> Self {
+        Self { data_dir }
+    }
+}
+
+impl DfsMetadataJournalPublisherHost for LocalDfsMetadataJournalPublisherHost {
+    fn open_primary_shard_backend(
+        &mut self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Box<dyn DfsMetadataBackend>, DfsError> {
+        Ok(Box::new(open_local_metadata_shard_backend(
+            &self.data_dir,
+            shard_id.clone(),
+        )?))
+    }
+
+    fn metadata_replication_cursor(
+        &mut self,
+        backend: &mut dyn DfsMetadataBackend,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<u64, DfsError> {
+        migrate_legacy_dfs_metadata_replication_cursor(
+            backend,
+            &self.data_dir,
+            target_node_id,
+            shard_id,
+        )
+    }
+}
+
+pub fn publish_dfs_metadata_journal_with_host(
+    file_system_id: DfsFileSystemId,
+    local_node_id: &NodeId,
+    mut shards: Vec<DfsMetadataShardConfig>,
+    host: &mut impl DfsMetadataJournalPublisherHost,
+    transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+    if shards.is_empty() {
+        return Ok(DfsMetadataJournalReplicationReport {
+            outcomes: vec![DfsMetadataJournalReplicationOutcome::MissingShard {
+                file_system_id,
+                shard_id: DfsMetadataShardId::new("root"),
+            }],
+        });
+    }
+
+    let mut outcomes = Vec::new();
+    for shard in shards {
+        let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        if shard.primary_node_id != *local_node_id {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::NotPrimary {
+                file_system_id: shard.file_system_id,
+                shard_id,
+                local_node_id: local_node_id.clone(),
+                primary_node_id: shard.primary_node_id,
+                epoch: shard.epoch,
+            });
+            continue;
+        }
+
+        let mut backend = host.open_primary_shard_backend(&shard_id)?;
+        for target_node_id in shard
+            .replica_node_ids
+            .into_iter()
+            .filter(|target_node_id| target_node_id != local_node_id)
+        {
+            let after_sequence =
+                host.metadata_replication_cursor(&mut *backend, &target_node_id, &shard_id)?;
+            outcomes.extend(replicate_dfs_metadata_shard_to_target(
+                &mut *backend,
+                local_node_id,
+                &target_node_id,
+                &shard_id,
+                after_sequence,
+                transport,
+                options,
+            )?);
+        }
+    }
+
+    Ok(DfsMetadataJournalReplicationReport { outcomes })
+}
+
+pub fn process_dfs_metadata_journal_batch(
+    backend: &mut dyn DfsMetadataBackend,
+    context: Option<&DfsMetadataReplicaShardContext>,
+    command: DfsMetadataJournalBatchCommand,
+) -> DfsMetadataJournalBatchResponse {
+    if let Some(response) = validate_dfs_metadata_journal_batch_source(context, &command) {
+        return response;
+    }
+    let shard_id = command.batch.shard_id.clone();
+    let next_after_sequence = command.batch.next_after_sequence;
+    match backend.apply_journal_batch(&command.batch) {
+        Ok(applied_entries) => DfsMetadataJournalBatchResponse {
+            request_id: command.request_id,
+            shard_id,
+            next_after_sequence,
+            applied_entries,
+            result: DfsMetadataJournalBatchResult::Applied,
+        },
+        Err(error) => DfsMetadataJournalBatchResponse {
+            request_id: command.request_id,
+            shard_id,
+            next_after_sequence,
+            applied_entries: 0,
+            result: DfsMetadataJournalBatchResult::Rejected {
+                reason: error.to_string(),
+            },
+        },
+    }
+}
+
+pub fn cluster_dfs_metadata_replica_shard_context(
+    cluster_paths: &ClusterPaths,
+    shard_id: &DfsMetadataShardId,
+) -> Result<Option<DfsMetadataReplicaShardContext>, DfsError> {
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let shard = sinomo_network::read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
+        cluster_paths,
+        &format!("{}/", metadata_shards_prefix(&sifs_file_system_id())),
+    )
+    .map_err(DfsError::from_network)?
+    .into_iter()
+    .find(|shard| shard.shard_id == shard_id.0.as_str());
+    Ok(shard.map(|shard| DfsMetadataReplicaShardContext {
+        local_node_id: state.local_node_id,
+        shard,
+    }))
+}
+
+pub fn process_cluster_dfs_metadata_journal_batch(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    command: DfsMetadataJournalBatchCommand,
+) -> Result<DfsMetadataJournalBatchResponse, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    let context =
+        cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.batch.shard_id)?;
+    let mut backend = open_local_metadata_shard_backend(data_dir, command.batch.shard_id.clone())?;
+    Ok(process_dfs_metadata_journal_batch(
+        &mut backend,
+        context.as_ref(),
+        command,
+    ))
+}
+
+pub fn process_dfs_metadata_snapshot_install(
+    backend: &mut dyn DfsMetadataBackend,
+    context: Option<&DfsMetadataReplicaShardContext>,
+    command: DfsMetadataSnapshotInstallCommand,
+) -> DfsMetadataSnapshotInstallResponse {
+    if let Some(response) = validate_dfs_metadata_snapshot_install_source(context, &command) {
+        return response;
+    }
+    let request_id = command.request_id.clone();
+    let shard_id = command.shard_id.clone();
+    let next_after_sequence = command.next_after_sequence;
+    match backend.replace_with_replicated_snapshot(
+        command.shard_id,
+        command.next_after_sequence,
+        command.snapshot,
+    ) {
+        Ok(archived_existing) => DfsMetadataSnapshotInstallResponse {
+            request_id,
+            shard_id,
+            next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Installed { archived_existing },
+        },
+        Err(error) => DfsMetadataSnapshotInstallResponse {
+            request_id,
+            shard_id,
+            next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Rejected {
+                reason: error.to_string(),
+            },
+        },
+    }
+}
+
+pub fn process_cluster_dfs_metadata_snapshot_install(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    command: DfsMetadataSnapshotInstallCommand,
+) -> Result<DfsMetadataSnapshotInstallResponse, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    let context = cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.shard_id)?;
+    let mut backend = open_local_metadata_shard_backend(data_dir, command.shard_id.clone())?;
+    Ok(process_dfs_metadata_snapshot_install(
+        &mut backend,
+        context.as_ref(),
+        command,
+    ))
+}
+
+pub fn materialize_default_sifs_metadata(
+    backend: &mut dyn DfsMetadataBackend,
+    file_system: &DfsFileSystem,
+    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
+    fallback_owner_node_id: NodeId,
+    created_at: OffsetDateTime,
+) -> Result<(), DfsError> {
+    if backend.get_file_system(&file_system.file_system_id)? != Some(file_system.clone()) {
+        backend.put_file_system(file_system)?;
+    }
+    for object in distributed_sifs_bootstrap_objects_for_nodes(
+        bootstrap_owner_node_ids,
+        fallback_owner_node_id,
+    ) {
+        if backend
+            .get_object_by_path(&object.file_system_id, object.path.trim_matches('/'))?
+            .is_none()
+        {
+            backend.put_object(&object)?;
+            backend.put_version(&DfsObjectVersionRecord {
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                version: object.version.clone(),
+                content_hash: object.content_hash.clone(),
+                size_bytes: object.content_size_bytes,
+                locations: object.current_locations.clone(),
+                created_by_event_id: object.created_by_event_id.clone(),
+                created_at,
+                visible: true,
+            })?;
+        }
+    }
+    Ok(())
+}
+
+pub fn materialize_default_sifs_metadata_on_shards(
+    backend: &mut LocalShardedMetadataBackend,
+    file_system: &DfsFileSystem,
+    bootstrap_owner_node_ids: impl IntoIterator<Item = NodeId>,
+    fallback_owner_node_id: NodeId,
+    created_at: OffsetDateTime,
+) -> Result<(), DfsError> {
+    backend.ensure_file_system_on_all_shards(file_system)?;
+    materialize_default_sifs_metadata(
+        backend,
+        file_system,
+        bootstrap_owner_node_ids,
+        fallback_owner_node_id,
+        created_at,
+    )?;
+    backend.migrate_objects_to_configured_shards(&file_system.file_system_id, usize::MAX)?;
+    Ok(())
+}
+
+pub fn validate_dfs_metadata_journal_batch_source(
+    context: Option<&DfsMetadataReplicaShardContext>,
+    command: &DfsMetadataJournalBatchCommand,
+) -> Option<DfsMetadataJournalBatchResponse> {
+    let Some(context) = context else {
+        return None;
+    };
+    if context.shard.shard_id != command.batch.shard_id.0 {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata journal batch has no local shard config".to_string(),
+        ));
+    }
+    let Some(source_node_id) = command.source_node_id.as_ref() else {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata journal batch is missing source node id".to_string(),
+        ));
+    };
+    if source_node_id != &context.shard.primary_node_id {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "metadata journal source {source_node_id} is not shard {} primary {}",
+                context.shard.shard_id, context.shard.primary_node_id
+            ),
+        ));
+    }
+    if context.shard.primary_node_id == context.local_node_id {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            "metadata primary must not apply a replica journal batch".to_string(),
+        ));
+    }
+    if !context
+        .shard
+        .replica_node_ids
+        .contains(&context.local_node_id)
+    {
+        return Some(dfs_metadata_journal_rejection_response(
+            command,
+            format!(
+                "local node {} is not configured as a replica for metadata shard {}",
+                context.local_node_id, context.shard.shard_id
+            ),
+        ));
+    }
+    None
+}
+
+pub fn validate_dfs_metadata_snapshot_install_source(
+    context: Option<&DfsMetadataReplicaShardContext>,
+    command: &DfsMetadataSnapshotInstallCommand,
+) -> Option<DfsMetadataSnapshotInstallResponse> {
+    let reject = |reason: String| DfsMetadataSnapshotInstallResponse {
+        request_id: command.request_id.clone(),
+        shard_id: command.shard_id.clone(),
+        next_after_sequence: command.next_after_sequence,
+        result: DfsMetadataSnapshotInstallResult::Rejected { reason },
+    };
+
+    let Some(context) = context else {
+        return Some(reject(
+            "metadata snapshot install has no local shard config".to_string(),
+        ));
+    };
+    if context.shard.shard_id != command.shard_id.0 {
+        return Some(reject(
+            "metadata snapshot install has no local shard config".to_string(),
+        ));
+    }
+    if context.shard.primary_node_id != command.source_node_id {
+        return Some(reject(format!(
+            "metadata snapshot source {} is not shard {} primary {}",
+            command.source_node_id, context.shard.shard_id, context.shard.primary_node_id
+        )));
+    }
+    if context.shard.primary_node_id == context.local_node_id {
+        return Some(reject(
+            "metadata primary must not install a replica snapshot".to_string(),
+        ));
+    }
+    if !context
+        .shard
+        .replica_node_ids
+        .contains(&context.local_node_id)
+    {
+        return Some(reject(format!(
+            "local node {} is not configured as a replica for metadata shard {}",
+            context.local_node_id, context.shard.shard_id
+        )));
+    }
+    None
+}
+
+fn dfs_metadata_journal_rejection_response(
+    command: &DfsMetadataJournalBatchCommand,
+    reason: String,
+) -> DfsMetadataJournalBatchResponse {
+    DfsMetadataJournalBatchResponse {
+        request_id: command.request_id.clone(),
+        shard_id: command.batch.shard_id.clone(),
+        next_after_sequence: command.batch.next_after_sequence,
+        applied_entries: 0,
+        result: DfsMetadataJournalBatchResult::Rejected { reason },
+    }
+}
+
+pub fn replicate_dfs_metadata_shard_to_target(
+    backend: &mut dyn DfsMetadataBackend,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+    shard_id: &DfsMetadataShardId,
+    mut after_sequence: u64,
+    transport: &mut dyn DfsMetadataJournalReplicationTransport,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<Vec<DfsMetadataJournalReplicationOutcome>, DfsError> {
+    let mut outcomes = Vec::new();
+    let mut sent_batches = 0usize;
+    loop {
+        let Some(batch) = backend.journal_batch_since_limited(
+            after_sequence,
+            options.batch_entry_limit,
+            options.batch_byte_limit,
+        )?
+        else {
+            if sent_batches == 0 {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::NoChanges {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                });
+            }
+            break;
+        };
+        if !transport.has_metadata_replication_route(target_node_id) {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                after_sequence,
+            });
+            break;
+        }
+
+        let next_after_sequence = batch.next_after_sequence;
+        let entry_count = batch.entries.len();
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: format!(
+                "dfs_meta_{}_{}_{}",
+                local_node_id, target_node_id, next_after_sequence
+            ),
+            source_node_id: Some(local_node_id.clone()),
+            batch,
+        };
+        let attempt_timeout = options.attempt_timeout.min(options.target_timeout);
+        let response = match transport.send_metadata_journal_batch(
+            target_node_id,
+            &command,
+            attempt_timeout,
+        ) {
+            Ok(response) => response,
+            Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint) => {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                });
+                break;
+            }
+            Err(DfsMetadataJournalReplicationTransportError::Failed { reason }) => {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    reason,
+                });
+                break;
+            }
+        };
+        if response.request_id != command.request_id
+            || response.shard_id != *shard_id
+            || response.next_after_sequence != next_after_sequence
+        {
+            outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                target_node_id: target_node_id.clone(),
+                shard_id: shard_id.clone(),
+                reason: "metadata journal replication returned mismatched response".to_string(),
+            });
+            break;
+        }
+
+        let mut terminal = false;
+        match response.result {
+            DfsMetadataJournalBatchResult::Applied => {
+                backend.put_metadata_replication_cursor(
+                    target_node_id,
+                    shard_id,
+                    next_after_sequence,
+                )?;
+                after_sequence = next_after_sequence;
+                sent_batches += 1;
+                outcomes.push(DfsMetadataJournalReplicationOutcome::Applied {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    entries: entry_count,
+                    next_after_sequence,
+                });
+            }
+            DfsMetadataJournalBatchResult::Rejected { reason } => {
+                if metadata_journal_rejection_is_sequence_conflict(&reason) {
+                    let snapshot_next_after_sequence = backend.journal_last_sequence()?;
+                    let snapshot_command = DfsMetadataSnapshotInstallCommand {
+                        request_id: format!(
+                            "dfs_meta_snapshot_{}_{}_{}",
+                            local_node_id, target_node_id, snapshot_next_after_sequence
+                        ),
+                        source_node_id: local_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        next_after_sequence: snapshot_next_after_sequence,
+                        snapshot: backend.export_table_snapshot()?,
+                        reason: reason.clone(),
+                    };
+                    match transport.send_metadata_snapshot_install(
+                        target_node_id,
+                        &snapshot_command,
+                        attempt_timeout,
+                    ) {
+                        Ok(snapshot_response) => {
+                            if snapshot_response.request_id != snapshot_command.request_id
+                                || snapshot_response.shard_id != *shard_id
+                                || snapshot_response.next_after_sequence
+                                    != snapshot_next_after_sequence
+                            {
+                                outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                                    target_node_id: target_node_id.clone(),
+                                    shard_id: shard_id.clone(),
+                                    reason:
+                                        "metadata snapshot install returned mismatched response"
+                                            .to_string(),
+                                });
+                                break;
+                            }
+                            match snapshot_response.result {
+                                DfsMetadataSnapshotInstallResult::Installed {
+                                    archived_existing,
+                                } => {
+                                    backend.put_metadata_replication_cursor(
+                                        target_node_id,
+                                        shard_id,
+                                        snapshot_next_after_sequence,
+                                    )?;
+                                    after_sequence = snapshot_next_after_sequence;
+                                    sent_batches += 1;
+                                    outcomes.push(
+                                        DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                                            target_node_id: target_node_id.clone(),
+                                            shard_id: shard_id.clone(),
+                                            next_after_sequence: snapshot_next_after_sequence,
+                                            archived_existing,
+                                        },
+                                    );
+                                }
+                                DfsMetadataSnapshotInstallResult::Rejected {
+                                    reason: snapshot_reason,
+                                } => {
+                                    outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
+                                        target_node_id: target_node_id.clone(),
+                                        shard_id: shard_id.clone(),
+                                        reason: format!(
+                                            "{reason}; snapshot repair rejected: {snapshot_reason}"
+                                        ),
+                                    });
+                                    terminal = true;
+                                }
+                            }
+                        }
+                        Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint) => {
+                            outcomes.push(DfsMetadataJournalReplicationOutcome::MissingEndpoint {
+                                target_node_id: target_node_id.clone(),
+                                shard_id: shard_id.clone(),
+                                after_sequence,
+                            });
+                            break;
+                        }
+                        Err(DfsMetadataJournalReplicationTransportError::Failed {
+                            reason: snapshot_reason,
+                        }) => {
+                            outcomes.push(DfsMetadataJournalReplicationOutcome::Failed {
+                                target_node_id: target_node_id.clone(),
+                                shard_id: shard_id.clone(),
+                                reason: format!(
+                                    "{reason}; snapshot repair failed: {snapshot_reason}"
+                                ),
+                            });
+                            break;
+                        }
+                    }
+                } else {
+                    outcomes.push(DfsMetadataJournalReplicationOutcome::Rejected {
+                        target_node_id: target_node_id.clone(),
+                        shard_id: shard_id.clone(),
+                        reason,
+                    });
+                    terminal = true;
+                }
+            }
+        }
+        if terminal {
+            break;
+        }
+        if sent_batches >= options.max_batches_per_target {
+            if backend
+                .journal_batch_since_limited(
+                    after_sequence,
+                    options.batch_entry_limit,
+                    options.batch_byte_limit,
+                )?
+                .is_some()
+            {
+                outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+                    target_node_id: target_node_id.clone(),
+                    shard_id: shard_id.clone(),
+                    after_sequence,
+                    max_batches: options.max_batches_per_target,
+                });
+            }
+            break;
+        }
+    }
+    Ok(outcomes)
+}
+
+fn metadata_journal_rejection_is_sequence_conflict(reason: &str) -> bool {
+    reason.contains("metadata journal sequence")
+        && reason.contains("already exists with a different entry")
+}
+
+pub const DEFAULT_DFS_PROTOCOL_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsPeerTransportError {
+    detail: String,
+}
+
+impl DfsPeerTransportError {
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DfsPeerTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for DfsPeerTransportError {}
+
+pub type DfsProtocolFrameSender = Arc<
+    dyn Fn(
+            &ClusterEndpointRecord,
+            &DfsProtocolFrameCommand,
+            Duration,
+        ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
+pub struct DfsEndpointTransport {
+    local_node_id: NodeId,
+    endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>>,
+    incoming_frames: VecDeque<InboundFrame>,
+    timeout: Duration,
+    sender: DfsProtocolFrameSender,
+}
+
+impl std::fmt::Debug for DfsEndpointTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DfsEndpointTransport")
+            .field("local_node_id", &self.local_node_id)
+            .field("endpoints_by_node_id", &self.endpoints_by_node_id)
+            .field("incoming_frames", &self.incoming_frames)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DfsEndpointTransport {
+    pub fn new(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        sender: DfsProtocolFrameSender,
+    ) -> Self {
+        Self::with_timeout(
+            local_node_id,
+            endpoints,
+            DEFAULT_DFS_PROTOCOL_FRAME_TIMEOUT,
+            sender,
+        )
+    }
+
+    pub fn with_timeout(
+        local_node_id: NodeId,
+        endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+        timeout: Duration,
+        sender: DfsProtocolFrameSender,
+    ) -> Self {
+        let mut endpoints_by_node_id: BTreeMap<NodeId, Vec<ClusterEndpointRecord>> =
+            BTreeMap::new();
+        for endpoint in endpoints {
+            if endpoint.node_id != local_node_id {
+                endpoints_by_node_id
+                    .entry(endpoint.node_id.clone())
+                    .or_default()
+                    .push(endpoint);
+            }
+        }
+        Self {
+            local_node_id,
+            endpoints_by_node_id,
+            incoming_frames: VecDeque::new(),
+            timeout,
+            sender,
+        }
+    }
+
+    fn deliver_returned_frame(&mut self, frame: NetworkFrame) -> Result<(), NetworkError> {
+        let target_node_id = frame.target_node_id.clone();
+        if target_node_id == self.local_node_id {
+            self.incoming_frames.push_back(InboundFrame {
+                received_by: self.local_node_id.clone(),
+                frame,
+            });
+            return Ok(());
+        }
+        self.send_frame_to_endpoint(&target_node_id, frame, false)
+    }
+
+    fn send_frame_to_endpoint(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkFrame,
+        require_local_source: bool,
+    ) -> Result<(), NetworkError> {
+        if require_local_source && &frame.source_node_id != self.local_node_id() {
+            return Err(NetworkError::FrameSourceMismatch {
+                local_node_id: self.local_node_id.clone(),
+                source_node_id: frame.source_node_id,
+            });
+        }
+        if !require_local_source
+            && frame.source_node_id != self.local_node_id
+            && !self
+                .endpoints_by_node_id
+                .contains_key(&frame.source_node_id)
+        {
+            return Err(NetworkError::UnknownNode {
+                node_id: frame.source_node_id,
+            });
+        }
+        if &frame.target_node_id != target_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: target_node_id.clone(),
+                frame_target_node_id: frame.target_node_id,
+            });
+        }
+        let endpoints = self
+            .endpoints_by_node_id
+            .get(target_node_id)
+            .cloned()
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })?;
+        let command = DfsProtocolFrameCommand {
+            request_id: format!("dfs_protocol_frame_{}", frame.frame_id.0),
+            frame,
+        };
+        let mut failures = Vec::new();
+        for endpoint in &endpoints {
+            match (self.sender)(endpoint, &command, self.timeout) {
+                Ok(response) => {
+                    for returned_frame in response.outbound_frames {
+                        self.deliver_returned_frame(returned_frame)?;
+                    }
+                    return Ok(());
+                }
+                Err(error) => failures.push(format!("{} failed: {error}", endpoint.address)),
+            }
+        }
+        Err(NetworkError::Io {
+            operation: format!("send DFS protocol frame to {target_node_id}"),
+            detail: failures.join("; "),
+        })
+    }
+}
+
+impl NetworkTransport for DfsEndpointTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+        self.send_frame_to_endpoint(target_node_id, frame, true)
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        Ok(self.incoming_frames.drain(..).collect())
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(self.incoming_frames.len()))
+    }
+}
+
+#[derive(Debug)]
+struct SingleDfsProtocolFrameTransport {
+    local_node_id: NodeId,
+    inbound_frames: Vec<InboundFrame>,
+    outbound_frames: Vec<NetworkFrame>,
+}
+
+impl SingleDfsProtocolFrameTransport {
+    fn new(local_node_id: NodeId, inbound_frame: NetworkFrame) -> Self {
+        Self {
+            local_node_id: local_node_id.clone(),
+            inbound_frames: vec![InboundFrame {
+                received_by: local_node_id,
+                frame: inbound_frame,
+            }],
+            outbound_frames: Vec::new(),
+        }
+    }
+}
+
+impl NetworkTransport for SingleDfsProtocolFrameTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    fn send(&mut self, _target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+        self.outbound_frames.push(frame);
+        Ok(())
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        Ok(std::mem::take(&mut self.inbound_frames))
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        Ok(Some(self.inbound_frames.len()))
+    }
+}
+
+pub fn process_dfs_protocol_frame(
+    local_node_id: NodeId,
+    inbound_frame: NetworkFrame,
+    content: LocalContentStore,
+    metadata_backend: Box<dyn DfsMetadataBackend>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<DfsProtocolFrameProcessResult, DfsError> {
+    if inbound_frame.target_node_id != local_node_id {
+        return Err(DfsError::Network {
+            message: format!(
+                "dfs protocol frame target {} does not match local node {}",
+                inbound_frame.target_node_id, local_node_id
+            ),
+        });
+    }
+    let transport = SingleDfsProtocolFrameTransport::new(local_node_id, inbound_frame);
+    let mut service = NetworkedDfsService::new(transport, content);
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
+    let events = service.process_incoming()?;
+    let outbound_frames = service.into_transport().outbound_frames;
+    Ok(DfsProtocolFrameProcessResult {
+        outbound_frames,
+        events,
+    })
+}
+
+pub fn process_cluster_dfs_protocol_frame(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    inbound_frame: NetworkFrame,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<Option<DfsProtocolFrameProcessResult>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let local_node_id = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?
+        .local_node_id;
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    process_dfs_protocol_frame(
+        local_node_id,
+        inbound_frame,
+        content,
+        metadata_backend,
+        control_plane,
+    )
+    .map(Some)
+}
+
+#[derive(Clone, Debug)]
+pub struct DfsProtocolFrameCommandProcessResult {
+    pub response: DfsProtocolFrameResponse,
+    pub events: Vec<NetworkedDfsServiceEvent>,
+}
+
+pub fn process_cluster_dfs_protocol_frame_command(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    command: DfsProtocolFrameCommand,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<Option<DfsProtocolFrameCommandProcessResult>, DfsError> {
+    let request_id = command.request_id;
+    let Some(result) =
+        process_cluster_dfs_protocol_frame(data_dir, cluster_paths, command.frame, control_plane)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(DfsProtocolFrameCommandProcessResult {
+        response: DfsProtocolFrameResponse {
+            request_id,
+            outbound_frames: result.outbound_frames,
+        },
+        events: result.events,
+    }))
+}
+
 impl<T: NetworkTransport> NetworkedDfsService<T> {
     pub fn new(transport: T, content: LocalContentStore) -> Self {
         let node_id = transport.local_node_id().clone();
@@ -1926,6 +5319,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
 
     pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + Send + 'static) -> Self {
         self.control_plane = Some(Box::new(kv));
+        self
+    }
+
+    pub fn with_boxed_control_plane(mut self, kv: Box<dyn DfsControlPlaneKvClient>) -> Self {
+        self.control_plane = Some(kv);
         self
     }
 

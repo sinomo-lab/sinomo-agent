@@ -9,14 +9,17 @@
 //!
 //! The registry mixes host-agnostic services from `sinomo-service` and native modules
 //! such as `sinomo-rollout` with **daemon-foundational** services defined here
-//! ([`DaemonControlService`], [`ClusterKvService`]) that own daemon state (their
-//! [`DaemonPaths`], which encode whether this is the main or shadow daemon) and call
-//! the daemon's own cluster/control handlers. Consuming services receive a real
+//! ([`DaemonControlService`], [`ClusterKvService`], [`ClusterHealthService`],
+//! [`ClusterRelayService`]) that own daemon state (their [`DaemonPaths`], which encode
+//! whether this is the main or shadow daemon) and call the daemon's own cluster/control
+//! handlers. Consuming services receive a real
 //! [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when the node is clustered.
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
+
+use time::OffsetDateTime;
 
 use sinomo_config::{
     ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
@@ -24,14 +27,17 @@ use sinomo_config::{
 use sinomo_dfs::{
     DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE, register_services as register_dfs_services,
 };
-use sinomo_kv::{KvEntry, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_kv::{
+    CLUSTER_KV_RPC_ROUTES, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES,
+    CLUSTER_KV_TXN_ROUTE, KvEntry, KvSnapshot, KvTxn, KvTxnResponse,
+};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES, CLUSTER_KV_TXN_ROUTE,
-    CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE, ClusterPaths, ClusterRaftAppendRequest,
-    ClusterRaftVoteRequest, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonControlStream,
-    ObjectRpcRequest, ObjectRpcResponse, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
-    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, read_cluster_kv_entry, read_cluster_kv_prefix_entries,
+    CLUSTER_HEALTH_ROUTE, CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
+    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE,
+    CLUSTER_RELAY_ROUTE, ClusterPaths, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
+    DaemonControlStream, ObjectRpcRequest, ObjectRpcResponse, RelayEnvelope,
+    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
@@ -61,9 +67,10 @@ use sinomo_service::{
 
 use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 use crate::cluster::{
+    DaemonClusterInvitePublishHost, DaemonClusterJoinRegistrationHost,
+    DaemonClusterMemberPublishHost, DaemonClusterStatusProbe, cluster_paths_from_daemon_paths,
     handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
-    handle_forwarded_daemon_cluster_kv_txn_request,
+    handle_daemon_cluster_relay_request, handle_forwarded_daemon_cluster_kv_txn_request,
 };
 use crate::control::{
     ACCEPTED_ROLLOUT_RESPONSE_DRAIN_GRACE, accepted_rollout_should_stop_current_daemon,
@@ -123,11 +130,13 @@ impl DaemonClusterAccess {
 
 impl ClusterAccess for DaemonClusterAccess {
     fn kv_get(&self, key: &str) -> Result<Option<KvEntry>, ServiceError> {
-        read_cluster_kv_entry(&self.cluster_paths, key).map_err(ServiceError::from)
+        sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+            .map_err(ServiceError::from)
     }
 
     fn kv_range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, ServiceError> {
-        read_cluster_kv_prefix_entries(&self.cluster_paths, prefix).map_err(ServiceError::from)
+        sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+            .map_err(ServiceError::from)
     }
 
     fn kv_commit(&self, txn: KvTxn) -> Result<KvTxnResponse, ServiceError> {
@@ -215,9 +224,11 @@ impl Service for DaemonControlService {
     }
 }
 
-/// Daemon-foundational service: the cluster KV control plane (snapshot + txn). A local
-/// signer commits directly; a remote signer's txn is applied without re-forwarding,
-/// matching the daemon's prior dispatch.
+/// Daemon-founded service adapter for cluster KV object-RPC routes. Snapshot + txn still
+/// wrap daemon quorum/forwarding behavior; local range/watch route semantics are decoded
+/// by `sinomo-kv` with a temporary network-backed host while the filesystem adapter still
+/// lives in `sinomo-network`. Watch-event fanout stays with network because it validates
+/// cluster identity and authorized leaders before appending local watch events.
 struct ClusterKvService {
     paths: DaemonPaths,
 }
@@ -228,13 +239,21 @@ impl Service for ClusterKvService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE]
+        CLUSTER_KV_RPC_ROUTES
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let paths = self.paths.clone();
         Box::pin(async move {
-            let response = match request.route.as_str() {
+            let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
+            if let Some(response) =
+                sinomo_network::handle_cluster_kv_read_watch_rpc_request(&cluster_paths, &request)?
+            {
+                ctx.respond(response)?;
+                return Ok(ServiceDisposition::Continue);
+            }
+            let route = request.route.clone();
+            let response = match route.as_str() {
                 CLUSTER_KV_SNAPSHOT_ROUTE => {
                     let _: () = request.decode_body()?;
                     let snapshot =
@@ -259,10 +278,67 @@ impl Service for ClusterKvService {
     }
 }
 
-/// Daemon-foundational service: cluster raft consensus (append + vote). These inbound
-/// peer RPCs authorize the sender against cluster membership, so the service carries the
-/// request's `AuthenticatedDaemonCommand` (captured when the per-request registry is
-/// built) and hands it to the daemon's own consensus handlers.
+/// Daemon adapter for the cluster health RPC. `sinomo-network` owns health aggregation;
+/// this service only supplies daemon-local probing through the existing cluster host code.
+struct ClusterHealthService;
+
+impl Service for ClusterHealthService {
+    fn name(&self) -> &'static str {
+        "cluster-health"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[CLUSTER_HEALTH_ROUTE]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        Box::pin(async move {
+            let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
+            let state = sinomo_network::read_cluster_state(&cluster_paths)?;
+            let probe = DaemonClusterStatusProbe::new(&cluster_paths);
+            let response = sinomo_network::handle_cluster_health_rpc_request(
+                &cluster_paths,
+                &state,
+                &probe,
+                request,
+                OffsetDateTime::now_utc(),
+            )?;
+            ctx.respond(response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+/// Daemon adapter for one-hop cluster relay routing. `sinomo-network` owns the relay
+/// decision; the daemon supplies local delivery by reinjecting through its control port.
+struct ClusterRelayService {
+    paths: DaemonPaths,
+}
+
+impl Service for ClusterRelayService {
+    fn name(&self) -> &'static str {
+        "cluster-relay"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[CLUSTER_RELAY_ROUTE]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
+        Box::pin(async move {
+            let envelope = RelayEnvelope::from_request(&request)?;
+            let response =
+                handle_daemon_cluster_relay_request(&paths, envelope).map_err(daemon_error)?;
+            ctx.respond(response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+/// Daemon adapter for cluster raft consensus (append + vote). The daemon carries the
+/// request's authenticated transport identity; `sinomo-network` validates that identity
+/// against cluster membership and applies the network-owned raft RPC policy.
 struct ClusterRaftService {
     paths: DaemonPaths,
     authenticated: AuthenticatedDaemonCommand,
@@ -281,23 +357,69 @@ impl Service for ClusterRaftService {
         let paths = self.paths.clone();
         let authenticated = self.authenticated.clone();
         Box::pin(async move {
-            let response = match request.route.as_str() {
-                CLUSTER_RAFT_APPEND_ROUTE => {
-                    let append: ClusterRaftAppendRequest = request.decode_body()?;
-                    let result =
-                        handle_daemon_cluster_raft_append_request(&paths, append, &authenticated)
-                            .map_err(daemon_error)?;
-                    ObjectRpcResponse::encode_body(CLUSTER_RAFT_APPEND_ROUTE, &result)?
-                }
-                CLUSTER_RAFT_VOTE_ROUTE => {
-                    let vote: ClusterRaftVoteRequest = request.decode_body()?;
-                    let result =
-                        handle_daemon_cluster_raft_vote_request(&paths, vote, &authenticated)
-                            .map_err(daemon_error)?;
-                    ObjectRpcResponse::encode_body(CLUSTER_RAFT_VOTE_ROUTE, &result)?
-                }
-                other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
+            if request.route == CLUSTER_RAFT_APPEND_ROUTE
+                && let Some(stats) = crate::process_idle_stats()
+            {
+                stats.incr_raft_appends_recv();
+            }
+            let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
+            let response = sinomo_network::handle_cluster_raft_rpc_request(
+                &cluster_paths,
+                request,
+                &cluster_authenticated_peer(&authenticated),
+            )?;
+            ctx.respond(response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+fn cluster_authenticated_peer(
+    authenticated: &AuthenticatedDaemonCommand,
+) -> sinomo_network::ClusterAuthenticatedPeer {
+    sinomo_network::ClusterAuthenticatedPeer {
+        node_id: authenticated.signer_node_id.clone(),
+        public_key: authenticated.signer_public_key.clone(),
+    }
+}
+
+/// Daemon adapter for cluster membership object-RPC routes. The domain join decision
+/// lives in `sinomo-network`; the daemon handler still supplies host-local member refresh,
+/// voter forwarding, and quorum persistence.
+struct ClusterMembershipService {
+    paths: DaemonPaths,
+    authenticated: AuthenticatedDaemonCommand,
+}
+
+impl Service for ClusterMembershipService {
+    fn name(&self) -> &'static str {
+        "cluster-membership"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[
+            CLUSTER_JOIN_REGISTER_ROUTE,
+            CLUSTER_INVITE_PUBLISH_ROUTE,
+            CLUSTER_MEMBER_PUBLISH_ROUTE,
+        ]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
+        let authenticated = self.authenticated.clone();
+        Box::pin(async move {
+            let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
+            let response = sinomo_network::handle_cluster_membership_rpc_request_with_hosts(
+                &cluster_paths,
+                request,
+                &authenticated.signer_node_id,
+                &authenticated.signer_public_key,
+                OffsetDateTime::now_utc(),
+                &mut DaemonClusterJoinRegistrationHost::new(&paths),
+                &mut DaemonClusterMemberPublishHost,
+                &mut DaemonClusterInvitePublishHost,
+            )
+            .map_err(daemon_error)?;
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
@@ -400,11 +522,9 @@ impl Service for RolloutBinaryService {
     }
 }
 
-/// Daemon-foundational service: the DFS data plane. `protocol-frame` processes an inbound
-/// peer frame against this node's local DFS backend + cluster control plane; `smoke` runs
-/// the cluster replication self-test, which reaches peers via the daemon's transport. Both
-/// are inherently clustered, so they wrap the daemon's own data-plane handlers (which do
-/// their own cluster access) rather than living in the host-agnostic `DfsService`.
+/// Daemon-foundational service: DFS data-plane routes that need daemon RPC transport.
+/// The DFS crate owns protocol-frame and smoke semantics; this service supplies
+/// daemon paths, authentication context, and response framing.
 struct DaemonDfsDataPlaneService {
     paths: DaemonPaths,
 }
@@ -636,7 +756,15 @@ fn daemon_service_registry(
         .register(ClusterKvService {
             paths: paths.clone(),
         })
+        .register(ClusterHealthService)
+        .register(ClusterRelayService {
+            paths: paths.clone(),
+        })
         .register(ClusterRaftService {
+            paths: paths.clone(),
+            authenticated: authenticated.clone(),
+        })
+        .register(ClusterMembershipService {
             paths: paths.clone(),
             authenticated: authenticated.clone(),
         })
@@ -870,5 +998,35 @@ mod tests {
                 .contains("cluster kv snapshot response is"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn cluster_registry_hosts_cluster_routes() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-cluster-kv-registry-routes-{}",
+            std::process::id()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let authenticated = AuthenticatedDaemonCommand {
+            command: "test".to_string(),
+            signer: DaemonSignerAuthority::Local,
+            signer_node_id: "node_local".to_string(),
+            signer_public_key: "local".to_string(),
+        };
+
+        let registry = daemon_service_registry(&paths, &authenticated);
+
+        for route in CLUSTER_KV_RPC_ROUTES.iter().copied().chain([
+            CLUSTER_HEALTH_ROUTE,
+            CLUSTER_RELAY_ROUTE,
+            CLUSTER_JOIN_REGISTER_ROUTE,
+            CLUSTER_INVITE_PUBLISH_ROUTE,
+            CLUSTER_MEMBER_PUBLISH_ROUTE,
+        ]) {
+            assert!(registry.owns(route), "registry should own {route}");
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

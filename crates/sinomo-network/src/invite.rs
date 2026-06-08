@@ -1,15 +1,39 @@
 use crate::error::NetworkError;
 use crate::prelude::*;
-use crate::{iroh_endpoint_public_key, stable_iroh_endpoint_id};
+use crate::{
+    ClusterPaths, iroh_endpoint_public_key, read_cluster_invitation_from_kv, read_cluster_state,
+    stable_iroh_endpoint_id,
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use sinomo_node::NodeIdentity;
-use time::format_description::well_known::Rfc3339;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
+pub const CLUSTER_INVITE_CHALLENGE_PROTOCOL: &str = "sinomo.cluster-invite-challenge.v1";
+pub const CLUSTER_INVITE_CHALLENGE_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const SINOMO_JOIN_URI_PREFIX: &str = "sinomo-join://v1/";
 pub const PENDING_INVITE_CLUSTER_ID: &str = "01hxy6qa9k0t9vr4g9n8d3q5c0";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInviteChallengeRequest {
+    pub protocol: String,
+    pub invite_id: ClusterInviteId,
+    pub challenge: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterInviteChallengeProof {
+    pub protocol: String,
+    pub invite_id: ClusterInviteId,
+    pub cluster_id: ClusterId,
+    pub responder_node_id: String,
+    pub responder_public_key: String,
+    pub challenge: String,
+    pub timestamp: String,
+    pub signature: String,
+}
 
 pub fn cluster_join_command(uri: &str) -> String {
     format!("sinomo cluster join \"{uri}\"")
@@ -137,6 +161,165 @@ pub fn verify_cluster_join_invite_signature(
     UnparsedPublicKey::new(&ED25519, public_key)
         .verify(payload.as_bytes(), &signature)
         .map_err(|_| NetworkError::AuthDenied)
+}
+
+pub fn cluster_invite_challenge_signing_payload(
+    invite_id: &ClusterInviteId,
+    cluster_id: &ClusterId,
+    responder_node_id: &str,
+    responder_public_key: &str,
+    challenge: &str,
+    timestamp: &str,
+) -> String {
+    format!(
+        "{CLUSTER_INVITE_CHALLENGE_PROTOCOL}\n{invite_id}\n{cluster_id}\n{responder_node_id}\n{responder_public_key}\n{challenge}\n{timestamp}"
+    )
+}
+
+pub fn verify_cluster_invite_challenge_proof(
+    invite: &ClusterJoinInvite,
+    expected_challenge: &str,
+    proof: &ClusterInviteChallengeProof,
+) -> Result<(), NetworkError> {
+    if proof.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL
+        || proof.invite_id != invite.invite_id
+        || (proof.cluster_id != invite.cluster_id
+            && invite.cluster_id.as_str() != PENDING_INVITE_CLUSTER_ID
+            && invite.cluster_id.as_str() != "cluster_pending_join")
+        || proof.challenge != expected_challenge
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let signed_at =
+        OffsetDateTime::parse(&proof.timestamp, &Rfc3339).map_err(|_| NetworkError::AuthDenied)?;
+    let skew = (OffsetDateTime::now_utc() - signed_at)
+        .whole_seconds()
+        .abs();
+    if skew > CLUSTER_INVITE_CHALLENGE_MAX_CLOCK_SKEW_SECONDS {
+        return Err(NetworkError::AuthExpired);
+    }
+    let responder_is_issuer = proof.responder_public_key == invite.issuer_public_key;
+    let responder_is_channel = invite
+        .communication_channels
+        .iter()
+        .any(|channel| channel.node_public_key == proof.responder_public_key);
+    if !responder_is_issuer && !responder_is_channel {
+        return Err(NetworkError::AuthDenied);
+    }
+    let public_key = URL_SAFE_NO_PAD
+        .decode(proof.responder_public_key.as_bytes())
+        .map_err(|_| NetworkError::AuthDenied)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(proof.signature.as_bytes())
+        .map_err(|_| NetworkError::AuthDenied)?;
+    let signing_payload = cluster_invite_challenge_signing_payload(
+        &proof.invite_id,
+        &proof.cluster_id,
+        &proof.responder_node_id,
+        &proof.responder_public_key,
+        &proof.challenge,
+        &proof.timestamp,
+    );
+    UnparsedPublicKey::new(&ED25519, public_key)
+        .verify(signing_payload.as_bytes(), &signature)
+        .map_err(|_| NetworkError::AuthDenied)
+}
+
+pub fn create_cluster_invite_challenge_proof(
+    paths: &ClusterPaths,
+    identity: &NodeIdentity,
+    request: &ClusterInviteChallengeRequest,
+    now: OffsetDateTime,
+) -> Result<ClusterInviteChallengeProof, NetworkError> {
+    if request.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL || request.challenge.trim().is_empty()
+    {
+        return Err(NetworkError::AuthDenied);
+    }
+    let invite = read_cluster_invitation_from_kv(paths, &request.invite_id)?;
+    if invite.expires_at <= now {
+        return Err(NetworkError::AuthExpired);
+    }
+    let state = read_cluster_state(paths)?;
+    if invite.cluster_id != state.cluster_id {
+        return Err(NetworkError::AuthDenied);
+    }
+    let local_member = state
+        .members
+        .iter()
+        .find(|member| {
+            member.node_id == state.local_node_id
+                && member.node_public_key == identity.public_key
+                && member.state.is_authorized()
+        })
+        .ok_or(NetworkError::AuthDenied)?;
+    let is_issuer = invite.issuer_node_id == local_member.node_id
+        && invite.issuer_public_key == identity.public_key;
+    let is_channel = invite.communication_channels.iter().any(|channel| {
+        channel.endpoint.node_id == local_member.node_id
+            && channel.node_public_key == identity.public_key
+    });
+    if !is_issuer && !is_channel {
+        return Err(NetworkError::AuthDenied);
+    }
+    let timestamp = now
+        .format(&Rfc3339)
+        .map_err(|source| NetworkError::Serialization {
+            detail: format!("invalid challenge proof timestamp: {source}"),
+        })?;
+    let signing_payload = cluster_invite_challenge_signing_payload(
+        &request.invite_id,
+        &invite.cluster_id,
+        local_member.node_id.as_str(),
+        &identity.public_key,
+        &request.challenge,
+        &timestamp,
+    );
+    let signature = identity
+        .key_pair()
+        .map_err(|source| NetworkError::Serialization {
+            detail: source.to_string(),
+        })?
+        .sign(signing_payload.as_bytes());
+    Ok(ClusterInviteChallengeProof {
+        protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
+        invite_id: request.invite_id.clone(),
+        cluster_id: invite.cluster_id,
+        responder_node_id: local_member.node_id.to_string(),
+        responder_public_key: identity.public_key.clone(),
+        challenge: request.challenge.clone(),
+        timestamp,
+        signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
+    })
+}
+
+pub fn build_cluster_join_invite(
+    state: &ClusterBootstrapState,
+    issuer_identity: &NodeIdentity,
+    introducers: Vec<ClusterEndpointRecord>,
+    ttl_seconds: i64,
+    now: OffsetDateTime,
+) -> Result<ClusterJoinInvite, NetworkError> {
+    let invite_id = ClusterInviteId::generate();
+    let invitation_secret = random_url_secret(32)?;
+    let communication_channels = invite_communication_channels(state, &introducers);
+    let mut invite = ClusterJoinInvite {
+        invite_id: invite_id.clone(),
+        cluster_id: state.cluster_id.clone(),
+        cluster_name: Some(state.cluster_name.clone()),
+        cluster_public_key: issuer_identity.public_key.clone(),
+        invitation_secret,
+        communication_channels,
+        introducers,
+        token_id: format!("token_{}", invite_id.as_str().trim_start_matches("invite_")),
+        expires_at: now + time::Duration::seconds(ttl_seconds),
+        trust_domain: TrustDomain::new("trust.local").expect("static trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner, ClusterMemberRole::NonVoting],
+        issuer_node_id: state.local_node_id.clone(),
+        issuer_public_key: issuer_identity.public_key.clone(),
+        signature: String::new(),
+    };
+    invite.signature = sign_cluster_join_invite(&invite, issuer_identity)?;
+    Ok(invite)
 }
 
 pub fn random_url_secret(byte_len: usize) -> Result<String, NetworkError> {

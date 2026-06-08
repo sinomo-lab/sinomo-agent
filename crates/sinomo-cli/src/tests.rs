@@ -1,33 +1,30 @@
 use super::{
-    AgentCliCommand, AgentRunOptions, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
-    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
-    ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
-    ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
-    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DfsCliCommand, DfsCommonOptions,
-    DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions, DfsPinCliCommand, InstallLayout,
-    InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind, ModelBackedInteractionHandler, ModelOptionValueUpdate,
-    ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand,
-    ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions,
-    ProviderName, RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
-    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    AgentCliCommand, AgentRunOptions, CliClusterMemberMutationHost, CliCommand, CliError,
+    CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
+    ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
+    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
+    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions,
+    DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
+    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutOptions, RolloutProgressExpectation,
+    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
+    UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
     apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
     cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
     cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_publish_targets, cluster_invite_with_paths,
-    cluster_join_with_paths, cluster_peer_members, cluster_raft_known_leader_id,
+    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
+    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
     cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
     daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, daemon_remove_cluster_members, data_dir_storage_contract_findings,
-    decode_cluster_join_invite, elect_cluster_raft_leader, encode_cluster_join_invite,
-    ensure_rollout_layout, expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
-    format_rollout_progress_line, handle_daemon_cluster_join_request,
-    handle_daemon_cluster_kv_range_prefix, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_cluster_kv_txn_request, handle_daemon_cluster_kv_watch_drain_request,
-    handle_daemon_cluster_kv_watch_events_request, handle_daemon_cluster_kv_watch_prefix_request,
-    handle_daemon_cluster_raft_append_request, handle_daemon_cluster_raft_vote_request,
+    daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
+    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
+    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
+    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
     handle_daemon_connection, handle_daemon_rollout_build_request, install_should_update_binary,
     install_with_layout, invite_channels_for_join_registration, invite_communication_channels,
     invite_introducer_endpoint, invite_introducer_endpoint_from_state,
@@ -41,18 +38,18 @@ use super::{
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_uninstall_options,
     parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
-    read_cluster_state, refresh_daemon_node_status_in_kv,
-    require_cluster_runtime_quorum_with_paths_and_daemon, rollout_advance_with_data_dir,
-    rollout_cluster_targets, rollout_cluster_targets_from_state, rollout_endpoint_candidates,
-    rollout_progress_bar, rollout_status_matches_expectation, rollout_target_endpoint_for_main,
-    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
-    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response,
-    run_shadow_daemon_with_paths, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, tui_default_daemon_status,
-    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
-    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
+    read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
+    rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
+    rollout_endpoint_candidates, rollout_progress_bar, rollout_status_matches_expectation,
+    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
+    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
+    rollout_terminal_response, run_shadow_daemon_with_paths, run_tui_with_handler_io,
+    run_tui_with_handler_io_and_daemon, send_cluster_join_registration_over_iroh,
+    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, tui_default_daemon_status, uninstall_with_layout,
+    with_cli_force_local_mode, write_daemon_status, write_imported_cluster_kv_snapshot,
+    write_model_runtime_config_for_node, write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -99,7 +96,9 @@ use sinomo_runtime::module::{
     MODULE_SHADOW_DECISION_EVENT_KIND, ModuleReplayCaseOutcome, ModuleReplayReport,
     read_module_loader_runtime_state,
 };
-use sinomo_runtime::network::{ClusterEndpointId, ClusterId, ClusterInviteId, daemon_lan_endpoint};
+use sinomo_runtime::network::{
+    self, ClusterEndpointId, ClusterId, ClusterInviteId, daemon_lan_endpoint,
+};
 use sinomo_runtime::node::{NodeId, main_daemon_capabilities};
 use sinomo_runtime::rollout::{
     RolloutAction, RolloutController, create_source_repo_bundle, read_rollout_runtime_state,
@@ -119,6 +118,36 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
+
+struct CliLocalMemberPublishHost;
+
+impl network::ClusterLocalMemberPublishHost for CliLocalMemberPublishHost {
+    fn cluster_has_local_quorum(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> bool {
+        true
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<sinomo_runtime::kv::KvSnapshot, network::NetworkError> {
+        network::append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+    }
+
+    fn send_cluster_member_publish(
+        &mut self,
+        _endpoint: &ClusterEndpointRecord,
+        _request: &network::ClusterMemberPublishRequest,
+        _timeout: Duration,
+    ) -> Result<network::ClusterMemberPublishResponse, network::NetworkError> {
+        panic!("local quorum host should not forward member publish requests")
+    }
+}
 
 #[cfg(feature = "sandbox")]
 fn with_test_sandbox_host<T>(
@@ -305,6 +334,15 @@ fn authenticated_test_command(
         signer,
         signer_node_id: signer_node_id.into(),
         signer_public_key: signer_public_key.into(),
+    }
+}
+
+fn authenticated_cluster_peer(
+    authenticated: &super::AuthenticatedDaemonCommand,
+) -> sinomo_runtime::network::ClusterAuthenticatedPeer {
+    sinomo_runtime::network::ClusterAuthenticatedPeer {
+        node_id: authenticated.signer_node_id.clone(),
+        public_key: authenticated.signer_public_key.clone(),
     }
 }
 
@@ -5957,194 +5995,6 @@ fn cluster_sync_targets_skip_remote_local_only_endpoints() {
 }
 
 #[test]
-fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-invite-target-order-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
-    let cluster_id = ClusterId::from_legacy_named("cluster_invite_target_order").expect("cluster");
-    let local_node = NodeId::from_legacy_named("node_invite_local").expect("node");
-    let voter_node = NodeId::from_legacy_named("node_invite_voter").expect("node");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "invite target order",
-        local_node,
-        "local",
-        "local-public-key",
-        OffsetDateTime::now_utc(),
-    );
-    let mut voter = ClusterMemberRecord::local_voter(
-        cluster_id,
-        voter_node.clone(),
-        "remote voter",
-        "remote-voter-public-key",
-        OffsetDateTime::now_utc(),
-    );
-    voter.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
-    voter.allowed_capabilities = voter.capabilities.clone();
-    voter.endpoints = vec![
-        ClusterEndpointRecord {
-            endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_voter_iroh")
-                .expect("endpoint"),
-            node_id: voter_node.clone(),
-            transport: ClusterTransportKind::Iroh,
-            address: "iroh://remote_voter_key?direct=203.0.113.10:21353".to_string(),
-            source: ClusterEndpointSource::Rendezvous,
-            privacy: ClusterEndpointPrivacy::InternetDirect,
-            priority: 1,
-            last_observed_latency_ms: None,
-        },
-        daemon_lan_endpoint(&voter_node, "192.0.2.11:21353".to_string(), 20),
-    ];
-    state.members.push(voter);
-
-    let targets = cluster_invite_publish_targets(&paths, &state);
-
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
-    assert_eq!(targets[0].address, "192.0.2.11:21353");
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-invite-target-connectivity-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("paths");
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_invite_target_connectivity").expect("cluster");
-    let local_node = NodeId::from_legacy_named("node_invite_connectivity_local").expect("node");
-    let voter_node = NodeId::from_legacy_named("node_invite_connectivity_voter").expect("node");
-    let mut state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "invite target connectivity",
-        local_node,
-        "local",
-        "local-public-key",
-        now,
-    );
-    let lan = sinomo_runtime::network::daemon_lan_endpoint(
-        &voter_node,
-        "10.0.0.41:21353".to_string(),
-        20,
-    );
-    let public = ClusterEndpointRecord {
-        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_invite_connectivity_public")
-            .expect("endpoint"),
-        node_id: voter_node.clone(),
-        transport: ClusterTransportKind::LanTcp,
-        address: "203.0.113.41:21353".to_string(),
-        source: ClusterEndpointSource::Observed,
-        privacy: ClusterEndpointPrivacy::InternetDirect,
-        priority: 30,
-        last_observed_latency_ms: None,
-    };
-    let iroh = ClusterEndpointRecord {
-        endpoint_id: sinomo_runtime::network::stable_iroh_endpoint_id(
-            &voter_node,
-            "iroh_public_key_invite_connectivity",
-        ),
-        node_id: voter_node.clone(),
-        transport: ClusterTransportKind::Iroh,
-        address: "iroh://iroh_public_key_invite_connectivity?relay=https://relay.example./"
-            .to_string(),
-        source: ClusterEndpointSource::Rendezvous,
-        privacy: ClusterEndpointPrivacy::Relayed,
-        priority: 0,
-        last_observed_latency_ms: None,
-    };
-    let mut voter = ClusterMemberRecord::local_voter(
-        cluster_id,
-        voter_node.clone(),
-        "remote voter",
-        "remote-voter-public-key",
-        now,
-    );
-    voter.capabilities = main_daemon_capabilities(&ClusterMemberRole::Voter);
-    voter.allowed_capabilities = voter.capabilities.clone();
-    voter.endpoints = vec![iroh.clone(), public.clone(), lan.clone()];
-    state.members.push(voter);
-    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
-    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync kv");
-
-    let targets = cluster_invite_publish_targets(&paths, &state);
-    assert_eq!(
-        targets.first().map(|endpoint| &endpoint.endpoint_id),
-        Some(&lan.endpoint_id)
-    );
-
-    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
-        &paths,
-        &state.local_node_id,
-        vec![sinomo_runtime::network::cluster_connectivity_record(
-            &state,
-            &lan,
-            sinomo_runtime::network::ClusterConnectivityState::Unreachable,
-            None,
-            3,
-            None,
-            Some("failed".to_string()),
-            now,
-            60,
-        )],
-    )
-    .expect("connectivity records");
-    let targets = cluster_invite_publish_targets(&paths, &state);
-    assert_eq!(
-        targets.first().map(|endpoint| &endpoint.endpoint_id),
-        Some(&public.endpoint_id)
-    );
-
-    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
-        &paths,
-        &state.local_node_id,
-        vec![
-            sinomo_runtime::network::cluster_connectivity_record(
-                &state,
-                &lan,
-                sinomo_runtime::network::ClusterConnectivityState::Unreachable,
-                None,
-                3,
-                None,
-                Some("failed".to_string()),
-                now,
-                60,
-            ),
-            sinomo_runtime::network::cluster_connectivity_record(
-                &state,
-                &public,
-                sinomo_runtime::network::ClusterConnectivityState::Unreachable,
-                None,
-                3,
-                None,
-                Some("failed".to_string()),
-                now,
-                60,
-            ),
-        ],
-    )
-    .expect("connectivity records");
-    let targets = cluster_invite_publish_targets(&paths, &state);
-    assert_eq!(
-        targets.first().map(|endpoint| &endpoint.endpoint_id),
-        Some(&iroh.endpoint_id)
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
 fn default_invite_compaction_keeps_iroh_fallback() {
     let node_id = NodeId::from_legacy_named("node_invite_compact").expect("node");
     let mut endpoints = vec![
@@ -7652,7 +7502,8 @@ fn cluster_init_persists_local_cluster_state() {
         cluster_raft_known_leader_id(&paths, &state).expect("cleared leader"),
         None
     );
-    assert!(elect_cluster_raft_leader(&paths, &state).expect("single-voter election"));
+    sinomo_runtime::network::set_cluster_raft_leader(&paths, &state.local_node_id, 65)
+        .expect("set single-voter leader");
     assert_eq!(
         cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
@@ -7749,12 +7600,13 @@ fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
         OffsetDateTime::now_utc(),
     ));
     sync_cluster_state_to_kv(&paths, &state).expect("sync state");
-    super::daemon_write_local_cluster_state(&paths, &state).expect("write state");
+    network::write_cluster_state(&paths, &state).expect("write state");
 
-    let removal = daemon_remove_cluster_members(
+    let removal = network::remove_cluster_members_with_host(
         &paths,
+        read_cluster_state(&paths).expect("state before remove"),
         vec![learner_id.clone(), non_voter_id.clone()],
-        OffsetDateTime::now_utc(),
+        &mut CliClusterMemberMutationHost,
     )
     .expect("remove members");
 
@@ -7811,7 +7663,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         &paths,
         &local_state.local_node_id,
         sinomo_runtime::kv::KvCommand::Op(KvOp::Delete {
-            key: sinomo_runtime::kv::cluster_member_key(&shadow_id),
+            key: sinomo_runtime::network::cluster_member_key(&shadow_id),
         }),
     )
     .expect("delete shadow from kv");
@@ -7829,8 +7681,15 @@ fn local_voter_republishes_local_members_missing_from_kv() {
             .iter()
             .any(|member| member.node_id == shadow_id)
     );
-    sinomo_runtime::daemon::publish_local_members_to_quorum_if_needed(&paths, &merged_state)
-        .expect("republish local members");
+    network::publish_local_members_to_quorum_if_needed_with_host(
+        &paths,
+        &merged_state,
+        network::ClusterLocalMemberPublishOptions {
+            member_publish_timeout: Duration::from_secs(1),
+        },
+        &mut CliLocalMemberPublishHost,
+    )
+    .expect("republish local members");
 
     assert!(
         read_cluster_members_from_kv(&paths)
@@ -8031,7 +7890,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_KV_SNAPSHOT_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_SNAPSHOT_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8040,7 +7899,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_KV_RANGE_PREFIX_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_RANGE_PREFIX_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8049,7 +7908,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_KV_WATCH_PREFIX_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_WATCH_PREFIX_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8058,7 +7917,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_KV_TXN_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE),
             super::DaemonSignerAuthority::Member,
             "node_member",
             "pk_member"
@@ -8067,7 +7926,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
-            &super::daemon_rpc_command(sinomo_runtime::network::CLUSTER_KV_TXN_ROUTE),
+            &super::daemon_rpc_command(sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE),
             super::DaemonSignerAuthority::Voter,
             "node_voter",
             "pk_voter"
@@ -11716,14 +11575,16 @@ fn daemon_cluster_kv_is_read_only_without_cluster_state() {
     let result = handle_daemon_cluster_kv_txn_request(&daemon_paths, txn);
 
     assert!(matches!(result, Err(CliError::ClusterReadOnly { .. })));
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     assert_eq!(
-        handle_daemon_cluster_kv_snapshot(&daemon_paths)
+        read_cluster_kv_snapshot(&cluster_paths)
             .expect("snapshot")
             .entries,
         Vec::new()
     );
     assert_eq!(
-        handle_daemon_cluster_kv_range_prefix(&daemon_paths, "/config").expect("range"),
+        sinomo_runtime::kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), "/config")
+            .expect("range"),
         Vec::new()
     );
     std::fs::remove_dir_all(root).ok();
@@ -11757,7 +11618,7 @@ fn single_node_cluster_has_local_quorum() {
 }
 
 #[test]
-fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
+fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-cli-raft-auth-binding-{}",
         SystemTime::now()
@@ -11787,10 +11648,10 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
 
     let append_request = build_cluster_raft_append_request_from_next_index(&paths, &state, 1)
         .expect("append request");
-    let append_response = handle_daemon_cluster_raft_append_request(
-        &DaemonPaths::with_root(root.join("daemon")),
+    let append_response = network::handle_cluster_raft_append_request(
+        &paths,
         append_request,
-        &bad_auth,
+        &authenticated_cluster_peer(&bad_auth),
     )
     .expect("append response");
     assert!(!append_response.accepted);
@@ -11813,10 +11674,10 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
             last_log_term,
         },
     };
-    let vote_response = handle_daemon_cluster_raft_vote_request(
-        &DaemonPaths::with_root(root.join("daemon")),
+    let vote_response = network::handle_cluster_raft_vote_request(
+        &paths,
         vote_request,
-        &bad_auth,
+        &authenticated_cluster_peer(&bad_auth),
     )
     .expect("vote response");
     assert!(!vote_response.accepted);
@@ -11849,10 +11710,10 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
             leader_commit: 0,
         },
     };
-    let forged_append_response = handle_daemon_cluster_raft_append_request(
-        &DaemonPaths::with_root(root.join("daemon")),
+    let forged_append_response = network::handle_cluster_raft_append_request(
+        &paths,
         forged_append,
-        &forged_auth,
+        &authenticated_cluster_peer(&forged_auth),
     )
     .expect("forged append response");
     assert!(!forged_append_response.accepted);
@@ -11873,10 +11734,10 @@ fn daemon_raft_handlers_reject_mismatched_authenticated_signer() {
             last_log_term: 0,
         },
     };
-    let forged_vote_response = handle_daemon_cluster_raft_vote_request(
-        &DaemonPaths::with_root(root.join("daemon")),
+    let forged_vote_response = network::handle_cluster_raft_vote_request(
+        &paths,
         forged_vote,
-        &forged_auth,
+        &authenticated_cluster_peer(&forged_auth),
     )
     .expect("forged vote response");
     assert!(!forged_vote_response.accepted);
@@ -12084,7 +11945,15 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
     };
     write_daemon_status(&daemon_paths, &status).expect("write status");
 
-    refresh_daemon_node_status_in_kv(&daemon_paths).expect("refresh status");
+    let cluster = status.cluster.as_ref().expect("cluster status");
+    let record = cluster_node_status_from_daemon_status(
+        &status,
+        cluster,
+        read_cluster_rollout_status(&rollout_paths).expect("read rollout"),
+        time::OffsetDateTime::now_utc(),
+    );
+    sinomo_runtime::network::sync_cluster_node_status_to_kv(&cluster_paths, record)
+        .expect("refresh status");
     let statuses =
         read_cluster_node_statuses_from_kv(&cluster_paths).expect("node statuses from kv");
 
@@ -12179,10 +12048,10 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         .expect("host kv");
     let request = build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
         .expect("raft append");
-    let peer_response = handle_daemon_cluster_raft_append_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
+    let peer_response = network::handle_cluster_raft_append_request(
+        &peer_paths,
         request.clone(),
-        &host_auth,
+        &authenticated_cluster_peer(&host_auth),
     )
     .expect("peer append");
 
@@ -12211,10 +12080,10 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let current_request =
         build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
             .expect("current raft append");
-    let current_response = handle_daemon_cluster_raft_append_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
+    let current_response = network::handle_cluster_raft_append_request(
+        &peer_paths,
         current_request,
-        &host_auth,
+        &authenticated_cluster_peer(&host_auth),
     )
     .expect("peer current append");
     assert!(current_response.accepted);
@@ -12226,10 +12095,10 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
             .any(|entry| entry.key == "/config/latency" && entry.value == b"current")
     );
 
-    let delayed_stale_response = handle_daemon_cluster_raft_append_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
+    let delayed_stale_response = network::handle_cluster_raft_append_request(
+        &peer_paths,
         request,
-        &host_auth,
+        &authenticated_cluster_peer(&host_auth),
     )
     .expect("peer stale append");
     assert!(delayed_stale_response.accepted);
@@ -12241,9 +12110,9 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
             .any(|entry| entry.key == "/config/latency" && entry.value == b"current")
     );
 
-    let watch = handle_daemon_cluster_kv_watch_prefix_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
-        sinomo_runtime::network::ClusterKvWatchPrefixRequest {
+    let watch = network::create_cluster_kv_watch(
+        &peer_paths,
+        sinomo_runtime::kv::ClusterKvWatchPrefixRequest {
             prefix: "/config/watch/".to_string(),
             start_revision: KvRevision(1),
         },
@@ -12267,10 +12136,10 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
         build_cluster_raft_append_request_from_next_index(&host_paths, &host_state, 1)
             .expect("watch raft append");
     assert!(
-        handle_daemon_cluster_raft_append_request(
-            &DaemonPaths::with_root(peer_root.join("daemon")),
+        network::handle_cluster_raft_append_request(
+            &peer_paths,
             watch_append,
-            &host_auth,
+            &authenticated_cluster_peer(&host_auth),
         )
         .expect("peer watch append")
         .accepted
@@ -12278,9 +12147,9 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     let host_events = read_cluster_kv_snapshot(&host_paths)
         .expect("host watch snapshot")
         .events;
-    let watch_fanout = handle_daemon_cluster_kv_watch_events_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
-        sinomo_runtime::network::ClusterKvWatchEventsRequest {
+    let watch_fanout = network::handle_cluster_kv_watch_events(
+        &peer_paths,
+        sinomo_runtime::kv::ClusterKvWatchEventsRequest {
             state: host_state.clone(),
             leader_id: host_state.local_node_id.clone(),
             events: host_events,
@@ -12288,9 +12157,9 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     )
     .expect("watch event fanout");
     assert!(watch_fanout.accepted);
-    let drained = handle_daemon_cluster_kv_watch_drain_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
-        sinomo_runtime::network::ClusterKvWatchDrainRequest {
+    let drained = network::drain_cluster_kv_watch(
+        &peer_paths,
+        sinomo_runtime::kv::ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
         },
@@ -12302,9 +12171,9 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
             .iter()
             .any(|event| event.key == "/config/watch/a")
     );
-    let drained_again = handle_daemon_cluster_kv_watch_drain_request(
-        &DaemonPaths::with_root(peer_root.join("daemon")),
-        sinomo_runtime::network::ClusterKvWatchDrainRequest {
+    let drained_again = network::drain_cluster_kv_watch(
+        &peer_paths,
+        sinomo_runtime::kv::ClusterKvWatchDrainRequest {
             watch_id: watch.watch_id,
             wait_timeout_millis: 0,
         },

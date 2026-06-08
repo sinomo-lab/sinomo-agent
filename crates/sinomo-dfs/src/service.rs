@@ -16,18 +16,16 @@
 use crate::{
     DFS_CONTROL_PLANE_ROUTES, DFS_EXPOSE_CONFIG_ROUTE, DFS_INSPECTION_ROUTE,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_STATUS_ROUTE,
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeStore, DfsMetadataBackend,
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
-    DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsOperatorInspector, DfsOperatorStatus,
-    LocalSobjMetadataBackend, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
-    open_root_local_metadata_backend, sifs_file_system_id,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataBackend,
+    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataShardConfig,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsOperatorInspector,
+    DfsOperatorStatus, default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    ensure_default_cluster_aware_dfs_expose_config, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    ClusterPaths, ObjectRpcRequest, ObjectRpcResponse, read_cluster_kv_prefix_entries,
-    read_cluster_kv_prefix_values, read_cluster_state_without_kv,
+    ClusterPaths, ObjectRpcRequest, ObjectRpcResponse, read_cluster_state_without_kv,
 };
 
 use sinomo_service::{
@@ -106,21 +104,6 @@ fn service_error(error: impl std::fmt::Display) -> ServiceError {
     ServiceError::Service(error.to_string())
 }
 
-/// Sanitize a string for use as a single filesystem path segment. Must match the
-/// daemon's helper so on-disk metadata lands in the same place.
-fn path_safe_segment(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 /// Open the DFS metadata backend for `data_dir`: the sharded backend when cluster state
 /// is present on disk (reading shard configs from the local cluster-KV snapshot),
 /// otherwise the local-owned root backend.
@@ -130,8 +113,8 @@ fn open_metadata_backend(
     let cluster_paths = ClusterPaths::new(data_dir);
     if cluster_paths.state.exists() {
         let file_system_id = sifs_file_system_id();
-        let mut shards = read_cluster_kv_prefix_entries(
-            &cluster_paths,
+        let mut shards = sinomo_kv::read_cluster_kv_prefix_entries(
+            &cluster_paths.kv_paths(),
             &format!("{}/", metadata_shards_prefix(&file_system_id)),
         )?
         .into_iter()
@@ -250,196 +233,27 @@ fn dfs_inspection(
 fn dfs_expose_config(data_dir: &SinomoDataDir) -> Result<String, ServiceError> {
     data_dir.ensure_root_layout().map_err(service_error)?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let node_id = if cluster_paths.state.exists() {
-        read_cluster_state_without_kv(&cluster_paths)
-            .map(|state| state.local_node_id)
-            .unwrap_or_else(|_| fallback_dfs_node_id())
-    } else {
-        fallback_dfs_node_id()
-    };
-    let config_path = data_dir.dfs_expose_config_file();
-    let store = DfsExposeStore::new(&config_path);
-    store
-        .ensure_default(&data_dir.root(), node_id)
+    let config = ensure_default_cluster_aware_dfs_expose_config(data_dir, &cluster_paths)
         .map_err(service_error)?;
-    let config = store.load().map_err(service_error)?;
     serde_json::to_string_pretty(&config).map_err(service_error)
-}
-
-/// Reject a journal batch with `reason`, mirroring the daemon's rejection response.
-fn journal_batch_rejection(
-    command: &DfsMetadataJournalBatchCommand,
-    reason: String,
-) -> DfsMetadataJournalBatchResponse {
-    DfsMetadataJournalBatchResponse {
-        request_id: command.request_id.clone(),
-        shard_id: command.batch.shard_id.clone(),
-        next_after_sequence: command.batch.next_after_sequence,
-        applied_entries: 0,
-        result: DfsMetadataJournalBatchResult::Rejected { reason },
-    }
-}
-
-/// Validate that a journal batch may be applied here (correct shard primary as source,
-/// local node is a configured replica). `Ok(Some(_))` is an early rejection; `Ok(None)`
-/// means proceed. With no cluster state on disk, batches apply locally.
-fn validate_journal_batch_source(
-    data_dir: &SinomoDataDir,
-    command: &DfsMetadataJournalBatchCommand,
-) -> Result<Option<DfsMetadataJournalBatchResponse>, ServiceError> {
-    let cluster_paths = ClusterPaths::new(data_dir);
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
-    let state = read_cluster_state_without_kv(&cluster_paths)?;
-    let shard = read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
-        &cluster_paths,
-        &format!("{}/", metadata_shards_prefix(&sifs_file_system_id())),
-    )?
-    .into_iter()
-    .find(|shard| shard.shard_id == command.batch.shard_id.0.as_str());
-    let Some(shard) = shard else {
-        return Ok(Some(journal_batch_rejection(
-            command,
-            "metadata journal batch has no local shard config".to_string(),
-        )));
-    };
-    let Some(source_node_id) = command.source_node_id.as_ref() else {
-        return Ok(Some(journal_batch_rejection(
-            command,
-            "metadata journal batch is missing source node id".to_string(),
-        )));
-    };
-    if source_node_id != &shard.primary_node_id {
-        return Ok(Some(journal_batch_rejection(
-            command,
-            format!(
-                "metadata journal source {source_node_id} is not shard {} primary {}",
-                shard.shard_id, shard.primary_node_id
-            ),
-        )));
-    }
-    if shard.primary_node_id == state.local_node_id {
-        return Ok(Some(journal_batch_rejection(
-            command,
-            "metadata primary must not apply a replica journal batch".to_string(),
-        )));
-    }
-    if !shard.replica_node_ids.contains(&state.local_node_id) {
-        return Ok(Some(journal_batch_rejection(
-            command,
-            format!(
-                "local node {} is not configured as a replica for metadata shard {}",
-                state.local_node_id, shard.shard_id
-            ),
-        )));
-    }
-    Ok(None)
 }
 
 fn dfs_metadata_journal_batch(
     data_dir: &SinomoDataDir,
     command: DfsMetadataJournalBatchCommand,
 ) -> Result<DfsMetadataJournalBatchResponse, ServiceError> {
-    data_dir.ensure_root_layout().map_err(service_error)?;
-    if let Some(rejection) = validate_journal_batch_source(data_dir, &command)? {
-        return Ok(rejection);
-    }
-    let mut backend = LocalSobjMetadataBackend::new(
-        command.batch.shard_id.clone(),
-        data_dir
-            .dfs_dir()
-            .join("metadata")
-            .join(path_safe_segment(&command.batch.shard_id.0)),
-    )
-    .map_err(service_error)?;
-    let shard_id = command.batch.shard_id.clone();
-    let next_after_sequence = command.batch.next_after_sequence;
-    match backend.apply_journal_batch(&command.batch) {
-        Ok(applied_entries) => Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id,
-            shard_id,
-            next_after_sequence,
-            applied_entries,
-            result: DfsMetadataJournalBatchResult::Applied,
-        }),
-        Err(error) => Ok(DfsMetadataJournalBatchResponse {
-            request_id: command.request_id,
-            shard_id,
-            next_after_sequence,
-            applied_entries: 0,
-            result: DfsMetadataJournalBatchResult::Rejected {
-                reason: error.to_string(),
-            },
-        }),
-    }
+    let cluster_paths = ClusterPaths::new(data_dir);
+    crate::process_cluster_dfs_metadata_journal_batch(data_dir, &cluster_paths, command)
+        .map_err(service_error)
 }
 
 fn dfs_metadata_snapshot_install(
     data_dir: &SinomoDataDir,
     command: DfsMetadataSnapshotInstallCommand,
 ) -> Result<DfsMetadataSnapshotInstallResponse, ServiceError> {
-    data_dir.ensure_root_layout().map_err(service_error)?;
     let cluster_paths = ClusterPaths::new(data_dir);
-    let state = read_cluster_state_without_kv(&cluster_paths)?;
-    let shard = read_cluster_kv_prefix_values::<DfsMetadataShardConfig>(
-        &cluster_paths,
-        &format!("{}/", metadata_shards_prefix(&sifs_file_system_id())),
-    )?
-    .into_iter()
-    .find(|shard| shard.shard_id == command.shard_id.0.as_str());
-
-    let reject = |reason: String| DfsMetadataSnapshotInstallResponse {
-        request_id: command.request_id.clone(),
-        shard_id: command.shard_id.clone(),
-        next_after_sequence: command.next_after_sequence,
-        result: DfsMetadataSnapshotInstallResult::Rejected { reason },
-    };
-
-    let Some(shard) = shard else {
-        return Ok(reject(
-            "metadata snapshot install has no local shard config".to_string(),
-        ));
-    };
-    if shard.primary_node_id != command.source_node_id {
-        return Ok(reject(format!(
-            "metadata snapshot source {} is not shard {} primary {}",
-            command.source_node_id, shard.shard_id, shard.primary_node_id
-        )));
-    }
-    if shard.primary_node_id == state.local_node_id {
-        return Ok(reject(
-            "metadata primary must not install a replica snapshot".to_string(),
-        ));
-    }
-    if !shard.replica_node_ids.contains(&state.local_node_id) {
-        return Ok(reject(format!(
-            "local node {} is not configured as a replica for metadata shard {}",
-            state.local_node_id, shard.shard_id
-        )));
-    }
-
-    let mut backend = LocalSobjMetadataBackend::new(
-        command.shard_id.clone(),
-        data_dir
-            .dfs_dir()
-            .join("metadata")
-            .join(path_safe_segment(&command.shard_id.0)),
-    )
-    .map_err(service_error)?;
-    match backend.replace_with_replicated_snapshot(
-        command.shard_id.clone(),
-        command.next_after_sequence,
-        command.snapshot,
-    ) {
-        Ok(archived_existing) => Ok(DfsMetadataSnapshotInstallResponse {
-            request_id: command.request_id,
-            shard_id: command.shard_id,
-            next_after_sequence: command.next_after_sequence,
-            result: DfsMetadataSnapshotInstallResult::Installed { archived_existing },
-        }),
-        Err(error) => Ok(reject(error.to_string())),
-    }
+    crate::process_cluster_dfs_metadata_snapshot_install(data_dir, &cluster_paths, command)
+        .map_err(service_error)
 }
 
 #[cfg(test)]
@@ -448,7 +262,9 @@ mod tests {
     use crate::DFS_RPC_CATEGORY;
     use crate::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig,
-        DfsMetadataJournalBatch, DfsMetadataShardId,
+        DfsMetadataJournalBatch, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
+        DfsMetadataSnapshotInstallResponse, DfsMetadataSnapshotInstallResult,
+        LocalSobjMetadataBackend,
     };
     use sinomo_service::{ResponseSink, ServiceRegistry, ServiceSigner};
     use std::sync::{Arc, Mutex};
@@ -547,6 +363,47 @@ mod tests {
         let result: DfsMetadataJournalBatchResponse = response.decode_body().expect("decode");
         assert_eq!(result.request_id, "req-journal-1");
         assert_eq!(result.shard_id.0, "shard-local");
+    }
+
+    #[tokio::test]
+    async fn dfs_metadata_snapshot_install_rejects_without_local_shard_config() {
+        let registry = register_services(ServiceRegistry::builder()).build();
+        let data_dir = temp_data_dir();
+        let snapshot = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("snapshot-source"),
+            data_dir.root().join("snapshot-source"),
+        )
+        .expect("source metadata")
+        .export_table_snapshot();
+        let command = DfsMetadataSnapshotInstallCommand {
+            request_id: "req-snapshot-1".to_string(),
+            source_node_id: sinomo_node::NodeId::from_legacy_named("node_snapshot_source")
+                .expect("source node"),
+            shard_id: DfsMetadataShardId::new("shard-snapshot-local"),
+            next_after_sequence: 7,
+            snapshot,
+            reason: "service test".to_string(),
+        };
+
+        let (disposition, response) = dispatch_local(
+            &registry,
+            data_dir,
+            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+            &command,
+        )
+        .await;
+
+        assert_eq!(disposition, ServiceDisposition::Continue);
+        let result: DfsMetadataSnapshotInstallResponse =
+            response.decode_body().expect("decode snapshot response");
+        assert_eq!(result.request_id, "req-snapshot-1");
+        assert_eq!(result.shard_id.0, "shard-snapshot-local");
+        assert_eq!(result.next_after_sequence, 7);
+        assert!(matches!(
+            result.result,
+            DfsMetadataSnapshotInstallResult::Rejected { ref reason }
+                if reason.contains("no local shard config")
+        ));
     }
 
     #[tokio::test]

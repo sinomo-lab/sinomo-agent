@@ -848,6 +848,62 @@ impl MdnsDiscoveryAdvertisement {
     }
 }
 
+pub fn lan_discovery_advertisement_for_state(
+    state: &ClusterBootstrapState,
+    advertised_tick: u64,
+) -> Option<MdnsDiscoveryAdvertisement> {
+    let member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == state.local_node_id)?;
+    let endpoints = member
+        .endpoints
+        .iter()
+        .filter(|endpoint| {
+            endpoint.privacy == ClusterEndpointPrivacy::Lan
+                && matches!(
+                    endpoint.transport,
+                    ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic
+                )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    (!endpoints.is_empty()).then(|| {
+        MdnsDiscoveryAdvertisement::new(
+            state.cluster_id.clone(),
+            state.local_node_id.clone(),
+            endpoints,
+            advertised_tick,
+        )
+    })
+}
+
+pub fn apply_lan_discovery_advertisements(
+    state: &mut ClusterBootstrapState,
+    cache: &mut MdnsDiscoveryCache,
+    advertisements: impl IntoIterator<Item = MdnsDiscoveryAdvertisement>,
+) -> bool {
+    let mut changed = false;
+    for advertisement in advertisements {
+        if advertisement.cluster_id != state.cluster_id
+            || advertisement.node_id == state.local_node_id
+        {
+            continue;
+        }
+        for record in advertisement.records() {
+            cache.upsert(record.clone());
+            if let Some(member) = state
+                .members
+                .iter_mut()
+                .find(|member| member.node_id == record.endpoint.node_id)
+            {
+                changed |= crate::storage::upsert_member_endpoint(member, record.endpoint);
+            }
+        }
+    }
+    changed
+}
+
 fn clamped_lan_discovery_ttl_ticks(ttl_ticks: u64) -> u64 {
     ttl_ticks.min(MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS)
 }

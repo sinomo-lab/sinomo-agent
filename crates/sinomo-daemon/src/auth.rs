@@ -4,8 +4,15 @@ use ring::digest;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState};
+use sinomo_kv::{
+    CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_WATCH_DRAIN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE,
+    CLUSTER_KV_WATCH_PREFIX_ROUTE,
+};
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterInviteId, ClusterPaths};
+use sinomo_network::{
+    ClusterInviteChallengeProof, ClusterInviteChallengeRequest, ClusterInviteId, ClusterPaths,
+};
 use sinomo_node::{
     NodeIdentity, NodeIdentityPaths, load_or_create_main_node_identity,
     load_or_create_node_identity,
@@ -22,8 +29,6 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 pub const DAEMON_AUTH_PROTOCOL: &str = "sinomo.daemon-auth.v1";
-pub const CLUSTER_INVITE_AUTH_PROTOCOL: &str = "sinomo.cluster-invite.v1";
-pub const CLUSTER_INVITE_CHALLENGE_PROTOCOL: &str = "sinomo.cluster-invite-challenge.v1";
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
 /// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
@@ -57,25 +62,6 @@ pub struct AuthenticatedDaemonCommand {
     pub signer_node_id: String,
     /// Existing cluster membership state stores node public keys as URL-safe base64 strings.
     pub signer_public_key: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterInviteChallengeRequest {
-    pub protocol: String,
-    pub invite_id: ClusterInviteId,
-    pub challenge: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClusterInviteChallengeProof {
-    pub protocol: String,
-    pub invite_id: ClusterInviteId,
-    pub cluster_id: sinomo_network::ClusterId,
-    pub responder_node_id: String,
-    pub responder_public_key: String,
-    pub challenge: String,
-    pub timestamp: String,
-    pub signature: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -222,122 +208,20 @@ pub fn create_cluster_invite_challenge_proof(
     paths: &DaemonPaths,
     request: &ClusterInviteChallengeRequest,
 ) -> Result<ClusterInviteChallengeProof, DaemonError> {
-    if request.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL || request.challenge.trim().is_empty()
-    {
-        return Err(DaemonError::AuthDenied);
-    }
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
         path: paths.root.display().to_string(),
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let invite = read_active_cluster_invite(&cluster_paths, &request.invite_id)?;
-    if invite.expires_at <= OffsetDateTime::now_utc() {
-        return Err(DaemonError::AuthExpired);
-    }
-    let state = sinomo_network::read_cluster_state(&cluster_paths)?;
-    if invite.cluster_id != state.cluster_id {
-        return Err(DaemonError::AuthDenied);
-    }
     let identity_paths = NodeIdentityPaths::new(data_dir);
     let identity = load_existing_node_identity(&identity_paths.main)?;
-    let local_member = state
-        .members
-        .iter()
-        .find(|member| {
-            member.node_id == state.local_node_id
-                && member.node_public_key == identity.public_key
-                && member.state.is_authorized()
-        })
-        .ok_or(DaemonError::AuthDenied)?;
-    // The responder is authorized to answer this challenge if it is named as a communication
-    // channel, OR if it is the invite's issuer -- a voter whose key signs the whole invite and
-    // is its root of trust. The issuer case is what lets a voter answer a challenge relayed to
-    // it by a non-channel bridge introducer that was named in an invite minted before the
-    // bridge joined (so the bridge is absent from `communication_channels`).
-    let is_issuer = invite.issuer_node_id == local_member.node_id
-        && invite.issuer_public_key == identity.public_key;
-    let is_channel = invite.communication_channels.iter().any(|channel| {
-        channel.endpoint.node_id == local_member.node_id
-            && channel.node_public_key == identity.public_key
-    });
-    if !is_issuer && !is_channel {
-        return Err(DaemonError::AuthDenied);
-    }
-    let timestamp = OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "unknown".to_string());
-    let signing_payload = cluster_invite_challenge_signing_payload(
-        &request.invite_id,
-        &invite.cluster_id,
-        local_member.node_id.as_str(),
-        &identity.public_key,
-        &request.challenge,
-        &timestamp,
-    );
-    let signature = identity.key_pair()?.sign(signing_payload.as_bytes());
-    Ok(ClusterInviteChallengeProof {
-        protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
-        invite_id: request.invite_id.clone(),
-        cluster_id: invite.cluster_id,
-        responder_node_id: local_member.node_id.to_string(),
-        responder_public_key: identity.public_key,
-        challenge: request.challenge.clone(),
-        timestamp,
-        signature: URL_SAFE_NO_PAD.encode(signature.as_ref()),
-    })
-}
-
-pub fn verify_cluster_invite_challenge_proof(
-    invite: &ClusterJoinInvite,
-    expected_challenge: &str,
-    proof: &ClusterInviteChallengeProof,
-) -> Result<(), DaemonError> {
-    if proof.protocol != CLUSTER_INVITE_CHALLENGE_PROTOCOL
-        || proof.invite_id != invite.invite_id
-        || (proof.cluster_id != invite.cluster_id
-            && invite.cluster_id.as_str() != "01hxy6qa9k0t9vr4g9n8d3q5c0"
-            && invite.cluster_id.as_str() != "cluster_pending_join")
-        || proof.challenge != expected_challenge
-    {
-        return Err(DaemonError::AuthDenied);
-    }
-    let signed_at =
-        OffsetDateTime::parse(&proof.timestamp, &Rfc3339).map_err(|_| DaemonError::AuthDenied)?;
-    let skew = (OffsetDateTime::now_utc() - signed_at)
-        .whole_seconds()
-        .abs();
-    if skew > DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS {
-        return Err(DaemonError::AuthExpired);
-    }
-    // Accept a proof signed by a known communication-channel key, or by the invite's issuer
-    // key (which signs the invite itself, so an issuer-signed proof -- e.g. relayed back
-    // through a non-channel bridge introducer -- is at least as trustworthy as a channel key).
-    let responder_is_issuer = proof.responder_public_key == invite.issuer_public_key;
-    let responder_is_channel = invite
-        .communication_channels
-        .iter()
-        .any(|channel| channel.node_public_key == proof.responder_public_key);
-    if !responder_is_issuer && !responder_is_channel {
-        return Err(DaemonError::AuthDenied);
-    }
-    let public_key = URL_SAFE_NO_PAD
-        .decode(proof.responder_public_key.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(proof.signature.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)?;
-    let signing_payload = cluster_invite_challenge_signing_payload(
-        &proof.invite_id,
-        &proof.cluster_id,
-        &proof.responder_node_id,
-        &proof.responder_public_key,
-        &proof.challenge,
-        &proof.timestamp,
-    );
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(signing_payload.as_bytes(), &signature)
-        .map_err(|_| DaemonError::AuthDenied)
+    sinomo_network::create_cluster_invite_challenge_proof(
+        &cluster_paths,
+        &identity,
+        request,
+        OffsetDateTime::now_utc(),
+    )
+    .map_err(Into::into)
 }
 
 pub fn authorize_authenticated_daemon_command(
@@ -346,7 +230,7 @@ pub fn authorize_authenticated_daemon_command(
     let command = authenticated.command.as_str();
     let allowed = match command {
         command if command == daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE) => true,
-        command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_SNAPSHOT_ROUTE) => true,
+        command if command == daemon_rpc_command(CLUSTER_KV_SNAPSHOT_ROUTE) => true,
         command if command == daemon_rpc_command(sinomo_network::DAEMON_SHUTDOWN_ROUTE) => {
             authenticated.signer.can_run_local_command()
         }
@@ -443,7 +327,7 @@ pub fn authorize_authenticated_daemon_command(
                 DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
             )
         }
-        command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_RANGE_PREFIX_ROUTE) => {
+        command if command == daemon_rpc_command(CLUSTER_KV_RANGE_PREFIX_ROUTE) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -460,10 +344,10 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE) =>
+            if command == daemon_rpc_command(CLUSTER_KV_WATCH_PREFIX_ROUTE)
+                || command == daemon_rpc_command(CLUSTER_KV_WATCH_DRAIN_ROUTE)
+                || command == daemon_rpc_command(CLUSTER_KV_WATCH_CANCEL_ROUTE)
+                || command == daemon_rpc_command(CLUSTER_KV_WATCH_EVENTS_ROUTE) =>
         {
             matches!(
                 authenticated.signer,
@@ -480,7 +364,7 @@ pub fn authorize_authenticated_daemon_command(
         {
             authenticated.signer.can_run_admin_command()
         }
-        command if command == daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE) => {
+        command if command == daemon_rpc_command(CLUSTER_KV_TXN_ROUTE) => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -723,77 +607,7 @@ fn read_active_cluster_invite(
 }
 
 fn verify_cluster_join_invite_signature(invite: &ClusterJoinInvite) -> Result<(), DaemonError> {
-    if invite.signature.trim().is_empty()
-        || invite.issuer_public_key.trim().is_empty()
-        || invite.issuer_node_id.as_str().trim().is_empty()
-    {
-        return Err(DaemonError::AuthDenied);
-    }
-    let public_key = URL_SAFE_NO_PAD
-        .decode(invite.issuer_public_key.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)?;
-    let signature = URL_SAFE_NO_PAD
-        .decode(invite.signature.as_bytes())
-        .map_err(|_| DaemonError::AuthDenied)?;
-    let payload = cluster_invite_signing_payload(invite)?;
-    UnparsedPublicKey::new(&ED25519, public_key)
-        .verify(payload.as_bytes(), &signature)
-        .map_err(|_| DaemonError::AuthDenied)
-}
-
-fn cluster_invite_signing_payload(invite: &ClusterJoinInvite) -> Result<String, DaemonError> {
-    let expires_at = invite
-        .expires_at
-        .format(&Rfc3339)
-        .map_err(|source| DaemonError::Parse {
-            detail: format!("invalid invite expiry timestamp: {source}"),
-        })?;
-    let introducers =
-        serde_json::to_string(&invite.introducers).map_err(|source| DaemonError::Json {
-            path: "cluster invite introducers".to_string(),
-            detail: source.to_string(),
-        })?;
-    let channels = serde_json::to_string(&invite.communication_channels).map_err(|source| {
-        DaemonError::Json {
-            path: "cluster invite communication channels".to_string(),
-            detail: source.to_string(),
-        }
-    })?;
-    let allowed_roles = serde_json::to_string(&invite.allowed_member_roles).map_err(|source| {
-        DaemonError::Json {
-            path: "cluster invite allowed roles".to_string(),
-            detail: source.to_string(),
-        }
-    })?;
-    Ok(format!(
-        "{CLUSTER_INVITE_AUTH_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-        invite.invite_id,
-        invite.cluster_id,
-        invite.cluster_name.clone().unwrap_or_default(),
-        invite.cluster_public_key,
-        invite.invitation_secret,
-        channels,
-        introducers,
-        invite.token_id,
-        expires_at,
-        invite.trust_domain,
-        allowed_roles,
-        invite.issuer_node_id,
-        invite.issuer_public_key
-    ))
-}
-
-fn cluster_invite_challenge_signing_payload(
-    invite_id: &ClusterInviteId,
-    cluster_id: &sinomo_network::ClusterId,
-    responder_node_id: &str,
-    responder_public_key: &str,
-    challenge: &str,
-    timestamp: &str,
-) -> String {
-    format!(
-        "{CLUSTER_INVITE_CHALLENGE_PROTOCOL}\n{invite_id}\n{cluster_id}\n{responder_node_id}\n{responder_public_key}\n{challenge}\n{timestamp}"
-    )
+    sinomo_network::verify_cluster_join_invite_signature(invite).map_err(Into::into)
 }
 
 fn load_existing_node_identity(path: &Path) -> Result<NodeIdentity, DaemonError> {
@@ -985,7 +799,7 @@ mod tests {
 
     #[test]
     fn cluster_kv_txn_authorizes_cluster_members_for_voter_forwarding() {
-        let command = daemon_rpc_command(sinomo_network::CLUSTER_KV_TXN_ROUTE);
+        let command = daemon_rpc_command(CLUSTER_KV_TXN_ROUTE);
         let authenticated = authenticated_command(command, DaemonSignerAuthority::Member);
 
         authorize_authenticated_daemon_command(&authenticated)
@@ -1091,10 +905,10 @@ mod tests {
     #[test]
     fn cluster_kv_watch_routes_authorize_cluster_members() {
         for route in [
-            sinomo_network::CLUSTER_KV_WATCH_PREFIX_ROUTE,
-            sinomo_network::CLUSTER_KV_WATCH_DRAIN_ROUTE,
-            sinomo_network::CLUSTER_KV_WATCH_CANCEL_ROUTE,
-            sinomo_network::CLUSTER_KV_WATCH_EVENTS_ROUTE,
+            CLUSTER_KV_WATCH_PREFIX_ROUTE,
+            CLUSTER_KV_WATCH_DRAIN_ROUTE,
+            CLUSTER_KV_WATCH_CANCEL_ROUTE,
+            CLUSTER_KV_WATCH_EVENTS_ROUTE,
         ] {
             let command = daemon_rpc_command(route);
             for signer in [

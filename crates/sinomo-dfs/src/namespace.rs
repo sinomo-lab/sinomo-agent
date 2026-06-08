@@ -60,6 +60,26 @@ pub fn distributed_sifs_bootstrap_objects(owner_node_id: NodeId) -> Vec<DfsObjec
     .collect()
 }
 
+pub fn distributed_sifs_bootstrap_objects_for_nodes(
+    node_ids: impl IntoIterator<Item = NodeId>,
+    fallback_node_id: NodeId,
+) -> Vec<DfsObjectMetadata> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut objects = Vec::new();
+    let mut node_ids = node_ids.into_iter().collect::<Vec<_>>();
+    if node_ids.is_empty() {
+        node_ids.push(fallback_node_id);
+    }
+    for node_id in node_ids {
+        for object in distributed_sifs_bootstrap_objects(node_id) {
+            if seen.insert(object.path.clone()) {
+                objects.push(object);
+            }
+        }
+    }
+    objects
+}
+
 pub fn directory_object(path: &str, owner_node_id: NodeId) -> DfsObjectMetadata {
     directory_object_with_policy(path, owner_node_id, DfsObjectPolicy::ReplicatedEventual)
 }
@@ -181,6 +201,34 @@ mod tests {
             objects
                 .iter()
                 .any(|object| object.path == SIFS_SERVICES_PATH)
+        );
+    }
+
+    #[test]
+    fn distributed_sifs_bootstrap_for_nodes_deduplicates_shared_paths() {
+        let node_a = NodeId::from_legacy_named("node_bootstrap_a").expect("node a");
+        let node_b = NodeId::from_legacy_named("node_bootstrap_b").expect("node b");
+        let objects = distributed_sifs_bootstrap_objects_for_nodes(
+            vec![node_a.clone(), node_b.clone()],
+            node_a.clone(),
+        );
+
+        assert_eq!(
+            objects
+                .iter()
+                .filter(|object| object.path == SIFS_ROOT_PATH)
+                .count(),
+            1
+        );
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.path == sifs_node_files_path(&node_a))
+        );
+        assert!(
+            objects
+                .iter()
+                .any(|object| object.path == sifs_node_files_path(&node_b))
         );
     }
 }

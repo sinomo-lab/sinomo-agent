@@ -4,16 +4,24 @@
 //! Sinomo: monotonic revisions, compare-and-swap transactions, leases,
 //! watches, snapshots, and a deterministic Raft replication core for tests,
 //! local development, and daemon integration.
+//!
+//! This crate owns KV storage and Raft leader/election/log semantics. Cross-node
+//! transmission should be supplied by network-owned transport capabilities; KV
+//! code should not decide routes or interpret cluster connectivity topology. KV
+//! can persist connectivity records as ordinary key/value entries, but those
+//! records remain network-domain facts. KV RPC route/category/body payload specs
+//! and local read/watch route dispatch live here; the cluster network wraps them
+//! in its generic object-RPC envelope when transmitting between peers.
 
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sinomo_core::ClusterMemberRecord;
+use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -35,6 +43,56 @@ pub const MAX_DELETE_PREFIX_KEYS: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
 pub const MAX_KEYS_PER_LEASE: usize = MAX_KV_MUTATION_EVENTS_PER_COMMAND;
 pub const MAX_KV_VALUE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_KV_COMMAND_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+pub const CLUSTER_KV_RPC_CATEGORY: &str = "cluster.kv";
+pub const CLUSTER_KV_SNAPSHOT_ROUTE: &str = "/cluster/kv/snapshot";
+pub const CLUSTER_KV_TXN_ROUTE: &str = "/cluster/kv/txn";
+pub const CLUSTER_KV_RANGE_PREFIX_ROUTE: &str = "/cluster/kv/range-prefix";
+pub const CLUSTER_KV_WATCH_PREFIX_ROUTE: &str = "/cluster/kv/watch-prefix";
+pub const CLUSTER_KV_WATCH_DRAIN_ROUTE: &str = "/cluster/kv/watch-drain";
+pub const CLUSTER_KV_WATCH_CANCEL_ROUTE: &str = "/cluster/kv/watch-cancel";
+pub const CLUSTER_KV_WATCH_EVENTS_ROUTE: &str = "/cluster/kv/watch-events";
+pub const CLUSTER_KV_READ_WATCH_ROUTES: &[&str] = &[
+    CLUSTER_KV_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_DRAIN_ROUTE,
+    CLUSTER_KV_WATCH_CANCEL_ROUTE,
+    CLUSTER_KV_WATCH_EVENTS_ROUTE,
+];
+pub const CLUSTER_KV_LOCAL_READ_WATCH_ROUTES: &[&str] = &[
+    CLUSTER_KV_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_DRAIN_ROUTE,
+    CLUSTER_KV_WATCH_CANCEL_ROUTE,
+];
+pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
+    CLUSTER_KV_SNAPSHOT_ROUTE,
+    CLUSTER_KV_TXN_ROUTE,
+    CLUSTER_KV_RANGE_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_DRAIN_ROUTE,
+    CLUSTER_KV_WATCH_CANCEL_ROUTE,
+    CLUSTER_KV_WATCH_EVENTS_ROUTE,
+];
+pub const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
+pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
+pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
+pub const CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG: u64 =
+    (MAX_CLUSTER_KV_WATCH_EVENTS / 2) as u64;
+pub const CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS / 2;
+pub const CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_AGE: Duration = Duration::from_secs(60);
+pub const MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS: usize = MAX_CLUSTER_KV_WATCH_EVENTS * 2;
+pub const MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES: u64 = 1024 * 1024;
+pub const MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_CLUSTER_KV_ACTIVE_WATCHES: usize = 1024;
+pub const MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
+pub const MAX_CLUSTER_KV_WATCH_DRAIN_WAIT: Duration = Duration::from_secs(30);
+pub const CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES: usize = 4096;
+pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYLOAD_BYTES;
+pub const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
+pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MAX_REVISION_LAG: u64 = 64;
+pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MIN_INTERVAL: Duration = Duration::from_secs(300);
+pub const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 /// Committed log entries kept in memory after a local snapshot compaction. A
 /// follower that has fallen at most this many entries behind can be caught up
 /// with small incremental appends instead of a full snapshot install. The tail is
@@ -46,6 +104,8 @@ pub const MAX_KV_COMMAND_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// older than this tail, so triggering at or below it rewrites the WAL to the same
 /// tail every time (a busy-idle loop). See `compact_cluster_raft_node_if_needed`.
 pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
+pub const CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS: usize = 3;
+pub const CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP: u64 = 64;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -151,6 +211,28 @@ pub fn register_storage_paths(
     layout.register_sinomo_object(
         "sinomo-kv",
         StorageRing::R1,
+        "cluster/watch-events.sobj",
+        ObjectSchema::new("Vec<KvEvent>", STORAGE_CONTRACT_OBJECT_VERSION),
+    )?;
+    layout.register_object_log("sinomo-kv", StorageRing::R1, "cluster/watch-events.sobjlog")?;
+    layout.register_file(sinomo_storage::StorageFileContract::binary(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/watches.lock",
+    )?)?;
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/watches-next.sobj",
+        ObjectSchema::new(
+            "ClusterKvWatchAllocatorState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("next_watch_id", "u64"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-kv",
+        StorageRing::R1,
         "cluster/kv-raft/hard-state.sobj",
         ObjectSchema::new("RaftHardState", STORAGE_CONTRACT_OBJECT_VERSION),
     )?;
@@ -166,7 +248,1562 @@ pub fn register_storage_paths(
         StorageRing::R1,
         "cluster/kv-raft",
         "durable raft nodes use dynamic node-id subdirectories for locks, WALs, hard state, and snapshots",
+    )?;
+    layout.register_escape_path(
+        "sinomo-kv",
+        StorageRing::R1,
+        "cluster/watches",
+        "dynamic cluster KV watch registration object files keyed by watch id",
     )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvPaths {
+    pub root: PathBuf,
+    pub snapshot: PathBuf,
+    pub raft: PathBuf,
+    pub watches: PathBuf,
+    pub watches_lock: PathBuf,
+    pub watches_next_id: PathBuf,
+    pub watch_events: PathBuf,
+    pub watch_events_log: PathBuf,
+}
+
+impl ClusterKvPaths {
+    pub fn new(cluster_root: impl Into<PathBuf>) -> Self {
+        let root = cluster_root.into();
+        Self {
+            snapshot: root.join("kv-snapshot.sobj"),
+            raft: root.join("kv-raft"),
+            watches: root.join("watches"),
+            watches_lock: root.join("watches.lock"),
+            watches_next_id: root.join("watches-next.sobj"),
+            watch_events: root.join("watch-events.sobj"),
+            watch_events_log: root.join("watch-events.sobjlog"),
+            root,
+        }
+    }
+
+    pub fn local_cache(&self) -> KvLocalCache {
+        KvLocalCache::new(self.snapshot.clone(), self.raft.clone())
+            .with_max_materialized_events(MAX_CLUSTER_KV_MATERIALIZED_EVENTS)
+    }
+
+    pub fn raft_wal_paths(&self, node_id: &NodeId) -> KvWalPaths {
+        KvWalPaths::new(self.raft.join(node_id.as_str()))
+    }
+
+    pub fn watch_path(&self, watch_id: WatchId) -> PathBuf {
+        self.watches.join(format!("watch-{}.sobj", watch_id.0))
+    }
+}
+
+pub fn read_cluster_kv_entry(
+    paths: &ClusterKvPaths,
+    key: &str,
+) -> Result<Option<KvEntry>, KvError> {
+    let Some(snapshot) = paths.local_cache().cached_snapshot_arc_if_present()? else {
+        return Ok(None);
+    };
+    Ok(snapshot.get(key).cloned())
+}
+
+pub fn read_cluster_kv_prefix_entries(
+    paths: &ClusterKvPaths,
+    prefix: &str,
+) -> Result<Vec<KvEntry>, KvError> {
+    read_cluster_kv_prefix_entries_limited(paths, prefix, CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES)
+}
+
+pub fn read_cluster_kv_prefix_entries_limited(
+    paths: &ClusterKvPaths,
+    prefix: &str,
+    max_entries: usize,
+) -> Result<Vec<KvEntry>, KvError> {
+    read_cluster_kv_prefix_entries_limited_by_payload_bytes(
+        paths,
+        prefix,
+        max_entries,
+        CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+    )
+}
+
+pub fn read_cluster_kv_prefix_entries_limited_by_payload_bytes(
+    paths: &ClusterKvPaths,
+    prefix: &str,
+    max_entries: usize,
+    max_payload_bytes: usize,
+) -> Result<Vec<KvEntry>, KvError> {
+    let Some(snapshot) = paths.local_cache().cached_snapshot_arc_if_present()? else {
+        return Ok(Vec::new());
+    };
+    snapshot.range_prefix_limited_by_payload_bytes(prefix, max_entries, max_payload_bytes)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchPrefixRequest {
+    pub prefix: String,
+    pub start_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchRegistration {
+    pub watch_id: WatchId,
+    pub prefix: String,
+    pub next_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchAllocatorState {
+    pub next_watch_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_watch_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pruned_compacted_revision: Option<KvRevision>,
+}
+
+impl ClusterKvWatchAllocatorState {
+    pub fn legacy(next_watch_id: u64) -> Self {
+        Self {
+            next_watch_id: next_watch_id.max(1),
+            active_watch_count: None,
+            pruned_compacted_revision: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchDrainRequest {
+    pub watch_id: WatchId,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub wait_timeout_millis: u64,
+}
+
+impl ClusterKvWatchDrainRequest {
+    pub fn wait_timeout(&self) -> Duration {
+        let max_millis = MAX_CLUSTER_KV_WATCH_DRAIN_WAIT.as_millis() as u64;
+        Duration::from_millis(self.wait_timeout_millis.min(max_millis))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchDrainResponse {
+    pub watch_id: WatchId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<KvEvent>,
+    pub next_revision: KvRevision,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchCancelRequest {
+    pub watch_id: WatchId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchCancelResponse {
+    pub watch_id: WatchId,
+    pub cancelled: bool,
+}
+
+pub fn collect_cluster_kv_watch_drain_events(
+    persisted_events: &[KvEvent],
+    snapshot: &KvSnapshot,
+    registration: &ClusterKvWatchRegistration,
+    max_payload_bytes: usize,
+) -> Vec<KvEvent> {
+    let mut events = persisted_events
+        .iter()
+        .chain(snapshot.events.iter())
+        .filter(|event| {
+            event.revision >= registration.next_revision
+                && event.key.starts_with(&registration.prefix)
+        })
+        .collect::<Vec<_>>();
+    events.sort_by(|left, right| {
+        (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
+    });
+    events.dedup_by(|left, right| {
+        left.revision == right.revision && left.key == right.key && left.kind == right.kind
+    });
+    limit_cluster_kv_watch_drain_events(events, max_payload_bytes)
+}
+
+fn limit_cluster_kv_watch_drain_events(
+    events: Vec<&KvEvent>,
+    max_payload_bytes: usize,
+) -> Vec<KvEvent> {
+    let mut limited = Vec::new();
+    let mut payload_bytes = 0_usize;
+    let mut events = events.into_iter().peekable();
+    while let Some(event) = events.next() {
+        let event_bytes = cluster_kv_watch_event_payload_bytes(event);
+        let next_payload_bytes = payload_bytes.saturating_add(event_bytes);
+        if !limited.is_empty() && next_payload_bytes > max_payload_bytes {
+            let current_revision = limited
+                .last()
+                .map(|last: &KvEvent| last.revision)
+                .unwrap_or(KvRevision::ZERO);
+            if event.revision != current_revision {
+                break;
+            }
+        }
+        payload_bytes = next_payload_bytes;
+        limited.push(event.clone());
+        if payload_bytes >= max_payload_bytes {
+            let current_revision = event.revision;
+            if !events
+                .peek()
+                .is_some_and(|candidate| candidate.revision == current_revision)
+            {
+                break;
+            }
+        }
+    }
+    limited
+}
+
+pub fn cluster_kv_watch_registration_cursor_should_persist(
+    drained_events: usize,
+    next_revision: KvRevision,
+    durable_next_revision: KvRevision,
+    registration_file_unchanged: bool,
+    registration_file_age: Option<Duration>,
+) -> bool {
+    if drained_events >= CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_EVENTS {
+        return true;
+    }
+    let revision_lag = next_revision.0.saturating_sub(durable_next_revision.0);
+    if revision_lag >= CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG {
+        return true;
+    }
+    if !registration_file_unchanged {
+        return true;
+    }
+    match registration_file_age {
+        Some(age) => age >= CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_AGE,
+        None => true,
+    }
+}
+
+pub fn cluster_kv_watch_events_payload_bytes(events: &[KvEvent]) -> usize {
+    events.iter().fold(0_usize, |total, event| {
+        total.saturating_add(cluster_kv_watch_event_payload_bytes(event))
+    })
+}
+
+pub fn cluster_kv_events_can_defer_materialized_snapshot(
+    events: &[KvEvent],
+    mut key_can_defer: impl FnMut(&str) -> bool,
+) -> bool {
+    !events.is_empty() && events.iter().all(|event| key_can_defer(&event.key))
+}
+
+pub fn cluster_kv_snapshot_delta_only_deferable(
+    existing: &KvSnapshot,
+    snapshot: &KvSnapshot,
+    mut key_can_defer: impl FnMut(&str) -> bool,
+) -> bool {
+    if existing.leases.len() != snapshot.leases.len() {
+        return false;
+    }
+    let leases_match = existing
+        .leases
+        .iter()
+        .map(|lease| (&lease.lease_id, lease.ttl_ticks, lease.remaining_ticks))
+        .eq(snapshot
+            .leases
+            .iter()
+            .map(|lease| (&lease.lease_id, lease.ttl_ticks, lease.remaining_ticks)));
+    if !leases_match {
+        return false;
+    }
+
+    let mut changed = false;
+    let mut existing_entries = existing.entries.iter().peekable();
+    let mut incoming_entries = snapshot.entries.iter().peekable();
+    loop {
+        match (existing_entries.peek(), incoming_entries.peek()) {
+            (Some(existing_entry), Some(incoming_entry)) => {
+                match existing_entry.key.cmp(&incoming_entry.key) {
+                    std::cmp::Ordering::Less => {
+                        if !key_can_defer(&existing_entry.key) {
+                            return false;
+                        }
+                        changed = true;
+                        existing_entries.next();
+                    }
+                    std::cmp::Ordering::Greater => {
+                        if !key_can_defer(&incoming_entry.key) {
+                            return false;
+                        }
+                        changed = true;
+                        incoming_entries.next();
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if existing_entry.value != incoming_entry.value
+                            || existing_entry.lease_id != incoming_entry.lease_id
+                        {
+                            if !key_can_defer(&incoming_entry.key) {
+                                return false;
+                            }
+                            changed = true;
+                        }
+                        existing_entries.next();
+                        incoming_entries.next();
+                    }
+                }
+            }
+            (Some(existing_entry), None) => {
+                if !key_can_defer(&existing_entry.key) {
+                    return false;
+                }
+                changed = true;
+                existing_entries.next();
+            }
+            (None, Some(incoming_entry)) => {
+                if !key_can_defer(&incoming_entry.key) {
+                    return false;
+                }
+                changed = true;
+                incoming_entries.next();
+            }
+            (None, None) => return changed,
+        }
+    }
+}
+
+pub fn cluster_kv_materialized_snapshot_is_fresh_enough_against(
+    existing_revision: KvRevision,
+    snapshot_revision: KvRevision,
+    materialized_snapshot_age: Option<Duration>,
+) -> bool {
+    if existing_revision > snapshot_revision {
+        return false;
+    }
+    let revision_lag = snapshot_revision.0.saturating_sub(existing_revision.0);
+    if revision_lag >= CLUSTER_KV_DEFERRED_MATERIALIZED_MAX_REVISION_LAG {
+        return false;
+    }
+    matches!(
+        materialized_snapshot_age,
+        Some(age) if age < CLUSTER_KV_DEFERRED_MATERIALIZED_MIN_INTERVAL
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterKvWatchEventFanoutBatchLimit {
+    EventCount {
+        observed_events: usize,
+        max_events: usize,
+    },
+    PayloadBytes {
+        observed_bytes: usize,
+        max_bytes: usize,
+    },
+}
+
+impl ClusterKvWatchEventFanoutBatchLimit {
+    pub fn detail(&self) -> String {
+        match self {
+            Self::EventCount {
+                observed_events,
+                max_events,
+            } => {
+                format!(
+                    "watch event fan-out batch has {observed_events} events; max is {max_events}"
+                )
+            }
+            Self::PayloadBytes {
+                observed_bytes,
+                max_bytes,
+            } => {
+                format!(
+                    "watch event fan-out batch is {observed_bytes} payload bytes; max is {max_bytes}"
+                )
+            }
+        }
+    }
+}
+
+pub fn validate_cluster_kv_watch_event_fanout_batch(
+    events: &[KvEvent],
+) -> Result<(), ClusterKvWatchEventFanoutBatchLimit> {
+    validate_cluster_kv_watch_event_fanout_batch_with_limits(
+        events,
+        CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS,
+        CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES,
+    )
+}
+
+pub fn validate_cluster_kv_watch_event_fanout_batch_with_limits(
+    events: &[KvEvent],
+    max_events: usize,
+    max_payload_bytes: usize,
+) -> Result<(), ClusterKvWatchEventFanoutBatchLimit> {
+    if events.len() > max_events {
+        return Err(ClusterKvWatchEventFanoutBatchLimit::EventCount {
+            observed_events: events.len(),
+            max_events,
+        });
+    }
+    let payload_bytes = cluster_kv_watch_events_payload_bytes(events);
+    if payload_bytes > max_payload_bytes {
+        return Err(ClusterKvWatchEventFanoutBatchLimit::PayloadBytes {
+            observed_bytes: payload_bytes,
+            max_bytes: max_payload_bytes,
+        });
+    }
+    Ok(())
+}
+
+pub fn cluster_kv_watch_event_fanout_batches(events: &[KvEvent]) -> Vec<&[KvEvent]> {
+    cluster_kv_watch_event_fanout_batches_with_limits(
+        events,
+        CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS,
+        CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_PAYLOAD_BYTES,
+    )
+}
+
+pub fn cluster_kv_watch_event_fanout_batches_with_limits(
+    events: &[KvEvent],
+    max_events: usize,
+    max_payload_bytes: usize,
+) -> Vec<&[KvEvent]> {
+    let mut batches = Vec::new();
+    let mut start = 0_usize;
+    while start < events.len() {
+        let mut end = start;
+        let mut payload_bytes = 0_usize;
+        while end < events.len() {
+            if end - start >= max_events {
+                break;
+            }
+            let event_bytes = cluster_kv_watch_event_payload_bytes(&events[end]);
+            let next_payload_bytes = payload_bytes.saturating_add(event_bytes);
+            if end > start && next_payload_bytes > max_payload_bytes {
+                break;
+            }
+            payload_bytes = next_payload_bytes;
+            end += 1;
+        }
+        if end == start {
+            end += 1;
+        }
+        batches.push(&events[start..end]);
+        start = end;
+    }
+    batches
+}
+
+pub fn compact_cluster_kv_watch_events(mut events: Vec<KvEvent>) -> Vec<KvEvent> {
+    events.sort_by(|left, right| {
+        (left.revision, left.key.as_str()).cmp(&(right.revision, right.key.as_str()))
+    });
+    events.dedup_by(|left, right| {
+        left.revision == right.revision && left.key == right.key && left.kind == right.kind
+    });
+    if events.len() > MAX_CLUSTER_KV_WATCH_EVENTS {
+        let mut split_at = events.len() - MAX_CLUSTER_KV_WATCH_EVENTS;
+        let retained_revision = events[split_at].revision;
+        while split_at > 0 && events[split_at - 1].revision == retained_revision {
+            split_at -= 1;
+        }
+        events.split_off(split_at)
+    } else {
+        events
+    }
+}
+
+pub fn compact_cluster_kv_watch_events_incremental(
+    mut retained: Vec<KvEvent>,
+    incoming: &[KvEvent],
+) -> Vec<KvEvent> {
+    for event in incoming {
+        if cluster_kv_events_contain(&retained, event) {
+            continue;
+        }
+        retained.push(event.clone());
+        if retained.len() > MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS {
+            retained = compact_cluster_kv_watch_events(retained);
+        }
+    }
+    compact_cluster_kv_watch_events(retained)
+}
+
+pub fn cluster_kv_watch_event_append_should_checkpoint(
+    incoming_events: usize,
+    appended_events: usize,
+    current_log_records: usize,
+    current_log_bytes: u64,
+    appended_log_bytes: u64,
+) -> bool {
+    incoming_events > MAX_CLUSTER_KV_WATCH_EVENTS
+        || current_log_records.saturating_add(appended_events)
+            >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
+        || current_log_bytes.saturating_add(appended_log_bytes)
+            >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES
+}
+
+pub fn cluster_kv_events_contain(events: &[KvEvent], event: &KvEvent) -> bool {
+    events.iter().any(|candidate| {
+        candidate.revision == event.revision
+            && candidate.key == event.key
+            && candidate.kind == event.kind
+    })
+}
+
+pub fn cluster_kv_events_contain_all(existing: &[KvEvent], incoming: &[KvEvent]) -> bool {
+    incoming
+        .iter()
+        .all(|event| cluster_kv_events_contain(existing, event))
+}
+
+pub fn cluster_kv_snapshot_compare(snapshot: &KvSnapshot, compare: &KvCompare) -> bool {
+    match compare {
+        KvCompare::Exists { key } => snapshot.get(key).is_some(),
+        KvCompare::Missing { key } => snapshot.get(key).is_none(),
+        KvCompare::ValueEquals { key, value } => snapshot
+            .get(key)
+            .is_some_and(|entry| entry.value.as_slice() == value.as_slice()),
+        KvCompare::VersionEquals { key, version } => snapshot
+            .get(key)
+            .is_some_and(|entry| entry.version == *version),
+        KvCompare::CreateRevisionEquals { key, revision } => snapshot
+            .get(key)
+            .is_some_and(|entry| entry.create_revision == *revision),
+        KvCompare::ModifyRevisionEquals { key, revision } => snapshot
+            .get(key)
+            .is_some_and(|entry| entry.modify_revision == *revision),
+        KvCompare::LeaseEquals { key, lease_id } => snapshot
+            .get(key)
+            .is_some_and(|entry| entry.lease_id == *lease_id),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncodedClusterKvWatchEventLogBatch {
+    pub records: Vec<Vec<u8>>,
+    pub bytes: u64,
+}
+
+pub fn open_cluster_kv_watch_event_log_for_append(paths: &ClusterKvPaths) -> Result<File, KvError> {
+    let parent = paths
+        .watch_events_log
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| KvError::Io {
+        path: parent.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    match OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .append(true)
+        .open(&paths.watch_events_log)
+    {
+        Ok(file) => {
+            sync_directory(parent)?;
+            Ok(file)
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&paths.watch_events_log)
+            .map_err(|source| KvError::Io {
+                path: paths.watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            }),
+        Err(source) => Err(KvError::Io {
+            path: paths.watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+pub fn lock_cluster_kv_watch_event_log_for_append(
+    paths: &ClusterKvPaths,
+    file: &File,
+) -> Result<(), KvError> {
+    file.lock_exclusive().map_err(|source| KvError::Io {
+        path: paths.watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn encode_cluster_kv_watch_event_log_batch(
+    events: &[KvEvent],
+) -> Result<EncodedClusterKvWatchEventLogBatch, KvError> {
+    let mut records = Vec::with_capacity(events.len());
+    let mut bytes = 0_u64;
+    for event in events {
+        let record = sinomo_object_serde::to_bytes(event, KV_OBJECT_VERSION_ID, LengthMode::U32)
+            .map_err(|source| KvError::Serialization {
+                detail: source.to_string(),
+            })?;
+        let len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
+            detail: "cluster kv watch-event log record exceeds u32 length".to_string(),
+        })?;
+        bytes = bytes.saturating_add(4).saturating_add(u64::from(len));
+        records.push(record);
+    }
+    Ok(EncodedClusterKvWatchEventLogBatch { records, bytes })
+}
+
+pub fn append_cluster_kv_watch_event_log_batch_to_file(
+    paths: &ClusterKvPaths,
+    file: &mut File,
+    batch: &EncodedClusterKvWatchEventLogBatch,
+) -> Result<u64, KvError> {
+    if batch.records.is_empty() {
+        return Ok(0);
+    }
+    for record in &batch.records {
+        let len = u32::try_from(record.len()).map_err(|_| KvError::Serialization {
+            detail: format!(
+                "cluster kv watch-event log record for {} exceeds u32 length",
+                paths.watch_events_log.display()
+            ),
+        })?;
+        file.write_all(&len.to_be_bytes())
+            .and_then(|()| file.write_all(record))
+            .map_err(|source| KvError::Io {
+                path: paths.watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            })?;
+    }
+    file.sync_data().map_err(|source| KvError::Io {
+        path: paths.watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(batch.bytes)
+}
+
+pub fn truncate_cluster_kv_watch_event_log_file(
+    paths: &ClusterKvPaths,
+    file: &mut File,
+) -> Result<(), KvError> {
+    file.set_len(0).map_err(|source| KvError::Io {
+        path: paths.watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| KvError::Io {
+            path: paths.watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.sync_data().map_err(|source| KvError::Io {
+        path: paths.watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+pub fn decode_cluster_kv_watch_event_log_record(record: &[u8]) -> Result<KvEvent, KvError> {
+    sinomo_object_serde::from_bytes(record).map_err(|source| KvError::Serialization {
+        detail: source.to_string(),
+    })
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterKvWatchEventsRead {
+    pub events: Vec<KvEvent>,
+    pub log_records: usize,
+    pub append_safe: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterKvWatchEventLogRead {
+    pub events: Vec<KvEvent>,
+    pub records: usize,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterKvWatchEventAppendCacheView {
+    pub events: Vec<KvEvent>,
+    pub log_records: usize,
+    pub log_bytes: u64,
+    pub append_safe: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterKvWatchEventAppendReport {
+    pub appended: Vec<KvEvent>,
+    pub retained: Vec<KvEvent>,
+    pub log_records: usize,
+    pub append_safe: bool,
+}
+
+pub fn read_cluster_kv_watch_events(
+    paths: &ClusterKvPaths,
+) -> Result<ClusterKvWatchEventsRead, KvError> {
+    read_cluster_kv_watch_events_with_observer(paths, |_| {})
+}
+
+pub fn read_cluster_kv_watch_events_with_observer<F>(
+    paths: &ClusterKvPaths,
+    on_log_read: F,
+) -> Result<ClusterKvWatchEventsRead, KvError>
+where
+    F: FnMut(u64),
+{
+    let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
+    let log = read_cluster_kv_watch_event_log_with_observer(paths, on_log_read)?;
+    let events =
+        compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
+    Ok(ClusterKvWatchEventsRead {
+        events,
+        log_records: log.records,
+        append_safe: !log.truncated,
+    })
+}
+
+pub fn read_cluster_kv_watch_event_checkpoint(
+    paths: &ClusterKvPaths,
+) -> Result<Vec<KvEvent>, KvError> {
+    read_optional_object(&paths.watch_events).map(|events| events.unwrap_or_default())
+}
+
+pub fn write_cluster_kv_watch_event_checkpoint(
+    paths: &ClusterKvPaths,
+    events: &[KvEvent],
+) -> Result<(), KvError> {
+    let parent = paths
+        .watch_events
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| KvError::Io {
+        path: parent.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    write_object_file(&paths.watch_events, &events)
+}
+
+pub fn append_cluster_kv_watch_events_to_storage(
+    paths: &ClusterKvPaths,
+    incoming: &[KvEvent],
+    cache: Option<&ClusterKvWatchEventAppendCacheView>,
+) -> Result<ClusterKvWatchEventAppendReport, KvError> {
+    append_cluster_kv_watch_events_to_storage_with_observers(paths, incoming, cache, |_| {}, |_| {})
+}
+
+pub fn append_cluster_kv_watch_events_to_storage_with_observers<R, W>(
+    paths: &ClusterKvPaths,
+    incoming: &[KvEvent],
+    cache: Option<&ClusterKvWatchEventAppendCacheView>,
+    mut on_log_read: R,
+    mut on_log_write: W,
+) -> Result<ClusterKvWatchEventAppendReport, KvError>
+where
+    R: FnMut(u64),
+    W: FnMut(u64),
+{
+    if incoming.is_empty() {
+        return Ok(ClusterKvWatchEventAppendReport::default());
+    }
+
+    let mut log_file = open_cluster_kv_watch_event_log_for_append(paths)?;
+    lock_cluster_kv_watch_event_log_for_append(paths, &log_file)?;
+
+    let (existing, log_records, log_bytes) =
+        if let Some(cache) = cache.filter(|cache| cache.append_safe) {
+            (cache.events.clone(), cache.log_records, cache.log_bytes)
+        } else {
+            let checkpoint = read_cluster_kv_watch_event_checkpoint(paths)?;
+            let log = read_cluster_kv_watch_event_log_from_file_with_observer(
+                paths,
+                &mut log_file,
+                &mut on_log_read,
+            )?;
+            let existing =
+                compact_cluster_kv_watch_events(checkpoint.into_iter().chain(log.events).collect());
+            if log.truncated {
+                write_cluster_kv_watch_event_checkpoint(paths, &existing)?;
+                truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+                (existing, 0, 0)
+            } else {
+                let log_bytes = log_file
+                    .metadata()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                (existing, log.records, log_bytes)
+            }
+        };
+
+    let retained = compact_cluster_kv_watch_events_incremental(existing.clone(), incoming);
+    let appended = retained
+        .iter()
+        .filter(|event| !cluster_kv_events_contain(&existing, event))
+        .cloned()
+        .collect::<Vec<_>>();
+    if appended.is_empty() {
+        return Ok(ClusterKvWatchEventAppendReport {
+            appended,
+            retained,
+            log_records,
+            append_safe: true,
+        });
+    }
+
+    let encoded_appended = encode_cluster_kv_watch_event_log_batch(&appended)?;
+    let mut current_log_records = log_records;
+    let should_checkpoint_without_append = cluster_kv_watch_event_append_should_checkpoint(
+        incoming.len(),
+        appended.len(),
+        current_log_records,
+        log_bytes,
+        encoded_appended.bytes,
+    );
+    if should_checkpoint_without_append {
+        write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
+        truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+        current_log_records = 0;
+    } else {
+        let written = append_cluster_kv_watch_event_log_batch_to_file(
+            paths,
+            &mut log_file,
+            &encoded_appended,
+        )?;
+        if written > 0 {
+            on_log_write(written);
+        }
+        current_log_records = current_log_records.saturating_add(appended.len());
+        if log_file
+            .metadata()
+            .map(|metadata| metadata.len() >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES)
+            .unwrap_or(false)
+        {
+            write_cluster_kv_watch_event_checkpoint(paths, &retained)?;
+            truncate_cluster_kv_watch_event_log_file(paths, &mut log_file)?;
+            current_log_records = 0;
+        }
+    }
+
+    Ok(ClusterKvWatchEventAppendReport {
+        appended,
+        retained,
+        log_records: current_log_records,
+        append_safe: true,
+    })
+}
+
+pub fn read_cluster_kv_watch_registration_file(
+    path: &Path,
+    watch_id: WatchId,
+) -> Result<ClusterKvWatchRegistration, KvError> {
+    let Some(registration) = read_optional_object::<ClusterKvWatchRegistration>(path)? else {
+        return Err(KvError::UnknownWatch { watch_id });
+    };
+    if registration.watch_id != watch_id {
+        return Err(KvError::UnknownWatch { watch_id });
+    }
+    Ok(registration)
+}
+
+pub fn write_cluster_kv_watch_registration_file(
+    path: &Path,
+    registration: &ClusterKvWatchRegistration,
+) -> Result<(), KvError> {
+    write_object_file(path, registration)
+}
+
+pub fn write_cluster_kv_watch_registration_file_create_new(
+    path: &Path,
+    registration: &ClusterKvWatchRegistration,
+) -> Result<bool, KvError> {
+    let content =
+        sinomo_object_serde::to_bytes(registration, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+            .map_err(|source| KvError::Serialization {
+                detail: source.to_string(),
+            })?;
+    write_object_file_bytes_create_new_serialized(path, &content)
+}
+
+pub fn remove_cluster_kv_watch_registration_file_if_exists(path: &Path) -> Result<bool, KvError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(KvError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        }),
+    }
+}
+
+pub fn read_cluster_kv_watch_allocator_state(
+    paths: &ClusterKvPaths,
+) -> Result<ClusterKvWatchAllocatorState, KvError> {
+    let state = read_optional_object::<ClusterKvWatchAllocatorState>(&paths.watches_next_id)?
+        .unwrap_or_else(|| ClusterKvWatchAllocatorState::legacy(1));
+    Ok(ClusterKvWatchAllocatorState {
+        next_watch_id: state.next_watch_id.max(1),
+        active_watch_count: state.active_watch_count,
+        pruned_compacted_revision: state.pruned_compacted_revision,
+    })
+}
+
+pub fn write_cluster_kv_watch_allocator_state(
+    paths: &ClusterKvPaths,
+    state: &ClusterKvWatchAllocatorState,
+) -> Result<(), KvError> {
+    write_object_file(&paths.watches_next_id, state)
+}
+
+pub fn lock_cluster_kv_watch_allocator(paths: &ClusterKvPaths) -> Result<File, KvError> {
+    fs::create_dir_all(&paths.root).map_err(|source| KvError::Io {
+        path: paths.root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&paths.watches_lock)
+        .map_err(|source| KvError::Io {
+            path: paths.watches_lock.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    file.lock_exclusive().map_err(|source| KvError::Io {
+        path: paths.watches_lock.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(file)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvWatchScanRegistration {
+    pub path: PathBuf,
+    pub registration: ClusterKvWatchRegistration,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterKvWatchScanResult {
+    pub scanned: bool,
+    pub removed: usize,
+    pub retained: usize,
+    pub max_seen_id: u64,
+    pub removed_paths: Vec<PathBuf>,
+    pub retained_registrations: Vec<ClusterKvWatchScanRegistration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvWatchRegistrationCreateReport {
+    pub watch_path: PathBuf,
+    pub registration: ClusterKvWatchRegistration,
+    pub allocator: ClusterKvWatchAllocatorState,
+    pub scan: Option<ClusterKvWatchScanResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterKvWatchDrainCursorAction {
+    Unchanged,
+    CacheOnly { durable_next_revision: KvRevision },
+    Persist,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvWatchDrainRegistrationReport {
+    pub registration: ClusterKvWatchRegistration,
+    pub response: ClusterKvWatchDrainResponse,
+    pub cursor_action: ClusterKvWatchDrainCursorAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterKvWatchDrainCursorPersistence {
+    Persisted {
+        registration: ClusterKvWatchRegistration,
+    },
+    CacheOnly {
+        registration: ClusterKvWatchRegistration,
+        durable_next_revision: KvRevision,
+    },
+    Unchanged {
+        registration: ClusterKvWatchRegistration,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvWatchRegistrationRemovalReport {
+    pub watch_path: PathBuf,
+    pub removed: bool,
+    pub allocator: Option<ClusterKvWatchAllocatorState>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClusterKvActiveWatchRegistrationReport {
+    pub has_active: bool,
+    pub allocator: Option<ClusterKvWatchAllocatorState>,
+    pub scan: Option<ClusterKvWatchScanResult>,
+}
+
+pub fn create_cluster_kv_watch_registration(
+    paths: &ClusterKvPaths,
+    request: ClusterKvWatchPrefixRequest,
+    compacted_revision: KvRevision,
+    allocator_trusted: bool,
+    max_active_watches: usize,
+) -> Result<ClusterKvWatchRegistrationCreateReport, KvError> {
+    if request.start_revision <= compacted_revision && compacted_revision != KvRevision::ZERO {
+        return Err(KvError::Compacted {
+            requested: request.start_revision,
+            compacted: compacted_revision,
+        });
+    }
+    fs::create_dir_all(&paths.watches).map_err(|source| KvError::Io {
+        path: paths.watches.display().to_string(),
+        detail: source.to_string(),
+    })?;
+
+    let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
+    let mut allocator = read_cluster_kv_watch_allocator_state(paths)?;
+    let scan =
+        if cluster_kv_watch_allocator_needs_scan(allocator_trusted, &allocator, compacted_revision)
+        {
+            let scan = scan_cluster_kv_watch_registrations(paths, compacted_revision)?;
+            allocator = cluster_kv_watch_allocator_after_scan(allocator, &scan, compacted_revision);
+            Some(scan)
+        } else {
+            None
+        };
+
+    let active_watch_count = allocator.active_watch_count.unwrap_or_default();
+    if active_watch_count >= max_active_watches {
+        return Err(KvError::WatchLimit {
+            max: max_active_watches,
+        });
+    }
+
+    let mut watch_id = WatchId(allocator.next_watch_id.max(1));
+    loop {
+        let registration = ClusterKvWatchRegistration {
+            watch_id,
+            prefix: request.prefix.clone(),
+            next_revision: request.start_revision,
+        };
+        let watch_path = paths.watch_path(watch_id);
+        if write_cluster_kv_watch_registration_file_create_new(&watch_path, &registration)? {
+            allocator.next_watch_id = watch_id.0.saturating_add(1).max(1);
+            allocator.active_watch_count = Some(active_watch_count.saturating_add(1));
+            allocator.pruned_compacted_revision = Some(compacted_revision);
+            return Ok(ClusterKvWatchRegistrationCreateReport {
+                watch_path,
+                registration,
+                allocator,
+                scan,
+            });
+        }
+        if watch_id.0 == u64::MAX {
+            return Err(KvError::WatchIdExhausted);
+        }
+        watch_id = WatchId(watch_id.0.saturating_add(1).max(1));
+    }
+}
+
+pub fn cluster_kv_active_watch_registration_report(
+    paths: &ClusterKvPaths,
+    compacted_revision: KvRevision,
+) -> Result<ClusterKvActiveWatchRegistrationReport, KvError> {
+    if !paths.watches.exists() && !paths.watches_next_id.exists() {
+        return Ok(ClusterKvActiveWatchRegistrationReport::default());
+    }
+    let allocator = read_cluster_kv_watch_allocator_state(paths)?;
+    let scan = scan_cluster_kv_watch_registrations(paths, compacted_revision)?;
+    let allocator = cluster_kv_watch_allocator_after_scan(allocator, &scan, compacted_revision);
+    Ok(ClusterKvActiveWatchRegistrationReport {
+        has_active: scan.retained > 0,
+        allocator: (paths.watches.exists() || paths.watches_next_id.exists()).then_some(allocator),
+        scan: Some(scan),
+    })
+}
+
+pub fn drain_cluster_kv_watch_registration(
+    mut registration: ClusterKvWatchRegistration,
+    durable_next_revision: KvRevision,
+    persisted_events: &[KvEvent],
+    snapshot: &KvSnapshot,
+    max_payload_bytes: usize,
+    registration_file_unchanged: bool,
+    registration_file_age: Option<Duration>,
+) -> Result<ClusterKvWatchDrainRegistrationReport, KvError> {
+    if registration.next_revision <= snapshot.compacted_revision
+        && snapshot.compacted_revision != KvRevision::ZERO
+    {
+        return Err(KvError::Compacted {
+            requested: registration.next_revision,
+            compacted: snapshot.compacted_revision,
+        });
+    }
+    let events = collect_cluster_kv_watch_drain_events(
+        persisted_events,
+        snapshot,
+        &registration,
+        max_payload_bytes,
+    );
+    let cursor_action = if let Some(last) = events.last() {
+        registration.next_revision = KvRevision(last.revision.0.saturating_add(1));
+        if cluster_kv_watch_registration_cursor_should_persist(
+            events.len(),
+            registration.next_revision,
+            durable_next_revision,
+            registration_file_unchanged,
+            registration_file_age,
+        ) {
+            ClusterKvWatchDrainCursorAction::Persist
+        } else {
+            ClusterKvWatchDrainCursorAction::CacheOnly {
+                durable_next_revision,
+            }
+        }
+    } else {
+        ClusterKvWatchDrainCursorAction::Unchanged
+    };
+    Ok(ClusterKvWatchDrainRegistrationReport {
+        response: ClusterKvWatchDrainResponse {
+            watch_id: registration.watch_id,
+            events,
+            next_revision: registration.next_revision,
+        },
+        registration,
+        cursor_action,
+    })
+}
+
+pub fn persist_cluster_kv_watch_drain_cursor(
+    watch_path: &Path,
+    report: &ClusterKvWatchDrainRegistrationReport,
+) -> Result<ClusterKvWatchDrainCursorPersistence, KvError> {
+    match report.cursor_action {
+        ClusterKvWatchDrainCursorAction::Persist => {
+            write_cluster_kv_watch_registration_file(watch_path, &report.registration)?;
+            Ok(ClusterKvWatchDrainCursorPersistence::Persisted {
+                registration: report.registration.clone(),
+            })
+        }
+        ClusterKvWatchDrainCursorAction::CacheOnly {
+            durable_next_revision,
+        } => Ok(ClusterKvWatchDrainCursorPersistence::CacheOnly {
+            registration: report.registration.clone(),
+            durable_next_revision,
+        }),
+        ClusterKvWatchDrainCursorAction::Unchanged => {
+            Ok(ClusterKvWatchDrainCursorPersistence::Unchanged {
+                registration: report.registration.clone(),
+            })
+        }
+    }
+}
+
+pub fn remove_cluster_kv_watch_registration_with_allocator(
+    paths: &ClusterKvPaths,
+    watch_id: WatchId,
+) -> Result<ClusterKvWatchRegistrationRemovalReport, KvError> {
+    let watch_path = paths.watch_path(watch_id);
+    if !watch_path.exists() {
+        return Ok(ClusterKvWatchRegistrationRemovalReport {
+            watch_path,
+            removed: false,
+            allocator: None,
+        });
+    }
+    let _allocator_lock = lock_cluster_kv_watch_allocator(paths)?;
+    let removed = remove_cluster_kv_watch_registration_file_if_exists(&watch_path)?;
+    let allocator = if removed {
+        let allocator = read_cluster_kv_watch_allocator_state(paths)?;
+        allocator
+            .active_watch_count
+            .is_some()
+            .then(|| cluster_kv_watch_allocator_after_registration_removed(allocator))
+    } else {
+        None
+    };
+    Ok(ClusterKvWatchRegistrationRemovalReport {
+        watch_path,
+        removed,
+        allocator,
+    })
+}
+
+pub fn scan_cluster_kv_watch_registrations(
+    paths: &ClusterKvPaths,
+    compacted_revision: KvRevision,
+) -> Result<ClusterKvWatchScanResult, KvError> {
+    let mut result = ClusterKvWatchScanResult::default();
+    let entries = match fs::read_dir(&paths.watches) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(result),
+        Err(source) => {
+            return Err(KvError::Io {
+                path: paths.watches.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    result.scanned = true;
+    for entry in entries {
+        let entry = entry.map_err(|source| KvError::Io {
+            path: paths.watches.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(file_watch_id) = cluster_kv_watch_id_from_file_name(&name) else {
+            continue;
+        };
+        result.max_seen_id = result.max_seen_id.max(file_watch_id);
+        let path = entry.path();
+        let watch_id = WatchId(file_watch_id);
+        match read_cluster_kv_watch_registration_file(&path, watch_id) {
+            Ok(registration)
+                if compacted_revision != KvRevision::ZERO
+                    && registration.next_revision <= compacted_revision =>
+            {
+                let _ = remove_cluster_kv_watch_registration_file_if_exists(&path)?;
+                result.removed = result.removed.saturating_add(1);
+                result.removed_paths.push(path);
+            }
+            Ok(registration) => {
+                result.retained = result.retained.saturating_add(1);
+                result
+                    .retained_registrations
+                    .push(ClusterKvWatchScanRegistration { path, registration });
+            }
+            Err(KvError::UnknownWatch { watch_id: returned }) if returned == watch_id => {
+                let _ = remove_cluster_kv_watch_registration_file_if_exists(&path)?;
+                result.removed = result.removed.saturating_add(1);
+                result.removed_paths.push(path);
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: removing unreadable cluster kv watch registration {}: {}",
+                    path.display(),
+                    error
+                );
+                let _ = remove_cluster_kv_watch_registration_file_if_exists(&path)?;
+                result.removed = result.removed.saturating_add(1);
+                result.removed_paths.push(path);
+            }
+        }
+    }
+    Ok(result)
+}
+
+pub fn list_cluster_kv_watch_registrations(
+    paths: &ClusterKvPaths,
+) -> Result<Vec<ClusterKvWatchRegistration>, KvError> {
+    let entries = match fs::read_dir(&paths.watches) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(KvError::Io {
+                path: paths.watches.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    let mut registrations = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| KvError::Io {
+            path: paths.watches.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(file_watch_id) = cluster_kv_watch_id_from_file_name(&name) else {
+            continue;
+        };
+        let watch_id = WatchId(file_watch_id);
+        match read_cluster_kv_watch_registration_file(&entry.path(), watch_id) {
+            Ok(registration) => registrations.push(registration),
+            Err(KvError::UnknownWatch { watch_id: returned }) if returned == watch_id => {}
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring unreadable cluster kv watch registration {} during fan-out filtering: {}",
+                    entry.path().display(),
+                    error
+                );
+            }
+        }
+    }
+    Ok(registrations)
+}
+
+pub fn cluster_kv_watch_events_matching_registrations(
+    registrations: &[ClusterKvWatchRegistration],
+    incoming: &[KvEvent],
+) -> Vec<KvEvent> {
+    if registrations.is_empty() {
+        return Vec::new();
+    }
+    incoming
+        .iter()
+        .filter(|event| {
+            registrations.iter().any(|registration| {
+                event.revision >= registration.next_revision
+                    && event.key.starts_with(&registration.prefix)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+pub fn cluster_kv_watch_ids_matching_events(
+    registrations: &[ClusterKvWatchRegistration],
+    events: &[KvEvent],
+) -> Vec<WatchId> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let mut watch_ids = BTreeSet::new();
+    for registration in registrations {
+        if events.iter().any(|event| {
+            event.revision >= registration.next_revision
+                && event.key.starts_with(&registration.prefix)
+        }) {
+            watch_ids.insert(registration.watch_id);
+        }
+    }
+    watch_ids.into_iter().collect()
+}
+
+pub fn cluster_kv_watch_id_from_file_name(name: &str) -> Option<u64> {
+    name.strip_prefix("watch-")
+        .and_then(|name| name.strip_suffix(".sobj"))
+        .and_then(|id| id.parse::<u64>().ok())
+}
+
+pub fn cluster_kv_watch_allocator_needs_scan(
+    allocator_trusted: bool,
+    allocator: &ClusterKvWatchAllocatorState,
+    compacted_revision: KvRevision,
+) -> bool {
+    if !allocator_trusted {
+        return true;
+    }
+    if allocator.active_watch_count.is_none() {
+        return true;
+    }
+    match allocator.pruned_compacted_revision {
+        Some(pruned) => pruned < compacted_revision,
+        None => true,
+    }
+}
+
+pub fn cluster_kv_watch_allocator_after_scan(
+    mut allocator: ClusterKvWatchAllocatorState,
+    scan: &ClusterKvWatchScanResult,
+    compacted_revision: KvRevision,
+) -> ClusterKvWatchAllocatorState {
+    allocator.next_watch_id = allocator
+        .next_watch_id
+        .max(scan.max_seen_id.saturating_add(1))
+        .max(1);
+    allocator.active_watch_count = Some(scan.retained);
+    allocator.pruned_compacted_revision = Some(compacted_revision);
+    allocator
+}
+
+pub fn cluster_kv_watch_allocator_after_registration_removed(
+    mut allocator: ClusterKvWatchAllocatorState,
+) -> ClusterKvWatchAllocatorState {
+    if let Some(active_watch_count) = allocator.active_watch_count {
+        allocator.active_watch_count = Some(active_watch_count.saturating_sub(1));
+    }
+    allocator
+}
+
+pub fn read_cluster_kv_watch_event_log(
+    paths: &ClusterKvPaths,
+) -> Result<ClusterKvWatchEventLogRead, KvError> {
+    read_cluster_kv_watch_event_log_with_observer(paths, |_| {})
+}
+
+pub fn read_cluster_kv_watch_event_log_with_observer<F>(
+    paths: &ClusterKvPaths,
+    on_log_read: F,
+) -> Result<ClusterKvWatchEventLogRead, KvError>
+where
+    F: FnMut(u64),
+{
+    let mut file = match File::open(&paths.watch_events_log) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ClusterKvWatchEventLogRead::default());
+        }
+        Err(source) => {
+            return Err(KvError::Io {
+                path: paths.watch_events_log.display().to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    file.lock_shared().map_err(|source| KvError::Io {
+        path: paths.watch_events_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    read_cluster_kv_watch_event_log_from_file_with_observer(paths, &mut file, on_log_read)
+}
+
+pub fn read_cluster_kv_watch_event_log_from_file_with_observer<F>(
+    paths: &ClusterKvPaths,
+    file: &mut File,
+    mut on_log_read: F,
+) -> Result<ClusterKvWatchEventLogRead, KvError>
+where
+    F: FnMut(u64),
+{
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| KvError::Io {
+            path: paths.watch_events_log.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut events = Vec::new();
+    let mut record_number = 0_usize;
+    let mut read_bytes = 0_u64;
+    let mut needs_repair = false;
+    loop {
+        record_number += 1;
+        let mut len_buf = [0_u8; 4];
+        match read_cluster_kv_watch_event_log_chunk(
+            &paths.watch_events_log,
+            file,
+            &mut len_buf,
+            &mut on_log_read,
+        )? {
+            WatchEventLogReadChunk::Complete => {}
+            WatchEventLogReadChunk::CleanEof => break,
+            WatchEventLogReadChunk::Truncated => {
+                eprintln!(
+                    "warning: ignoring partial cluster kv watch-event log record {} in {}",
+                    record_number,
+                    paths.watch_events_log.display()
+                );
+                return Ok(ClusterKvWatchEventLogRead {
+                    events,
+                    records: record_number.saturating_sub(1),
+                    truncated: true,
+                });
+            }
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+        read_bytes = read_bytes.saturating_add(4).saturating_add(len as u64);
+        if len == 0 || len > MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES {
+            eprintln!(
+                "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
+                record_number,
+                paths.watch_events_log.display()
+            );
+            return Ok(ClusterKvWatchEventLogRead {
+                events,
+                records: record_number.saturating_sub(1),
+                truncated: true,
+            });
+        }
+        let mut record = vec![0_u8; len];
+        if read_cluster_kv_watch_event_log_chunk(
+            &paths.watch_events_log,
+            file,
+            &mut record,
+            &mut on_log_read,
+        )? != WatchEventLogReadChunk::Complete
+        {
+            eprintln!(
+                "warning: ignoring corrupt cluster kv watch-event log record {} in {}",
+                record_number,
+                paths.watch_events_log.display()
+            );
+            return Ok(ClusterKvWatchEventLogRead {
+                events,
+                records: record_number.saturating_sub(1),
+                truncated: true,
+            });
+        }
+        match decode_cluster_kv_watch_event_log_record(&record) {
+            Ok(event) => events.push(event),
+            Err(source) => {
+                eprintln!(
+                    "warning: ignoring unreadable cluster kv watch-event log record {} in {}: {}",
+                    record_number,
+                    paths.watch_events_log.display(),
+                    source
+                );
+                return Ok(ClusterKvWatchEventLogRead {
+                    events,
+                    records: record_number.saturating_sub(1),
+                    truncated: true,
+                });
+            }
+        }
+        if record_number >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS
+            || read_bytes >= MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES
+        {
+            needs_repair = true;
+        }
+        if events.len() > MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS {
+            events = compact_cluster_kv_watch_events(events);
+        }
+    }
+    if needs_repair {
+        eprintln!(
+            "warning: repairing overgrown cluster kv watch-event log {} after reading {} records / {} bytes",
+            paths.watch_events_log.display(),
+            record_number.saturating_sub(1),
+            read_bytes
+        );
+    }
+    Ok(ClusterKvWatchEventLogRead {
+        events,
+        records: record_number.saturating_sub(1),
+        truncated: needs_repair,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchEventLogReadChunk {
+    Complete,
+    CleanEof,
+    Truncated,
+}
+
+fn read_cluster_kv_watch_event_log_chunk<F>(
+    log_path: &Path,
+    file: &mut File,
+    buf: &mut [u8],
+    on_log_read: &mut F,
+) -> Result<WatchEventLogReadChunk, KvError>
+where
+    F: FnMut(u64),
+{
+    let mut offset = 0;
+    while offset < buf.len() {
+        match file.read(&mut buf[offset..]) {
+            Ok(0) if offset == 0 => return Ok(WatchEventLogReadChunk::CleanEof),
+            Ok(0) => return Ok(WatchEventLogReadChunk::Truncated),
+            Ok(read) => {
+                offset += read;
+                on_log_read(read as u64);
+            }
+            Err(source) => {
+                return Err(KvError::Io {
+                    path: log_path.display().to_string(),
+                    detail: source.to_string(),
+                });
+            }
+        }
+    }
+    Ok(WatchEventLogReadChunk::Complete)
+}
+
+pub fn cluster_kv_watch_event_payload_bytes(event: &KvEvent) -> usize {
+    let value_bytes = match &event.kind {
+        KvEventKind::Put { value } => value.len(),
+        KvEventKind::Delete => 0,
+    };
+    event.key.len().saturating_add(value_bytes)
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 pub fn encode_kv_value<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
@@ -181,6 +1818,185 @@ pub fn decode_kv_value<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, KvError> 
     sinomo_object_serde::from_bytes(bytes).map_err(|source| KvError::Serialization {
         detail: source.to_string(),
     })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvRpcPayload {
+    pub route: &'static str,
+    pub category: &'static str,
+    pub body: Vec<u8>,
+}
+
+fn encode_cluster_kv_rpc_body<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, KvError> {
+    sinomo_object_serde::to_bytes(value, KV_OBJECT_VERSION_ID, LengthMode::U32).map_err(|source| {
+        KvError::Serialization {
+            detail: source.to_string(),
+        }
+    })
+}
+
+fn decode_cluster_kv_rpc_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, KvError> {
+    sinomo_object_serde::from_bytes(body).map_err(|source| KvError::Serialization {
+        detail: source.to_string(),
+    })
+}
+
+pub fn cluster_kv_snapshot_rpc_payload() -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&())?,
+    })
+}
+
+pub fn decode_cluster_kv_snapshot_rpc_body(body: &[u8]) -> Result<KvSnapshot, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_txn_rpc_payload(txn: &KvTxn) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_TXN_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(txn)?,
+    })
+}
+
+pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<KvTxnResponse, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchEventsRequest {
+    pub state: ClusterBootstrapState,
+    pub leader_id: NodeId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<KvEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvWatchEventsResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub stored_events: usize,
+}
+
+pub fn cluster_kv_watch_events_noop_response(
+    request: &ClusterKvWatchEventsRequest,
+) -> Option<ClusterKvWatchEventsResponse> {
+    request
+        .events
+        .is_empty()
+        .then(|| ClusterKvWatchEventsResponse {
+            accepted: true,
+            detail: "no watch events to fan out".to_string(),
+            stored_events: 0,
+        })
+}
+
+pub fn cluster_kv_watch_events_rpc_payload(
+    request: &ClusterKvWatchEventsRequest,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_WATCH_EVENTS_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(request)?,
+    })
+}
+
+pub fn decode_cluster_kv_watch_events_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterKvWatchEventsRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_watch_events_response_rpc_payload(
+    response: &ClusterKvWatchEventsResponse,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_WATCH_EVENTS_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_kv_watch_events_rpc_response_body(
+    body: &[u8],
+) -> Result<ClusterKvWatchEventsResponse, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub trait ClusterKvLocalReadWatchHost {
+    type Error: From<KvError>;
+
+    fn range_prefix(&mut self, prefix: &str) -> Result<Vec<KvEntry>, Self::Error>;
+
+    fn create_watch(
+        &mut self,
+        request: ClusterKvWatchPrefixRequest,
+    ) -> Result<ClusterKvWatchRegistration, Self::Error>;
+
+    fn drain_watch(
+        &mut self,
+        request: ClusterKvWatchDrainRequest,
+    ) -> Result<ClusterKvWatchDrainResponse, Self::Error>;
+
+    fn cancel_watch(
+        &mut self,
+        request: ClusterKvWatchCancelRequest,
+    ) -> Result<ClusterKvWatchCancelResponse, Self::Error>;
+}
+
+pub fn handle_cluster_kv_local_read_watch_rpc_payload<H>(
+    route: &str,
+    body: &[u8],
+    host: &mut H,
+) -> Result<Option<ClusterKvRpcPayload>, H::Error>
+where
+    H: ClusterKvLocalReadWatchHost,
+{
+    let payload = match route {
+        CLUSTER_KV_RANGE_PREFIX_ROUTE => {
+            let prefix: String = decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+            let result = host.range_prefix(&prefix)?;
+            ClusterKvRpcPayload {
+                route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+            }
+        }
+        CLUSTER_KV_WATCH_PREFIX_ROUTE => {
+            let request: ClusterKvWatchPrefixRequest =
+                decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+            let result = host.create_watch(request)?;
+            ClusterKvRpcPayload {
+                route: CLUSTER_KV_WATCH_PREFIX_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+            }
+        }
+        CLUSTER_KV_WATCH_DRAIN_ROUTE => {
+            let request: ClusterKvWatchDrainRequest =
+                decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+            let result = host.drain_watch(request)?;
+            ClusterKvRpcPayload {
+                route: CLUSTER_KV_WATCH_DRAIN_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+            }
+        }
+        CLUSTER_KV_WATCH_CANCEL_ROUTE => {
+            let request: ClusterKvWatchCancelRequest =
+                decode_cluster_kv_rpc_body(body).map_err(H::Error::from)?;
+            let result = host.cancel_watch(request)?;
+            ClusterKvRpcPayload {
+                route: CLUSTER_KV_WATCH_CANCEL_ROUTE,
+                category: CLUSTER_KV_RPC_CATEGORY,
+                body: encode_cluster_kv_rpc_body(&result).map_err(H::Error::from)?,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(payload))
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -436,11 +2252,6 @@ fn validate_kv_command_payload(command: &KvCommand) -> Result<(), KvError> {
             validate_kv_payload_total(kv_op_payload_bytes(op))
         }
         KvCommand::Txn(txn) => validate_kv_txn_payload(txn),
-        KvCommand::PutClusterMember(member) => {
-            let op = KvOp::put_serde(cluster_member_key(&member.node_id), member, None)?;
-            validate_kv_op_payload(&op)?;
-            validate_kv_payload_total(kv_op_payload_bytes(&op))
-        }
     }
 }
 
@@ -1608,7 +3419,534 @@ impl KvLocalCache {
 pub enum KvCommand {
     Op(KvOp),
     Txn(KvTxn),
-    PutClusterMember(ClusterMemberRecord),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClusterKvRaftUncommittedAppend {
+    Appended(KvLogEntry),
+    NoEffect {
+        snapshot: KvSnapshot,
+        txn_response: Option<KvTxnResponse>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftCommitResult {
+    pub snapshot: KvSnapshot,
+    pub txn_response: Option<KvTxnResponse>,
+    pub events: Vec<KvEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftAppendRequest {
+    pub snapshot: Option<RaftSnapshot>,
+    pub append: RaftAppendEntriesRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftLocalVoteMetadata {
+    pub current_term: u64,
+    pub last_log_index: u64,
+    pub last_log_term: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftLeaderElectionOptions {
+    pub max_attempts: usize,
+}
+
+pub trait ClusterKvRaftLeaderElectionHost {
+    type Error: From<KvError>;
+
+    fn begin_election_attempt(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn local_vote_metadata(&mut self) -> Result<ClusterKvRaftLocalVoteMetadata, Self::Error>;
+
+    fn apply_local_vote(
+        &mut self,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<RaftRequestVoteResponse, Self::Error>;
+
+    fn should_request_more_remote_votes(&mut self) -> bool {
+        true
+    }
+
+    fn request_remote_vote(
+        &mut self,
+        target_index: usize,
+        voter_id: &NodeId,
+        vote: &RaftRequestVoteRequest,
+    ) -> Result<RaftRequestVoteResponse, Self::Error>;
+
+    fn observe_raft_term(&mut self, term: u64) -> Result<(), Self::Error>;
+
+    fn set_raft_leader(&mut self, term: u64) -> Result<(), Self::Error>;
+}
+
+pub fn cluster_kv_raft_quorum_size(voter_count: usize) -> usize {
+    voter_count / 2 + 1
+}
+
+pub fn elect_cluster_kv_raft_leader_with_host<H>(
+    local_node_id: &NodeId,
+    voter_ids: impl IntoIterator<Item = NodeId>,
+    remote_vote_targets: impl IntoIterator<Item = NodeId>,
+    options: ClusterKvRaftLeaderElectionOptions,
+    host: &mut H,
+) -> Result<bool, H::Error>
+where
+    H: ClusterKvRaftLeaderElectionHost,
+{
+    let voter_ids = voter_ids.into_iter().collect::<BTreeSet<_>>();
+    if !voter_ids.contains(local_node_id) {
+        return Ok(false);
+    }
+    let quorum_size = cluster_kv_raft_quorum_size(voter_ids.len());
+    let remote_vote_targets = remote_vote_targets
+        .into_iter()
+        .filter(|voter_id| voter_id != local_node_id && voter_ids.contains(voter_id))
+        .collect::<Vec<_>>();
+
+    for _ in 0..options.max_attempts {
+        host.begin_election_attempt()?;
+        let metadata = host.local_vote_metadata()?;
+        let election_term = metadata
+            .current_term
+            .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
+        let vote_request = RaftRequestVoteRequest {
+            term: election_term,
+            candidate_id: local_node_id.clone(),
+            last_log_index: metadata.last_log_index,
+            last_log_term: metadata.last_log_term,
+        };
+        let local_vote = host.apply_local_vote(vote_request.clone())?;
+        let mut highest_observed_term = local_vote.term.max(election_term);
+        let mut granted = BTreeSet::new();
+        if local_vote.vote_granted {
+            granted.insert(local_node_id.clone());
+        }
+
+        for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
+            if granted.len() >= quorum_size {
+                break;
+            }
+            if !host.should_request_more_remote_votes() {
+                break;
+            }
+            let Ok(response) = host.request_remote_vote(target_index, voter_id, &vote_request)
+            else {
+                continue;
+            };
+            highest_observed_term = highest_observed_term.max(response.term);
+            if response.vote_granted {
+                granted.insert(voter_id.clone());
+            }
+        }
+
+        if highest_observed_term > election_term {
+            host.observe_raft_term(highest_observed_term)?;
+            continue;
+        }
+        if granted.len() < quorum_size {
+            return Ok(false);
+        }
+        host.set_raft_leader(election_term)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Storage-side contract for applying a cluster KV command to the local Raft log.
+///
+/// Implementors own KV/Raft durability only. They must not choose peers, route
+/// messages, score endpoints, or interpret the cluster connectivity graph.
+pub trait ClusterKvRaftCommandStorage {
+    type Error: From<KvError>;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect(
+        &mut self,
+        command: KvCommand,
+    ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error>;
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader(&mut self)
+    -> Result<(), Self::Error>;
+
+    fn commit_cluster_raft_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> Result<ClusterKvRaftCommitResult, Self::Error>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftCompactionPolicy {
+    pub max_snapshot_bytes: u64,
+    pub max_snapshot_events: usize,
+}
+
+pub fn cluster_kv_raft_node_should_compact(
+    node: &DurableRaftKvNode,
+    snapshot_bytes: u64,
+    policy: ClusterKvRaftCompactionPolicy,
+) -> bool {
+    // Snapshotting rewrites the entire WAL down to the retained tail plus the
+    // snapshot file, so it must only run when it makes durable progress.
+    //
+    // Compaction advances the on-disk snapshot to `applied_index` and drops log
+    // entries older than the retained tail. The durable progress is
+    // `applied_index - snapshot_index`; the in-memory log length and event
+    // history are not valid progress triggers because they include the retained
+    // replication tail.
+    let compaction_high_watermark = RAFT_COMPACTION_RETAINED_ENTRIES.saturating_mul(2);
+    let unsnapshotted_applied = node.applied_index().saturating_sub(node.snapshot_index());
+    let has_compactable_progress = unsnapshotted_applied > compaction_high_watermark;
+    let oversized_snapshot_can_shrink = snapshot_bytes > policy.max_snapshot_bytes
+        && node.store().event_history_len() > policy.max_snapshot_events;
+    has_compactable_progress || oversized_snapshot_can_shrink
+}
+
+pub fn compact_cluster_kv_raft_node_if_needed(
+    node: &mut DurableRaftKvNode,
+    snapshot_bytes: u64,
+    policy: ClusterKvRaftCompactionPolicy,
+) -> Result<bool, KvError> {
+    if !cluster_kv_raft_node_should_compact(node, snapshot_bytes, policy) {
+        return Ok(false);
+    }
+    node.compact_event_history_to(policy.max_snapshot_events);
+    node.save_snapshot()?;
+    Ok(true)
+}
+
+#[derive(Clone, Debug)]
+pub struct ClusterKvRaftStore {
+    paths: ClusterKvPaths,
+    compaction_policy: ClusterKvRaftCompactionPolicy,
+}
+
+impl ClusterKvRaftStore {
+    pub fn new(paths: ClusterKvPaths, compaction_policy: ClusterKvRaftCompactionPolicy) -> Self {
+        Self {
+            paths,
+            compaction_policy,
+        }
+    }
+
+    pub fn paths(&self) -> &ClusterKvPaths {
+        &self.paths
+    }
+
+    pub fn wal_paths(&self, node_id: &NodeId) -> KvWalPaths {
+        self.paths.raft_wal_paths(node_id)
+    }
+
+    fn snapshot_bytes(&self, node_id: &NodeId) -> u64 {
+        fs::metadata(&self.wal_paths(node_id).snapshot)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+
+    fn compact_node_if_needed(&self, node: &mut DurableRaftKvNode) -> Result<bool, KvError> {
+        compact_cluster_kv_raft_node_if_needed(
+            node,
+            self.snapshot_bytes(node.node_id()),
+            self.compaction_policy,
+        )
+    }
+
+    pub fn open_node(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
+        let cache = self.paths.local_cache();
+        let mut node = cache.open_raft_node(node_id.clone())?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(node)
+    }
+
+    pub fn open_node_discarding_uncommitted_tail(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<DurableRaftKvNode, KvError> {
+        let cache = self.paths.local_cache();
+        let mut node = cache.open_raft_node_discarding_uncommitted_tail(node_id.clone())?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(node)
+    }
+
+    pub async fn open_node_async(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
+        let cache = self.paths.local_cache();
+        let mut node = cache.open_raft_node_async(node_id.clone()).await?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(node)
+    }
+
+    pub fn build_append_entries_request_from_next_index(
+        &self,
+        node_id: &NodeId,
+        leader_id: &NodeId,
+        next_index: u64,
+    ) -> Result<ClusterKvRaftAppendRequest, KvError> {
+        let node = self.open_node(node_id)?;
+        let prev_log_index = next_index.saturating_sub(1).min(node.last_log_index());
+        let earliest_log_index = node.log().first().map(|entry| entry.index);
+        let prev_log_resolvable = prev_log_index == node.snapshot_index()
+            || earliest_log_index.is_some_and(|first| prev_log_index >= first);
+        let include_snapshot = node.snapshot_index() > 0 && !prev_log_resolvable;
+        let (snapshot, prev_log_index, entries) = if include_snapshot {
+            let mut kv = node.store().snapshot();
+            compact_kv_snapshot_event_history(&mut kv, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
+            let snapshot = RaftSnapshot {
+                last_included_index: node.applied_index(),
+                last_included_term: node.term_at(node.applied_index()).unwrap_or(1),
+                kv,
+            };
+            let entries = node
+                .log()
+                .iter()
+                .filter(|entry| entry.index > snapshot.last_included_index)
+                .cloned()
+                .collect::<Vec<_>>();
+            (Some(snapshot), node.applied_index(), entries)
+        } else {
+            let entries = node
+                .log()
+                .iter()
+                .filter(|entry| entry.index >= next_index)
+                .cloned()
+                .collect::<Vec<_>>();
+            (None, prev_log_index, entries)
+        };
+        let prev_log_term = node.term_at(prev_log_index).unwrap_or(0);
+        Ok(ClusterKvRaftAppendRequest {
+            snapshot,
+            append: RaftAppendEntriesRequest {
+                term: node.hard_state().current_term,
+                leader_id: leader_id.clone(),
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit: node.hard_state().commit_index,
+            },
+        })
+    }
+
+    pub fn restore_from_snapshot_if_newer(
+        &self,
+        node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        self.paths
+            .local_cache()
+            .restore_raft_from_snapshot_if_newer(node_id.clone(), snapshot)
+    }
+
+    pub fn local_vote_metadata(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<ClusterKvRaftLocalVoteMetadata, KvError> {
+        let node = self.open_node(node_id)?;
+        Ok(ClusterKvRaftLocalVoteMetadata {
+            current_term: node.hard_state().current_term,
+            last_log_index: node.last_log_index(),
+            last_log_term: node.last_log_term(),
+        })
+    }
+
+    pub fn apply_vote(
+        &self,
+        node_id: &NodeId,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<RaftRequestVoteResponse, KvError> {
+        let mut node = self.open_node(node_id)?;
+        node.request_vote(vote)
+    }
+
+    pub fn apply_append_entries_with_optional_snapshot(
+        &self,
+        node_id: &NodeId,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+    ) -> Result<RaftAppendEntriesApplyOutcome, KvError> {
+        let mut node = self.open_node(node_id)?;
+        let outcome = node.apply_append_entries_with_optional_snapshot(snapshot, append)?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(outcome)
+    }
+
+    pub fn append_entries_rejection_response(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RaftAppendEntriesResponse, KvError> {
+        let node = self.open_node(node_id)?;
+        Ok(RaftAppendEntriesResponse {
+            term: node.hard_state().current_term,
+            success: false,
+            match_index: node.last_log_index(),
+        })
+    }
+
+    pub fn request_vote_rejection_response(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<RaftRequestVoteResponse, KvError> {
+        let hard_state = self.wal_paths(node_id).read_persisted_hard_state()?;
+        Ok(RaftRequestVoteResponse {
+            term: hard_state.current_term,
+            vote_granted: false,
+        })
+    }
+
+    pub fn observe_term(&self, node_id: &NodeId, term: u64) -> Result<Option<KvSnapshot>, KvError> {
+        let mut node = self.open_node(node_id)?;
+        let changed = node.observe_term(term)?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(changed.then(|| node.store().snapshot()))
+    }
+
+    pub fn set_leader(&self, node_id: &NodeId, term: u64) -> Result<KvSnapshot, KvError> {
+        let mut node = self.open_node(node_id)?;
+        node.become_leader(term)?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(node.store().snapshot())
+    }
+
+    pub fn clear_leader(&self, node_id: &NodeId) -> Result<KvSnapshot, KvError> {
+        let mut node = self.open_node(node_id)?;
+        node.clear_known_leader()?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(node.store().snapshot())
+    }
+
+    pub fn append_command_with_response(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<ClusterKvRaftCommitResult, KvError> {
+        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        if let Some((snapshot, txn_response)) = Self::command_no_effect_response(&node, &command)? {
+            return Ok(ClusterKvRaftCommitResult {
+                snapshot,
+                txn_response,
+                events: Vec::new(),
+            });
+        }
+        let before_revision = node.store().revision();
+        let term = node.hard_state().current_term.max(1);
+        let entry = node.append_local_command(term, command)?;
+        node.commit_to(entry.index)?;
+        let txn_response = node.txn_response_at(entry.index).cloned();
+        self.compact_node_if_needed(&mut node)?;
+        let snapshot = node.store().snapshot();
+        let events = Self::events_after_revision(&snapshot, before_revision);
+        Ok(ClusterKvRaftCommitResult {
+            snapshot,
+            txn_response,
+            events,
+        })
+    }
+
+    pub fn append_command_uncommitted(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<KvLogEntry, KvError> {
+        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        self.append_command_to_open_node(&mut node, command)
+    }
+
+    pub fn append_command_uncommitted_or_no_effect(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
+        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        if let Some((snapshot, txn_response)) = Self::command_no_effect_response(&node, &command)? {
+            return Ok(ClusterKvRaftUncommittedAppend::NoEffect {
+                snapshot,
+                txn_response,
+            });
+        }
+        self.append_command_to_open_node(&mut node, command)
+            .map(ClusterKvRaftUncommittedAppend::Appended)
+    }
+
+    pub fn discard_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
+        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let discarded = node.discard_uncommitted_tail()?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(discarded)
+    }
+
+    pub fn discard_uncommitted_tail_and_clear_leader(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvSnapshot, KvError> {
+        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        node.discard_uncommitted_tail()?;
+        node.clear_known_leader()?;
+        self.compact_node_if_needed(&mut node)?;
+        Ok(node.store().snapshot())
+    }
+
+    pub fn commit_index_with_events(
+        &self,
+        node_id: &NodeId,
+        commit_index: u64,
+    ) -> Result<ClusterKvRaftCommitResult, KvError> {
+        let mut node = self.open_node(node_id)?;
+        let before_revision = node.store().revision();
+        node.commit_to(commit_index)?;
+        let txn_response = node.txn_response_at(commit_index).cloned();
+        self.compact_node_if_needed(&mut node)?;
+        let snapshot = node.store().snapshot();
+        let events = Self::events_after_revision(&snapshot, before_revision);
+        Ok(ClusterKvRaftCommitResult {
+            snapshot,
+            txn_response,
+            events,
+        })
+    }
+
+    fn append_command_to_open_node(
+        &self,
+        node: &mut DurableRaftKvNode,
+        command: KvCommand,
+    ) -> Result<KvLogEntry, KvError> {
+        let term = node.hard_state().current_term.max(1);
+        let entry = node.append_local_command(term, command)?;
+        self.compact_node_if_needed(node)?;
+        Ok(entry)
+    }
+
+    fn command_no_effect_response(
+        node: &DurableRaftKvNode,
+        command: &KvCommand,
+    ) -> Result<Option<(KvSnapshot, Option<KvTxnResponse>)>, KvError> {
+        match command {
+            KvCommand::Op(op) => {
+                if node.store().op_response_if_no_effect(op)?.is_some() {
+                    return Ok(Some((node.store().snapshot(), None)));
+                }
+            }
+            KvCommand::Txn(txn) => {
+                if let Some(response) = node
+                    .store()
+                    .txn_response_if_selected_branch_no_effect(txn)?
+                {
+                    return Ok(Some((node.store().snapshot(), Some(response))));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn events_after_revision(snapshot: &KvSnapshot, before_revision: KvRevision) -> Vec<KvEvent> {
+        snapshot
+            .events
+            .iter()
+            .filter(|event| event.revision > before_revision)
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1849,9 +4187,6 @@ impl InProcessKvStore {
                 let response = self.txn(txn)?;
                 Ok((response.revision, Some(response)))
             }
-            KvCommand::PutClusterMember(member) => self
-                .put_cluster_member(member)
-                .map(|revision| (revision, None)),
         }
     }
 
@@ -1870,25 +4205,7 @@ impl InProcessKvStore {
                 };
                 self.validate_ops(ops)
             }
-            KvCommand::PutClusterMember(member) => {
-                let op = KvOp::put_serde(cluster_member_key(&member.node_id), member, None)?;
-                self.validate_ops(std::slice::from_ref(&op))
-            }
         }
-    }
-
-    pub fn put_cluster_member(
-        &mut self,
-        member: ClusterMemberRecord,
-    ) -> Result<KvRevision, KvError> {
-        self.put_serde(cluster_member_key(&member.node_id), &member, None)
-    }
-
-    pub fn read_cluster_member(
-        &self,
-        node_id: &NodeId,
-    ) -> Result<Option<ClusterMemberRecord>, KvError> {
-        self.get_serde(&cluster_member_key(node_id))
     }
 
     pub fn watch_prefix(
@@ -3241,13 +5558,6 @@ impl InProcessRaftKvCluster {
         self.txn_response(txn).map(|response| response.revision)
     }
 
-    pub fn put_cluster_member(
-        &mut self,
-        member: ClusterMemberRecord,
-    ) -> Result<KvRevision, KvError> {
-        self.apply_as_leader(KvCommand::PutClusterMember(member))
-    }
-
     pub fn install_snapshot(
         &mut self,
         target_node_id: NodeId,
@@ -3742,6 +6052,14 @@ struct RaftAppendEntriesOutcome {
     response: RaftAppendEntriesResponse,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RaftAppendEntriesApplyOutcome {
+    pub response: RaftAppendEntriesResponse,
+    pub snapshot: KvSnapshot,
+    pub snapshot_restored: bool,
+    pub committed_events: Vec<KvEvent>,
+}
+
 #[derive(Debug)]
 pub struct DurableRaftKvNode {
     node_id: NodeId,
@@ -4064,6 +6382,50 @@ impl DurableRaftKvNode {
             self.node.apply_preflighted_commit(entries, commit_index)?;
         }
         Ok(preparation.response)
+    }
+
+    pub fn apply_append_entries_with_optional_snapshot(
+        &mut self,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+    ) -> Result<RaftAppendEntriesApplyOutcome, KvError> {
+        let before_revision = self.store().revision();
+        let mut snapshot_restored = false;
+        if let Some(snapshot) = snapshot {
+            let snapshot_matches_append = append.prev_log_index >= snapshot.last_included_index
+                && (append.prev_log_index != snapshot.last_included_index
+                    || append.prev_log_term == snapshot.last_included_term);
+            let snapshot_is_newer = snapshot.last_included_index > self.applied_index();
+            let snapshot_repairs_divergent_compaction = snapshot.last_included_term
+                > self.last_log_term()
+                && snapshot.kv.revision >= self.store().revision();
+            let append_term_is_current = append.term >= self.hard_state().current_term;
+            if append_term_is_current
+                && snapshot_matches_append
+                && (snapshot_is_newer || snapshot_repairs_divergent_compaction)
+            {
+                self.restore_snapshot(snapshot)?;
+                snapshot_restored = true;
+            }
+        }
+        let response = self.append_entries(append)?;
+        let snapshot = self.store().snapshot();
+        let committed_events = if snapshot_restored || snapshot.revision == before_revision {
+            Vec::new()
+        } else {
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.revision > before_revision)
+                .cloned()
+                .collect()
+        };
+        Ok(RaftAppendEntriesApplyOutcome {
+            response,
+            snapshot,
+            snapshot_restored,
+            committed_events,
+        })
     }
 
     pub fn request_vote(
@@ -4736,6 +7098,122 @@ fn write_object_file_bytes_if_changed(path: &Path, content: &[u8]) -> Result<boo
     Ok(true)
 }
 
+fn write_object_file_bytes_create_new_serialized(
+    path: &Path,
+    content: &[u8],
+) -> Result<bool, KvError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| KvError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sobj");
+    let temp_path = parent.join(format!(
+        ".{file_name}.create-new-tmp-{}-{}",
+        std::process::id(),
+        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_temp_result = (|| -> Result<(), KvError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|source| KvError::Io {
+                path: temp_path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        file.write_all(content).map_err(|source| KvError::Io {
+            path: temp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        file.sync_data().map_err(|source| KvError::Io {
+            path: temp_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        Ok(())
+    })();
+    if let Err(error) = write_temp_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    match fs::hard_link(&temp_path, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temp_path);
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temp_path);
+            return Ok(false);
+        }
+        Err(source) if hard_link_unsupported(&source) => {
+            match fs::metadata(path) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&temp_path);
+                    return Ok(false);
+                }
+                Err(metadata_source) if metadata_source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(metadata_source) => {
+                    let _ = fs::remove_file(&temp_path);
+                    return Err(KvError::Io {
+                        path: path.display().to_string(),
+                        detail: metadata_source.to_string(),
+                    });
+                }
+            }
+            if let Err(rename_source) = fs::rename(&temp_path, path) {
+                let existed = path.exists();
+                let _ = fs::remove_file(&temp_path);
+                if existed
+                    && matches!(
+                        rename_source.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                    )
+                {
+                    return Ok(false);
+                }
+                return Err(KvError::Io {
+                    path: format!("{} -> {}", temp_path.display(), path.display()),
+                    detail: rename_source.to_string(),
+                });
+            }
+        }
+        Err(source) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(KvError::Io {
+                path: format!("{} -> {}", temp_path.display(), path.display()),
+                detail: source.to_string(),
+            });
+        }
+    }
+
+    sync_directory(parent)?;
+    let content_hash = blake3::hash(content);
+    let (modified, ino) = file_modified_and_ino(path);
+    record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
+    Ok(true)
+}
+
+fn hard_link_unsupported(source: &std::io::Error) -> bool {
+    source.kind() == std::io::ErrorKind::Unsupported
+        || matches!(
+            source.raw_os_error(),
+            Some(
+                1     // EPERM on Unix filesystems that disallow hard links.
+                    | 18   // EXDEV, kept defensive even though temp and target share a directory.
+                    | 38   // ENOSYS
+                    | 45   // EOPNOTSUPP on macOS/BSD
+                    | 50   // ERROR_NOT_SUPPORTED on Windows
+                    | 95   // EOPNOTSUPP on Linux
+                    | 1314 // ERROR_PRIVILEGE_NOT_HELD on Windows
+            )
+        )
+}
+
 fn replace_file(temp_path: &Path, path: &Path) -> Result<(), KvError> {
     match fs::rename(temp_path, path) {
         Ok(()) => Ok(()),
@@ -4868,10 +7346,6 @@ fn sync_directory(path: &Path) -> Result<(), KvError> {
         })
 }
 
-pub fn cluster_member_key(node_id: &NodeId) -> String {
-    format!("/cluster/members/{node_id}")
-}
-
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
 pub enum KvError {
     #[error("requested revision {requested:?} has been compacted at {compacted:?}")]
@@ -4974,9 +7448,6 @@ pub enum KvError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::{ClusterMemberRecord, Id};
-
-    type ClusterId = Id;
 
     static OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX: std::sync::Mutex<()> =
         std::sync::Mutex::new(());
@@ -4986,6 +7457,1806 @@ mod tests {
     struct TestRecord {
         name: String,
         count: u64,
+    }
+
+    #[test]
+    fn cluster_kv_rpc_routes_group_storage_routes() {
+        assert_eq!(CLUSTER_KV_RPC_CATEGORY, "cluster.kv");
+        assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_SNAPSHOT_ROUTE));
+        assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
+        for route in CLUSTER_KV_READ_WATCH_ROUTES {
+            assert!(CLUSTER_KV_RPC_ROUTES.contains(route));
+        }
+        assert!(!CLUSTER_KV_READ_WATCH_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
+    }
+
+    #[test]
+    fn cluster_kv_rpc_payloads_encode_storage_owned_bodies() {
+        let snapshot_payload = cluster_kv_snapshot_rpc_payload().expect("snapshot rpc payload");
+        assert_eq!(snapshot_payload.route, CLUSTER_KV_SNAPSHOT_ROUTE);
+        assert_eq!(snapshot_payload.category, CLUSTER_KV_RPC_CATEGORY);
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<()>(&snapshot_payload.body)
+                .expect("snapshot request body"),
+            ()
+        );
+
+        let txn = KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key: "/rpc/payload".to_string(),
+                value: b"value".to_vec(),
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        };
+        let txn_payload = cluster_kv_txn_rpc_payload(&txn).expect("txn rpc payload");
+        assert_eq!(txn_payload.route, CLUSTER_KV_TXN_ROUTE);
+        assert_eq!(txn_payload.category, CLUSTER_KV_RPC_CATEGORY);
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<KvTxn>(&txn_payload.body).expect("txn request body"),
+            txn
+        );
+
+        let snapshot = KvSnapshot {
+            revision: KvRevision(7),
+            compacted_revision: KvRevision::ZERO,
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events: Vec::new(),
+        };
+        let snapshot_body = encode_cluster_kv_rpc_body(&snapshot).expect("snapshot response body");
+        assert_eq!(
+            decode_cluster_kv_snapshot_rpc_body(&snapshot_body).expect("snapshot response body"),
+            snapshot
+        );
+
+        let txn_response = KvTxnResponse {
+            succeeded: true,
+            revision: KvRevision(9),
+            responses: Vec::new(),
+        };
+        let txn_response_body =
+            encode_cluster_kv_rpc_body(&txn_response).expect("txn response body");
+        assert_eq!(
+            decode_cluster_kv_txn_rpc_body(&txn_response_body).expect("txn response body"),
+            txn_response
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct FixedLocalReadWatchHost {
+        seen_range_prefix: Option<String>,
+        created_watch: Option<ClusterKvWatchPrefixRequest>,
+        drained_watch: Option<ClusterKvWatchDrainRequest>,
+        cancelled_watch: Option<ClusterKvWatchCancelRequest>,
+    }
+
+    impl ClusterKvLocalReadWatchHost for FixedLocalReadWatchHost {
+        type Error = KvError;
+
+        fn range_prefix(&mut self, prefix: &str) -> Result<Vec<KvEntry>, Self::Error> {
+            self.seen_range_prefix = Some(prefix.to_string());
+            Ok(vec![KvEntry {
+                key: format!("{prefix}/value"),
+                value: b"value".to_vec(),
+                create_revision: KvRevision(1),
+                modify_revision: KvRevision(1),
+                version: KvVersion(1),
+                lease_id: None,
+            }])
+        }
+
+        fn create_watch(
+            &mut self,
+            request: ClusterKvWatchPrefixRequest,
+        ) -> Result<ClusterKvWatchRegistration, Self::Error> {
+            self.created_watch = Some(request.clone());
+            Ok(ClusterKvWatchRegistration {
+                watch_id: WatchId(7),
+                prefix: request.prefix,
+                next_revision: request.start_revision,
+            })
+        }
+
+        fn drain_watch(
+            &mut self,
+            request: ClusterKvWatchDrainRequest,
+        ) -> Result<ClusterKvWatchDrainResponse, Self::Error> {
+            self.drained_watch = Some(request.clone());
+            Ok(ClusterKvWatchDrainResponse {
+                watch_id: request.watch_id,
+                events: Vec::new(),
+                next_revision: KvRevision(11),
+            })
+        }
+
+        fn cancel_watch(
+            &mut self,
+            request: ClusterKvWatchCancelRequest,
+        ) -> Result<ClusterKvWatchCancelResponse, Self::Error> {
+            self.cancelled_watch = Some(request.clone());
+            Ok(ClusterKvWatchCancelResponse {
+                watch_id: request.watch_id,
+                cancelled: true,
+            })
+        }
+    }
+
+    #[test]
+    fn cluster_kv_local_read_watch_rpc_dispatch_is_storage_owned() {
+        let mut host = FixedLocalReadWatchHost::default();
+
+        let range_body =
+            encode_cluster_kv_rpc_body(&"/svc".to_string()).expect("range request body");
+        let range_payload = handle_cluster_kv_local_read_watch_rpc_payload(
+            CLUSTER_KV_RANGE_PREFIX_ROUTE,
+            &range_body,
+            &mut host,
+        )
+        .expect("range dispatch")
+        .expect("range route");
+        assert_eq!(range_payload.route, CLUSTER_KV_RANGE_PREFIX_ROUTE);
+        assert_eq!(range_payload.category, CLUSTER_KV_RPC_CATEGORY);
+        assert_eq!(host.seen_range_prefix.as_deref(), Some("/svc"));
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<Vec<KvEntry>>(&range_payload.body)
+                .expect("range response body")
+                .first()
+                .map(|entry| entry.key.as_str()),
+            Some("/svc/value")
+        );
+
+        let watch_request = ClusterKvWatchPrefixRequest {
+            prefix: "/svc".to_string(),
+            start_revision: KvRevision(3),
+        };
+        let watch_body = encode_cluster_kv_rpc_body(&watch_request).expect("watch request body");
+        let watch_payload = handle_cluster_kv_local_read_watch_rpc_payload(
+            CLUSTER_KV_WATCH_PREFIX_ROUTE,
+            &watch_body,
+            &mut host,
+        )
+        .expect("watch dispatch")
+        .expect("watch route");
+        assert_eq!(watch_payload.route, CLUSTER_KV_WATCH_PREFIX_ROUTE);
+        assert_eq!(host.created_watch, Some(watch_request));
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<ClusterKvWatchRegistration>(&watch_payload.body)
+                .expect("watch response body")
+                .watch_id,
+            WatchId(7)
+        );
+
+        let drain_request = ClusterKvWatchDrainRequest {
+            watch_id: WatchId(7),
+            wait_timeout_millis: 5,
+        };
+        let drain_body = encode_cluster_kv_rpc_body(&drain_request).expect("drain request body");
+        let drain_payload = handle_cluster_kv_local_read_watch_rpc_payload(
+            CLUSTER_KV_WATCH_DRAIN_ROUTE,
+            &drain_body,
+            &mut host,
+        )
+        .expect("drain dispatch")
+        .expect("drain route");
+        assert_eq!(drain_payload.route, CLUSTER_KV_WATCH_DRAIN_ROUTE);
+        assert_eq!(host.drained_watch, Some(drain_request));
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<ClusterKvWatchDrainResponse>(&drain_payload.body)
+                .expect("drain response body")
+                .next_revision,
+            KvRevision(11)
+        );
+
+        let cancel_request = ClusterKvWatchCancelRequest {
+            watch_id: WatchId(7),
+        };
+        let cancel_body = encode_cluster_kv_rpc_body(&cancel_request).expect("cancel request body");
+        let cancel_payload = handle_cluster_kv_local_read_watch_rpc_payload(
+            CLUSTER_KV_WATCH_CANCEL_ROUTE,
+            &cancel_body,
+            &mut host,
+        )
+        .expect("cancel dispatch")
+        .expect("cancel route");
+        assert_eq!(cancel_payload.route, CLUSTER_KV_WATCH_CANCEL_ROUTE);
+        assert_eq!(host.cancelled_watch, Some(cancel_request));
+        assert!(
+            decode_cluster_kv_rpc_body::<ClusterKvWatchCancelResponse>(&cancel_payload.body)
+                .expect("cancel response body")
+                .cancelled
+        );
+
+        assert!(
+            handle_cluster_kv_local_read_watch_rpc_payload(
+                CLUSTER_KV_WATCH_EVENTS_ROUTE,
+                &[],
+                &mut host,
+            )
+            .expect("watch events stays external")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cluster_kv_paths_define_cluster_storage_layout() {
+        let root = PathBuf::from("/sinomo-cluster");
+        let paths = ClusterKvPaths::new(&root);
+
+        assert_eq!(paths.snapshot, root.join("kv-snapshot.sobj"));
+        assert_eq!(paths.raft, root.join("kv-raft"));
+        assert_eq!(paths.watches, root.join("watches"));
+        assert_eq!(paths.watches_lock, root.join("watches.lock"));
+        assert_eq!(paths.watches_next_id, root.join("watches-next.sobj"));
+        assert_eq!(paths.watch_events, root.join("watch-events.sobj"));
+        assert_eq!(paths.watch_events_log, root.join("watch-events.sobjlog"));
+        let node_id = NodeId::from_legacy_named("node_path_layout").expect("node");
+        assert_eq!(
+            paths.raft_wal_paths(&node_id).root,
+            root.join("kv-raft").join(node_id.as_str())
+        );
+        assert_eq!(
+            paths.watch_path(WatchId(7)),
+            root.join("watches/watch-7.sobj")
+        );
+    }
+
+    #[test]
+    fn cluster_kv_paths_prefix_read_uses_materialized_snapshot_limits() {
+        let root = temp_raft_root("sinomo-kv-cluster-prefix-read");
+        let paths = ClusterKvPaths::new(root.clone());
+        let cache = paths.local_cache();
+        let mut store = InProcessKvStore::new();
+        for (key, value) in [
+            ("/apps/a", b"one".to_vec()),
+            ("/apps/b", b"two".to_vec()),
+            ("/other/c", b"three".to_vec()),
+        ] {
+            store.put(key, value, None).expect("put");
+        }
+        cache
+            .write_snapshot(&store.snapshot())
+            .expect("write materialized snapshot");
+
+        let entries = read_cluster_kv_prefix_entries(&paths, "/apps/").expect("read prefix");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/apps/a", "/apps/b"]
+        );
+
+        let error = read_cluster_kv_prefix_entries_limited(&paths, "/apps/", 1)
+            .expect_err("prefix entry limit");
+        assert_eq!(
+            error,
+            KvError::RangeLimit {
+                prefix: "/apps/".to_string(),
+                max_entries: 1,
+            }
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_paths_read_missing_materialized_snapshot_as_empty() {
+        let root = temp_raft_root("sinomo-kv-cluster-missing-snapshot-read");
+        let paths = ClusterKvPaths::new(root.clone());
+
+        assert_eq!(
+            read_cluster_kv_entry(&paths, "/missing").expect("read missing entry"),
+            None
+        );
+        assert_eq!(
+            read_cluster_kv_prefix_entries(&paths, "/missing/").expect("read missing prefix"),
+            Vec::new()
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_drain_events_filter_sort_and_dedupe() {
+        let duplicate = test_kv_put_event(5, "/svc/b", b"b");
+        let persisted_events = vec![
+            test_kv_put_event(3, "/svc/c", b"c"),
+            test_kv_put_event(2, "/svc/old", b"old"),
+            test_kv_put_event(4, "/other/a", b"other"),
+            duplicate.clone(),
+        ];
+        let snapshot = test_kv_snapshot_with_events(vec![
+            test_kv_put_event(4, "/svc/a", b"a"),
+            duplicate,
+            test_kv_delete_event(6, "/svc/d"),
+        ]);
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(9),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(3),
+        };
+
+        let events = collect_cluster_kv_watch_drain_events(
+            &persisted_events,
+            &snapshot,
+            &registration,
+            usize::MAX,
+        );
+
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| (event.revision.0, event.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "/svc/c"), (4, "/svc/a"), (5, "/svc/b"), (6, "/svc/d")]
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
+        let events = vec![
+            test_kv_put_event(7, "/svc/a", b"a"),
+            test_kv_put_event(7, "/svc/b", b"larger-than-limit"),
+            test_kv_put_event(8, "/svc/c", b"c"),
+        ];
+        let snapshot = test_kv_snapshot_with_events(Vec::new());
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(10),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(7),
+        };
+        let max_payload_bytes = cluster_kv_watch_event_payload_bytes(&events[0]);
+
+        let drained = collect_cluster_kv_watch_drain_events(
+            &events,
+            &snapshot,
+            &registration,
+            max_payload_bytes,
+        );
+
+        assert_eq!(
+            drained
+                .iter()
+                .map(|event| (event.revision.0, event.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(7, "/svc/a"), (7, "/svc/b")]
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_cursor_persist_policy_uses_storage_thresholds() {
+        assert!(!cluster_kv_watch_registration_cursor_should_persist(
+            1,
+            KvRevision(2),
+            KvRevision(1),
+            true,
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(cluster_kv_watch_registration_cursor_should_persist(
+            CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_EVENTS,
+            KvRevision(2),
+            KvRevision(1),
+            true,
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(cluster_kv_watch_registration_cursor_should_persist(
+            1,
+            KvRevision(CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG + 1),
+            KvRevision(1),
+            true,
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(cluster_kv_watch_registration_cursor_should_persist(
+            1,
+            KvRevision(2),
+            KvRevision(1),
+            false,
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(cluster_kv_watch_registration_cursor_should_persist(
+            1,
+            KvRevision(2),
+            KvRevision(1),
+            true,
+            None,
+        ));
+        assert!(cluster_kv_watch_registration_cursor_should_persist(
+            1,
+            KvRevision(2),
+            KvRevision(1),
+            true,
+            Some(CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_AGE),
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_materialized_snapshot_deferral_is_key_predicate_driven() {
+        let events = vec![
+            test_kv_put_event(1, "/deferred/a", b"a"),
+            test_kv_delete_event(2, "/deferred/b"),
+        ];
+
+        assert!(cluster_kv_events_can_defer_materialized_snapshot(
+            &events,
+            |key| key.starts_with("/deferred/"),
+        ));
+
+        let mixed_events = vec![
+            test_kv_put_event(1, "/deferred/a", b"a"),
+            test_kv_put_event(2, "/durable/a", b"a"),
+        ];
+        assert!(!cluster_kv_events_can_defer_materialized_snapshot(
+            &mixed_events,
+            |key| key.starts_with("/deferred/"),
+        ));
+        assert!(!cluster_kv_events_can_defer_materialized_snapshot(
+            &[],
+            |key| key.starts_with("/deferred/"),
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_snapshot_delta_defers_only_predicate_matched_changes() {
+        let entry = |key: &str, value: &[u8]| KvEntry {
+            key: key.to_string(),
+            value: value.to_vec(),
+            create_revision: KvRevision(1),
+            modify_revision: KvRevision(1),
+            version: KvVersion(1),
+            lease_id: None,
+        };
+        let snapshot = |revision: u64, entries: Vec<KvEntry>| KvSnapshot {
+            revision: KvRevision(revision),
+            compacted_revision: KvRevision::ZERO,
+            entries,
+            leases: Vec::new(),
+            events: Vec::new(),
+        };
+        let key_can_defer = |key: &str| key.starts_with("/deferred/");
+
+        let existing = snapshot(
+            1,
+            vec![entry("/deferred/a", b"old"), entry("/durable/a", b"same")],
+        );
+        let deferable_change = snapshot(
+            2,
+            vec![entry("/deferred/a", b"new"), entry("/durable/a", b"same")],
+        );
+        let durable_change = snapshot(
+            3,
+            vec![entry("/deferred/a", b"old"), entry("/durable/a", b"new")],
+        );
+
+        assert!(cluster_kv_snapshot_delta_only_deferable(
+            &existing,
+            &deferable_change,
+            key_can_defer,
+        ));
+        assert!(!cluster_kv_snapshot_delta_only_deferable(
+            &existing,
+            &durable_change,
+            key_can_defer,
+        ));
+        assert!(!cluster_kv_snapshot_delta_only_deferable(
+            &existing,
+            &existing,
+            key_can_defer,
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_materialized_snapshot_freshness_uses_storage_thresholds() {
+        assert!(cluster_kv_materialized_snapshot_is_fresh_enough_against(
+            KvRevision(10),
+            KvRevision(11),
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(!cluster_kv_materialized_snapshot_is_fresh_enough_against(
+            KvRevision(12),
+            KvRevision(11),
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(!cluster_kv_materialized_snapshot_is_fresh_enough_against(
+            KvRevision(1),
+            KvRevision(1 + CLUSTER_KV_DEFERRED_MATERIALIZED_MAX_REVISION_LAG),
+            Some(Duration::from_secs(1)),
+        ));
+        assert!(!cluster_kv_materialized_snapshot_is_fresh_enough_against(
+            KvRevision(10),
+            KvRevision(11),
+            None,
+        ));
+        assert!(!cluster_kv_materialized_snapshot_is_fresh_enough_against(
+            KvRevision(10),
+            KvRevision(11),
+            Some(CLUSTER_KV_DEFERRED_MATERIALIZED_MIN_INTERVAL),
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_event_containment_and_snapshot_compare_are_storage_semantics() {
+        let retained = vec![
+            test_kv_put_event(1, "/kv/a", b"a"),
+            test_kv_delete_event(2, "/kv/b"),
+        ];
+        assert!(cluster_kv_events_contain_all(
+            &retained,
+            &[test_kv_put_event(1, "/kv/a", b"a")],
+        ));
+        assert!(!cluster_kv_events_contain_all(
+            &retained,
+            &[test_kv_put_event(1, "/kv/a", b"changed")],
+        ));
+
+        let snapshot = KvSnapshot {
+            revision: KvRevision(3),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![KvEntry {
+                key: "/kv/a".to_string(),
+                value: b"a".to_vec(),
+                create_revision: KvRevision(1),
+                modify_revision: KvRevision(3),
+                version: KvVersion(2),
+                lease_id: Some(LeaseId(7)),
+            }],
+            leases: Vec::new(),
+            events: Vec::new(),
+        };
+        assert!(cluster_kv_snapshot_compare(
+            &snapshot,
+            &KvCompare::Exists {
+                key: "/kv/a".to_string(),
+            },
+        ));
+        assert!(cluster_kv_snapshot_compare(
+            &snapshot,
+            &KvCompare::ValueEquals {
+                key: "/kv/a".to_string(),
+                value: b"a".to_vec(),
+            },
+        ));
+        assert!(cluster_kv_snapshot_compare(
+            &snapshot,
+            &KvCompare::LeaseEquals {
+                key: "/kv/a".to_string(),
+                lease_id: Some(LeaseId(7)),
+            },
+        ));
+        assert!(!cluster_kv_snapshot_compare(
+            &snapshot,
+            &KvCompare::ModifyRevisionEquals {
+                key: "/kv/a".to_string(),
+                revision: KvRevision(2),
+            },
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_payload_bytes_count_keys_and_put_values() {
+        let put = test_kv_put_event(1, "/svc/value", b"payload");
+        let delete = test_kv_delete_event(2, "/svc/deleted");
+
+        assert_eq!(
+            cluster_kv_watch_event_payload_bytes(&put),
+            "/svc/value".len() + "payload".len()
+        );
+        assert_eq!(
+            cluster_kv_watch_event_payload_bytes(&delete),
+            "/svc/deleted".len()
+        );
+        assert_eq!(
+            cluster_kv_watch_events_payload_bytes(&[put, delete]),
+            "/svc/value".len() + "payload".len() + "/svc/deleted".len()
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_fanout_batch_validation_enforces_storage_limits() {
+        let events = vec![
+            test_kv_put_event(1, "/svc/a", b"a"),
+            test_kv_put_event(2, "/svc/b", b"larger"),
+            test_kv_delete_event(3, "/svc/c"),
+        ];
+
+        assert_eq!(
+            validate_cluster_kv_watch_event_fanout_batch_with_limits(&events, 2, usize::MAX),
+            Err(ClusterKvWatchEventFanoutBatchLimit::EventCount {
+                observed_events: 3,
+                max_events: 2,
+            })
+        );
+
+        let payload_bytes = cluster_kv_watch_events_payload_bytes(&events);
+        assert_eq!(
+            validate_cluster_kv_watch_event_fanout_batch_with_limits(
+                &events,
+                events.len(),
+                payload_bytes - 1,
+            ),
+            Err(ClusterKvWatchEventFanoutBatchLimit::PayloadBytes {
+                observed_bytes: payload_bytes,
+                max_bytes: payload_bytes - 1,
+            })
+        );
+
+        assert!(
+            validate_cluster_kv_watch_event_fanout_batch_with_limits(
+                &events,
+                events.len(),
+                payload_bytes,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_fanout_batches_are_storage_limited() {
+        let events = (0..5)
+            .map(|index| test_kv_put_event(index + 1, &format!("/svc/{index}"), b"payload"))
+            .collect::<Vec<_>>();
+
+        let count_limited =
+            cluster_kv_watch_event_fanout_batches_with_limits(&events, 2, usize::MAX);
+        assert_eq!(
+            count_limited
+                .iter()
+                .map(|batch| batch.len())
+                .collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+
+        let payload_limited =
+            cluster_kv_watch_event_fanout_batches_with_limits(&events, events.len(), 20);
+        assert_eq!(
+            payload_limited
+                .iter()
+                .map(|batch| batch.len())
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            payload_limited
+                .iter()
+                .flat_map(|batch| batch.iter().map(|event| event.revision))
+                .collect::<Vec<_>>(),
+            events
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_compaction_sorts_dedupes_and_bounds_retained_events() {
+        let duplicate = test_kv_put_event(3, "/svc/b", b"b");
+        let compacted = compact_cluster_kv_watch_events(vec![
+            duplicate.clone(),
+            test_kv_put_event(1, "/svc/a", b"a"),
+            duplicate,
+            test_kv_delete_event(2, "/svc/deleted"),
+        ]);
+
+        assert_eq!(
+            compacted
+                .iter()
+                .map(|event| (event.revision.0, event.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "/svc/a"), (2, "/svc/deleted"), (3, "/svc/b")]
+        );
+
+        let bounded = (0..(MAX_CLUSTER_KV_WATCH_EVENTS + 4))
+            .map(|index| test_kv_put_event(index as u64 + 1, &format!("/svc/{index}"), b"value"))
+            .collect::<Vec<_>>();
+        let compacted = compact_cluster_kv_watch_events(bounded);
+        assert_eq!(compacted.len(), MAX_CLUSTER_KV_WATCH_EVENTS);
+        assert_eq!(
+            compacted.first().expect("first retained").revision,
+            KvRevision(5)
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_compaction_keeps_cutoff_revision_group() {
+        let mut events = vec![test_kv_put_event(1, "/svc/old", b"old")];
+        for index in 0..5 {
+            events.push(test_kv_put_event(
+                2,
+                &format!("/svc/group/{index}"),
+                b"group",
+            ));
+        }
+        for index in 0..(MAX_CLUSTER_KV_WATCH_EVENTS - 2) {
+            events.push(test_kv_put_event(
+                index as u64 + 3,
+                &format!("/svc/new/{index}"),
+                b"new",
+            ));
+        }
+
+        let compacted = compact_cluster_kv_watch_events(events);
+        assert_eq!(compacted.len(), MAX_CLUSTER_KV_WATCH_EVENTS + 3);
+        assert_eq!(
+            compacted.first().expect("first retained").revision,
+            KvRevision(2)
+        );
+        assert!(
+            compacted
+                .iter()
+                .take(5)
+                .all(|event| event.revision == KvRevision(2))
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_incremental_compaction_skips_duplicates() {
+        let first = test_kv_put_event(1, "/svc/a", b"a");
+        let second = test_kv_put_event(2, "/svc/b", b"b");
+
+        let retained = compact_cluster_kv_watch_events_incremental(
+            vec![first.clone()],
+            &[first.clone(), second.clone()],
+        );
+
+        assert_eq!(retained, vec![first.clone(), second.clone()]);
+        assert!(cluster_kv_events_contain(&retained, &first));
+        assert!(cluster_kv_events_contain(&retained, &second));
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_append_checkpoint_policy_uses_storage_limits() {
+        assert!(!cluster_kv_watch_event_append_should_checkpoint(
+            1, 1, 0, 0, 1
+        ));
+        assert!(cluster_kv_watch_event_append_should_checkpoint(
+            MAX_CLUSTER_KV_WATCH_EVENTS + 1,
+            1,
+            0,
+            0,
+            1,
+        ));
+        assert!(cluster_kv_watch_event_append_should_checkpoint(
+            1,
+            1,
+            MAX_CLUSTER_KV_WATCH_EVENT_LOG_RECORDS - 1,
+            0,
+            1,
+        ));
+        assert!(cluster_kv_watch_event_append_should_checkpoint(
+            1,
+            1,
+            0,
+            MAX_CLUSTER_KV_WATCH_EVENT_LOG_BYTES - 1,
+            1,
+        ));
+        assert!(cluster_kv_watch_event_append_should_checkpoint(
+            1,
+            1,
+            usize::MAX,
+            u64::MAX,
+            u64::MAX,
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_log_open_for_append_creates_and_reopens_log() {
+        let root = temp_raft_root("sinomo-kv-watch-event-log-open");
+        let paths = ClusterKvPaths::new(root.clone());
+
+        let first = open_cluster_kv_watch_event_log_for_append(&paths).expect("open new log");
+        lock_cluster_kv_watch_event_log_for_append(&paths, &first).expect("lock new log");
+        assert!(paths.watch_events_log.exists());
+        first.unlock().expect("unlock new log");
+        drop(first);
+
+        let mut second =
+            open_cluster_kv_watch_event_log_for_append(&paths).expect("reopen existing log");
+        lock_cluster_kv_watch_event_log_for_append(&paths, &second).expect("lock reopened log");
+        let batch =
+            encode_cluster_kv_watch_event_log_batch(&[test_kv_put_event(1, "/svc/a", b"a")])
+                .expect("encode log");
+        append_cluster_kv_watch_event_log_batch_to_file(&paths, &mut second, &batch)
+            .expect("append reopened log");
+        second.unlock().expect("unlock reopened log");
+        drop(second);
+
+        let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
+        assert_eq!(read.records, 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_log_batch_encodes_records_and_bytes() {
+        let events = vec![
+            test_kv_put_event(1, "/svc/a", b"a"),
+            test_kv_delete_event(2, "/svc/b"),
+        ];
+
+        let batch = encode_cluster_kv_watch_event_log_batch(&events).expect("encode batch");
+
+        assert_eq!(batch.records.len(), events.len());
+        assert_eq!(
+            batch.bytes,
+            batch
+                .records
+                .iter()
+                .map(|record| 4_u64 + record.len() as u64)
+                .sum::<u64>()
+        );
+        let decoded = batch
+            .records
+            .iter()
+            .map(|record| decode_cluster_kv_watch_event_log_record(record))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode records");
+        assert_eq!(decoded, events);
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_log_batch_appends_to_log_file() {
+        let root = temp_raft_root("sinomo-kv-watch-event-log-append");
+        let paths = ClusterKvPaths::new(root.clone());
+        let parent = paths.watch_events_log.parent().expect("log parent");
+        std::fs::create_dir_all(parent).expect("create log parent");
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&paths.watch_events_log)
+            .expect("open log");
+        let events = vec![
+            test_kv_put_event(1, "/svc/a", b"a"),
+            test_kv_delete_event(2, "/svc/b"),
+        ];
+        let batch = encode_cluster_kv_watch_event_log_batch(&events).expect("encode log");
+
+        assert_eq!(
+            append_cluster_kv_watch_event_log_batch_to_file(&paths, &mut log_file, &batch)
+                .expect("append log"),
+            batch.bytes
+        );
+        drop(log_file);
+
+        let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
+        assert_eq!(read.events, events);
+        assert_eq!(read.records, 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_log_truncates_log_file() {
+        let root = temp_raft_root("sinomo-kv-watch-event-log-truncate");
+        let paths = ClusterKvPaths::new(root.clone());
+        let parent = paths.watch_events_log.parent().expect("log parent");
+        std::fs::create_dir_all(parent).expect("create log parent");
+        let mut log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&paths.watch_events_log)
+            .expect("open log");
+        let batch = encode_cluster_kv_watch_event_log_batch(&[
+            test_kv_put_event(1, "/svc/a", b"a"),
+            test_kv_delete_event(2, "/svc/b"),
+        ])
+        .expect("encode log");
+        append_cluster_kv_watch_event_log_batch_to_file(&paths, &mut log_file, &batch)
+            .expect("append log");
+
+        truncate_cluster_kv_watch_event_log_file(&paths, &mut log_file).expect("truncate log");
+        drop(log_file);
+
+        let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
+        assert!(read.events.is_empty());
+        assert_eq!(read.records, 0);
+        assert_eq!(
+            std::fs::metadata(&paths.watch_events_log)
+                .expect("log metadata")
+                .len(),
+            0
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_events_read_merges_checkpoint_and_log() {
+        let root = temp_raft_root("sinomo-kv-watch-events-read");
+        let paths = ClusterKvPaths::new(root.clone());
+        let checkpoint = vec![
+            test_kv_put_event(1, "/svc/a", b"a"),
+            test_kv_put_event(2, "/svc/b", b"b"),
+        ];
+        write_cluster_kv_watch_event_checkpoint(&paths, &checkpoint).expect("checkpoint");
+
+        let log_events = vec![
+            test_kv_put_event(3, "/svc/c", b"c"),
+            test_kv_put_event(4, "/svc/d", b"d"),
+        ];
+        let batch = encode_cluster_kv_watch_event_log_batch(&log_events).expect("encode log");
+        let parent = paths.watch_events_log.parent().expect("log parent");
+        std::fs::create_dir_all(parent).expect("create log parent");
+        let mut log_file = std::fs::File::create(&paths.watch_events_log).expect("create log");
+        for record in &batch.records {
+            let len = u32::try_from(record.len()).expect("record length");
+            log_file
+                .write_all(&len.to_be_bytes())
+                .and_then(|()| log_file.write_all(record))
+                .expect("write log record");
+        }
+        log_file.sync_data().expect("sync log");
+
+        let mut observed_read_bytes = 0_u64;
+        let read = read_cluster_kv_watch_events_with_observer(&paths, |bytes| {
+            observed_read_bytes = observed_read_bytes.saturating_add(bytes);
+        })
+        .expect("read watch events");
+
+        assert_eq!(read.log_records, log_events.len());
+        assert!(read.append_safe);
+        assert_eq!(
+            read.events
+                .iter()
+                .map(|event| event.revision)
+                .collect::<Vec<_>>(),
+            vec![KvRevision(1), KvRevision(2), KvRevision(3), KvRevision(4)]
+        );
+        assert_eq!(observed_read_bytes, batch.bytes);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_events_append_to_storage_uses_cache_view() {
+        let root = temp_raft_root("sinomo-kv-watch-events-append-storage");
+        let paths = ClusterKvPaths::new(root.clone());
+        let first = test_kv_put_event(1, "/svc/a", b"a");
+        let second = test_kv_put_event(2, "/svc/b", b"b");
+        let mut observed_read_bytes = 0_u64;
+        let mut observed_write_bytes = 0_u64;
+
+        let first_report = append_cluster_kv_watch_events_to_storage_with_observers(
+            &paths,
+            &[first.clone(), second.clone()],
+            None,
+            |bytes| observed_read_bytes = observed_read_bytes.saturating_add(bytes),
+            |bytes| observed_write_bytes = observed_write_bytes.saturating_add(bytes),
+        )
+        .expect("append first batch");
+
+        assert_eq!(first_report.appended, vec![first.clone(), second.clone()]);
+        assert_eq!(first_report.retained, vec![first.clone(), second.clone()]);
+        assert_eq!(first_report.log_records, 2);
+        assert!(first_report.append_safe);
+        assert_eq!(observed_read_bytes, 0);
+        assert!(observed_write_bytes > 0);
+
+        let log_bytes = std::fs::metadata(&paths.watch_events_log)
+            .expect("log metadata")
+            .len();
+        let cache = ClusterKvWatchEventAppendCacheView {
+            events: first_report.retained.clone(),
+            log_records: first_report.log_records,
+            log_bytes,
+            append_safe: first_report.append_safe,
+        };
+        observed_read_bytes = 0;
+        observed_write_bytes = 0;
+        let duplicate_report = append_cluster_kv_watch_events_to_storage_with_observers(
+            &paths,
+            std::slice::from_ref(&first),
+            Some(&cache),
+            |bytes| observed_read_bytes = observed_read_bytes.saturating_add(bytes),
+            |bytes| observed_write_bytes = observed_write_bytes.saturating_add(bytes),
+        )
+        .expect("append duplicate");
+
+        assert!(duplicate_report.appended.is_empty());
+        assert_eq!(duplicate_report.retained, cache.events);
+        assert_eq!(duplicate_report.log_records, cache.log_records);
+        assert_eq!(observed_read_bytes, 0);
+        assert_eq!(observed_write_bytes, 0);
+
+        let third = test_kv_put_event(3, "/svc/c", b"c");
+        observed_read_bytes = 0;
+        observed_write_bytes = 0;
+        let second_cache = ClusterKvWatchEventAppendCacheView {
+            events: duplicate_report.retained.clone(),
+            log_records: duplicate_report.log_records,
+            log_bytes,
+            append_safe: duplicate_report.append_safe,
+        };
+        let second_report = append_cluster_kv_watch_events_to_storage_with_observers(
+            &paths,
+            std::slice::from_ref(&third),
+            Some(&second_cache),
+            |bytes| observed_read_bytes = observed_read_bytes.saturating_add(bytes),
+            |bytes| observed_write_bytes = observed_write_bytes.saturating_add(bytes),
+        )
+        .expect("append second batch");
+
+        assert_eq!(second_report.appended, vec![third.clone()]);
+        assert_eq!(
+            second_report.retained,
+            vec![first.clone(), second.clone(), third.clone()]
+        );
+        assert_eq!(second_report.log_records, 3);
+        assert_eq!(observed_read_bytes, 0);
+        assert!(observed_write_bytes > 0);
+        assert_eq!(
+            read_cluster_kv_watch_events(&paths)
+                .expect("read retained events")
+                .events,
+            second_report.retained
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_file_validates_watch_id_and_removes() {
+        let root = temp_raft_root("sinomo-kv-watch-registration-file");
+        let paths = ClusterKvPaths::new(root.clone());
+        let path = paths.watch_path(WatchId(7));
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(7),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(3),
+        };
+
+        write_cluster_kv_watch_registration_file(&path, &registration).expect("write registration");
+        assert_eq!(
+            read_cluster_kv_watch_registration_file(&path, WatchId(7)).expect("read registration"),
+            registration
+        );
+        assert!(
+            !write_cluster_kv_watch_registration_file_create_new(&path, &registration)
+                .expect("create existing registration"),
+            "create-new registration writes must not clobber existing watch files"
+        );
+        assert_eq!(
+            read_cluster_kv_watch_registration_file(&path, WatchId(8)),
+            Err(KvError::UnknownWatch {
+                watch_id: WatchId(8),
+            })
+        );
+        assert!(
+            remove_cluster_kv_watch_registration_file_if_exists(&path)
+                .expect("remove registration")
+        );
+        assert!(
+            !remove_cluster_kv_watch_registration_file_if_exists(&path)
+                .expect("remove absent registration")
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_allocator_state_defaults_and_normalizes_next_id() {
+        let root = temp_raft_root("sinomo-kv-watch-allocator-state");
+        let paths = ClusterKvPaths::new(root.clone());
+
+        assert_eq!(
+            read_cluster_kv_watch_allocator_state(&paths).expect("default allocator"),
+            ClusterKvWatchAllocatorState::legacy(1)
+        );
+
+        let persisted = ClusterKvWatchAllocatorState {
+            next_watch_id: 0,
+            active_watch_count: Some(3),
+            pruned_compacted_revision: Some(KvRevision(11)),
+        };
+        write_cluster_kv_watch_allocator_state(&paths, &persisted).expect("write allocator");
+        assert_eq!(
+            read_cluster_kv_watch_allocator_state(&paths).expect("read allocator"),
+            ClusterKvWatchAllocatorState {
+                next_watch_id: 1,
+                active_watch_count: Some(3),
+                pruned_compacted_revision: Some(KvRevision(11)),
+            }
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_allocator_lock_creates_durable_lock_file() {
+        let root = temp_raft_root("sinomo-kv-watch-allocator-lock");
+        let paths = ClusterKvPaths::new(root.clone());
+
+        let lock = lock_cluster_kv_watch_allocator(&paths).expect("lock allocator");
+
+        assert!(paths.watches_lock.exists());
+        lock.unlock().expect("unlock allocator");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_allocator_scan_policy_uses_trust_count_and_compaction() {
+        let allocator = ClusterKvWatchAllocatorState {
+            next_watch_id: 5,
+            active_watch_count: Some(2),
+            pruned_compacted_revision: Some(KvRevision(7)),
+        };
+
+        assert!(cluster_kv_watch_allocator_needs_scan(
+            false,
+            &allocator,
+            KvRevision(7)
+        ));
+        assert!(!cluster_kv_watch_allocator_needs_scan(
+            true,
+            &allocator,
+            KvRevision(7)
+        ));
+        assert!(cluster_kv_watch_allocator_needs_scan(
+            true,
+            &allocator,
+            KvRevision(8)
+        ));
+        assert!(cluster_kv_watch_allocator_needs_scan(
+            true,
+            &ClusterKvWatchAllocatorState {
+                active_watch_count: None,
+                ..allocator.clone()
+            },
+            KvRevision(7)
+        ));
+        assert!(cluster_kv_watch_allocator_needs_scan(
+            true,
+            &ClusterKvWatchAllocatorState {
+                pruned_compacted_revision: None,
+                ..allocator
+            },
+            KvRevision(7)
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_watch_allocator_after_scan_repairs_next_id_and_counts() {
+        let allocator = ClusterKvWatchAllocatorState {
+            next_watch_id: 2,
+            active_watch_count: None,
+            pruned_compacted_revision: None,
+        };
+        let scan = ClusterKvWatchScanResult {
+            scanned: true,
+            removed: 1,
+            retained: 3,
+            max_seen_id: 9,
+            removed_paths: Vec::new(),
+            retained_registrations: Vec::new(),
+        };
+
+        assert_eq!(
+            cluster_kv_watch_allocator_after_scan(allocator, &scan, KvRevision(4)),
+            ClusterKvWatchAllocatorState {
+                next_watch_id: 10,
+                active_watch_count: Some(3),
+                pruned_compacted_revision: Some(KvRevision(4)),
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_allocator_after_registration_removed_updates_known_count() {
+        assert_eq!(
+            cluster_kv_watch_allocator_after_registration_removed(ClusterKvWatchAllocatorState {
+                next_watch_id: 7,
+                active_watch_count: Some(3),
+                pruned_compacted_revision: Some(KvRevision(4)),
+            }),
+            ClusterKvWatchAllocatorState {
+                next_watch_id: 7,
+                active_watch_count: Some(2),
+                pruned_compacted_revision: Some(KvRevision(4)),
+            }
+        );
+        assert_eq!(
+            cluster_kv_watch_allocator_after_registration_removed(ClusterKvWatchAllocatorState {
+                next_watch_id: 7,
+                active_watch_count: Some(0),
+                pruned_compacted_revision: Some(KvRevision(4)),
+            })
+            .active_watch_count,
+            Some(0)
+        );
+        assert_eq!(
+            cluster_kv_watch_allocator_after_registration_removed(ClusterKvWatchAllocatorState {
+                next_watch_id: 7,
+                active_watch_count: None,
+                pruned_compacted_revision: Some(KvRevision(4)),
+            })
+            .active_watch_count,
+            None
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_create_allocates_and_reports_allocator() {
+        let root = temp_raft_root("sinomo-kv-watch-create");
+        let paths = ClusterKvPaths::new(root.clone());
+
+        let first = create_cluster_kv_watch_registration(
+            &paths,
+            ClusterKvWatchPrefixRequest {
+                prefix: "/svc/first/".to_string(),
+                start_revision: KvRevision(1),
+            },
+            KvRevision::ZERO,
+            false,
+            MAX_CLUSTER_KV_ACTIVE_WATCHES,
+        )
+        .expect("create first registration");
+
+        assert_eq!(first.registration.watch_id, WatchId(1));
+        assert!(first.watch_path.exists());
+        assert_eq!(
+            first.allocator,
+            ClusterKvWatchAllocatorState {
+                next_watch_id: 2,
+                active_watch_count: Some(1),
+                pruned_compacted_revision: Some(KvRevision::ZERO),
+            }
+        );
+        assert!(
+            first.scan.as_ref().is_some_and(|scan| scan.scanned),
+            "untrusted allocator should force a watch directory scan"
+        );
+        write_cluster_kv_watch_allocator_state(&paths, &first.allocator)
+            .expect("persist allocator");
+
+        let second = create_cluster_kv_watch_registration(
+            &paths,
+            ClusterKvWatchPrefixRequest {
+                prefix: "/svc/second/".to_string(),
+                start_revision: KvRevision(1),
+            },
+            KvRevision::ZERO,
+            true,
+            MAX_CLUSTER_KV_ACTIVE_WATCHES,
+        )
+        .expect("create second registration");
+
+        assert_eq!(second.registration.watch_id, WatchId(2));
+        assert!(second.scan.is_none());
+        assert_eq!(second.allocator.active_watch_count, Some(2));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_create_prunes_and_keeps_high_watermark() {
+        let root = temp_raft_root("sinomo-kv-watch-create-scan");
+        let paths = ClusterKvPaths::new(root.clone());
+        std::fs::create_dir_all(&paths.watches).expect("watch dir");
+        let stale_path = paths.watch_path(WatchId(7));
+        let live_path = paths.watch_path(WatchId(9));
+        write_cluster_kv_watch_registration_file(
+            &stale_path,
+            &ClusterKvWatchRegistration {
+                watch_id: WatchId(7),
+                prefix: "/svc/stale/".to_string(),
+                next_revision: KvRevision(1),
+            },
+        )
+        .expect("write stale");
+        write_cluster_kv_watch_registration_file(
+            &live_path,
+            &ClusterKvWatchRegistration {
+                watch_id: WatchId(9),
+                prefix: "/svc/live/".to_string(),
+                next_revision: KvRevision(2),
+            },
+        )
+        .expect("write live");
+
+        let report = create_cluster_kv_watch_registration(
+            &paths,
+            ClusterKvWatchPrefixRequest {
+                prefix: "/svc/new/".to_string(),
+                start_revision: KvRevision(2),
+            },
+            KvRevision(1),
+            false,
+            MAX_CLUSTER_KV_ACTIVE_WATCHES,
+        )
+        .expect("create after pruning");
+
+        assert!(!stale_path.exists());
+        assert!(live_path.exists());
+        assert_eq!(report.registration.watch_id, WatchId(10));
+        assert_eq!(report.allocator.active_watch_count, Some(2));
+        let scan = report.scan.expect("scan report");
+        assert_eq!(scan.retained, 1);
+        assert_eq!(scan.removed, 1);
+        assert_eq!(scan.max_seen_id, 9);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_drain_advances_cursor_with_cache_action() {
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(3),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(1),
+        };
+        let snapshot = InProcessKvStore::new().snapshot();
+        let events = vec![
+            KvEvent {
+                revision: KvRevision(1),
+                key: "/svc/one".to_string(),
+                kind: KvEventKind::Put {
+                    value: b"one".to_vec(),
+                },
+            },
+            KvEvent {
+                revision: KvRevision(2),
+                key: "/svc/two".to_string(),
+                kind: KvEventKind::Put {
+                    value: b"two".to_vec(),
+                },
+            },
+            KvEvent {
+                revision: KvRevision(2),
+                key: "/other/two".to_string(),
+                kind: KvEventKind::Put {
+                    value: b"ignored".to_vec(),
+                },
+            },
+        ];
+
+        let report = drain_cluster_kv_watch_registration(
+            registration,
+            KvRevision(1),
+            &events,
+            &snapshot,
+            MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+            true,
+            Some(Duration::ZERO),
+        )
+        .expect("drain registration");
+
+        assert_eq!(report.response.watch_id, WatchId(3));
+        assert_eq!(report.response.next_revision, KvRevision(3));
+        assert_eq!(
+            report
+                .response
+                .events
+                .iter()
+                .map(|event| event.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/svc/one", "/svc/two"]
+        );
+        assert_eq!(report.registration.next_revision, KvRevision(3));
+        assert_eq!(
+            report.cursor_action,
+            ClusterKvWatchDrainCursorAction::CacheOnly {
+                durable_next_revision: KvRevision(1),
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_drain_reports_persist_and_compaction() {
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(5),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(1),
+        };
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/svc/one", b"one".to_vec(), None)
+            .expect("put snapshot event");
+        let snapshot = store.snapshot();
+
+        let report = drain_cluster_kv_watch_registration(
+            registration.clone(),
+            KvRevision(1),
+            &[],
+            &snapshot,
+            MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+            false,
+            Some(Duration::ZERO),
+        )
+        .expect("drain registration");
+
+        assert_eq!(report.response.next_revision, KvRevision(2));
+        assert_eq!(
+            report.cursor_action,
+            ClusterKvWatchDrainCursorAction::Persist
+        );
+
+        store.compact(KvRevision(1)).expect("compact snapshot");
+        assert!(matches!(
+            drain_cluster_kv_watch_registration(
+                registration,
+                KvRevision(1),
+                &[],
+                &store.snapshot(),
+                MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+                true,
+                Some(Duration::ZERO),
+            ),
+            Err(KvError::Compacted {
+                requested: KvRevision(1),
+                compacted: KvRevision(1),
+            })
+        ));
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_remove_reports_allocator_update() {
+        let root = temp_raft_root("sinomo-kv-watch-remove");
+        let paths = ClusterKvPaths::new(root.clone());
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(7),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(3),
+        };
+        write_cluster_kv_watch_registration_file(
+            &paths.watch_path(registration.watch_id),
+            &registration,
+        )
+        .expect("write registration");
+        write_cluster_kv_watch_allocator_state(
+            &paths,
+            &ClusterKvWatchAllocatorState {
+                next_watch_id: 8,
+                active_watch_count: Some(2),
+                pruned_compacted_revision: Some(KvRevision(1)),
+            },
+        )
+        .expect("write allocator");
+
+        let report = remove_cluster_kv_watch_registration_with_allocator(&paths, WatchId(7))
+            .expect("remove registration");
+
+        assert!(report.removed);
+        assert!(!report.watch_path.exists());
+        assert_eq!(
+            report.allocator,
+            Some(ClusterKvWatchAllocatorState {
+                next_watch_id: 8,
+                active_watch_count: Some(1),
+                pruned_compacted_revision: Some(KvRevision(1)),
+            })
+        );
+        assert!(
+            !remove_cluster_kv_watch_registration_with_allocator(&paths, WatchId(7))
+                .expect("remove absent registration")
+                .removed
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_drain_cursor_persistence_writes_only_when_needed() {
+        let root = temp_raft_root("sinomo-kv-watch-drain-cursor-persist");
+        let paths = ClusterKvPaths::new(root.clone());
+        let watch_path = paths.watch_path(WatchId(7));
+        let registration = ClusterKvWatchRegistration {
+            watch_id: WatchId(7),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(3),
+        };
+        write_cluster_kv_watch_registration_file(&watch_path, &registration)
+            .expect("write initial registration");
+        let advanced = ClusterKvWatchRegistration {
+            next_revision: KvRevision(9),
+            ..registration.clone()
+        };
+        let persist_report = ClusterKvWatchDrainRegistrationReport {
+            registration: advanced.clone(),
+            response: ClusterKvWatchDrainResponse {
+                watch_id: advanced.watch_id,
+                events: Vec::new(),
+                next_revision: advanced.next_revision,
+            },
+            cursor_action: ClusterKvWatchDrainCursorAction::Persist,
+        };
+
+        assert_eq!(
+            persist_cluster_kv_watch_drain_cursor(&watch_path, &persist_report)
+                .expect("persist cursor"),
+            ClusterKvWatchDrainCursorPersistence::Persisted {
+                registration: advanced.clone()
+            }
+        );
+        assert_eq!(
+            read_cluster_kv_watch_registration_file(&watch_path, WatchId(7))
+                .expect("read persisted registration"),
+            advanced
+        );
+
+        let cache_only = ClusterKvWatchRegistration {
+            next_revision: KvRevision(11),
+            ..registration.clone()
+        };
+        let cache_report = ClusterKvWatchDrainRegistrationReport {
+            registration: cache_only.clone(),
+            response: ClusterKvWatchDrainResponse {
+                watch_id: cache_only.watch_id,
+                events: Vec::new(),
+                next_revision: cache_only.next_revision,
+            },
+            cursor_action: ClusterKvWatchDrainCursorAction::CacheOnly {
+                durable_next_revision: advanced.next_revision,
+            },
+        };
+        assert_eq!(
+            persist_cluster_kv_watch_drain_cursor(&watch_path, &cache_report)
+                .expect("cache-only cursor"),
+            ClusterKvWatchDrainCursorPersistence::CacheOnly {
+                registration: cache_only,
+                durable_next_revision: advanced.next_revision
+            }
+        );
+        assert_eq!(
+            read_cluster_kv_watch_registration_file(&watch_path, WatchId(7))
+                .expect("read unchanged durable registration"),
+            advanced
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_scan_prunes_stale_and_invalid_registrations() {
+        let root = temp_raft_root("sinomo-kv-watch-scan");
+        let paths = ClusterKvPaths::new(root.clone());
+        std::fs::create_dir_all(&paths.watches).expect("watch dir");
+        let stale_path = paths.watch_path(WatchId(7));
+        let live_path = paths.watch_path(WatchId(9));
+        let mismatched_path = paths.watch_path(WatchId(11));
+        let corrupt_path = paths.watch_path(WatchId(13));
+        write_cluster_kv_watch_registration_file(
+            &stale_path,
+            &ClusterKvWatchRegistration {
+                watch_id: WatchId(7),
+                prefix: "/svc/stale/".to_string(),
+                next_revision: KvRevision(1),
+            },
+        )
+        .expect("write stale");
+        let live = ClusterKvWatchRegistration {
+            watch_id: WatchId(9),
+            prefix: "/svc/live/".to_string(),
+            next_revision: KvRevision(2),
+        };
+        write_cluster_kv_watch_registration_file(&live_path, &live).expect("write live");
+        write_cluster_kv_watch_registration_file(
+            &mismatched_path,
+            &ClusterKvWatchRegistration {
+                watch_id: WatchId(1),
+                prefix: "/svc/mismatched/".to_string(),
+                next_revision: KvRevision(2),
+            },
+        )
+        .expect("write mismatched");
+        std::fs::write(&corrupt_path, b"not-a-sinomo-object").expect("write corrupt");
+
+        let scan =
+            scan_cluster_kv_watch_registrations(&paths, KvRevision(1)).expect("scan watches");
+
+        assert!(scan.scanned);
+        assert_eq!(scan.retained, 1);
+        assert_eq!(scan.removed, 3);
+        assert_eq!(scan.max_seen_id, 13);
+        assert_eq!(
+            scan.retained_registrations,
+            vec![ClusterKvWatchScanRegistration {
+                path: live_path.clone(),
+                registration: live,
+            }]
+        );
+        assert!(!stale_path.exists(), "stale registration should be pruned");
+        assert!(live_path.exists(), "live registration should remain");
+        assert!(
+            !mismatched_path.exists(),
+            "mismatched registration should be pruned"
+        );
+        assert!(
+            !corrupt_path.exists(),
+            "corrupt registration should be pruned"
+        );
+        assert!(scan.removed_paths.contains(&stale_path));
+        assert!(scan.removed_paths.contains(&mismatched_path));
+        assert!(scan.removed_paths.contains(&corrupt_path));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_active_watch_registration_report_updates_allocator_after_scan() {
+        let root = temp_raft_root("sinomo-kv-active-watch-report");
+        let paths = ClusterKvPaths::new(root.clone());
+        std::fs::create_dir_all(&paths.watches).expect("watch dir");
+        let stale = ClusterKvWatchRegistration {
+            watch_id: WatchId(2),
+            prefix: "/stale/".to_string(),
+            next_revision: KvRevision(2),
+        };
+        write_cluster_kv_watch_registration_file(&paths.watch_path(stale.watch_id), &stale)
+            .expect("write stale registration");
+        let retained = ClusterKvWatchRegistration {
+            watch_id: WatchId(4),
+            prefix: "/svc/".to_string(),
+            next_revision: KvRevision(9),
+        };
+        write_cluster_kv_watch_registration_file(&paths.watch_path(retained.watch_id), &retained)
+            .expect("write retained registration");
+        write_cluster_kv_watch_allocator_state(
+            &paths,
+            &ClusterKvWatchAllocatorState {
+                next_watch_id: 3,
+                active_watch_count: Some(99),
+                pruned_compacted_revision: Some(KvRevision(1)),
+            },
+        )
+        .expect("write stale allocator");
+
+        let report = cluster_kv_active_watch_registration_report(&paths, KvRevision(5))
+            .expect("active watch report");
+
+        assert!(report.has_active);
+        assert_eq!(
+            report.allocator,
+            Some(ClusterKvWatchAllocatorState {
+                next_watch_id: 5,
+                active_watch_count: Some(1),
+                pruned_compacted_revision: Some(KvRevision(5)),
+            })
+        );
+        let scan = report.scan.expect("scan report");
+        assert_eq!(scan.retained, 1);
+        assert_eq!(scan.removed, 1);
+        assert_eq!(scan.retained_registrations[0].registration, retained);
+        assert!(
+            !paths.watch_path(stale.watch_id).exists(),
+            "stale registration should be pruned by report scan"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_id_file_names_parse_only_watch_objects() {
+        assert_eq!(
+            cluster_kv_watch_id_from_file_name("watch-42.sobj"),
+            Some(42)
+        );
+        assert_eq!(cluster_kv_watch_id_from_file_name("watch-.sobj"), None);
+        assert_eq!(cluster_kv_watch_id_from_file_name("watch-42.tmp"), None);
+        assert_eq!(cluster_kv_watch_id_from_file_name("other-42.sobj"), None);
+    }
+
+    #[test]
+    fn cluster_kv_watch_registration_listing_ignores_invalid_files() {
+        let root = temp_raft_root("sinomo-kv-watch-registration-list");
+        let paths = ClusterKvPaths::new(root.clone());
+        std::fs::create_dir_all(&paths.watches).expect("watch dir");
+        let first = ClusterKvWatchRegistration {
+            watch_id: WatchId(3),
+            prefix: "/svc/a/".to_string(),
+            next_revision: KvRevision(2),
+        };
+        let second = ClusterKvWatchRegistration {
+            watch_id: WatchId(5),
+            prefix: "/svc/b/".to_string(),
+            next_revision: KvRevision(4),
+        };
+        write_cluster_kv_watch_registration_file(&paths.watch_path(first.watch_id), &first)
+            .expect("write first");
+        write_cluster_kv_watch_registration_file(&paths.watch_path(second.watch_id), &second)
+            .expect("write second");
+        write_cluster_kv_watch_registration_file(
+            &paths.watch_path(WatchId(7)),
+            &ClusterKvWatchRegistration {
+                watch_id: WatchId(1),
+                prefix: "/svc/mismatch/".to_string(),
+                next_revision: KvRevision(1),
+            },
+        )
+        .expect("write mismatched");
+        std::fs::write(paths.watches.join("watch-9.sobj"), b"not-a-sinomo-object")
+            .expect("write corrupt");
+        std::fs::write(paths.watches.join("ignore.tmp"), b"ignored").expect("write ignored");
+
+        let mut registrations =
+            list_cluster_kv_watch_registrations(&paths).expect("list registrations");
+        registrations.sort_by_key(|registration| registration.watch_id);
+
+        assert_eq!(registrations, vec![first, second]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_events_matching_registrations_filters_by_prefix_and_revision() {
+        let registrations = vec![
+            ClusterKvWatchRegistration {
+                watch_id: WatchId(1),
+                prefix: "/svc/a/".to_string(),
+                next_revision: KvRevision(3),
+            },
+            ClusterKvWatchRegistration {
+                watch_id: WatchId(2),
+                prefix: "/svc/b/".to_string(),
+                next_revision: KvRevision(5),
+            },
+        ];
+        let events = vec![
+            test_kv_put_event(2, "/svc/a/old", b"old"),
+            test_kv_put_event(3, "/svc/a/current", b"current"),
+            test_kv_put_event(5, "/svc/b/current", b"current"),
+            test_kv_put_event(6, "/svc/c/ignored", b"ignored"),
+        ];
+
+        let matched = cluster_kv_watch_events_matching_registrations(&registrations, &events);
+
+        assert_eq!(
+            matched
+                .iter()
+                .map(|event| (event.revision.0, event.key.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "/svc/a/current"), (5, "/svc/b/current")]
+        );
+    }
+
+    #[test]
+    fn cluster_kv_watch_ids_matching_events_are_deduped_and_ordered() {
+        let registrations = vec![
+            ClusterKvWatchRegistration {
+                watch_id: WatchId(9),
+                prefix: "/svc/a/".to_string(),
+                next_revision: KvRevision(2),
+            },
+            ClusterKvWatchRegistration {
+                watch_id: WatchId(3),
+                prefix: "/svc/a/".to_string(),
+                next_revision: KvRevision(4),
+            },
+            ClusterKvWatchRegistration {
+                watch_id: WatchId(7),
+                prefix: "/svc/b/".to_string(),
+                next_revision: KvRevision(5),
+            },
+        ];
+        let events = vec![
+            test_kv_put_event(3, "/svc/a/one", b"one"),
+            test_kv_put_event(5, "/svc/a/two", b"two"),
+            test_kv_put_event(5, "/svc/b/three", b"three"),
+        ];
+
+        assert_eq!(
+            cluster_kv_watch_ids_matching_events(&registrations, &events),
+            vec![WatchId(3), WatchId(7), WatchId(9)]
+        );
+    }
+
+    fn test_kv_snapshot_with_events(events: Vec<KvEvent>) -> KvSnapshot {
+        KvSnapshot {
+            revision: events
+                .iter()
+                .map(|event| event.revision)
+                .max()
+                .unwrap_or(KvRevision::ZERO),
+            compacted_revision: KvRevision::ZERO,
+            entries: Vec::new(),
+            leases: Vec::new(),
+            events,
+        }
+    }
+
+    fn test_kv_put_event(revision: u64, key: &str, value: &[u8]) -> KvEvent {
+        KvEvent {
+            revision: KvRevision(revision),
+            key: key.to_string(),
+            kind: KvEventKind::Put {
+                value: value.to_vec(),
+            },
+        }
+    }
+
+    fn test_kv_delete_event(revision: u64, key: &str) -> KvEvent {
+        KvEvent {
+            revision: KvRevision(revision),
+            key: key.to_string(),
+            kind: KvEventKind::Delete,
+        }
     }
 
     fn put_test_prefix_keys(store: &mut InProcessKvStore, prefix: &str, count: usize) {
@@ -8323,32 +12594,6 @@ mod tests {
     }
 
     #[test]
-    fn cluster_member_records_are_stored_under_cluster_namespace() {
-        let node_id = NodeId::from_legacy_named("node_desktop").expect("node");
-        let member = ClusterMemberRecord::local_voter(
-            ClusterId::from_legacy_named("cluster_home").expect("cluster"),
-            node_id.clone(),
-            "desktop",
-            "pk_desktop",
-            OffsetDateTime::now_utc(),
-        );
-        let mut store = InProcessKvStore::new();
-
-        store
-            .put_cluster_member(member.clone())
-            .expect("put member");
-
-        assert!(store.get(&cluster_member_key(&node_id)).is_some());
-        assert_eq!(
-            store
-                .read_cluster_member(&node_id)
-                .expect("member")
-                .expect("exists"),
-            member
-        );
-    }
-
-    #[test]
     fn learner_can_catch_up_from_snapshot() {
         let node_a = NodeId::from_legacy_named("node_a").expect("node");
         let node_b = NodeId::from_legacy_named("node_b").expect("node");
@@ -8541,6 +12786,87 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_raft_leader_election_driver_sets_leader_after_remote_quorum() {
+        struct RecordingElectionHost {
+            sent_votes: Vec<(usize, NodeId, u64)>,
+            observed_terms: Vec<u64>,
+            leader_terms: Vec<u64>,
+        }
+
+        impl ClusterKvRaftLeaderElectionHost for RecordingElectionHost {
+            type Error = KvError;
+
+            fn local_vote_metadata(
+                &mut self,
+            ) -> Result<ClusterKvRaftLocalVoteMetadata, Self::Error> {
+                Ok(ClusterKvRaftLocalVoteMetadata {
+                    current_term: 1,
+                    last_log_index: 7,
+                    last_log_term: 1,
+                })
+            }
+
+            fn apply_local_vote(
+                &mut self,
+                vote: RaftRequestVoteRequest,
+            ) -> Result<RaftRequestVoteResponse, Self::Error> {
+                Ok(RaftRequestVoteResponse {
+                    term: vote.term,
+                    vote_granted: true,
+                })
+            }
+
+            fn request_remote_vote(
+                &mut self,
+                target_index: usize,
+                voter_id: &NodeId,
+                vote: &RaftRequestVoteRequest,
+            ) -> Result<RaftRequestVoteResponse, Self::Error> {
+                self.sent_votes
+                    .push((target_index, voter_id.clone(), vote.term));
+                Ok(RaftRequestVoteResponse {
+                    term: vote.term,
+                    vote_granted: true,
+                })
+            }
+
+            fn observe_raft_term(&mut self, term: u64) -> Result<(), Self::Error> {
+                self.observed_terms.push(term);
+                Ok(())
+            }
+
+            fn set_raft_leader(&mut self, term: u64) -> Result<(), Self::Error> {
+                self.leader_terms.push(term);
+                Ok(())
+            }
+        }
+
+        let local_node_id = NodeId::from_legacy_named("node_kv_election_local").expect("node");
+        let peer_a = NodeId::from_legacy_named("node_kv_election_peer_a").expect("node");
+        let peer_b = NodeId::from_legacy_named("node_kv_election_peer_b").expect("node");
+        let mut host = RecordingElectionHost {
+            sent_votes: Vec::new(),
+            observed_terms: Vec::new(),
+            leader_terms: Vec::new(),
+        };
+
+        let elected = elect_cluster_kv_raft_leader_with_host(
+            &local_node_id,
+            vec![local_node_id.clone(), peer_a.clone(), peer_b.clone()],
+            vec![peer_a.clone(), peer_b],
+            ClusterKvRaftLeaderElectionOptions { max_attempts: 1 },
+            &mut host,
+        )
+        .expect("election");
+
+        assert!(elected);
+        let expected_term = 1 + CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP;
+        assert_eq!(host.sent_votes, vec![(0, peer_a, expected_term)]);
+        assert!(host.observed_terms.is_empty());
+        assert_eq!(host.leader_terms, vec![expected_term]);
+    }
+
+    #[test]
     fn raft_votes_require_current_candidate_log() {
         let voter = NodeId::from_legacy_named("node_voter").expect("node");
         let stale = NodeId::from_legacy_named("node_stale").expect("node");
@@ -8659,6 +12985,399 @@ mod tests {
                 "unchanged snapshot save should not rewrite an identical snapshot object"
             );
         }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_compaction_policy_skips_idle_retained_tail() {
+        let root = temp_raft_root("sinomo-kv-compaction-policy-idle");
+        let node_id = NodeId::from_legacy_named("node_compaction_policy_idle").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open");
+        let entry = node
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/compaction/idle".to_string(),
+                    value: b"value".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append");
+        node.commit_to(entry.index).expect("commit");
+        node.save_snapshot().expect("initial snapshot");
+        let snapshot_before = fs::metadata(&paths.snapshot).expect("snapshot before");
+        thread::sleep(Duration::from_millis(20));
+
+        let compacted = compact_cluster_kv_raft_node_if_needed(
+            &mut node,
+            snapshot_before.len(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        )
+        .expect("compaction policy");
+
+        let snapshot_after = fs::metadata(&paths.snapshot).expect("snapshot after");
+        assert!(!compacted);
+        assert_eq!(snapshot_before.len(), snapshot_after.len());
+        assert_eq!(file_ino(&snapshot_before), file_ino(&snapshot_after));
+        assert_eq!(
+            snapshot_before.modified().ok(),
+            snapshot_after.modified().ok()
+        );
+        drop(node);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_compaction_policy_compacts_after_progress_watermark() {
+        let root = temp_raft_root("sinomo-kv-compaction-policy-progress");
+        let node_id = NodeId::from_legacy_named("node_compaction_policy_progress").expect("node");
+        let paths = KvWalPaths::new(&root);
+        let mut node = DurableRaftKvNode::open(node_id, paths).expect("open");
+        let command_count = RAFT_COMPACTION_RETAINED_ENTRIES
+            .saturating_mul(2)
+            .saturating_add(1);
+        for index in 1..=command_count {
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: format!("/compaction/progress/{index}"),
+                        value: index.to_be_bytes().to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append");
+            node.commit_to(entry.index).expect("commit");
+        }
+
+        assert!(cluster_kv_raft_node_should_compact(
+            &node,
+            0,
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        ));
+        assert!(
+            compact_cluster_kv_raft_node_if_needed(
+                &mut node,
+                0,
+                ClusterKvRaftCompactionPolicy {
+                    max_snapshot_bytes: u64::MAX,
+                    max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+                },
+            )
+            .expect("compact")
+        );
+        assert_eq!(node.snapshot_index(), command_count);
+        assert!(node.log().len() <= RAFT_COMPACTION_RETAINED_ENTRIES as usize);
+        drop(node);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_store_applies_vote_and_leader_updates() {
+        let root = temp_raft_root("sinomo-kv-raft-store-vote-leader");
+        let node_id = NodeId::from_legacy_named("node_raft_store_vote_leader").expect("node");
+        let candidate_id =
+            NodeId::from_legacy_named("node_raft_store_candidate").expect("candidate");
+        let paths = ClusterKvPaths::new(root.clone());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+
+        let metadata = store
+            .local_vote_metadata(&node_id)
+            .expect("initial vote metadata");
+        assert_eq!(
+            metadata,
+            ClusterKvRaftLocalVoteMetadata {
+                current_term: 1,
+                last_log_index: 0,
+                last_log_term: 0,
+            }
+        );
+
+        let vote = store
+            .apply_vote(
+                &node_id,
+                RaftRequestVoteRequest {
+                    term: 2,
+                    candidate_id: candidate_id.clone(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+            )
+            .expect("apply vote");
+        assert!(vote.vote_granted);
+        assert_eq!(vote.term, 2);
+        let hard_state = paths
+            .raft_wal_paths(&node_id)
+            .read_persisted_hard_state()
+            .expect("read hard state after vote");
+        assert_eq!(hard_state.current_term, 2);
+        assert_eq!(hard_state.voted_for.as_ref(), Some(&candidate_id));
+        assert!(hard_state.leader_id.is_none());
+
+        let observed = store.observe_term(&node_id, 3).expect("observe term");
+        assert!(observed.is_some());
+        let hard_state = paths
+            .raft_wal_paths(&node_id)
+            .read_persisted_hard_state()
+            .expect("read hard state after term");
+        assert_eq!(hard_state.current_term, 3);
+        assert!(hard_state.voted_for.is_none());
+        assert!(hard_state.leader_id.is_none());
+
+        store.set_leader(&node_id, 3).expect("set leader");
+        let hard_state = paths
+            .raft_wal_paths(&node_id)
+            .read_persisted_hard_state()
+            .expect("read hard state after leader");
+        assert_eq!(hard_state.current_term, 3);
+        assert_eq!(hard_state.voted_for.as_ref(), Some(&node_id));
+        assert_eq!(hard_state.leader_id.as_ref(), Some(&node_id));
+
+        store.clear_leader(&node_id).expect("clear leader");
+        let hard_state = paths
+            .raft_wal_paths(&node_id)
+            .read_persisted_hard_state()
+            .expect("read hard state after clear");
+        assert_eq!(hard_state.current_term, 3);
+        assert_eq!(hard_state.voted_for.as_ref(), Some(&node_id));
+        assert!(hard_state.leader_id.is_none());
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_store_applies_append_and_reports_rejections() {
+        let root = temp_raft_root("sinomo-kv-raft-store-append");
+        let follower_id =
+            NodeId::from_legacy_named("node_raft_store_append_follower").expect("follower");
+        let leader_id = NodeId::from_legacy_named("node_raft_store_append_leader").expect("leader");
+        let paths = ClusterKvPaths::new(root.clone());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+
+        let outcome = store
+            .apply_append_entries_with_optional_snapshot(
+                &follower_id,
+                None,
+                RaftAppendEntriesRequest {
+                    term: 2,
+                    leader_id: leader_id.clone(),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![KvLogEntry {
+                        index: 1,
+                        term: 2,
+                        command: KvCommand::Op(KvOp::Put {
+                            key: "/raft-store/append".to_string(),
+                            value: b"value".to_vec(),
+                            lease_id: None,
+                        }),
+                        revision: KvRevision::ZERO,
+                    }],
+                    leader_commit: 1,
+                },
+            )
+            .expect("apply append");
+
+        assert!(outcome.response.success);
+        assert!(!outcome.snapshot_restored);
+        assert_eq!(outcome.committed_events.len(), 1);
+        assert_eq!(outcome.committed_events[0].key, "/raft-store/append");
+        assert_eq!(
+            outcome
+                .snapshot
+                .get("/raft-store/append")
+                .expect("entry")
+                .value,
+            b"value".to_vec()
+        );
+
+        let append_rejection = store
+            .append_entries_rejection_response(&follower_id)
+            .expect("append rejection");
+        assert_eq!(
+            append_rejection,
+            RaftAppendEntriesResponse {
+                term: 2,
+                success: false,
+                match_index: 1,
+            }
+        );
+        let vote_rejection = store
+            .request_vote_rejection_response(&follower_id)
+            .expect("vote rejection");
+        assert_eq!(
+            vote_rejection,
+            RaftRequestVoteResponse {
+                term: 2,
+                vote_granted: false,
+            }
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_store_appends_commits_and_detects_no_effect_commands() {
+        let root = temp_raft_root("sinomo-kv-raft-store-command");
+        let node_id = NodeId::from_legacy_named("node_raft_store_command").expect("node");
+        let paths = ClusterKvPaths::new(root.clone());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let put = KvCommand::Op(KvOp::Put {
+            key: "/raft-store/command".to_string(),
+            value: b"value".to_vec(),
+            lease_id: None,
+        });
+
+        let committed = store
+            .append_command_with_response(&node_id, put.clone())
+            .expect("append and commit");
+        assert_eq!(committed.snapshot.revision, KvRevision(1));
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(committed.events[0].key, "/raft-store/command");
+        assert!(committed.txn_response.is_none());
+        let hard_state = paths
+            .raft_wal_paths(&node_id)
+            .read_persisted_hard_state()
+            .expect("read hard state after commit");
+        assert_eq!(hard_state.commit_index, 1);
+
+        let no_effect_commit = store
+            .append_command_with_response(&node_id, put.clone())
+            .expect("append no-effect command");
+        assert_eq!(no_effect_commit.snapshot.revision, KvRevision(1));
+        assert!(no_effect_commit.events.is_empty());
+
+        let no_effect_uncommitted = store
+            .append_command_uncommitted_or_no_effect(&node_id, put)
+            .expect("uncommitted no-effect command");
+        match no_effect_uncommitted {
+            ClusterKvRaftUncommittedAppend::NoEffect {
+                snapshot,
+                txn_response,
+            } => {
+                assert_eq!(snapshot.revision, KvRevision(1));
+                assert!(txn_response.is_none());
+            }
+            ClusterKvRaftUncommittedAppend::Appended(entry) => {
+                panic!("expected no-effect append, got entry {entry:?}");
+            }
+        }
+
+        let append = store
+            .append_command_uncommitted(
+                &node_id,
+                KvCommand::Op(KvOp::Put {
+                    key: "/raft-store/pending".to_string(),
+                    value: b"pending".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append uncommitted command");
+        assert_eq!(append.index, 2);
+        let committed = store
+            .commit_index_with_events(&node_id, append.index)
+            .expect("commit uncommitted command");
+        assert_eq!(committed.snapshot.revision, KvRevision(2));
+        assert_eq!(committed.events.len(), 1);
+        assert_eq!(committed.events[0].key, "/raft-store/pending");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_store_builds_append_request_from_retained_tail() {
+        let root = temp_raft_root("sinomo-kv-raft-store-append-request-tail");
+        let node_id = NodeId::from_legacy_named("node_raft_store_append_request").expect("node");
+        let leader_id =
+            NodeId::from_legacy_named("node_raft_store_append_request_leader").expect("leader");
+        let paths = ClusterKvPaths::new(root.clone());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let mut node = DurableRaftKvNode::open(node_id.clone(), paths.raft_wal_paths(&node_id))
+            .expect("open node");
+        for index in 1..=400u64 {
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: format!("/append-request/{index:03}"),
+                        value: index.to_le_bytes().to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append");
+            node.commit_to(entry.index).expect("commit");
+        }
+        node.save_snapshot().expect("save snapshot");
+        let snapshot_index = node.snapshot_index();
+        let earliest_retained = node.log().first().map(|entry| entry.index).expect("tail");
+        let last_log_index = node.last_log_index();
+        assert!(snapshot_index > 0);
+        assert!(!node.log().is_empty());
+        assert!(node.log().len() <= RAFT_COMPACTION_RETAINED_ENTRIES as usize);
+        drop(node);
+
+        let heartbeat = store
+            .build_append_entries_request_from_next_index(
+                &node_id,
+                &leader_id,
+                last_log_index.saturating_add(1),
+            )
+            .expect("heartbeat");
+        assert!(heartbeat.snapshot.is_none());
+        assert!(heartbeat.append.entries.is_empty());
+        assert_eq!(&heartbeat.append.leader_id, &leader_id);
+        assert_eq!(heartbeat.append.prev_log_index, snapshot_index);
+
+        let near = store
+            .build_append_entries_request_from_next_index(
+                &node_id,
+                &leader_id,
+                earliest_retained + 1,
+            )
+            .expect("near");
+        assert!(near.snapshot.is_none());
+        assert!(!near.append.entries.is_empty());
+
+        let far = store
+            .build_append_entries_request_from_next_index(
+                &node_id,
+                &leader_id,
+                earliest_retained.saturating_sub(1).max(1),
+            )
+            .expect("far");
+        assert!(far.snapshot.is_some());
+
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -9774,6 +14493,66 @@ mod tests {
                 .expect("second value")
                 .value,
             b"two"
+        );
+        std::fs::remove_dir_all(leader_root).ok();
+        std::fs::remove_dir_all(follower_root).ok();
+    }
+
+    #[test]
+    fn optional_snapshot_append_restores_newer_snapshot() {
+        let leader_root = temp_raft_root("sinomo-kv-optional-snapshot-append-leader");
+        let follower_root = temp_raft_root("sinomo-kv-optional-snapshot-append-follower");
+        let leader_id = NodeId::from_legacy_named("node_optional_snapshot_leader").expect("node");
+        let follower_id =
+            NodeId::from_legacy_named("node_optional_snapshot_follower").expect("node");
+        let mut leader = DurableRaftKvNode::open(leader_id.clone(), KvWalPaths::new(&leader_root))
+            .expect("leader open");
+        let mut follower = DurableRaftKvNode::open(follower_id, KvWalPaths::new(&follower_root))
+            .expect("follower open");
+
+        let entry = leader
+            .append_local_command(
+                1,
+                KvCommand::Op(KvOp::Put {
+                    key: "/config/snapshot".to_string(),
+                    value: b"from-snapshot".to_vec(),
+                    lease_id: None,
+                }),
+            )
+            .expect("append leader command");
+        leader
+            .commit_to(entry.index)
+            .expect("commit leader command");
+        let snapshot = leader.save_snapshot().expect("save leader snapshot");
+
+        let outcome = follower
+            .apply_append_entries_with_optional_snapshot(
+                Some(snapshot.clone()),
+                RaftAppendEntriesRequest {
+                    term: 1,
+                    leader_id,
+                    prev_log_index: snapshot.last_included_index,
+                    prev_log_term: snapshot.last_included_term,
+                    entries: Vec::new(),
+                    leader_commit: snapshot.last_included_index,
+                },
+            )
+            .expect("apply append with snapshot");
+
+        assert!(outcome.response.success);
+        assert!(outcome.snapshot_restored);
+        assert!(outcome.committed_events.is_empty());
+        assert_eq!(
+            follower.hard_state().commit_index,
+            snapshot.last_included_index
+        );
+        assert_eq!(
+            follower
+                .store()
+                .get("/config/snapshot")
+                .expect("restored value")
+                .value,
+            b"from-snapshot"
         );
         std::fs::remove_dir_all(leader_root).ok();
         std::fs::remove_dir_all(follower_root).ok();

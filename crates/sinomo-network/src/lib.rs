@@ -1,4 +1,16 @@
-//! Peer registry, mesh contracts, and cluster networking primitives.
+//! Cluster network, peer transport, and routing primitives.
+//!
+//! This crate owns route choice, endpoint selection, relay decisions, peer
+//! transport contracts, and interpretation of the cluster connectivity graph.
+//! Connectivity records are network-domain facts even when they are persisted
+//! in KV. This crate interprets those records for routing through narrow query
+//! adapters; it must not own KV transactions, watches, compaction, snapshots, or
+//! Raft leaders/elections/storage layout. When cluster routes carry KV traffic,
+//! this crate wraps KV-owned payload specs in the generic object-RPC envelope and
+//! chooses how that envelope reaches a peer. KV local read/watch RPC dispatch
+//! and Raft election semantics belong to `sinomo-kv`; network may temporarily
+//! host filesystem and transport adapters while cluster-aware validation remains
+//! here.
 
 mod error;
 mod invite;
@@ -42,35 +54,6 @@ pub fn register_storage_paths(
     layout.register_sinomo_object(
         "sinomo-network",
         StorageRing::R1,
-        "cluster/watch-events.sobj",
-        ObjectSchema::new(
-            "Vec<ClusterKvWatchEventRecord>",
-            STORAGE_CONTRACT_OBJECT_VERSION,
-        ),
-    )?;
-    layout.register_object_log(
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/watch-events.sobjlog",
-    )?;
-    layout.register_file(sinomo_storage::StorageFileContract::binary(
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/watches.lock",
-    )?)?;
-    layout.register_sinomo_object(
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/watches-next.sobj",
-        ObjectSchema::new(
-            "ClusterKvWatchAllocatorState",
-            STORAGE_CONTRACT_OBJECT_VERSION,
-        )
-        .field("next_watch_id", "u64"),
-    )?;
-    layout.register_sinomo_object(
-        "sinomo-network",
-        StorageRing::R1,
         "cluster/connectivity-local.sobj",
         ObjectSchema::new(
             "Vec<ClusterConnectivityRecord>",
@@ -85,12 +68,6 @@ pub fn register_storage_paths(
         StorageRing::R1,
         "cluster/iroh",
         "dynamic iroh key and endpoint object files keyed by node id",
-    )?;
-    layout.register_escape_path(
-        "sinomo-network",
-        StorageRing::R1,
-        "cluster/watches",
-        "dynamic cluster KV watch registration object files keyed by watch id",
     )
 }
 
@@ -100,17 +77,18 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_core::{
         CapabilityName, ClusterBootstrapState, ClusterCertificate, ClusterEndpointPrivacy,
         ClusterEndpointRecord, ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite,
-        ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeRole,
-        ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope, LatencyClass, RoutingScope,
-        TrustDomain,
+        ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability,
+        ClusterNodeRole, ClusterNodeStatusRecord, ClusterTransportKind, EventEnvelope,
+        LatencyClass, RoutingScope, TrustDomain,
     };
     pub(crate) use sinomo_events::{
         EventId, EventSequence, EventStore, EventStoreError, SessionId, StoredEvent,
     };
     pub(crate) use sinomo_kv::{
-        DurableRaftKvNode, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent,
-        KvLocalCache, KvLogEntry, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths,
-        LeaseId, RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
+        ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, DurableRaftKvNode,
+        InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvLocalCache,
+        KvLogEntry, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths, LeaseId,
+        RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
         RaftRequestVoteResponse, RaftSnapshot, WatchId,
     };
     pub(crate) use sinomo_local::SinomoDataDir;

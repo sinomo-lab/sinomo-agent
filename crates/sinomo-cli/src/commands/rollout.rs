@@ -880,7 +880,7 @@ fn resolve_rollout_controller_node_id(
         return Ok(cluster.node_id);
     }
     let cluster_paths = ClusterPaths::new(data_dir);
-    if let Ok(state) = daemon_read_local_cluster_state(&cluster_paths) {
+    if let Ok(state) = read_cluster_state(&cluster_paths) {
         return Ok(state.local_node_id);
     }
     let identity = load_or_create_main_node_identity(&data_dir.root())?;
@@ -987,7 +987,7 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     let artifacts = prepare_local_rollout_artifacts(&paths, options.repo.as_deref())?;
 
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let installed_modules = daemon_install_local_rollout_native_dylib_modules(
+    let installed_modules = rollout_install_local_rollout_native_dylib_modules(
         &data_dir.root(),
         &artifacts.native_dylib_modules,
     )?;
@@ -1241,8 +1241,8 @@ fn publish_cluster_rollout_desired(
         failure: Vec::new(),
     };
     let request = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_KV_TXN_ROUTE,
-        network::CLUSTER_KV_RPC_CATEGORY,
+        sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
+        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
         &txn,
     )
     .map_err(CliError::from)?;
@@ -1748,14 +1748,22 @@ pub(crate) struct RolloutUploadSource {
 }
 
 pub(crate) fn rollout_target_platform_matches_local(status: &DaemonStatus) -> Option<bool> {
-    daemon_rollout_target_platform_matches_local(status)
+    sinomo_runtime::rollout::rollout_target_platform_matches_local(
+        status.target_os.as_deref(),
+        status.target_arch.as_deref(),
+    )
 }
 
 pub(crate) fn ensure_rollout_target_platform_from_status(
     address: &str,
     status: &DaemonStatus,
 ) -> Result<(), CliError> {
-    daemon_ensure_rollout_target_platform_matches_local(address, status).map_err(Into::into)
+    sinomo_runtime::rollout::ensure_rollout_target_platform_matches_local(
+        address,
+        status.target_os.as_deref(),
+        status.target_arch.as_deref(),
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn prepare_cluster_binary_rollout(

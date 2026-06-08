@@ -1593,8 +1593,8 @@ pub(crate) fn iroh_daemon_control_request_allows_response_retry(
     matches!(
         rpc.route.as_str(),
         crate::CLUSTER_HEALTH_ROUTE
-            | crate::CLUSTER_KV_RANGE_PREFIX_ROUTE
-            | crate::CLUSTER_KV_SNAPSHOT_ROUTE
+            | sinomo_kv::CLUSTER_KV_RANGE_PREFIX_ROUTE
+            | sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE
             | crate::ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE
             | crate::ROLLOUT_DIAGNOSTICS_ROUTE
     )

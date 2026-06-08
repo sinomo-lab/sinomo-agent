@@ -1,20 +1,16 @@
-use crate::{
-    AuthenticatedDaemonCommand, DaemonError, DaemonPaths, DaemonSignerAuthority, IdleStatsSnapshot,
-    send_daemon_rpc,
-};
+use crate::{DaemonError, DaemonPaths, IdleStatsSnapshot, send_daemon_rpc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
-    ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterMemberRecord,
-    ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
-    ClusterNodeStatusRecord,
+    ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRole, ClusterMemberState,
+    ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterId;
 use sinomo_node::NodeId;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -116,7 +112,8 @@ pub fn daemon_cluster_status(
     })
 }
 
-pub fn ensure_daemon_cluster_members(
+#[cfg(test)]
+pub(crate) fn ensure_daemon_cluster_members(
     state: &mut ClusterBootstrapState,
     main_options: &DaemonRunOptions,
     shadow_options: &DaemonRunOptions,
@@ -178,78 +175,17 @@ pub fn daemon_advertised_endpoints_from_ips(
     allow_public_ip_discovery: bool,
 ) -> Vec<ClusterEndpointRecord> {
     let advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV).ok();
-    daemon_advertised_endpoints_from_ips_with_advertise_host(
+    sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host(
         node_id,
-        options,
+        daemon_connect_address(&options.host, options.port),
+        &options.host,
+        options.port,
         priority,
         lan_ips,
         route_ips,
         allow_public_ip_discovery,
         advertise_host.as_deref(),
     )
-}
-
-fn daemon_advertised_endpoints_from_ips_with_advertise_host(
-    node_id: &NodeId,
-    options: &DaemonRunOptions,
-    priority: u16,
-    lan_ips: &[IpAddr],
-    route_ips: &[IpAddr],
-    allow_public_ip_discovery: bool,
-    advertise_host: Option<&str>,
-) -> Vec<ClusterEndpointRecord> {
-    let mut endpoints =
-        sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery(
-            node_id,
-            daemon_connect_address(&options.host, options.port),
-            &options.host,
-            options.port,
-            priority,
-            lan_ips,
-            route_ips,
-            allow_public_ip_discovery,
-        );
-    if let Some(address) = daemon_advertise_host_address(advertise_host, options.port)
-        && endpoints.iter().all(|endpoint| endpoint.address != address)
-    {
-        endpoints.push(sinomo_network::daemon_lan_endpoint(
-            node_id,
-            address,
-            priority.saturating_add(5),
-        ));
-    }
-    endpoints
-}
-
-fn daemon_advertise_host_address(host: Option<&str>, port: u16) -> Option<String> {
-    let host = host?.trim();
-    if host.is_empty()
-        || matches!(host, "0.0.0.0" | "::")
-        || host.contains("://")
-        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified())
-    {
-        return None;
-    }
-    let address = if let Ok(socket) = host.parse::<SocketAddr>() {
-        if socket.ip().is_unspecified() {
-            return None;
-        }
-        host.to_string()
-    } else if let Ok(ip) = host.parse::<IpAddr>() {
-        sinomo_network::format_ip_port(ip, port)
-    } else if let Some((name, explicit_port)) = host.rsplit_once(':') {
-        if !name.contains(':') && explicit_port.parse::<u16>().is_ok() {
-            host.to_string()
-        } else {
-            format!("[{host}]:{port}")
-        }
-    } else {
-        format!("{host}:{port}")
-    };
-    if sinomo_network::is_loopback_connect_address(&address) {
-        return None;
-    }
-    Some(address)
 }
 
 pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> DaemonRunOptions {
@@ -274,26 +210,6 @@ pub fn daemon_cluster_status_matches(
 ) -> bool {
     status.cluster.as_ref().is_some_and(|cluster| {
         cluster.cluster_id == state.cluster_id && cluster.node_id == endpoint.node_id
-    })
-}
-
-pub fn authenticated_signer_matches_cluster_node(
-    state: &ClusterBootstrapState,
-    authenticated: &AuthenticatedDaemonCommand,
-    node_id: &NodeId,
-) -> bool {
-    if !matches!(
-        authenticated.signer,
-        DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
-    ) {
-        return false;
-    }
-    state.members.iter().any(|member| {
-        member.node_id == *node_id
-            && member.cluster_id == state.cluster_id
-            && member.state.is_authorized()
-            && member.node_id.as_str() == authenticated.signer_node_id
-            && member.node_public_key == authenticated.signer_public_key
     })
 }
 
@@ -452,43 +368,6 @@ pub fn cluster_node_status_from_daemon_status(
             .map(|path| path.display().to_string()),
         rollout: rollout.or_else(|| status.rollout.clone()),
         daemon_started_at: Some(status.started_at.clone()),
-        observed_at,
-    }
-}
-
-pub fn unknown_cluster_node_status(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    observed_at: OffsetDateTime,
-) -> ClusterNodeStatusRecord {
-    ClusterNodeStatusRecord {
-        cluster_id: state.cluster_id.clone(),
-        node_id: member.node_id.clone(),
-        process: member
-            .capabilities
-            .iter()
-            .find_map(|capability| match capability.as_str() {
-                "daemon.main.run" => Some(DAEMON_MAIN_CLUSTER_ROLE.to_string()),
-                "daemon.shadow.supervise" => Some(DAEMON_SHADOW_CLUSTER_ROLE.to_string()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_string()),
-        availability: ClusterNodeAvailability::Unknown,
-        daemon_version: "unknown".to_string(),
-        commit: None,
-        target_os: None,
-        target_arch: None,
-        pid: None,
-        address: member
-            .endpoints
-            .iter()
-            .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
-            .or_else(|| member.endpoints.first())
-            .map(|endpoint| endpoint.address.clone()),
-        bind_address: None,
-        executable: None,
-        rollout: None,
-        daemon_started_at: None,
         observed_at,
     }
 }
@@ -689,7 +568,7 @@ pub fn write_daemon_status(paths: &DaemonPaths, status: &DaemonStatus) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::ClusterTransportKind;
+    use sinomo_core::{ClusterEndpointPrivacy, ClusterTransportKind};
     use sinomo_node::shadow_daemon_node_id;
 
     #[test]
@@ -727,12 +606,11 @@ mod tests {
     #[test]
     fn advertised_host_adds_stable_hostname_endpoint_for_wildcard_bind() {
         let node_id = NodeId::from_legacy_named("node_advertise_hostname").expect("node");
-        let endpoints = daemon_advertised_endpoints_from_ips_with_advertise_host(
+        let endpoints = sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host(
             &node_id,
-            &DaemonRunOptions {
-                host: "0.0.0.0".to_string(),
-                port: 21_353,
-            },
+            "127.0.0.1:21353".to_string(),
+            "0.0.0.0",
+            21_353,
             0,
             &["172.24.0.4".parse().expect("lan ip")],
             &[],
