@@ -190,9 +190,36 @@ pub fn send_daemon_rpc_to_endpoint(
     request: &ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    send_daemon_rpc_to_endpoint_with_timeout_policy(
+        endpoint,
+        request,
+        timeout,
+        DaemonEndpointRpcTimeoutPolicy::FairControlPlane,
+    )
+}
+
+fn send_daemon_large_rpc_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    send_daemon_rpc_to_endpoint_with_timeout_policy(
+        endpoint,
+        request,
+        timeout,
+        DaemonEndpointRpcTimeoutPolicy::FullRequestBudget,
+    )
+}
+
+fn send_daemon_rpc_to_endpoint_with_timeout_policy(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
     let command = daemon_rpc_command(&request.route);
-    let mut host = DaemonSignedEndpointRpcHost;
+    let mut host = DaemonSignedEndpointRpcHost::new(timeout_policy);
     sinomo_network::send_signed_rpc_to_endpoint_with_host(
         endpoint,
         request,
@@ -205,7 +232,31 @@ pub fn send_daemon_rpc_to_endpoint(
     .map_err(DaemonError::from)
 }
 
-struct DaemonSignedEndpointRpcHost;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DaemonEndpointRpcTimeoutPolicy {
+    FairControlPlane,
+    FullRequestBudget,
+}
+
+struct DaemonSignedEndpointRpcHost {
+    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
+}
+
+impl DaemonSignedEndpointRpcHost {
+    fn new(timeout_policy: DaemonEndpointRpcTimeoutPolicy) -> Self {
+        Self { timeout_policy }
+    }
+
+    fn endpoint_timeout(&self, endpoint: &ClusterEndpointRecord, remaining: Duration) -> Duration {
+        match self.timeout_policy {
+            DaemonEndpointRpcTimeoutPolicy::FairControlPlane => {
+                crate::cluster::cluster_voter_reachability_options()
+                    .fair_command_timeout(endpoint, remaining)
+            }
+            DaemonEndpointRpcTimeoutPolicy::FullRequestBudget => remaining,
+        }
+    }
+}
 
 impl sinomo_network::ClusterSignedEndpointRpcHost for DaemonSignedEndpointRpcHost {
     fn try_gateway_signed_rpc(
@@ -247,8 +298,7 @@ impl sinomo_network::ClusterSignedEndpointRpcHost for DaemonSignedEndpointRpcHos
         endpoint: &ClusterEndpointRecord,
         remaining: Duration,
     ) -> Duration {
-        crate::cluster::cluster_voter_reachability_options()
-            .fair_command_timeout(endpoint, remaining)
+        self.endpoint_timeout(endpoint, remaining)
     }
 
     fn send_signed_endpoint_rpc(
@@ -310,8 +360,7 @@ impl sinomo_network::ClusterSignedRelayRpcHost for DaemonSignedEndpointRpcHost {
         request: &sinomo_network::ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        let timeout = crate::cluster::cluster_voter_reachability_options()
-            .fair_command_timeout(endpoint, timeout);
+        let timeout = self.endpoint_timeout(endpoint, timeout);
         sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             endpoint,
             command,
@@ -714,7 +763,7 @@ pub fn send_daemon_rollout_binary_to_endpoint(
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let rpc_request =
         ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 
@@ -742,7 +791,7 @@ pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
         ROLLOUT_RPC_CATEGORY,
         request,
     )?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 
@@ -770,7 +819,7 @@ pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
         ROLLOUT_RPC_CATEGORY,
         request,
     )?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 
@@ -792,7 +841,7 @@ pub fn send_daemon_rollout_build_to_endpoint(
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     let rpc_request =
         ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
+    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
     response.decode_body().map_err(DaemonError::from)
 }
 
@@ -819,7 +868,8 @@ pub fn send_daemon_rollout_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonRpcAddressTransport, DaemonRpcAttemptDeadline, daemon_rpc_address_transport,
+        DaemonEndpointRpcTimeoutPolicy, DaemonRpcAddressTransport, DaemonRpcAttemptDeadline,
+        DaemonSignedEndpointRpcHost, daemon_rpc_address_transport,
         local_daemon_can_gateway_endpoint,
     };
     use crate::DaemonClusterStatus;
@@ -844,6 +894,19 @@ mod tests {
             address: "10.0.0.2:21353".to_string(),
             source: ClusterEndpointSource::KvMembership,
             privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn iroh_endpoint(node_id: NodeId) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: sinomo_core::Id::generate(),
+            node_id,
+            transport: ClusterTransportKind::Iroh,
+            address: "iroh://example?relay=https://relay.example./".to_string(),
+            source: ClusterEndpointSource::KvMembership,
+            privacy: ClusterEndpointPrivacy::Relayed,
             priority: 0,
             last_observed_latency_ms: None,
         }
@@ -927,6 +990,30 @@ mod tests {
         assert!(!sinomo_network::relay_response_is_routing_error(
             &target_error
         ));
+    }
+
+    #[test]
+    fn daemon_endpoint_rpc_control_plane_policy_caps_iroh_attempts() {
+        let endpoint = iroh_endpoint(node_id("node_endpoint_timeout_control"));
+        let host =
+            DaemonSignedEndpointRpcHost::new(DaemonEndpointRpcTimeoutPolicy::FairControlPlane);
+
+        assert_eq!(
+            host.endpoint_timeout(&endpoint, Duration::from_secs(60)),
+            Duration::from_millis(1500)
+        );
+    }
+
+    #[test]
+    fn daemon_endpoint_rpc_large_policy_uses_full_request_budget() {
+        let endpoint = iroh_endpoint(node_id("node_endpoint_timeout_rollout"));
+        let host =
+            DaemonSignedEndpointRpcHost::new(DaemonEndpointRpcTimeoutPolicy::FullRequestBudget);
+
+        assert_eq!(
+            host.endpoint_timeout(&endpoint, Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
