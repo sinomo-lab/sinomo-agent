@@ -1504,13 +1504,67 @@ fn prepare_local_cluster_state_for_cli(
 
 pub(crate) fn refresh_cluster_kv_from_local_daemon(paths: &ClusterPaths) -> Result<(), CliError> {
     let Some(status) = default_main_daemon_status()? else {
+        return refresh_cluster_kv_from_reachable_voters(paths);
+    };
+    match daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT) {
+        Ok(snapshot) => write_imported_cluster_kv_snapshot(paths, &snapshot),
+        Err(_) => refresh_cluster_kv_from_reachable_voters(paths),
+    }
+}
+
+fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), CliError> {
+    struct CliClusterKvSnapshotRefreshHost;
+
+    impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
+        fn known_raft_leader_id(
+            &mut self,
+            paths: &ClusterPaths,
+            state: &ClusterBootstrapState,
+        ) -> Result<Option<NodeId>, network::NetworkError> {
+            network::cluster_raft_known_leader_id(paths, state).or(Ok(None))
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            endpoint: &ClusterEndpointRecord,
+            timeout: Duration,
+        ) -> Result<KvSnapshot, network::NetworkError> {
+            daemon_fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout).map_err(|source| {
+                network::NetworkError::Io {
+                    operation: "cluster kv snapshot refresh".to_string(),
+                    detail: source.to_string(),
+                }
+            })
+        }
+
+        fn restore_cluster_raft_from_snapshot_if_newer(
+            &mut self,
+            paths: &ClusterPaths,
+            local_node_id: &NodeId,
+            snapshot: KvSnapshot,
+        ) -> Result<bool, network::NetworkError> {
+            network::locked_restore_cluster_raft_from_snapshot_if_newer(
+                paths,
+                local_node_id,
+                snapshot,
+            )
+        }
+    }
+
+    let Ok(state) = network::read_cluster_state(paths) else {
         return Ok(());
     };
-    let Ok(snapshot) = daemon_fetch_cluster_kv_snapshot(&status.address, DAEMON_PROBE_TIMEOUT)
-    else {
-        return Ok(());
-    };
-    write_imported_cluster_kv_snapshot(paths, &snapshot)
+    match network::refresh_current_cluster_kv_store_with_host(
+        paths,
+        &state,
+        network::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_snapshot_refresh_options(),
+        &mut CliClusterKvSnapshotRefreshHost,
+    ) {
+        Ok(_) | Err(network::NetworkError::ClusterReadOnly { .. }) => Ok(()),
+        Err(network::NetworkError::Io { .. }) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(test)]

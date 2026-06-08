@@ -1219,6 +1219,36 @@ mod tests {
     }
 
     #[test]
+    fn text_format_from_view_matches_owned_document() {
+        let document = Document::dynamic(
+            1,
+            LengthMode::U32,
+            Value::Object(Object::new(vec![
+                Field::new("node", Value::String("aarch64".to_owned())),
+                Field::new("port", Value::Uint16(21353)),
+                Field::new(
+                    "capabilities",
+                    Value::list(List::new(
+                        ElementType::Builtin(TypeId::String),
+                        vec![
+                            Value::String("rollout".to_owned()),
+                            Value::String("kv".to_owned()),
+                        ],
+                    )),
+                ),
+            ])),
+        );
+
+        let bytes = document.to_bytes().unwrap();
+        let view = DocumentView::parse(&bytes).unwrap();
+
+        assert_eq!(
+            crate::text::document_view_to_text(&view),
+            crate::text::document_to_text(&document)
+        );
+    }
+
+    #[test]
     fn bytes_and_array_views_borrow_payload() {
         let tensor_bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
             .into_iter()

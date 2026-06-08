@@ -108,9 +108,10 @@ pub use status::{
     write_daemon_status,
 };
 pub(crate) use status::{
-    daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
-    daemon_cluster_status_matches, daemon_probe_status_needs_restart_for_options,
-    probe_daemon_status_at_address, read_daemon_status,
+    current_daemon_cluster_options, daemon_cluster_options_from_status,
+    daemon_cluster_process_from_paths, daemon_cluster_status_matches,
+    daemon_probe_status_needs_restart_for_options, probe_daemon_status_at_address,
+    read_daemon_status,
 };
 
 pub fn register_storage_paths(

@@ -1053,6 +1053,7 @@ pub(crate) enum CliCommand {
     Install(InstallOptions),
     Uninstall(UninstallOptions),
     Daemon(DaemonCliCommand),
+    Debug(DebugCliCommand),
     Rollout(RolloutCliCommand),
     Dfs(DfsCliCommand),
     Models(ModelsCliCommand),
@@ -1124,6 +1125,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         }
         Some((command, rest)) if command == "daemon" => {
             Ok(CliCommand::Daemon(parse_daemon_command(rest)?))
+        }
+        Some((command, rest)) if command == "debug" => {
+            Ok(CliCommand::Debug(parse_debug_command(rest)?))
         }
         Some((command, rest)) if command == "rollout" => {
             Ok(CliCommand::Rollout(parse_rollout_command(rest)?))
@@ -1638,6 +1642,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Install(options) => install(options),
         CliCommand::Uninstall(options) => uninstall(options),
         CliCommand::Daemon(command) => run_daemon_cli_command(command),
+        CliCommand::Debug(command) => run_debug_cli_command(command),
         CliCommand::Rollout(command) => run_rollout_cli_command(command),
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),

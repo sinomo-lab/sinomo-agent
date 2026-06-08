@@ -4,15 +4,15 @@ use super::{
     ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
     ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
     DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions,
-    DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel, InteractionRuntime,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
-    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
-    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
-    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
-    RolloutMainActivation, RolloutOptions, RolloutProgressExpectation,
-    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
+    DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
+    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
+    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
+    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
+    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
+    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
+    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
     apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
     cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
@@ -437,6 +437,19 @@ fn top_level_cli_parser_routes_subcommands() {
     assert!(matches!(
         parse_cli_command(&["daemon".to_string()]).expect("daemon help"),
         CliCommand::Daemon(DaemonCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["debug".to_string()]).expect("debug help"),
+        CliCommand::Debug(DebugCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&[
+            "debug".to_string(),
+            "sobj".to_string(),
+            "state.sobj".to_string()
+        ])
+        .expect("debug sobj"),
+        CliCommand::Debug(DebugCliCommand::Sobj(_))
     ));
     assert!(matches!(
         parse_cli_command(&["cluster".to_string(), "status".to_string()]).expect("cluster status"),
@@ -14131,6 +14144,48 @@ fn captured_cli_command_collects_registered_command_stdout() {
     assert!(stdout.contains("Observe:"));
     assert!(stdout.contains("sinomo observe events"));
     assert!(captured.output.stderr.is_empty());
+}
+
+#[test]
+fn debug_sobj_command_prints_typed_text() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-cli-debug-sobj-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).expect("root");
+    let path = root.join("state.sobj");
+    let document = sinomo_runtime::object::Document::dynamic(
+        1,
+        sinomo_runtime::object::LengthMode::U32,
+        sinomo_runtime::object::Value::Object(sinomo_runtime::object::Object::new(vec![
+            sinomo_runtime::object::Field::new(
+                "node",
+                sinomo_runtime::object::Value::String("aarch64".to_string()),
+            ),
+            sinomo_runtime::object::Field::new(
+                "port",
+                sinomo_runtime::object::Value::Uint16(21353),
+            ),
+        ])),
+    );
+    std::fs::write(&path, document.to_bytes().expect("encode")).expect("write sobj");
+
+    let captured = super::execute_cli_command_captured(&[
+        "debug".to_string(),
+        "sobj".to_string(),
+        path.display().to_string(),
+    ]);
+
+    assert_eq!(captured.status, super::CliCommandStatus::Completed);
+    let stdout = String::from_utf8_lossy(&captured.output.stdout);
+    assert!(stdout.contains("document(version=1,length=uint32"));
+    assert!(stdout.contains("\"node\": \"aarch64\""));
+    assert!(stdout.contains("\"port\": uint16(21353)"));
+    assert!(captured.output.stderr.is_empty());
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(unix)]

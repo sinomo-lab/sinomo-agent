@@ -203,6 +203,25 @@ pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> Daem
     }
 }
 
+pub fn current_daemon_cluster_options(
+    data_dir: &Path,
+) -> Option<(DaemonRunOptions, DaemonRunOptions)> {
+    let main_options = read_daemon_status(&DaemonPaths::with_root(data_dir.join("daemon")))
+        .map(|status| daemon_options_from_status(&status))
+        .ok();
+    let shadow_options =
+        read_daemon_status(&DaemonPaths::with_root(data_dir.join("shadow-daemon")))
+            .map(|status| daemon_options_from_status(&status))
+            .ok();
+    if main_options.is_none() && shadow_options.is_none() {
+        return None;
+    }
+    Some((
+        main_options.unwrap_or_else(DaemonRunOptions::default),
+        shadow_options.unwrap_or_else(DaemonRunOptions::shadow_default),
+    ))
+}
+
 pub fn daemon_cluster_status_matches(
     state: &ClusterBootstrapState,
     endpoint: &ClusterEndpointRecord,

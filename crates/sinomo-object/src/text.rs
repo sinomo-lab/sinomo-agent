@@ -10,8 +10,9 @@
 use std::fmt::Write;
 
 use crate::{
-    AlignmentHint, Array, Document, ElementType, Error, Field, LengthMode, List, Metadata, Object,
-    OptionalValue, Payload, Schema, SchemaField, SchemaType, TypeId, Value,
+    AlignmentHint, Array, ArrayView, Document, DocumentView, ElementType, ElementView, Error,
+    Field, LengthMode, List, ListView, Metadata, Object, ObjectView, OptionalValue, OptionalView,
+    Payload, PayloadView, Schema, SchemaField, SchemaType, TypeId, Value,
 };
 
 pub fn value_to_text(value: &Value) -> String {
@@ -57,6 +58,43 @@ pub fn document_to_text(document: &Document) -> String {
     out
 }
 
+pub fn document_view_to_text(document: &DocumentView<'_>) -> String {
+    let mut out = String::new();
+    out.push_str("document(");
+    let _ = write!(out, "version={},", document.metadata.version_id);
+    out.push_str("length=");
+    out.push_str(length_mode_name(document.metadata.length_mode));
+    out.push(',');
+    out.push_str("align=");
+    out.push_str(match document.metadata.alignment_hint {
+        AlignmentHint::NotAligned => "false",
+        AlignmentHint::Aligned => "true",
+    });
+    out.push(',');
+    out.push_str("schema=");
+    write_schema(&mut out, &document.schema);
+    out.push(',');
+    out.push_str("payload=");
+    match &document.payload {
+        PayloadView::Dynamic(value) => write_element_view(&mut out, value),
+        PayloadView::Schema {
+            root_schema_type_id,
+            root_count,
+            data,
+        } => {
+            let _ = write!(
+                out,
+                "schema_payload(id={},count={},data=",
+                root_schema_type_id, root_count
+            );
+            write_hex(&mut out, data);
+            out.push(')');
+        }
+    }
+    out.push(')');
+    out
+}
+
 pub fn parse_value(input: &str) -> crate::Result<Value> {
     let mut parser = Parser::new(input);
     let value = parser.parse_value()?;
@@ -69,6 +107,32 @@ pub fn parse_document(input: &str) -> crate::Result<Document> {
     let document = parser.parse_document()?;
     parser.finish()?;
     Ok(document)
+}
+
+fn write_element_view(out: &mut String, value: &ElementView<'_>) {
+    match value {
+        ElementView::Boolean(value) => out.push_str(if *value { "true" } else { "false" }),
+        ElementView::Uint8(value) => write_typed(out, "uint8", *value),
+        ElementView::Int8(value) => write_typed(out, "int8", *value),
+        ElementView::Uint16(value) => write_typed(out, "uint16", *value),
+        ElementView::Int16(value) => write_typed(out, "int16", *value),
+        ElementView::Uint32(value) => write_typed(out, "uint32", *value),
+        ElementView::Int32(value) => write_typed(out, "int32", *value),
+        ElementView::Uint64(value) => write_typed(out, "uint64", *value),
+        ElementView::Int64(value) => write_typed(out, "int64", *value),
+        ElementView::Float(value) => write_typed(out, "float", format_float(*value as f64)),
+        ElementView::Double(value) => write_typed(out, "double", format_float(*value)),
+        ElementView::Object(object) => write_object_view(out, object),
+        ElementView::List(list) => write_list_view(out, list),
+        ElementView::Array(array) => write_array_view(out, array),
+        ElementView::String(value) => write_string(out, value),
+        ElementView::Bytes(value) => {
+            out.push_str("bytes(");
+            write_hex(out, value);
+            out.push(')');
+        }
+        ElementView::Optional(optional) => write_optional_view(out, optional),
+    }
 }
 
 fn write_value(out: &mut String, value: &Value) {
@@ -116,6 +180,19 @@ fn format_float(value: f64) -> String {
     }
 }
 
+fn write_object_view(out: &mut String, object: &ObjectView<'_>) {
+    out.push('{');
+    for (index, field) in object.fields.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        write_string(out, field.key);
+        out.push_str(": ");
+        write_element_view(out, &field.value);
+    }
+    out.push('}');
+}
+
 fn write_object(out: &mut String, object: &Object) {
     out.push('{');
     for (index, field) in object.fields.iter().enumerate() {
@@ -129,6 +206,19 @@ fn write_object(out: &mut String, object: &Object) {
     out.push('}');
 }
 
+fn write_list_view(out: &mut String, list: &ListView<'_>) {
+    out.push_str("list<");
+    write_element_type(out, &list.element_type);
+    out.push_str(">[");
+    for (index, value) in list.values.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        write_element_view(out, value);
+    }
+    out.push(']');
+}
+
 fn write_list(out: &mut String, list: &List) {
     out.push_str("list<");
     write_element_type(out, &list.element_type);
@@ -140,6 +230,23 @@ fn write_list(out: &mut String, list: &List) {
         write_value(out, value);
     }
     out.push(']');
+}
+
+fn write_array_view(out: &mut String, array: &ArrayView<'_>) {
+    out.push_str("array<");
+    write_element_type(out, &array.element_type);
+    out.push_str(">(size=");
+    let _ = write!(out, "{}", array.element_size);
+    out.push_str(",dims=[");
+    for (index, dimension) in array.dimensions.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{dimension}");
+    }
+    out.push_str("],data=");
+    write_hex(out, array.data);
+    out.push(')');
 }
 
 fn write_array(out: &mut String, array: &Array) {
@@ -156,6 +263,17 @@ fn write_array(out: &mut String, array: &Array) {
     }
     out.push_str("],data=");
     write_hex(out, &array.data);
+    out.push(')');
+}
+
+fn write_optional_view(out: &mut String, optional: &OptionalView<'_>) {
+    out.push_str("optional<");
+    write_element_type(out, &optional.element_type);
+    out.push_str(">(");
+    match optional.value.as_deref() {
+        Some(value) => write_element_view(out, value),
+        None => out.push_str("none"),
+    }
     out.push(')');
 }
 

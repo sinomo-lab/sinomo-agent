@@ -8,6 +8,7 @@ pub fn print_usage() {
     println!("  sinomo install");
     println!("  sinomo uninstall");
     println!("  sinomo daemon");
+    println!("  sinomo debug");
     println!("  sinomo rollout");
     for command in cli_command_registry().metadata() {
         println!("  sinomo {}", command.name);
@@ -116,6 +117,14 @@ pub(super) fn print_daemon_help() {
     println!("      Ask the running daemon to shut down.");
     println!("  sinomo daemon shadow run|start|status|stop [--host <host>] [--port <port>]");
     println!("      Control the shadow daemon. Defaults to 127.0.0.1:21354.");
+}
+
+pub(super) fn print_debug_help() {
+    println!("Debug:");
+    println!("  sinomo debug");
+    println!("      Show debug commands.");
+    println!("  sinomo debug sobj <path>");
+    println!("      Decode a SOBJ file and print the typed text representation.");
 }
 
 pub(super) fn print_rollout_help() {

@@ -7,13 +7,13 @@ use crate::{
     DaemonClusterStatus, DaemonError, DaemonPaths, DaemonProbeStatus, DaemonRunOptions,
     IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
     SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options, daemon_cluster_options_from_status,
-    daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
-    daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
-    fetch_cluster_kv_snapshot_from_endpoint, fetch_daemon_status_from_endpoint,
-    handle_daemon_rollout_build_request, probe_daemon_status, read_daemon_status,
-    send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_raft_append,
-    send_cluster_raft_vote, write_daemon_status,
+    current_daemon_cluster_options, current_shadow_daemon_options,
+    daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_cluster_status,
+    daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
+    daemon_paths_are_shadow, fetch_cluster_kv_snapshot_from_endpoint,
+    fetch_daemon_status_from_endpoint, handle_daemon_rollout_build_request, probe_daemon_status,
+    read_daemon_status, send_cluster_kv_txn, send_cluster_kv_watch_events,
+    send_cluster_raft_append, send_cluster_raft_vote, write_daemon_status,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
@@ -1952,11 +1952,22 @@ pub(crate) fn prepare_local_cluster_state(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
 ) -> Result<(), DaemonError> {
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let (main_options, shadow_options) =
+        current_daemon_cluster_options(data_dir).unwrap_or_else(|| {
+            (
+                DaemonRunOptions::default(),
+                DaemonRunOptions::shadow_default(),
+            )
+        });
     let _ = refresh_local_daemon_membership(
         paths,
         state,
-        &DaemonRunOptions::default(),
-        &DaemonRunOptions::shadow_default(),
+        &main_options,
+        &shadow_options,
         OffsetDateTime::now_utc(),
     )?;
     Ok(())
@@ -2029,14 +2040,26 @@ impl sinomo_network::ClusterMemberMutationHost for DaemonClusterMemberMutationHo
         paths: &ClusterPaths,
         state: &mut ClusterBootstrapState,
     ) -> Result<(), sinomo_network::NetworkError> {
-        refresh_local_daemon_membership(
-            paths,
-            state,
-            &DaemonRunOptions::default(),
-            &DaemonRunOptions::shadow_default(),
-            OffsetDateTime::now_utc(),
-        )
-        .map_err(|error| daemon_host_network_error("cluster state membership sync", error))?;
+        let data_dir = paths
+            .root
+            .parent()
+            .ok_or_else(|| sinomo_network::NetworkError::Io {
+                operation: "cluster state membership sync".to_string(),
+                detail: format!(
+                    "cluster paths have no data directory parent: {}",
+                    paths.root.display()
+                ),
+            })?;
+        if let Some((main_options, shadow_options)) = current_daemon_cluster_options(data_dir) {
+            refresh_local_daemon_membership(
+                paths,
+                state,
+                &main_options,
+                &shadow_options,
+                OffsetDateTime::now_utc(),
+            )
+            .map_err(|error| daemon_host_network_error("cluster state membership sync", error))?;
+        }
         Ok(())
     }
 
@@ -3007,6 +3030,200 @@ mod tests {
             .expect("remote target"),
             None
         );
+    }
+
+    #[test]
+    fn cluster_state_kv_sync_preparation_uses_daemon_status_options() {
+        let root = unique_cluster_test_root("cluster-sync-status-options");
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let main_paths = DaemonPaths::new(&data_dir);
+        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+        main_paths.ensure().expect("main daemon paths");
+        shadow_paths.ensure().expect("shadow daemon paths");
+
+        let main_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 32_153,
+        };
+        let shadow_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 32_154,
+        };
+        write_daemon_status(
+            &main_paths,
+            &crate::DaemonStatus::new(&main_options, &main_paths, None),
+        )
+        .expect("write main status");
+        write_daemon_status(
+            &shadow_paths,
+            &crate::DaemonStatus::new(&shadow_options, &shadow_paths, None),
+        )
+        .expect("write shadow status");
+
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_sync_status_options").expect("cluster"),
+            "sync status options".to_string(),
+            NodeId::from_legacy_named("node_sync_status_options").expect("node"),
+            "sync status options".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        ensure_daemon_cluster_members(
+            &mut state,
+            &DaemonRunOptions::default(),
+            &DaemonRunOptions::shadow_default(),
+            now,
+        );
+
+        let mut host = DaemonClusterMemberMutationHost;
+        sinomo_network::ClusterMemberMutationHost::prepare_cluster_state_for_kv_sync(
+            &mut host,
+            &cluster_paths,
+            &mut state,
+        )
+        .expect("prepare membership");
+
+        let main_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .expect("main member");
+        assert!(
+            main_member
+                .endpoints
+                .iter()
+                .any(
+                    |endpoint| endpoint.transport == ClusterTransportKind::Loopback
+                        && endpoint.address == "127.0.0.1:32153"
+                )
+        );
+        assert!(
+            main_member
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.address != "127.0.0.1:21353")
+        );
+
+        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+        let shadow_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == shadow_node_id)
+            .expect("shadow member");
+        assert!(
+            shadow_member
+                .endpoints
+                .iter()
+                .any(
+                    |endpoint| endpoint.transport == ClusterTransportKind::Loopback
+                        && endpoint.address == "127.0.0.1:32154"
+                )
+        );
+        assert!(
+            shadow_member
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.address != "127.0.0.1:21354")
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn local_cluster_state_preparation_uses_daemon_status_options() {
+        let root = unique_cluster_test_root("cluster-prepare-status-options");
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let main_paths = DaemonPaths::new(&data_dir);
+        let shadow_paths = DaemonPaths::for_shadow(&data_dir);
+        main_paths.ensure().expect("main daemon paths");
+        shadow_paths.ensure().expect("shadow daemon paths");
+
+        let main_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 32_153,
+        };
+        let shadow_options = DaemonRunOptions {
+            host: "0.0.0.0".to_string(),
+            port: 32_154,
+        };
+        write_daemon_status(
+            &main_paths,
+            &crate::DaemonStatus::new(&main_options, &main_paths, None),
+        )
+        .expect("write main status");
+        write_daemon_status(
+            &shadow_paths,
+            &crate::DaemonStatus::new(&shadow_options, &shadow_paths, None),
+        )
+        .expect("write shadow status");
+
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_prepare_status_options").expect("cluster"),
+            "prepare status options".to_string(),
+            NodeId::from_legacy_named("node_prepare_status_options").expect("node"),
+            "prepare status options".to_string(),
+            "main-public-key".to_string(),
+            now,
+        );
+        ensure_daemon_cluster_members(
+            &mut state,
+            &DaemonRunOptions::default(),
+            &DaemonRunOptions::shadow_default(),
+            now,
+        );
+
+        prepare_local_cluster_state(&cluster_paths, &mut state).expect("prepare local state");
+
+        let main_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == state.local_node_id)
+            .expect("main member");
+        assert!(
+            main_member
+                .endpoints
+                .iter()
+                .any(
+                    |endpoint| endpoint.transport == ClusterTransportKind::Loopback
+                        && endpoint.address == "127.0.0.1:32153"
+                )
+        );
+        assert!(
+            main_member
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.address != "127.0.0.1:21353")
+        );
+
+        let shadow_node_id = shadow_daemon_node_id(&state.local_node_id);
+        let shadow_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == shadow_node_id)
+            .expect("shadow member");
+        assert!(
+            shadow_member
+                .endpoints
+                .iter()
+                .any(
+                    |endpoint| endpoint.transport == ClusterTransportKind::Loopback
+                        && endpoint.address == "127.0.0.1:32154"
+                )
+        );
+        assert!(
+            shadow_member
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.address != "127.0.0.1:21354")
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
