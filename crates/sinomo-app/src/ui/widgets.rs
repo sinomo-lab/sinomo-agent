@@ -2,8 +2,9 @@
 
 use sui::{ArrangeCtx, prelude::Padding};
 use sui::{
-    Color, Constraints, IconGlyph, MeasureCtx, PaintCtx, Path, Point, Rect, SingleChild, Size,
-    TextStyle, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
+    Color, Constraints, IconGlyph, MeasureCtx, PaintCtx, Path, Point, Rect, SemanticsCtx,
+    SingleChild, Size, TextStyle, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    draw_glyph,
 };
 
 use crate::state::Shared;
@@ -110,6 +111,16 @@ impl Widget for Dock {
         }
         if let Some(bottom) = &self.bottom {
             bottom.paint(ctx);
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        if let Some(top) = &self.top {
+            top.semantics(ctx);
+        }
+        self.body.semantics(ctx);
+        if let Some(bottom) = &self.bottom {
+            bottom.semantics(ctx);
         }
     }
 

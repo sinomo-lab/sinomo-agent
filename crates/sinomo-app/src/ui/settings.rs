@@ -8,7 +8,7 @@
 //!
 //! The page is a fully *composed* `sui-widgets` tree: [`view`] returns a small
 //! responsive host ([`SettingsView`]) wrapping two pre-built pods (wide/narrow),
-//! each assembled from stock `PanelSection` / `PropertyRow` / `TabBar` / `Switch` /
+//! each assembled from stock `FormSection` / `FormRow` / `TabBar` / `Switch` /
 //! `TextInput` / `Select` / `Button` / `ListView` / `ScrollView` widgets. State lives
 //! entirely in [`SettingsState`]; controls bind to it via reactive `*_when` readers and
 //! snapshot-seed-plus-`on_change` writeback. The async provider device-login status is
@@ -20,10 +20,10 @@ use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 
 use sui::{
-    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FontWeight, Label, ListItem,
-    ListView, MeasureCtx, PaintCtx, PanelSection, PropertyRow, Rect, ScrollState, ScrollView,
-    Select, Separator, Size, SizedBox, Stack, Switch, SwitchView, TabBar, TextInput, Widget,
-    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FieldGroup, FontWeight,
+    FormRow, FormSection, Label, ListItem, ListView, MeasureCtx, PaintCtx, Rect, ScrollState,
+    ScrollView, Select, SemanticsCtx, Separator, Size, SizedBox, Stack, Switch, SwitchView, TabBar,
+    TextInput, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
 };
 
 use sinomo_runtime::config::ConfigClient;
@@ -466,14 +466,14 @@ fn value_row(
     reader: &ThemeReader,
     label: &str,
     value: impl Into<String>,
-) -> PropertyRow {
-    PropertyRow::new(label, muted_label(shared, value))
+) -> FormRow {
+    FormRow::new(label, muted_label(shared, value))
         .inline()
         .theme_when(clone_reader(reader))
 }
 
 /// A toggle row: `label` + a `Switch` seeded `on`, calling `on_toggle` when flipped.
-fn switch_row<F>(reader: &ThemeReader, label: &str, on: bool, on_toggle: F) -> PropertyRow
+fn switch_row<F>(reader: &ThemeReader, label: &str, on: bool, on_toggle: F) -> FormRow
 where
     F: FnMut(bool) + 'static,
 {
@@ -481,7 +481,7 @@ where
         .on(on)
         .theme_when(clone_reader(reader))
         .on_toggle(on_toggle);
-    PropertyRow::new(label, switch)
+    FormRow::new(label, switch)
         .inline()
         .theme_when(clone_reader(reader))
 }
@@ -494,7 +494,7 @@ fn text_row<F>(
     value: impl Into<String>,
     placeholder: &str,
     on_change: F,
-) -> PropertyRow
+) -> FormRow
 where
     F: FnMut(String) + 'static,
 {
@@ -503,7 +503,7 @@ where
         .placeholder(placeholder)
         .theme_when(clone_reader(reader))
         .on_change(on_change);
-    PropertyRow::new(label, input)
+    FormRow::new(label, input)
         .inline()
         .theme_when(clone_reader(reader))
 }
@@ -516,7 +516,7 @@ fn select_row<S, C>(
     options: &[&str],
     selected_when: S,
     on_change: C,
-) -> PropertyRow
+) -> FormRow
 where
     S: Fn() -> Option<usize> + 'static,
     C: FnMut(usize, String) + 'static,
@@ -526,7 +526,7 @@ where
         .selected_when(selected_when)
         .theme_when(clone_reader(reader))
         .on_change(on_change);
-    PropertyRow::new(label, select)
+    FormRow::new(label, select)
         .inline()
         .theme_when(clone_reader(reader))
 }
@@ -563,12 +563,12 @@ fn section_appearance(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
                 s.borrow_mut().theme_mode = index_to_mode(i);
             })
     };
-    let body = Stack::vertical().alignment(Alignment::Stretch).with_child(
-        PropertyRow::new("Theme", tab_bar)
+    let body = FieldGroup::new().with_child(
+        FormRow::new("Theme", tab_bar)
             .inline()
             .theme_when(clone_reader(reader)),
     );
-    PanelSection::new("Appearance", body).theme_when(clone_reader(reader))
+    FormSection::new("Appearance", body).theme_when(clone_reader(reader))
 }
 
 fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -576,12 +576,11 @@ fn section_connection(shared: &Shared, reader: &ThemeReader) -> impl Widget + us
         let s = shared.settings();
         (s.mode_label.clone(), s.status_detail.clone())
     };
-    let body = Stack::vertical()
-        .spacing(2.0)
-        .alignment(Alignment::Stretch)
+    let body = FieldGroup::new()
+        .spacing(6.0)
         .with_child(value_row(shared, reader, "Mode", mode_label))
         .with_child(value_row(shared, reader, "Status", status_detail));
-    PanelSection::new("Connection", body).theme_when(clone_reader(reader))
+    FormSection::new("Connection", body).theme_when(clone_reader(reader))
 }
 
 fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -589,12 +588,11 @@ fn section_node(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         let s = shared.settings();
         (short(&s.node_id, 30), s.role.clone())
     };
-    let body = Stack::vertical()
-        .spacing(2.0)
-        .alignment(Alignment::Stretch)
+    let body = FieldGroup::new()
+        .spacing(6.0)
         .with_child(value_row(shared, reader, "Node ID", node_id))
         .with_child(value_row(shared, reader, "Role", role));
-    PanelSection::new("Node", body).theme_when(clone_reader(reader))
+    FormSection::new("Node", body).theme_when(clone_reader(reader))
 }
 
 fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -606,27 +604,24 @@ fn section_cluster(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<>
                 .clone()
                 .unwrap_or_else(|| "connected".to_string());
             drop(s);
-            Stack::vertical()
-                .spacing(2.0)
-                .alignment(Alignment::Stretch)
+            FieldGroup::new()
+                .spacing(6.0)
                 .with_child(value_row(shared, reader, "Cluster", summary))
         } else {
             drop(s);
-            Stack::vertical()
-                .spacing(2.0)
-                .alignment(Alignment::Stretch)
+            FieldGroup::new()
+                .spacing(6.0)
                 .with_child(value_row(shared, reader, "State", "running locally"))
                 .with_child(value_row(shared, reader, "Nodes", "this device only"))
         }
     };
-    PanelSection::new("Cluster", body).theme_when(clone_reader(reader))
+    FormSection::new("Cluster", body).theme_when(clone_reader(reader))
 }
 
 fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let version = shared.settings().version.clone();
-    let body = Stack::vertical()
-        .spacing(2.0)
-        .alignment(Alignment::Stretch)
+    let body = FieldGroup::new()
+        .spacing(6.0)
         .with_child(value_row(
             shared,
             reader,
@@ -634,7 +629,7 @@ fn section_about(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
             format!("v{version}"),
         ))
         .with_child(value_row(shared, reader, "Toolkit", "SUI"));
-    PanelSection::new("About", body).theme_when(clone_reader(reader))
+    FormSection::new("About", body).theme_when(clone_reader(reader))
 }
 
 /// One provider's card: enable toggle (header action), auth row, model / base URL, and effort.
@@ -652,7 +647,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             })
     };
 
-    let mut body = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+    let mut body = FieldGroup::new().spacing(8.0);
 
     // Authentication: device-login (status + button) or an API-key field.
     if form.uses_device_login {
@@ -676,7 +671,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             .with_child(StatusReflector::new(shared.clone(), index))
             .with_child(button);
         body = body.with_child(
-            PropertyRow::new("Authentication", auth)
+            FormRow::new("Authentication", auth)
                 .stacked()
                 .theme_when(clone_reader(reader)),
         );
@@ -763,7 +758,7 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
         ));
     }
 
-    PanelSection::new(form.display_name.clone(), body)
+    FormSection::new(form.display_name.clone(), body)
         .header_action(enable_switch)
         .theme_when(clone_reader(reader))
 }
@@ -791,14 +786,14 @@ fn section_configuration(shared: &Shared, reader: &ThemeReader) -> impl Widget +
         } else {
             let count = settings.config_items.len();
             drop(settings);
-            let mut stack = Stack::vertical().spacing(8.0).alignment(Alignment::Stretch);
+            let mut stack = FieldGroup::new().spacing(8.0);
             for index in 0..count {
                 stack = stack.with_child(config_row(shared, reader, index));
             }
             WidgetPod::new(stack)
         }
     };
-    PanelSection::new("Advanced", PodHost::new(body)).theme_when(clone_reader(reader))
+    FormSection::new("Advanced", PodHost::new(body)).theme_when(clone_reader(reader))
 }
 
 /// One Advanced config row: a toggle for booleans, otherwise a text field with a muted subtitle
@@ -1010,7 +1005,7 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -
                 .width(SIDEBAR_W)
                 .with_child(sidebar(shared, reader)),
         )
-        .with_child(Separator::vertical())
+        .with_child(Separator::vertical().theme_when(clone_reader(reader)))
         .with_child(SizedBox::new().with_child(detail));
     WidgetPod::new(row)
 }
@@ -1036,7 +1031,7 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
                 .with_child(SizedBox::new().height(8.0)),
             12.0,
         ))
-        .with_child(Separator::horizontal())
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
         .with_child(SizedBox::new().with_child(section_body(shared, reader, scroll_state)));
 
     let switch = SwitchView::new()
@@ -1076,6 +1071,10 @@ impl Widget for PodHost {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
@@ -1129,6 +1128,10 @@ impl Widget for InsetX {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
@@ -1403,6 +1406,10 @@ impl Widget for SettingsView {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.active().paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.active().semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {

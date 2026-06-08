@@ -91,42 +91,29 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Derive the app's chrome palette from the toolkit's resolved [`ControlPalette`]
-    /// (`theme.palette`) and color roles (`theme.colors`), so the bespoke chrome stays on the
-    /// exact same, scheme-tuned color system as the `sui-widgets` the tabs are built from. Surfaces,
-    /// text, accent and status come straight from the theme (this is what makes light mode legible);
-    /// hairlines, hover and selection stay as subtle translucent overlays so the flat chrome reads
-    /// well on any surface.
-    ///
-    // TODO(ui-polish): re-verify surface/border values against captures once the renderer's shadow
-    // primitive lands — pure-black `base_100` in dark mode wants elevation under it.
+    /// Adapt SUI's reusable surface palette to the app's existing chrome names.
     pub fn from_theme(theme: &DefaultTheme, dark: bool) -> Self {
-        let cp = &theme.palette;
-        let colors = &theme.colors;
-        let line = if dark { 0.10 } else { 0.12 };
+        let surfaces = &theme.surfaces;
         Palette {
-            dark,
-            window: cp.surface,
-            panel: cp.surface_raised,
-            sidebar: cp.surface,
-            titlebar: cp.surface_raised,
-            border: with_alpha(cp.text, line),
-            border_strong: with_alpha(cp.text, line * 2.0),
-            text: cp.text,
-            // Derive muted/faint from full text rather than the toolkit's roles: the theme fades
-            // muted text far toward the surface (fine on a control, too low-contrast for the chrome's
-            // heavy use of secondary text — especially in light mode on a near-white surface).
-            text_muted: mix(cp.text, cp.surface, 0.34),
-            text_faint: mix(cp.text, cp.surface, 0.52),
-            accent: cp.accent,
-            accent_hover: cp.accent_hover,
-            on_accent: cp.accent_text,
-            hover: with_alpha(cp.text, if dark { 0.06 } else { 0.05 }),
-            selected: cp.selection,
-            field: cp.control,
-            good: colors.success,
-            warn: colors.warning,
-            bad: colors.error,
+            dark: surfaces.dark || dark,
+            window: surfaces.window,
+            panel: surfaces.panel,
+            sidebar: surfaces.sidebar,
+            titlebar: surfaces.titlebar,
+            border: surfaces.border,
+            border_strong: surfaces.border_strong,
+            text: surfaces.text,
+            text_muted: surfaces.text_muted,
+            text_faint: surfaces.text_faint,
+            accent: surfaces.accent,
+            accent_hover: surfaces.accent_hover,
+            on_accent: surfaces.on_accent,
+            hover: surfaces.hover,
+            selected: surfaces.selected,
+            field: surfaces.field,
+            good: surfaces.good,
+            warn: surfaces.warn,
+            bad: surfaces.bad,
         }
     }
 
@@ -154,22 +141,4 @@ impl Palette {
             ..theme.body_text_style()
         }
     }
-}
-
-/// Override a color's alpha, preserving its RGB — used for translucent hairlines, hover and
-/// selection overlays that sit on top of any surface.
-fn with_alpha(c: Color, a: f32) -> Color {
-    Color::rgba(c.red, c.green, c.blue, a)
-}
-
-/// Linear blend of `a` toward `b` by `t` (0 = a, 1 = b), preserving a's alpha. Used to derive
-/// contrast-tuned muted/faint text from the theme's text + surface colors.
-fn mix(a: Color, b: Color, t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    Color::rgba(
-        a.red + (b.red - a.red) * t,
-        a.green + (b.green - a.green) * t,
-        a.blue + (b.blue - a.blue) * t,
-        a.alpha,
-    )
 }

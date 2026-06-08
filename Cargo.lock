@@ -8089,6 +8089,7 @@ version = "1.17.0"
 dependencies = [
  "sui-core",
  "sui-runtime",
+ "sui-scene",
 ]
 
 [[package]]

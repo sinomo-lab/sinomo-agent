@@ -39,10 +39,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use sui::{
-    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconGlyph,
-    KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind, Rect, ScrollDelta,
-    Separator, Size, SizedBox, Stack, TextArea, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, draw_glyph,
+    Alignment, ArrangeCtx, Constraints, DefaultTheme, Event, EventCtx, FontWeight, IconButton,
+    IconGlyph, Insets, KeyState, Label, ListItem, ListView, MeasureCtx, PaintCtx, PointerEventKind,
+    Rect, ScrollDelta, SemanticsCtx, Separator, Size, SizedBox, Stack, Surface, SurfaceBorder,
+    SurfaceRole, TextArea, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
 use sinomo_cli::app_api::{AgentSummary, ProviderSummary, agent_summaries, reasoning_efforts};
@@ -62,6 +62,10 @@ const COMPOSER_H: f32 = 132.0;
 const PAD: f32 = 16.0;
 const SIDEBAR_ROW_H: f32 = 36.0;
 const SELECTOR_H: f32 = 30.0;
+const COMPOSER_PAD_Y: f32 = 12.0;
+const COMPOSER_SECTION_GAP: f32 = 10.0;
+const INPUT_ACTION_GAP: f32 = 10.0;
+const SEND_BUTTON_SIZE: f32 = 40.0;
 
 /// A shared closure that resolves the current widget theme — threaded into every control so the
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as the other tabs.)
@@ -516,15 +520,11 @@ fn heading(shared: &Shared, text: &str) -> Label {
 
 /// Build the AGENTS ListView: one row per agent, the active one selected, selecting one switches.
 fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    // NB: `ListView`/`ListItem` have no leading-icon slot, and a custom `with_child` row content
-    // suppresses the ListView's click-to-select + hover handling — so these rows keep a leading text
-    // glyph rather than a real Lucide `Icon` (the bespoke painters elsewhere use real icons). The ✦
-    // marks the "agents" rows like the empty-state Sparkles mark.
     let items: Vec<ListItem> = shared
         .chat()
         .agents
         .iter()
-        .map(|agent| ListItem::new(format!("✦  {}", agent.name)))
+        .map(|agent| ListItem::new(agent.name.clone()).leading_text("✦"))
         .collect();
     let s = shared.clone();
     ListView::new("chat-agents")
@@ -546,15 +546,13 @@ fn agents_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
 /// Build the SESSIONS ListView: a "New chat" row followed by session history. Selecting row 0
 /// starts a fresh session; later rows open that stored session.
 fn sessions_list(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    // Leading text glyphs (no ListView leading-icon slot — see `agents_list`): the New chat row
-    // reads as a "+" (Plus), session-history rows as a clock-face "◷" (History).
-    let mut items = vec![ListItem::new("+  New chat")];
+    let mut items = vec![ListItem::new("New chat").leading_text("+")];
     items.extend(
         shared
             .chat()
             .sessions
             .iter()
-            .map(|session| ListItem::new(format!("◷  {}", session.title))),
+            .map(|session| ListItem::new(session.title.clone()).leading_text("◷")),
     );
     let s = shared.clone();
     ListView::new("chat-sessions")
@@ -597,7 +595,7 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 .with_child(InsetX::new(heading(&s, "SESSIONS"), 18.0))
                 .with_child(SizedBox::new().height(2.0))
                 .with_child(InsetX::new(sessions_list(&s, &r), 8.0));
-            WidgetPod::new(SidebarSurface::new(s.clone(), column))
+            WidgetPod::new(Surface::sidebar(column).fill().theme_when(clone_reader(&r)))
         },
     )
 }
@@ -941,9 +939,9 @@ fn selectors(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     WidgetPod::new(row)
 }
 
-/// The composer's bottom row: a flexible message `TextArea` and a fixed-width Send `Button`/
-/// `Spinner`. The input is bound to the draft via `on_change`; the send action is wired to
-/// `ChatState::submit`. The Send control swaps to a `Spinner` while streaming.
+/// The composer's bottom row: a flexible message `TextArea` and a fixed-size send action slot. The
+/// input is bound to the draft via `on_change`; the send action is wired to `ChatState::submit`.
+/// The Send control swaps to a `Spinner` while streaming.
 fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     let input = {
         let s = shared.clone();
@@ -956,6 +954,12 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
                 font_size: 13.5,
                 line_height: 19.0,
                 ..theme.body_text_style()
+            })
+            .padding(Insets {
+                left: 12.0,
+                top: 8.0,
+                right: 12.0,
+                bottom: 8.0,
             })
             .theme_when(clone_reader(reader))
             .on_change({
@@ -982,7 +986,9 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     } else {
         let s = shared.clone();
         WidgetPod::new(
-            sui::Button::new("Send")
+            IconButton::new(IconGlyph::Send, "Send")
+                .size(SEND_BUTTON_SIZE)
+                .icon_size(17.0)
                 .theme_when(clone_reader(reader))
                 .enabled_when({
                     let s = s.clone();
@@ -994,10 +1000,11 @@ fn input_row(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         )
     };
 
-    let row = Split::new(
-        SizedBox::new().with_child(PodHost::new(WidgetPod::new(input))),
-        SizedBox::new().with_child(PodHost::new(send)),
-        92.0,
+    let row = ComposerInputRow::new(
+        WidgetPod::new(input),
+        send,
+        SEND_BUTTON_SIZE,
+        INPUT_ACTION_GAP,
     );
     WidgetPod::new(row)
 }
@@ -1031,148 +1038,25 @@ fn composer(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
         )
     };
 
-    // Fixed-height input row so the composer layout is deterministic:
-    // COMPOSER_H − top(14) − selectors(SELECTOR_H) − gap(12) − bottom(14).
-    let input_h = (COMPOSER_H - 14.0 - SELECTOR_H - 12.0 - 14.0).max(40.0);
+    let input_h =
+        (COMPOSER_H - (COMPOSER_PAD_Y * 2.0) - SELECTOR_H - COMPOSER_SECTION_GAP).max(48.0);
     let body = Stack::vertical()
-        .spacing(12.0)
+        .spacing(0.0)
         .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(14.0))
+        .with_child(SizedBox::new().height(COMPOSER_PAD_Y))
         .with_child(InsetX::new(selector_host, PAD))
+        .with_child(SizedBox::new().height(COMPOSER_SECTION_GAP))
         .with_child(
             SizedBox::new()
                 .height(input_h)
                 .with_child(InsetX::new(input_host, PAD)),
         )
-        .with_child(SizedBox::new().height(14.0));
+        .with_child(SizedBox::new().height(COMPOSER_PAD_Y));
 
-    ComposerSurface::new(shared.clone(), body)
-}
-
-// ---------------------------------------------------------------------------
-// Surfaces — thin painters that fill a chrome surface behind their child.
-// ---------------------------------------------------------------------------
-
-/// Fills the sidebar surface (+ right hairline) behind its child column.
-struct SidebarSurface {
-    shared: Shared,
-    child: WidgetPod,
-}
-
-impl SidebarSurface {
-    fn new<W: Widget + 'static>(shared: Shared, child: W) -> Self {
-        Self {
-            shared,
-            child: WidgetPod::new(child),
-        }
-    }
-}
-
-impl Widget for SidebarSurface {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.child.measure(ctx, constraints);
-        constraints.max
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let pal = palette(&self.shared);
-        ctx.fill_rect(ctx.bounds(), pal.sidebar);
-        widgets::hairline_right(ctx, ctx.bounds(), pal.border);
-        self.child.paint(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
-}
-
-/// Fills the composer surface (titlebar color + top hairline) behind its child.
-struct ComposerSurface {
-    shared: Shared,
-    child: WidgetPod,
-}
-
-impl ComposerSurface {
-    fn new<W: Widget + 'static>(shared: Shared, child: W) -> Self {
-        Self {
-            shared,
-            child: WidgetPod::new(child),
-        }
-    }
-}
-
-impl Widget for ComposerSurface {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.child.measure(ctx, constraints);
-        constraints.max
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let pal = palette(&self.shared);
-        ctx.fill_rect(ctx.bounds(), pal.titlebar);
-        widgets::hairline_top(ctx, ctx.bounds(), pal.border);
-        self.child.paint(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
-}
-
-/// Fills the window surface behind the whole tab (so the transcript area has a base color).
-struct WindowSurface {
-    shared: Shared,
-    child: WidgetPod,
-}
-
-impl WindowSurface {
-    fn new<W: Widget + 'static>(shared: Shared, child: W) -> Self {
-        Self {
-            shared,
-            child: WidgetPod::new(child),
-        }
-    }
-}
-
-impl Widget for WindowSurface {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.child.measure(ctx, constraints);
-        constraints.max
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        let pal = palette(&self.shared);
-        ctx.fill_rect(ctx.bounds(), pal.window);
-        self.child.paint(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
-    }
+    Surface::new(SurfaceRole::Titlebar, body)
+        .border(SurfaceBorder::Top)
+        .fill()
+        .theme_when(clone_reader(reader))
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,15 +1076,17 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
         sidebar(shared, reader),
         main_column(shared, reader),
         SIDEBAR_W,
+        reader,
     );
-    WidgetPod::new(WindowSurface::new(shared.clone(), row))
+    WidgetPod::new(Surface::window(row).fill().theme_when(clone_reader(reader)))
 }
 
 fn narrow_pod(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
-    WidgetPod::new(WindowSurface::new(
-        shared.clone(),
-        main_column(shared, reader),
-    ))
+    WidgetPod::new(
+        Surface::window(main_column(shared, reader))
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
 }
 
 /// The chat tab: a thin responsive host owning two pre-built pods (wide split with sidebar / narrow
@@ -1415,6 +1301,10 @@ impl Widget for ChatView {
         self.active().paint(ctx);
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.active().semantics(ctx);
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(self.active());
     }
@@ -1502,6 +1392,10 @@ impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
         self.child.paint(ctx);
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.child);
     }
@@ -1511,8 +1405,100 @@ impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
     }
 }
 
+struct ComposerInputRow {
+    input: WidgetPod,
+    action: WidgetPod,
+    action_side: f32,
+    gap: f32,
+}
+
+impl ComposerInputRow {
+    fn new(input: WidgetPod, action: WidgetPod, action_side: f32, gap: f32) -> Self {
+        Self {
+            input,
+            action,
+            action_side: action_side.max(0.0),
+            gap: gap.max(0.0),
+        }
+    }
+
+    fn layout_rects(&self, bounds: Rect) -> (Rect, Rect) {
+        let side = self
+            .action_side
+            .min(bounds.width())
+            .min(bounds.height())
+            .max(0.0);
+        let gap = if side > 0.0 && bounds.width() > side {
+            self.gap.min(bounds.width() - side).max(0.0)
+        } else {
+            0.0
+        };
+        let input_width = (bounds.width() - side - gap).max(0.0);
+        let input = Rect::new(bounds.x(), bounds.y(), input_width, bounds.height());
+        let action = Rect::new(
+            bounds.x() + input_width + gap,
+            bounds.y() + ((bounds.height() - side) * 0.5).max(0.0),
+            side,
+            side,
+        );
+        (input, action)
+    }
+}
+
+impl Widget for ComposerInputRow {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            constraints.min.width.max(320.0)
+        };
+        let height = if constraints.max.height.is_finite() {
+            constraints.max.height
+        } else {
+            constraints.min.height.max(self.action_side)
+        };
+        let bounds = Rect::new(0.0, 0.0, width, height);
+        let (input, action) = self.layout_rects(bounds);
+        self.input.measure(
+            ctx,
+            Constraints::tight(Size::new(input.width(), input.height())),
+        );
+        self.action.measure(
+            ctx,
+            Constraints::tight(Size::new(action.width(), action.height())),
+        );
+        constraints.clamp(Size::new(width, height))
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        let (input, action) = self.layout_rects(bounds);
+        self.input.arrange(ctx, input);
+        self.action.arrange(ctx, action);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.input.paint(ctx);
+        self.action.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.input.semantics(ctx);
+        self.action.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.input);
+        visitor.visit(&self.action);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.input);
+        visitor.visit(&mut self.action);
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Small layout helpers (Split / PodHost / InsetX) — mirrors the Files tab.
+// Small layout helpers (Split / InsetX) — mirrors the Files tab.
 // ---------------------------------------------------------------------------
 
 /// A horizontal split with one fixed-width pane and one flexible pane, a 1px vertical [`Separator`]
@@ -1529,30 +1515,15 @@ struct Split {
 const SPLIT_SEPARATOR_W: f32 = 1.0;
 
 impl Split {
-    /// Left pane flexible, right pane fixed `right_width`.
-    fn new<L, R>(left: L, right: R, right_width: f32) -> Self
-    where
-        L: Widget + 'static,
-        R: Widget + 'static,
-    {
-        Self {
-            left: WidgetPod::new(left),
-            separator: WidgetPod::new(Separator::vertical()),
-            right: WidgetPod::new(right),
-            fixed_width: right_width.max(0.0),
-            fixed_is_left: false,
-        }
-    }
-
     /// Left pane fixed `left_width`, right pane flexible.
-    fn left_fixed<L, R>(left: L, right: R, left_width: f32) -> Self
+    fn left_fixed<L, R>(left: L, right: R, left_width: f32, reader: &ThemeReader) -> Self
     where
         L: Widget + 'static,
         R: Widget + 'static,
     {
         Self {
             left: WidgetPod::new(left),
-            separator: WidgetPod::new(Separator::vertical()),
+            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
             right: WidgetPod::new(right),
             fixed_width: left_width.max(0.0),
             fixed_is_left: true,
@@ -1623,6 +1594,12 @@ impl Widget for Split {
         self.right.paint(ctx);
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.left.semantics(ctx);
+        self.separator.semantics(ctx);
+        self.right.semantics(ctx);
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.left);
         visitor.visit(&self.separator);
@@ -1633,40 +1610,6 @@ impl Widget for Split {
         visitor.visit(&mut self.left);
         visitor.visit(&mut self.separator);
         visitor.visit(&mut self.right);
-    }
-}
-
-/// A container that hosts a pre-built [`WidgetPod`] (so a branch-chosen subtree can still be a
-/// single widget). Delegates everything to the pod. (Same as the Settings helper.)
-struct PodHost {
-    child: WidgetPod,
-}
-
-impl PodHost {
-    fn new(child: WidgetPod) -> Self {
-        Self { child }
-    }
-}
-
-impl Widget for PodHost {
-    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
-        self.child.measure(ctx, constraints)
-    }
-
-    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
-        self.child.arrange(ctx, bounds);
-    }
-
-    fn paint(&self, ctx: &mut PaintCtx) {
-        self.child.paint(ctx);
-    }
-
-    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
-        visitor.visit(&self.child);
-    }
-
-    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
-        visitor.visit(&mut self.child);
     }
 }
 
@@ -1712,6 +1655,10 @@ impl Widget for InsetX {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {

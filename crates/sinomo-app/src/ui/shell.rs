@@ -18,8 +18,9 @@ use std::cell::Cell;
 
 use sui::{
     ArrangeCtx, Constraints, Event, EventCtx, EventPhase, FontWeight, Image, ImageFit, ImageHandle,
-    MeasureCtx, PaintCtx, Rect, SingleChild, Size, Spinner, SwitchView, TabBar, ThemeShadow,
-    Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent,
+    MeasureCtx, PaintCtx, Rect, SemanticsCtx, SemanticsNode, SemanticsRole, SingleChild, Size,
+    Spinner, SwitchView, TabBar, ThemeShadow, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, WindowEvent,
 };
 
 use crate::state::{Shared, Tab};
@@ -29,8 +30,8 @@ use crate::ui::{chat, files, settings, widgets};
 pub const TOPBAR_HEIGHT: f32 = 44.0;
 const LOGO_SIZE: f32 = 24.0;
 const EDGE_PAD: f32 = 18.0;
-const TAB_SEG_HEIGHT: f32 = 30.0;
-const TAB_GAP: f32 = 4.0;
+const TAB_SEG_HEIGHT: f32 = 32.0;
+const TAB_GAP: f32 = 6.0;
 /// Spinner shown in the connecting indicator / loading screen.
 const SPINNER_SIZE: f32 = 18.0;
 
@@ -304,6 +305,21 @@ impl Widget for Shell {
         }
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Window, ctx.bounds());
+        node.name = Some("Sinomo".to_string());
+        ctx.push(node);
+
+        self.logo.semantics(ctx);
+        self.tabs.semantics(ctx);
+        if !self.shared.is_ready() {
+            self.spinner.semantics(ctx);
+        }
+        if let Some(content) = &self.content {
+            content.semantics(ctx);
+        }
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         self.logo.visit_children(visitor);
         visitor.visit(&self.tabs);
@@ -401,13 +417,8 @@ impl Shell {
         } else {
             // status dot
             let r = 4.0;
-            ctx.fill_rect(
-                Rect::new(
-                    pill_x + 12.0 - r,
-                    pill_y + pill_h / 2.0 - r,
-                    r * 2.0,
-                    r * 2.0,
-                ),
+            ctx.fill(
+                sui::Path::circle(sui::Point::new(pill_x + 12.0, pill_y + pill_h / 2.0), r),
                 dot,
             );
             widgets::draw_text_in(

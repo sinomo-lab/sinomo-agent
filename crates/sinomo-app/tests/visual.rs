@@ -244,14 +244,69 @@ fn settings_narrow_click_navigates() {
 }
 
 fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
-    use sui::{Event, Point, PointerButton, PointerEvent, PointerEventKind};
+    use sui::{Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
     let pos = Point::new(x, y);
+    root.dispatch_event(Event::Pointer(PointerEvent::new(
+        PointerEventKind::Move,
+        pos,
+    )))
+    .expect("move");
     let mut down = PointerEvent::new(PointerEventKind::Down, pos);
     down.button = Some(PointerButton::Primary);
+    down.buttons = PointerButtons::new(1);
     root.dispatch_event(Event::Pointer(down)).expect("down");
     let mut up = PointerEvent::new(PointerEventKind::Up, pos);
     up.button = Some(PointerButton::Primary);
     root.dispatch_event(Event::Pointer(up)).expect("up");
+}
+
+fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
+    use sinomo_cli::app_api::ProviderSummary;
+
+    let mut chat = shared.chat_mut();
+    chat.providers = vec![
+        ProviderSummary {
+            id: "openai".to_string(),
+            name: "OpenAI".to_string(),
+            models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+        },
+        ProviderSummary {
+            id: "anthropic".to_string(),
+            name: "Anthropic".to_string(),
+            models: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
+        },
+    ];
+    chat.provider_idx = 0;
+    chat.model_idx = 0;
+    chat.models_loading = false;
+}
+
+fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
+    use sui::SemanticsRole;
+
+    window
+        .get_by_role(SemanticsRole::ComboBox)
+        .with_name("chat-provider")
+        .click()
+        .expect("open provider select");
+
+    let snapshot = window
+        .snapshot()
+        .expect("snapshot after opening provider select");
+    let provider = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::ComboBox && node.name.as_deref() == Some("chat-provider")
+        })
+        .expect("provider select semantics");
+    assert_eq!(
+        provider.state.expanded,
+        Some(true),
+        "provider Select must be expanded before dropdown capture"
+    );
+    provider.bounds
 }
 
 /// Deterministic captures for the rebuilt (composed) Files tab: the root listing + empty inspector
@@ -389,16 +444,22 @@ fn capture_chat_dropdown() {
     let dir = shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
 
-    let runtime = build_runtime(boot(Tab::Sinomo)).expect("build runtime");
+    let shared = boot(Tab::Sinomo);
+    seed_chat_providers(&shared);
+    let runtime = build_runtime(shared).expect("build runtime");
     let app = TestApp::from_runtime(runtime).expect("headless test app");
     let window = app.main_window().expect("main window");
-    let root = window.root();
     app.run_until_idle().expect("settle initial layout");
 
-    // Click the provider selector chip to open its dropdown menu.
-    click_at(&root, 300.0, 615.0);
+    let before = window
+        .capture_screenshot()
+        .expect("capture before dropdown");
+
+    // Open the provider selector chip through semantics so the capture stays stable as layout moves.
+    let provider_bounds = open_chat_provider_select(&window);
 
     let shot = window.capture_screenshot().expect("capture screenshot");
+    assert_provider_dropdown_visible(&before, &shot, provider_bounds, 2);
     let path = dir.join("sinomo-app-chat-dropdown.png");
     shot.write_png(&path).expect("write png");
     println!("wrote {}", path.display());
@@ -777,37 +838,17 @@ fn capture_chat_composed() {
     }
 
     // Provider/model selector open: seed a couple of providers + models so the menu has options,
-    // then click the provider Select chip to drop its menu. (Same chip coordinate the legacy
-    // `capture_chat_dropdown` used; the composed `Select` opens its menu on pointer-up over the
-    // header.)
+    // then open the provider Select through semantics so the capture follows the widget identity
+    // instead of a fragile coordinate.
     {
-        use sinomo_cli::app_api::ProviderSummary;
         let shared = boot(Tab::Sinomo);
         seed_conversation(&shared);
-        {
-            let mut chat = shared.chat_mut();
-            chat.providers = vec![
-                ProviderSummary {
-                    id: "openai".to_string(),
-                    name: "OpenAI".to_string(),
-                    models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
-                },
-                ProviderSummary {
-                    id: "anthropic".to_string(),
-                    name: "Anthropic".to_string(),
-                    models: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
-                },
-            ];
-            chat.provider_idx = 0;
-            chat.model_idx = 0;
-        }
+        seed_chat_providers(&shared);
         let runtime = build_runtime(shared).expect("build runtime");
         let app = TestApp::from_runtime(runtime).expect("headless test app");
         let window = app.main_window().expect("main window");
-        let root = window.root();
         app.run_until_idle().expect("settle chat-selector layout");
-        click_at(&root, 300.0, 615.0);
-        app.run_until_idle().expect("settle selector-open layout");
+        open_chat_provider_select(&window);
         capture("chat-composed-selector-open", &window);
     }
 }
@@ -830,7 +871,6 @@ fn capture_final_polish() {
     use sinomo_app::theme::AppThemeMode;
     use sinomo_app::ui::chat::ChatMessage;
     use sinomo_app::ui::settings::SettingsSection;
-    use sinomo_cli::app_api::ProviderSummary;
 
     let dir = target_shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");
@@ -942,31 +982,13 @@ fn capture_final_polish() {
             let shared = boot(Tab::Sinomo);
             shared.borrow_mut().theme_mode = mode;
             seed_conversation(&shared);
-            {
-                let mut chat = shared.chat_mut();
-                chat.providers = vec![
-                    ProviderSummary {
-                        id: "openai".to_string(),
-                        name: "OpenAI".to_string(),
-                        models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
-                    },
-                    ProviderSummary {
-                        id: "anthropic".to_string(),
-                        name: "Anthropic".to_string(),
-                        models: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
-                    },
-                ];
-                chat.provider_idx = 0;
-                chat.model_idx = 0;
-            }
+            seed_chat_providers(&shared);
             let runtime = build_runtime(shared).expect("build runtime");
             let app = TestApp::from_runtime(runtime).expect("headless test app");
             let window = app.main_window().expect("main window");
-            let root = window.root();
             app.run_until_idle().expect("settle selector layout");
-            // Open the provider Select chip (same chip coordinate the other selector captures use).
-            click_at(&root, 300.0, 615.0);
-            app.run_until_idle().expect("settle selector-open layout");
+            // Open the provider Select chip through semantics so the dropdown screenshot is real.
+            open_chat_provider_select(&window);
             capture(&format!("chat-dropdown-{suffix}"), &window);
         }
     }
@@ -991,6 +1013,74 @@ fn pixel_diff(a: &sui_testing::Screenshot, b: &sui_testing::Screenshot) -> usize
         .zip(pb.chunks_exact(4))
         .filter(|(x, y)| x != y)
         .count()
+}
+
+fn assert_provider_dropdown_visible(
+    before: &sui_testing::Screenshot,
+    after: &sui_testing::Screenshot,
+    select_bounds: sui::Rect,
+    option_count: usize,
+) {
+    let row_height = select_bounds.height().max(1.0);
+    let menu_height = row_height * option_count as f32;
+    let below = sui::Rect::new(
+        select_bounds.x(),
+        select_bounds.max_y() + 6.0,
+        select_bounds.width(),
+        menu_height,
+    );
+    let above = sui::Rect::new(
+        select_bounds.x(),
+        select_bounds.y() - 6.0 - menu_height,
+        select_bounds.width(),
+        menu_height,
+    );
+    let changed_pixels =
+        pixel_diff_in_rect(before, after, below).max(pixel_diff_in_rect(before, after, above));
+
+    assert!(
+        changed_pixels > 400,
+        "expanded provider Select should visibly paint its menu outside the chip; \
+         changed_pixels={changed_pixels}, select_bounds={select_bounds:?}"
+    );
+}
+
+fn pixel_diff_in_rect(
+    a: &sui_testing::Screenshot,
+    b: &sui_testing::Screenshot,
+    rect: sui::Rect,
+) -> usize {
+    if a.width() != b.width() || a.height() != b.height() {
+        return a
+            .pixels()
+            .len()
+            .max(b.pixels().len())
+            .checked_div(4)
+            .unwrap_or(0);
+    }
+
+    let left = rect.x().floor().max(0.0) as u32;
+    let top = rect.y().floor().max(0.0) as u32;
+    let right = rect.max_x().ceil().max(0.0) as u32;
+    let bottom = rect.max_y().ceil().max(0.0) as u32;
+    let right = right.min(a.width());
+    let bottom = bottom.min(a.height());
+    if left >= right || top >= bottom {
+        return 0;
+    }
+
+    let mut changed = 0usize;
+    let a_pixels = a.pixels();
+    let b_pixels = b.pixels();
+    for y in top..bottom {
+        for x in left..right {
+            let offset = ((y * a.width() + x) * 4) as usize;
+            if a_pixels[offset..offset + 4] != b_pixels[offset..offset + 4] {
+                changed += 1;
+            }
+        }
+    }
+    changed
 }
 
 /// Issue 1 (Enter-to-send): a plain Enter dispatched to the focused composer must start a turn

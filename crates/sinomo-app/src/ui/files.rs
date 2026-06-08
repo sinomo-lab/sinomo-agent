@@ -26,8 +26,8 @@ use std::rc::Rc;
 use sui::{
     Alignment, ArrangeCtx, Breadcrumb, BreadcrumbItem, Constraints, DefaultTheme, Event, EventCtx,
     FontWeight, IconButton, IconGlyph, ListItem, ListView, MeasureCtx, PaintCtx, Rect, ScrollState,
-    ScrollView, Separator, Size, SizedBox, Stack, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, WindowEvent, draw_glyph,
+    ScrollView, SemanticsCtx, Separator, Size, SizedBox, Stack, Widget, WidgetPod,
+    WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, draw_glyph,
 };
 
 use sinomo_cli::app_api::{SifsBrowser, SifsEntry};
@@ -216,11 +216,6 @@ fn entry_meta(entry: &SifsEntry) -> String {
     }
 }
 
-/// A leading glyph hint for the row label (folder / link / file). `ListView`/`ListItem` have no
-/// leading-icon slot (and a custom `with_child` row content would suppress the ListView's
-/// click-to-navigate + hover handling), so these rows keep a leading text mark rather than a real
-/// Lucide `Icon` — the bespoke painters in this tab (placeholders, the inspector node badge) DO use
-/// real Folder/File/HardDrive Lucide glyphs.
 fn entry_glyph(entry: &SifsEntry) -> &'static str {
     if entry.is_dir {
         "▸"
@@ -305,12 +300,13 @@ fn listing(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) ->
         );
     }
 
-    // Build the row items: a glyph hint + name on the left, metadata as the row detail on the right.
+    // Build the row items: icon + name on the left, compact metadata on the right.
     let items: Vec<ListItem> = entries
         .iter()
         .map(|entry| {
-            ListItem::new(format!("{}  {}", entry_glyph(entry), entry.name))
-                .detail(entry_meta(entry))
+            ListItem::new(entry.name.clone())
+                .leading_text(entry_glyph(entry))
+                .trailing(entry_meta(entry))
         })
         .collect();
 
@@ -690,6 +686,10 @@ impl<K: PartialEq + Clone + 'static> Widget for RebuildOnChange<K> {
         self.child.paint(ctx);
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.child);
     }
@@ -717,14 +717,14 @@ struct Split {
 const SPLIT_SEPARATOR_W: f32 = 1.0;
 
 impl Split {
-    fn new<L, R>(left: L, right: R, right_width: f32) -> Self
+    fn new<L, R>(left: L, right: R, right_width: f32, reader: &ThemeReader) -> Self
     where
         L: Widget + 'static,
         R: Widget + 'static,
     {
         Self {
             left: WidgetPod::new(left),
-            separator: WidgetPod::new(Separator::vertical()),
+            separator: WidgetPod::new(Separator::vertical().theme_when(clone_reader(reader))),
             right: WidgetPod::new(right),
             right_width: right_width.max(0.0),
         }
@@ -790,6 +790,12 @@ impl Widget for Split {
         self.right.paint(ctx);
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.left.semantics(ctx);
+        self.separator.semantics(ctx);
+        self.right.semantics(ctx);
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.left);
         visitor.visit(&self.separator);
@@ -851,6 +857,10 @@ impl Widget for InsetX {
         self.child.paint(ctx);
     }
 
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
         visitor.visit(&self.child);
     }
@@ -909,6 +919,7 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -
         list_column(shared, reader, scroll_state),
         inspector(shared),
         INSPECTOR_W,
+        reader,
     );
     let header = Stack::vertical()
         .alignment(Alignment::Stretch)
@@ -917,7 +928,7 @@ fn wide_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState) -
                 .height(HEADER_H)
                 .with_child(header_bar(shared, reader)),
         )
-        .with_child(Separator::horizontal());
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(widgets::Dock::new(body).top(HEADER_H + 1.0, header))
 }
 
@@ -930,7 +941,7 @@ fn narrow_pod(shared: &Shared, reader: &ThemeReader, scroll_state: &ScrollState)
                 .height(HEADER_H)
                 .with_child(header_bar(shared, reader)),
         )
-        .with_child(Separator::horizontal());
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
     WidgetPod::new(
         widgets::Dock::new(list_column(shared, reader, scroll_state)).top(HEADER_H + 1.0, header),
     )
@@ -1009,6 +1020,10 @@ impl Widget for FilesView {
 
     fn paint(&self, ctx: &mut PaintCtx) {
         self.active().paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.active().semantics(ctx);
     }
 
     fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
