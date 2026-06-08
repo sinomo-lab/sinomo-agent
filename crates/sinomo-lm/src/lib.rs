@@ -1570,6 +1570,25 @@ pub fn upsert_provider_account_config(
     Ok(())
 }
 
+/// Store an API-key credential for `provider` in the node-local credentials file
+/// (`lm.credentials.<provider>` — always local, never written to cluster config).
+pub fn set_provider_api_key(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+    api_key: &str,
+) -> Result<(), LanguageModelError> {
+    let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
+    let credentials_path = Some(data_dir.provider_credentials_file(&provider));
+    api_key::save_api_key_credential(&provider, &credentials_path, api_key, "manual")
+}
+
+/// Whether a non-empty API-key credential is stored locally for `provider`.
+pub fn provider_has_stored_api_key(data_dir: &SinomoDataDir, provider: &str) -> bool {
+    let provider = normalize_model_provider(provider).unwrap_or_else(|| provider.to_string());
+    let credentials_path = Some(data_dir.provider_credentials_file(&provider));
+    api_key::stored_api_key_is_present(&provider, &credentials_path)
+}
+
 pub fn provider_account_config<'a>(
     config: &'a ModelConfig,
     provider: &str,
@@ -1720,6 +1739,41 @@ pub fn provider_available_model_ids(provider: &str) -> Result<Vec<String>, Langu
             model: PROVIDER_DEFAULT_MODEL.to_string(),
             detail: format!("unknown provider `{provider}`"),
         }),
+    }
+}
+
+/// Whether a reasoning-effort setting is meaningful for `provider`/`model`.
+///
+/// This is the single source of truth for reasoning-effort applicability and is kept
+/// consistent with the per-provider request builders — only the providers whose modules
+/// actually apply a [`ProviderReasoningEffort`] (anthropic, openai, codex, codex-cli,
+/// claude-code, github-copilot) can return `true`, and within those it is further gated
+/// to the models that support reasoning. UIs use this to decide whether to surface a
+/// reasoning-effort control at all.
+pub fn model_supports_reasoning_effort(provider: &str, model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    // OpenAI-style reasoning model families (also the ones Copilot proxies).
+    let openai_reasoning = model.contains("gpt-5")
+        || model.contains("codex")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4");
+
+    match provider {
+        // Agent CLIs that always run a reasoning model.
+        CodexCliProvider::PROVIDER_ID | CODEX_PROVIDER_ID | ClaudeCodeProvider::PROVIDER_ID => true,
+        // Anthropic extended-thinking models (the Claude 4 family).
+        AnthropicProvider::PROVIDER_ID => {
+            model.contains("opus") || model.contains("sonnet") || model.contains("haiku-4")
+        }
+        // OpenAI: reasoning models only (not gpt-4*, etc.).
+        OpenAiProvider::PROVIDER_ID => openai_reasoning,
+        // Copilot proxies many backends; gate on the underlying reasoning model.
+        GitHubCopilotProvider::PROVIDER_ID | GitHubCopilotCliProvider::PROVIDER_ID => {
+            openai_reasoning || model.contains("claude") || model.contains("gemini-2.5")
+        }
+        // gemini, deepseek, nvidia, and unknown providers do not take a reasoning effort.
+        _ => false,
     }
 }
 
@@ -3582,6 +3636,43 @@ mod tests {
             LanguageModelError::ProviderInvocationFailed { provider, .. }
                 if provider == "unknown-provider"
         ));
+    }
+
+    #[test]
+    fn reasoning_effort_capability_matches_provider_and_model() {
+        // OpenAI: only reasoning model families (not gpt-4*, etc.).
+        assert!(model_supports_reasoning_effort(
+            OpenAiProvider::PROVIDER_ID,
+            "gpt-5.2-codex"
+        ));
+        assert!(model_supports_reasoning_effort(
+            OpenAiProvider::PROVIDER_ID,
+            "o3-mini"
+        ));
+        assert!(!model_supports_reasoning_effort(
+            OpenAiProvider::PROVIDER_ID,
+            "gpt-4o"
+        ));
+        // Anthropic extended-thinking family.
+        assert!(model_supports_reasoning_effort(
+            AnthropicProvider::PROVIDER_ID,
+            "claude-sonnet-4-6"
+        ));
+        // Agent CLIs always run a reasoning model.
+        assert!(model_supports_reasoning_effort(
+            CodexCliProvider::PROVIDER_ID,
+            "whatever"
+        ));
+        assert!(model_supports_reasoning_effort(
+            ClaudeCodeProvider::PROVIDER_ID,
+            "whatever"
+        ));
+        // Providers whose request builders never apply a reasoning effort.
+        assert!(!model_supports_reasoning_effort(
+            GeminiProvider::PROVIDER_ID,
+            "gemini-2.5-pro"
+        ));
+        assert!(!model_supports_reasoning_effort("definitely-unknown", "x"));
     }
 
     #[test]

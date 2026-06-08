@@ -91,62 +91,30 @@ pub struct Palette {
 }
 
 impl Palette {
+    /// Adapt SUI's reusable surface palette to the app's existing chrome names.
     pub fn from_theme(theme: &DefaultTheme, dark: bool) -> Self {
-        let p = &theme.palette;
-        let accent = theme.colors.primary;
-        if dark {
-            Palette {
-                dark,
-                window: gray(0.086),
-                panel: gray(0.122),
-                sidebar: gray(0.102),
-                titlebar: gray(0.143),
-                border: rgba(1.0, 1.0, 1.0, 0.08),
-                border_strong: rgba(1.0, 1.0, 1.0, 0.16),
-                text: gray(0.94),
-                text_muted: gray(0.64),
-                text_faint: gray(0.46),
-                accent,
-                accent_hover: mix(accent, gray(1.0), 0.14),
-                on_accent: theme.colors.primary_content,
-                hover: rgba(1.0, 1.0, 1.0, 0.05),
-                selected: with_alpha(accent, 0.22),
-                field: gray(0.16),
-                good: rgba(0.30, 0.81, 0.46, 1.0),
-                warn: rgba(0.98, 0.74, 0.20, 1.0),
-                bad: rgba(0.97, 0.37, 0.37, 1.0),
-            }
-        } else {
-            Palette {
-                dark,
-                window: gray(0.93),
-                panel: gray(0.997),
-                sidebar: gray(0.955),
-                titlebar: gray(0.98),
-                border: rgba(0.0, 0.0, 0.0, 0.13),
-                border_strong: rgba(0.0, 0.0, 0.0, 0.24),
-                text: gray(0.10),
-                text_muted: gray(0.36),
-                text_faint: gray(0.55),
-                accent,
-                accent_hover: mix(accent, gray(0.0), 0.10),
-                on_accent: gray(1.0),
-                hover: rgba(0.0, 0.0, 0.0, 0.05),
-                selected: with_alpha(accent, 0.16),
-                field: gray(0.965),
-                good: rgba(0.13, 0.55, 0.27, 1.0),
-                warn: rgba(0.78, 0.52, 0.05, 1.0),
-                bad: rgba(0.80, 0.18, 0.18, 1.0),
-            }
+        let surfaces = &theme.surfaces;
+        Palette {
+            dark: surfaces.dark || dark,
+            window: surfaces.window,
+            panel: surfaces.panel,
+            sidebar: surfaces.sidebar,
+            titlebar: surfaces.titlebar,
+            border: surfaces.border,
+            border_strong: surfaces.border_strong,
+            text: surfaces.text,
+            text_muted: surfaces.text_muted,
+            text_faint: surfaces.text_faint,
+            accent: surfaces.accent,
+            accent_hover: surfaces.accent_hover,
+            on_accent: surfaces.on_accent,
+            hover: surfaces.hover,
+            selected: surfaces.selected,
+            field: surfaces.field,
+            good: surfaces.good,
+            warn: surfaces.warn,
+            bad: surfaces.bad,
         }
-        .with_fallback_text(p.text, p.text_muted)
-    }
-
-    fn with_fallback_text(mut self, _text: Color, _muted: Color) -> Self {
-        // Reserved hook: we currently prefer our own neutral ramp over the raw
-        // palette text colors for a flatter, product-grade look.
-        let _ = &mut self;
-        self
     }
 
     /// Body text style in the primary text color.
@@ -173,27 +141,4 @@ impl Palette {
             ..theme.body_text_style()
         }
     }
-}
-
-fn gray(v: f32) -> Color {
-    Color::rgba(v, v, v, 1.0)
-}
-
-fn rgba(r: f32, g: f32, b: f32, a: f32) -> Color {
-    Color::rgba(r, g, b, a)
-}
-
-fn with_alpha(c: Color, a: f32) -> Color {
-    Color::rgba(c.red, c.green, c.blue, a)
-}
-
-/// Linear blend of `a` toward `b` by `t` (0 = a, 1 = b), preserving a's alpha.
-fn mix(a: Color, b: Color, t: f32) -> Color {
-    let t = t.clamp(0.0, 1.0);
-    Color::rgba(
-        a.red + (b.red - a.red) * t,
-        a.green + (b.green - a.green) * t,
-        a.blue + (b.blue - a.blue) * t,
-        a.alpha,
-    )
 }

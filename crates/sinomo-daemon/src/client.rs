@@ -1,6 +1,12 @@
 use crate::{
     DaemonError, DaemonStatus, daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
 };
+use sinomo_config::{
+    CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
+    ConfigCatalogRequest, ConfigCatalogResponse, ConfigClient, ConfigDefinition, ConfigError,
+    ConfigGetRequest, ConfigGetResponse, ConfigResolution, ConfigSetRequest, ConfigSetResponse,
+    ConfigWriteResult, ConfigWriteTarget,
+};
 use sinomo_core::ClusterEndpointRecord;
 use sinomo_dfs::{
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
@@ -50,6 +56,79 @@ pub fn send_daemon_rpc(
         }
     }
     .map_err(DaemonError::from)
+}
+
+/// A [`ConfigClient`] backed by RPC to a running daemon's `/config/*` service over the daemon
+/// control protocol. The daemon resolves each request with its own cluster access, so a remote
+/// caller (e.g. the desktop app) sees exactly the same configuration as the daemon and CLI —
+/// keeping every component on one source of truth.
+#[derive(Clone)]
+pub struct RemoteConfigClient {
+    address: String,
+    timeout: Duration,
+}
+
+impl RemoteConfigClient {
+    pub fn new(address: impl Into<String>, timeout: Duration) -> Self {
+        Self {
+            address: address.into(),
+            timeout,
+        }
+    }
+
+    fn rpc<Req, Resp>(&self, route: &str, body: &Req) -> Result<Resp, ConfigError>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let client_error = |detail: String| ConfigError::Client { detail };
+        let request = ObjectRpcRequest::encode_body(route, CONFIG_RPC_CATEGORY, body)
+            .map_err(|error| client_error(error.to_string()))?;
+        let response = send_daemon_rpc(&self.address, &request, self.timeout)
+            .map_err(|error| client_error(error.to_string()))?;
+        response
+            .decode_body()
+            .map_err(|error| client_error(error.to_string()))
+    }
+}
+
+impl ConfigClient for RemoteConfigClient {
+    fn catalog(&self, owner: Option<&str>) -> Result<Vec<ConfigDefinition>, ConfigError> {
+        let response: ConfigCatalogResponse = self.rpc(
+            CONFIG_CATALOG_ROUTE,
+            &ConfigCatalogRequest {
+                owner: owner.map(str::to_string),
+            },
+        )?;
+        Ok(response.definitions)
+    }
+
+    fn get(&self, key: &str) -> Result<ConfigResolution, ConfigError> {
+        let response: ConfigGetResponse = self.rpc(
+            CONFIG_GET_ROUTE,
+            &ConfigGetRequest {
+                key: key.to_string(),
+            },
+        )?;
+        Ok(response.resolution)
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+        target: ConfigWriteTarget,
+    ) -> Result<ConfigWriteResult, ConfigError> {
+        let response: ConfigSetResponse = self.rpc(
+            CONFIG_SET_ROUTE,
+            &ConfigSetRequest {
+                key: key.to_string(),
+                value,
+                target,
+            },
+        )?;
+        Ok(response.result)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

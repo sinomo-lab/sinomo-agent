@@ -15,8 +15,7 @@ use sinomo_runtime::dfs::{
 use sinomo_runtime::kv::{
     ClusterKvRaftCommandStorage, ClusterKvRaftCommitResult, ClusterKvRaftUncommittedAppend,
     ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, KvCommand, KvEntry, KvError,
-    KvEvent, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, RaftRequestVoteRequest,
-    RaftRequestVoteResponse,
+    KvEvent, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
@@ -1484,28 +1483,7 @@ impl network::ClusterVoterReachabilityHost for DfsFuseClusterVoterReachabilityHo
 
 struct DfsFuseClusterRaftLeaderElectionHost;
 
-impl network::ClusterRaftLeaderElectionHost for DfsFuseClusterRaftLeaderElectionHost {
-    fn local_vote_metadata(
-        &mut self,
-        paths: &network::ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> std::result::Result<network::ClusterRaftLocalVoteMetadata, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft local vote metadata", || {
-            network::cluster_raft_local_vote_metadata(paths, &state.local_node_id)
-        })
-    }
-
-    fn apply_local_vote(
-        &mut self,
-        paths: &network::ClusterPaths,
-        state: &ClusterBootstrapState,
-        vote: RaftRequestVoteRequest,
-    ) -> std::result::Result<RaftRequestVoteResponse, NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft local vote", || {
-            network::apply_cluster_raft_vote(paths, &state.local_node_id, vote)
-        })
-    }
-
+impl network::ClusterRaftVoteTransportHost for DfsFuseClusterRaftLeaderElectionHost {
     fn send_raft_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -1520,28 +1498,6 @@ impl network::ClusterRaftLeaderElectionHost for DfsFuseClusterRaftLeaderElection
             "cluster raft vote",
         )?;
         network::decode_cluster_raft_vote_rpc_response(&response)
-    }
-
-    fn observe_raft_term(
-        &mut self,
-        paths: &network::ClusterPaths,
-        local_node_id: &NodeId,
-        term: u64,
-    ) -> std::result::Result<(), NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft term observation", || {
-            network::observe_cluster_raft_term(paths, local_node_id, term).map(|_| ())
-        })
-    }
-
-    fn set_raft_leader(
-        &mut self,
-        paths: &network::ClusterPaths,
-        local_node_id: &NodeId,
-        term: u64,
-    ) -> std::result::Result<(), NetworkError> {
-        with_dfs_fuse_cluster_raft_operation("cluster raft leader set", || {
-            network::set_cluster_raft_leader(paths, local_node_id, term).map(|_| ())
-        })
     }
 }
 

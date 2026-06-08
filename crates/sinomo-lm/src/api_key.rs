@@ -66,6 +66,17 @@ pub(crate) fn save_api_key_credential(
     write_provider_credentials_json_value(provider, credentials_path, value)
 }
 
+/// Whether a non-empty stored API-key credential exists for `provider`.
+pub(crate) fn stored_api_key_is_present(
+    provider: &str,
+    credentials_path: &Option<PathBuf>,
+) -> bool {
+    load_api_key_credential(provider, credentials_path)
+        .ok()
+        .flatten()
+        .is_some_and(|credential| !credential.api_key.trim().is_empty())
+}
+
 pub(crate) fn default_api_key_credentials_path(
     env_var: &str,
     provider_id: &str,

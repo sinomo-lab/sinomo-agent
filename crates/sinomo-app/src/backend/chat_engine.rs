@@ -52,6 +52,11 @@ pub enum ChatCommand {
         account: String,
     },
     SetAgent(String),
+    /// Ask sinomo-lm for the provider's available models (fetched off the worker so the
+    /// blocking API call never stalls chat turns); the result arrives as [`ChatEvent::Models`].
+    FetchModels {
+        provider: String,
+    },
     Shutdown,
 }
 
@@ -68,6 +73,11 @@ pub enum ChatEvent {
     RuntimeInfo(RuntimeInfo),
     SessionReset {
         session_id: String,
+    },
+    /// Available models for `provider`, fetched from sinomo-lm (empty on failure).
+    Models {
+        provider: String,
+        models: Vec<String>,
     },
     Error(String),
 }
@@ -178,6 +188,18 @@ fn worker(
                     let _ = evt_tx.send(ChatEvent::Error(format!("agent switch failed: {error}")));
                 }
             },
+            ChatCommand::FetchModels { provider } => {
+                // Fetch off-thread: the provider API call blocks, and chat turns must not.
+                let tx = evt_tx.clone();
+                thread::Builder::new()
+                    .name("sinomo-models".to_string())
+                    .spawn(move || {
+                        let models =
+                            sinomo_lm::provider_available_model_ids(&provider).unwrap_or_default();
+                        let _ = tx.send(ChatEvent::Models { provider, models });
+                    })
+                    .ok();
+            }
             ChatCommand::Shutdown => break,
         }
     }

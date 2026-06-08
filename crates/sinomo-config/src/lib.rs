@@ -347,6 +347,105 @@ impl ConfigStore {
     }
 }
 
+/// A client-facing view of the configuration service — the single surface that the app,
+/// daemon, and CLI all share. Implementations may be in-process ([`LocalConfigClient`]) or
+/// talk to a remote daemon over RPC; callers cannot tell the difference, which keeps every
+/// component on the same configuration source of truth.
+///
+/// Object-safe on purpose (typed conveniences live in [`ConfigClientExt`]).
+pub trait ConfigClient: Send + Sync {
+    /// All config definitions, optionally filtered to an owner crate.
+    fn catalog(&self, owner: Option<&str>) -> Result<Vec<ConfigDefinition>, ConfigError>;
+
+    /// Resolve a single key. The cluster/local layering is applied server-side.
+    fn get(&self, key: &str) -> Result<ConfigResolution, ConfigError>;
+
+    /// Write a key to the requested target (cluster / local / auto).
+    fn set(
+        &self,
+        key: &str,
+        value: Value,
+        target: ConfigWriteTarget,
+    ) -> Result<ConfigWriteResult, ConfigError>;
+}
+
+/// Typed conveniences over a [`ConfigClient`]; kept off the object-safe trait so `dyn
+/// ConfigClient` stays usable.
+pub trait ConfigClientExt: ConfigClient {
+    fn get_typed<T: DeserializeOwned>(&self, key: &str) -> Result<T, ConfigError> {
+        let resolution = self.get(key)?;
+        serde_json::from_value(resolution.value).map_err(|source| ConfigError::Serde {
+            path: key.to_string(),
+            detail: source.to_string(),
+        })
+    }
+
+    fn set_typed<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        target: ConfigWriteTarget,
+    ) -> Result<ConfigWriteResult, ConfigError> {
+        let value = serde_json::to_value(value).map_err(|source| ConfigError::Serde {
+            path: key.to_string(),
+            detail: source.to_string(),
+        })?;
+        self.set(key, value, target)
+    }
+}
+
+impl<C: ConfigClient + ?Sized> ConfigClientExt for C {}
+
+/// In-process [`ConfigClient`] backed directly by a [`ConfigStore`] and an optional cluster
+/// handle — the "same process, no channel" implementation. Resolves exactly as the config
+/// service does for a remote caller.
+#[derive(Clone)]
+pub struct LocalConfigClient {
+    store: Arc<ConfigStore>,
+    data_dir: SinomoDataDir,
+    cluster: Option<Arc<dyn ClusterAccess>>,
+}
+
+impl LocalConfigClient {
+    pub fn new(
+        store: Arc<ConfigStore>,
+        data_dir: SinomoDataDir,
+        cluster: Option<Arc<dyn ClusterAccess>>,
+    ) -> Self {
+        Self {
+            store,
+            data_dir,
+            cluster,
+        }
+    }
+}
+
+impl ConfigClient for LocalConfigClient {
+    fn catalog(&self, owner: Option<&str>) -> Result<Vec<ConfigDefinition>, ConfigError> {
+        Ok(self
+            .store
+            .registry()
+            .definitions()
+            .filter(|definition| owner.is_none_or(|owner| definition.owner.as_str() == owner))
+            .cloned()
+            .collect())
+    }
+
+    fn get(&self, key: &str) -> Result<ConfigResolution, ConfigError> {
+        self.store.get(&self.data_dir, self.cluster.as_deref(), key)
+    }
+
+    fn set(
+        &self,
+        key: &str,
+        value: Value,
+        target: ConfigWriteTarget,
+    ) -> Result<ConfigWriteResult, ConfigError> {
+        self.store
+            .set(&self.data_dir, self.cluster.as_deref(), key, value, target)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ConfigCatalogRequest {
     #[serde(default)]
@@ -955,6 +1054,8 @@ pub enum ConfigError {
     Kv(#[from] sinomo_kv::KvError),
     #[error(transparent)]
     Service(#[from] ServiceError),
+    #[error("config client/transport error: {detail}")]
+    Client { detail: String },
 }
 
 impl From<ConfigError> for ServiceError {

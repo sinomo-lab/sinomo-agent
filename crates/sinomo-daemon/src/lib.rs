@@ -21,7 +21,7 @@ pub use auth::{
     sign_daemon_rpc_request_from_data_dir,
 };
 pub use client::{
-    fetch_cluster_kv_snapshot, fetch_cluster_kv_snapshot_from_endpoint,
+    RemoteConfigClient, fetch_cluster_kv_snapshot, fetch_cluster_kv_snapshot_from_endpoint,
     fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     send_daemon_rollout_binary, send_daemon_rollout_binary_to_endpoint,
     send_daemon_rollout_binary_upload_chunk, send_daemon_rollout_binary_upload_chunk_to_endpoint,

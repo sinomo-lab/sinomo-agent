@@ -16,7 +16,7 @@ use sui::{
 };
 
 use crate::backend::Backend;
-use crate::state::{AppState, Shared, Tab};
+use crate::state::{AppState, ConnectEvent, Shared, Tab};
 use crate::ui::Shell;
 use crate::ui::shell::logo_image_handle;
 
@@ -27,7 +27,7 @@ fn render_options() -> WindowRenderOptions {
         .with_text_hinting(WindowTextHinting::Slight { max_ppem: 96.0 })
         .with_stem_darkening(WindowStemDarkening::Enabled {
             max_ppem: 72.0,
-            amount: 0.6,
+            amount: 0.4,
         })
 }
 
@@ -44,11 +44,12 @@ pub fn build_application(shared: Shared) -> sui::Result<Application> {
     ))
 }
 
-/// Build shared state with the embedded/daemon backend resolved and a starting tab.
+/// Build a fully-resolved shared state with a starting tab. Uses a synchronous, daemonless
+/// backend — intended for headless tooling and visual tests, which render the tabs directly.
+/// The interactive app uses the non-blocking path in [`run`].
 pub fn boot(initial_tab: Tab) -> Shared {
-    let backend = Backend::connect();
-    tracing::info!(mode = %backend.mode_label(), "sinomo-app starting");
-    let mut state = AppState::new(backend);
+    let backend = Backend::local_fallback();
+    let mut state = AppState::ready(backend);
     state.active_tab = initial_tab;
     Shared::new(state)
 }
@@ -67,6 +68,29 @@ pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
 }
 
 /// Build and run the desktop application. Blocks until the window closes.
+///
+/// The window opens immediately in a *connecting* state; the backend (daemon probe / starting an
+/// in-process daemon) resolves on a background thread, which wakes the UI as it progresses and
+/// once it's ready. This keeps launch responsive even when the in-process daemon takes a moment.
 pub fn run() -> sui::Result<()> {
-    build_application(boot(Tab::Sinomo))?.run()
+    let shared = Shared::new(AppState::connecting());
+    let app = build_application(shared.clone())?;
+    app.run_with(move |waker| {
+        // Stash a waker so background work (e.g. provider device-login) can refresh the UI.
+        shared.borrow_mut().waker = Some(waker.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        shared.borrow_mut().connect_rx = Some(rx);
+        std::thread::Builder::new()
+            .name("sinomo-app-connect".to_string())
+            .spawn(move || {
+                let backend = Backend::connect(|status| {
+                    let _ = tx.send(ConnectEvent::Status(status.to_string()));
+                    waker.wake();
+                });
+                tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
+                let _ = tx.send(ConnectEvent::Connected(Box::new(backend)));
+                waker.wake();
+            })
+            .expect("spawn connect thread");
+    })
 }

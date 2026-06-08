@@ -796,24 +796,7 @@ impl network::ClusterRaftAppendReplicationHost for CliClusterRaftAppendReplicati
 
 struct CliClusterRaftLeaderElectionHost;
 
-impl network::ClusterRaftLeaderElectionHost for CliClusterRaftLeaderElectionHost {
-    fn local_vote_metadata(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<network::ClusterRaftLocalVoteMetadata, network::NetworkError> {
-        network::locked_cluster_raft_local_vote_metadata(paths, &state.local_node_id)
-    }
-
-    fn apply_local_vote(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        vote: sinomo_runtime::kv::RaftRequestVoteRequest,
-    ) -> Result<sinomo_runtime::kv::RaftRequestVoteResponse, network::NetworkError> {
-        network::locked_apply_cluster_raft_vote(paths, &state.local_node_id, vote)
-    }
-
+impl network::ClusterRaftVoteTransportHost for CliClusterRaftLeaderElectionHost {
     fn send_raft_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -821,24 +804,6 @@ impl network::ClusterRaftLeaderElectionHost for CliClusterRaftLeaderElectionHost
         timeout: Duration,
     ) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
         cli_send_cluster_raft_vote(endpoint, request, timeout)
-    }
-
-    fn observe_raft_term(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        term: u64,
-    ) -> Result<(), network::NetworkError> {
-        network::locked_observe_cluster_raft_term(paths, local_node_id, term).map(|_| ())
-    }
-
-    fn set_raft_leader(
-        &mut self,
-        paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        term: u64,
-    ) -> Result<(), network::NetworkError> {
-        network::locked_set_cluster_raft_leader(paths, local_node_id, term).map(|_| ())
     }
 }
 
@@ -1034,14 +999,6 @@ impl network::ClusterMembershipRpcForwardHost for CliClusterJoinRegistrationHost
 
 #[cfg(test)]
 impl network::ClusterJoinRegistrationHost for CliClusterJoinRegistrationHost {
-    fn prepare_join_registration_state(
-        &mut self,
-        _paths: &ClusterPaths,
-        state: ClusterBootstrapState,
-    ) -> Result<ClusterBootstrapState, network::NetworkError> {
-        Ok(state)
-    }
-
     fn commit_join_registration_state(
         &mut self,
         paths: &ClusterPaths,
