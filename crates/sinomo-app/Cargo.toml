@@ -1,28 +1,35 @@
 [package]
 name = "sinomo-app"
-version.workspace = true
+version = "0.1.0"
 description = "Sinomo agent client — graphical desktop app (chat, SIFS files, settings)"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
 include = ["**/*.rs", "Cargo.toml", "assets/**/*"]
 
 [package.metadata.sinomo]
 ring = "application"
 
+[features]
+default = ["gui"]
+gui = ["dep:sui"]
+
 [[bin]]
 name = "sinomo-app"
 path = "src/main.rs"
+required-features = ["gui"]
 
 [dependencies]
-serde.workspace = true
-serde_json.workspace = true
-time.workspace = true
-tracing.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }
+tracing = "0.1"
 
-# Graphical toolkit (separate workspace, referenced by path).
-sui = { path = "../../../sui/crates/sui" }
+# Graphical toolkit (separate workspace, referenced by path). Keep this behind
+# the app feature so daemon rollout builds can load the workspace without the
+# sibling SUI checkout when `sinomo-app` is not being built.
+sui = { path = "../../../sui/crates/sui", optional = true }
 
 # Application/R2 service crates used directly (allowed by trust-ring rules).
 sinomo-cli = { path = "../sinomo-cli" }

@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER: &str = "crates/sinomo-app";
+
 pub fn discover_current_git_repo() -> Result<Option<PathBuf>, RolloutError> {
     let current_dir = std::env::current_dir().map_err(|source| RolloutError::Io {
         path: ".".to_string(),
@@ -112,6 +114,7 @@ pub fn rollout_build_dev_artifacts(
 ) -> Result<RolloutBuiltArtifacts, RolloutError> {
     let modules = default_native_dylib_module_builds(repo);
     let build_args = rollout_build_args(&modules);
+    let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
     let build = Command::new("cargo")
         .args(&build_args)
         .current_dir(repo)
@@ -167,6 +170,7 @@ fn rollout_build_dev_native_dylib_modules(
 ) -> Result<Vec<LocalRolloutNativeDylibModuleArtifact>, RolloutError> {
     let modules = default_native_dylib_module_builds(repo);
     let build_args = rollout_module_build_args(&modules);
+    let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
     let build = Command::new("cargo")
         .args(&build_args)
         .current_dir(repo)
@@ -224,6 +228,126 @@ fn ensure_artifact_exists(path: &Path) -> Result<(), RolloutError> {
             artifact: path.display().to_string(),
         })
     }
+}
+
+struct RolloutBuildWorkspaceManifest {
+    path: PathBuf,
+    original: Option<String>,
+}
+
+impl Drop for RolloutBuildWorkspaceManifest {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            let _ = fs::write(&self.path, original);
+        }
+    }
+}
+
+fn prepare_rollout_build_workspace_manifest(
+    repo: &Path,
+) -> Result<RolloutBuildWorkspaceManifest, RolloutError> {
+    let path = repo.join("Cargo.toml");
+    let original = fs::read_to_string(&path).map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let patched = rollout_build_workspace_manifest(&original);
+    if patched == original {
+        return Ok(RolloutBuildWorkspaceManifest {
+            path,
+            original: None,
+        });
+    }
+    fs::write(&path, patched).map_err(|source| RolloutError::Io {
+        path: path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(RolloutBuildWorkspaceManifest {
+        path,
+        original: Some(original),
+    })
+}
+
+fn rollout_build_workspace_manifest(original: &str) -> String {
+    let without_default_member =
+        remove_rollout_build_default_member(original, ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER);
+    if workspace_manifest_excludes_member(
+        &without_default_member,
+        ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER,
+    ) {
+        return without_default_member;
+    }
+
+    let mut patched = String::with_capacity(
+        without_default_member.len() + ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER.len() + 32,
+    );
+    let mut inserted = false;
+    for line in without_default_member.split_inclusive('\n') {
+        patched.push_str(line);
+        if !inserted && line.trim() == "[workspace]" {
+            patched.push_str("exclude = [\n    \"");
+            patched.push_str(ROLLOUT_BUILD_EXCLUDED_WORKSPACE_MEMBER);
+            patched.push_str("\",\n]\n");
+            inserted = true;
+        }
+    }
+    if inserted {
+        patched
+    } else {
+        without_default_member
+    }
+}
+
+fn remove_rollout_build_default_member(original: &str, member: &str) -> String {
+    let mut patched = String::with_capacity(original.len());
+    let mut in_default_members = false;
+    let member_line = format!("\"{member}\",");
+    for line in original.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with("default-members") && trimmed.ends_with('[') {
+            in_default_members = true;
+            patched.push_str(line);
+            continue;
+        }
+        if in_default_members && trimmed == member_line {
+            continue;
+        }
+        if in_default_members && trimmed == "]" {
+            in_default_members = false;
+        }
+        patched.push_str(line);
+    }
+    patched
+}
+
+fn workspace_manifest_excludes_member(manifest: &str, member: &str) -> bool {
+    let member_line = format!("\"{member}\",");
+    let mut in_workspace = false;
+    let mut in_exclude = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[workspace]" {
+            in_workspace = true;
+            continue;
+        }
+        if in_workspace && trimmed.starts_with('[') {
+            return false;
+        }
+        if !in_workspace {
+            continue;
+        }
+        if trimmed.starts_with("exclude") && trimmed.ends_with('[') {
+            in_exclude = true;
+            continue;
+        }
+        if in_exclude && trimmed == member_line {
+            return true;
+        }
+        if in_exclude && trimmed == "]" {
+            in_exclude = false;
+        }
+    }
+    false
 }
 
 pub fn prepare_rollout_dev_binary(
@@ -849,6 +973,52 @@ mod tests {
             fs::read(&artifacts.staged_shadow_binary).expect("shadow staged"),
             b"binary"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rollout_build_workspace_manifest_excludes_app_crate() {
+        let original = r#"[workspace]
+resolver = "3"
+
+members = [
+    "crates/*",
+    "modules/*/*",
+]
+
+default-members = [
+    "crates/sinomo",
+    "crates/sinomo-app",
+    "crates/sinomo-cli",
+]
+"#;
+
+        let patched = rollout_build_workspace_manifest(original);
+
+        assert!(patched.contains("exclude = [\n    \"crates/sinomo-app\",\n]\n"));
+        assert!(patched.contains("    \"crates/*\",\n"));
+        assert!(patched.contains("    \"crates/sinomo\",\n"));
+        assert!(patched.contains("    \"crates/sinomo-cli\",\n"));
+        assert_eq!(patched.matches("\"crates/sinomo-app\",").count(), 1);
+    }
+
+    #[test]
+    fn rollout_build_workspace_manifest_guard_restores_original_manifest() {
+        let root = unique_temp("sinomo-rollout-build-manifest");
+        fs::create_dir_all(&root).expect("repo dir");
+        let manifest = root.join("Cargo.toml");
+        let original =
+            "[workspace]\nresolver = \"3\"\ndefault-members = [\n    \"crates/sinomo-app\",\n]\n";
+        fs::write(&manifest, original).expect("manifest");
+
+        {
+            let _guard = prepare_rollout_build_workspace_manifest(&root).expect("guard");
+            let patched = fs::read_to_string(&manifest).expect("patched");
+            assert_ne!(patched, original);
+            assert!(patched.contains("exclude = [\n    \"crates/sinomo-app\",\n]\n"));
+        }
+
+        assert_eq!(fs::read_to_string(&manifest).expect("restored"), original);
         fs::remove_dir_all(root).ok();
     }
 
