@@ -57,13 +57,92 @@ pub(crate) struct RepairRetryState {
 }
 
 #[derive(Debug)]
+pub(crate) struct ChunkedTransferState {
+    pub(crate) total_size_bytes: u64,
+    pub(crate) last_updated_at: Instant,
+    pub(crate) assembler: ChunkedBlobAssembler,
+    label: &'static str,
+}
+
+impl ChunkedTransferState {
+    pub(crate) fn new(
+        label: &'static str,
+        total_size_bytes: u64,
+        total_chunks: u32,
+        assembler: ChunkedBlobAssembler,
+    ) -> Result<Self, DfsError> {
+        validate_chunked_transfer_shape(label, total_size_bytes, total_chunks)?;
+        Ok(Self {
+            total_size_bytes,
+            last_updated_at: Instant::now(),
+            assembler,
+            label,
+        })
+    }
+
+    pub(crate) fn insert_chunk(
+        &mut self,
+        chunk_index: u32,
+        total_chunks: u32,
+        bytes: Vec<u8>,
+    ) -> Result<bool, DfsError> {
+        validate_chunk_bytes(
+            self.label,
+            self.total_size_bytes,
+            chunk_index,
+            total_chunks,
+            &bytes,
+        )?;
+        self.last_updated_at = Instant::now();
+        self.assembler
+            .insert_chunk(chunk_index, &bytes)
+            .map_err(DfsError::from)
+    }
+
+    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+        self.assembler.contiguous_received_chunk_count()
+    }
+}
+
+macro_rules! impl_chunked_transfer_common {
+    ($transfer:ty) => {
+        impl $transfer {
+            pub(crate) fn total_size_bytes(&self) -> u64 {
+                self.chunks.total_size_bytes
+            }
+
+            pub(crate) fn last_updated_at(&self) -> Instant {
+                self.chunks.last_updated_at
+            }
+
+            pub(crate) fn insert_chunk(
+                &mut self,
+                chunk_index: u32,
+                total_chunks: u32,
+                bytes: Vec<u8>,
+            ) -> Result<bool, DfsError> {
+                self.chunks.insert_chunk(chunk_index, total_chunks, bytes)
+            }
+
+            pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
+                self.chunks.contiguous_received_chunk_count()
+            }
+
+            #[cfg(test)]
+            #[allow(dead_code)]
+            pub(crate) fn set_last_updated_at_for_test(&mut self, last_updated_at: Instant) {
+                self.chunks.last_updated_at = last_updated_at;
+            }
+        }
+    };
+}
+
+#[derive(Debug)]
 pub(crate) struct InProgressReadTransfer {
     pub(crate) object_id: DfsObjectId,
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
-    pub(crate) total_size_bytes: u64,
-    pub(crate) last_updated_at: Instant,
-    pub(crate) assembler: ChunkedBlobAssembler,
+    pub(crate) chunks: ChunkedTransferState,
 }
 
 impl InProgressReadTransfer {
@@ -75,53 +154,28 @@ impl InProgressReadTransfer {
         total_chunks: u32,
         assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        validate_chunked_transfer_shape(
-            "chunked DFS read response",
-            total_size_bytes,
-            total_chunks,
-        )?;
         Ok(Self {
             object_id,
             version,
             content_hash,
-            total_size_bytes,
-            last_updated_at: Instant::now(),
-            assembler,
+            chunks: ChunkedTransferState::new(
+                "chunked DFS read response",
+                total_size_bytes,
+                total_chunks,
+                assembler,
+            )?,
         })
     }
-
-    pub(crate) fn insert_chunk(
-        &mut self,
-        chunk_index: u32,
-        total_chunks: u32,
-        bytes: Vec<u8>,
-    ) -> Result<bool, DfsError> {
-        validate_chunk_bytes(
-            "chunked DFS read response",
-            self.total_size_bytes,
-            chunk_index,
-            total_chunks,
-            &bytes,
-        )?;
-        self.last_updated_at = Instant::now();
-        self.assembler
-            .insert_chunk(chunk_index, &bytes)
-            .map_err(DfsError::from)
-    }
-
-    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
-        self.assembler.contiguous_received_chunk_count()
-    }
 }
+
+impl_chunked_transfer_common!(InProgressReadTransfer);
 
 #[derive(Debug)]
 pub(crate) struct InProgressFetchBlobTransfer {
     pub(crate) object_id: DfsObjectId,
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
-    pub(crate) total_size_bytes: u64,
-    pub(crate) last_updated_at: Instant,
-    pub(crate) assembler: ChunkedBlobAssembler,
+    pub(crate) chunks: ChunkedTransferState,
 }
 
 impl InProgressFetchBlobTransfer {
@@ -133,44 +187,21 @@ impl InProgressFetchBlobTransfer {
         total_chunks: u32,
         assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        validate_chunked_transfer_shape(
-            "chunked DFS fetch response",
-            total_size_bytes,
-            total_chunks,
-        )?;
         Ok(Self {
             object_id,
             version,
             content_hash,
-            total_size_bytes,
-            last_updated_at: Instant::now(),
-            assembler,
+            chunks: ChunkedTransferState::new(
+                "chunked DFS fetch response",
+                total_size_bytes,
+                total_chunks,
+                assembler,
+            )?,
         })
     }
-
-    pub(crate) fn insert_chunk(
-        &mut self,
-        chunk_index: u32,
-        total_chunks: u32,
-        bytes: Vec<u8>,
-    ) -> Result<bool, DfsError> {
-        validate_chunk_bytes(
-            "chunked DFS fetch response",
-            self.total_size_bytes,
-            chunk_index,
-            total_chunks,
-            &bytes,
-        )?;
-        self.last_updated_at = Instant::now();
-        self.assembler
-            .insert_chunk(chunk_index, &bytes)
-            .map_err(DfsError::from)
-    }
-
-    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
-        self.assembler.contiguous_received_chunk_count()
-    }
 }
+
+impl_chunked_transfer_common!(InProgressFetchBlobTransfer);
 
 #[derive(Debug)]
 pub(crate) struct InProgressBlobTransfer {
@@ -181,9 +212,7 @@ pub(crate) struct InProgressBlobTransfer {
     pub(crate) expected_base_version: Option<DfsVersion>,
     pub(crate) version: DfsVersion,
     pub(crate) content_hash: String,
-    pub(crate) total_size_bytes: u64,
-    pub(crate) last_updated_at: Instant,
-    pub(crate) assembler: ChunkedBlobAssembler,
+    pub(crate) chunks: ChunkedTransferState,
 }
 
 impl InProgressBlobTransfer {
@@ -200,11 +229,6 @@ impl InProgressBlobTransfer {
         total_chunks: u32,
         assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        validate_chunked_transfer_shape(
-            "chunked DFS blob transfer",
-            total_size_bytes,
-            total_chunks,
-        )?;
         Ok(Self {
             request_id,
             intent_id,
@@ -213,35 +237,17 @@ impl InProgressBlobTransfer {
             expected_base_version,
             version,
             content_hash,
-            total_size_bytes,
-            last_updated_at: Instant::now(),
-            assembler,
+            chunks: ChunkedTransferState::new(
+                "chunked DFS blob transfer",
+                total_size_bytes,
+                total_chunks,
+                assembler,
+            )?,
         })
     }
-
-    pub(crate) fn insert_chunk(
-        &mut self,
-        chunk_index: u32,
-        total_chunks: u32,
-        bytes: Vec<u8>,
-    ) -> Result<bool, DfsError> {
-        validate_chunk_bytes(
-            "chunked DFS blob transfer",
-            self.total_size_bytes,
-            chunk_index,
-            total_chunks,
-            &bytes,
-        )?;
-        self.last_updated_at = Instant::now();
-        self.assembler
-            .insert_chunk(chunk_index, &bytes)
-            .map_err(DfsError::from)
-    }
-
-    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
-        self.assembler.contiguous_received_chunk_count()
-    }
 }
+
+impl_chunked_transfer_common!(InProgressBlobTransfer);
 
 #[derive(Debug)]
 pub(crate) struct InProgressPatchTransfer {
@@ -254,9 +260,7 @@ pub(crate) struct InProgressPatchTransfer {
     pub(crate) content_hash: String,
     pub(crate) offset: u64,
     pub(crate) patch_hash: String,
-    pub(crate) total_size_bytes: u64,
-    pub(crate) last_updated_at: Instant,
-    pub(crate) assembler: ChunkedBlobAssembler,
+    pub(crate) chunks: ChunkedTransferState,
 }
 
 impl InProgressPatchTransfer {
@@ -275,11 +279,6 @@ impl InProgressPatchTransfer {
         total_chunks: u32,
         assembler: ChunkedBlobAssembler,
     ) -> Result<Self, DfsError> {
-        validate_chunked_transfer_shape(
-            "chunked DFS patch transfer",
-            total_size_bytes,
-            total_chunks,
-        )?;
         Ok(Self {
             request_id,
             intent_id,
@@ -290,35 +289,17 @@ impl InProgressPatchTransfer {
             content_hash,
             offset,
             patch_hash,
-            total_size_bytes,
-            last_updated_at: Instant::now(),
-            assembler,
+            chunks: ChunkedTransferState::new(
+                "chunked DFS patch transfer",
+                total_size_bytes,
+                total_chunks,
+                assembler,
+            )?,
         })
     }
-
-    pub(crate) fn insert_chunk(
-        &mut self,
-        chunk_index: u32,
-        total_chunks: u32,
-        bytes: Vec<u8>,
-    ) -> Result<bool, DfsError> {
-        validate_chunk_bytes(
-            "chunked DFS patch transfer",
-            self.total_size_bytes,
-            chunk_index,
-            total_chunks,
-            &bytes,
-        )?;
-        self.last_updated_at = Instant::now();
-        self.assembler
-            .insert_chunk(chunk_index, &bytes)
-            .map_err(DfsError::from)
-    }
-
-    pub(crate) fn contiguous_received_chunk_count(&self) -> u32 {
-        self.assembler.contiguous_received_chunk_count()
-    }
 }
+
+impl_chunked_transfer_common!(InProgressPatchTransfer);
 
 pub(crate) fn blob_chunk_count(bytes: &[u8]) -> Result<u32, DfsError> {
     blob_chunk_count_for_size(bytes.len() as u64)

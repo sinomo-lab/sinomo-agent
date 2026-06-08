@@ -14,7 +14,6 @@ use crate::{
     is_loopback_connect_address,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::thread;
@@ -32,6 +31,7 @@ pub use sinomo_kv::{
     MAX_CLUSTER_KV_ACTIVE_WATCHES, MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
     MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES, MAX_CLUSTER_KV_WATCH_EVENTS,
 };
+use sinomo_storage::durable_file::{self, file_ino};
 pub(crate) const MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES: usize =
     sinomo_kv::MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES;
 pub(crate) const MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS: usize = CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
@@ -70,11 +70,9 @@ pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
 const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
-pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
-static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static OBJECT_FILE_WRITE_MARK_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_KV_WATCH_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_KV_WATCH_NOTIFIER_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_KV_METADATA_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
@@ -397,93 +395,13 @@ impl PublicEndpointReachabilityCache {
     }
 }
 
-/// Per-path record of the last content `write_object_file` wrote (or confirmed
-/// already on disk), used to skip the read-back + compare when nothing changed.
-#[derive(Clone)]
-struct ObjectFileWriteMark {
-    hash: blake3::Hash,
-    len: u64,
-    modified: Option<SystemTime>,
-    ino: u64,
-    last_used: u64,
-}
-
 /// Cache of last-written object files. The cluster directory can be shared by the
 /// main and shadow daemons, so the fast-path skip is guarded by a `stat`: an entry
 /// is trusted only when the file's length, mtime, and inode still match what we
 /// wrote, so a write by another process is detected and falls back to a real read
 /// + compare.
-static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn object_file_write_mark_cache_tick() -> u64 {
-    OBJECT_FILE_WRITE_MARK_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
-}
-
-fn evict_object_file_write_mark_if_needed(
-    cache: &mut HashMap<PathBuf, ObjectFileWriteMark>,
-    protected: &PathBuf,
-) {
-    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
-        return;
-    }
-    let eviction_candidate = cache
-        .iter()
-        .filter(|(path, _)| *path != protected)
-        .min_by_key(|(_, mark)| mark.last_used)
-        .map(|(path, _)| path.clone());
-    if let Some(path) = eviction_candidate {
-        cache.remove(&path);
-    }
-}
-
-fn cached_object_file_mark(path: &PathBuf) -> Option<ObjectFileWriteMark> {
-    let mut cache = LAST_WRITTEN_OBJECT_FILES.lock().ok()?;
-    let mark = cache.get_mut(path)?;
-    mark.last_used = object_file_write_mark_cache_tick();
-    Some(mark.clone())
-}
-
-fn record_object_file_mark(
-    path: &PathBuf,
-    hash: blake3::Hash,
-    len: u64,
-    modified: Option<SystemTime>,
-    ino: u64,
-) {
-    if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        evict_object_file_write_mark_if_needed(&mut cache, path);
-        cache.insert(
-            path.clone(),
-            ObjectFileWriteMark {
-                hash,
-                len,
-                modified,
-                ino,
-                last_used: object_file_write_mark_cache_tick(),
-            },
-        );
-    }
-}
-
-fn file_ino(metadata: &fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::MetadataExt::ino(metadata)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        0
-    }
-}
-
-fn file_modified_and_ino(path: &PathBuf) -> (Option<SystemTime>, u64) {
-    match fs::metadata(path) {
-        Ok(metadata) => (metadata.modified().ok(), file_ino(&metadata)),
-        Err(_) => (None, 0),
-    }
-}
+static LAST_WRITTEN_OBJECT_FILES: LazyLock<durable_file::ObjectFileWriteMarkCache> =
+    LazyLock::new(|| durable_file::ObjectFileWriteMarkCache::new(FILE_CACHE_CAPACITY));
 
 fn cluster_file_mark(path: &PathBuf) -> Option<ClusterFileMark> {
     match fs::metadata(path) {
@@ -1221,20 +1139,17 @@ pub(crate) fn local_cluster_connectivity_prune_passes_for_test(paths: &ClusterPa
 
 #[cfg(test)]
 pub(crate) fn object_file_write_mark_cache_capacity_for_test() -> usize {
-    FILE_CACHE_CAPACITY
+    LAST_WRITTEN_OBJECT_FILES.capacity()
 }
 
 #[cfg(test)]
 pub(crate) fn object_file_write_mark_cache_contains_for_test(path: &PathBuf) -> bool {
-    LAST_WRITTEN_OBJECT_FILES
-        .lock()
-        .map(|cache| cache.contains_key(path))
-        .unwrap_or(false)
+    LAST_WRITTEN_OBJECT_FILES.contains(path)
 }
 
 #[cfg(test)]
 pub(crate) fn record_object_file_write_mark_for_test(path: &PathBuf) {
-    record_object_file_mark(
+    LAST_WRITTEN_OBJECT_FILES.record_mark(
         path,
         blake3::hash(b"stable"),
         6,
@@ -1245,14 +1160,12 @@ pub(crate) fn record_object_file_write_mark_for_test(path: &PathBuf) {
 
 #[cfg(test)]
 pub(crate) fn refresh_object_file_write_mark_for_test(path: &PathBuf) -> bool {
-    cached_object_file_mark(path).is_some()
+    LAST_WRITTEN_OBJECT_FILES.refresh(path)
 }
 
 #[cfg(test)]
 pub(crate) fn remove_object_file_write_mark_entries_under_root_for_test(root: &std::path::Path) {
-    if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        cache.retain(|path, _| !path.starts_with(root));
-    }
+    LAST_WRITTEN_OBJECT_FILES.retain_not_under_root(root);
 }
 
 #[cfg(all(test, feature = "iroh-transport"))]
@@ -11272,24 +11185,13 @@ fn cluster_member_put_no_effect_response(
     if !key.starts_with("/cluster/members/") {
         return Ok(None);
     }
-    let Ok(member) = sinomo_kv::decode_kv_value::<ClusterMemberRecord>(value) else {
-        return Ok(None);
-    };
-    if key != cluster_member_key(&member.node_id) {
-        return Ok(None);
-    }
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterMemberRecord>() else {
-        return Ok(None);
-    };
-    Ok(
-        cluster_member_stable_eq(&existing, &member).then(|| sinomo_kv::KvOpResponse::Put {
-            key: key.to_string(),
-            revision: entry.modify_revision,
-        }),
-    )
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |member: &ClusterMemberRecord| key == cluster_member_key(&member.node_id),
+        cluster_member_stable_eq,
+    ))
 }
 
 fn cluster_capability_policy_put_no_effect_response(
@@ -11300,26 +11202,15 @@ fn cluster_capability_policy_put_no_effect_response(
     if !key.starts_with("/cluster/policy/capabilities/") {
         return Ok(None);
     }
-    let Ok(policy) = sinomo_kv::decode_kv_value::<ClusterCapabilityPolicyRecord>(value) else {
-        return Ok(None);
-    };
-    if key != cluster_capability_policy_key(&policy.node_id) {
-        return Ok(None);
-    }
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterCapabilityPolicyRecord>() else {
-        return Ok(None);
-    };
-    Ok(
-        cluster_capability_policy_stable_eq(&existing, &policy).then(|| {
-            sinomo_kv::KvOpResponse::Put {
-                key: key.to_string(),
-                revision: entry.modify_revision,
-            }
-        }),
-    )
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |policy: &ClusterCapabilityPolicyRecord| {
+            key == cluster_capability_policy_key(&policy.node_id)
+        },
+        cluster_capability_policy_stable_eq,
+    ))
 }
 
 fn cluster_endpoint_put_no_effect_response(
@@ -11330,24 +11221,13 @@ fn cluster_endpoint_put_no_effect_response(
     if !key.starts_with("/cluster/endpoints/") {
         return Ok(None);
     }
-    let Ok(endpoint) = sinomo_kv::decode_kv_value::<ClusterEndpointRecord>(value) else {
-        return Ok(None);
-    };
-    if key != cluster_endpoint_key(&endpoint.node_id, &endpoint) {
-        return Ok(None);
-    }
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterEndpointRecord>() else {
-        return Ok(None);
-    };
-    Ok(
-        cluster_endpoint_stable_eq(&existing, &endpoint).then(|| sinomo_kv::KvOpResponse::Put {
-            key: key.to_string(),
-            revision: entry.modify_revision,
-        }),
-    )
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |endpoint: &ClusterEndpointRecord| key == cluster_endpoint_key(&endpoint.node_id, endpoint),
+        cluster_endpoint_stable_eq,
+    ))
 }
 
 fn cluster_identity_put_no_effect_response(
@@ -11358,23 +11238,13 @@ fn cluster_identity_put_no_effect_response(
     if key != cluster_identity_key() {
         return Ok(None);
     }
-    let Ok(identity) = sinomo_kv::decode_kv_value::<ClusterIdentityRecord>(value) else {
-        return Ok(None);
-    };
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterIdentityRecord>() else {
-        return Ok(None);
-    };
-    Ok(
-        cluster_identity_record_stable_eq(&existing, &identity).then(|| {
-            sinomo_kv::KvOpResponse::Put {
-                key: key.to_string(),
-                revision: entry.modify_revision,
-            }
-        }),
-    )
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |_identity: &ClusterIdentityRecord| true,
+        cluster_identity_record_stable_eq,
+    ))
 }
 
 fn cluster_raft_config_put_no_effect_response(
@@ -11385,23 +11255,13 @@ fn cluster_raft_config_put_no_effect_response(
     if key != cluster_raft_config_key() {
         return Ok(None);
     }
-    let Ok(config) = sinomo_kv::decode_kv_value::<ClusterRaftConfigRecord>(value) else {
-        return Ok(None);
-    };
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterRaftConfigRecord>() else {
-        return Ok(None);
-    };
-    Ok(
-        cluster_raft_config_record_stable_eq(&existing, &config).then(|| {
-            sinomo_kv::KvOpResponse::Put {
-                key: key.to_string(),
-                revision: entry.modify_revision,
-            }
-        }),
-    )
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |_config: &ClusterRaftConfigRecord| true,
+        cluster_raft_config_record_stable_eq,
+    ))
 }
 
 fn cluster_connectivity_put_no_effect_response(
@@ -11413,30 +11273,22 @@ fn cluster_connectivity_put_no_effect_response(
     if !key.starts_with("/cluster/network/connectivity/") {
         return Ok(None);
     }
-    let Ok(record) = sinomo_kv::decode_kv_value::<ClusterConnectivityRecord>(value) else {
-        return Ok(None);
-    };
-    if key
-        != cluster_connectivity_key(
-            &record.source_node_id,
-            &record.target_node_id,
-            &record.endpoint_id,
-        )
-    {
-        return Ok(None);
-    }
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterConnectivityRecord>() else {
-        return Ok(None);
-    };
-    Ok((cluster_connectivity_stable_eq(&existing, &record)
-        && !cluster_network_record_should_refresh(existing.expires_at, now))
-    .then(|| sinomo_kv::KvOpResponse::Put {
-        key: key.to_string(),
-        revision: entry.modify_revision,
-    }))
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |record: &ClusterConnectivityRecord| {
+            key == cluster_connectivity_key(
+                &record.source_node_id,
+                &record.target_node_id,
+                &record.endpoint_id,
+            )
+        },
+        |existing, record| {
+            cluster_connectivity_stable_eq(existing, record)
+                && !cluster_network_record_should_refresh(existing.expires_at, now)
+        },
+    ))
 }
 
 fn cluster_network_info_put_no_effect_response(
@@ -11448,24 +11300,16 @@ fn cluster_network_info_put_no_effect_response(
     if !key.starts_with("/cluster/network/info/") {
         return Ok(None);
     }
-    let Ok(info) = sinomo_kv::decode_kv_value::<ClusterNetworkInfoRecord>(value) else {
-        return Ok(None);
-    };
-    if key != cluster_network_info_key(&info.node_id) {
-        return Ok(None);
-    }
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
-    };
-    let Ok(existing) = entry.decode::<ClusterNetworkInfoRecord>() else {
-        return Ok(None);
-    };
-    Ok((cluster_network_info_stable_eq(&existing, &info)
-        && !cluster_network_record_should_refresh(existing.expires_at, now))
-    .then(|| sinomo_kv::KvOpResponse::Put {
-        key: key.to_string(),
-        revision: entry.modify_revision,
-    }))
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |info: &ClusterNetworkInfoRecord| key == cluster_network_info_key(&info.node_id),
+        |existing, info| {
+            cluster_network_info_stable_eq(existing, info)
+                && !cluster_network_record_should_refresh(existing.expires_at, now)
+        },
+    ))
 }
 
 fn cluster_node_status_put_no_effect_response(
@@ -11476,24 +11320,41 @@ fn cluster_node_status_put_no_effect_response(
     if !key.starts_with("/cluster/node-status/") {
         return Ok(None);
     }
-    let Ok(status) = sinomo_kv::decode_kv_value::<ClusterNodeStatusRecord>(value) else {
-        return Ok(None);
+    Ok(cluster_semantic_stable_put_no_effect_response(
+        snapshot,
+        key,
+        value,
+        |status: &ClusterNodeStatusRecord| key == cluster_node_status_key(&status.node_id),
+        cluster_node_status_stable_eq,
+    ))
+}
+
+fn cluster_semantic_stable_put_no_effect_response<T, K, S>(
+    snapshot: &KvSnapshot,
+    key: &str,
+    value: &[u8],
+    key_matches_record: K,
+    stable_eq: S,
+) -> Option<sinomo_kv::KvOpResponse>
+where
+    T: serde::de::DeserializeOwned,
+    K: FnOnce(&T) -> bool,
+    S: FnOnce(&T, &T) -> bool,
+{
+    let Ok(record) = sinomo_kv::decode_kv_value::<T>(value) else {
+        return None;
     };
-    if key != cluster_node_status_key(&status.node_id) {
-        return Ok(None);
+    if !key_matches_record(&record) {
+        return None;
     }
-    let Some(entry) = snapshot.get(key) else {
-        return Ok(None);
+    let entry = snapshot.get(key)?;
+    let Ok(existing) = entry.decode::<T>() else {
+        return None;
     };
-    let Ok(existing) = entry.decode::<ClusterNodeStatusRecord>() else {
-        return Ok(None);
-    };
-    Ok(
-        cluster_node_status_stable_eq(&existing, &status).then(|| sinomo_kv::KvOpResponse::Put {
-            key: key.to_string(),
-            revision: entry.modify_revision,
-        }),
-    )
+    stable_eq(&existing, &record).then(|| sinomo_kv::KvOpResponse::Put {
+        key: key.to_string(),
+        revision: entry.modify_revision,
+    })
 }
 
 pub fn stored_cluster_network_info_matches(
@@ -13260,71 +13121,13 @@ pub(crate) fn read_optional_object_file<T: serde::de::DeserializeOwned>(
 }
 
 fn read_optional_object_file_bytes(path: &PathBuf) -> Result<Option<Vec<u8>>, NetworkError> {
-    let file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(NetworkError::StorageIo {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    };
-    read_object_file_bytes_from_open_file(path, file).map(Some)
+    durable_file::read_optional_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
+        .map_err(network_durable_file_error)
 }
 
 fn read_object_file_bytes(path: &PathBuf) -> Result<Vec<u8>, NetworkError> {
-    let file = fs::File::open(path).map_err(|source| NetworkError::StorageIo {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    read_object_file_bytes_from_open_file(path, file)
-}
-
-fn read_object_file_bytes_from_open_file(
-    path: &PathBuf,
-    file: fs::File,
-) -> Result<Vec<u8>, NetworkError> {
-    let len = file
-        .metadata()
-        .map_err(|source| NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?
-        .len();
-    if len > MAX_OBJECT_FILE_READ_BYTES {
-        return Err(NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: format!("object file is {len} bytes; max is {MAX_OBJECT_FILE_READ_BYTES}"),
-        });
-    }
-
-    let mut bytes = Vec::with_capacity(len as usize);
-    let mut limited = file.take(MAX_OBJECT_FILE_READ_BYTES.saturating_add(1));
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|source| NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    if bytes.len() as u64 > MAX_OBJECT_FILE_READ_BYTES {
-        return Err(NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: format!("object file read exceeded max of {MAX_OBJECT_FILE_READ_BYTES} bytes"),
-        });
-    }
-    Ok(bytes)
-}
-
-fn read_existing_object_file_for_compare(path: &PathBuf, expected_len: u64) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() != expected_len {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(expected_len as usize);
-    let mut limited = file.take(expected_len.saturating_add(1));
-    limited.read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 == expected_len).then_some(bytes)
+    durable_file::read_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
+        .map_err(network_durable_file_error)
 }
 
 pub(crate) fn write_object_file<T: Serialize>(
@@ -13332,93 +13135,23 @@ pub(crate) fn write_object_file<T: Serialize>(
     value: &T,
 ) -> Result<(), NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
-    let desired_hash = blake3::hash(&desired);
-
-    // Fast path: if we last wrote this exact content and the file is unchanged
-    // since (length + mtime + inode still match our record), skip without
-    // reading it back.
-    if let Some(mark) = cached_object_file_mark(path)
-        && mark.hash == desired_hash
-        && let Ok(metadata) = fs::metadata(path)
-        && metadata.len() == mark.len
-        && metadata.modified().ok() == mark.modified
-        && file_ino(&metadata) == mark.ino
-    {
-        if let Some(observer) = io_observer() {
-            observer.on_object_file_skipped_write();
-        }
-        return Ok(());
+    let result = durable_file::write_object_file_bytes_if_changed(
+        path,
+        &desired,
+        &LAST_WRITTEN_OBJECT_FILES,
+        durable_file::DurableObjectFileOptions::new("sobj", "tmp"),
+    )
+    .map_err(network_durable_file_error)?;
+    if let (Some(observer), Some(read_bytes)) = (io_observer(), result.compare_read_bytes) {
+        observer.on_disk_read(read_bytes);
     }
-
-    // Slow path: read the file back and compare only when the length could match.
-    // Handles a cold cache and files changed by another writer (e.g. a shadow
-    // daemon sharing the cluster dir) without reading sparse/corrupt oversized
-    // files that are already known to differ.
-    let existing = read_existing_object_file_for_compare(path, desired.len() as u64);
-    if let (Some(observer), Some(existing)) = (io_observer(), existing.as_ref()) {
-        observer.on_disk_read(existing.len() as u64);
-    }
-    if existing.as_deref() == Some(desired.as_slice()) {
-        // Already current: record the mark so subsequent calls take the fast path.
-        let (modified, ino) = file_modified_and_ino(path);
-        record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);
-        if let Some(observer) = io_observer() {
-            observer.on_object_file_skipped_write();
-        }
-        return Ok(());
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sobj");
-    let temp_path = parent.join(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write_temp_result = (|| -> Result<(), NetworkError> {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|source| NetworkError::StorageIo {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.write_all(&desired)
-            .map_err(|source| NetworkError::StorageIo {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.sync_data().map_err(|source| NetworkError::StorageIo {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(())
-    })();
-    if let Err(error) = write_temp_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    if let Err(error) = replace_file(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    sync_directory(parent)?;
-    let (modified, ino) = file_modified_and_ino(path);
-    record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);
     if let Some(observer) = io_observer() {
-        observer.on_object_file_actual_write();
-        observer.on_disk_write(desired.len() as u64);
+        if result.changed {
+            observer.on_object_file_actual_write();
+            observer.on_disk_write(desired.len() as u64);
+        } else {
+            observer.on_object_file_skipped_write();
+        }
     }
     Ok(())
 }
@@ -13436,105 +13169,25 @@ pub(crate) fn write_object_file_create_new_serialized<T: Serialize>(
     value: &T,
 ) -> Result<bool, NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| NetworkError::StorageIo {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sobj");
-    let temp_path = parent.join(format!(
-        ".{file_name}.create-new-tmp-{}-{}",
-        std::process::id(),
-        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
     #[cfg(all(test, feature = "iroh-transport"))]
     record_write_object_file_create_new_attempt_for_test(path);
-    let write_temp_result = (|| -> Result<(), NetworkError> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .map_err(|source| NetworkError::StorageIo {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.write_all(&desired)
-            .map_err(|source| NetworkError::StorageIo {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.sync_data().map_err(|source| NetworkError::StorageIo {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(())
-    })();
-    if let Err(error) = write_temp_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    match create_new_link_or_unsupported_for_test(&temp_path, path) {
-        Ok(()) => {
-            let _ = fs::remove_file(&temp_path);
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temp_path);
-            return Ok(false);
-        }
-        Err(source) if hard_link_unsupported(&source) => {
-            match fs::metadata(path) {
-                Ok(_) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Ok(false);
-                }
-                Err(metadata_source) if metadata_source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(metadata_source) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(NetworkError::StorageIo {
-                        path: path.display().to_string(),
-                        detail: metadata_source.to_string(),
-                    });
-                }
-            }
-            if let Err(rename_source) = fs::rename(&temp_path, path) {
-                let existed = path.exists();
-                let _ = fs::remove_file(&temp_path);
-                if existed
-                    && matches!(
-                        rename_source.kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                    )
-                {
-                    return Ok(false);
-                }
-                return Err(NetworkError::StorageIo {
-                    path: format!("{} -> {}", temp_path.display(), path.display()),
-                    detail: rename_source.to_string(),
-                });
-            }
-        }
-        Err(source) => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(NetworkError::StorageIo {
-                path: format!("{} -> {}", temp_path.display(), path.display()),
-                detail: source.to_string(),
-            });
-        }
-    }
-    sync_directory(parent)?;
-    let desired_hash = blake3::hash(&desired);
-    let (modified, ino) = file_modified_and_ino(path);
-    record_object_file_mark(path, desired_hash, desired.len() as u64, modified, ino);
+    let result = durable_file::write_object_file_bytes_create_new_serialized(
+        path,
+        &desired,
+        &LAST_WRITTEN_OBJECT_FILES,
+        durable_file::DurableObjectFileOptions::new("sobj", "create-new-tmp"),
+        |temp_path, path| create_new_link_or_unsupported_for_test(temp_path, &path.to_path_buf()),
+    )
+    .map_err(network_durable_file_error)?;
     if let Some(observer) = io_observer() {
-        observer.on_object_file_actual_write();
-        observer.on_disk_write(desired.len() as u64);
+        if result.changed {
+            observer.on_object_file_actual_write();
+            observer.on_disk_write(desired.len() as u64);
+        } else {
+            observer.on_object_file_skipped_write();
+        }
     }
-    Ok(true)
+    Ok(result.changed)
 }
 
 #[cfg(any(test, feature = "iroh-transport"))]
@@ -13552,66 +13205,9 @@ fn create_new_link_or_unsupported_for_test(
     fs::hard_link(temp_path, path)
 }
 
-#[cfg(any(test, feature = "iroh-transport"))]
-fn hard_link_unsupported(source: &std::io::Error) -> bool {
-    source.kind() == std::io::ErrorKind::Unsupported
-        || matches!(
-            source.raw_os_error(),
-            Some(
-                1     // EPERM on Unix filesystems that disallow hard links.
-                    | 18   // EXDEV, kept defensive even though temp and target share a directory.
-                    | 38   // ENOSYS
-                    | 45   // EOPNOTSUPP on macOS/BSD
-                    | 50   // ERROR_NOT_SUPPORTED on Windows
-                    | 95   // EOPNOTSUPP on Linux
-                    | 1314 // ERROR_PRIVILEGE_NOT_HELD on Windows
-            )
-        )
-}
-
-fn replace_file(temp_path: &std::path::Path, path: &std::path::Path) -> Result<(), NetworkError> {
-    match fs::rename(temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(source)
-            if path.exists()
-                && matches!(
-                    source.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-        {
-            fs::remove_file(path).map_err(|remove_source| NetworkError::StorageIo {
-                path: path.display().to_string(),
-                detail: format!(
-                    "replace failed with {}; additionally failed to remove existing file: {}",
-                    source, remove_source
-                ),
-            })?;
-            fs::rename(temp_path, path).map_err(|rename_source| NetworkError::StorageIo {
-                path: format!("{} -> {}", temp_path.display(), path.display()),
-                detail: format!(
-                    "replace after removing existing file failed: {}",
-                    rename_source
-                ),
-            })
-        }
-        Err(source) => Err(NetworkError::StorageIo {
-            path: format!("{} -> {}", temp_path.display(), path.display()),
-            detail: source.to_string(),
-        }),
+fn network_durable_file_error(error: durable_file::DurableFileError) -> NetworkError {
+    NetworkError::StorageIo {
+        path: error.path().to_string(),
+        detail: error.detail().to_string(),
     }
-}
-
-fn sync_directory(path: &std::path::Path) -> Result<(), NetworkError> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        return Ok(());
-    }
-    #[cfg(not(windows))]
-    fs::File::open(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|source| NetworkError::StorageIo {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
 }

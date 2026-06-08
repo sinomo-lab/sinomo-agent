@@ -5498,21 +5498,21 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let incoming_transfer_bytes = self
             .incoming_blob_transfers
             .values()
-            .map(|transfer| transfer.total_size_bytes)
+            .map(|transfer| transfer.total_size_bytes())
             .chain(
                 self.incoming_patch_transfers
                     .values()
-                    .map(|transfer| transfer.total_size_bytes),
+                    .map(|transfer| transfer.total_size_bytes()),
             )
             .chain(
                 self.incoming_fetch_transfers
                     .values()
-                    .map(|transfer| transfer.total_size_bytes),
+                    .map(|transfer| transfer.total_size_bytes()),
             )
             .chain(
                 self.incoming_read_transfers
                     .values()
-                    .map(|transfer| transfer.total_size_bytes),
+                    .map(|transfer| transfer.total_size_bytes()),
             )
             .fold(0_u64, |total, size| total.saturating_add(size));
         let incoming_blob_transfer_received_bytes = self
@@ -5520,7 +5520,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .values()
             .map(|transfer| {
                 chunk_prefix_bytes(
-                    transfer.total_size_bytes,
+                    transfer.total_size_bytes(),
                     transfer.contiguous_received_chunk_count(),
                 )
             })
@@ -5530,7 +5530,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .values()
             .map(|transfer| {
                 chunk_prefix_bytes(
-                    transfer.total_size_bytes,
+                    transfer.total_size_bytes(),
                     transfer.contiguous_received_chunk_count(),
                 )
             })
@@ -5540,7 +5540,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .values()
             .map(|transfer| {
                 chunk_prefix_bytes(
-                    transfer.total_size_bytes,
+                    transfer.total_size_bytes(),
                     transfer.contiguous_received_chunk_count(),
                 )
             })
@@ -5550,7 +5550,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .values()
             .map(|transfer| {
                 chunk_prefix_bytes(
-                    transfer.total_size_bytes,
+                    transfer.total_size_bytes(),
                     transfer.contiguous_received_chunk_count(),
                 )
             })
@@ -10190,14 +10190,14 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
         let now = Instant::now();
         self.incoming_blob_transfers.retain(|_, transfer| {
-            now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+            now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
         });
         self.incoming_patch_transfers.retain(|_, transfer| {
-            now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
+            now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT
         });
         self.incoming_read_transfers.retain(|request_id, transfer| {
             let keep =
-                now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
+                now.duration_since(transfer.last_updated_at()) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
             if !keep {
                 self.pending_reads.remove(request_id);
             }
@@ -10207,8 +10207,8 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let mut expired_fetches = Vec::new();
         self.incoming_fetch_transfers
             .retain(|request_id, transfer| {
-                let keep =
-                    now.duration_since(transfer.last_updated_at) <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
+                let keep = now.duration_since(transfer.last_updated_at())
+                    <= DFS_CHUNK_TRANSFER_IDLE_TIMEOUT;
                 if !keep {
                     expired_fetches.push(request_id.clone());
                 }
@@ -11291,7 +11291,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             || transfer.content_hash != command.content_hash
             || transfer.offset != command.offset
             || transfer.patch_hash != command.patch_hash
-            || transfer.total_size_bytes != command.total_size_bytes
+            || transfer.total_size_bytes() != command.total_size_bytes
         {
             self.incoming_patch_transfers.remove(&transfer_key);
             let reason = format!(
@@ -11324,7 +11324,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .remove(&transfer_key)
             .expect("completed transfer");
         let manifest = match self.content.commit_chunked_object_version_patch(
-            transfer.assembler,
+            transfer.chunks.assembler,
             transfer.base_version.as_str(),
             transfer.offset,
         ) {
@@ -11616,7 +11616,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .expect("completed transfer");
         let manifest = match self
             .content
-            .commit_chunked_object_version(transfer.assembler)
+            .commit_chunked_object_version(transfer.chunks.assembler)
         {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -12534,7 +12534,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             .expect("completed transfer");
         let manifest = match self
             .content
-            .commit_chunked_object_version(transfer.assembler)
+            .commit_chunked_object_version(transfer.chunks.assembler)
         {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -12891,48 +12891,33 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         &mut self,
         requester_node_id: &NodeId,
         command: &DfsFetchBlobCommand,
-        mut reader: ObjectVersionReader,
+        reader: ObjectVersionReader,
         total_size_bytes: u64,
     ) -> Result<(), DfsError> {
-        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
-        let end_chunk_index =
-            fetch_response_window_end(command.start_chunk_index, total_chunks, command.max_chunks);
-        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in command.start_chunk_index..end_chunk_index {
-            let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-            let chunk_len = (total_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
-            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
-                message: format!("DFS blob chunk is too large to fit in memory: {chunk_len} bytes"),
-            })?;
-            reader
-                .read_exact(&mut buffer[..chunk_len])
-                .map_err(|source| DfsError::ContentStore {
-                    message: format!(
-                        "failed to read blob {} chunk {}: {}",
-                        command.content_hash, chunk_index, source
-                    ),
-                })?;
-            let sent = self.send_dfs_message_if_routable(
-                requester_node_id,
+        let source_node_id = self.node_id.clone();
+        self.send_object_version_response_chunks_from_reader(
+            requester_node_id,
+            command.start_chunk_index,
+            command.max_chunks,
+            total_size_bytes,
+            &command.content_hash,
+            reader,
+            |chunk_index, total_chunks, bytes| {
                 DfsNetworkMessage::FetchBlobResponseChunk(DfsFetchBlobResponseChunk {
                     request_id: command.request_id.clone(),
                     intent_id: command.intent_id.clone(),
                     object_id: command.object_id.clone(),
                     version: command.version.clone(),
-                    source_node_id: self.node_id.clone(),
+                    source_node_id: source_node_id.clone(),
                     content_hash: command.content_hash.clone(),
                     total_size_bytes,
                     chunk_index,
                     total_chunks,
-                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
-                    bytes: buffer[..chunk_len].to_vec(),
-                }),
-            )?;
-            if !sent {
-                break;
-            }
-        }
-        Ok(())
+                    chunk_hash: Some(chunk_hash(&bytes)),
+                    bytes,
+                })
+            },
+        )
     }
 
     fn open_fetch_response_chunk_reader(
@@ -13331,7 +13316,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if transfer.object_id != chunk.object_id
             || transfer.version != chunk.version
             || transfer.content_hash != chunk.content_hash
-            || transfer.total_size_bytes != chunk.total_size_bytes
+            || transfer.total_size_bytes() != chunk.total_size_bytes
         {
             let reason = format!(
                 "conflicting DFS fetch response chunk metadata for {}",
@@ -13412,7 +13397,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         }
         let manifest = match self
             .content
-            .commit_chunked_object_version(transfer.assembler)
+            .commit_chunked_object_version(transfer.chunks.assembler)
         {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -13865,28 +13850,17 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         request: &DfsReadRequest,
         data: &DfsReadData,
         total_size_bytes: u64,
-        mut reader: ObjectVersionReader,
+        reader: ObjectVersionReader,
     ) -> Result<(), DfsError> {
-        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
-        let end_chunk_index =
-            fetch_response_window_end(request.start_chunk_index, total_chunks, request.max_chunks);
-        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in request.start_chunk_index..end_chunk_index {
-            let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-            let chunk_len = (total_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
-            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
-                message: format!("DFS read chunk is too large to fit in memory: {chunk_len} bytes"),
-            })?;
-            reader
-                .read_exact(&mut buffer[..chunk_len])
-                .map_err(|source| DfsError::ContentStore {
-                    message: format!(
-                        "failed to read blob {:?} chunk {}: {}",
-                        data.content_hash, chunk_index, source
-                    ),
-                })?;
-            let sent = self.send_dfs_message_if_routable(
-                requester_node_id,
+        let read_error_subject = format!("{:?}", data.content_hash);
+        self.send_object_version_response_chunks_from_reader(
+            requester_node_id,
+            request.start_chunk_index,
+            request.max_chunks,
+            total_size_bytes,
+            &read_error_subject,
+            reader,
+            |chunk_index, total_chunks, bytes| {
                 DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
                     request_id: request.request_id.clone(),
                     object_id: request.object_id.clone(),
@@ -13897,9 +13871,40 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     total_size_bytes,
                     chunk_index,
                     total_chunks,
-                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
-                    bytes: buffer[..chunk_len].to_vec(),
-                }),
+                    chunk_hash: Some(chunk_hash(&bytes)),
+                    bytes,
+                })
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_object_version_response_chunks_from_reader(
+        &mut self,
+        requester_node_id: &NodeId,
+        start_chunk_index: u32,
+        max_chunks: u32,
+        total_size_bytes: u64,
+        read_error_subject: &str,
+        mut reader: ObjectVersionReader,
+        mut message_for_chunk: impl FnMut(u32, u32, Vec<u8>) -> DfsNetworkMessage,
+    ) -> Result<(), DfsError> {
+        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
+        let end_chunk_index =
+            fetch_response_window_end(start_chunk_index, total_chunks, max_chunks);
+        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
+        for chunk_index in start_chunk_index..end_chunk_index {
+            let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
+            reader
+                .read_exact(&mut buffer[..chunk_len])
+                .map_err(|source| DfsError::ContentStore {
+                    message: format!(
+                        "failed to read blob {read_error_subject} chunk {chunk_index}: {source}"
+                    ),
+                })?;
+            let sent = self.send_dfs_message_if_routable(
+                requester_node_id,
+                message_for_chunk(chunk_index, total_chunks, buffer[..chunk_len].to_vec()),
             )?;
             if !sent {
                 break;
@@ -13914,7 +13919,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         request: &DfsReadRequest,
         data: &DfsReadRangeData,
         range_size_bytes: u64,
-        mut reader: ObjectVersionReader,
+        reader: ObjectVersionReader,
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count_for_size(range_size_bytes)?;
         let max_chunks = if request.max_chunks == 0 {
@@ -13927,25 +13932,15 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if end_chunk_index <= request.start_chunk_index {
             return Ok(());
         }
-        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in request.start_chunk_index..end_chunk_index {
-            let chunk_offset = u64::from(chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-            let chunk_len = (range_size_bytes - chunk_offset).min(DFS_BLOB_CHUNK_BYTES as u64);
-            let chunk_len = usize::try_from(chunk_len).map_err(|_| DfsError::Distributed {
-                message: format!(
-                    "DFS range read chunk is too large to fit in memory: {chunk_len} bytes"
-                ),
-            })?;
-            reader
-                .read_exact(&mut buffer[..chunk_len])
-                .map_err(|source| DfsError::ContentStore {
-                    message: format!(
-                        "failed to read blob {:?} range chunk {}: {}",
-                        data.content_hash, chunk_index, source
-                    ),
-                })?;
-            let sent = self.send_dfs_message_if_routable(
-                requester_node_id,
+        let read_error_subject = format!("{:?} range", data.content_hash);
+        self.send_object_version_response_chunks_from_reader(
+            requester_node_id,
+            request.start_chunk_index,
+            max_chunks,
+            range_size_bytes,
+            &read_error_subject,
+            reader,
+            |chunk_index, total_chunks, bytes| {
                 DfsNetworkMessage::ReadResponseChunk(DfsReadResponseChunk {
                     request_id: request.request_id.clone(),
                     object_id: request.object_id.clone(),
@@ -13956,15 +13951,11 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     total_size_bytes: range_size_bytes,
                     chunk_index,
                     total_chunks,
-                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
-                    bytes: buffer[..chunk_len].to_vec(),
-                }),
-            )?;
-            if !sent {
-                break;
-            }
-        }
-        Ok(())
+                    chunk_hash: Some(chunk_hash(&bytes)),
+                    bytes,
+                })
+            },
+        )
     }
 
     fn handle_networked_read_response(
@@ -14884,7 +14875,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         if transfer.object_id != chunk.object_id
             || transfer.version != chunk.version
             || transfer.content_hash != chunk_content_hash
-            || transfer.total_size_bytes != chunk.total_size_bytes
+            || transfer.total_size_bytes() != chunk.total_size_bytes
         {
             self.pending_reads.remove(&chunk.request_id);
             self.incoming_read_transfers.remove(&chunk.request_id);
@@ -14951,7 +14942,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         self.pending_reads.remove(&request_id);
         let manifest = match self
             .content
-            .commit_chunked_object_version(transfer.assembler)
+            .commit_chunked_object_version(transfer.chunks.assembler)
         {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -17228,27 +17219,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<bool, DfsError> {
-        if bytes.len() <= DFS_BLOB_INLINE_LIMIT_BYTES {
-            return self.send_best_effort_message_if_routable(
-                target_node_id,
+        self.send_blob_bytes_if_routable_for_test(
+            target_node_id,
+            bytes,
+            |bytes| {
                 DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
-                    request_id,
+                    request_id: request_id.clone(),
                     intent_id: intent_id.to_string(),
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
-                    expected_base_version,
+                    expected_base_version: expected_base_version.clone(),
                     version: version.clone(),
                     content_hash: content_hash.to_string(),
-                    bytes: bytes.to_vec(),
-                    object_metadata,
-                }),
-            );
-        }
-
-        let total_chunks = blob_chunk_count(bytes)?;
-        for (chunk_index, chunk) in bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
-            let sent = self.send_best_effort_message_if_routable(
-                target_node_id,
+                    bytes,
+                    object_metadata: object_metadata.clone(),
+                })
+            },
+            |chunk_index, total_chunks, chunk| {
                 DfsNetworkMessage::StageBlobChunk(DfsStageBlobChunkCommand {
                     request_id: request_id.clone(),
                     intent_id: intent_id.to_string(),
@@ -17263,13 +17250,9 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     chunk_hash: Some(chunk_hash(chunk)),
                     bytes: chunk.to_vec(),
                     object_metadata: object_metadata.clone(),
-                }),
-            )?;
-            if !sent {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+                })
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17439,55 +17422,16 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
 
-        let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
-        if start_chunk_index >= total_chunks {
-            return Ok(StageBlobSendOutcome {
-                sent: true,
-                complete: true,
-                next_chunk_index: total_chunks,
-            });
-        }
-        let max_chunks = max_chunks.max(1);
-        let end_chunk_index = start_chunk_index
-            .saturating_add(max_chunks)
-            .min(total_chunks);
-        let start_offset = u64::from(start_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64;
-        let end_offset = if end_chunk_index >= total_chunks {
-            total_size_bytes
-        } else {
-            u64::from(end_chunk_index) * DFS_BLOB_CHUNK_BYTES as u64
-        };
-        let range_len = usize::try_from(end_offset.saturating_sub(start_offset)).map_err(|_| {
-            DfsError::Distributed {
-                message: format!(
-                    "DFS stage chunk window is too large: {start_offset}..{end_offset}"
-                ),
-            }
-        })?;
-        let (manifest, mut reader) = self.content.open_object_version_range_stream(
-            object_id.as_str(),
-            version.as_str(),
-            start_offset,
-            range_len,
-        )?;
-        if manifest.content_hash != content_hash {
-            return Err(DfsError::ContentHashMismatch {
-                expected: content_hash.to_string(),
-                actual: manifest.content_hash,
-            });
-        }
-        let mut buffer = vec![0_u8; DFS_BLOB_CHUNK_BYTES];
-        for chunk_index in start_chunk_index..end_chunk_index {
-            let chunk_len = blob_chunk_len(total_size_bytes, chunk_index)?;
-            reader
-                .read_exact(&mut buffer[..chunk_len])
-                .map_err(|source| DfsError::ContentStore {
-                    message: format!(
-                        "failed to read blob {content_hash} stage chunk {chunk_index}: {source}"
-                    ),
-                })?;
-            let sent = self.send_best_effort_message_if_routable(
-                target_node_id,
+        self.send_object_version_chunk_window_if_routable(
+            target_node_id,
+            object_id,
+            version,
+            content_hash,
+            total_size_bytes,
+            start_chunk_index,
+            max_chunks,
+            "stage",
+            |chunk_index, total_chunks, bytes| {
                 DfsNetworkMessage::StageBlobChunk(DfsStageBlobChunkCommand {
                     request_id: request_id.clone(),
                     intent_id: intent_id.to_string(),
@@ -17499,24 +17443,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     total_size_bytes,
                     chunk_index,
                     total_chunks,
-                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
-                    bytes: buffer[..chunk_len].to_vec(),
+                    chunk_hash: Some(chunk_hash(&bytes)),
+                    bytes,
                     object_metadata: object_metadata.clone(),
-                }),
-            )?;
-            if !sent {
-                return Ok(StageBlobSendOutcome {
-                    sent: false,
-                    complete: false,
-                    next_chunk_index: chunk_index,
-                });
-            }
-        }
-        Ok(StageBlobSendOutcome {
-            sent: true,
-            complete: end_chunk_index >= total_chunks,
-            next_chunk_index: end_chunk_index,
-        })
+                })
+            },
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -17546,7 +17478,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             let sent = self.send_best_effort_message_if_routable(
                 target_node_id,
                 DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
-                    request_id,
+                    request_id: request_id.clone(),
                     intent_id: intent_id.to_string(),
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
@@ -17564,6 +17496,48 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
             });
         }
 
+        self.send_object_version_chunk_window_if_routable(
+            target_node_id,
+            object_id,
+            version,
+            content_hash,
+            total_size_bytes,
+            start_chunk_index,
+            max_chunks,
+            "repair",
+            |chunk_index, total_chunks, bytes| {
+                DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
+                    request_id: request_id.clone(),
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    expected_base_version: expected_base_version.clone(),
+                    version: version.clone(),
+                    content_hash: content_hash.to_string(),
+                    total_size_bytes,
+                    chunk_index,
+                    total_chunks,
+                    chunk_hash: Some(chunk_hash(&bytes)),
+                    bytes,
+                    object_metadata: object_metadata.clone(),
+                })
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_object_version_chunk_window_if_routable(
+        &mut self,
+        target_node_id: &NodeId,
+        object_id: &DfsObjectId,
+        version: &DfsVersion,
+        content_hash: &str,
+        total_size_bytes: u64,
+        start_chunk_index: u32,
+        max_chunks: u32,
+        operation_label: &str,
+        mut message_for_chunk: impl FnMut(u32, u32, Vec<u8>) -> DfsNetworkMessage,
+    ) -> Result<StageBlobSendOutcome, DfsError> {
         let total_chunks = blob_chunk_count_for_size(total_size_bytes)?;
         if start_chunk_index >= total_chunks {
             return Ok(StageBlobSendOutcome {
@@ -17585,7 +17559,7 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         let range_len = usize::try_from(end_offset.saturating_sub(start_offset)).map_err(|_| {
             DfsError::Distributed {
                 message: format!(
-                    "DFS repair chunk window is too large: {start_offset}..{end_offset}"
+                    "DFS {operation_label} chunk window is too large: {start_offset}..{end_offset}"
                 ),
             }
         })?;
@@ -17608,26 +17582,12 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                 .read_exact(&mut buffer[..chunk_len])
                 .map_err(|source| DfsError::ContentStore {
                     message: format!(
-                        "failed to read blob {content_hash} repair chunk {chunk_index}: {source}"
+                        "failed to read blob {content_hash} {operation_label} chunk {chunk_index}: {source}"
                     ),
                 })?;
             let sent = self.send_best_effort_message_if_routable(
                 target_node_id,
-                DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
-                    request_id: request_id.clone(),
-                    intent_id: intent_id.to_string(),
-                    file_system_id: file_system_id.clone(),
-                    object_id: object_id.clone(),
-                    expected_base_version: expected_base_version.clone(),
-                    version: version.clone(),
-                    content_hash: content_hash.to_string(),
-                    total_size_bytes,
-                    chunk_index,
-                    total_chunks,
-                    chunk_hash: Some(chunk_hash(&buffer[..chunk_len])),
-                    bytes: buffer[..chunk_len].to_vec(),
-                    object_metadata: object_metadata.clone(),
-                }),
+                message_for_chunk(chunk_index, total_chunks, buffer[..chunk_len].to_vec()),
             )?;
             if !sent {
                 return Ok(StageBlobSendOutcome {
@@ -17670,27 +17630,23 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
         bytes: &[u8],
         object_metadata: Option<DfsObjectMetadata>,
     ) -> Result<bool, DfsError> {
-        if bytes.len() <= DFS_BLOB_INLINE_LIMIT_BYTES {
-            return self.send_best_effort_message_if_routable(
-                target_node_id,
+        self.send_blob_bytes_if_routable_for_test(
+            target_node_id,
+            bytes,
+            |bytes| {
                 DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
-                    request_id,
+                    request_id: request_id.clone(),
                     intent_id: intent_id.to_string(),
                     file_system_id: file_system_id.clone(),
                     object_id: object_id.clone(),
-                    expected_base_version,
+                    expected_base_version: expected_base_version.clone(),
                     version: version.clone(),
                     content_hash: content_hash.to_string(),
-                    bytes: bytes.to_vec(),
-                    object_metadata,
-                }),
-            );
-        }
-
-        let total_chunks = blob_chunk_count(bytes)?;
-        for (chunk_index, chunk) in bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
-            let sent = self.send_best_effort_message_if_routable(
-                target_node_id,
+                    bytes,
+                    object_metadata: object_metadata.clone(),
+                })
+            },
+            |chunk_index, total_chunks, chunk| {
                 DfsNetworkMessage::RepairReplicaChunk(DfsRepairReplicaChunkCommand {
                     request_id: request_id.clone(),
                     intent_id: intent_id.to_string(),
@@ -17705,7 +17661,31 @@ impl<T: NetworkTransport> NetworkedDfsService<T> {
                     chunk_hash: Some(chunk_hash(chunk)),
                     bytes: chunk.to_vec(),
                     object_metadata: object_metadata.clone(),
-                }),
+                })
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn send_blob_bytes_if_routable_for_test(
+        &mut self,
+        target_node_id: &NodeId,
+        bytes: &[u8],
+        mut inline_message: impl FnMut(Vec<u8>) -> DfsNetworkMessage,
+        mut chunk_message: impl FnMut(u32, u32, &[u8]) -> DfsNetworkMessage,
+    ) -> Result<bool, DfsError> {
+        if bytes.len() <= DFS_BLOB_INLINE_LIMIT_BYTES {
+            return self.send_best_effort_message_if_routable(
+                target_node_id,
+                inline_message(bytes.to_vec()),
+            );
+        }
+
+        let total_chunks = blob_chunk_count(bytes)?;
+        for (chunk_index, chunk) in bytes.chunks(DFS_BLOB_CHUNK_BYTES).enumerate() {
+            let sent = self.send_best_effort_message_if_routable(
+                target_node_id,
+                chunk_message(chunk_index as u32, total_chunks, chunk),
             )?;
             if !sent {
                 return Ok(false);

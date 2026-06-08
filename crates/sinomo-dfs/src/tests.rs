@@ -6510,7 +6510,7 @@ fn chunk_assemblers_ignore_identical_duplicate_chunks() {
             .expect("second blob chunk")
     );
     let manifest = blob_store
-        .commit_chunked_object_version(blob_transfer.assembler)
+        .commit_chunked_object_version(blob_transfer.chunks.assembler)
         .expect("commit assembled blob");
     assert_eq!(
         blob_store
@@ -6553,7 +6553,7 @@ fn chunk_assemblers_ignore_identical_duplicate_chunks() {
             .expect("second read chunk")
     );
     let manifest = read_store
-        .commit_chunked_object_version(read_transfer.assembler)
+        .commit_chunked_object_version(read_transfer.chunks.assembler)
         .expect("commit assembled read");
     assert_eq!(
         read_store
@@ -6596,7 +6596,7 @@ fn chunk_assemblers_ignore_identical_duplicate_chunks() {
             .expect("second fetch chunk")
     );
     let manifest = fetch_store
-        .commit_chunked_object_version(fetch_transfer.assembler)
+        .commit_chunked_object_version(fetch_transfer.chunks.assembler)
         .expect("commit assembled fetch");
     assert_eq!(
         fetch_store
@@ -6894,14 +6894,8 @@ fn process_incoming_prunes_expired_pending_remote_reads() {
             70_000,
             2,
         );
-        InProgressReadTransfer {
-            object_id,
-            version,
-            content_hash: hash,
-            total_size_bytes: 70_000,
-            last_updated_at: Instant::now(),
-            assembler,
-        }
+        InProgressReadTransfer::new(object_id, version, hash, 70_000, 2, assembler)
+            .expect("expired read transfer")
     });
 
     assert!(
@@ -7180,14 +7174,15 @@ fn pending_remote_read_to_removed_location_does_not_block_fallback() {
                 transfer_size,
                 1,
             );
-            InProgressReadTransfer {
-                object_id: object_id.clone(),
-                version: object.version.clone(),
-                content_hash: transfer_hash,
-                total_size_bytes: transfer_size,
-                last_updated_at: Instant::now(),
+            InProgressReadTransfer::new(
+                object_id.clone(),
+                object.version.clone(),
+                transfer_hash,
+                transfer_size,
+                1,
                 assembler,
-            }
+            )
+            .expect("removed location read transfer")
         });
     object.current_locations = vec![source_b.clone()];
     reader_dfs
@@ -7941,14 +7936,17 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
                 70_000,
                 2,
             );
-            InProgressReadTransfer {
-                object_id: object_id.clone(),
-                version: version.clone(),
-                content_hash: content_hash.clone(),
-                total_size_bytes: 70_000,
-                last_updated_at: stale_at,
+            let mut transfer = InProgressReadTransfer::new(
+                object_id.clone(),
+                version.clone(),
+                content_hash.clone(),
+                70_000,
+                2,
                 assembler,
-            }
+            )
+            .expect("read transfer");
+            transfer.set_last_updated_at_for_test(stale_at);
+            transfer
         });
 
     let fetch_request_id = "dfs_net_req_prune_fetch".to_string();
@@ -8012,7 +8010,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
                 assembler,
             )
             .expect("fetch transfer");
-            transfer.last_updated_at = stale_at;
+            transfer.set_last_updated_at_for_test(stale_at);
             transfer
         });
 
@@ -8040,7 +8038,7 @@ fn idle_chunk_transfer_pruning_releases_request_state() {
             assembler,
         )
         .expect("blob transfer");
-        transfer.last_updated_at = stale_at;
+        transfer.set_last_updated_at_for_test(stale_at);
         transfer
     });
 
@@ -8153,14 +8151,11 @@ fn retry_pending_repairs_prunes_idle_reads_without_distributed_writes() {
             70_000,
             2,
         );
-        InProgressReadTransfer {
-            object_id,
-            version,
-            content_hash,
-            total_size_bytes: 70_000,
-            last_updated_at: stale_at,
-            assembler,
-        }
+        let mut transfer =
+            InProgressReadTransfer::new(object_id, version, content_hash, 70_000, 2, assembler)
+                .expect("read transfer");
+        transfer.set_last_updated_at_for_test(stale_at);
+        transfer
     });
 
     let scheduled = dfs.retry_pending_repairs().expect("retry prune");

@@ -99,7 +99,7 @@ pub(crate) mod prelude {
     };
     pub(crate) use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
     pub(crate) use std::fs;
-    pub(crate) use std::io::{self, Write};
+    pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::net::{Shutdown, TcpStream};

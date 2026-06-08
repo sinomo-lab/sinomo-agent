@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_storage::durable_file;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -2921,30 +2922,12 @@ fn copy_file_create_new(source_path: &Path, target_path: &Path) -> Result<()> {
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent.to_owned())?;
-    }
-
-    let tmp_path = temporary_path_for(path);
-    let mut file = fs::File::create(&tmp_path).map_err(|source| ContentStoreError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| ContentStoreError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(file);
-    fs::rename(&tmp_path, path).map_err(|source| ContentStoreError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    Ok(())
+    durable_file::write_file_atomic(
+        path,
+        bytes,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+    )
+    .map_err(content_durable_file_error)
 }
 
 fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2982,18 +2965,14 @@ fn write_file_create_new_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        return Ok(());
+    durable_file::sync_directory(path).map_err(content_durable_file_error)
+}
+
+fn content_durable_file_error(error: durable_file::DurableFileError) -> ContentStoreError {
+    ContentStoreError::Io {
+        path: PathBuf::from(error.path()),
+        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
     }
-    #[cfg(not(windows))]
-    fs::File::open(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|source| ContentStoreError::Io {
-            path: path.to_owned(),
-            source,
-        })
 }
 
 fn temporary_path_for(path: &Path) -> PathBuf {

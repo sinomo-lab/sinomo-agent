@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::ClusterBootstrapState;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_storage::durable_file::{self, file_ino};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -107,92 +108,20 @@ pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 pub const CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS: usize = 3;
 pub const CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP: u64 = 64;
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
-pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
 const RAFT_NODE_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 const RAFT_NODE_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
 static OBJECT_FILE_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static OBJECT_FILE_WRITE_MARK_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static KV_READ_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
-
-/// Per-path record of the last content `write_object_file` wrote (or confirmed
-/// already on disk), used to skip the read-back + compare when nothing changed.
-#[derive(Clone)]
-struct ObjectFileWriteMark {
-    hash: blake3::Hash,
-    len: u64,
-    modified: Option<SystemTime>,
-    ino: u64,
-    last_used: u64,
-}
 
 /// Cache of last-written object files. The cluster directory holding these WAL /
 /// snapshot files can be shared by the main and shadow daemons, so the fast-path
 /// skip is guarded by a `stat`: an entry is trusted only when the file's length,
 /// mtime, and inode still match what we wrote, so a write by another process is
 /// detected and falls back to a real read + compare.
-static LAST_WRITTEN_OBJECT_FILES: LazyLock<Mutex<HashMap<PathBuf, ObjectFileWriteMark>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn object_file_write_mark_cache_tick() -> u64 {
-    OBJECT_FILE_WRITE_MARK_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
-}
-
-fn evict_object_file_write_mark_if_needed(
-    cache: &mut HashMap<PathBuf, ObjectFileWriteMark>,
-    protected: &Path,
-) {
-    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
-        return;
-    }
-    let eviction_candidate = cache
-        .iter()
-        .filter(|(path, _)| path.as_path() != protected)
-        .min_by_key(|(_, mark)| mark.last_used)
-        .map(|(path, _)| path.clone());
-    if let Some(path) = eviction_candidate {
-        cache.remove(&path);
-    }
-}
-
-fn cached_object_file_mark(path: &Path) -> Option<ObjectFileWriteMark> {
-    let mut cache = LAST_WRITTEN_OBJECT_FILES.lock().ok()?;
-    let mark = cache.get_mut(path)?;
-    mark.last_used = object_file_write_mark_cache_tick();
-    Some(mark.clone())
-}
-
-fn record_object_file_mark(
-    path: &Path,
-    hash: blake3::Hash,
-    len: u64,
-    modified: Option<SystemTime>,
-    ino: u64,
-) {
-    if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-        evict_object_file_write_mark_if_needed(&mut cache, path);
-        cache.insert(
-            path.to_path_buf(),
-            ObjectFileWriteMark {
-                hash,
-                len,
-                modified,
-                ino,
-                last_used: object_file_write_mark_cache_tick(),
-            },
-        );
-    }
-}
-
-/// Captures the `(mtime, inode)` of `path` for the write-mark cache. Returns
-/// `(None, 0)` when the file can't be stat'd, which records an entry that can
-/// never be trusted (mtime `None`) — forcing the slow path on the next call.
-fn file_modified_and_ino(path: &Path) -> (Option<SystemTime>, u64) {
-    match fs::metadata(path) {
-        Ok(metadata) => (metadata.modified().ok(), file_ino(&metadata)),
-        Err(_) => (None, 0),
-    }
-}
+static LAST_WRITTEN_OBJECT_FILES: LazyLock<durable_file::ObjectFileWriteMarkCache> =
+    LazyLock::new(|| durable_file::ObjectFileWriteMarkCache::new(FILE_CACHE_CAPACITY));
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -2650,18 +2579,6 @@ struct RaftViewIdentity {
 /// against unbounded growth under pathological path churn. Read caches evict the
 /// oldest entry so a noisy set of roots cannot repeatedly cold-start hot roots.
 const FILE_CACHE_CAPACITY: usize = 4096;
-
-fn file_ino(metadata: &fs::Metadata) -> u64 {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::MetadataExt::ino(metadata)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        0
-    }
-}
 
 fn path_exists(path: &Path) -> Result<bool, KvError> {
     #[cfg(test)]
@@ -6941,70 +6858,15 @@ fn decode_object_file<T: for<'de> Deserialize<'de>>(
 }
 
 fn read_optional_object_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, KvError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(KvError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    };
-    read_object_file_bytes_from_open_file(path, file).map(Some)
+    durable_file::read_optional_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
+        .map_err(kv_durable_file_error)
 }
 
 fn read_object_file_bytes(path: &Path) -> Result<Vec<u8>, KvError> {
     #[cfg(test)]
     record_required_object_file_read_for_test(path);
-    let file = File::open(path).map_err(|source| KvError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    read_object_file_bytes_from_open_file(path, file)
-}
-
-fn read_object_file_bytes_from_open_file(path: &Path, file: File) -> Result<Vec<u8>, KvError> {
-    let len = file
-        .metadata()
-        .map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?
-        .len();
-    if len > MAX_OBJECT_FILE_READ_BYTES {
-        return Err(KvError::Io {
-            path: path.display().to_string(),
-            detail: format!("object file is {len} bytes; max is {MAX_OBJECT_FILE_READ_BYTES}"),
-        });
-    }
-
-    let mut bytes = Vec::with_capacity(len as usize);
-    let mut limited = file.take(MAX_OBJECT_FILE_READ_BYTES.saturating_add(1));
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    if bytes.len() as u64 > MAX_OBJECT_FILE_READ_BYTES {
-        return Err(KvError::Io {
-            path: path.display().to_string(),
-            detail: format!("object file read exceeded max of {MAX_OBJECT_FILE_READ_BYTES} bytes"),
-        });
-    }
-    Ok(bytes)
-}
-
-fn read_existing_object_file_for_compare(path: &Path, expected_len: u64) -> Option<Vec<u8>> {
-    let file = File::open(path).ok()?;
-    if file.metadata().ok()?.len() != expected_len {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(expected_len as usize);
-    let mut limited = file.take(expected_len.saturating_add(1));
-    limited.read_to_end(&mut bytes).ok()?;
-    (bytes.len() as u64 == expected_len).then_some(bytes)
+    durable_file::read_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
+        .map_err(kv_durable_file_error)
 }
 
 fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), KvError> {
@@ -7020,229 +6882,39 @@ fn write_object_file_if_changed<T: Serialize>(path: &Path, value: &T) -> Result<
 }
 
 fn write_object_file_bytes_if_changed(path: &Path, content: &[u8]) -> Result<bool, KvError> {
-    let content_hash = blake3::hash(content);
-
-    // Fast path: if we last wrote this exact content and the file is unchanged
-    // since (length + mtime + inode still match our record), skip without
-    // reading it back.
-    if let Some(mark) = cached_object_file_mark(path)
-        && mark.hash == content_hash
-        && let Ok(metadata) = fs::metadata(path)
-        && metadata.len() == mark.len
-        && metadata.modified().ok() == mark.modified
-        && file_ino(&metadata) == mark.ino
-    {
-        return Ok(false);
-    }
-
-    // Slow path: read the file back and compare only when the length could match.
-    // Handles a cold cache and files changed by another writer (e.g. a shadow
-    // daemon sharing the cluster dir) without reading sparse/corrupt oversized
-    // files that are already known to differ.
-    if read_existing_object_file_for_compare(path, content.len() as u64)
-        .is_some_and(|existing| existing == content)
-    {
-        // Already current: record the mark so subsequent calls take the fast path.
-        let (modified, ino) = file_modified_and_ino(path);
-        record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
-        return Ok(false);
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| KvError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("json");
-    let temp_path = parent.join(format!(
-        ".{file_name}.tmp-{}-{}",
-        std::process::id(),
-        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write_temp_result = (|| -> Result<(), KvError> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|source| KvError::Io {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.write_all(content).map_err(|source| KvError::Io {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        file.sync_data().map_err(|source| KvError::Io {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(())
-    })();
-    if let Err(error) = write_temp_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    if let Err(error) = replace_file(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    sync_directory(parent)?;
-    let (modified, ino) = file_modified_and_ino(path);
-    record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
-    Ok(true)
+    durable_file::write_object_file_bytes_if_changed(
+        path,
+        content,
+        &LAST_WRITTEN_OBJECT_FILES,
+        durable_file::DurableObjectFileOptions::new("json", "tmp"),
+    )
+    .map(|result| result.changed)
+    .map_err(kv_durable_file_error)
 }
 
 fn write_object_file_bytes_create_new_serialized(
     path: &Path,
     content: &[u8],
 ) -> Result<bool, KvError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| KvError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sobj");
-    let temp_path = parent.join(format!(
-        ".{file_name}.create-new-tmp-{}-{}",
-        std::process::id(),
-        OBJECT_FILE_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let write_temp_result = (|| -> Result<(), KvError> {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .map_err(|source| KvError::Io {
-                path: temp_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        file.write_all(content).map_err(|source| KvError::Io {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        file.sync_data().map_err(|source| KvError::Io {
-            path: temp_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(())
-    })();
-    if let Err(error) = write_temp_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    match fs::hard_link(&temp_path, path) {
-        Ok(()) => {
-            let _ = fs::remove_file(&temp_path);
-        }
-        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
-            let _ = fs::remove_file(&temp_path);
-            return Ok(false);
-        }
-        Err(source) if hard_link_unsupported(&source) => {
-            match fs::metadata(path) {
-                Ok(_) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Ok(false);
-                }
-                Err(metadata_source) if metadata_source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(metadata_source) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(KvError::Io {
-                        path: path.display().to_string(),
-                        detail: metadata_source.to_string(),
-                    });
-                }
-            }
-            if let Err(rename_source) = fs::rename(&temp_path, path) {
-                let existed = path.exists();
-                let _ = fs::remove_file(&temp_path);
-                if existed
-                    && matches!(
-                        rename_source.kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                    )
-                {
-                    return Ok(false);
-                }
-                return Err(KvError::Io {
-                    path: format!("{} -> {}", temp_path.display(), path.display()),
-                    detail: rename_source.to_string(),
-                });
-            }
-        }
-        Err(source) => {
-            let _ = fs::remove_file(&temp_path);
-            return Err(KvError::Io {
-                path: format!("{} -> {}", temp_path.display(), path.display()),
-                detail: source.to_string(),
-            });
-        }
-    }
-
-    sync_directory(parent)?;
-    let content_hash = blake3::hash(content);
-    let (modified, ino) = file_modified_and_ino(path);
-    record_object_file_mark(path, content_hash, content.len() as u64, modified, ino);
-    Ok(true)
-}
-
-fn hard_link_unsupported(source: &std::io::Error) -> bool {
-    source.kind() == std::io::ErrorKind::Unsupported
-        || matches!(
-            source.raw_os_error(),
-            Some(
-                1     // EPERM on Unix filesystems that disallow hard links.
-                    | 18   // EXDEV, kept defensive even though temp and target share a directory.
-                    | 38   // ENOSYS
-                    | 45   // EOPNOTSUPP on macOS/BSD
-                    | 50   // ERROR_NOT_SUPPORTED on Windows
-                    | 95   // EOPNOTSUPP on Linux
-                    | 1314 // ERROR_PRIVILEGE_NOT_HELD on Windows
-            )
-        )
+    durable_file::write_object_file_bytes_create_new_serialized(
+        path,
+        content,
+        &LAST_WRITTEN_OBJECT_FILES,
+        durable_file::DurableObjectFileOptions::new("sobj", "create-new-tmp"),
+        |temp_path, path| fs::hard_link(temp_path, path),
+    )
+    .map(|result| result.changed)
+    .map_err(kv_durable_file_error)
 }
 
 fn replace_file(temp_path: &Path, path: &Path) -> Result<(), KvError> {
-    match fs::rename(temp_path, path) {
-        Ok(()) => Ok(()),
-        Err(source)
-            if path.exists()
-                && matches!(
-                    source.kind(),
-                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-                ) =>
-        {
-            fs::remove_file(path).map_err(|remove_source| KvError::Io {
-                path: path.display().to_string(),
-                detail: format!(
-                    "replace failed with {}; additionally failed to remove existing file: {}",
-                    source, remove_source
-                ),
-            })?;
-            fs::rename(temp_path, path).map_err(|rename_source| KvError::Io {
-                path: format!("{} -> {}", temp_path.display(), path.display()),
-                detail: format!(
-                    "replace after removing existing file failed: {}",
-                    rename_source
-                ),
-            })
-        }
-        Err(source) => Err(KvError::Io {
-            path: format!("{} -> {}", temp_path.display(), path.display()),
-            detail: source.to_string(),
-        }),
+    durable_file::replace_file(temp_path, path).map_err(kv_durable_file_error)
+}
+
+fn kv_durable_file_error(error: durable_file::DurableFileError) -> KvError {
+    KvError::Io {
+        path: error.path().to_string(),
+        detail: error.detail().to_string(),
     }
 }
 
@@ -7332,18 +7004,7 @@ fn quarantine_unreadable_raft_view(paths: &KvWalPaths) {
 }
 
 fn sync_directory(path: &Path) -> Result<(), KvError> {
-    #[cfg(windows)]
-    {
-        let _ = path;
-        return Ok(());
-    }
-    #[cfg(not(windows))]
-    File::open(path)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|source| KvError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
+    durable_file::sync_directory(path).map_err(kv_durable_file_error)
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -9342,14 +9003,12 @@ mod tests {
         let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
             .lock()
             .expect("object mark cache mutex");
-        if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-            cache.clear();
-        }
-        OBJECT_FILE_WRITE_MARK_CACHE_CLOCK.store(1, Ordering::Relaxed);
+        LAST_WRITTEN_OBJECT_FILES.clear();
+        LAST_WRITTEN_OBJECT_FILES.reset_clock();
         let hash = blake3::hash(b"stable");
         let hot_path = PathBuf::from("/sinomo-kv-object-mark-lru/000-hot.sobj");
         for index in 0..FILE_CACHE_CAPACITY.saturating_sub(1) {
-            record_object_file_mark(
+            LAST_WRITTEN_OBJECT_FILES.record_mark(
                 &PathBuf::from(format!(
                     "/sinomo-kv-object-mark-lru/100-quiet-{index:04}.sobj"
                 )),
@@ -9359,7 +9018,7 @@ mod tests {
                 index as u64,
             );
         }
-        record_object_file_mark(
+        LAST_WRITTEN_OBJECT_FILES.record_mark(
             &hot_path,
             hash,
             6,
@@ -9367,11 +9026,11 @@ mod tests {
             FILE_CACHE_CAPACITY as u64,
         );
         assert!(
-            cached_object_file_mark(&hot_path).is_some(),
+            LAST_WRITTEN_OBJECT_FILES.refresh(&hot_path),
             "looking up the hot object write mark should refresh its recency"
         );
 
-        record_object_file_mark(
+        LAST_WRITTEN_OBJECT_FILES.record_mark(
             &PathBuf::from("/sinomo-kv-object-mark-lru/999-extra.sobj"),
             hash,
             6,
@@ -9380,12 +9039,10 @@ mod tests {
         );
 
         assert!(
-            cached_object_file_mark(&hot_path).is_some(),
+            LAST_WRITTEN_OBJECT_FILES.refresh(&hot_path),
             "recent object write mark should survive capacity churn"
         );
-        if let Ok(mut cache) = LAST_WRITTEN_OBJECT_FILES.lock() {
-            cache.retain(|path, _| !path.starts_with("/sinomo-kv-object-mark-lru"));
-        }
+        LAST_WRITTEN_OBJECT_FILES.retain_not_under_root(Path::new("/sinomo-kv-object-mark-lru"));
     }
 
     #[test]

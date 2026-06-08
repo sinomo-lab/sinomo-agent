@@ -14,17 +14,15 @@ use sinomo_core::DfsWriteReceipt;
 use sinomo_events::EventId;
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_storage::durable_file;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::Duration;
-#[cfg(windows)]
-use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -10187,79 +10185,23 @@ where
 }
 
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent.to_owned())?;
-    }
-    let tmp_path = temporary_path_for(path);
-    let mut file = fs::File::create(&tmp_path).map_err(|source| MetadataBackendError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| MetadataBackendError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(file);
-    fs::rename(&tmp_path, path).map_err(|source| MetadataBackendError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
-    Ok(())
+    durable_file::write_file_atomic(
+        path,
+        bytes,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+    )
+    .map_err(metadata_durable_file_error)
 }
 
 fn sync_dir(path: &Path) -> Result<()> {
-    sync_dir_impl(path).map_err(|source| MetadataBackendError::Io {
-        path: path.to_owned(),
-        source,
-    })
+    durable_file::sync_directory(path).map_err(metadata_durable_file_error)
 }
 
-#[cfg(not(windows))]
-fn sync_dir_impl(path: &Path) -> io::Result<()> {
-    open_dir_for_sync(path).and_then(|dir| dir.sync_all())
-}
-
-#[cfg(windows)]
-fn sync_dir_impl(path: &Path) -> io::Result<()> {
-    match open_dir_for_sync(path).and_then(|dir| dir.sync_all()) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-        Err(source) => Err(source),
+fn metadata_durable_file_error(error: durable_file::DurableFileError) -> MetadataBackendError {
+    MetadataBackendError::Io {
+        path: PathBuf::from(error.path()),
+        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
     }
-}
-
-#[cfg(not(windows))]
-fn open_dir_for_sync(path: &Path) -> io::Result<fs::File> {
-    fs::File::open(path)
-}
-
-#[cfg(windows)]
-fn open_dir_for_sync(path: &Path) -> io::Result<fs::File> {
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-}
-
-fn temporary_path_for(path: &Path) -> PathBuf {
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
-    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("tmp");
-    path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        counter
-    ))
 }
 
 #[cfg(test)]

@@ -9,12 +9,10 @@ use crate::{SIFS_FILE_SYSTEM_ID, namespace::sifs_node_files_path};
 use serde::{Deserialize, Serialize};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
+use sinomo_storage::durable_file;
 use std::fs;
-use std::io::{self, Write};
-#[cfg(windows)]
-use std::os::windows::fs::OpenOptionsExt;
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -635,100 +633,35 @@ fn decode_json_expose_config_value(
 }
 
 fn write_expose_config_atomic(path: &Path, bytes: &[u8]) -> Result<(), DfsExposeStoreError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| DfsExposeStoreError::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
-    }
-    let tmp_path = temporary_path_for(path);
-    let mut file = fs::File::create(&tmp_path).map_err(|source| DfsExposeStoreError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| DfsExposeStoreError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(file);
-    fs::rename(&tmp_path, path).map_err(|source| DfsExposeStoreError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    sync_parent_dir(path).map_err(|source| DfsExposeStoreError::Io {
-        path: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
-        source,
-    })
+    durable_file::write_file_atomic(
+        path,
+        bytes,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+    )
+    .map_err(expose_durable_file_error)
 }
 
 fn write_local_owned_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), LocalOwnedDfsError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| LocalOwnedDfsError::Io {
-            path: parent.to_owned(),
-            source,
-        })?;
-    }
-    let tmp_path = temporary_path_for(path);
-    let mut file = fs::File::create(&tmp_path).map_err(|source| LocalOwnedDfsError::Io {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|source| LocalOwnedDfsError::Io {
-            path: tmp_path.clone(),
-            source,
-        })?;
-    drop(file);
-    fs::rename(&tmp_path, path).map_err(|source| LocalOwnedDfsError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    sync_parent_dir(path).map_err(|source| LocalOwnedDfsError::Io {
-        path: path.parent().unwrap_or_else(|| Path::new(".")).to_owned(),
-        source,
-    })
+    durable_file::write_file_atomic(
+        path,
+        bytes,
+        durable_file::DurableAtomicFileOptions::new("tmp", "tmp").sync_all(),
+    )
+    .map_err(local_owned_durable_file_error)
 }
 
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    sync_dir(path.parent().unwrap_or_else(|| Path::new(".")))
-}
-
-#[cfg(not(windows))]
-fn sync_dir(path: &Path) -> io::Result<()> {
-    fs::File::open(path).and_then(|dir| dir.sync_all())
-}
-
-#[cfg(windows)]
-fn sync_dir(path: &Path) -> io::Result<()> {
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-
-    match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
-        .and_then(|dir| dir.sync_all())
-    {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-        Err(source) => Err(source),
+fn expose_durable_file_error(error: durable_file::DurableFileError) -> DfsExposeStoreError {
+    DfsExposeStoreError::Io {
+        path: PathBuf::from(error.path()),
+        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
     }
 }
 
-fn temporary_path_for(path: &Path) -> PathBuf {
-    static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
-    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("tmp");
-    path.with_file_name(format!(
-        ".{file_name}.{}.{}.tmp",
-        std::process::id(),
-        counter
-    ))
+fn local_owned_durable_file_error(error: durable_file::DurableFileError) -> LocalOwnedDfsError {
+    LocalOwnedDfsError::Io {
+        path: PathBuf::from(error.path()),
+        source: io::Error::new(io::ErrorKind::Other, error.detail().to_string()),
+    }
 }
 
 #[cfg(test)]
