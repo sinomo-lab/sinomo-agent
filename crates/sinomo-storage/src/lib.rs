@@ -5,6 +5,8 @@
 //! their crate, so storage usage can be inspected without hard-coding every
 //! downstream path here.
 
+pub mod durable_file;
+
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;

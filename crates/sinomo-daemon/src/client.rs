@@ -258,6 +258,139 @@ impl DaemonSignedEndpointRpcHost {
     }
 }
 
+fn send_daemon_rpc_body<Req, Resp>(
+    address: &str,
+    route: &str,
+    category: &str,
+    body: &Req,
+    timeout: Duration,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let request = ObjectRpcRequest::encode_body(route, category, body)?;
+    send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
+        response.decode_body()
+    })
+}
+
+fn send_daemon_rpc_body_to_endpoint<Req, Resp>(
+    endpoint: &ClusterEndpointRecord,
+    route: &str,
+    category: &str,
+    body: &Req,
+    timeout: Duration,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    send_daemon_rpc_body_to_endpoint_with_timeout_policy(
+        endpoint,
+        route,
+        category,
+        body,
+        timeout,
+        DaemonEndpointRpcTimeoutPolicy::FairControlPlane,
+    )
+}
+
+fn send_daemon_large_rpc_body_to_endpoint<Req, Resp>(
+    endpoint: &ClusterEndpointRecord,
+    route: &str,
+    category: &str,
+    body: &Req,
+    timeout: Duration,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    send_daemon_rpc_body_to_endpoint_with_timeout_policy(
+        endpoint,
+        route,
+        category,
+        body,
+        timeout,
+        DaemonEndpointRpcTimeoutPolicy::FullRequestBudget,
+    )
+}
+
+fn send_daemon_rpc_body_to_endpoint_with_timeout_policy<Req, Resp>(
+    endpoint: &ClusterEndpointRecord,
+    route: &str,
+    category: &str,
+    body: &Req,
+    timeout: Duration,
+    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
+) -> Result<Resp, DaemonError>
+where
+    Req: serde::Serialize + ?Sized,
+    Resp: serde::de::DeserializeOwned,
+{
+    let request = ObjectRpcRequest::encode_body(route, category, body)?;
+    send_daemon_rpc_request_to_endpoint_with_decoder_with_timeout_policy(
+        endpoint,
+        &request,
+        timeout,
+        timeout_policy,
+        |response| response.decode_body(),
+    )
+}
+
+fn send_daemon_rpc_request_with_decoder<Resp, DecodeError>(
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    decode: impl FnOnce(&sinomo_network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
+) -> Result<Resp, DaemonError>
+where
+    DecodeError: Into<DaemonError>,
+{
+    let response = send_daemon_rpc(address, request, timeout)?;
+    decode(&response).map_err(Into::into)
+}
+
+fn send_daemon_rpc_request_to_endpoint_with_decoder<Resp, DecodeError>(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    decode: impl FnOnce(&sinomo_network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
+) -> Result<Resp, DaemonError>
+where
+    DecodeError: Into<DaemonError>,
+{
+    send_daemon_rpc_request_to_endpoint_with_decoder_with_timeout_policy(
+        endpoint,
+        request,
+        timeout,
+        DaemonEndpointRpcTimeoutPolicy::FairControlPlane,
+        decode,
+    )
+}
+
+fn send_daemon_rpc_request_to_endpoint_with_decoder_with_timeout_policy<Resp, DecodeError>(
+    endpoint: &ClusterEndpointRecord,
+    request: &ObjectRpcRequest,
+    timeout: Duration,
+    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
+    decode: impl FnOnce(&sinomo_network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
+) -> Result<Resp, DaemonError>
+where
+    DecodeError: Into<DaemonError>,
+{
+    let response = match timeout_policy {
+        DaemonEndpointRpcTimeoutPolicy::FairControlPlane => {
+            send_daemon_rpc_to_endpoint(endpoint, request, timeout)?
+        }
+        DaemonEndpointRpcTimeoutPolicy::FullRequestBudget => {
+            send_daemon_large_rpc_to_endpoint(endpoint, request, timeout)?
+        }
+    };
+    decode(&response).map_err(Into::into)
+}
+
 impl sinomo_network::ClusterSignedEndpointRpcHost for DaemonSignedEndpointRpcHost {
     fn try_gateway_signed_rpc(
         &mut self,
@@ -486,13 +619,13 @@ pub fn fetch_daemon_status_from_endpoint(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
 ) -> Result<DaemonStatus, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
         sinomo_network::DAEMON_STATUS_ROUTE,
         sinomo_network::DAEMON_RPC_CATEGORY,
         &(),
-    )?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub(crate) fn send_dfs_metadata_journal_batch_to_endpoint(
@@ -501,8 +634,9 @@ pub(crate) fn send_dfs_metadata_journal_batch_to_endpoint(
     timeout: Duration,
 ) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
     let rpc_request = sinomo_dfs::dfs_metadata_journal_batch_rpc_request(request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(response)
+    })
 }
 
 pub(crate) fn send_dfs_metadata_snapshot_install_to_endpoint(
@@ -511,9 +645,9 @@ pub(crate) fn send_dfs_metadata_snapshot_install_to_endpoint(
     timeout: Duration,
 ) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
     let rpc_request = sinomo_dfs::dfs_metadata_snapshot_install_rpc_request(request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(&response)
-        .map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(response)
+    })
 }
 
 pub(crate) fn send_dfs_protocol_frame_to_endpoint(
@@ -522,34 +656,35 @@ pub(crate) fn send_dfs_protocol_frame_to_endpoint(
     timeout: Duration,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
     let rpc_request = sinomo_dfs::dfs_protocol_frame_rpc_request(request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_dfs::decode_dfs_protocol_frame_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_dfs::decode_dfs_protocol_frame_rpc_response(response)
+    })
 }
 
 pub fn fetch_daemon_status_from_address(
     address: &str,
     timeout: Duration,
 ) -> Result<DaemonStatus, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
+    send_daemon_rpc_body(
+        address,
         sinomo_network::DAEMON_STATUS_ROUTE,
         sinomo_network::DAEMON_RPC_CATEGORY,
         &(),
-    )?;
-    let response = send_daemon_rpc(address, &request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub fn send_daemon_shutdown_request(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    let request = ObjectRpcRequest::encode_body(
+    send_daemon_rpc_body(
+        address,
         sinomo_network::DAEMON_SHUTDOWN_ROUTE,
         sinomo_network::DAEMON_RPC_CATEGORY,
         &(),
-    )?;
-    let response = send_daemon_rpc(address, &request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub fn fetch_cluster_kv_snapshot(
@@ -557,8 +692,9 @@ pub fn fetch_cluster_kv_snapshot(
     timeout: Duration,
 ) -> Result<KvSnapshot, DaemonError> {
     let request = sinomo_network::cluster_kv_snapshot_rpc_request()?;
-    let response = send_daemon_rpc(address, &request, timeout)?;
-    sinomo_network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
+        sinomo_network::decode_cluster_kv_snapshot_rpc_response(response)
+    })
 }
 
 pub fn fetch_cluster_kv_snapshot_from_endpoint(
@@ -566,8 +702,9 @@ pub fn fetch_cluster_kv_snapshot_from_endpoint(
     timeout: Duration,
 ) -> Result<KvSnapshot, DaemonError> {
     let rpc_request = sinomo_network::cluster_kv_snapshot_rpc_request()?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_network::decode_cluster_kv_snapshot_rpc_response(response)
+    })
 }
 
 pub(crate) fn send_cluster_kv_txn(
@@ -576,8 +713,9 @@ pub(crate) fn send_cluster_kv_txn(
     timeout: Duration,
 ) -> Result<KvTxnResponse, DaemonError> {
     let rpc_request = sinomo_network::cluster_kv_txn_rpc_request(txn)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_network::decode_cluster_kv_txn_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_network::decode_cluster_kv_txn_rpc_response(response)
+    })
 }
 
 pub(crate) fn send_cluster_raft_append(
@@ -586,8 +724,9 @@ pub(crate) fn send_cluster_raft_append(
     timeout: Duration,
 ) -> Result<ClusterRaftAppendResponse, DaemonError> {
     let rpc_request = sinomo_network::cluster_raft_append_rpc_request(request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_network::decode_cluster_raft_append_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_network::decode_cluster_raft_append_rpc_response(response)
+    })
 }
 
 pub(crate) fn send_cluster_raft_vote(
@@ -596,8 +735,9 @@ pub(crate) fn send_cluster_raft_vote(
     timeout: Duration,
 ) -> Result<ClusterRaftVoteResponse, DaemonError> {
     let rpc_request = sinomo_network::cluster_raft_vote_rpc_request(request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_network::decode_cluster_raft_vote_rpc_response(&response).map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_network::decode_cluster_raft_vote_rpc_response(response)
+    })
 }
 
 pub(crate) fn send_cluster_member_publish(
@@ -605,13 +745,13 @@ pub(crate) fn send_cluster_member_publish(
     request: &ClusterMemberPublishRequest,
     timeout: Duration,
 ) -> Result<ClusterMemberPublishResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
         sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE,
         sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
         request,
-    )?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 fn connect_daemon_control_stream(
@@ -740,9 +880,9 @@ pub(crate) fn send_cluster_kv_watch_events(
         return Ok(response);
     }
     let rpc_request = sinomo_network::cluster_kv_watch_events_rpc_request(request)?;
-    let response = send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    sinomo_network::decode_cluster_kv_watch_events_rpc_response(&response)
-        .map_err(DaemonError::from)
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &rpc_request, timeout, |response| {
+        sinomo_network::decode_cluster_kv_watch_events_rpc_response(response)
+    })
 }
 
 pub fn send_daemon_rollout_binary(
@@ -750,10 +890,13 @@ pub fn send_daemon_rollout_binary(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+    send_daemon_rpc_body(
+        address,
+        ROLLOUT_BINARY_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_binary_to_endpoint(
@@ -761,10 +904,13 @@ pub fn send_daemon_rollout_binary_to_endpoint(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+    send_daemon_large_rpc_body_to_endpoint(
+        endpoint,
+        ROLLOUT_BINARY_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_binary_upload_chunk(
@@ -772,13 +918,13 @@ pub fn send_daemon_rollout_binary_upload_chunk(
     request: &ClusterRolloutBinaryUploadChunkRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
+    send_daemon_rpc_body(
+        address,
         ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
-    )?;
-    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
@@ -786,13 +932,13 @@ pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
     request: &ClusterRolloutBinaryUploadChunkRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
+    send_daemon_large_rpc_body_to_endpoint(
+        endpoint,
         ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
-    )?;
-    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_binary_upload_finalize(
@@ -800,13 +946,13 @@ pub fn send_daemon_rollout_binary_upload_finalize(
     request: &ClusterRolloutBinaryUploadFinalizeRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
+    send_daemon_rpc_body(
+        address,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
-    )?;
-    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
@@ -814,13 +960,13 @@ pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
     request: &ClusterRolloutBinaryUploadFinalizeRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request = ObjectRpcRequest::encode_body(
+    send_daemon_large_rpc_body_to_endpoint(
+        endpoint,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
-    )?;
-    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_build(
@@ -828,10 +974,13 @@ pub fn send_daemon_rollout_build(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    let response = send_daemon_rpc(address, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+    send_daemon_rpc_body(
+        address,
+        ROLLOUT_BUILD_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_build_to_endpoint(
@@ -839,30 +988,39 @@ pub fn send_daemon_rollout_build_to_endpoint(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    let rpc_request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, request)?;
-    let response = send_daemon_large_rpc_to_endpoint(endpoint, &rpc_request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+    send_daemon_large_rpc_body_to_endpoint(
+        endpoint,
+        ROLLOUT_BUILD_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_clear_status(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    let request =
-        ObjectRpcRequest::encode_body(ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?;
-    let response = send_daemon_rpc(address, &request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+    send_daemon_rpc_body(
+        address,
+        ROLLOUT_CLEAR_STATUS_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        &(),
+        timeout,
+    )
 }
 
 pub fn send_daemon_rollout_diagnostics(
     address: &str,
     timeout: Duration,
 ) -> Result<String, DaemonError> {
-    let request =
-        ObjectRpcRequest::encode_body(ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY, &())?;
-    let response = send_daemon_rpc(address, &request, timeout)?;
-    response.decode_body().map_err(DaemonError::from)
+    send_daemon_rpc_body(
+        address,
+        ROLLOUT_DIAGNOSTICS_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        &(),
+        timeout,
+    )
 }
 
 #[cfg(test)]
