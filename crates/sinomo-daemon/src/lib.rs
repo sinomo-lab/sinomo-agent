@@ -13,7 +13,6 @@ mod rollout;
 mod service_adapter;
 mod status;
 
-pub(crate) use auth::create_cluster_invite_challenge_proof;
 pub use auth::{
     AuthenticatedDaemonCommand, DaemonSignerAuthority, SignedDaemonCommand,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
@@ -21,8 +20,7 @@ pub use auth::{
     sign_daemon_rpc_request_from_data_dir,
 };
 pub use client::{
-    RemoteConfigClient, fetch_cluster_kv_snapshot, fetch_cluster_kv_snapshot_from_endpoint,
-    fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
+    RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
     send_daemon_rollout_binary, send_daemon_rollout_binary_to_endpoint,
     send_daemon_rollout_binary_upload_chunk, send_daemon_rollout_binary_upload_chunk_to_endpoint,
     send_daemon_rollout_binary_upload_finalize,
@@ -35,13 +33,6 @@ pub(crate) use client::{
     send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_raft_append,
     send_cluster_raft_vote, send_dfs_metadata_journal_batch_to_endpoint,
     send_dfs_metadata_snapshot_install_to_endpoint, send_dfs_protocol_frame_to_endpoint,
-};
-pub(crate) use cluster::{
-    CLUSTER_HEALTH_PROBE_TIMEOUT, ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL,
-    DAEMON_CLUSTER_TICK_INTERVAL, cluster_paths_from_daemon_paths, ensure_daemon_status_cluster,
-    forward_cluster_invite_challenge_to_voter, handle_daemon_cluster_kv_snapshot,
-    prune_local_cluster_raft_uncommitted_tail, start_daemon_iroh_proxy_if_clustered,
-    start_shadow_daemon_status_publisher,
 };
 pub use control::{
     handle_daemon_connection, handle_daemon_sandbox_checkpoint, handle_daemon_sandbox_create,

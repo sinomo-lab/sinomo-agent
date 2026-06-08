@@ -904,21 +904,52 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
     invite: &ClusterJoinInvite,
     paths: Option<&ClusterPaths>,
 ) -> Result<(), CliError> {
-    struct CliClusterJoinReconciliationHost;
+    fn unsupported_join_reconciliation_transport(operation: &str) -> network::NetworkError {
+        network::NetworkError::Io {
+            operation: operation.to_string(),
+            detail: "cluster join reconciliation only supports membership RPC and snapshot fetch"
+                .to_string(),
+        }
+    }
 
-    impl network::ClusterJoinReconciliationHost for CliClusterJoinReconciliationHost {
-        fn send_join_registration(
+    struct CliClusterJoinReconciliationTransport;
+
+    impl network::ClusterControlPlaneTransport for CliClusterJoinReconciliationTransport {
+        fn send_raft_append(
             &mut self,
-            endpoint: &ClusterEndpointRecord,
-            request: &ClusterJoinRegistrationRequest,
-            tcp_timeout: Duration,
-            iroh_timeout: Duration,
-        ) -> Result<ClusterJoinRegistrationResponse, network::NetworkError> {
-            send_cluster_join_registration_to_channel(endpoint, request, tcp_timeout, iroh_timeout)
-                .map_err(|source| network::NetworkError::Io {
-                    operation: "cluster join registration".to_string(),
-                    detail: source.to_string(),
-                })
+            _endpoint: &ClusterEndpointRecord,
+            _request: &network::ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+            Err(unsupported_join_reconciliation_transport(
+                "cluster join raft append",
+            ))
+        }
+
+        fn send_raft_vote(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &network::ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
+            Err(unsupported_join_reconciliation_transport(
+                "cluster join raft vote",
+            ))
+        }
+
+        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+            false
+        }
+
+        fn send_cluster_kv_txn(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _txn: &KvTxn,
+            _timeout: Duration,
+        ) -> Result<KvTxnResponse, network::NetworkError> {
+            Err(unsupported_join_reconciliation_transport(
+                "cluster join kv txn",
+            ))
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -933,15 +964,64 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                 }
             })
         }
+
+        fn send_cluster_kv_watch_events(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &sinomo_runtime::kv::ClusterKvWatchEventsRequest,
+            _timeout: Duration,
+        ) -> Result<sinomo_runtime::kv::ClusterKvWatchEventsResponse, network::NetworkError>
+        {
+            Err(unsupported_join_reconciliation_transport(
+                "cluster join kv watch events",
+            ))
+        }
+
+        fn send_cluster_member_publish(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &network::ClusterMemberPublishRequest,
+            _timeout: Duration,
+        ) -> Result<network::ClusterMemberPublishResponse, network::NetworkError> {
+            Err(unsupported_join_reconciliation_transport(
+                "cluster join member publish",
+            ))
+        }
+
+        fn send_cluster_membership_rpc(
+            &mut self,
+            endpoint: &ClusterEndpointRecord,
+            request: &network::ObjectRpcRequest,
+            timeout: Duration,
+        ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+            send_join_rpc(endpoint, request, timeout).map_err(|source| network::NetworkError::Io {
+                operation: "cluster join membership rpc".to_string(),
+                detail: source.to_string(),
+            })
+        }
+
+        fn relay_rpc_to_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _peer: &ClusterEndpointRecord,
+            _request: &network::ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<network::ObjectRpcResponse, network::NetworkError> {
+            Err(unsupported_join_reconciliation_transport(
+                "cluster join relay rpc",
+            ))
+        }
     }
 
+    let mut host = network::ClusterControlPlaneDriver::new(CliClusterJoinReconciliationTransport);
     let reconciliation = network::reconcile_cluster_join_with_introducers_with_host(
         state,
         invite,
         DAEMON_JOIN_TIMEOUT,
         IROH_DAEMON_JOIN_TIMEOUT,
         paths,
-        &mut CliClusterJoinReconciliationHost,
+        &mut host,
     )
     .map_err(CliError::from)?;
     if let Some(snapshot) = reconciliation.kv_snapshot
@@ -963,46 +1043,24 @@ pub(crate) fn send_cluster_join_registration_over_iroh(
     send_cluster_join_registration_to_endpoint(endpoint, request, IROH_DAEMON_JOIN_TIMEOUT)
 }
 
-fn send_cluster_join_registration_to_channel(
-    endpoint: &ClusterEndpointRecord,
-    request: &ClusterJoinRegistrationRequest,
-    tcp_timeout: Duration,
-    iroh_timeout: Duration,
-) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let timeout = match endpoint.transport {
-        ClusterTransportKind::Iroh => iroh_timeout,
-        _ => tcp_timeout,
-    };
-    send_cluster_join_registration_to_endpoint(endpoint, request, timeout)
-}
-
+#[cfg(test)]
 fn send_cluster_join_registration_to_endpoint(
     endpoint: &ClusterEndpointRecord,
     request: &ClusterJoinRegistrationRequest,
     timeout: Duration,
 ) -> Result<ClusterJoinRegistrationResponse, CliError> {
-    let challenge = network::random_url_secret(32)?;
-    let challenge_request = ClusterInviteChallengeRequest {
-        protocol: CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
-        invite_id: request.invite.invite_id.clone(),
-        challenge: challenge.clone(),
-    };
-    let challenge_rpc = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_JOIN_CHALLENGE_ROUTE,
-        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-        &challenge_request,
-    )?;
-    let proof_response = send_join_rpc(endpoint, &challenge_rpc, timeout)?;
-    let proof: ClusterInviteChallengeProof = proof_response.decode_body()?;
-    verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
-
-    let register_rpc = network::ObjectRpcRequest::encode_body(
-        network::CLUSTER_JOIN_REGISTER_ROUTE,
-        network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+    network::send_cluster_join_registration_over_membership_rpc(
+        endpoint,
         request,
-    )?;
-    let response = send_join_rpc(endpoint, &register_rpc, timeout)?;
-    response.decode_body().map_err(Into::into)
+        timeout,
+        |endpoint, request, timeout| {
+            send_join_rpc(endpoint, request, timeout).map_err(|source| network::NetworkError::Io {
+                operation: "cluster join membership rpc".to_string(),
+                detail: source.to_string(),
+            })
+        },
+    )
+    .map_err(Into::into)
 }
 
 fn send_join_rpc(

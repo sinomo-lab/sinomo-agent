@@ -7,20 +7,21 @@ use sinomo_core::ClusterEndpointRecord;
 use sinomo_dfs::DfsFileSystemConfig;
 #[cfg(test)]
 use sinomo_dfs::{
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult, DfsMetadataShardAssignment,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsObjectVersionRecord, LocalContentStore,
-    LocalSobjMetadataBackend, distributed_sifs, distributed_sifs_bootstrap_objects,
-    file_system_config_key, metadata_shard_key, sifs_node_files_path,
+    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsMetadataJournalBatchResult,
+    DfsMetadataJournalBatchSender, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardId, DfsMetadataSnapshotInstallResult, DfsMetadataSnapshotInstallSender,
+    DfsObjectVersionRecord, LocalContentStore, LocalSobjMetadataBackend, distributed_sifs,
+    distributed_sifs_bootstrap_objects, file_system_config_key, metadata_shard_key,
+    sifs_node_files_path,
 };
 use sinomo_dfs::{
-    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsEndpointTransport,
-    DfsMaintenanceTickOptions, DfsMetadataBackend, DfsMetadataJournalBatchSender,
+    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDefaultClusterBootstrapOptions,
+    DfsDefaultClusterSmokeOptions, DfsEndpointTransport, DfsMaintenanceTickOptions,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPeerTransportError, DfsMetadataSnapshotInstallSender, DfsPeerTransportError,
+    DfsMetadataPeerTransportError, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsPeerTransport, DfsPeerTransportError,
     DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, NetworkedDfsService,
-    NetworkedDfsServiceEvent,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
@@ -90,6 +91,34 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct DaemonDfsDataPlaneHost {
+    paths: DaemonPaths,
+}
+
+impl DaemonDfsDataPlaneHost {
+    pub(crate) fn new(paths: DaemonPaths) -> Self {
+        Self { paths }
+    }
+}
+
+impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
+    fn run_smoke(&self) -> Result<sinomo_dfs::DfsSmokeReport, DfsDataPlaneHostError> {
+        run_daemon_dfs_smoke(&self.paths).map_err(daemon_dfs_data_plane_error)
+    }
+
+    fn handle_protocol_frame(
+        &self,
+        command: DfsProtocolFrameCommand,
+    ) -> Result<DfsProtocolFrameResponse, DfsDataPlaneHostError> {
+        handle_daemon_dfs_protocol_frame(&self.paths, command).map_err(daemon_dfs_data_plane_error)
+    }
+}
+
+fn daemon_dfs_data_plane_error(source: DaemonError) -> DfsDataPlaneHostError {
+    DfsDataPlaneHostError::new(source.to_string())
+}
+
 pub(crate) fn with_daemon_dfs_control_plane<T: NetworkTransport>(
     service: NetworkedDfsService<T>,
     cluster_paths: &ClusterPaths,
@@ -117,25 +146,52 @@ pub(crate) fn daemon_dfs_endpoint_transport(
     DfsEndpointTransport::new(local_node_id, endpoints, daemon_dfs_protocol_frame_sender())
 }
 
-fn daemon_dfs_protocol_frame_sender() -> DfsProtocolFrameSender {
-    Arc::new(|endpoint, command, timeout| {
+#[derive(Clone, Debug)]
+struct DaemonDfsPeerTransport;
+
+impl DfsPeerTransport for DaemonDfsPeerTransport {
+    fn send_protocol_frame(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsProtocolFrameCommand,
+        timeout: std::time::Duration,
+    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
         send_dfs_protocol_frame_to_endpoint(endpoint, command, timeout)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    })
-}
+    }
 
-fn daemon_dfs_metadata_journal_batch_sender() -> DfsMetadataJournalBatchSender {
-    Arc::new(|endpoint, command, timeout| {
+    fn send_metadata_journal_batch(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMetadataJournalBatchCommand,
+        timeout: std::time::Duration,
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError> {
         send_dfs_metadata_journal_batch_to_endpoint(endpoint, command, timeout)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
-    })
-}
+    }
 
-fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
-    Arc::new(|endpoint, command, timeout| {
+    fn send_metadata_snapshot_install(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMetadataSnapshotInstallCommand,
+        timeout: std::time::Duration,
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError> {
         send_dfs_metadata_snapshot_install_to_endpoint(endpoint, command, timeout)
             .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
-    })
+    }
+}
+
+fn daemon_dfs_peer_transport() -> Arc<dyn DfsPeerTransport> {
+    Arc::new(DaemonDfsPeerTransport)
+}
+
+fn daemon_dfs_protocol_frame_sender() -> DfsProtocolFrameSender {
+    sinomo_dfs::dfs_protocol_frame_sender_from_peer_transport(daemon_dfs_peer_transport())
+}
+
+#[cfg(test)]
+fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
+    sinomo_dfs::dfs_metadata_snapshot_install_sender_from_peer_transport(daemon_dfs_peer_transport())
 }
 
 // DFS inspection request/response types live in `sinomo-dfs`; this module only
@@ -157,23 +213,50 @@ pub(crate) fn open_daemon_dfs_metadata_backend(
     sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths).map_err(Into::into)
 }
 
-pub(crate) fn handle_daemon_dfs_protocol_frame(
+fn handle_daemon_dfs_protocol_frame(
     paths: &DaemonPaths,
     command: DfsProtocolFrameCommand,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let Some(result) = sinomo_dfs::process_cluster_dfs_protocol_frame_command(
+    let peer_transport = daemon_dfs_peer_transport();
+    let control_plane = daemon_dfs_control_plane_client(&cluster_paths);
+    #[cfg(not(test))]
+    let result = sinomo_dfs::schedule_cluster_dfs_protocol_frame_command_metadata_publish(
+        data_dir,
+        cluster_paths,
+        command,
+        peer_transport,
+        control_plane,
+        sinomo_dfs::DfsMetadataPublishScheduleOptions::default(),
+        DfsMetadataJournalReplicationOptions::default(),
+        log_dfs_metadata_replication_report,
+        |error| {
+            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+        },
+    )?;
+    #[cfg(test)]
+    let result = sinomo_dfs::run_cluster_dfs_protocol_frame_command_with_metadata_publish(
         &data_dir,
         &cluster_paths,
         command,
-        daemon_dfs_control_plane_client(&cluster_paths),
-    )?
-    else {
+        peer_transport,
+        control_plane,
+        DfsMetadataJournalReplicationOptions::default(),
+        log_dfs_metadata_replication_report,
+        |error| {
+            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
+        },
+    )?;
+    let Some(result) = result else {
         return Err(DaemonError::ClusterOrphan);
     };
-    publish_dfs_metadata_after_mutating_protocol_events(paths, &result.events);
+    if let Some(error) = result.metadata_publish_schedule_error {
+        eprintln!(
+            "sinomo daemon failed to spawn DFS metadata publish after protocol mutation: {error}"
+        );
+    }
     Ok(result.response)
 }
 
@@ -207,12 +290,10 @@ pub(crate) fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(),
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let Some(report) = sinomo_dfs::run_cluster_dfs_maintenance_tick(
+    let Some(report) = sinomo_dfs::run_cluster_dfs_maintenance_tick_with_peer_transport(
         &data_dir,
         &cluster_paths,
-        daemon_dfs_protocol_frame_sender(),
-        daemon_dfs_metadata_journal_batch_sender(),
-        daemon_dfs_metadata_snapshot_install_sender(),
+        daemon_dfs_peer_transport(),
         daemon_dfs_control_plane_client(&cluster_paths),
         DfsMaintenanceTickOptions::default(),
     )?
@@ -267,20 +348,16 @@ fn publish_default_dfs_metadata_journal_with_senders(
     )?)
 }
 
-pub(crate) fn run_daemon_dfs_smoke(
-    paths: &DaemonPaths,
-) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
+fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let options = DaemonRunOptions::default();
     let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
-    let Some(report) = sinomo_dfs::run_default_cluster_dfs_smoke(
+    let Some(report) = sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
         &data_dir,
         &cluster_paths,
-        daemon_dfs_protocol_frame_sender(),
-        daemon_dfs_metadata_journal_batch_sender(),
-        daemon_dfs_metadata_snapshot_install_sender(),
+        daemon_dfs_peer_transport(),
         Box::new(DaemonDfsControlPlaneKvClient::new(&cluster_paths)),
         daemon_dfs_control_plane_client(&cluster_paths),
         DfsDefaultClusterSmokeOptions {
@@ -302,79 +379,6 @@ fn daemon_data_dir(paths: &DaemonPaths) -> Result<&std::path::Path, DaemonError>
         path: paths.root.display().to_string(),
         detail: "daemon root has no data directory parent".to_string(),
     })
-}
-
-fn publish_dfs_metadata_after_mutating_protocol_events(
-    paths: &DaemonPaths,
-    events: &[NetworkedDfsServiceEvent],
-) {
-    publish_dfs_metadata_after_protocol_mutation(paths, events);
-}
-
-#[cfg(not(test))]
-fn publish_dfs_metadata_after_protocol_mutation(
-    paths: &DaemonPaths,
-    events: &[NetworkedDfsServiceEvent],
-) {
-    if !sinomo_dfs::dfs_events_should_publish_metadata(events) {
-        return;
-    }
-    let data_dir = match daemon_data_dir(paths) {
-        Ok(data_dir) => SinomoDataDir::new(data_dir),
-        Err(error) => {
-            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
-            return;
-        }
-    };
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let result = sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events(
-        data_dir,
-        cluster_paths,
-        daemon_dfs_metadata_journal_batch_sender(),
-        daemon_dfs_metadata_snapshot_install_sender(),
-        events,
-        sinomo_dfs::DfsMetadataPublishScheduleOptions::default(),
-        DfsMetadataJournalReplicationOptions::default(),
-        log_dfs_metadata_replication_report,
-        |error| {
-            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
-        },
-    );
-    if let Err(source) = result {
-        eprintln!(
-            "sinomo daemon failed to spawn DFS metadata publish after protocol mutation: {source}"
-        );
-    }
-}
-
-#[cfg(test)]
-fn publish_dfs_metadata_after_protocol_mutation(
-    paths: &DaemonPaths,
-    events: &[NetworkedDfsServiceEvent],
-) {
-    if !sinomo_dfs::dfs_events_should_publish_metadata(events) {
-        return;
-    }
-    let data_dir = match daemon_data_dir(paths) {
-        Ok(data_dir) => SinomoDataDir::new(data_dir),
-        Err(error) => {
-            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
-            return;
-        }
-    };
-    let cluster_paths = ClusterPaths::new(&data_dir);
-    let _ = sinomo_dfs::run_cluster_dfs_metadata_publish_after_events(
-        &data_dir,
-        &cluster_paths,
-        daemon_dfs_metadata_journal_batch_sender(),
-        daemon_dfs_metadata_snapshot_install_sender(),
-        events,
-        DfsMetadataJournalReplicationOptions::default(),
-        log_dfs_metadata_replication_report,
-        |error| {
-            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
-        },
-    );
 }
 
 #[cfg(test)]

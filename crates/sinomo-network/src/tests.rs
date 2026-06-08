@@ -448,6 +448,56 @@ fn async_daemon_control_client_round_trips_object_frames() {
 }
 
 #[test]
+fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: DaemonControlRequest = read_object_frame_async(&mut stream, 4096)
+                .await
+                .expect("read request");
+            assert_eq!(request.command, "RPC /test/slow");
+            let rpc_response = ObjectRpcResponse::encode_body("/test/slow", &"OK".to_string())
+                .expect("rpc response");
+            let mut response_frame = Vec::new();
+            write_object_frame_blocking(
+                &mut response_frame,
+                &DaemonControlResponse::rpc(String::new(), rpc_response),
+            )
+            .expect("encode response frame");
+
+            for chunk in response_frame.chunks(8) {
+                stream.write_all(chunk).await.expect("write response chunk");
+                stream.flush().await.expect("flush response chunk");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        let request =
+            ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("rpc request");
+        let response = send_daemon_rpc_raw_async(
+            &address,
+            "RPC /test/slow",
+            None,
+            &request,
+            Duration::from_millis(25),
+        )
+        .await
+        .expect("response");
+        server.await.expect("server");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
+    });
+}
+
+#[test]
 fn async_daemon_rpc_client_rejects_non_rpc_response() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -497,17 +547,6 @@ fn daemon_rpc_response_helper_rejects_framed_rpc_errors() {
 }
 
 #[test]
-fn daemon_rpc_deadline_remaining_shrinks_across_phases() {
-    let deadline = crate::roaming::DaemonRpcDeadline::new(Duration::from_millis(80));
-    std::thread::sleep(Duration::from_millis(20));
-
-    assert!(
-        deadline.remaining() < Duration::from_millis(80),
-        "daemon RPC deadline should be shared across connect/write/read phases"
-    );
-}
-
-#[test]
 fn daemon_rpc_blocking_wrapper_works_inside_current_thread_runtime() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -527,16 +566,15 @@ fn daemon_rpc_blocking_wrapper_works_inside_current_thread_runtime() {
 }
 
 #[test]
-fn daemon_control_stream_deadline_refreshes_blocking_timeouts() {
+fn daemon_control_stream_idle_timeout_configures_blocking_timeouts() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     let stream = std::net::TcpStream::connect(listener.local_addr().expect("local addr"))
         .expect("client stream");
-    let deadline = crate::roaming::DaemonRpcDeadline::new(Duration::from_millis(500));
 
-    crate::roaming::configure_daemon_control_stream_deadline(
+    crate::roaming::configure_daemon_control_stream_idle_timeout(
         &stream,
         "127.0.0.1",
-        &deadline,
+        Duration::from_millis(500),
         true,
         true,
     )
@@ -550,11 +588,10 @@ fn daemon_control_stream_deadline_refreshes_blocking_timeouts() {
         .expect("write timeout")
         .expect("write timeout set");
 
-    std::thread::sleep(Duration::from_millis(100));
-    crate::roaming::configure_daemon_control_stream_deadline(
+    crate::roaming::configure_daemon_control_stream_idle_timeout(
         &stream,
         "127.0.0.1",
-        &deadline,
+        Duration::from_millis(500),
         true,
         false,
     )
@@ -565,8 +602,8 @@ fn daemon_control_stream_deadline_refreshes_blocking_timeouts() {
         .expect("read timeout set");
 
     assert!(
-        refreshed_read_timeout < initial_read_timeout,
-        "blocking daemon proxy reads should use remaining route budget, not the original timeout"
+        refreshed_read_timeout == initial_read_timeout,
+        "blocking daemon proxy reads should use an idle timeout, not a shrinking route budget"
     );
     assert_eq!(
         stream
@@ -1121,29 +1158,6 @@ fn daemon_member_endpoint_publish_replaces_stale_tcp_listener_advertisements() {
     assert!(
         !member.endpoints.contains(&stale_lan),
         "old TCP listener advertisements must be removed when the daemon bind changes"
-    );
-}
-
-#[test]
-fn iroh_daemon_proxy_uses_long_timeout_for_rollout_build() {
-    let request =
-        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, &"build request")
-            .expect("request");
-    let control = DaemonControlRequest::rpc(format!("RPC {ROLLOUT_BUILD_ROUTE}"), request);
-    let mut payload = Vec::new();
-    write_object_frame_blocking(&mut payload, &control).expect("frame");
-
-    assert!(iroh_daemon_command_forward_timeout(&payload) >= std::time::Duration::from_secs(600));
-}
-
-#[test]
-fn iroh_daemon_proxy_keeps_short_timeout_for_regular_commands() {
-    let mut payload = Vec::new();
-    write_object_frame_blocking(&mut payload, &DaemonControlRequest::new("status")).expect("frame");
-
-    assert_eq!(
-        iroh_daemon_command_forward_timeout(&payload),
-        std::time::Duration::from_secs(10)
     );
 }
 
@@ -7195,6 +7209,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
             max_raft_append_attempts: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
             rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
+            membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
             tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
             iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
@@ -7210,6 +7225,7 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         max_raft_append_attempts: 7,
         raft_append_timeout: Duration::from_secs(10),
         rpc_timeout: Duration::from_secs(2),
+        membership_rpc_timeout: Duration::from_secs(15),
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
         tcp_foreground_attempt_timeout: Duration::from_secs(3),
@@ -7277,6 +7293,761 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
             iroh_foreground_attempt_timeout: Duration::from_secs(5),
         }
     );
+}
+
+#[test]
+fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory() {
+    #[derive(Default)]
+    struct RecordingMembershipTransport {
+        sent: Vec<(NodeId, Duration, String)>,
+        relayed: Vec<(NodeId, NodeId, Duration, String)>,
+        connectivity: Vec<(NodeId, ClusterConnectivityState, Option<u64>)>,
+    }
+
+    impl ClusterControlPlaneTransport for RecordingMembershipTransport {
+        fn send_raft_append(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+            panic!("membership forwarding should not send raft append")
+        }
+
+        fn send_raft_vote(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            panic!("membership forwarding should not send raft vote")
+        }
+
+        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+            panic!("membership forwarding should not probe voters")
+        }
+
+        fn send_cluster_kv_txn(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _txn: &KvTxn,
+            _timeout: Duration,
+        ) -> Result<KvTxnResponse, NetworkError> {
+            panic!("membership forwarding should not send kv txn")
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> Result<KvSnapshot, NetworkError> {
+            panic!("membership forwarding should not fetch kv snapshots")
+        }
+
+        fn send_cluster_kv_watch_events(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterKvWatchEventsRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+            panic!("membership forwarding should not send watch events")
+        }
+
+        fn send_cluster_member_publish(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterMemberPublishRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+            panic!("membership forwarding should not publish members")
+        }
+
+        fn send_cluster_membership_rpc(
+            &mut self,
+            endpoint: &ClusterEndpointRecord,
+            request: &ObjectRpcRequest,
+            timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.sent
+                .push((endpoint.node_id.clone(), timeout, request.route.clone()));
+            ObjectRpcResponse::encode_body(request.route.clone(), &())
+        }
+
+        fn relay_rpc_to_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            target_node_id: &NodeId,
+            peer: &ClusterEndpointRecord,
+            request: &ObjectRpcRequest,
+            timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.relayed.push((
+                target_node_id.clone(),
+                peer.node_id.clone(),
+                timeout,
+                request.route.clone(),
+            ));
+            ObjectRpcResponse::encode_body(request.route.clone(), &())
+        }
+
+        fn record_endpoint_command_connectivity(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            endpoint: &ClusterEndpointRecord,
+            connectivity_state: ClusterConnectivityState,
+            latency_ms: Option<u64>,
+        ) {
+            self.connectivity
+                .push((endpoint.node_id.clone(), connectivity_state, latency_ms));
+        }
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_membership_driver_forwarding").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_membership_driver_forwarding_local").expect("local");
+    let voter =
+        NodeId::from_legacy_named("node_membership_driver_forwarding_voter").expect("voter");
+    let peer = NodeId::from_legacy_named("node_membership_driver_forwarding_peer").expect("peer");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "membership driver",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-membership-driver-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let voter_endpoint = daemon_lan_endpoint(&voter, "10.81.0.2:21353".to_string(), 10);
+    let peer_endpoint = daemon_lan_endpoint(&peer, "10.81.0.3:21353".to_string(), 20);
+    let request = ObjectRpcRequest::encode_body(
+        CLUSTER_JOIN_REGISTER_ROUTE,
+        CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        &(),
+    )
+    .expect("join register request");
+    let membership_timeout = Duration::from_secs(17);
+    let mut timeouts = ClusterControlPlaneTimeouts::default_daemon_transport();
+    timeouts.membership_rpc_timeout = membership_timeout;
+    let mut driver =
+        ClusterControlPlaneDriver::with_timeouts(RecordingMembershipTransport::default(), timeouts);
+
+    ClusterMembershipRpcForwardHost::send_membership_rpc(&mut driver, &voter_endpoint, &request)
+        .expect("send membership rpc");
+    ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
+        &mut driver,
+        &state,
+        &voter_endpoint,
+        &peer_endpoint,
+        &request,
+    )
+    .expect("relay membership rpc");
+    ClusterJoinRegistrationHost::remember_successful_join_endpoint(
+        &mut driver,
+        &paths,
+        &state,
+        &peer_endpoint,
+    )
+    .expect("remember endpoint");
+
+    let transport = driver.into_transport();
+    assert_eq!(
+        transport.sent,
+        vec![(
+            voter.clone(),
+            membership_timeout,
+            CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
+        )]
+    );
+    assert_eq!(
+        transport.relayed,
+        vec![(
+            voter,
+            peer.clone(),
+            membership_timeout,
+            CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
+        )]
+    );
+    assert_eq!(
+        transport.connectivity,
+        vec![(peer, ClusterConnectivityState::Healthy, None)]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_join_registration_driver_uses_local_membership_observer() {
+    struct UnusedControlPlaneTransport;
+
+    impl ClusterControlPlaneTransport for UnusedControlPlaneTransport {
+        fn send_raft_append(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+            panic!("local observation should not send raft append")
+        }
+
+        fn send_raft_vote(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            panic!("local observation should not send raft vote")
+        }
+
+        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+            panic!("local observation should not probe voters")
+        }
+
+        fn send_cluster_kv_txn(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _txn: &KvTxn,
+            _timeout: Duration,
+        ) -> Result<KvTxnResponse, NetworkError> {
+            panic!("local observation should not send kv txn")
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> Result<KvSnapshot, NetworkError> {
+            panic!("local observation should not fetch kv snapshots")
+        }
+
+        fn send_cluster_kv_watch_events(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterKvWatchEventsRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+            panic!("local observation should not send watch events")
+        }
+
+        fn send_cluster_member_publish(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterMemberPublishRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+            panic!("local observation should not publish members")
+        }
+
+        fn send_cluster_membership_rpc(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("local observation should not send membership rpc")
+        }
+
+        fn relay_rpc_to_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _peer: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("local observation should not relay membership rpc")
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticObserver {
+        calls: usize,
+        observation: ClusterLocalDaemonMembershipObservation,
+    }
+
+    impl ClusterLocalDaemonMembershipObserver for StaticObserver {
+        fn local_daemon_membership_observation(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
+            self.calls += 1;
+            Ok(Some(self.observation.clone()))
+        }
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_join_driver_observer").expect("cluster");
+    let local = NodeId::from_legacy_named("node_join_driver_observer_local").expect("local");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "join driver observer",
+        local,
+        "local",
+        "pk-main",
+        now,
+    );
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-join-driver-observer-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let observation = ClusterLocalDaemonMembershipObservation {
+        main_endpoints: Vec::new(),
+        shadow_endpoints: Vec::new(),
+        main_public_key: "pk-main-observed".to_string(),
+        shadow_public_key: "pk-shadow-observed".to_string(),
+        timestamp: now,
+    };
+    let mut driver = ClusterJoinRegistrationDriver::with_transport(
+        UnusedControlPlaneTransport,
+        StaticObserver {
+            calls: 0,
+            observation: observation.clone(),
+        },
+    );
+
+    let observed = ClusterJoinRegistrationHost::local_daemon_membership_observation(
+        &mut driver,
+        &paths,
+        &state,
+    )
+    .expect("local observation");
+
+    assert_eq!(observed, Some(observation));
+    assert_eq!(driver.observer_mut().calls, 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer() {
+    struct UnusedControlPlaneTransport;
+
+    impl ClusterControlPlaneTransport for UnusedControlPlaneTransport {
+        fn send_raft_append(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+            panic!("membership preparation should not send raft append")
+        }
+
+        fn send_raft_vote(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            panic!("membership preparation should not send raft vote")
+        }
+
+        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+            panic!("membership preparation should not probe voters")
+        }
+
+        fn send_cluster_kv_txn(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _txn: &KvTxn,
+            _timeout: Duration,
+        ) -> Result<KvTxnResponse, NetworkError> {
+            panic!("membership preparation should not send kv txn")
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> Result<KvSnapshot, NetworkError> {
+            panic!("membership preparation should not fetch kv snapshots")
+        }
+
+        fn send_cluster_kv_watch_events(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterKvWatchEventsRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+            panic!("membership preparation should not send watch events")
+        }
+
+        fn send_cluster_member_publish(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterMemberPublishRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+            panic!("membership preparation should not publish members")
+        }
+
+        fn send_cluster_membership_rpc(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("membership preparation should not send membership rpc")
+        }
+
+        fn relay_rpc_to_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _peer: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("membership preparation should not relay membership rpc")
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticObserver {
+        calls: usize,
+        observation: ClusterLocalDaemonMembershipObservation,
+    }
+
+    impl ClusterLocalDaemonMembershipObserver for StaticObserver {
+        fn local_daemon_membership_observation(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
+            self.calls += 1;
+            Ok(Some(self.observation.clone()))
+        }
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_mutation_driver_observer").expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_member_mutation_driver_observer_local").expect("local");
+    let shadow = sinomo_node::shadow_daemon_node_id(&local);
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "member mutation driver observer",
+        local.clone(),
+        "local",
+        "old-main-public-key",
+        now,
+    );
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-member-mutation-driver-observer-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let main_endpoint = daemon_lan_endpoint(&local, "192.0.2.30:21353".to_string(), 0);
+    let shadow_endpoint = ClusterEndpointRecord {
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_member_mutation_shadow")
+            .expect("shadow endpoint"),
+        node_id: shadow.clone(),
+        transport: ClusterTransportKind::Loopback,
+        address: "127.0.0.1:21354".to_string(),
+        source: ClusterEndpointSource::Observed,
+        privacy: ClusterEndpointPrivacy::LocalOnly,
+        priority: 10,
+        last_observed_latency_ms: None,
+    };
+    let mut driver = ClusterMemberMutationDriver::with_transport(
+        UnusedControlPlaneTransport,
+        StaticObserver {
+            calls: 0,
+            observation: ClusterLocalDaemonMembershipObservation {
+                main_endpoints: vec![main_endpoint.clone()],
+                shadow_endpoints: vec![shadow_endpoint.clone()],
+                main_public_key: "new-main-public-key".to_string(),
+                shadow_public_key: "new-shadow-public-key".to_string(),
+                timestamp: now,
+            },
+        },
+    );
+
+    ClusterMemberMutationHost::prepare_cluster_state_for_kv_sync(&mut driver, &paths, &mut state)
+        .expect("prepare cluster state");
+
+    assert_eq!(driver.observer_mut().calls, 1);
+    let main = state
+        .members
+        .iter()
+        .find(|member| member.node_id == local)
+        .expect("main member");
+    assert_eq!(main.node_public_key, "new-main-public-key");
+    assert!(main.endpoints.contains(&main_endpoint));
+    let shadow_member = state
+        .members
+        .iter()
+        .find(|member| member.node_id == shadow)
+        .expect("shadow member");
+    assert_eq!(shadow_member.node_public_key, "new-shadow-public-key");
+    assert!(shadow_member.endpoints.contains(&shadow_endpoint));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
+    #[derive(Default)]
+    struct RecordingPublishCacheTransport {
+        network_match: bool,
+        network_checks: usize,
+        network_remembers: usize,
+        node_match: bool,
+        node_checks: usize,
+        node_remembers: usize,
+        connectivity_match: bool,
+        connectivity_checks: usize,
+        connectivity_remembers: usize,
+    }
+
+    impl ClusterControlPlaneTransport for RecordingPublishCacheTransport {
+        fn send_raft_append(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+            panic!("cache hook test should not send raft append")
+        }
+
+        fn send_raft_vote(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            panic!("cache hook test should not send raft vote")
+        }
+
+        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+            panic!("cache hook test should not probe voters")
+        }
+
+        fn send_cluster_kv_txn(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _txn: &KvTxn,
+            _timeout: Duration,
+        ) -> Result<KvTxnResponse, NetworkError> {
+            panic!("cache hook test should not send kv txn")
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> Result<KvSnapshot, NetworkError> {
+            panic!("cache hook test should not fetch kv snapshots")
+        }
+
+        fn send_cluster_kv_watch_events(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterKvWatchEventsRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+            panic!("cache hook test should not send watch events")
+        }
+
+        fn send_cluster_member_publish(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterMemberPublishRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+            panic!("cache hook test should not publish members")
+        }
+
+        fn send_cluster_membership_rpc(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("cache hook test should not send membership rpc")
+        }
+
+        fn relay_rpc_to_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _peer: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("cache hook test should not relay rpc")
+        }
+
+        fn published_network_info_matches(
+            &mut self,
+            _paths: &ClusterPaths,
+            _info: &ClusterNetworkInfoRecord,
+        ) -> bool {
+            self.network_checks += 1;
+            self.network_match
+        }
+
+        fn remember_published_network_info(
+            &mut self,
+            _paths: &ClusterPaths,
+            _info: &ClusterNetworkInfoRecord,
+        ) {
+            self.network_remembers += 1;
+        }
+
+        fn published_node_status_matches(
+            &mut self,
+            _paths: &ClusterPaths,
+            _status: &ClusterNodeStatusRecord,
+        ) -> bool {
+            self.node_checks += 1;
+            self.node_match
+        }
+
+        fn remember_published_node_status(
+            &mut self,
+            _paths: &ClusterPaths,
+            _status: &ClusterNodeStatusRecord,
+        ) {
+            self.node_remembers += 1;
+        }
+
+        fn published_connectivity_record_set_matches(
+            &mut self,
+            _paths: &ClusterPaths,
+            _source_node_id: &NodeId,
+            _records: &[ClusterConnectivityRecord],
+        ) -> bool {
+            self.connectivity_checks += 1;
+            self.connectivity_match
+        }
+
+        fn remember_published_connectivity_record_set(
+            &mut self,
+            _paths: &ClusterPaths,
+            _source_node_id: &NodeId,
+            _records: &[ClusterConnectivityRecord],
+        ) {
+            self.connectivity_remembers += 1;
+        }
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_driver_publish_cache_hooks").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_driver_publish_cache_hooks").expect("node");
+    let target_node =
+        NodeId::from_legacy_named("node_driver_publish_cache_hooks_target").expect("target");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-driver-publish-cache-hooks-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let info = ClusterNetworkInfoRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        environment_id: "env_driver_publish_cache_hooks".to_string(),
+        observed_addresses: vec!["192.0.2.44".to_string()],
+        endpoints: Vec::new(),
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(600),
+    };
+    let status = ClusterNodeStatusRecord {
+        cluster_id: cluster_id.clone(),
+        node_id: node_id.clone(),
+        process: "daemon-main".to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: None,
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-06-08T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    let connectivity = vec![ClusterConnectivityRecord {
+        cluster_id,
+        source_node_id: node_id.clone(),
+        target_node_id: target_node,
+        endpoint_id: ClusterEndpointId::from_legacy_named("endpoint_driver_publish_cache_hooks")
+            .expect("endpoint"),
+        transport: ClusterTransportKind::LanTcp,
+        address: "192.0.2.45:21353".to_string(),
+        state: ClusterConnectivityState::Healthy,
+        latency_ms: Some(7),
+        consecutive_failures: 0,
+        last_success_at: Some("ok".to_string()),
+        last_failure_at: None,
+        observed_at: now,
+        expires_at: now + time::Duration::seconds(600),
+    }];
+    let mut driver = ClusterControlPlaneDriver::new(RecordingPublishCacheTransport {
+        network_match: true,
+        node_match: true,
+        connectivity_match: true,
+        ..Default::default()
+    });
+
+    assert!(
+        ClusterNetworkInfoPublishHost::published_network_info_matches(&mut driver, &paths, &info)
+    );
+    ClusterNetworkInfoPublishHost::remember_published_network_info(&mut driver, &paths, &info);
+    assert!(ClusterNodeStatusPublishHost::published_node_status_matches(
+        &mut driver,
+        &paths,
+        &status
+    ));
+    ClusterNodeStatusPublishHost::remember_published_node_status(&mut driver, &paths, &status);
+    assert!(
+        ClusterConnectivityPublishHost::published_connectivity_record_set_matches(
+            &mut driver,
+            &paths,
+            &node_id,
+            &connectivity
+        )
+    );
+    ClusterConnectivityPublishHost::remember_published_connectivity_record_set(
+        &mut driver,
+        &paths,
+        &node_id,
+        &connectivity,
+    );
+
+    let transport = driver.into_transport();
+    assert_eq!(transport.network_checks, 1);
+    assert_eq!(transport.network_remembers, 1);
+    assert_eq!(transport.node_checks, 1);
+    assert_eq!(transport.node_remembers, 1);
+    assert_eq!(transport.connectivity_checks, 1);
+    assert_eq!(transport.connectivity_remembers, 1);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -7377,6 +8148,72 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
             .expect("materialized imported snapshot")
             .revision,
         leader_snapshot.revision
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-kv-refresh-local-driver-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let (mut state, _local_node_id, first_peer_id) = cluster_raft_handler_test_state(
+        "cluster_kv_snapshot_refresh_local_driver",
+        "node_kv_refresh_local_driver_local",
+        "node_kv_refresh_local_driver_peer",
+    );
+    state
+        .members
+        .iter_mut()
+        .find(|member| member.node_id == first_peer_id)
+        .expect("first peer")
+        .endpoints
+        .push(daemon_lan_endpoint(
+            &first_peer_id,
+            "10.0.0.92:21353".to_string(),
+            20,
+        ));
+    write_cluster_state(&paths, &state).expect("write state");
+    let local_snapshot =
+        sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("seed local snapshot");
+    let mut remote_store = InProcessKvStore::restore(local_snapshot);
+    remote_store
+        .put("/refresh/local-driver", b"local-driver".to_vec(), None)
+        .expect("remote snapshot put");
+    let remote_snapshot = remote_store.snapshot();
+    let mut fetches = Vec::new();
+
+    let refreshed = refresh_current_cluster_kv_store_with_local_storage_and_transport(
+        &paths,
+        &state,
+        kv_snapshot_refresh_test_options(),
+        |endpoint, timeout| {
+            fetches.push((endpoint.node_id.clone(), timeout));
+            Ok(remote_snapshot.clone())
+        },
+    )
+    .expect("refresh snapshot through local driver");
+
+    assert_eq!(
+        fetches.first().map(|(node_id, _)| node_id),
+        Some(&first_peer_id)
+    );
+    assert!(
+        refreshed.get("/refresh/local-driver").is_some(),
+        "the local driver should return the newest fetched snapshot"
+    );
+    assert_eq!(
+        read_cluster_kv_snapshot(&paths)
+            .expect("materialized imported snapshot")
+            .revision,
+        remote_snapshot.revision
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -9759,6 +10596,244 @@ fn cluster_join_reconciliation_driver_merges_acceptance_through_host() {
         pending.members.iter().any(|member| {
             member.node_id == joined && member.state == ClusterMemberState::Learner
         })
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
+    #[derive(Clone)]
+    struct RecordingJoinReconciliationTransport {
+        paths: ClusterPaths,
+        identity: sinomo_node::NodeIdentity,
+        accepted_state: ClusterBootstrapState,
+        sent_routes: Vec<String>,
+        connectivity: Vec<ClusterEndpointRecord>,
+        snapshot_fetches: usize,
+    }
+
+    impl ClusterControlPlaneTransport for RecordingJoinReconciliationTransport {
+        fn send_raft_append(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+            panic!("join reconciliation should not send raft append")
+        }
+
+        fn send_raft_vote(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterRaftVoteRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+            panic!("join reconciliation should not send raft vote")
+        }
+
+        fn probe_voter(&mut self, _endpoint: &ClusterEndpointRecord, _timeout: Duration) -> bool {
+            panic!("join reconciliation should not probe voters")
+        }
+
+        fn send_cluster_kv_txn(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _txn: &KvTxn,
+            _timeout: Duration,
+        ) -> Result<KvTxnResponse, NetworkError> {
+            panic!("join reconciliation should not send kv txn")
+        }
+
+        fn fetch_cluster_kv_snapshot(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _timeout: Duration,
+        ) -> Result<KvSnapshot, NetworkError> {
+            self.snapshot_fetches += 1;
+            Err(NetworkError::Io {
+                operation: "test snapshot fetch".to_string(),
+                detail: "accepted response should not need snapshot fallback".to_string(),
+            })
+        }
+
+        fn send_cluster_kv_watch_events(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterKvWatchEventsRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+            panic!("join reconciliation should not send watch events")
+        }
+
+        fn send_cluster_member_publish(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            _request: &ClusterMemberPublishRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+            panic!("join reconciliation should not publish members")
+        }
+
+        fn send_cluster_membership_rpc(
+            &mut self,
+            _endpoint: &ClusterEndpointRecord,
+            request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            self.sent_routes.push(request.route.clone());
+            match request.route.as_str() {
+                CLUSTER_JOIN_CHALLENGE_ROUTE => {
+                    let challenge: ClusterInviteChallengeRequest = request.decode_body()?;
+                    let proof = create_cluster_invite_challenge_proof(
+                        &self.paths,
+                        &self.identity,
+                        &challenge,
+                        OffsetDateTime::now_utc(),
+                    )?;
+                    ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &proof)
+                }
+                CLUSTER_JOIN_REGISTER_ROUTE => {
+                    let registration: ClusterJoinRegistrationRequest = request.decode_body()?;
+                    ObjectRpcResponse::encode_body(
+                        CLUSTER_JOIN_REGISTER_ROUTE,
+                        &ClusterJoinRegistrationResponse {
+                            accepted: true,
+                            detail: format!("accepted {}", registration.invite.invite_id.as_str()),
+                            state: self.accepted_state.clone(),
+                            kv_snapshot: None,
+                        },
+                    )
+                }
+                route => Err(NetworkError::Io {
+                    operation: "test membership rpc".to_string(),
+                    detail: format!("unexpected route {route}"),
+                }),
+            }
+        }
+
+        fn relay_rpc_to_node(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _target_node_id: &NodeId,
+            _peer: &ClusterEndpointRecord,
+            _request: &ObjectRpcRequest,
+            _timeout: Duration,
+        ) -> Result<ObjectRpcResponse, NetworkError> {
+            panic!("join reconciliation should not relay rpc")
+        }
+
+        fn record_endpoint_command_connectivity(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            endpoint: &ClusterEndpointRecord,
+            connectivity_state: ClusterConnectivityState,
+            latency_ms: Option<u64>,
+        ) {
+            assert_eq!(connectivity_state, ClusterConnectivityState::Healthy);
+            assert_eq!(latency_ms, None);
+            self.connectivity.push(endpoint.clone());
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-driver-join-reconcile-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_driver_join_reconcile").expect("cluster");
+    let issuer = NodeId::from_legacy_named("node_driver_join_reconcile_issuer").expect("issuer");
+    let joined = NodeId::from_legacy_named("node_driver_join_reconcile_joined").expect("joined");
+    let issuer_identity =
+        sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
+    let endpoint = daemon_lan_endpoint(&issuer, "10.34.0.2:21353".to_string(), 0);
+    let issuer_state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "driver join reconcile",
+        issuer.clone(),
+        "issuer",
+        issuer_identity.public_key.clone(),
+        now,
+    );
+    write_cluster_state(&paths, &issuer_state).expect("write issuer state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &issuer_state).expect("sync state");
+
+    let mut invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_driver_join_reconcile")
+            .expect("invite"),
+        cluster_id: cluster_id.clone(),
+        cluster_name: Some("driver join reconcile".to_string()),
+        cluster_public_key: issuer_identity.public_key.clone(),
+        invitation_secret: "secret-driver-join-reconcile".to_string(),
+        communication_channels: vec![ClusterInvitationChannel {
+            endpoint: endpoint.clone(),
+            node_public_key: issuer_identity.public_key.clone(),
+        }],
+        introducers: Vec::new(),
+        token_id: "token-driver-join-reconcile".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: issuer.clone(),
+        issuer_public_key: issuer_identity.public_key.clone(),
+        signature: String::new(),
+    };
+    invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
+    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invite");
+
+    let mut pending = ClusterBootstrapState::pending_join(
+        cluster_id.clone(),
+        "driver join reconcile",
+        joined.clone(),
+        "joined",
+        "pk-joined",
+        now,
+    );
+    let mut accepted_state = issuer_state.clone();
+    let mut joined_member =
+        ClusterMemberRecord::local_voter(cluster_id, joined.clone(), "joined", "pk-joined", now);
+    apply_cluster_raft_role(&mut joined_member, ClusterMemberRole::Learner, now);
+    upsert_member_record(&mut accepted_state, joined_member);
+    let mut driver = ClusterControlPlaneDriver::new(RecordingJoinReconciliationTransport {
+        paths: paths.clone(),
+        identity: issuer_identity,
+        accepted_state,
+        sent_routes: Vec::new(),
+        connectivity: Vec::new(),
+        snapshot_fetches: 0,
+    });
+
+    let reconciliation = reconcile_cluster_join_with_introducers_with_host(
+        &mut pending,
+        &invite,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Some(&paths),
+        &mut driver,
+    )
+    .expect("reconcile join through driver");
+
+    let transport = driver.into_transport();
+    assert_eq!(
+        transport.sent_routes,
+        vec![
+            CLUSTER_JOIN_CHALLENGE_ROUTE.to_string(),
+            CLUSTER_JOIN_REGISTER_ROUTE.to_string(),
+        ]
+    );
+    assert_eq!(transport.snapshot_fetches, 0);
+    assert_eq!(transport.connectivity, vec![endpoint.clone()]);
+    assert_eq!(reconciliation.accepted_endpoint, Some(endpoint));
+    assert!(
+        !cluster_state_needs_join_registration(&pending),
+        "driver-owned reconciliation should merge accepted state"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -13371,6 +14446,28 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
     let merged_response_rows =
         decode_cluster_health_rpc_response(&merged_response).expect("merged response rows");
     assert_eq!(merged_response_rows.len(), merged_rows.len());
+    let current_state_response = handle_current_cluster_health_rpc_request(
+        &paths,
+        &probe,
+        cluster_health_rpc_request().expect("current-state health request"),
+        now,
+    )
+    .expect("current-state health response");
+    let current_state_response_rows = decode_cluster_health_rpc_response(&current_state_response)
+        .expect("current-state response rows");
+    assert_eq!(
+        current_state_response_rows.len(),
+        merged_response_rows.len(),
+        "current-state health helper should own reading cluster state before aggregation"
+    );
+    assert_eq!(
+        current_state_response_rows
+            .iter()
+            .find(|row| row.member.node_id == target_node)
+            .expect("current-state target row")
+            .availability,
+        ClusterNodeAvailability::Online
+    );
     assert_eq!(
         merged_response_rows
             .iter()

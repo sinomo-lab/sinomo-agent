@@ -19,25 +19,22 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use time::OffsetDateTime;
-
 use sinomo_config::{
     ConfigRegistry, ConfigRegistryBuilder, register_services as register_config_services,
 };
-use sinomo_dfs::{
-    DFS_PROTOCOL_FRAME_ROUTE, DFS_SMOKE_ROUTE, register_services as register_dfs_services,
-};
+use sinomo_dfs::register_services as register_dfs_services;
 use sinomo_kv::{
     CLUSTER_KV_RPC_ROUTES, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES,
     CLUSTER_KV_TXN_ROUTE, KvEntry, KvSnapshot, KvTxn, KvTxnResponse,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    CLUSTER_HEALTH_ROUTE, CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
-    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE,
-    CLUSTER_RELAY_ROUTE, ClusterPaths, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
-    DaemonControlStream, ObjectRpcRequest, ObjectRpcResponse, RelayEnvelope,
-    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+    CLUSTER_HEALTH_ROUTE, CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE,
+    CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+    CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE, CLUSTER_RELAY_ROUTE, ClusterPaths,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonControlRequest, DaemonControlStream,
+    ObjectRpcRequest, ObjectRpcResponse, RelayEnvelope, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
@@ -65,10 +62,10 @@ use sinomo_service::{
     ServiceFuture, ServiceRegistry, ServiceRegistryBuilder, ServiceSigner,
 };
 
-use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
+use crate::auth::{AuthenticatedDaemonCommand, DaemonSignerAuthority, daemon_rpc_command};
 use crate::cluster::{
-    DaemonClusterInvitePublishHost, DaemonClusterJoinRegistrationHost,
-    DaemonClusterMemberPublishHost, DaemonClusterStatusProbe, cluster_paths_from_daemon_paths,
+    DaemonClusterJoinRegistrationHost, DaemonClusterStatusProbe, cluster_paths_from_daemon_paths,
+    daemon_cluster_control_plane_driver, forward_cluster_invite_challenge_to_voter,
     handle_daemon_cluster_kv_snapshot, handle_daemon_cluster_kv_txn_request,
     handle_daemon_cluster_relay_request, handle_forwarded_daemon_cluster_kv_txn_request,
 };
@@ -86,7 +83,7 @@ use crate::control::{
     handle_daemon_sandbox_toolchain_import_package_from_path, handle_daemon_sandbox_update,
     handle_daemon_sandbox_write, write_daemon_rpc_response_frame,
 };
-use crate::dfs::{handle_daemon_dfs_protocol_frame, run_daemon_dfs_smoke};
+use crate::dfs::DaemonDfsDataPlaneHost;
 use crate::error::DaemonError;
 use crate::paths::DaemonPaths;
 use crate::rollout::{
@@ -294,14 +291,12 @@ impl Service for ClusterHealthService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
             let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
-            let state = sinomo_network::read_cluster_state(&cluster_paths)?;
             let probe = DaemonClusterStatusProbe::new(&cluster_paths);
-            let response = sinomo_network::handle_cluster_health_rpc_request(
+            let response = sinomo_network::handle_current_cluster_health_rpc_request(
                 &cluster_paths,
-                &state,
                 &probe,
                 request,
-                OffsetDateTime::now_utc(),
+                time::OffsetDateTime::now_utc(),
             )?;
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
@@ -398,6 +393,7 @@ impl Service for ClusterMembershipService {
 
     fn routes(&self) -> &'static [&'static str] {
         &[
+            CLUSTER_JOIN_CHALLENGE_ROUTE,
             CLUSTER_JOIN_REGISTER_ROUTE,
             CLUSTER_INVITE_PUBLISH_ROUTE,
             CLUSTER_MEMBER_PUBLISH_ROUTE,
@@ -408,18 +404,48 @@ impl Service for ClusterMembershipService {
         let paths = self.paths.clone();
         let authenticated = self.authenticated.clone();
         Box::pin(async move {
+            if request.route == CLUSTER_JOIN_CHALLENGE_ROUTE {
+                let challenge: sinomo_network::ClusterInviteChallengeRequest =
+                    request.decode_body()?;
+                let proof = match crate::auth::create_cluster_invite_challenge_proof(
+                    &paths, &challenge,
+                ) {
+                    Ok(proof) => proof,
+                    Err(local_error) => {
+                        // A bridge introducer may hold the invite but not be proof-capable.
+                        // Relay to a voter that can produce an issuer-signed proof.
+                        match forward_cluster_invite_challenge_to_voter(&paths, &challenge) {
+                            Ok(proof) => proof,
+                            Err(forward_error) => {
+                                eprintln!(
+                                    "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
+                                    challenge.invite_id
+                                );
+                                return Err(daemon_error(local_error));
+                            }
+                        }
+                    }
+                };
+                ctx.respond(ObjectRpcResponse::encode_body(
+                    CLUSTER_JOIN_CHALLENGE_ROUTE,
+                    &proof,
+                )?)?;
+                return Ok(ServiceDisposition::Continue);
+            }
             let cluster_paths = cluster_paths_from_daemon_paths(&paths).map_err(daemon_error)?;
+            let mut member_host = daemon_cluster_control_plane_driver();
+            let mut invite_host = daemon_cluster_control_plane_driver();
             let response = sinomo_network::handle_cluster_membership_rpc_request_with_hosts(
                 &cluster_paths,
                 request,
                 &authenticated.signer_node_id,
                 &authenticated.signer_public_key,
-                OffsetDateTime::now_utc(),
+                time::OffsetDateTime::now_utc(),
                 &mut DaemonClusterJoinRegistrationHost::new(&paths),
-                &mut DaemonClusterMemberPublishHost,
-                &mut DaemonClusterInvitePublishHost,
+                &mut member_host,
+                &mut invite_host,
             )
-            .map_err(daemon_error)?;
+            .map_err(ServiceError::from)?;
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
@@ -518,45 +544,6 @@ impl Service for RolloutBinaryService {
             };
             ctx.respond(response)?;
             Ok(disposition)
-        })
-    }
-}
-
-/// Daemon-foundational service: DFS data-plane routes that need daemon RPC transport.
-/// The DFS crate owns protocol-frame and smoke semantics; this service supplies
-/// daemon paths, authentication context, and response framing.
-struct DaemonDfsDataPlaneService {
-    paths: DaemonPaths,
-}
-
-impl Service for DaemonDfsDataPlaneService {
-    fn name(&self) -> &'static str {
-        "dfs-data-plane"
-    }
-
-    fn routes(&self) -> &'static [&'static str] {
-        &[DFS_SMOKE_ROUTE, DFS_PROTOCOL_FRAME_ROUTE]
-    }
-
-    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
-        let paths = self.paths.clone();
-        Box::pin(async move {
-            let response = match request.route.as_str() {
-                DFS_SMOKE_ROUTE => {
-                    let _: () = request.decode_body()?;
-                    let report = run_daemon_dfs_smoke(&paths).map_err(daemon_error)?;
-                    ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
-                }
-                DFS_PROTOCOL_FRAME_ROUTE => {
-                    let command = request.decode_body()?;
-                    let frame_response =
-                        handle_daemon_dfs_protocol_frame(&paths, command).map_err(daemon_error)?;
-                    ObjectRpcResponse::encode_body(DFS_PROTOCOL_FRAME_ROUTE, &frame_response)?
-                }
-                other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
-            ctx.respond(response)?;
-            Ok(ServiceDisposition::Continue)
         })
     }
 }
@@ -770,10 +757,11 @@ fn daemon_service_registry(
         })
         .register(RolloutBinaryService {
             paths: paths.clone(),
-        })
-        .register(DaemonDfsDataPlaneService {
-            paths: paths.clone(),
         });
+    let builder = sinomo_dfs::register_data_plane_services(
+        builder,
+        Arc::new(DaemonDfsDataPlaneHost::new(paths.clone())),
+    );
     sinomo_sandbox::register_services_with_factory(
         builder,
         Arc::new(DaemonSandboxBackendFactory {
@@ -845,6 +833,45 @@ fn try_dispatch_sandbox_stream(
         _ => return None,
     };
     Some(result.map(|()| false))
+}
+
+pub(crate) fn try_dispatch_pre_auth_via_registry(
+    request: &DaemonControlRequest,
+    stream: &mut DaemonControlStream,
+    paths: &DaemonPaths,
+) -> Result<bool, DaemonError> {
+    let Some(rpc_request) = request.rpc.as_ref() else {
+        return Ok(false);
+    };
+    if request.command.trim() != daemon_rpc_command(CLUSTER_JOIN_CHALLENGE_ROUTE)
+        || rpc_request.route != CLUSTER_JOIN_CHALLENGE_ROUTE
+        || rpc_request.category != CLUSTER_MEMBERSHIP_RPC_CATEGORY
+    {
+        return Ok(false);
+    }
+
+    let authenticated = AuthenticatedDaemonCommand {
+        command: request.command.trim().to_string(),
+        signer: DaemonSignerAuthority::JoinCandidate,
+        signer_node_id: String::new(),
+        signer_public_key: String::new(),
+    };
+    let registry = daemon_service_registry(paths, &authenticated);
+    if !registry.owns(CLUSTER_JOIN_CHALLENGE_ROUTE) {
+        return Ok(false);
+    }
+    let _stop = dispatch_via_registry(
+        &registry,
+        &authenticated,
+        rpc_request.clone(),
+        stream,
+        paths,
+    )?;
+    stream.flush().map_err(|source| DaemonError::Network {
+        address: "daemon client".to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(true)
 }
 
 /// If the request's route is owned by the service registry, serve it and return the
@@ -1020,6 +1047,7 @@ mod tests {
         for route in CLUSTER_KV_RPC_ROUTES.iter().copied().chain([
             CLUSTER_HEALTH_ROUTE,
             CLUSTER_RELAY_ROUTE,
+            CLUSTER_JOIN_CHALLENGE_ROUTE,
             CLUSTER_JOIN_REGISTER_ROUTE,
             CLUSTER_INVITE_PUBLISH_ROUTE,
             CLUSTER_MEMBER_PUBLISH_ROUTE,

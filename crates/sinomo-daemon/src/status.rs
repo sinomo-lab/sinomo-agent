@@ -166,7 +166,7 @@ pub fn daemon_advertised_endpoints_for_state(
     )
 }
 
-pub fn daemon_advertised_endpoints_from_ips(
+fn daemon_advertised_endpoints_from_ips(
     node_id: &NodeId,
     options: &DaemonRunOptions,
     priority: u16,
@@ -559,7 +559,7 @@ pub fn default_main_daemon_status(timeout: Duration) -> Result<Option<DaemonStat
     })
 }
 
-pub fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
+fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
     expected.pid == actual.pid
         && expected.data_dir == actual.data_dir
         && expected.lock_file == actual.lock_file

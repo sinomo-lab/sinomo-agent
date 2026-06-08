@@ -337,6 +337,42 @@ where
     Ok(())
 }
 
+pub async fn write_object_frame_async_with_idle_timeout<W, T>(
+    writer: &mut W,
+    value: &T,
+    idle_timeout: Duration,
+) -> Result<(), NetworkError>
+where
+    W: AsyncWrite + Unpin,
+    T: serde::Serialize + ?Sized,
+{
+    let bytes = SinomoObjectCodec::default().encode(value)?;
+    let len = u32::try_from(bytes.len()).map_err(|_| NetworkError::FrameTooLarge {
+        actual_bytes: bytes.len(),
+        max_bytes: u32::MAX as usize,
+    })?;
+    write_all_async_frame_with_idle_timeout(
+        writer,
+        &len.to_be_bytes(),
+        idle_timeout,
+        "write async object frame",
+        "length",
+    )
+    .await?;
+    write_all_async_frame_with_idle_timeout(
+        writer,
+        &bytes,
+        idle_timeout,
+        "write async object frame",
+        "body",
+    )
+    .await?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_sent(4 + bytes.len() as u64);
+    }
+    Ok(())
+}
+
 pub async fn read_object_frame_async<R, T>(
     reader: &mut R,
     max_bytes: usize,
@@ -366,6 +402,130 @@ where
         observer.on_net_recv(4 + bytes.len() as u64);
     }
     SinomoObjectCodec::default().decode(&bytes)
+}
+
+pub async fn read_object_frame_async_with_idle_timeout<R, T>(
+    reader: &mut R,
+    max_bytes: usize,
+    idle_timeout: Duration,
+) -> Result<T, NetworkError>
+where
+    R: AsyncRead + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    let mut len_bytes = [0_u8; 4];
+    read_exact_async_frame_with_idle_timeout(
+        reader,
+        &mut len_bytes,
+        idle_timeout,
+        "read async object frame length",
+        "length",
+    )
+    .await?;
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > max_bytes {
+        return Err(NetworkError::FrameTooLarge {
+            actual_bytes: len,
+            max_bytes,
+        });
+    }
+    let mut bytes = vec![0_u8; len];
+    read_exact_async_frame_with_idle_timeout(
+        reader,
+        &mut bytes,
+        idle_timeout,
+        "read async object frame body",
+        "body",
+    )
+    .await?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_recv(4 + bytes.len() as u64);
+    }
+    SinomoObjectCodec::default().decode(&bytes)
+}
+
+async fn write_all_async_frame_with_idle_timeout<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    buf: &[u8],
+    idle_timeout: Duration,
+    operation: &'static str,
+    part: &'static str,
+) -> Result<(), NetworkError> {
+    let expected = buf.len();
+    let mut written = 0_usize;
+    while written < expected {
+        match tokio::time::timeout(idle_timeout, writer.write(&buf[written..])).await {
+            Ok(Ok(0)) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: format!(
+                        "peer stopped accepting object frame {part}: wrote {written} of {expected} bytes"
+                    ),
+                });
+            }
+            Ok(Ok(n)) => written = written.saturating_add(n),
+            Ok(Err(source)) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(source)) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: source.to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: format!(
+                        "timed out after {}ms without {part} write progress",
+                        idle_timeout.as_millis()
+                    ),
+                });
+            }
+        }
+    }
+    writer.flush().await.map_err(|source| NetworkError::Io {
+        operation: operation.to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(())
+}
+
+async fn read_exact_async_frame_with_idle_timeout<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+    idle_timeout: Duration,
+    operation: &'static str,
+    part: &'static str,
+) -> Result<(), NetworkError> {
+    let expected = buf.len();
+    let mut read = 0_usize;
+    while read < expected {
+        match tokio::time::timeout(idle_timeout, reader.read(&mut buf[read..])).await {
+            Ok(Ok(0)) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: object_frame_eof_detail(part, read, expected),
+                });
+            }
+            Ok(Ok(n)) => read = read.saturating_add(n),
+            Ok(Err(source)) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(source)) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: source.to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(NetworkError::Io {
+                    operation: operation.to_string(),
+                    detail: format!(
+                        "timed out after {}ms without {part} read progress",
+                        idle_timeout.as_millis()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn read_exact_async_frame<R: AsyncRead + Unpin>(

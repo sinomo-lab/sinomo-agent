@@ -179,6 +179,150 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
     }
 }
 
+#[derive(Default)]
+struct RecordingPeerTransport {
+    calls: Mutex<Vec<String>>,
+}
+
+impl DfsPeerTransport for RecordingPeerTransport {
+    fn send_protocol_frame(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsProtocolFrameCommand,
+        _timeout: Duration,
+    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
+        self.calls.lock().expect("calls").push(format!(
+            "protocol:{}:{}",
+            endpoint.address, command.request_id
+        ));
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: Vec::new(),
+        })
+    }
+
+    fn send_metadata_journal_batch(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMetadataJournalBatchCommand,
+        _timeout: Duration,
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError> {
+        self.calls.lock().expect("calls").push(format!(
+            "journal:{}:{}",
+            endpoint.address, command.request_id
+        ));
+        Ok(DfsMetadataJournalBatchResponse {
+            request_id: command.request_id.clone(),
+            shard_id: command.batch.shard_id.clone(),
+            next_after_sequence: command.batch.next_after_sequence,
+            applied_entries: command.batch.entries.len(),
+            result: DfsMetadataJournalBatchResult::Applied,
+        })
+    }
+
+    fn send_metadata_snapshot_install(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMetadataSnapshotInstallCommand,
+        _timeout: Duration,
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError> {
+        self.calls.lock().expect("calls").push(format!(
+            "snapshot:{}:{}",
+            endpoint.address, command.request_id
+        ));
+        Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id.clone(),
+            shard_id: command.shard_id.clone(),
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Installed {
+                archived_existing: false,
+            },
+        })
+    }
+}
+
+#[test]
+fn dfs_peer_transport_adapters_delegate_all_routes() {
+    let peer = Arc::new(RecordingPeerTransport::default());
+    let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
+    let protocol_sender =
+        dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport));
+    let journal_sender =
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport));
+    let snapshot_sender = dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport);
+    let local = NodeId::from_legacy_named("node_dfs_peer_transport_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_peer_transport_remote").expect("remote");
+    let endpoint = test_endpoint(&remote, "10.95.0.2:21353");
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(42),
+        source_node_id: local.clone(),
+        target_node_id: remote.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(42),
+            origin_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            body: MeshMessageBody::Protocol(ProtocolMessage {
+                protocol: DFS_PROTOCOL.to_string(),
+                payload: Vec::new(),
+            }),
+        },
+    };
+
+    protocol_sender(
+        &endpoint,
+        &DfsProtocolFrameCommand {
+            request_id: "protocol-1".to_string(),
+            frame,
+        },
+        Duration::from_secs(1),
+    )
+    .expect("protocol send");
+
+    let shard_id = DfsMetadataShardId::new("root");
+    journal_sender(
+        &endpoint,
+        &DfsMetadataJournalBatchCommand {
+            request_id: "journal-1".to_string(),
+            source_node_id: Some(local.clone()),
+            batch: DfsMetadataJournalBatch {
+                shard_id: shard_id.clone(),
+                entries: Vec::new(),
+                next_after_sequence: 0,
+            },
+        },
+        Duration::from_secs(1),
+    )
+    .expect("journal send");
+
+    let snapshot_root = temp_root("dfs_peer_transport_snapshot");
+    let snapshot = LocalSobjMetadataBackend::new(shard_id.clone(), &snapshot_root)
+        .expect("metadata backend")
+        .export_table_snapshot();
+    snapshot_sender(
+        &endpoint,
+        &DfsMetadataSnapshotInstallCommand {
+            request_id: "snapshot-1".to_string(),
+            source_node_id: local,
+            shard_id,
+            next_after_sequence: 0,
+            snapshot,
+            reason: "test".to_string(),
+        },
+        Duration::from_secs(1),
+    )
+    .expect("snapshot send");
+
+    assert_eq!(
+        peer.calls.lock().expect("calls").as_slice(),
+        &[
+            "protocol:10.95.0.2:21353:protocol-1".to_string(),
+            "journal:10.95.0.2:21353:journal-1".to_string(),
+            "snapshot:10.95.0.2:21353:snapshot-1".to_string(),
+        ]
+    );
+    std::fs::remove_dir_all(snapshot_root).ok();
+}
+
 impl NetworkTransport for CountingEmptyTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
@@ -1065,6 +1209,72 @@ fn cluster_protocol_frame_command_processor_returns_none_without_cluster_state()
     .expect("cluster protocol frame command");
 
     assert!(result.is_none());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_protocol_frame_handler_returns_none_without_cluster_state() {
+    let root = temp_root("cluster_protocol_frame_handler_orphan");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let local =
+        NodeId::from_legacy_named("node_cluster_protocol_handler_orphan_local").expect("local");
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(1),
+        source_node_id: local.clone(),
+        target_node_id: local.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(1),
+            origin_node_id: local.clone(),
+            target_node_id: local.clone(),
+            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                node_id: local,
+                tick: 1,
+            }),
+        },
+    };
+    let command = DfsProtocolFrameCommand {
+        request_id: "dfs_protocol_frame_handler_orphan".to_string(),
+        frame,
+    };
+    let peer = Arc::new(RecordingPeerTransport::default());
+    let peer_transport: Arc<dyn DfsPeerTransport> = peer.clone();
+    let mut reports = Vec::new();
+    let mut errors = Vec::new();
+
+    let result = run_cluster_dfs_protocol_frame_command_with_metadata_publish(
+        &data_dir,
+        &cluster_paths,
+        command.clone(),
+        peer_transport,
+        None,
+        DfsMetadataJournalReplicationOptions::default(),
+        |report| reports.push(report),
+        |error| errors.push(error),
+    )
+    .expect("run handler");
+
+    assert!(result.is_none());
+    assert!(reports.is_empty());
+    assert!(errors.is_empty());
+    assert!(peer.calls.lock().expect("calls").is_empty());
+
+    let scheduled = schedule_cluster_dfs_protocol_frame_command_metadata_publish(
+        data_dir.clone(),
+        cluster_paths.clone(),
+        command,
+        peer.clone(),
+        None,
+        DfsMetadataPublishScheduleOptions::default(),
+        DfsMetadataJournalReplicationOptions::default(),
+        |_report| panic!("orphan protocol frame must not publish metadata"),
+        |_error| panic!("orphan protocol frame must not publish metadata"),
+    )
+    .expect("schedule handler");
+
+    assert!(scheduled.is_none());
+    assert!(peer.calls.lock().expect("calls").is_empty());
     std::fs::remove_dir_all(root).ok();
 }
 

@@ -322,14 +322,6 @@ pub trait ClusterSignedEndpointRpcHost {
         endpoint: &ClusterEndpointRecord,
     ) -> Result<bool, NetworkError>;
 
-    fn direct_endpoint_timeout(
-        &mut self,
-        _endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        remaining
-    }
-
     fn send_signed_endpoint_rpc(
         &mut self,
         endpoint: &ClusterEndpointRecord,
@@ -404,7 +396,7 @@ pub fn relay_request_for_signed_rpc(
 /// Wrap an already-built object RPC for relay to `target_node_id` through `peer`.
 ///
 /// Network owns the relay envelope and routing-error semantics; the caller supplies
-/// daemon-specific command strings, signing, timeout policy, and transport.
+/// daemon-specific command strings, signing, timeout budget, and transport.
 pub fn relay_rpc_to_node_via_peer_with_host(
     state: &ClusterBootstrapState,
     target_node_id: &NodeId,
@@ -468,13 +460,12 @@ pub fn send_signed_rpc_to_endpoint_with_host(
         let Some(remaining) = deadline.checked_remaining() else {
             return Err(deadline.timeout_error(endpoint));
         };
-        let direct_timeout = host.direct_endpoint_timeout(endpoint, remaining);
         match host.send_signed_endpoint_rpc(
             endpoint,
             request_command,
             request_auth,
             request,
-            direct_timeout,
+            remaining,
         ) {
             Ok(response) => return Ok(response),
             Err(direct_error) => {
@@ -1486,15 +1477,6 @@ mod tests {
             Ok(self.prefers_relay)
         }
 
-        fn direct_endpoint_timeout(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            remaining: Duration,
-        ) -> Duration {
-            self.calls.push("direct_timeout");
-            remaining.min(Duration::from_millis(50))
-        }
-
         fn send_signed_endpoint_rpc(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -1574,17 +1556,13 @@ mod tests {
         assert_eq!(response.decode_body::<String>().expect("body"), "relay-ok");
         assert_eq!(
             host.calls,
-            vec![
-                "gateway",
-                "prefer_relay",
-                "direct_timeout",
-                "direct",
-                "relay"
-            ]
+            vec!["gateway", "prefer_relay", "direct", "relay"]
         );
         assert_eq!(host.direct_auth, vec![b"inner-auth".to_vec()]);
         assert_eq!(host.relay_auth, vec![b"inner-auth".to_vec()]);
-        assert_eq!(host.direct_timeouts, vec![Duration::from_millis(50)]);
+        assert_eq!(host.direct_timeouts.len(), 1);
+        assert!(host.direct_timeouts[0] <= Duration::from_secs(5));
+        assert!(host.direct_timeouts[0] > Duration::from_secs(4));
         assert_eq!(host.relay_timeouts.len(), 1);
         assert!(host.relay_timeouts[0] <= Duration::from_secs(5));
     }

@@ -93,7 +93,10 @@ pub type DfsObjectId = sinomo_core::Id;
 pub type DfsVersion = sinomo_core::Id;
 
 use serde::{Deserialize, Serialize};
-pub use service::{DfsService, register_services};
+pub use service::{
+    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneService, DfsService,
+    register_data_plane_services, register_services,
+};
 use sinomo_core::{
     CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterMemberRecord, ClusterMemberRole, ClusterTransportKind, Confidence, DfsObjectPolicy,
@@ -793,6 +796,21 @@ pub fn publish_cluster_dfs_metadata_journal(
         shards,
         &mut host,
         &mut transport,
+        options,
+    )
+}
+
+pub fn publish_cluster_dfs_metadata_journal_with_peer_transport(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
+    publish_cluster_dfs_metadata_journal(
+        data_dir,
+        cluster_paths,
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
         options,
     )
 }
@@ -1950,6 +1968,24 @@ pub fn run_cluster_dfs_maintenance_tick(
     .map(Some)
 }
 
+pub fn run_cluster_dfs_maintenance_tick_with_peer_transport(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsMaintenanceTickOptions,
+) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
+    run_cluster_dfs_maintenance_tick(
+        data_dir,
+        cluster_paths,
+        dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        control_plane,
+        options,
+    )
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsSmokeReport {
     pub path: String,
@@ -2595,6 +2631,26 @@ pub fn run_default_cluster_dfs_smoke(
         snapshot_sender,
         smoke_control_plane,
         options.smoke,
+    )
+}
+
+pub fn run_default_cluster_dfs_smoke_with_peer_transport(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    bootstrap_control_plane: Box<dyn DfsControlPlaneKvClient>,
+    smoke_control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    options: DfsDefaultClusterSmokeOptions,
+) -> Result<Option<DfsSmokeReport>, DfsError> {
+    run_default_cluster_dfs_smoke(
+        data_dir,
+        cluster_paths,
+        dfs_protocol_frame_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        bootstrap_control_plane,
+        smoke_control_plane,
+        options,
     )
 }
 
@@ -3942,6 +3998,31 @@ where
     )
 }
 
+pub fn run_cluster_dfs_metadata_publish_after_events_with_peer_transport<R, E>(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    events: &[NetworkedDfsServiceEvent],
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> bool
+where
+    R: FnMut(DfsMetadataJournalReplicationReport),
+    E: FnMut(String),
+{
+    run_cluster_dfs_metadata_publish_after_events(
+        data_dir,
+        cluster_paths,
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        events,
+        replication_options,
+        on_report,
+        on_error,
+    )
+}
+
 pub fn schedule_cluster_dfs_metadata_publish_after_events<R, E>(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
@@ -3970,6 +4051,33 @@ where
             )
             .map_err(|error| error.to_string())
         },
+        on_report,
+        on_error,
+    )
+}
+
+pub fn schedule_cluster_dfs_metadata_publish_after_events_with_peer_transport<R, E>(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    events: &[NetworkedDfsServiceEvent],
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Result<Option<DfsMetadataPublishScheduleStart>, std::io::Error>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    schedule_cluster_dfs_metadata_publish_after_events(
+        data_dir,
+        cluster_paths,
+        dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
+        dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
+        events,
+        schedule_options,
+        replication_options,
         on_report,
         on_error,
     )
@@ -5012,6 +5120,53 @@ pub type DfsProtocolFrameSender = Arc<
         + Sync,
 >;
 
+pub trait DfsPeerTransport: Send + Sync {
+    fn send_protocol_frame(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsProtocolFrameCommand,
+        timeout: Duration,
+    ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError>;
+
+    fn send_metadata_journal_batch(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMetadataJournalBatchCommand,
+        timeout: Duration,
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>;
+
+    fn send_metadata_snapshot_install(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+        command: &DfsMetadataSnapshotInstallCommand,
+        timeout: Duration,
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>;
+}
+
+pub fn dfs_protocol_frame_sender_from_peer_transport(
+    peer_transport: Arc<dyn DfsPeerTransport>,
+) -> DfsProtocolFrameSender {
+    Arc::new(move |endpoint, command, timeout| {
+        peer_transport.send_protocol_frame(endpoint, command, timeout)
+    })
+}
+
+pub fn dfs_metadata_journal_batch_sender_from_peer_transport(
+    peer_transport: Arc<dyn DfsPeerTransport>,
+) -> DfsMetadataJournalBatchSender {
+    Arc::new(move |endpoint, command, timeout| {
+        peer_transport.send_metadata_journal_batch(endpoint, command, timeout)
+    })
+}
+
+pub fn dfs_metadata_snapshot_install_sender_from_peer_transport(
+    peer_transport: Arc<dyn DfsPeerTransport>,
+) -> DfsMetadataSnapshotInstallSender {
+    Arc::new(move |endpoint, command, timeout| {
+        peer_transport.send_metadata_snapshot_install(endpoint, command, timeout)
+    })
+}
+
 #[derive(Clone)]
 pub struct DfsEndpointTransport {
     local_node_id: NodeId,
@@ -5263,6 +5418,13 @@ pub struct DfsProtocolFrameCommandProcessResult {
     pub events: Vec<NetworkedDfsServiceEvent>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DfsProtocolFrameCommandHandleResult {
+    pub response: DfsProtocolFrameResponse,
+    pub metadata_publish_requested: bool,
+    pub metadata_publish_schedule_error: Option<String>,
+}
+
 pub fn process_cluster_dfs_protocol_frame_command(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -5281,6 +5443,96 @@ pub fn process_cluster_dfs_protocol_frame_command(
             outbound_frames: result.outbound_frames,
         },
         events: result.events,
+    }))
+}
+
+pub fn run_cluster_dfs_protocol_frame_command_with_metadata_publish<R, E>(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    command: DfsProtocolFrameCommand,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Result<Option<DfsProtocolFrameCommandHandleResult>, DfsError>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport),
+    E: FnMut(String),
+{
+    let Some(result) = process_cluster_dfs_protocol_frame_command(
+        data_dir,
+        cluster_paths,
+        command,
+        control_plane,
+    )?
+    else {
+        return Ok(None);
+    };
+    let DfsProtocolFrameCommandProcessResult { response, events } = result;
+    let metadata_publish_requested =
+        run_cluster_dfs_metadata_publish_after_events_with_peer_transport(
+            data_dir,
+            cluster_paths,
+            peer_transport,
+            &events,
+            replication_options,
+            on_report,
+            on_error,
+        );
+    Ok(Some(DfsProtocolFrameCommandHandleResult {
+        response,
+        metadata_publish_requested,
+        metadata_publish_schedule_error: None,
+    }))
+}
+
+pub fn schedule_cluster_dfs_protocol_frame_command_metadata_publish<R, E>(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    command: DfsProtocolFrameCommand,
+    peer_transport: Arc<dyn DfsPeerTransport>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    schedule_options: DfsMetadataPublishScheduleOptions,
+    replication_options: DfsMetadataJournalReplicationOptions,
+    on_report: R,
+    on_error: E,
+) -> Result<Option<DfsProtocolFrameCommandHandleResult>, DfsError>
+where
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    let Some(result) = process_cluster_dfs_protocol_frame_command(
+        &data_dir,
+        &cluster_paths,
+        command,
+        control_plane,
+    )?
+    else {
+        return Ok(None);
+    };
+    let DfsProtocolFrameCommandProcessResult { response, events } = result;
+    let metadata_publish_requested = dfs_events_should_publish_metadata(&events);
+    let metadata_publish_schedule_error = if metadata_publish_requested {
+        schedule_cluster_dfs_metadata_publish_after_events_with_peer_transport(
+            data_dir,
+            cluster_paths,
+            peer_transport,
+            &events,
+            schedule_options,
+            replication_options,
+            on_report,
+            on_error,
+        )
+        .err()
+        .map(|source| source.to_string())
+    } else {
+        None
+    };
+    Ok(Some(DfsProtocolFrameCommandHandleResult {
+        response,
+        metadata_publish_requested,
+        metadata_publish_schedule_error,
     }))
 }
 

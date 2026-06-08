@@ -13,6 +13,7 @@
 //! here.
 
 mod error;
+mod health;
 mod invite;
 mod lan;
 mod object;
@@ -23,6 +24,7 @@ mod rpc;
 mod storage;
 
 pub use error::*;
+pub use health::*;
 pub use invite::*;
 pub use lan::*;
 pub use object::*;

@@ -549,6 +549,17 @@ fn authorize_cluster_join_rpc_signer(
     authorize_cluster_join_request_signer(paths, &request, public_key)
 }
 
+pub(crate) fn is_cluster_join_register_control_request(
+    request: &sinomo_network::DaemonControlRequest,
+) -> bool {
+    let Some(rpc) = request.rpc.as_ref() else {
+        return false;
+    };
+    request.command.trim() == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE)
+        && rpc.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE
+        && rpc.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
+}
+
 fn authorize_cluster_join_request_signer(
     paths: &DaemonPaths,
     request: &sinomo_network::ClusterJoinRegistrationRequest,

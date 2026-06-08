@@ -1,19 +1,20 @@
+use crate::cluster::{
+    ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
+    cluster_paths_from_daemon_paths, ensure_daemon_status_cluster,
+    handle_daemon_cluster_kv_snapshot, prune_local_cluster_raft_uncommitted_tail,
+    start_daemon_iroh_proxy_if_clustered,
+};
 use crate::dfs::{
     daemon_dfs_endpoint_transport, ensure_default_distributed_dfs, ensure_default_local_dfs_expose,
     run_daemon_dfs_maintenance_tick,
 };
 use crate::{
-    AuthenticatedDaemonCommand, ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL,
-    DAEMON_CLUSTER_TICK_INTERVAL, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
-    authenticate_daemon_control_request, cluster_paths_from_daemon_paths,
-    create_cluster_invite_challenge_proof, daemon_connect_address, daemon_paths_are_shadow,
-    daemon_rpc_command, ensure_daemon_status_cluster, forward_cluster_invite_challenge_to_voter,
-    handle_daemon_clear_rollout_status, handle_daemon_cluster_kv_snapshot,
-    handle_daemon_finalize_shadow_rollout, prune_local_cluster_raft_uncommitted_tail,
-    read_daemon_status, start_daemon_iroh_proxy_if_clustered,
+    AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
+    authenticate_daemon_control_request, daemon_connect_address, daemon_paths_are_shadow,
+    daemon_rpc_command, handle_daemon_clear_rollout_status, handle_daemon_finalize_shadow_rollout,
+    read_daemon_status,
 };
 use sinomo_events::EventStore;
-use sinomo_network::ClusterInviteChallengeRequest;
 use sinomo_node::NodeId;
 use sinomo_rollout::{
     AppliedRolloutTransition, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE,
@@ -150,64 +151,20 @@ where
             return Ok(false);
         }
     };
-    let command = request.command.trim().to_string();
-    if command == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE) {
-        let Some(rpc_request) = request.rpc.as_ref() else {
-            stream.shutdown_both();
-            return Ok(false);
-        };
-        if rpc_request.route != sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE
-            || rpc_request.category != sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
-        {
-            stream.shutdown_both();
-            return Ok(false);
-        }
-        let challenge: ClusterInviteChallengeRequest = match rpc_request.decode_body() {
-            Ok(challenge) => challenge,
-            Err(_) => {
-                stream.shutdown_both();
-                return Ok(false);
-            }
-        };
-        let proof = match create_cluster_invite_challenge_proof(paths, &challenge) {
-            Ok(proof) => proof,
-            Err(local_error) => {
-                // This node holds the invite but is not itself a proof-capable channel/issuer
-                // (e.g. a bridge introducer named in an invite minted before it joined). Relay
-                // the challenge to a reachable voter, which can produce an issuer-signed proof,
-                // and pass that back to the joiner. Only if that also fails do we close.
-                match forward_cluster_invite_challenge_to_voter(paths, &challenge) {
-                    Ok(proof) => proof,
-                    Err(forward_error) => {
-                        eprintln!(
-                            "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
-                            challenge.invite_id
-                        );
-                        stream.shutdown_both();
-                        return Ok(false);
-                    }
-                }
-            }
-        };
-        let response = sinomo_network::ObjectRpcResponse::encode_body(
-            sinomo_network::CLUSTER_JOIN_CHALLENGE_ROUTE,
-            &proof,
-        )
-        .map_err(DaemonError::from)?;
-        write_daemon_rpc_response_frame(stream, response)?;
-        stream.flush().map_err(|source| DaemonError::Network {
-            address: "daemon client".to_string(),
-            detail: source.to_string(),
-        })?;
+    let mut command = request.command.trim().to_string();
+    if crate::service_adapter::try_dispatch_pre_auth_via_registry(&request, stream, paths)
+        .map_err(E::from)?
+    {
         request = match read_daemon_control_frame(stream) {
             Ok(request) => request,
             Err(_) => return Ok(false),
         };
+        command = request.command.trim().to_string();
     }
     let authenticated = match authenticate_daemon_control_request(paths, &request) {
         Ok(authenticated) => authenticated,
         Err(error) => {
-            if is_cluster_join_register_request(&request) {
+            if crate::auth::is_cluster_join_register_control_request(&request) {
                 eprintln!("sinomo daemon client auth failed for {command}: {error}");
             }
             if let Some(rpc_request) = request.rpc.as_ref()
@@ -240,15 +197,6 @@ where
             Err(error)
         }
     }
-}
-
-fn is_cluster_join_register_request(request: &sinomo_network::DaemonControlRequest) -> bool {
-    let Some(rpc) = request.rpc.as_ref() else {
-        return false;
-    };
-    request.command.trim() == daemon_rpc_command(sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE)
-        && rpc.route == sinomo_network::CLUSTER_JOIN_REGISTER_ROUTE
-        && rpc.category == sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY
 }
 
 fn prepare_daemon_client_stream(

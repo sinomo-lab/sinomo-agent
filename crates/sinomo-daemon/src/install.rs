@@ -156,7 +156,7 @@ pub fn installed_daemon_paths(layout: &InstallLayout) -> InstalledDaemonPaths {
     }
 }
 
-pub fn installed_daemon_start_specs(
+fn installed_daemon_start_specs(
     layout: &InstallLayout,
     host: &str,
     main_port: u16,
@@ -236,7 +236,7 @@ pub fn prepare_installed_daemon_install_plan(
     })
 }
 
-pub fn installed_daemon_install_stop_reason(
+fn installed_daemon_install_stop_reason(
     updating_binary: bool,
     restarting_for_options: bool,
 ) -> Option<&'static str> {
@@ -249,7 +249,7 @@ pub fn installed_daemon_install_stop_reason(
     }
 }
 
-pub fn install_layout_exists(layout: &InstallLayout) -> bool {
+fn install_layout_exists(layout: &InstallLayout) -> bool {
     layout.binary.exists()
         || layout.shadow_binary.exists()
         || layout.main_boot_entry.exists()
@@ -356,7 +356,7 @@ pub fn ensure_local_bin_symlink(
 }
 
 #[cfg(not(windows))]
-pub fn local_bin_symlink_is_current(link: &Path, target: &Path) -> bool {
+fn local_bin_symlink_is_current(link: &Path, target: &Path) -> bool {
     let Ok(existing_target) = fs::read_link(link) else {
         return false;
     };
@@ -460,7 +460,7 @@ pub fn deactivate_boot_entries(layout: &InstallLayout) -> Vec<SystemctlUserOutco
 }
 
 #[cfg(not(windows))]
-pub fn systemctl_user_best_effort(args: &[&str]) -> SystemctlUserOutcome {
+fn systemctl_user_best_effort(args: &[&str]) -> SystemctlUserOutcome {
     let output = Command::new("systemctl").arg("--user").args(args).output();
     let args = args.iter().map(|arg| (*arg).to_string()).collect();
     match output {
@@ -476,7 +476,7 @@ pub fn systemctl_user_best_effort(args: &[&str]) -> SystemctlUserOutcome {
     }
 }
 
-pub fn installed_daemons_need_restart(
+fn installed_daemons_need_restart(
     host: &str,
     main_port: u16,
     shadow_port: u16,
@@ -842,7 +842,7 @@ pub fn default_boot_dir(data_dir: &SinomoDataDir) -> PathBuf {
     }
 }
 
-pub fn boot_entry_path(boot_dir: &Path, name: &str) -> PathBuf {
+fn boot_entry_path(boot_dir: &Path, name: &str) -> PathBuf {
     #[cfg(windows)]
     {
         boot_dir.join(format!("{name}.vbs"))
@@ -854,7 +854,7 @@ pub fn boot_entry_path(boot_dir: &Path, name: &str) -> PathBuf {
     }
 }
 
-pub fn write_boot_entry(
+fn write_boot_entry(
     path: &Path,
     data_dir: &Path,
     binary: &Path,
@@ -938,7 +938,7 @@ pub fn remove_boot_entry(path: &Path) -> Result<(), DaemonError> {
     }
 }
 
-pub fn boot_entry_content(
+fn boot_entry_content(
     data_dir: &Path,
     binary: &Path,
     command_prefix: &[&str],

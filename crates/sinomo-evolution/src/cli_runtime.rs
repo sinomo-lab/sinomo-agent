@@ -22,10 +22,7 @@ use sinomo_runtime::cli_registry::{
     CliCommandPolicy, CliParseError,
 };
 use sinomo_runtime::core::{EvaluationOutcome, EventEnvelope};
-use sinomo_runtime::daemon::{
-    default_main_daemon_status as daemon_default_main_daemon_status,
-    fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
-};
+use sinomo_runtime::daemon::default_main_daemon_status as daemon_default_main_daemon_status;
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, JsonlEventStore, ReplayDirection, ReplayQuery};
 #[cfg(not(test))]
@@ -866,6 +863,15 @@ fn resolve_requested_evolution_model(
 
 fn default_main_daemon_status() -> Result<Option<sinomo_runtime::daemon::DaemonStatus>, CliError> {
     daemon_default_main_daemon_status(DAEMON_PROBE_TIMEOUT).map_err(Into::into)
+}
+
+fn daemon_fetch_cluster_kv_snapshot(
+    address: &str,
+    timeout: Duration,
+) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
+    let request = network::cluster_kv_snapshot_rpc_request()?;
+    let response = sinomo_runtime::daemon::send_daemon_rpc(address, &request, timeout)?;
+    network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
 }
 
 fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {

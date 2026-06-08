@@ -190,36 +190,9 @@ pub fn send_daemon_rpc_to_endpoint(
     request: &ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    send_daemon_rpc_to_endpoint_with_timeout_policy(
-        endpoint,
-        request,
-        timeout,
-        DaemonEndpointRpcTimeoutPolicy::FairControlPlane,
-    )
-}
-
-fn send_daemon_large_rpc_to_endpoint(
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    timeout: Duration,
-) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    send_daemon_rpc_to_endpoint_with_timeout_policy(
-        endpoint,
-        request,
-        timeout,
-        DaemonEndpointRpcTimeoutPolicy::FullRequestBudget,
-    )
-}
-
-fn send_daemon_rpc_to_endpoint_with_timeout_policy(
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    timeout: Duration,
-    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
-) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let signed = sign_daemon_rpc_request_for_local_node(request)?;
     let command = daemon_rpc_command(&request.route);
-    let mut host = DaemonSignedEndpointRpcHost::new(timeout_policy);
+    let mut host = DaemonSignedEndpointRpcHost;
     sinomo_network::send_signed_rpc_to_endpoint_with_host(
         endpoint,
         request,
@@ -232,31 +205,7 @@ fn send_daemon_rpc_to_endpoint_with_timeout_policy(
     .map_err(DaemonError::from)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DaemonEndpointRpcTimeoutPolicy {
-    FairControlPlane,
-    FullRequestBudget,
-}
-
-struct DaemonSignedEndpointRpcHost {
-    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
-}
-
-impl DaemonSignedEndpointRpcHost {
-    fn new(timeout_policy: DaemonEndpointRpcTimeoutPolicy) -> Self {
-        Self { timeout_policy }
-    }
-
-    fn endpoint_timeout(&self, endpoint: &ClusterEndpointRecord, remaining: Duration) -> Duration {
-        match self.timeout_policy {
-            DaemonEndpointRpcTimeoutPolicy::FairControlPlane => {
-                crate::cluster::cluster_voter_reachability_options()
-                    .fair_command_timeout(endpoint, remaining)
-            }
-            DaemonEndpointRpcTimeoutPolicy::FullRequestBudget => remaining,
-        }
-    }
-}
+struct DaemonSignedEndpointRpcHost;
 
 fn send_daemon_rpc_body<Req, Resp>(
     address: &str,
@@ -286,57 +235,10 @@ where
     Req: serde::Serialize + ?Sized,
     Resp: serde::de::DeserializeOwned,
 {
-    send_daemon_rpc_body_to_endpoint_with_timeout_policy(
-        endpoint,
-        route,
-        category,
-        body,
-        timeout,
-        DaemonEndpointRpcTimeoutPolicy::FairControlPlane,
-    )
-}
-
-fn send_daemon_large_rpc_body_to_endpoint<Req, Resp>(
-    endpoint: &ClusterEndpointRecord,
-    route: &str,
-    category: &str,
-    body: &Req,
-    timeout: Duration,
-) -> Result<Resp, DaemonError>
-where
-    Req: serde::Serialize + ?Sized,
-    Resp: serde::de::DeserializeOwned,
-{
-    send_daemon_rpc_body_to_endpoint_with_timeout_policy(
-        endpoint,
-        route,
-        category,
-        body,
-        timeout,
-        DaemonEndpointRpcTimeoutPolicy::FullRequestBudget,
-    )
-}
-
-fn send_daemon_rpc_body_to_endpoint_with_timeout_policy<Req, Resp>(
-    endpoint: &ClusterEndpointRecord,
-    route: &str,
-    category: &str,
-    body: &Req,
-    timeout: Duration,
-    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
-) -> Result<Resp, DaemonError>
-where
-    Req: serde::Serialize + ?Sized,
-    Resp: serde::de::DeserializeOwned,
-{
     let request = ObjectRpcRequest::encode_body(route, category, body)?;
-    send_daemon_rpc_request_to_endpoint_with_decoder_with_timeout_policy(
-        endpoint,
-        &request,
-        timeout,
-        timeout_policy,
-        |response| response.decode_body(),
-    )
+    send_daemon_rpc_request_to_endpoint_with_decoder(endpoint, &request, timeout, |response| {
+        response.decode_body()
+    })
 }
 
 fn send_daemon_rpc_request_with_decoder<Resp, DecodeError>(
@@ -361,33 +263,7 @@ fn send_daemon_rpc_request_to_endpoint_with_decoder<Resp, DecodeError>(
 where
     DecodeError: Into<DaemonError>,
 {
-    send_daemon_rpc_request_to_endpoint_with_decoder_with_timeout_policy(
-        endpoint,
-        request,
-        timeout,
-        DaemonEndpointRpcTimeoutPolicy::FairControlPlane,
-        decode,
-    )
-}
-
-fn send_daemon_rpc_request_to_endpoint_with_decoder_with_timeout_policy<Resp, DecodeError>(
-    endpoint: &ClusterEndpointRecord,
-    request: &ObjectRpcRequest,
-    timeout: Duration,
-    timeout_policy: DaemonEndpointRpcTimeoutPolicy,
-    decode: impl FnOnce(&sinomo_network::ObjectRpcResponse) -> Result<Resp, DecodeError>,
-) -> Result<Resp, DaemonError>
-where
-    DecodeError: Into<DaemonError>,
-{
-    let response = match timeout_policy {
-        DaemonEndpointRpcTimeoutPolicy::FairControlPlane => {
-            send_daemon_rpc_to_endpoint(endpoint, request, timeout)?
-        }
-        DaemonEndpointRpcTimeoutPolicy::FullRequestBudget => {
-            send_daemon_large_rpc_to_endpoint(endpoint, request, timeout)?
-        }
-    };
+    let response = send_daemon_rpc_to_endpoint(endpoint, request, timeout)?;
     decode(&response).map_err(Into::into)
 }
 
@@ -424,14 +300,6 @@ impl sinomo_network::ClusterSignedEndpointRpcHost for DaemonSignedEndpointRpcHos
         Ok(cluster_paths_from_env()
             .as_ref()
             .is_some_and(|paths| sinomo_network::cluster_endpoint_prefers_relay(paths, endpoint)))
-    }
-
-    fn direct_endpoint_timeout(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        remaining: Duration,
-    ) -> Duration {
-        self.endpoint_timeout(endpoint, remaining)
     }
 
     fn send_signed_endpoint_rpc(
@@ -493,7 +361,6 @@ impl sinomo_network::ClusterSignedRelayRpcHost for DaemonSignedEndpointRpcHost {
         request: &sinomo_network::ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        let timeout = self.endpoint_timeout(endpoint, timeout);
         sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             endpoint,
             command,
@@ -687,17 +554,7 @@ pub fn send_daemon_shutdown_request(
     )
 }
 
-pub fn fetch_cluster_kv_snapshot(
-    address: &str,
-    timeout: Duration,
-) -> Result<KvSnapshot, DaemonError> {
-    let request = sinomo_network::cluster_kv_snapshot_rpc_request()?;
-    send_daemon_rpc_request_with_decoder(address, &request, timeout, |response| {
-        sinomo_network::decode_cluster_kv_snapshot_rpc_response(response)
-    })
-}
-
-pub fn fetch_cluster_kv_snapshot_from_endpoint(
+pub(crate) fn fetch_cluster_kv_snapshot_from_endpoint(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
 ) -> Result<KvSnapshot, DaemonError> {
@@ -904,7 +761,7 @@ pub fn send_daemon_rollout_binary_to_endpoint(
     request: &ClusterRolloutBinaryRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_large_rpc_body_to_endpoint(
+    send_daemon_rpc_body_to_endpoint(
         endpoint,
         ROLLOUT_BINARY_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -932,7 +789,7 @@ pub fn send_daemon_rollout_binary_upload_chunk_to_endpoint(
     request: &ClusterRolloutBinaryUploadChunkRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryUploadChunkResponse, DaemonError> {
-    send_daemon_large_rpc_body_to_endpoint(
+    send_daemon_rpc_body_to_endpoint(
         endpoint,
         ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -960,7 +817,7 @@ pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
     request: &ClusterRolloutBinaryUploadFinalizeRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_large_rpc_body_to_endpoint(
+    send_daemon_rpc_body_to_endpoint(
         endpoint,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -988,7 +845,7 @@ pub fn send_daemon_rollout_build_to_endpoint(
     request: &ClusterRolloutBuildRequest,
     timeout: Duration,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
-    send_daemon_large_rpc_body_to_endpoint(
+    send_daemon_rpc_body_to_endpoint(
         endpoint,
         ROLLOUT_BUILD_ROUTE,
         ROLLOUT_RPC_CATEGORY,
@@ -1026,8 +883,7 @@ pub fn send_daemon_rollout_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::{
-        DaemonEndpointRpcTimeoutPolicy, DaemonRpcAddressTransport, DaemonRpcAttemptDeadline,
-        DaemonSignedEndpointRpcHost, daemon_rpc_address_transport,
+        DaemonRpcAddressTransport, DaemonRpcAttemptDeadline, daemon_rpc_address_transport,
         local_daemon_can_gateway_endpoint,
     };
     use crate::DaemonClusterStatus;
@@ -1052,19 +908,6 @@ mod tests {
             address: "10.0.0.2:21353".to_string(),
             source: ClusterEndpointSource::KvMembership,
             privacy: ClusterEndpointPrivacy::Lan,
-            priority: 0,
-            last_observed_latency_ms: None,
-        }
-    }
-
-    fn iroh_endpoint(node_id: NodeId) -> ClusterEndpointRecord {
-        ClusterEndpointRecord {
-            endpoint_id: sinomo_core::Id::generate(),
-            node_id,
-            transport: ClusterTransportKind::Iroh,
-            address: "iroh://example?relay=https://relay.example./".to_string(),
-            source: ClusterEndpointSource::KvMembership,
-            privacy: ClusterEndpointPrivacy::Relayed,
             priority: 0,
             last_observed_latency_ms: None,
         }
@@ -1148,30 +991,6 @@ mod tests {
         assert!(!sinomo_network::relay_response_is_routing_error(
             &target_error
         ));
-    }
-
-    #[test]
-    fn daemon_endpoint_rpc_control_plane_policy_caps_iroh_attempts() {
-        let endpoint = iroh_endpoint(node_id("node_endpoint_timeout_control"));
-        let host =
-            DaemonSignedEndpointRpcHost::new(DaemonEndpointRpcTimeoutPolicy::FairControlPlane);
-
-        assert_eq!(
-            host.endpoint_timeout(&endpoint, Duration::from_secs(60)),
-            Duration::from_millis(1500)
-        );
-    }
-
-    #[test]
-    fn daemon_endpoint_rpc_large_policy_uses_full_request_budget() {
-        let endpoint = iroh_endpoint(node_id("node_endpoint_timeout_rollout"));
-        let host =
-            DaemonSignedEndpointRpcHost::new(DaemonEndpointRpcTimeoutPolicy::FullRequestBudget);
-
-        assert_eq!(
-            host.endpoint_timeout(&endpoint, Duration::from_secs(60)),
-            Duration::from_secs(60)
-        );
     }
 
     #[test]

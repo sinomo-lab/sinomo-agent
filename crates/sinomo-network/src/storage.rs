@@ -3,7 +3,6 @@ use crate::lan::local_network_cache_key;
 use crate::object::SinomoObjectCodec;
 use crate::prelude::*;
 use crate::rpc::{
-    CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_SCOPE_LOCAL, CLUSTER_HEALTH_SCOPE_METADATA_KEY,
     CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
     CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY, CLUSTER_RAFT_APPEND_ROUTE,
     CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE, ObjectRpcRequest, ObjectRpcResponse,
@@ -19,7 +18,6 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use sinomo_kv::CLUSTER_KV_RPC_CATEGORY;
 pub use sinomo_kv::{
     CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
     CLUSTER_KV_SNAPSHOT_RPC_MAX_PAYLOAD_BYTES,
@@ -69,7 +67,6 @@ pub const DAEMON_MAIN_RUN_CAPABILITY: &str = "daemon.main.run";
 pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 pub const DAEMON_MAIN_CLUSTER_ROLE: &str = "daemon-main";
 pub const DAEMON_SHADOW_CLUSTER_ROLE: &str = "daemon-shadow";
-const CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS: usize = 8;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const FILE_CACHE_CAPACITY: usize = 4096;
 const MAX_LOCAL_CLUSTER_CONNECTIVITY_CACHE_ENTRIES: usize = 128;
@@ -2201,6 +2198,43 @@ pub fn handle_cluster_join_registration_request_with_host(
     Ok(prepared)
 }
 
+pub fn send_cluster_join_registration_over_membership_rpc<S>(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterJoinRegistrationRequest,
+    timeout: Duration,
+    mut send_rpc: S,
+) -> Result<ClusterJoinRegistrationResponse, NetworkError>
+where
+    S: FnMut(
+        &ClusterEndpointRecord,
+        &ObjectRpcRequest,
+        Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError>,
+{
+    let challenge = crate::invite::random_url_secret(32)?;
+    let challenge_request = crate::invite::ClusterInviteChallengeRequest {
+        protocol: crate::invite::CLUSTER_INVITE_CHALLENGE_PROTOCOL.to_string(),
+        invite_id: request.invite.invite_id.clone(),
+        challenge: challenge.clone(),
+    };
+    let challenge_rpc = ObjectRpcRequest::encode_body(
+        CLUSTER_JOIN_CHALLENGE_ROUTE,
+        CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        &challenge_request,
+    )?;
+    let proof_response = send_rpc(endpoint, &challenge_rpc, timeout)?;
+    let proof: crate::invite::ClusterInviteChallengeProof = proof_response.decode_body()?;
+    crate::invite::verify_cluster_invite_challenge_proof(&request.invite, &challenge, &proof)?;
+
+    let register_rpc = ObjectRpcRequest::encode_body(
+        CLUSTER_JOIN_REGISTER_ROUTE,
+        CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+        request,
+    )?;
+    let response = send_rpc(endpoint, &register_rpc, timeout)?;
+    response.decode_body()
+}
+
 pub fn record_forwarded_join_registration_acceptance_with_host(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -3559,6 +3593,40 @@ pub trait ClusterKvSnapshotRefreshHost {
     ) -> Result<bool, NetworkError>;
 }
 
+struct LocalClusterKvSnapshotRefreshHost<F> {
+    fetch_cluster_kv_snapshot: F,
+}
+
+impl<F> ClusterKvSnapshotRefreshHost for LocalClusterKvSnapshotRefreshHost<F>
+where
+    F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
+{
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, NetworkError> {
+        (self.fetch_cluster_kv_snapshot)(endpoint, timeout)
+    }
+
+    fn restore_cluster_raft_from_snapshot_if_newer(
+        &mut self,
+        paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, NetworkError> {
+        locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterKvTxnQuorumOptions {
     pub allow_forwarding: bool,
@@ -3570,6 +3638,7 @@ pub struct ClusterKvTxnQuorumOptions {
 
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS: usize = 32;
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT: Duration = Duration::from_millis(750);
+pub const DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEFAULT_CLUSTER_CONTROL_PLANE_TCP_FOREGROUND_ATTEMPT_TIMEOUT: Duration =
@@ -3585,6 +3654,7 @@ pub struct ClusterControlPlaneTimeouts {
     pub max_raft_append_attempts: usize,
     pub raft_append_timeout: Duration,
     pub rpc_timeout: Duration,
+    pub membership_rpc_timeout: Duration,
     pub tcp_command_timeout: Duration,
     pub iroh_command_timeout: Duration,
     pub tcp_foreground_attempt_timeout: Duration,
@@ -3598,6 +3668,7 @@ impl ClusterControlPlaneTimeouts {
             max_raft_append_attempts: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_MAX_ATTEMPTS,
             raft_append_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT,
             rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_RPC_TIMEOUT,
+            membership_rpc_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_MEMBERSHIP_RPC_TIMEOUT,
             tcp_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_TCP_COMMAND_TIMEOUT,
             iroh_command_timeout: DEFAULT_CLUSTER_CONTROL_PLANE_IROH_COMMAND_TIMEOUT,
             tcp_foreground_attempt_timeout:
@@ -3731,6 +3802,846 @@ pub trait ClusterKvTxnQuorumHost {
     ) -> Result<ClusterRaftQuorumCommitResult, NetworkError>;
 }
 
+pub trait ClusterControlPlaneTransport {
+    fn send_raft_append(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, NetworkError>;
+
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError>;
+
+    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool;
+
+    fn send_cluster_kv_txn(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        txn: &KvTxn,
+        timeout: Duration,
+    ) -> Result<KvTxnResponse, NetworkError>;
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, NetworkError>;
+
+    fn send_cluster_kv_watch_events(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> Result<ClusterKvWatchEventsResponse, NetworkError>;
+
+    fn send_cluster_member_publish(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterMemberPublishRequest,
+        timeout: Duration,
+    ) -> Result<ClusterMemberPublishResponse, NetworkError>;
+
+    fn send_cluster_membership_rpc(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError>;
+
+    fn relay_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError>;
+
+    fn record_endpoint_command_connectivity(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+        _endpoint: &ClusterEndpointRecord,
+        _connectivity_state: ClusterConnectivityState,
+        _latency_ms: Option<u64>,
+    ) {
+    }
+
+    fn published_network_info_matches(
+        &mut self,
+        _paths: &ClusterPaths,
+        _info: &ClusterNetworkInfoRecord,
+    ) -> bool {
+        false
+    }
+
+    fn remember_published_network_info(
+        &mut self,
+        _paths: &ClusterPaths,
+        _info: &ClusterNetworkInfoRecord,
+    ) {
+    }
+
+    fn published_node_status_matches(
+        &mut self,
+        _paths: &ClusterPaths,
+        _status: &ClusterNodeStatusRecord,
+    ) -> bool {
+        false
+    }
+
+    fn remember_published_node_status(
+        &mut self,
+        _paths: &ClusterPaths,
+        _status: &ClusterNodeStatusRecord,
+    ) {
+    }
+
+    fn published_connectivity_record_set_matches(
+        &mut self,
+        _paths: &ClusterPaths,
+        _source_node_id: &NodeId,
+        _records: &[ClusterConnectivityRecord],
+    ) -> bool {
+        false
+    }
+
+    fn remember_published_connectivity_record_set(
+        &mut self,
+        _paths: &ClusterPaths,
+        _source_node_id: &NodeId,
+        _records: &[ClusterConnectivityRecord],
+    ) {
+    }
+
+    fn fan_out_committed_cluster_raft_command(
+        &mut self,
+        _paths: ClusterPaths,
+        _state: ClusterBootstrapState,
+        _events: Vec<KvEvent>,
+        _targets: Vec<ClusterEndpointRecord>,
+    ) {
+    }
+
+    fn on_raft_append_sent(&mut self) {}
+}
+
+pub struct ClusterControlPlaneDriver<T> {
+    transport: T,
+    timeouts: ClusterControlPlaneTimeouts,
+}
+
+impl<T> ClusterControlPlaneDriver<T> {
+    pub fn new(transport: T) -> Self {
+        Self::with_timeouts(
+            transport,
+            ClusterControlPlaneTimeouts::default_daemon_transport(),
+        )
+    }
+
+    pub fn with_timeouts(transport: T, timeouts: ClusterControlPlaneTimeouts) -> Self {
+        Self {
+            transport,
+            timeouts,
+        }
+    }
+
+    pub fn transport_mut(&mut self) -> &mut T {
+        &mut self.transport
+    }
+
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+}
+
+struct DriverRaftAppendReplicationHost<'a, T> {
+    transport: &'a mut T,
+}
+
+impl<T> ClusterRaftAppendReplicationHost for DriverRaftAppendReplicationHost<'_, T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn last_local_raft_log_index(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<u64, NetworkError> {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        Ok(open_cluster_raft_kv_node(paths, &state.local_node_id)?.last_log_index())
+    }
+
+    fn build_raft_append_request(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, NetworkError> {
+        let _raft_guard = lock_cluster_raft_operation()?;
+        build_cluster_raft_append_request_from_next_index(paths, state, next_index)
+    }
+
+    fn send_raft_append(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+        self.transport.send_raft_append(endpoint, request, timeout)
+    }
+
+    fn on_raft_append_sent(&mut self) {
+        self.transport.on_raft_append_sent();
+    }
+}
+
+struct DriverRaftQuorumCommitHost<'a, T> {
+    storage: LocalClusterRaftCommandStorage<'a>,
+    driver: &'a mut ClusterControlPlaneDriver<T>,
+}
+
+impl<T> sinomo_kv::ClusterKvRaftCommandStorage for DriverRaftQuorumCommitHost<'_, T> {
+    type Error = NetworkError;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect(
+        &mut self,
+        command: KvCommand,
+    ) -> Result<sinomo_kv::ClusterKvRaftUncommittedAppend, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::append_cluster_raft_command_uncommitted_or_no_effect(
+            &mut self.storage,
+            command,
+        )
+    }
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+        &mut self,
+    ) -> Result<(), NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::discard_cluster_raft_uncommitted_tail_and_clear_leader(
+            &mut self.storage,
+        )
+    }
+
+    fn commit_cluster_raft_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_kv::ClusterKvRaftCommitResult, NetworkError> {
+        sinomo_kv::ClusterKvRaftCommandStorage::commit_cluster_raft_index_with_events(
+            &mut self.storage,
+            index,
+        )
+    }
+}
+
+impl<T> ClusterRaftQuorumTransportHost for DriverRaftQuorumCommitHost<'_, T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn replicate_cluster_raft_to_endpoint(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, NetworkError> {
+        let mut host = DriverRaftAppendReplicationHost {
+            transport: &mut self.driver.transport,
+        };
+        replicate_cluster_raft_to_endpoint_with_host(
+            paths,
+            state,
+            endpoint,
+            &[],
+            self.driver
+                .timeouts
+                .raft_append_replication_options(timeout),
+            &mut host,
+        )
+        .map(|outcome| outcome.response)
+    }
+
+    fn record_endpoint_command_connectivity(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        connectivity_state: ClusterConnectivityState,
+        latency_ms: Option<u64>,
+    ) {
+        self.driver.transport.record_endpoint_command_connectivity(
+            paths,
+            state,
+            endpoint,
+            connectivity_state,
+            latency_ms,
+        );
+    }
+
+    fn fan_out_committed_cluster_raft_command(
+        &mut self,
+        paths: ClusterPaths,
+        state: ClusterBootstrapState,
+        events: Vec<KvEvent>,
+        targets: Vec<ClusterEndpointRecord>,
+    ) {
+        self.driver
+            .transport
+            .fan_out_committed_cluster_raft_command(paths, state, events, targets);
+    }
+}
+
+impl<T> ClusterRaftCommittedFanoutHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn replicate_cluster_raft_to_endpoint(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        watch_events: &[KvEvent],
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError> {
+        let mut host = DriverRaftAppendReplicationHost {
+            transport: &mut self.transport,
+        };
+        replicate_cluster_raft_to_endpoint_with_host(
+            paths,
+            state,
+            endpoint,
+            watch_events,
+            self.timeouts.raft_append_replication_options(timeout),
+            &mut host,
+        )
+    }
+
+    fn send_cluster_kv_watch_events(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+        self.transport
+            .send_cluster_kv_watch_events(endpoint, request, timeout)
+    }
+}
+
+impl<T> ClusterVoterReachabilityHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+        self.transport.probe_voter(endpoint, timeout)
+    }
+}
+
+impl<T> ClusterRaftVoteTransportHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, NetworkError> {
+        self.transport.send_raft_vote(endpoint, request, timeout)
+    }
+}
+
+impl<T> ClusterKvSnapshotRefreshHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, NetworkError> {
+        self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
+    }
+
+    fn restore_cluster_raft_from_snapshot_if_newer(
+        &mut self,
+        paths: &ClusterPaths,
+        local_node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, NetworkError> {
+        locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+    }
+}
+
+impl<T> ClusterKvTxnForwardHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn known_raft_leader_id(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        locked_cluster_raft_known_leader_id(paths, state)
+    }
+
+    fn send_cluster_kv_txn(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        txn: &KvTxn,
+        timeout: Duration,
+    ) -> Result<KvTxnResponse, NetworkError> {
+        self.transport.send_cluster_kv_txn(endpoint, txn, timeout)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, NetworkError> {
+        self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
+    }
+
+    fn relay_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Vec<ClusterEndpointRecord> {
+        cluster_member_publish_targets(paths, state)
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport
+            .relay_rpc_to_node(state, target_node_id, peer, request, timeout)
+    }
+}
+
+impl<T> ClusterKvTxnQuorumHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn refresh_current_cluster_kv_store(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<(), NetworkError> {
+        refresh_current_cluster_kv_store_with_host(
+            paths,
+            state,
+            self.timeouts.kv_snapshot_refresh_options(),
+            self,
+        )
+        .map(|_| ())
+    }
+
+    fn local_is_raft_leader(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, NetworkError> {
+        locked_cluster_raft_local_is_leader(paths, state)
+    }
+
+    fn forward_cluster_kv_txn_to_voter(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        txn: &KvTxn,
+        options: ClusterKvTxnForwardOptions,
+    ) -> Result<Option<ClusterKvTxnForwardResult>, NetworkError> {
+        forward_cluster_kv_txn_to_voter_with_host(paths, state, txn, options, self)
+    }
+
+    fn elect_cluster_raft_leader(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        options: ClusterRaftLeaderElectionOptions,
+    ) -> Result<bool, NetworkError> {
+        elect_cluster_raft_leader_with_host(paths, state, options, self)
+    }
+
+    fn reachable_voter_count(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        options: ClusterVoterReachabilityOptions,
+    ) -> usize {
+        cluster_reachable_voter_count_with_host(paths, state, options, self)
+    }
+
+    fn commit_cluster_raft_command_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        command: KvCommand,
+        options: ClusterRaftQuorumCommitOptions,
+    ) -> Result<ClusterRaftQuorumCommitResult, NetworkError> {
+        let mut host = DriverRaftQuorumCommitHost {
+            storage: LocalClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
+            driver: self,
+        };
+        commit_cluster_raft_command_with_quorum_driver(paths, state, command, options, &mut host)
+    }
+}
+
+impl<T> ClusterMemberPublishHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    type Error = NetworkError;
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterLocalMemberPublishHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn cluster_has_local_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> bool {
+        let options = self.timeouts.voter_reachability_options();
+        cluster_has_local_quorum_with_host(paths, state, options, self)
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, NetworkError> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+
+    fn send_cluster_member_publish(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterMemberPublishRequest,
+        timeout: Duration,
+    ) -> Result<ClusterMemberPublishResponse, NetworkError> {
+        self.transport
+            .send_cluster_member_publish(endpoint, request, timeout)
+    }
+}
+
+impl<T> ClusterInvitePublishHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    type Error = NetworkError;
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterNetworkRecordExpiryHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    type Error = NetworkError;
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterNetworkInfoPublishHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    type Error = NetworkError;
+
+    fn published_network_info_matches(
+        &mut self,
+        paths: &ClusterPaths,
+        info: &ClusterNetworkInfoRecord,
+    ) -> bool {
+        self.transport.published_network_info_matches(paths, info)
+    }
+
+    fn remember_published_network_info(
+        &mut self,
+        paths: &ClusterPaths,
+        info: &ClusterNetworkInfoRecord,
+    ) {
+        self.transport.remember_published_network_info(paths, info);
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterNodeStatusPublishHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    type Error = NetworkError;
+
+    fn published_node_status_matches(
+        &mut self,
+        paths: &ClusterPaths,
+        status: &ClusterNodeStatusRecord,
+    ) -> bool {
+        self.transport.published_node_status_matches(paths, status)
+    }
+
+    fn remember_published_node_status(
+        &mut self,
+        paths: &ClusterPaths,
+        status: &ClusterNodeStatusRecord,
+    ) {
+        self.transport.remember_published_node_status(paths, status);
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterConnectivityPublishHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    type Error = NetworkError;
+
+    fn published_connectivity_record_set_matches(
+        &mut self,
+        paths: &ClusterPaths,
+        source_node_id: &NodeId,
+        records: &[ClusterConnectivityRecord],
+    ) -> bool {
+        self.transport
+            .published_connectivity_record_set_matches(paths, source_node_id, records)
+    }
+
+    fn remember_published_connectivity_record_set(
+        &mut self,
+        paths: &ClusterPaths,
+        source_node_id: &NodeId,
+        records: &[ClusterConnectivityRecord],
+    ) {
+        self.transport
+            .remember_published_connectivity_record_set(paths, source_node_id, records);
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, Self::Error> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterMemberMutationHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn current_cluster_kv_store(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<InProcessKvStore, NetworkError> {
+        refresh_current_cluster_kv_store_with_host(
+            paths,
+            state,
+            self.timeouts.kv_snapshot_refresh_options(),
+            self,
+        )
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, NetworkError> {
+        let options = self.timeouts.kv_txn_quorum_options(true);
+        commit_cluster_kv_txn_with_quorum_response_with_host(paths, state, txn, options, self)
+            .map(|result| result.snapshot)
+    }
+}
+
+impl<T> ClusterMembershipRpcForwardHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn send_membership_rpc(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport.send_cluster_membership_rpc(
+            endpoint,
+            request,
+            self.timeouts.membership_rpc_timeout,
+        )
+    }
+
+    fn relay_membership_rpc_to_voter_via_peer(
+        &mut self,
+        state: &ClusterBootstrapState,
+        voter: &ClusterEndpointRecord,
+        peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport.relay_rpc_to_node(
+            state,
+            &voter.node_id,
+            peer,
+            request,
+            self.timeouts.membership_rpc_timeout,
+        )
+    }
+}
+
+impl<T> ClusterJoinRegistrationHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn commit_join_registration_state(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<KvSnapshot, NetworkError> {
+        sync_cluster_state_to_kv_with_host(paths, state, self)
+    }
+
+    fn remember_successful_join_endpoint(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Result<(), NetworkError> {
+        self.transport.record_endpoint_command_connectivity(
+            paths,
+            state,
+            endpoint,
+            ClusterConnectivityState::Healthy,
+            None,
+        );
+        Ok(())
+    }
+}
+
+impl<T> ClusterJoinReconciliationHost for ClusterControlPlaneDriver<T>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn send_join_registration(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterJoinRegistrationRequest,
+        tcp_timeout: Duration,
+        iroh_timeout: Duration,
+    ) -> Result<ClusterJoinRegistrationResponse, NetworkError> {
+        let timeout = match endpoint.transport {
+            ClusterTransportKind::Iroh => iroh_timeout,
+            _ => tcp_timeout,
+        };
+        send_cluster_join_registration_over_membership_rpc(
+            endpoint,
+            request,
+            timeout,
+            |endpoint, request, timeout| {
+                self.transport
+                    .send_cluster_membership_rpc(endpoint, request, timeout)
+            },
+        )
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> Result<KvSnapshot, NetworkError> {
+        self.transport.fetch_cluster_kv_snapshot(endpoint, timeout)
+    }
+
+    fn observe_join_reconciliation_connectivity(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        reconciliation: &ClusterJoinReconciliation,
+    ) -> Result<(), NetworkError> {
+        if let Some(endpoint) = reconciliation.accepted_endpoint.as_ref() {
+            self.transport.record_endpoint_command_connectivity(
+                paths,
+                state,
+                endpoint,
+                ClusterConnectivityState::Healthy,
+                None,
+            );
+        }
+        Ok(())
+    }
+}
+
 pub trait ClusterMembershipRpcForwardHost {
     fn send_membership_rpc(
         &mut self,
@@ -3789,6 +4700,175 @@ pub trait ClusterJoinRegistrationHost: ClusterMembershipRpcForwardHost {
         _endpoint: &ClusterEndpointRecord,
     ) -> Result<(), NetworkError> {
         Ok(())
+    }
+}
+
+pub trait ClusterLocalDaemonMembershipObserver {
+    fn local_daemon_membership_observation(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NoopClusterLocalDaemonMembershipObserver;
+
+impl ClusterLocalDaemonMembershipObserver for NoopClusterLocalDaemonMembershipObserver {}
+
+pub struct ClusterJoinRegistrationDriver<T, O> {
+    driver: ClusterControlPlaneDriver<T>,
+    observer: O,
+}
+
+impl<T, O> ClusterJoinRegistrationDriver<T, O> {
+    pub fn new(driver: ClusterControlPlaneDriver<T>, observer: O) -> Self {
+        Self { driver, observer }
+    }
+
+    pub fn with_transport(transport: T, observer: O) -> Self {
+        Self::new(ClusterControlPlaneDriver::new(transport), observer)
+    }
+
+    pub fn driver_mut(&mut self) -> &mut ClusterControlPlaneDriver<T> {
+        &mut self.driver
+    }
+
+    pub fn observer_mut(&mut self) -> &mut O {
+        &mut self.observer
+    }
+}
+
+impl<T, O> ClusterMembershipRpcForwardHost for ClusterJoinRegistrationDriver<T, O>
+where
+    T: ClusterControlPlaneTransport,
+{
+    fn send_membership_rpc(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        ClusterMembershipRpcForwardHost::send_membership_rpc(&mut self.driver, endpoint, request)
+    }
+
+    fn relay_membership_rpc_to_voter_via_peer(
+        &mut self,
+        state: &ClusterBootstrapState,
+        voter: &ClusterEndpointRecord,
+        peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
+            &mut self.driver,
+            state,
+            voter,
+            peer,
+            request,
+        )
+    }
+}
+
+impl<T, O> ClusterJoinRegistrationHost for ClusterJoinRegistrationDriver<T, O>
+where
+    T: ClusterControlPlaneTransport,
+    O: ClusterLocalDaemonMembershipObserver,
+{
+    fn local_daemon_membership_observation(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<ClusterLocalDaemonMembershipObservation>, NetworkError> {
+        self.observer
+            .local_daemon_membership_observation(paths, state)
+    }
+
+    fn commit_join_registration_state(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<KvSnapshot, NetworkError> {
+        ClusterJoinRegistrationHost::commit_join_registration_state(&mut self.driver, paths, state)
+    }
+
+    fn remember_successful_join_endpoint(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Result<(), NetworkError> {
+        ClusterJoinRegistrationHost::remember_successful_join_endpoint(
+            &mut self.driver,
+            paths,
+            state,
+            endpoint,
+        )
+    }
+}
+
+pub struct ClusterMemberMutationDriver<T, O> {
+    driver: ClusterControlPlaneDriver<T>,
+    observer: O,
+}
+
+impl<T, O> ClusterMemberMutationDriver<T, O> {
+    pub fn new(driver: ClusterControlPlaneDriver<T>, observer: O) -> Self {
+        Self { driver, observer }
+    }
+
+    pub fn with_transport(transport: T, observer: O) -> Self {
+        Self::new(ClusterControlPlaneDriver::new(transport), observer)
+    }
+
+    pub fn driver_mut(&mut self) -> &mut ClusterControlPlaneDriver<T> {
+        &mut self.driver
+    }
+
+    pub fn observer_mut(&mut self) -> &mut O {
+        &mut self.observer
+    }
+}
+
+impl<T, O> ClusterMemberMutationHost for ClusterMemberMutationDriver<T, O>
+where
+    T: ClusterControlPlaneTransport,
+    O: ClusterLocalDaemonMembershipObserver,
+{
+    fn prepare_cluster_state_for_kv_sync(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<(), NetworkError> {
+        if let Some(observation) = self
+            .observer
+            .local_daemon_membership_observation(paths, state)?
+        {
+            refresh_local_daemon_membership_from_disk(paths, state, observation)?;
+        }
+        Ok(())
+    }
+
+    fn current_cluster_kv_store(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<InProcessKvStore, NetworkError> {
+        ClusterMemberMutationHost::current_cluster_kv_store(&mut self.driver, paths, state)
+    }
+
+    fn commit_cluster_kv_txn_with_quorum(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<KvSnapshot, NetworkError> {
+        ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
+            &mut self.driver,
+            paths,
+            state,
+            txn,
+        )
     }
 }
 
@@ -7372,354 +8452,6 @@ pub fn read_cluster_node_statuses_from_kv(
     Ok(statuses)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ClusterHealthRow {
-    pub member: ClusterMemberRecord,
-    pub status: ClusterNodeStatusRecord,
-    pub availability: ClusterNodeAvailability,
-}
-
-pub fn cluster_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(CLUSTER_HEALTH_ROUTE, CLUSTER_KV_RPC_CATEGORY, &())
-}
-
-pub fn cluster_local_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
-    let mut request = cluster_health_rpc_request()?;
-    request.metadata.insert(
-        CLUSTER_HEALTH_SCOPE_METADATA_KEY.to_string(),
-        CLUSTER_HEALTH_SCOPE_LOCAL.to_string(),
-    );
-    Ok(request)
-}
-
-pub fn cluster_health_rpc_request_is_local_scope(request: &ObjectRpcRequest) -> bool {
-    request
-        .metadata
-        .get(CLUSTER_HEALTH_SCOPE_METADATA_KEY)
-        .is_some_and(|scope| scope == CLUSTER_HEALTH_SCOPE_LOCAL)
-}
-
-pub fn decode_cluster_health_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<Vec<ClusterHealthRow>, NetworkError> {
-    response.decode_body()
-}
-
-pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    probe: &P,
-    request: ObjectRpcRequest,
-    observed_at: OffsetDateTime,
-) -> Result<ObjectRpcResponse, NetworkError> {
-    match request.route.as_str() {
-        CLUSTER_HEALTH_ROUTE => {
-            let _: () = request.decode_body()?;
-            let rows = cluster_health_rows_with_probe(
-                paths,
-                state,
-                probe,
-                !cluster_health_rpc_request_is_local_scope(&request),
-                observed_at,
-            )?;
-            ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
-        }
-        other => {
-            ObjectRpcResponse::encode_error(other, format!("unknown cluster health route: {other}"))
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ClusterDoctorFinding {
-    pub severity: String,
-    pub code: String,
-    pub detail: String,
-}
-
-impl ClusterDoctorFinding {
-    fn warning(code: impl Into<String>, detail: impl Into<String>) -> Self {
-        Self {
-            severity: "warning".to_string(),
-            code: code.into(),
-            detail: detail.into(),
-        }
-    }
-}
-
-pub trait ClusterStatusProbe {
-    fn probe_member_status(
-        &self,
-        state: &ClusterBootstrapState,
-        member: &ClusterMemberRecord,
-    ) -> Option<ClusterNodeStatusRecord>;
-
-    fn peer_local_health_rows(
-        &self,
-        _state: &ClusterBootstrapState,
-        _member: &ClusterMemberRecord,
-    ) -> Option<Vec<ClusterHealthRow>> {
-        None
-    }
-}
-
-pub fn cluster_health_rows_with_probe<P: ClusterStatusProbe + ?Sized>(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    probe: &P,
-    include_peer_views: bool,
-    observed_at: OffsetDateTime,
-) -> Result<Vec<ClusterHealthRow>, NetworkError> {
-    let stored_statuses = read_cluster_node_statuses_from_kv(paths)?;
-    let mut rows = Vec::new();
-    for member in &state.members {
-        if matches!(member.state, ClusterMemberState::Removed) {
-            continue;
-        }
-        let live = probe.probe_member_status(state, member);
-        let stored = stored_statuses
-            .iter()
-            .find(|status| status.node_id == member.node_id)
-            .cloned();
-        let live_online = live.is_some();
-        let mut status = if let Some(live) = live {
-            let mut live = live;
-            if live.rollout.is_none() {
-                live.rollout = stored.as_ref().and_then(|status| status.rollout.clone());
-            }
-            live
-        } else if let Some(stored) = stored {
-            stored
-        } else {
-            unknown_cluster_node_status(state, member, observed_at)
-        };
-        // Availability is driven by the active probe, not by stored status freshness.
-        let availability = if live_online {
-            ClusterNodeAvailability::Online
-        } else if live_cluster_member_probe_possible(state, member) {
-            ClusterNodeAvailability::Offline
-        } else {
-            ClusterNodeAvailability::Unknown
-        };
-        status.availability = availability.clone();
-        rows.push(ClusterHealthRow {
-            member: member.clone(),
-            status,
-            availability,
-        });
-    }
-    if include_peer_views {
-        merge_reachable_peer_health_rows(state, &mut rows, probe);
-    }
-    rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
-    Ok(rows)
-}
-
-pub fn cluster_doctor_findings(
-    state: &ClusterBootstrapState,
-    connectivity: &[ClusterConnectivityRecord],
-    health: &[ClusterHealthRow],
-) -> Vec<ClusterDoctorFinding> {
-    let mut findings = Vec::new();
-    for row in health {
-        if row.availability == ClusterNodeAvailability::Offline {
-            findings.push(ClusterDoctorFinding::warning(
-                "node-offline",
-                format!(
-                    "{} is offline from {} using advertised endpoints",
-                    row.member.node_id, state.local_node_id
-                ),
-            ));
-        } else if row.availability == ClusterNodeAvailability::Unknown {
-            findings.push(ClusterDoctorFinding::warning(
-                "node-unknown",
-                format!("{} has no recent reachable status", row.member.node_id),
-            ));
-        }
-    }
-
-    let connectivity_graph = ClusterConnectivityGraph::from_records(
-        state.local_node_id.clone(),
-        connectivity.iter().cloned(),
-    );
-    let online_nodes = health
-        .iter()
-        .filter(|row| row.availability == ClusterNodeAvailability::Online)
-        .map(|row| row.member.node_id.clone())
-        .collect::<BTreeSet<_>>();
-    for record in connectivity {
-        if record.state == ClusterConnectivityState::Unreachable
-            && !online_nodes.contains(&record.target_node_id)
-            && cluster_route_next_hop(
-                &connectivity_graph,
-                &record.source_node_id,
-                &record.target_node_id,
-            )
-            .is_none()
-        {
-            findings.push(ClusterDoctorFinding::warning(
-                "endpoint-unreachable",
-                format!(
-                    "{} cannot reach {} at {} via {:?} ({} consecutive failures)",
-                    record.source_node_id,
-                    record.target_node_id,
-                    record.address,
-                    record.transport,
-                    record.consecutive_failures
-                ),
-            ));
-        }
-    }
-
-    for member in &state.members {
-        let mut by_public_key = BTreeMap::<String, usize>::new();
-        for endpoint in &member.endpoints {
-            if let Some(public_key) = iroh_endpoint_public_key(endpoint) {
-                *by_public_key.entry(public_key).or_default() += 1;
-            }
-        }
-        for (public_key, count) in by_public_key {
-            if count > 1 {
-                findings.push(ClusterDoctorFinding::warning(
-                    "duplicate-iroh-endpoint",
-                    format!(
-                        "{} has {count} Iroh endpoint records for public key {public_key}",
-                        member.node_id
-                    ),
-                ));
-            }
-        }
-    }
-
-    let route_targets = advertised_peer_route_targets(state);
-    if !route_targets.is_empty() {
-        let route_ips = discover_peer_route_ip_candidates(state);
-        if route_ips.is_empty() {
-            findings.push(ClusterDoctorFinding::warning(
-                "peer-route-unadvertised",
-                format!(
-                    "{} peer route target(s) exist, but no routable local source address could be discovered",
-                    route_targets.len()
-                ),
-            ));
-        }
-    }
-
-    findings.sort_by(|left, right| (&left.code, &left.detail).cmp(&(&right.code, &right.detail)));
-    findings
-}
-
-pub fn unknown_cluster_node_status(
-    state: &ClusterBootstrapState,
-    member: &ClusterMemberRecord,
-    observed_at: OffsetDateTime,
-) -> ClusterNodeStatusRecord {
-    ClusterNodeStatusRecord {
-        cluster_id: state.cluster_id.clone(),
-        node_id: member.node_id.clone(),
-        process: member
-            .capabilities
-            .iter()
-            .find_map(|capability| match capability.as_str() {
-                DAEMON_MAIN_RUN_CAPABILITY => Some(DAEMON_MAIN_CLUSTER_ROLE.to_string()),
-                DAEMON_SHADOW_SUPERVISE_CAPABILITY => Some(DAEMON_SHADOW_CLUSTER_ROLE.to_string()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "unknown".to_string()),
-        availability: ClusterNodeAvailability::Unknown,
-        daemon_version: "unknown".to_string(),
-        commit: None,
-        target_os: None,
-        target_arch: None,
-        pid: None,
-        address: member
-            .endpoints
-            .iter()
-            .find(|endpoint| !matches!(endpoint.privacy, ClusterEndpointPrivacy::LocalOnly))
-            .or_else(|| member.endpoints.first())
-            .map(|endpoint| endpoint.address.clone()),
-        bind_address: None,
-        executable: None,
-        rollout: None,
-        daemon_started_at: None,
-        observed_at,
-    }
-}
-
-fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(
-    state: &ClusterBootstrapState,
-    rows: &mut [ClusterHealthRow],
-    probe: &P,
-) {
-    if !rows
-        .iter()
-        .any(|row| row.availability != ClusterNodeAvailability::Online)
-    {
-        return;
-    }
-
-    let mut peer_members = rows
-        .iter()
-        .filter(|row| {
-            row.availability == ClusterNodeAvailability::Online
-                && row.member.node_id != state.local_node_id
-                && row
-                    .member
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
-        })
-        .map(|row| row.member.clone())
-        .collect::<Vec<_>>();
-    peer_members.sort_by_key(|member| {
-        (
-            std::cmp::Reverse(
-                member
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-                    .count(),
-            ),
-            member.node_id.clone(),
-        )
-    });
-
-    for member in peer_members
-        .into_iter()
-        .take(CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS)
-    {
-        let Some(peer_rows) = probe.peer_local_health_rows(state, &member) else {
-            continue;
-        };
-        merge_online_peer_health_rows(rows, peer_rows);
-        if rows
-            .iter()
-            .all(|row| row.availability == ClusterNodeAvailability::Online)
-        {
-            break;
-        }
-    }
-}
-
-fn merge_online_peer_health_rows(rows: &mut [ClusterHealthRow], peer_rows: Vec<ClusterHealthRow>) {
-    let mut by_node = peer_rows
-        .into_iter()
-        .filter(|row| row.availability == ClusterNodeAvailability::Online)
-        .map(|row| (row.member.node_id.clone(), row))
-        .collect::<BTreeMap<_, _>>();
-    for row in rows {
-        if row.availability == ClusterNodeAvailability::Online {
-            continue;
-        }
-        let Some(peer_row) = by_node.remove(&row.member.node_id) else {
-            continue;
-        };
-        row.status = peer_row.status;
-        row.status.availability = ClusterNodeAvailability::Online;
-        row.availability = ClusterNodeAvailability::Online;
-    }
-}
-
 pub fn read_cluster_module_rollout_statuses_from_kv(
     paths: &ClusterPaths,
 ) -> Result<Vec<ClusterModuleRolloutStatusRecord>, NetworkError> {
@@ -9470,6 +10202,21 @@ pub fn refresh_current_cluster_kv_store_with_host(
         snapshot.clone(),
     )?;
     Ok(InProcessKvStore::restore(snapshot))
+}
+
+pub fn refresh_current_cluster_kv_store_with_local_storage_and_transport<F>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    options: ClusterKvSnapshotRefreshOptions,
+    fetch_cluster_kv_snapshot: F,
+) -> Result<InProcessKvStore, NetworkError>
+where
+    F: FnMut(&ClusterEndpointRecord, Duration) -> Result<KvSnapshot, NetworkError>,
+{
+    let mut host = LocalClusterKvSnapshotRefreshHost {
+        fetch_cluster_kv_snapshot,
+    };
+    refresh_current_cluster_kv_store_with_host(paths, state, options, &mut host)
 }
 
 pub fn elect_cluster_raft_leader_with_host(

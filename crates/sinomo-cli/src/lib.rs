@@ -92,8 +92,6 @@ use sinomo_runtime::daemon::{
     default_boot_dir as daemon_default_boot_dir,
     default_main_daemon_status as daemon_default_main_daemon_status,
     ensure_install_layout_dirs as daemon_ensure_install_layout_dirs,
-    fetch_cluster_kv_snapshot as daemon_fetch_cluster_kv_snapshot,
-    fetch_cluster_kv_snapshot_from_endpoint as daemon_fetch_cluster_kv_snapshot_from_endpoint,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
     git_is_available as daemon_git_is_available,
@@ -185,14 +183,14 @@ use sinomo_runtime::events::{EventStore, InMemoryEventStore};
 use sinomo_runtime::kv::{InProcessKvStore, KvError, KvOp, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::module::ModuleReplayReport;
+#[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationRequest;
+#[cfg(test)]
 use sinomo_runtime::network::ClusterJoinRegistrationResponse;
 use sinomo_runtime::network::{self, ClusterPaths, cluster_doctor_findings};
-use sinomo_runtime::network::{
-    CLUSTER_INVITE_CHALLENGE_PROTOCOL, ClusterDoctorFinding, ClusterHealthRow, ClusterId,
-    ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
-    verify_cluster_invite_challenge_proof,
-};
+use sinomo_runtime::network::{ClusterDoctorFinding, ClusterHealthRow, ClusterId};
+#[cfg(test)]
+use sinomo_runtime::network::{ClusterInviteChallengeProof, ClusterInviteChallengeRequest};
 use sinomo_runtime::node::{
     NodeId, load_or_create_main_node_identity, load_or_create_shadow_node_identity,
     shadow_daemon_node_id,
@@ -1677,3 +1675,21 @@ const CLUSTER_HEALTH_PEER_ROWS_TIMEOUT: Duration = Duration::from_secs(8);
 const SINOMO_JOIN_URI_PREFIX: &str = network::SINOMO_JOIN_URI_PREFIX;
 const CLUSTER_INVITE_DEFAULT_TTL_SECONDS: i64 = 24 * 60 * 60;
 const INSTALL_DEFAULT_HOST: &str = "0.0.0.0";
+
+fn daemon_fetch_cluster_kv_snapshot(
+    address: &str,
+    timeout: Duration,
+) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
+    let request = network::cluster_kv_snapshot_rpc_request()?;
+    let response = daemon_send_daemon_rpc(address, &request, timeout)?;
+    network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+}
+
+fn daemon_fetch_cluster_kv_snapshot_from_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    timeout: Duration,
+) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
+    let request = network::cluster_kv_snapshot_rpc_request()?;
+    let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
+    network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+}

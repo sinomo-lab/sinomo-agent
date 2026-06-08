@@ -1,3 +1,4 @@
+use crate::client::fetch_cluster_kv_snapshot_from_endpoint;
 use crate::dfs::ensure_default_distributed_dfs;
 #[cfg(test)]
 use crate::status::ensure_daemon_cluster_members;
@@ -10,10 +11,10 @@ use crate::{
     current_daemon_cluster_options, current_shadow_daemon_options,
     daemon_cluster_options_from_status, daemon_cluster_process_from_paths, daemon_cluster_status,
     daemon_cluster_status_matches, daemon_connect_address, daemon_options_from_status,
-    daemon_paths_are_shadow, fetch_cluster_kv_snapshot_from_endpoint,
-    fetch_daemon_status_from_endpoint, handle_daemon_rollout_build_request, probe_daemon_status,
-    read_daemon_status, send_cluster_kv_txn, send_cluster_kv_watch_events,
-    send_cluster_raft_append, send_cluster_raft_vote, write_daemon_status,
+    daemon_paths_are_shadow, fetch_daemon_status_from_endpoint,
+    handle_daemon_rollout_build_request, probe_daemon_status, read_daemon_status,
+    send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_raft_append,
+    send_cluster_raft_vote, write_daemon_status,
 };
 use sinomo_core::{
     ClusterBootstrapState, ClusterEndpointRecord, ClusterMemberRecord, ClusterNodeRole,
@@ -27,20 +28,21 @@ use sinomo_core::{
 #[cfg(test)]
 use sinomo_kv::KvOp;
 use sinomo_kv::{ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse};
-use sinomo_kv::{InProcessKvStore, KvCommand, KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
+use sinomo_kv::{InProcessKvStore, KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
 #[cfg(test)]
-use sinomo_kv::{KvCompare, KvOpResponse};
+use sinomo_kv::{KvCommand, KvCompare, KvOpResponse};
 use sinomo_local::SinomoDataDir;
 #[cfg(test)]
 use sinomo_network::{
     ClusterConnectivityProbeState, ClusterId, ClusterInviteId, ClusterJoinRegistrationResponse,
-    ClusterRaftAppendRequest, MdnsDiscoveryAdvertisement, ObjectRpcRequest, cluster_member_key,
+    MdnsDiscoveryAdvertisement, cluster_member_key,
 };
 use sinomo_network::{
     ClusterConnectivityRecord, ClusterHealthRow, ClusterInviteChallengeProof,
     ClusterInviteChallengeRequest, ClusterMemberPublishRequest, ClusterMemberPublishResponse,
-    ClusterNetworkInfoRecord, ClusterPaths, ClusterRaftVoteRequest, ClusterRaftVoteResponse,
-    ClusterStatusProbe, IrohEndpointRecord, MdnsDiscoveryCache, MdnsDiscoverySocket,
+    ClusterNetworkInfoRecord, ClusterPaths, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse, ClusterStatusProbe, IrohEndpointRecord,
+    MdnsDiscoveryCache, MdnsDiscoverySocket, ObjectRpcRequest, ObjectRpcResponse,
 };
 use sinomo_node::NodeId;
 use sinomo_node::shadow_daemon_node_id;
@@ -187,29 +189,6 @@ fn trim_published_connectivity_cache_records(
         }
         break;
     }
-}
-
-fn locked_cluster_raft_known_leader_id(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<Option<NodeId>, DaemonError> {
-    sinomo_network::locked_cluster_raft_known_leader_id(paths, state).map_err(Into::into)
-}
-
-fn locked_cluster_raft_local_is_leader(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<bool, DaemonError> {
-    sinomo_network::locked_cluster_raft_local_is_leader(paths, state).map_err(Into::into)
-}
-
-fn locked_restore_cluster_raft_from_snapshot_if_newer(
-    paths: &ClusterPaths,
-    node_id: &NodeId,
-    snapshot: KvSnapshot,
-) -> Result<bool, DaemonError> {
-    sinomo_network::locked_restore_cluster_raft_from_snapshot_if_newer(paths, node_id, snapshot)
-        .map_err(Into::into)
 }
 
 fn cached_network_info_matches(paths: &ClusterPaths, info: &ClusterNetworkInfoRecord) -> bool {
@@ -834,7 +813,7 @@ pub(crate) fn handle_cluster_kv_txn_request_with_cluster_paths(
     txn: KvTxn,
     allow_forwarding: bool,
 ) -> Result<KvTxnResponse, DaemonError> {
-    let mut host = DaemonClusterKvTxnQuorumHost;
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::handle_cluster_kv_txn_request_with_host(
         cluster_paths,
         txn,
@@ -845,12 +824,41 @@ pub(crate) fn handle_cluster_kv_txn_request_with_cluster_paths(
 }
 
 pub(crate) struct DaemonClusterJoinRegistrationHost<'a> {
-    daemon_paths: &'a DaemonPaths,
+    driver: sinomo_network::ClusterJoinRegistrationDriver<
+        DaemonClusterControlPlaneTransport,
+        DaemonLocalDaemonMembershipObserver<'a>,
+    >,
 }
 
 impl<'a> DaemonClusterJoinRegistrationHost<'a> {
     pub(crate) fn new(daemon_paths: &'a DaemonPaths) -> Self {
-        Self { daemon_paths }
+        Self {
+            driver: sinomo_network::ClusterJoinRegistrationDriver::new(
+                daemon_cluster_control_plane_driver(),
+                DaemonLocalDaemonMembershipObserver { daemon_paths },
+            ),
+        }
+    }
+}
+
+struct DaemonLocalDaemonMembershipObserver<'a> {
+    daemon_paths: &'a DaemonPaths,
+}
+
+impl sinomo_network::ClusterLocalDaemonMembershipObserver
+    for DaemonLocalDaemonMembershipObserver<'_>
+{
+    fn local_daemon_membership_observation(
+        &mut self,
+        _paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<
+        Option<sinomo_network::ClusterLocalDaemonMembershipObservation>,
+        sinomo_network::NetworkError,
+    > {
+        local_daemon_membership_observation_from_daemon_paths(self.daemon_paths, state)
+            .map(Some)
+            .map_err(|error| daemon_host_network_error("cluster join local membership", error))
     }
 }
 
@@ -860,8 +868,11 @@ impl sinomo_network::ClusterMembershipRpcForwardHost for DaemonClusterJoinRegist
         endpoint: &ClusterEndpointRecord,
         request: &sinomo_network::ObjectRpcRequest,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        crate::send_daemon_rpc_to_endpoint(endpoint, request, DAEMON_CLUSTER_RELAY_TIMEOUT)
-            .map_err(|error| daemon_host_network_error("cluster membership rpc", error))
+        sinomo_network::ClusterMembershipRpcForwardHost::send_membership_rpc(
+            &mut self.driver,
+            endpoint,
+            request,
+        )
     }
 
     fn relay_membership_rpc_to_voter_via_peer(
@@ -871,57 +882,30 @@ impl sinomo_network::ClusterMembershipRpcForwardHost for DaemonClusterJoinRegist
         peer: &ClusterEndpointRecord,
         request: &sinomo_network::ObjectRpcRequest,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        relay_membership_rpc_to_voter_via_peer(state, voter, peer, request)
-            .map_err(|error| daemon_host_network_error("cluster membership relay", error))
+        sinomo_network::ClusterMembershipRpcForwardHost::relay_membership_rpc_to_voter_via_peer(
+            &mut self.driver,
+            state,
+            voter,
+            peer,
+            request,
+        )
     }
 }
 
 impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrationHost<'_> {
     fn local_daemon_membership_observation(
         &mut self,
-        _paths: &ClusterPaths,
+        paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<
         Option<sinomo_network::ClusterLocalDaemonMembershipObservation>,
         sinomo_network::NetworkError,
     > {
-        let data_dir = self.daemon_paths.root.parent().ok_or_else(|| {
-            sinomo_network::NetworkError::StorageIo {
-                path: self.daemon_paths.root.display().to_string(),
-                detail: "daemon paths have no data directory parent".to_string(),
-            }
-        })?;
-        let now = time::OffsetDateTime::now_utc();
-        let (main_options, shadow_options) =
-            if let Ok(main_status) = read_daemon_status(self.daemon_paths) {
-                let shadow_options = match probe_daemon_status(
-                    &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
-                    DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
-                ) {
-                    DaemonProbeStatus::Running(status)
-                    | DaemonProbeStatus::Locked {
-                        status: Some(status),
-                    } => daemon_options_from_status(&status),
-                    DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
-                        DaemonRunOptions::shadow_default()
-                    }
-                };
-                (daemon_options_from_status(&main_status), shadow_options)
-            } else {
-                (
-                    DaemonRunOptions::default(),
-                    DaemonRunOptions::shadow_default(),
-                )
-            };
-        let observation = local_daemon_membership_observation(
-            data_dir,
-            &state,
-            &main_options,
-            &shadow_options,
-            now,
+        sinomo_network::ClusterJoinRegistrationHost::local_daemon_membership_observation(
+            &mut self.driver,
+            paths,
+            state,
         )
-        .map_err(|error| daemon_host_network_error("cluster join local membership", error))?;
-        Ok(Some(observation))
     }
 
     fn commit_join_registration_state(
@@ -929,8 +913,11 @@ impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrati
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
-        sync_cluster_state_to_kv(paths, state)
-            .map_err(|error| daemon_host_network_error("cluster join kv commit", error))
+        sinomo_network::ClusterJoinRegistrationHost::commit_join_registration_state(
+            &mut self.driver,
+            paths,
+            state,
+        )
     }
 
     fn remember_successful_join_endpoint(
@@ -939,14 +926,12 @@ impl sinomo_network::ClusterJoinRegistrationHost for DaemonClusterJoinRegistrati
         state: &ClusterBootstrapState,
         endpoint: &ClusterEndpointRecord,
     ) -> Result<(), sinomo_network::NetworkError> {
-        remember_cluster_endpoint_command_connectivity(
+        sinomo_network::ClusterJoinRegistrationHost::remember_successful_join_endpoint(
+            &mut self.driver,
             paths,
             state,
             endpoint,
-            sinomo_network::ClusterConnectivityState::Healthy,
-            None,
-        );
-        Ok(())
+        )
     }
 }
 
@@ -960,51 +945,13 @@ pub(crate) fn forward_cluster_invite_challenge_to_voter(
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
     let rpc_request = sinomo_network::cluster_join_challenge_rpc_request(challenge)?;
+    let mut host = daemon_cluster_control_plane_driver();
     let response = sinomo_network::forward_cluster_join_challenge_rpc_to_voter_with_host(
         &cluster_paths,
         &rpc_request,
-        &mut DaemonClusterMembershipRpcForwardHost,
+        &mut host,
     )?;
     response.decode_body().map_err(DaemonError::from)
-}
-
-struct DaemonClusterMembershipRpcForwardHost;
-
-impl sinomo_network::ClusterMembershipRpcForwardHost for DaemonClusterMembershipRpcForwardHost {
-    fn send_membership_rpc(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &sinomo_network::ObjectRpcRequest,
-    ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        crate::send_daemon_rpc_to_endpoint(endpoint, request, DAEMON_CLUSTER_RELAY_TIMEOUT)
-            .map_err(|error| daemon_host_network_error("cluster membership rpc", error))
-    }
-
-    fn relay_membership_rpc_to_voter_via_peer(
-        &mut self,
-        state: &ClusterBootstrapState,
-        voter: &ClusterEndpointRecord,
-        peer: &ClusterEndpointRecord,
-        request: &sinomo_network::ObjectRpcRequest,
-    ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        relay_membership_rpc_to_voter_via_peer(state, voter, peer, request)
-            .map_err(|error| daemon_host_network_error("cluster membership relay", error))
-    }
-}
-
-fn relay_membership_rpc_to_voter_via_peer(
-    state: &ClusterBootstrapState,
-    voter: &ClusterEndpointRecord,
-    peer: &ClusterEndpointRecord,
-    rpc_request: &sinomo_network::ObjectRpcRequest,
-) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    relay_rpc_to_node_via_peer(
-        state,
-        &voter.node_id,
-        peer,
-        rpc_request,
-        DAEMON_CLUSTER_RELAY_TIMEOUT,
-    )
 }
 
 fn relay_rpc_to_node_via_peer(
@@ -1047,7 +994,6 @@ impl sinomo_network::ClusterSignedRelayRpcHost for DaemonSignedRelayRpcHost {
         request: &sinomo_network::ObjectRpcRequest,
         timeout: Duration,
     ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        let timeout = cluster_voter_reachability_options().fair_command_timeout(endpoint, timeout);
         sinomo_network::send_daemon_rpc_to_cluster_endpoint(
             endpoint,
             command,
@@ -1062,13 +1008,14 @@ pub(crate) fn publish_local_members_via_voter(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<(), DaemonError> {
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::publish_local_members_via_voter_with_host(
         paths,
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
         },
-        &mut DaemonClusterLocalMemberPublishHost,
+        &mut host,
     )
     .map_err(Into::into)
 }
@@ -1077,13 +1024,14 @@ pub(crate) fn publish_local_members_to_quorum_if_needed(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::publish_local_members_to_quorum_if_needed_with_host(
         paths,
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
         },
-        &mut DaemonClusterLocalMemberPublishHost,
+        &mut host,
     )
     .map_err(Into::into)
 }
@@ -1806,7 +1754,7 @@ pub(crate) fn sync_cluster_state_to_kv(
     sinomo_network::sync_cluster_state_to_kv_with_host(
         paths,
         state,
-        &mut DaemonClusterMemberMutationHost,
+        &mut DaemonClusterMemberMutationHost::new(),
     )
     .map_err(Into::into)
 }
@@ -2027,19 +1975,43 @@ fn update_cluster_node_role(
     now: OffsetDateTime,
 ) -> Result<sinomo_network::ClusterNodeRoleUpdate, DaemonError> {
     let state = read_local_cluster_state(paths)?;
-    let mut host = DaemonClusterMemberMutationHost;
+    let mut host = DaemonClusterMemberMutationHost::new();
     sinomo_network::update_cluster_node_role_with_host(paths, state, node_id, role, now, &mut host)
         .map_err(Into::into)
 }
 
-struct DaemonClusterMemberMutationHost;
+struct DaemonClusterMemberMutationHost {
+    driver: sinomo_network::ClusterMemberMutationDriver<
+        DaemonClusterControlPlaneTransport,
+        DaemonClusterStateSyncMembershipObserver,
+    >,
+}
 
-impl sinomo_network::ClusterMemberMutationHost for DaemonClusterMemberMutationHost {
-    fn prepare_cluster_state_for_kv_sync(
+impl DaemonClusterMemberMutationHost {
+    fn new() -> Self {
+        Self {
+            driver: sinomo_network::ClusterMemberMutationDriver::new(
+                daemon_cluster_control_plane_driver(),
+                DaemonClusterStateSyncMembershipObserver,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DaemonClusterStateSyncMembershipObserver;
+
+impl sinomo_network::ClusterLocalDaemonMembershipObserver
+    for DaemonClusterStateSyncMembershipObserver
+{
+    fn local_daemon_membership_observation(
         &mut self,
         paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-    ) -> Result<(), sinomo_network::NetworkError> {
+        state: &ClusterBootstrapState,
+    ) -> Result<
+        Option<sinomo_network::ClusterLocalDaemonMembershipObservation>,
+        sinomo_network::NetworkError,
+    > {
         let data_dir = paths
             .root
             .parent()
@@ -2050,17 +2022,32 @@ impl sinomo_network::ClusterMemberMutationHost for DaemonClusterMemberMutationHo
                     paths.root.display()
                 ),
             })?;
-        if let Some((main_options, shadow_options)) = current_daemon_cluster_options(data_dir) {
-            refresh_local_daemon_membership(
-                paths,
-                state,
-                &main_options,
-                &shadow_options,
-                OffsetDateTime::now_utc(),
-            )
-            .map_err(|error| daemon_host_network_error("cluster state membership sync", error))?;
-        }
-        Ok(())
+        let Some((main_options, shadow_options)) = current_daemon_cluster_options(data_dir) else {
+            return Ok(None);
+        };
+        local_daemon_membership_observation(
+            data_dir,
+            state,
+            &main_options,
+            &shadow_options,
+            OffsetDateTime::now_utc(),
+        )
+        .map(Some)
+        .map_err(|error| daemon_host_network_error("cluster state membership sync", error))
+    }
+}
+
+impl sinomo_network::ClusterMemberMutationHost for DaemonClusterMemberMutationHost {
+    fn prepare_cluster_state_for_kv_sync(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &mut ClusterBootstrapState,
+    ) -> Result<(), sinomo_network::NetworkError> {
+        sinomo_network::ClusterMemberMutationHost::prepare_cluster_state_for_kv_sync(
+            &mut self.driver,
+            paths,
+            state,
+        )
     }
 
     fn current_cluster_kv_store(
@@ -2068,8 +2055,11 @@ impl sinomo_network::ClusterMemberMutationHost for DaemonClusterMemberMutationHo
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<InProcessKvStore, sinomo_network::NetworkError> {
-        current_cluster_kv_store(paths, state)
-            .map_err(|error| daemon_host_network_error("cluster member mutation kv view", error))
+        sinomo_network::ClusterMemberMutationHost::current_cluster_kv_store(
+            &mut self.driver,
+            paths,
+            state,
+        )
     }
 
     fn commit_cluster_kv_txn_with_quorum(
@@ -2078,42 +2068,67 @@ impl sinomo_network::ClusterMemberMutationHost for DaemonClusterMemberMutationHo
         state: &mut ClusterBootstrapState,
         txn: KvTxn,
     ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn).map_err(|error| match error {
-            DaemonError::ClusterOrphan => sinomo_network::NetworkError::ClusterOrphan,
-            DaemonError::ClusterReadOnly { detail } => {
-                sinomo_network::NetworkError::ClusterReadOnly { detail }
-            }
-            DaemonError::Parse { detail } => {
-                sinomo_network::NetworkError::InvalidClusterCommand { detail }
-            }
-            other => daemon_host_network_error("cluster member mutation commit", other),
-        })
+        sinomo_network::ClusterMemberMutationHost::commit_cluster_kv_txn_with_quorum(
+            &mut self.driver,
+            paths,
+            state,
+            txn,
+        )
     }
 }
 
-fn current_cluster_kv_store(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-) -> Result<InProcessKvStore, DaemonError> {
-    sinomo_network::refresh_current_cluster_kv_store_with_host(
-        paths,
-        state,
-        cluster_kv_snapshot_refresh_options(),
-        &mut DaemonClusterKvSnapshotRefreshHost,
+pub(crate) fn daemon_cluster_control_plane_driver()
+-> sinomo_network::ClusterControlPlaneDriver<DaemonClusterControlPlaneTransport> {
+    sinomo_network::ClusterControlPlaneDriver::with_timeouts(
+        DaemonClusterControlPlaneTransport,
+        cluster_control_plane_timeouts(),
     )
-    .map_err(Into::into)
 }
 
-struct DaemonClusterKvSnapshotRefreshHost;
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DaemonClusterControlPlaneTransport;
 
-impl sinomo_network::ClusterKvSnapshotRefreshHost for DaemonClusterKvSnapshotRefreshHost {
-    fn known_raft_leader_id(
+impl sinomo_network::ClusterControlPlaneTransport for DaemonClusterControlPlaneTransport {
+    fn send_raft_append(
         &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, sinomo_network::NetworkError> {
-        locked_cluster_raft_known_leader_id(paths, state)
-            .map_err(|error| daemon_host_network_error("cluster raft known leader", error))
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, sinomo_network::NetworkError> {
+        send_cluster_raft_append(endpoint, request, timeout).map_err(|error| {
+            sinomo_network::NetworkError::Io {
+                operation: "cluster raft append".to_string(),
+                detail: error.to_string(),
+            }
+        })
+    }
+
+    fn send_raft_vote(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterRaftVoteRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftVoteResponse, sinomo_network::NetworkError> {
+        send_cluster_raft_vote(endpoint, request, timeout).map_err(|error| {
+            sinomo_network::NetworkError::Io {
+                operation: "cluster raft vote".to_string(),
+                detail: error.to_string(),
+            }
+        })
+    }
+
+    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
+        fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
+    }
+
+    fn send_cluster_kv_txn(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        txn: &KvTxn,
+        timeout: Duration,
+    ) -> Result<KvTxnResponse, sinomo_network::NetworkError> {
+        send_cluster_kv_txn(endpoint, txn, timeout)
+            .map_err(|error| daemon_host_network_error("cluster kv txn", error))
     }
 
     fn fetch_cluster_kv_snapshot(
@@ -2122,17 +2137,132 @@ impl sinomo_network::ClusterKvSnapshotRefreshHost for DaemonClusterKvSnapshotRef
         timeout: Duration,
     ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
         fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout)
-            .map_err(|error| daemon_host_network_error("cluster kv snapshot refresh", error))
+            .map_err(|error| daemon_host_network_error("cluster kv snapshot", error))
     }
 
-    fn restore_cluster_raft_from_snapshot_if_newer(
+    fn send_cluster_kv_watch_events(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterKvWatchEventsRequest,
+        timeout: Duration,
+    ) -> Result<ClusterKvWatchEventsResponse, sinomo_network::NetworkError> {
+        send_cluster_kv_watch_events(endpoint, request, timeout)
+            .map_err(|error| daemon_host_network_error("cluster kv watch-event fanout", error))
+    }
+
+    fn send_cluster_member_publish(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ClusterMemberPublishRequest,
+        timeout: Duration,
+    ) -> Result<ClusterMemberPublishResponse, sinomo_network::NetworkError> {
+        crate::client::send_cluster_member_publish(endpoint, request, timeout)
+            .map_err(|error| daemon_host_network_error("cluster local member publish rpc", error))
+    }
+
+    fn send_cluster_membership_rpc(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, sinomo_network::NetworkError> {
+        crate::send_daemon_rpc_to_endpoint(endpoint, request, timeout)
+            .map_err(|error| daemon_host_network_error("cluster membership rpc", error))
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, sinomo_network::NetworkError> {
+        relay_rpc_to_node_via_peer(state, target_node_id, peer, request, timeout)
+            .map_err(|error| daemon_host_network_error("cluster relay", error))
+    }
+
+    fn record_endpoint_command_connectivity(
         &mut self,
         paths: &ClusterPaths,
-        local_node_id: &NodeId,
-        snapshot: KvSnapshot,
-    ) -> Result<bool, sinomo_network::NetworkError> {
-        locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
-            .map_err(|error| daemon_host_network_error("cluster raft snapshot restore", error))
+        state: &ClusterBootstrapState,
+        endpoint: &ClusterEndpointRecord,
+        connectivity_state: sinomo_network::ClusterConnectivityState,
+        latency_ms: Option<u64>,
+    ) {
+        remember_cluster_endpoint_command_connectivity(
+            paths,
+            state,
+            endpoint,
+            connectivity_state,
+            latency_ms,
+        );
+    }
+
+    fn published_network_info_matches(
+        &mut self,
+        paths: &ClusterPaths,
+        info: &ClusterNetworkInfoRecord,
+    ) -> bool {
+        cached_network_info_matches(paths, info)
+    }
+
+    fn remember_published_network_info(
+        &mut self,
+        paths: &ClusterPaths,
+        info: &ClusterNetworkInfoRecord,
+    ) {
+        remember_network_info(paths, info);
+    }
+
+    fn published_node_status_matches(
+        &mut self,
+        paths: &ClusterPaths,
+        status: &ClusterNodeStatusRecord,
+    ) -> bool {
+        cached_node_status_matches(paths, status)
+    }
+
+    fn remember_published_node_status(
+        &mut self,
+        paths: &ClusterPaths,
+        status: &ClusterNodeStatusRecord,
+    ) {
+        remember_node_status(paths, status);
+    }
+
+    fn published_connectivity_record_set_matches(
+        &mut self,
+        paths: &ClusterPaths,
+        source_node_id: &NodeId,
+        records: &[ClusterConnectivityRecord],
+    ) -> bool {
+        cached_connectivity_record_set_matches(paths, source_node_id, records)
+    }
+
+    fn remember_published_connectivity_record_set(
+        &mut self,
+        paths: &ClusterPaths,
+        source_node_id: &NodeId,
+        records: &[ClusterConnectivityRecord],
+    ) {
+        remember_connectivity_record_set(paths, source_node_id, records);
+    }
+
+    fn fan_out_committed_cluster_raft_command(
+        &mut self,
+        paths: ClusterPaths,
+        state: ClusterBootstrapState,
+        events: Vec<KvEvent>,
+        _targets: Vec<ClusterEndpointRecord>,
+    ) {
+        crate::cluster::fan_out_committed_cluster_raft_command(paths, state, events);
+    }
+
+    fn on_raft_append_sent(&mut self) {
+        if let Some(stats) = crate::process_idle_stats() {
+            stats.incr_raft_appends_sent();
+        }
     }
 }
 
@@ -2158,78 +2288,18 @@ pub(crate) fn sync_cluster_node_status_to_kv(
     paths: &ClusterPaths,
     status: ClusterNodeStatusRecord,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let mut host = DaemonClusterNodeStatusPublishHost;
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::publish_cluster_node_status_to_quorum_with_host(paths, status, &mut host)
-}
-
-struct DaemonClusterNodeStatusPublishHost;
-
-impl sinomo_network::ClusterNodeStatusPublishHost for DaemonClusterNodeStatusPublishHost {
-    type Error = DaemonError;
-
-    fn published_node_status_matches(
-        &mut self,
-        paths: &ClusterPaths,
-        status: &ClusterNodeStatusRecord,
-    ) -> bool {
-        cached_node_status_matches(paths, status)
-    }
-
-    fn remember_published_node_status(
-        &mut self,
-        paths: &ClusterPaths,
-        status: &ClusterNodeStatusRecord,
-    ) {
-        remember_node_status(paths, status);
-    }
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn)
-    }
+        .map_err(Into::into)
 }
 
 pub(crate) fn sync_cluster_network_info_to_kv(
     paths: &ClusterPaths,
     info: ClusterNetworkInfoRecord,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let mut host = DaemonClusterNetworkInfoPublishHost;
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::publish_cluster_network_info_to_quorum_with_host(paths, info, &mut host)
-}
-
-struct DaemonClusterNetworkInfoPublishHost;
-
-impl sinomo_network::ClusterNetworkInfoPublishHost for DaemonClusterNetworkInfoPublishHost {
-    type Error = DaemonError;
-
-    fn published_network_info_matches(
-        &mut self,
-        paths: &ClusterPaths,
-        info: &ClusterNetworkInfoRecord,
-    ) -> bool {
-        cached_network_info_matches(paths, info)
-    }
-
-    fn remember_published_network_info(
-        &mut self,
-        paths: &ClusterPaths,
-        info: &ClusterNetworkInfoRecord,
-    ) {
-        remember_network_info(paths, info);
-    }
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn)
-    }
+        .map_err(Into::into)
 }
 
 pub(crate) fn sync_cluster_connectivity_records_to_kv(
@@ -2237,46 +2307,14 @@ pub(crate) fn sync_cluster_connectivity_records_to_kv(
     source_node_id: &NodeId,
     records: Vec<ClusterConnectivityRecord>,
 ) -> Result<Option<KvSnapshot>, DaemonError> {
-    let mut host = DaemonClusterConnectivityPublishHost;
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::sync_cluster_connectivity_records_to_quorum_with_host(
         paths,
         source_node_id,
         records,
         &mut host,
     )
-}
-
-struct DaemonClusterConnectivityPublishHost;
-
-impl sinomo_network::ClusterConnectivityPublishHost for DaemonClusterConnectivityPublishHost {
-    type Error = DaemonError;
-
-    fn published_connectivity_record_set_matches(
-        &mut self,
-        paths: &ClusterPaths,
-        source_node_id: &NodeId,
-        records: &[ClusterConnectivityRecord],
-    ) -> bool {
-        cached_connectivity_record_set_matches(paths, source_node_id, records)
-    }
-
-    fn remember_published_connectivity_record_set(
-        &mut self,
-        paths: &ClusterPaths,
-        source_node_id: &NodeId,
-        records: &[ClusterConnectivityRecord],
-    ) {
-        remember_connectivity_record_set(paths, source_node_id, records);
-    }
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn)
-    }
+    .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -2336,6 +2374,38 @@ fn local_daemon_membership_observation(
     })
 }
 
+fn local_daemon_membership_observation_from_daemon_paths(
+    paths: &DaemonPaths,
+    state: &ClusterBootstrapState,
+) -> Result<sinomo_network::ClusterLocalDaemonMembershipObservation, DaemonError> {
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let now = OffsetDateTime::now_utc();
+    let (main_options, shadow_options) = if let Ok(main_status) = read_daemon_status(paths) {
+        let shadow_options = match probe_daemon_status(
+            &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
+            DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
+        ) {
+            DaemonProbeStatus::Running(status)
+            | DaemonProbeStatus::Locked {
+                status: Some(status),
+            } => daemon_options_from_status(&status),
+            DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+                DaemonRunOptions::shadow_default()
+            }
+        };
+        (daemon_options_from_status(&main_status), shadow_options)
+    } else {
+        (
+            DaemonRunOptions::default(),
+            DaemonRunOptions::shadow_default(),
+        )
+    };
+    local_daemon_membership_observation(data_dir, state, &main_options, &shadow_options, now)
+}
+
 fn refresh_local_daemon_membership(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
@@ -2362,11 +2432,12 @@ pub(crate) fn cluster_has_local_quorum(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
 ) -> bool {
+    let mut host = daemon_cluster_control_plane_driver();
     sinomo_network::cluster_has_local_quorum_with_host(
         paths,
         state,
         cluster_voter_reachability_options(),
-        &mut DaemonClusterVoterReachabilityHost,
+        &mut host,
     )
 }
 
@@ -2380,7 +2451,7 @@ fn fan_out_committed_cluster_raft_command(
         state,
         events,
         cluster_raft_committed_fanout_options(),
-        || DaemonClusterRaftCommittedFanoutHost,
+        daemon_cluster_control_plane_driver,
     );
 }
 
@@ -2392,7 +2463,7 @@ pub(crate) fn commit_cluster_kv_txn_with_quorum(
     commit_cluster_kv_txn_with_quorum_response(paths, state, txn).map(|(snapshot, _)| snapshot)
 }
 
-pub(crate) fn commit_cluster_kv_txn_with_quorum_response(
+fn commit_cluster_kv_txn_with_quorum_response(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,
     txn: KvTxn,
@@ -2406,7 +2477,7 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding(
     txn: KvTxn,
     allow_forwarding: bool,
 ) -> Result<(KvSnapshot, Option<KvTxnResponse>), DaemonError> {
-    let mut host = DaemonClusterKvTxnQuorumHost;
+    let mut host = daemon_cluster_control_plane_driver();
     let result = sinomo_network::commit_cluster_kv_txn_with_quorum_response_with_host(
         paths,
         state,
@@ -2415,115 +2486,6 @@ fn commit_cluster_kv_txn_with_quorum_response_with_forwarding(
         &mut host,
     )?;
     Ok((result.snapshot, result.txn_response))
-}
-
-struct DaemonClusterKvTxnQuorumHost;
-
-impl sinomo_network::ClusterKvTxnQuorumHost for DaemonClusterKvTxnQuorumHost {
-    fn refresh_current_cluster_kv_store(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<(), sinomo_network::NetworkError> {
-        current_cluster_kv_store(paths, state)
-            .map(|_| ())
-            .map_err(|error| daemon_host_network_error("cluster kv snapshot refresh", error))
-    }
-
-    fn local_is_raft_leader(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<bool, sinomo_network::NetworkError> {
-        locked_cluster_raft_local_is_leader(paths, state)
-            .map_err(|error| daemon_host_network_error("cluster raft leader check", error))
-    }
-
-    fn forward_cluster_kv_txn_to_voter(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        txn: &KvTxn,
-        options: sinomo_network::ClusterKvTxnForwardOptions,
-    ) -> Result<Option<sinomo_network::ClusterKvTxnForwardResult>, sinomo_network::NetworkError>
-    {
-        sinomo_network::forward_cluster_kv_txn_to_voter_with_host(
-            paths,
-            state,
-            txn,
-            options,
-            &mut DaemonClusterKvTxnForwardHost,
-        )
-    }
-
-    fn elect_cluster_raft_leader(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        options: sinomo_network::ClusterRaftLeaderElectionOptions,
-    ) -> Result<bool, sinomo_network::NetworkError> {
-        sinomo_network::elect_cluster_raft_leader_with_host(
-            paths,
-            state,
-            options,
-            &mut DaemonClusterRaftVoteTransportHost,
-        )
-    }
-
-    fn reachable_voter_count(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        options: sinomo_network::ClusterVoterReachabilityOptions,
-    ) -> usize {
-        sinomo_network::cluster_reachable_voter_count_with_host(
-            paths,
-            state,
-            options,
-            &mut DaemonClusterVoterReachabilityHost,
-        )
-    }
-
-    fn commit_cluster_raft_command_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        command: KvCommand,
-        options: sinomo_network::ClusterRaftQuorumCommitOptions,
-    ) -> Result<sinomo_network::ClusterRaftQuorumCommitResult, sinomo_network::NetworkError> {
-        sinomo_network::commit_cluster_raft_command_with_local_storage_and_transport(
-            paths,
-            state,
-            command,
-            options,
-            cluster_control_plane_timeouts(),
-            |endpoint, request, timeout| {
-                send_cluster_raft_append(endpoint, request, timeout).map_err(|error| {
-                    sinomo_network::NetworkError::Io {
-                        operation: "cluster raft quorum replication".to_string(),
-                        detail: error.to_string(),
-                    }
-                })
-            },
-            |paths, state, endpoint, connectivity_state, latency_ms| {
-                remember_cluster_endpoint_command_connectivity(
-                    paths,
-                    state,
-                    endpoint,
-                    connectivity_state,
-                    latency_ms,
-                );
-            },
-            |paths, state, events, _targets| {
-                fan_out_committed_cluster_raft_command(paths, state, events);
-            },
-            || {
-                if let Some(stats) = crate::process_idle_stats() {
-                    stats.incr_raft_appends_sent();
-                }
-            },
-        )
-    }
 }
 
 /// Per-hop timeout for a relayed cluster RPC. The first hop waits for the whole downstream
@@ -2611,7 +2573,6 @@ fn send_cluster_relay_request_to_next_hop(
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
     let request_auth = crate::sign_daemon_rpc_request_for_local_node(request)?;
     let command = crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE);
-    let timeout = cluster_voter_reachability_options().fair_command_timeout(endpoint, timeout);
     sinomo_network::send_daemon_rpc_to_cluster_endpoint(
         endpoint,
         &command,
@@ -2654,146 +2615,6 @@ fn relay_local_delivery_address(
     Ok(Some(daemon_connect_address("127.0.0.1", port)))
 }
 
-fn replicate_cluster_raft_to_endpoint_with_timeout_result(
-    paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    endpoint: &ClusterEndpointRecord,
-    timeout: Duration,
-    watch_events: &[KvEvent],
-) -> Result<sinomo_network::ClusterRaftAppendReplicationOutcome, DaemonError> {
-    sinomo_network::replicate_cluster_raft_to_endpoint_with_local_host(
-        paths,
-        state,
-        endpoint,
-        watch_events,
-        cluster_raft_append_replication_options(timeout),
-        |endpoint, request, timeout| {
-            send_cluster_raft_append(endpoint, request, timeout).map_err(|error| {
-                sinomo_network::NetworkError::Io {
-                    operation: "cluster raft append".to_string(),
-                    detail: error.to_string(),
-                }
-            })
-        },
-        || {
-            if let Some(stats) = crate::process_idle_stats() {
-                stats.incr_raft_appends_sent();
-            }
-        },
-    )
-    .map_err(Into::into)
-}
-
-struct DaemonClusterRaftCommittedFanoutHost;
-
-impl sinomo_network::ClusterRaftCommittedFanoutHost for DaemonClusterRaftCommittedFanoutHost {
-    fn replicate_cluster_raft_to_endpoint(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-        watch_events: &[KvEvent],
-        timeout: Duration,
-    ) -> Result<sinomo_network::ClusterRaftAppendReplicationOutcome, sinomo_network::NetworkError>
-    {
-        replicate_cluster_raft_to_endpoint_with_timeout_result(
-            paths,
-            state,
-            endpoint,
-            timeout,
-            watch_events,
-        )
-        .map_err(|error| daemon_host_network_error("cluster raft committed fanout", error))
-    }
-
-    fn send_cluster_kv_watch_events(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterKvWatchEventsRequest,
-        timeout: Duration,
-    ) -> Result<ClusterKvWatchEventsResponse, sinomo_network::NetworkError> {
-        send_cluster_kv_watch_events(endpoint, request, timeout)
-            .map_err(|error| daemon_host_network_error("cluster kv watch-event fanout", error))
-    }
-}
-
-struct DaemonClusterVoterReachabilityHost;
-
-impl sinomo_network::ClusterVoterReachabilityHost for DaemonClusterVoterReachabilityHost {
-    fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
-        fetch_daemon_status_from_endpoint(endpoint, timeout).is_ok()
-    }
-}
-
-struct DaemonClusterRaftVoteTransportHost;
-
-impl sinomo_network::ClusterRaftVoteTransportHost for DaemonClusterRaftVoteTransportHost {
-    fn send_raft_vote(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterRaftVoteRequest,
-        timeout: Duration,
-    ) -> Result<ClusterRaftVoteResponse, sinomo_network::NetworkError> {
-        send_cluster_raft_vote(endpoint, request, timeout).map_err(|error| {
-            sinomo_network::NetworkError::Io {
-                operation: "cluster raft vote".to_string(),
-                detail: error.to_string(),
-            }
-        })
-    }
-}
-
-struct DaemonClusterKvTxnForwardHost;
-
-impl sinomo_network::ClusterKvTxnForwardHost for DaemonClusterKvTxnForwardHost {
-    fn known_raft_leader_id(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Result<Option<NodeId>, sinomo_network::NetworkError> {
-        sinomo_network::locked_cluster_raft_known_leader_id(paths, state)
-    }
-
-    fn send_cluster_kv_txn(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        txn: &KvTxn,
-        timeout: Duration,
-    ) -> Result<KvTxnResponse, sinomo_network::NetworkError> {
-        send_cluster_kv_txn(endpoint, txn, timeout)
-            .map_err(|error| daemon_host_network_error("cluster kv txn", error))
-    }
-
-    fn fetch_cluster_kv_snapshot(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
-        fetch_cluster_kv_snapshot_from_endpoint(endpoint, timeout)
-            .map_err(|error| daemon_host_network_error("cluster kv snapshot", error))
-    }
-
-    fn relay_peers(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> Vec<ClusterEndpointRecord> {
-        sinomo_network::cluster_member_publish_targets(paths, state)
-    }
-
-    fn relay_rpc_to_node(
-        &mut self,
-        state: &ClusterBootstrapState,
-        target_node_id: &NodeId,
-        peer: &ClusterEndpointRecord,
-        request: &sinomo_network::ObjectRpcRequest,
-        timeout: Duration,
-    ) -> Result<sinomo_network::ObjectRpcResponse, sinomo_network::NetworkError> {
-        relay_rpc_to_node_via_peer(state, target_node_id, peer, request, timeout)
-            .map_err(|error| daemon_host_network_error("cluster relay", error))
-    }
-}
-
 fn daemon_host_network_error(operation: &str, error: DaemonError) -> sinomo_network::NetworkError {
     sinomo_network::NetworkError::Io {
         operation: operation.to_string(),
@@ -2805,6 +2626,7 @@ fn cluster_control_plane_timeouts() -> sinomo_network::ClusterControlPlaneTimeou
     sinomo_network::ClusterControlPlaneTimeouts::default_daemon_transport()
 }
 
+#[cfg(test)]
 fn cluster_raft_append_replication_options(
     timeout: Duration,
 ) -> sinomo_network::ClusterRaftAppendReplicationOptions {
@@ -2815,8 +2637,7 @@ fn cluster_raft_committed_fanout_options() -> sinomo_network::ClusterRaftCommitt
     cluster_control_plane_timeouts().committed_fanout_options()
 }
 
-pub(crate) fn cluster_voter_reachability_options() -> sinomo_network::ClusterVoterReachabilityOptions
-{
+fn cluster_voter_reachability_options() -> sinomo_network::ClusterVoterReachabilityOptions {
     cluster_control_plane_timeouts().voter_reachability_options()
 }
 
@@ -2824,10 +2645,6 @@ fn cluster_kv_txn_quorum_options(
     allow_forwarding: bool,
 ) -> sinomo_network::ClusterKvTxnQuorumOptions {
     cluster_control_plane_timeouts().kv_txn_quorum_options(allow_forwarding)
-}
-
-fn cluster_kv_snapshot_refresh_options() -> sinomo_network::ClusterKvSnapshotRefreshOptions {
-    cluster_control_plane_timeouts().kv_snapshot_refresh_options()
 }
 
 #[cfg(test)]
@@ -2838,73 +2655,6 @@ fn cluster_raft_append_attempt_timeout(
 ) -> Duration {
     cluster_raft_append_replication_options(remaining)
         .append_attempt_timeout(endpoint, remaining, request)
-}
-
-pub(crate) struct DaemonClusterMemberPublishHost;
-
-impl sinomo_network::ClusterMemberPublishHost for DaemonClusterMemberPublishHost {
-    type Error = DaemonError;
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn)
-    }
-}
-
-struct DaemonClusterLocalMemberPublishHost;
-
-impl sinomo_network::ClusterLocalMemberPublishHost for DaemonClusterLocalMemberPublishHost {
-    fn cluster_has_local_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-    ) -> bool {
-        cluster_has_local_quorum(paths, state)
-    }
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, sinomo_network::NetworkError> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn).map_err(|error| match error {
-            DaemonError::ClusterOrphan => sinomo_network::NetworkError::ClusterOrphan,
-            DaemonError::ClusterReadOnly { detail } => {
-                sinomo_network::NetworkError::ClusterReadOnly { detail }
-            }
-            other => daemon_host_network_error("cluster local member publish commit", other),
-        })
-    }
-
-    fn send_cluster_member_publish(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterMemberPublishRequest,
-        timeout: Duration,
-    ) -> Result<ClusterMemberPublishResponse, sinomo_network::NetworkError> {
-        crate::client::send_cluster_member_publish(endpoint, request, timeout)
-            .map_err(|error| daemon_host_network_error("cluster local member publish rpc", error))
-    }
-}
-
-pub(crate) struct DaemonClusterInvitePublishHost;
-
-impl sinomo_network::ClusterInvitePublishHost for DaemonClusterInvitePublishHost {
-    type Error = DaemonError;
-
-    fn commit_cluster_kv_txn_with_quorum(
-        &mut self,
-        paths: &ClusterPaths,
-        state: &mut ClusterBootstrapState,
-        txn: KvTxn,
-    ) -> Result<KvSnapshot, Self::Error> {
-        commit_cluster_kv_txn_with_quorum(paths, state, txn)
-    }
 }
 
 #[cfg(test)]
@@ -3078,7 +2828,7 @@ mod tests {
             now,
         );
 
-        let mut host = DaemonClusterMemberMutationHost;
+        let mut host = DaemonClusterMemberMutationHost::new();
         sinomo_network::ClusterMemberMutationHost::prepare_cluster_state_for_kv_sync(
             &mut host,
             &cluster_paths,
@@ -4789,6 +4539,8 @@ mod tests {
             },
         )
         .expect("member publish rpc request");
+        let mut member_host = daemon_cluster_control_plane_driver();
+        let mut invite_host = daemon_cluster_control_plane_driver();
         let response = sinomo_network::handle_cluster_membership_rpc_request_with_hosts(
             &cluster_paths,
             request,
@@ -4796,8 +4548,8 @@ mod tests {
             &authenticated.signer_public_key,
             now,
             &mut DaemonClusterJoinRegistrationHost::new(&daemon_paths),
-            &mut DaemonClusterMemberPublishHost,
-            &mut DaemonClusterInvitePublishHost,
+            &mut member_host,
+            &mut invite_host,
         )
         .expect("member publish response");
         let response: ClusterMemberPublishResponse =
