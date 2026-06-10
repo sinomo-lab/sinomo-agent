@@ -6367,6 +6367,26 @@ where
         self.agent_definition = definition;
         Ok(())
     }
+
+    pub(crate) fn replace_agent_session(
+        &mut self,
+        interaction_session: &InteractionSession,
+        transcript: sinomo_agent::AgentTranscript,
+    ) -> Result<(), CliError> {
+        let mut agent_session = AgentSession::new(
+            interaction_session.session_id.clone(),
+            self.agent_definition.role.clone(),
+        );
+        agent_session.transcript = transcript.clone();
+        agent_session.raw_transcript = transcript;
+        let cursor = {
+            let runtime = self.ensure_runtime(interaction_session)?;
+            runtime.replace_session(agent_session)?;
+            runtime.runtime_event_cursor()?
+        };
+        self.runtime_cursor = cursor;
+        Ok(())
+    }
 }
 
 impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {

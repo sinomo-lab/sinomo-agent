@@ -5,9 +5,13 @@
 //! crate-internal handler types. Everything here returns plain data so the app
 //! never depends on `tui` internals.
 
+use std::thread;
+use std::time::Duration;
+
 use sinomo_agent::{
-    AgentCatalog, AgentDefinition, InteractionOutput, InteractionSession, InteractionSurface,
-    InteractionSurfaceKind,
+    AgentCatalog, AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeEvent,
+    AgentRuntimeEventPayload, AgentToolProgressEvent, InteractionOutput, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, TaskId,
 };
 use sinomo_lm::{
     AnthropicConfig, ClaudeCodeConfig, CodexCliConfig, GeminiConfig, GitHubCopilotConfig,
@@ -23,6 +27,7 @@ use crate::tui::{
 };
 
 type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
+const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The active agent / model selection, as plain strings.
 #[derive(Clone, Debug, Default)]
@@ -55,6 +60,13 @@ pub enum ChatStreamEvent {
     Notice(String),
     /// Token accounting for the just-finished turn.
     Usage { provider: String, model: String },
+}
+
+/// One visible message restored into a GUI chat runtime.
+#[derive(Clone, Debug)]
+pub struct ChatHistoryMessage {
+    pub role: String,
+    pub text: String,
 }
 
 /// A selectable agent.
@@ -96,15 +108,29 @@ impl AgentChat {
 
     /// Begin a brand-new session (clears the in-memory transcript/context).
     pub fn reset_session(&mut self) {
+        let session = app_session(None);
         self.runtime
-            .replace_store_and_session(InMemoryEventStore::new(), app_session(None));
+            .replace_store_and_session(InMemoryEventStore::new(), session.clone());
+        let _ = self
+            .runtime
+            .handler_mut()
+            .replace_agent_session(&session, agent_transcript_from_history(&[]));
     }
 
     /// Adopt an existing session id for continued turns (fresh in-memory context;
     /// the visible transcript is restored by the caller from its own store).
-    pub fn resume_session(&mut self, session_id: &str) {
+    pub fn resume_session(
+        &mut self,
+        session_id: &str,
+        history: &[ChatHistoryMessage],
+    ) -> Result<(), CliError> {
+        let session = app_session(Some(session_id));
         self.runtime
-            .replace_store_and_session(InMemoryEventStore::new(), app_session(Some(session_id)));
+            .replace_store_and_session(InMemoryEventStore::new(), session.clone());
+        self.runtime
+            .handler_mut()
+            .replace_agent_session(&session, agent_transcript_from_history(history))?;
+        Ok(())
     }
 
     pub fn session_id(&self) -> String {
@@ -126,6 +152,7 @@ impl AgentChat {
         for output in trailing {
             forward_output(output, on_event);
         }
+        drain_runtime_events(&mut self.runtime, on_event)?;
         Ok(())
     }
 
@@ -160,6 +187,198 @@ impl AgentChat {
             self.daemon_connected,
         )?;
         Ok(info.into())
+    }
+}
+
+fn agent_transcript_from_history(history: &[ChatHistoryMessage]) -> sinomo_agent::AgentTranscript {
+    let mut transcript = sinomo_agent::AgentTranscript::new();
+    for (index, message) in history.iter().enumerate() {
+        if message.text.trim().is_empty() {
+            continue;
+        }
+        match message.role.as_str() {
+            "user" => transcript.push(AgentItem::UserMessage {
+                item_id: TaskId::generate(),
+                step_index: index,
+                content: message.text.clone(),
+                event_id: None,
+            }),
+            "agent" | "assistant" => transcript.push(AgentItem::AssistantText {
+                item_id: TaskId::generate(),
+                step_index: index,
+                content: message.text.clone(),
+            }),
+            _ => {}
+        }
+    }
+    transcript
+}
+
+fn drain_runtime_events(
+    runtime: &mut InteractionRuntime<InMemoryEventStore, Handler>,
+    on_event: &mut dyn FnMut(ChatStreamEvent),
+) -> Result<(), CliError> {
+    let mut saw_worker = false;
+    let mut terminal = false;
+    let mut failure = None;
+    let mut streamed_text = String::new();
+
+    loop {
+        let events = runtime.handler_mut().drain_runtime_events()?;
+        if events.is_empty() {
+            if saw_worker && !terminal {
+                thread::sleep(APP_CHAT_RUNTIME_DRAIN_INTERVAL);
+                continue;
+            }
+            break;
+        }
+
+        for event in events {
+            match runtime_event_to_chat(event, &mut streamed_text, on_event) {
+                RuntimeDrainState::Running => {
+                    saw_worker = true;
+                }
+                RuntimeDrainState::TerminalOk => {
+                    terminal = true;
+                }
+                RuntimeDrainState::TerminalErr(detail) => {
+                    terminal = true;
+                    failure = Some(detail);
+                }
+                RuntimeDrainState::Noop => {}
+            }
+        }
+
+        if terminal {
+            break;
+        }
+        if saw_worker {
+            thread::sleep(APP_CHAT_RUNTIME_DRAIN_INTERVAL);
+        } else {
+            break;
+        }
+    }
+
+    if let Some(detail) = failure {
+        return Err(CliError::Parse { detail });
+    }
+    Ok(())
+}
+
+enum RuntimeDrainState {
+    Noop,
+    Running,
+    TerminalOk,
+    TerminalErr(String),
+}
+
+fn runtime_event_to_chat(
+    event: AgentRuntimeEvent,
+    streamed_text: &mut String,
+    on_event: &mut dyn FnMut(ChatStreamEvent),
+) -> RuntimeDrainState {
+    match event.payload {
+        AgentRuntimeEventPayload::WorkerStarted { action, .. } => {
+            on_event(ChatStreamEvent::Notice(format!(
+                "agent task started: {action}"
+            )));
+            RuntimeDrainState::Running
+        }
+        AgentRuntimeEventPayload::WorkerCompleted { .. } => RuntimeDrainState::TerminalOk,
+        AgentRuntimeEventPayload::WorkerFailed { detail, .. } => {
+            RuntimeDrainState::TerminalErr(detail)
+        }
+        AgentRuntimeEventPayload::TurnFinalDecision { decision, .. } => {
+            let text = decision.text.trim();
+            if !text.is_empty() {
+                if streamed_text.trim().is_empty() {
+                    streamed_text.push_str(text);
+                    on_event(ChatStreamEvent::Token(text.to_string()));
+                } else if text.starts_with(streamed_text.as_str()) {
+                    let suffix = &text[streamed_text.len()..];
+                    if !suffix.is_empty() {
+                        streamed_text.push_str(suffix);
+                        on_event(ChatStreamEvent::Token(suffix.to_string()));
+                    }
+                }
+            }
+            RuntimeDrainState::Running
+        }
+        AgentRuntimeEventPayload::ModelProgress { event, .. } => {
+            forward_model_event(event, streamed_text, on_event);
+            RuntimeDrainState::Running
+        }
+        AgentRuntimeEventPayload::ToolProgress { event, .. } => {
+            forward_tool_event(event, on_event);
+            RuntimeDrainState::Running
+        }
+        AgentRuntimeEventPayload::ControlEvent { .. } => RuntimeDrainState::Noop,
+    }
+}
+
+fn forward_model_event(
+    event: AgentModelEvent,
+    streamed_text: &mut String,
+    on_event: &mut dyn FnMut(ChatStreamEvent),
+) {
+    match event {
+        AgentModelEvent::Started {
+            provider, model, ..
+        } => on_event(ChatStreamEvent::Notice(format!(
+            "model started: {provider}/{model}"
+        ))),
+        AgentModelEvent::AssistantTextDelta { delta, .. } => {
+            streamed_text.push_str(&delta);
+            on_event(ChatStreamEvent::Token(delta));
+        }
+        AgentModelEvent::AssistantReasoningSummary { summary, .. } => {
+            if !summary.trim().is_empty() {
+                on_event(ChatStreamEvent::Notice(summary));
+            }
+        }
+        AgentModelEvent::ToolCallStarted { tool, .. } => {
+            on_event(ChatStreamEvent::Notice(format!("using tool: {tool}")));
+        }
+        AgentModelEvent::ToolCallDelta { .. } => {}
+        AgentModelEvent::ToolCallCompleted { call, .. } => {
+            on_event(ChatStreamEvent::Notice(format!(
+                "tool completed: {}",
+                call.tool
+            )));
+        }
+        AgentModelEvent::Usage {
+            provider, model, ..
+        } => on_event(ChatStreamEvent::Usage { provider, model }),
+        AgentModelEvent::Finished { .. } => {}
+        AgentModelEvent::Error { detail, .. } => {
+            on_event(ChatStreamEvent::Notice(format!("model failed: {detail}")));
+        }
+        AgentModelEvent::Aborted { reason } => {
+            on_event(ChatStreamEvent::Notice(format!("model aborted: {reason}")));
+        }
+    }
+}
+
+fn forward_tool_event(event: AgentToolProgressEvent, on_event: &mut dyn FnMut(ChatStreamEvent)) {
+    match event {
+        AgentToolProgressEvent::ProcessStarted { process } => {
+            on_event(ChatStreamEvent::Notice(format!(
+                "command started: {}",
+                process.command
+            )));
+        }
+        AgentToolProgressEvent::ProcessOutput { .. } => {}
+        AgentToolProgressEvent::ProcessCompleted { process } => {
+            on_event(ChatStreamEvent::Notice(format!(
+                "command finished: {}",
+                process.command
+            )));
+        }
+        AgentToolProgressEvent::Message { summary, .. } => {
+            if !summary.trim().is_empty() {
+                on_event(ChatStreamEvent::Notice(summary));
+            }
+        }
     }
 }
 
@@ -357,6 +576,18 @@ impl SifsBrowser {
         Ok(entries)
     }
 
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        self.backend.read_file(path)
+    }
+
+    pub fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        self.backend.write_file(path, bytes)
+    }
+
+    pub fn create_dir_all(&self, path: &str) -> Result<(), String> {
+        self.backend.create_dir_all(path)
+    }
+
     pub fn parent(&self, path: &str) -> Option<String> {
         self.backend.parent_path(path)
     }
@@ -365,5 +596,93 @@ impl SifsBrowser {
         self.backend
             .normalize_path(path)
             .unwrap_or_else(|_| "/".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_agent::{
+        AgentInteractionState, AgentLoopDecision, AgentLoopResponseMode, AgentStopReason,
+    };
+
+    fn chat_event_label(event: ChatStreamEvent) -> String {
+        match event {
+            ChatStreamEvent::Token(token) => format!("token:{token}"),
+            ChatStreamEvent::Notice(notice) => format!("notice:{notice}"),
+            ChatStreamEvent::Usage { provider, model } => format!("usage:{provider}/{model}"),
+        }
+    }
+
+    fn final_decision(text: &str) -> AgentLoopDecision {
+        AgentLoopDecision {
+            response_mode: AgentLoopResponseMode::Answer,
+            text: text.to_string(),
+            tool_calls: Vec::new(),
+            background_handoff: None,
+            next_state: AgentInteractionState::Idle,
+        }
+    }
+
+    fn runtime_event(payload: AgentRuntimeEventPayload) -> AgentRuntimeEvent {
+        AgentRuntimeEvent::new(SessionId::generate(), payload)
+    }
+
+    #[test]
+    fn chat_mapper_emits_final_decision_without_streaming_delta() {
+        let mut streamed_text = String::new();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+
+        let state = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+                sequence: 1,
+                op_id: TaskId::generate(),
+                decision: final_decision("ready"),
+                stop_reason: AgentStopReason::FinalDecision,
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+
+        assert!(matches!(state, RuntimeDrainState::Running));
+        assert_eq!(events, vec!["token:ready"]);
+        assert_eq!(streamed_text, "ready");
+    }
+
+    #[test]
+    fn chat_mapper_appends_only_final_suffix_after_streaming_delta() {
+        let mut streamed_text = String::new();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+        let op_id = TaskId::generate();
+
+        let first = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::ModelProgress {
+                sequence: 1,
+                op_id: op_id.clone(),
+                event: AgentModelEvent::AssistantTextDelta {
+                    step_index: 0,
+                    delta: "hello".to_string(),
+                },
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+        let final_state = runtime_event_to_chat(
+            runtime_event(AgentRuntimeEventPayload::TurnFinalDecision {
+                sequence: 2,
+                op_id,
+                decision: final_decision("hello world"),
+                stop_reason: AgentStopReason::FinalDecision,
+            }),
+            &mut streamed_text,
+            &mut on_event,
+        );
+
+        assert!(matches!(first, RuntimeDrainState::Running));
+        assert!(matches!(final_state, RuntimeDrainState::Running));
+        assert_eq!(events, vec!["token:hello", "token: world"]);
+        assert_eq!(streamed_text, "hello world");
     }
 }

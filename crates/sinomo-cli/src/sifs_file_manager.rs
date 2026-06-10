@@ -50,6 +50,43 @@ impl SifsFileManagerBackend {
             .map(|service| service.node_id().to_string())
             .unwrap_or_default()
     }
+
+    pub(crate) fn read_file(&self, path: &str) -> Result<Vec<u8>, String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        service
+            .posix_read_file_distributed(&path)
+            .map_err(|error| format!("cannot read SIFS file {path}: {error}"))
+    }
+
+    pub(crate) fn write_file(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        if let Some(parent) = parent_sifs_path(&path) {
+            service
+                .posix_mkdir_all(&parent)
+                .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
+        }
+        let options = sifs_write_options(&service);
+        service
+            .posix_write_file(&path, bytes, options)
+            .map(|_| ())
+            .map_err(|error| format!("cannot write SIFS file {path}: {error}"))?;
+        drop(service);
+        self.publish_metadata_after_mutation();
+        Ok(())
+    }
+
+    pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
+        let path = normalize_sifs_path(path)?;
+        let mut service = self.lock_service()?;
+        service
+            .posix_mkdir_all(&path)
+            .map_err(|error| format!("cannot create SIFS directory {path}: {error}"))?;
+        drop(service);
+        self.publish_metadata_after_mutation();
+        Ok(())
+    }
 }
 
 impl FileManagerBackend for SifsFileManagerBackend {
@@ -400,6 +437,19 @@ fn normalize_sifs_path(path: &str) -> Result<String, String> {
     } else {
         Ok(format!("/{}", parts.join("/")))
     }
+}
+
+fn parent_sifs_path(path: &str) -> Option<String> {
+    let path = normalize_sifs_path(path).ok()?;
+    if path == "/" {
+        return None;
+    }
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
 }
 
 #[cfg(test)]

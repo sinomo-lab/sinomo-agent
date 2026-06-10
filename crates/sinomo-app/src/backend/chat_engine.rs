@@ -8,7 +8,7 @@
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 
-use sinomo_cli::app_api::{AgentChat, ChatRuntimeInfo, ChatStreamEvent};
+use sinomo_cli::app_api::{AgentChat, ChatHistoryMessage, ChatRuntimeInfo, ChatStreamEvent};
 use sinomo_runtime::local::SinomoDataDir;
 
 /// Who authored a chat message.
@@ -45,7 +45,10 @@ impl From<ChatRuntimeInfo> for RuntimeInfo {
 pub enum ChatCommand {
     Send(String),
     NewSession,
-    Resume(String),
+    Resume {
+        session_id: String,
+        history: Vec<ChatHistoryMessage>,
+    },
     SetModel {
         provider: String,
         model: String,
@@ -165,8 +168,13 @@ fn worker(
                     session_id: chat.session_id(),
                 });
             }
-            ChatCommand::Resume(session_id) => {
-                chat.resume_session(&session_id);
+            ChatCommand::Resume {
+                session_id,
+                history,
+            } => {
+                if let Err(error) = chat.resume_session(&session_id, &history) {
+                    let _ = evt_tx.send(ChatEvent::Error(format!("resume failed: {error}")));
+                }
             }
             ChatCommand::SetModel {
                 provider,

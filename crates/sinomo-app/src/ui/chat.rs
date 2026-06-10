@@ -45,7 +45,9 @@ use sui::{
     SurfaceRole, TextArea, Widget, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, draw_glyph,
 };
 
-use sinomo_cli::app_api::{AgentSummary, ProviderSummary, agent_summaries, reasoning_efforts};
+use sinomo_cli::app_api::{
+    AgentSummary, ChatHistoryMessage, ProviderSummary, agent_summaries, reasoning_efforts,
+};
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::Backend;
@@ -211,6 +213,14 @@ impl ChatState {
         };
         let id = session.id.clone();
         let transcript = sessions::load_transcript(&self.data_dir, &id).unwrap_or_default();
+        let history: Vec<ChatHistoryMessage> = transcript
+            .messages
+            .iter()
+            .map(|m| ChatHistoryMessage {
+                role: m.role.clone(),
+                text: m.text.clone(),
+            })
+            .collect();
         self.messages = transcript
             .messages
             .into_iter()
@@ -228,7 +238,10 @@ impl ChatState {
         self.notice = None;
         self.scroll = f32::MAX;
         self.stick_bottom = true;
-        self.handle.send_command(ChatCommand::Resume(id));
+        self.handle.send_command(ChatCommand::Resume {
+            session_id: id,
+            history,
+        });
     }
 
     fn current_provider(&self) -> Option<&ProviderSummary> {

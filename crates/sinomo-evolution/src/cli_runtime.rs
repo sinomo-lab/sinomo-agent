@@ -820,9 +820,10 @@ fn commit_registry_trust_cluster_txn(
             detail: "clustered trusted signer registry writes require the local daemon".to_string(),
         });
     };
-    let request: network::ObjectRpcRequest = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn)
-        .map_err(network::NetworkError::from)?
-        .into();
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn)
+        .map_err(network::NetworkError::from)?;
+    let request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(
         &status.address,
         &request,

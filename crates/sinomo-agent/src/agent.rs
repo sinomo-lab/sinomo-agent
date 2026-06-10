@@ -3934,6 +3934,29 @@ where
         Ok(self.lock_state()?.control.session.clone())
     }
 
+    pub fn replace_session(&self, session: AgentSession) -> Result<(), AgentError> {
+        self.reap_finished_worker()?;
+        let mut state = self.lock_state()?;
+        if state.control.active_turn.is_some() {
+            return Err(AgentError::Runtime {
+                detail: "cannot replace agent session while a turn is active".to_string(),
+            });
+        }
+        if state
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
+            return Err(AgentError::Runtime {
+                detail: "cannot replace agent session while a worker is active".to_string(),
+            });
+        }
+        state.control = AgentSessionControlPlane::new(session);
+        state.runtime_events.clear();
+        state.completed_turns.clear();
+        Ok(())
+    }
+
     pub fn control_snapshot(&self) -> Result<AgentSessionControlSnapshot, AgentError> {
         Ok(self.lock_state()?.control.snapshot())
     }
@@ -12146,6 +12169,41 @@ old
             control.snapshot().tasks[0].status,
             AgentTaskLifecycleStatus::TimedOut
         );
+    }
+
+    #[test]
+    fn agent_session_runtime_replace_session_swaps_transcript() {
+        let first_session_id =
+            SessionId::from_legacy_named("sess_runtime_replace_first").expect("session");
+        let second_session_id =
+            SessionId::from_legacy_named("sess_runtime_replace_second").expect("session");
+        let agent = Agent::new(SequencedModel::new(Vec::<String>::new()), "fake", "fake");
+        let runtime =
+            AgentSessionRuntime::new(agent, AgentSession::new(first_session_id, AgentRole::Main));
+        let mut replacement = AgentSession::new(second_session_id.clone(), AgentRole::Main);
+        replacement.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "remember this".to_string(),
+            event_id: None,
+        });
+        replacement.raw_transcript = replacement.transcript.clone();
+
+        runtime
+            .replace_session(replacement.clone())
+            .expect("replace session");
+
+        let snapshot = runtime.session_snapshot().expect("snapshot");
+        assert_eq!(snapshot.session_id, second_session_id);
+        assert_eq!(snapshot.transcript, replacement.transcript);
+        assert_eq!(snapshot.raw_transcript, replacement.raw_transcript);
+        let events = runtime
+            .runtime_events_since(AgentRuntimeEventCursor {
+                offset: 0,
+                last_event_id: None,
+            })
+            .expect("runtime events");
+        assert!(events.events.is_empty());
     }
 
     #[cfg(not(windows))]
