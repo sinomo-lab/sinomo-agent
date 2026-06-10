@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT: usize = 8;
+const POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP: Duration = Duration::from_millis(10);
+const POSIX_WAIT_FOR_COMMIT_TIMEOUT: Duration = Duration::from_secs(5);
 const POSIX_LIST_DIR_COLLECT_PAGE_SIZE: usize = 4096;
 const POSIX_LINK_COUNT_PAGE_SIZE: usize = 4096;
 const POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS: usize = 512;
@@ -167,13 +169,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(outcome);
         };
         let mut intent_id = intent_id.clone();
-        let mut outcome = outcome;
-        for _ in 0..POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
+        let started_at = Instant::now();
+        let mut ready_drains = 0;
+        loop {
             let events = self.process_incoming()?;
-            if events.is_empty() {
-                break;
-            }
-            outcome = self.write_outcome(&intent_id)?;
+            let outcome = self.write_outcome(&intent_id)?;
             if let NetworkedDfsWriteOutcome::Pending {
                 intent_id: next_intent_id,
                 ..
@@ -182,10 +182,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 intent_id = next_intent_id.clone();
             }
             if !matches!(outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
-                break;
+                return Ok(outcome);
+            }
+            if events.is_empty() || ready_drains >= POSIX_WAIT_FOR_COMMIT_READY_DRAIN_LIMIT {
+                let elapsed = started_at.elapsed();
+                if elapsed >= POSIX_WAIT_FOR_COMMIT_TIMEOUT {
+                    return Ok(outcome);
+                }
+                std::thread::sleep(
+                    POSIX_WAIT_FOR_COMMIT_IDLE_SLEEP
+                        .min(POSIX_WAIT_FOR_COMMIT_TIMEOUT.saturating_sub(elapsed)),
+                );
+                ready_drains = 0;
+            } else {
+                ready_drains += 1;
             }
         }
-        Ok(outcome)
     }
 
     pub fn bootstrap_distributed_sifs(&mut self) -> Result<()> {

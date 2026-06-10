@@ -1041,7 +1041,15 @@ fn commit_model_config_cluster_txn(_data_dir: &SinomoDataDir, txn: KvTxn) -> Res
         &request,
         DAEMON_CLUSTER_KV_TXN_TIMEOUT,
     )?;
-    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    let txn_response: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    if !txn_response.succeeded {
+        return Err(CliError::Parse {
+            detail: format!(
+                "cluster model config transaction did not commit at revision {:?}",
+                txn_response.revision
+            ),
+        });
+    }
     Ok(())
 }
 

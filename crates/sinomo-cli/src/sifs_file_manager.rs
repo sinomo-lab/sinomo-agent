@@ -1,34 +1,40 @@
+use crate::commands::cli_commit_cluster_kv_txn_with_quorum_response;
 use crate::file_manager::{
     FileManagerBackend, FileManagerEntry, FileManagerEntryKind, FileManagerMetadata,
     FileManagerRead, validated_relative_child_path,
 };
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::dfs::{
-    DfsEndpointTransport, DfsMetadataJournalBatchSender, DfsMetadataJournalReplicationOptions,
-    DfsMetadataPeerTransportError, DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender,
-    DfsObjectKind, DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsProtocolFrameSender, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, fallback_dfs_node_id,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    DfsControlPlaneKvClient, DfsEndpointTransport, DfsMetadataJournalBatchSender,
+    DfsMetadataJournalReplicationOptions, DfsMetadataPeerTransportError, DfsMetadataShardConfig,
+    DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectKind, DfsPeerTransportError,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, DfsWriteOptions,
+    LocalContentStore, NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
-use sinomo_runtime::kv;
+use sinomo_runtime::kv::{self, KvError, KvOp, KvTxn, KvTxnResponse};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
+use sinomo_runtime::node::NodeId;
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(crate) struct SifsFileManagerBackend {
     data_dir: SinomoDataDir,
     service: Mutex<NetworkedDfsService<DfsEndpointTransport>>,
+    replica_candidates: Vec<NodeId>,
 }
 
 impl SifsFileManagerBackend {
     pub(crate) fn open(data_dir: &SinomoDataDir) -> Result<Self, String> {
         let service = open_sifs_service(data_dir)?;
+        let replica_candidates = sifs_replica_candidates(data_dir, service.node_id());
         Ok(Self {
             data_dir: data_dir.clone(),
             service: Mutex::new(service),
+            replica_candidates,
         })
     }
 
@@ -67,7 +73,7 @@ impl SifsFileManagerBackend {
                 .posix_mkdir_all(&parent)
                 .map_err(|error| format!("cannot create SIFS directory {parent}: {error}"))?;
         }
-        let options = sifs_write_options(&service);
+        let options = sifs_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file(&path, bytes, options)
             .map(|_| ())
@@ -211,7 +217,7 @@ impl FileManagerBackend for SifsFileManagerBackend {
     fn create_file(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;
-        let options = sifs_write_options(&service);
+        let options = sifs_write_options(&service, &self.replica_candidates);
         service
             .posix_write_file(&path, &[], options)
             .map(|_| ())
@@ -292,10 +298,13 @@ fn open_sifs_service(
     };
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
-    let service = NetworkedDfsService::new(
+    let mut service = NetworkedDfsService::new(
         DfsEndpointTransport::new(local_node_id, endpoints, sifs_protocol_frame_sender()),
         content,
     );
+    if cluster_paths.state.exists() {
+        service = service.with_control_plane(SifsControlPlaneKvClient::new(&cluster_paths));
+    }
     let service =
         if let Some(metadata) = open_sifs_sharded_metadata_backend(data_dir, &cluster_paths)? {
             service
@@ -313,6 +322,66 @@ fn open_sifs_service(
         .bootstrap_distributed_sifs()
         .map_err(|error| format!("cannot bootstrap SIFS namespace: {error}"))?;
     Ok(service)
+}
+
+#[derive(Clone, Debug)]
+struct SifsControlPlaneKvClient {
+    cluster_paths: ClusterPaths,
+}
+
+impl SifsControlPlaneKvClient {
+    fn new(cluster_paths: &ClusterPaths) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+        }
+    }
+
+    fn kv_error(&self, source: impl std::fmt::Display) -> KvError {
+        KvError::Io {
+            path: self.cluster_paths.kv_snapshot.display().to_string(),
+            detail: source.to_string(),
+        }
+    }
+}
+
+impl DfsControlPlaneKvClient for SifsControlPlaneKvClient {
+    fn get(&self, key: &str) -> Result<Option<sinomo_runtime::kv::KvEntry>, KvError> {
+        kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<sinomo_runtime::kv::KvEntry>, KvError> {
+        kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+    }
+
+    fn put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_runtime::kv::KvRevision, KvError> {
+        let response = self.txn(KvTxn {
+            compares: Vec::new(),
+            success: vec![KvOp::Put {
+                key,
+                value,
+                lease_id: None,
+            }],
+            failure: Vec::new(),
+        })?;
+        Ok(response.revision)
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        let mut state = network::read_cluster_state(&self.cluster_paths)
+            .map_err(|source| self.kv_error(source))?;
+        let result =
+            cli_commit_cluster_kv_txn_with_quorum_response(&self.cluster_paths, &mut state, txn)
+                .map_err(|source| self.kv_error(source))?;
+        Ok(result.txn_response.unwrap_or(KvTxnResponse {
+            succeeded: true,
+            revision: result.snapshot.revision,
+            responses: Vec::new(),
+        }))
+    }
 }
 
 fn open_sifs_sharded_metadata_backend(
@@ -343,6 +412,42 @@ fn open_sifs_sharded_metadata_backend(
     open_local_sharded_metadata_backend(default_dfs_metadata_shards_root(data_dir), shards)
         .map(Some)
         .map_err(|error| format!("cannot open DFS metadata shards: {error}"))
+}
+
+fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> Vec<NodeId> {
+    let mut candidates = vec![local_node_id.clone()];
+    let cluster_paths = ClusterPaths::new(data_dir);
+    if !cluster_paths.state.exists() {
+        return candidates;
+    }
+    let Ok(state) = network::read_cluster_state_without_kv(&cluster_paths) else {
+        return candidates;
+    };
+    let mut routable_node_ids = network::cluster_dfs_protocol_targets(&cluster_paths, &state)
+        .into_iter()
+        .map(|endpoint| endpoint.node_id)
+        .collect::<Vec<_>>();
+    routable_node_ids.sort();
+    routable_node_ids.dedup();
+    let Ok(entries) =
+        kv::read_cluster_kv_prefix_entries(&cluster_paths.kv_paths(), content_services_prefix())
+    else {
+        return candidates;
+    };
+    let mut content_node_ids = entries
+        .into_iter()
+        .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok())
+        .map(|advertisement| advertisement.node_id)
+        .collect::<Vec<_>>();
+    content_node_ids.sort();
+    content_node_ids.dedup();
+    if let Some(remote_node_id) = content_node_ids
+        .into_iter()
+        .find(|node_id| node_id != local_node_id && routable_node_ids.contains(node_id))
+    {
+        candidates.push(remote_node_id);
+    }
+    candidates
 }
 
 fn sifs_protocol_frame_sender() -> DfsProtocolFrameSender {
@@ -395,8 +500,15 @@ fn publish_sifs_metadata_journal_from_data_dir(
     Ok(())
 }
 
-fn sifs_write_options(service: &NetworkedDfsService<DfsEndpointTransport>) -> DfsWriteOptions {
-    DfsWriteOptions::replicated_eventual(vec![service.node_id().clone()])
+fn sifs_write_options(
+    service: &NetworkedDfsService<DfsEndpointTransport>,
+    replica_candidates: &[NodeId],
+) -> DfsWriteOptions {
+    let mut candidates = replica_candidates.to_vec();
+    if !candidates.contains(service.node_id()) {
+        candidates.insert(0, service.node_id().clone());
+    }
+    DfsWriteOptions::replicated_eventual(candidates)
 }
 
 fn sifs_entry_kind(kind: &DfsObjectKind) -> FileManagerEntryKind {

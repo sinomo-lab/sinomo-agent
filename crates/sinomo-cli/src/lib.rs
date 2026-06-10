@@ -53,8 +53,9 @@ use sinomo_lm::{
     model_runtime_config_from_cluster_kv_snapshot, normalize_model_id_for_provider,
     normalize_model_provider, normalize_provider_account_name, provider_account_config,
     provider_api_key_from_env, provider_options_for_model, resolve_default_model,
-    save_provider_api_key, save_provider_api_key_in_model_config, subscription_usage_provider_ids,
-    test_provider_account_credentials, test_provider_credentials, write_default_model_config,
+    save_provider_api_key, save_provider_api_key_in_model_config, stored_provider_api_key,
+    subscription_usage_provider_ids, test_provider_account_credentials, test_provider_credentials,
+    write_default_model_config,
 };
 use sinomo_pytorch::{
     MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, ManagedPytorchServer, ManagedPytorchServerConfig,

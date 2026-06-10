@@ -5219,6 +5219,7 @@ fn routed_write_response_tracks_remote_intent_alias() {
                     required_receipts: 2,
                 },
             },
+            metadata_journal_batch: None,
         },
     )
     .expect("pending response");
@@ -5249,6 +5250,7 @@ fn routed_write_response_tracks_remote_intent_alias() {
                     repair_jobs: Vec::new(),
                 },
             },
+            metadata_journal_batch: None,
         },
     )
     .expect("committed response");
@@ -5262,6 +5264,103 @@ fn routed_write_response_tracks_remote_intent_alias() {
             ..
         } if intent_id == "intent_remote_alias" && committed_version == version
     ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn routed_write_response_replays_primary_metadata_journal() {
+    let requester =
+        NodeId::from_legacy_named("node_routed_write_journal_requester").expect("requester");
+    let primary = NodeId::from_legacy_named("node_routed_write_journal_primary").expect("primary");
+    let object_id = DfsObjectId::from_legacy_named("obj_routed_write_journal").expect("object");
+    let version = DfsVersion::from_legacy_named("version_routed_write_journal").expect("version");
+    let root = temp_root("routed-write-journal-replay");
+    let file_system = file_system(primary.clone());
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/read-your-write.txt".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.version = version.clone();
+    object.content_hash = Some("blake3:routed-write-journal".to_string());
+    object.content_size_bytes = Some(23);
+    object.current_locations = vec![requester.clone(), primary.clone()];
+
+    let mut primary_backend =
+        open_root_local_metadata_backend(root.join("primary-metadata")).expect("primary metadata");
+    primary_backend
+        .put_file_system(&file_system)
+        .expect("primary filesystem");
+    primary_backend
+        .put_object_and_version(
+            &object,
+            &object_version_record(&object, object.content_size_bytes),
+        )
+        .expect("primary object");
+    let batch = primary_backend
+        .journal_batch_since_limited(
+            0,
+            DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
+            DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT,
+        )
+        .expect("primary journal")
+        .expect("primary journal batch");
+
+    let requester_metadata_root = root.join("requester-metadata");
+    let mut dfs = NetworkedDfsService::new(
+        FailingSendTransport {
+            local_node_id: requester.clone(),
+        },
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_metadata_backend(
+        open_root_local_metadata_backend(&requester_metadata_root).expect("requester metadata"),
+    )
+    .expect("requester dfs");
+    dfs.pending_routed_writes.insert(
+        "dfs_net_req_journal".to_string(),
+        PendingRoutedWrite {
+            object_id: object_id.clone(),
+            primary_node_id: primary.clone(),
+            remote_intent_id: None,
+            durable_receipts: 0,
+            required_receipts: 1,
+            result: None,
+        },
+    );
+
+    dfs.handle_distributed_write_response(
+        primary,
+        DfsDistributedWriteResponse {
+            request_id: "dfs_net_req_journal".to_string(),
+            object_id: object_id.clone(),
+            result: DfsDistributedWriteResult::Outcome {
+                outcome: NetworkedDfsWriteOutcome::Committed {
+                    intent_id: "dfs_net_req_journal".to_string(),
+                    version: version.clone(),
+                    content_hash: "blake3:routed-write-journal".to_string(),
+                    repair_jobs: Vec::new(),
+                },
+            },
+            metadata_journal_batch: Some(batch),
+        },
+    )
+    .expect("committed response");
+    drop(dfs);
+
+    let reopened =
+        open_root_local_metadata_backend(&requester_metadata_root).expect("reopened metadata");
+    let stored = reopened
+        .get_object_by_path(&file_system.file_system_id, "/services/read-your-write.txt")
+        .expect("lookup persisted object")
+        .expect("persisted object");
+    assert_eq!(stored.object_id, object_id);
+    assert_eq!(stored.version, version);
+    assert_eq!(
+        stored.content_hash.as_deref(),
+        Some("blake3:routed-write-journal")
+    );
 
     std::fs::remove_dir_all(root).ok();
 }

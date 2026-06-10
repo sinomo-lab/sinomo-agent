@@ -15,6 +15,9 @@ use sinomo_cli::app_api::SifsBrowser;
 use sinomo_runtime::local::SinomoDataDir;
 
 pub const SIFS_SESSIONS_ROOT: &str = "/services/sinomo-app/chat/sessions";
+const SIFS_SESSIONS_INDEX: &str = "/services/sinomo-app-chat-sessions-index.json";
+const SIFS_SESSION_FILE_PREFIX: &str = "/services/sinomo-app-chat-session-";
+const SIFS_SESSION_FILE_SUFFIX: &str = ".json";
 
 /// Sidebar metadata for a stored session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +41,18 @@ pub struct StoredMessage {
 pub struct StoredTranscript {
     #[serde(default)]
     pub messages: Vec<StoredMessage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StoredSessionRecord {
+    meta: SessionMeta,
+    transcript: StoredTranscript,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct StoredSessionIndex {
+    #[serde(default)]
+    sessions: Vec<SessionMeta>,
 }
 
 fn sessions_root(data_dir: &SinomoDataDir) -> PathBuf {
@@ -166,15 +181,25 @@ fn save_sifs(
     transcript: &StoredTranscript,
 ) -> Result<(), String> {
     let browser = SifsBrowser::open(data_dir)?;
-    let dir = sifs_session_dir(id)?;
-    browser.create_dir_all(&dir)?;
+    let record = StoredSessionRecord {
+        meta: meta.clone(),
+        transcript: transcript.clone(),
+    };
     browser.write_file(
-        &format!("{dir}/meta.json"),
-        &serde_json::to_vec_pretty(meta).map_err(|error| error.to_string())?,
+        &sifs_session_file(id)?,
+        &serde_json::to_vec(&record).map_err(|error| error.to_string())?,
     )?;
+    let mut index = read_sifs_index(&browser).unwrap_or_default();
+    match index.sessions.iter_mut().find(|existing| existing.id == id) {
+        Some(existing) => *existing = meta.clone(),
+        None => index.sessions.push(meta.clone()),
+    }
+    index
+        .sessions
+        .sort_by_key(|meta| std::cmp::Reverse(meta.updated_unix));
     browser.write_file(
-        &format!("{dir}/transcript.json"),
-        &serde_json::to_vec(transcript).map_err(|error| error.to_string())?,
+        SIFS_SESSIONS_INDEX,
+        &serde_json::to_vec(&index).map_err(|error| error.to_string())?,
     )
 }
 
@@ -182,6 +207,20 @@ fn list_sifs(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
     let Ok(browser) = SifsBrowser::open(data_dir) else {
         return Vec::new();
     };
+    let mut metas = read_sifs_index(&browser)
+        .map(|index| index.sessions)
+        .unwrap_or_default();
+    for meta in list_legacy_sifs(&browser) {
+        match metas.iter_mut().find(|existing| existing.id == meta.id) {
+            Some(existing) if meta.updated_unix > existing.updated_unix => *existing = meta,
+            Some(_) => {}
+            None => metas.push(meta),
+        }
+    }
+    metas
+}
+
+fn list_legacy_sifs(browser: &SifsBrowser) -> Vec<SessionMeta> {
     let Ok(entries) = browser.list(SIFS_SESSIONS_ROOT) else {
         return Vec::new();
     };
@@ -202,9 +241,37 @@ fn list_sifs(data_dir: &SinomoDataDir) -> Vec<SessionMeta> {
 
 fn load_sifs_transcript(data_dir: &SinomoDataDir, id: &str) -> Option<StoredTranscript> {
     let browser = SifsBrowser::open(data_dir).ok()?;
+    if let Some(transcript) = load_flat_sifs_transcript(&browser, id) {
+        return Some(transcript);
+    }
+    load_legacy_sifs_transcript(&browser, id)
+}
+
+fn read_sifs_index(browser: &SifsBrowser) -> Result<StoredSessionIndex, String> {
+    let bytes = browser.read_file(SIFS_SESSIONS_INDEX)?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+fn load_flat_sifs_transcript(browser: &SifsBrowser, id: &str) -> Option<StoredTranscript> {
+    let bytes = browser.read_file(&sifs_session_file(id).ok()?).ok()?;
+    serde_json::from_slice::<StoredSessionRecord>(&bytes)
+        .ok()
+        .map(|record| record.transcript)
+}
+
+fn load_legacy_sifs_transcript(browser: &SifsBrowser, id: &str) -> Option<StoredTranscript> {
     let dir = sifs_session_dir(id).ok()?;
     let bytes = browser.read_file(&format!("{dir}/transcript.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+fn sifs_session_file(id: &str) -> Result<String, String> {
+    if !valid_session_id(id) {
+        return Err("invalid session id".to_string());
+    }
+    Ok(format!(
+        "{SIFS_SESSION_FILE_PREFIX}{id}{SIFS_SESSION_FILE_SUFFIX}"
+    ))
 }
 
 fn sifs_session_dir(id: &str) -> Result<String, String> {

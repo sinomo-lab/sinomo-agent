@@ -373,8 +373,10 @@ fn auth_api_key_provider(
     account: &str,
 ) -> Result<(), CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
-    let (api_key, source) = api_key_from_env_or_prompt(provider_name, provider_id)?;
-    if model_config_uses_cluster(&data_dir) {
+    let uses_cluster = model_config_uses_cluster(&data_dir);
+    let (api_key, source) =
+        api_key_from_env_or_stored_or_prompt(provider_name, provider_id, uses_cluster)?;
+    if uses_cluster {
         let (mut config, _) = load_model_config_for_node(&data_dir)?;
         let account_info = save_provider_api_key_in_model_config(
             &mut config,
@@ -382,10 +384,10 @@ fn auth_api_key_provider(
             Some(account),
             &api_key,
         )?;
-        let config_path = write_model_config_for_node(&data_dir, &config)?;
         println!("Testing {provider_name} provider connection...");
         let account_config = provider_account_config(&config, provider_id, Some(account));
         test_provider_account_credentials(provider_id, account_config)?;
+        let config_path = write_model_config_for_node(&data_dir, &config)?;
         println!(
             "{provider_name} account `{}` saved to cluster KV at {} ({})",
             account_info.account,
@@ -442,8 +444,19 @@ fn api_key_from_env_or_prompt(
     provider_name: &str,
     provider_id: &str,
 ) -> Result<(String, String), CliError> {
+    api_key_from_env_or_stored_or_prompt(provider_name, provider_id, false)
+}
+
+fn api_key_from_env_or_stored_or_prompt(
+    provider_name: &str,
+    provider_id: &str,
+    allow_stored: bool,
+) -> Result<(String, String), CliError> {
     if let Some(api_key) = provider_api_key_from_env(provider_id) {
         return Ok(api_key);
+    }
+    if allow_stored && let Some(api_key) = stored_provider_api_key(provider_id)? {
+        return Ok((api_key, "stored-local-credential".to_string()));
     }
 
     println!("No {provider_name} API key found in environment. Paste an API key to store locally.");

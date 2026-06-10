@@ -1589,6 +1589,45 @@ pub fn provider_has_stored_api_key(data_dir: &SinomoDataDir, provider: &str) -> 
     api_key::stored_api_key_is_present(&provider, &credentials_path)
 }
 
+/// Return the node-local stored API key for an API-key provider without consulting env vars.
+pub fn stored_provider_api_key_in_data_dir(
+    data_dir: &SinomoDataDir,
+    provider: &str,
+) -> Result<Option<String>, LanguageModelError> {
+    let provider = normalize_model_provider(provider).ok_or_else(|| {
+        LanguageModelError::ProviderInvocationFailed {
+            provider: provider.to_string(),
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: format!("unknown provider `{provider}`"),
+        }
+    })?;
+    if provider_api_key_env_vars(&provider).is_none() {
+        return Err(LanguageModelError::ProviderInvocationFailed {
+            provider,
+            model: PROVIDER_DEFAULT_MODEL.to_string(),
+            detail: "provider does not support API-key credential storage".to_string(),
+        });
+    }
+    let credentials_path = Some(data_dir.provider_credentials_file(&provider));
+    match api_key::resolve_api_key(
+        &provider,
+        &None,
+        &credentials_path,
+        &[],
+        "no stored API key found",
+    ) {
+        Ok(api_key) => Ok(Some(api_key)),
+        Err(LanguageModelError::AuthenticationRequired { .. }) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Return the stored API key from this process' Sinomo data dir, if one exists.
+pub fn stored_provider_api_key(provider: &str) -> Result<Option<String>, LanguageModelError> {
+    let data_dir = provider_data_dir(provider)?;
+    stored_provider_api_key_in_data_dir(&data_dir, provider)
+}
+
 pub fn provider_account_config<'a>(
     config: &'a ModelConfig,
     provider: &str,
@@ -3720,6 +3759,29 @@ mod tests {
                 && model == PROVIDER_DEFAULT_MODEL
                 && detail.contains("API-key credential storage")
         ));
+    }
+
+    #[test]
+    fn stored_provider_api_key_reads_config_document_credentials() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-lm-stored-api-key-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or(Duration::ZERO)
+                .as_nanos()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+
+        set_provider_api_key(&data_dir, DeepSeekProvider::PROVIDER_ID, "sk-test")
+            .expect("store provider api key");
+
+        assert_eq!(
+            stored_provider_api_key_in_data_dir(&data_dir, DeepSeekProvider::PROVIDER_ID)
+                .expect("read stored provider api key"),
+            Some("sk-test".to_string())
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

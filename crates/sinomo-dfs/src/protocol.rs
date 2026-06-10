@@ -114,6 +114,8 @@ pub struct DfsDistributedWriteCommand {
     pub request: DfsWriteRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_base_version: Option<DfsVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_journal_after_sequence: Option<u64>,
     pub bytes: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
@@ -130,6 +132,8 @@ pub struct DfsDistributedWriteResponse {
     pub request_id: String,
     pub object_id: DfsObjectId,
     pub result: DfsDistributedWriteResult,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_journal_batch: Option<DfsMetadataJournalBatch>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
