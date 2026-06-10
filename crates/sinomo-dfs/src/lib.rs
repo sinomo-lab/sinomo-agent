@@ -16087,6 +16087,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
+        self.restore_pending_write_for_intent_if_missing(&response.intent_id, &response.object_id)?;
         let Some(pending) = self.pending_writes.get(&response.intent_id).cloned() else {
             let reason = format!(
                 "distributed DFS error: missing pending write for fetched blob: {}",
@@ -16099,7 +16100,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason,
             });
         };
-        if !pending.fetch_inflight_from.contains(&frame_source_node_id) {
+        let restored_fetch_response =
+            self.restored_fetch_response_source_is_authorized_without_inflight(
+                &response.intent_id,
+                &frame_source_node_id,
+            ) && pending.fetch_inflight_from.is_empty()
+                && pending.fetch_inflight_request_ids.is_empty();
+        if !pending.fetch_inflight_from.contains(&frame_source_node_id) && !restored_fetch_response
+        {
             return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id: response.intent_id,
                 object_id: response.object_id,
@@ -16107,11 +16115,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason: "unexpected DFS fetch response source".to_string(),
             });
         }
-        if pending
+        if let Some(expected_request_id) = pending
             .fetch_inflight_request_ids
             .get(&frame_source_node_id)
-            != Some(&response.request_id)
         {
+            if expected_request_id != &response.request_id {
+                return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
+                    intent_id: response.intent_id,
+                    object_id: response.object_id,
+                    source_node_id: frame_source_node_id,
+                    reason: "unexpected DFS fetch response request id".to_string(),
+                });
+            }
+        } else if !restored_fetch_response {
             return Ok(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id: response.intent_id,
                 object_id: response.object_id,
@@ -16246,6 +16262,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
     }
 
+    fn restored_fetch_response_source_is_authorized_without_inflight(
+        &self,
+        intent_id: &str,
+        source_node_id: &NodeId,
+    ) -> bool {
+        let Some(intent) = self.coordinator.intent(intent_id) else {
+            return false;
+        };
+        intent.desired_replica_nodes.contains(source_node_id)
+            && self
+                .coordinator
+                .receipts_for_intent(intent_id)
+                .iter()
+                .any(|receipt| receipt.replica_node_id == *source_node_id)
+    }
+
     fn handle_fetch_blob_response_chunk(
         &mut self,
         frame_source_node_id: NodeId,
@@ -16263,6 +16295,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason,
             }));
         }
+        self.restore_pending_write_for_intent_if_missing(&chunk.intent_id, &chunk.object_id)?;
         let Some(pending) = self.pending_writes.get(&chunk.intent_id).cloned() else {
             let reason = format!(
                 "distributed DFS error: missing pending write for fetched blob chunk: {}",
@@ -16275,7 +16308,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason,
             }));
         };
-        if !pending.fetch_inflight_from.contains(&frame_source_node_id) {
+        let restored_fetch_response =
+            self.restored_fetch_response_source_is_authorized_without_inflight(
+                &chunk.intent_id,
+                &frame_source_node_id,
+            ) && pending.fetch_inflight_from.is_empty()
+                && pending.fetch_inflight_request_ids.is_empty();
+        if !pending.fetch_inflight_from.contains(&frame_source_node_id) && !restored_fetch_response
+        {
             return Ok(Some(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id: chunk.intent_id,
                 object_id: chunk.object_id,
@@ -16283,11 +16323,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason: "unexpected DFS fetch response source".to_string(),
             }));
         }
-        if pending
+        if let Some(expected_request_id) = pending
             .fetch_inflight_request_ids
             .get(&frame_source_node_id)
-            != Some(&chunk.request_id)
         {
+            if expected_request_id != &chunk.request_id {
+                return Ok(Some(NetworkedDfsServiceEvent::BlobFetchRejected {
+                    intent_id: chunk.intent_id,
+                    object_id: chunk.object_id,
+                    source_node_id: frame_source_node_id,
+                    reason: "unexpected DFS fetch response request id".to_string(),
+                }));
+            }
+        } else if !restored_fetch_response {
             return Ok(Some(NetworkedDfsServiceEvent::BlobFetchRejected {
                 intent_id: chunk.intent_id,
                 object_id: chunk.object_id,

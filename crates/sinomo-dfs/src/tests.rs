@@ -5588,6 +5588,177 @@ fn fetch_receipt_completion_sends_untracked_routed_write_response() {
 }
 
 #[test]
+fn stateless_endpoint_reader_write_commits_after_primary_fetch_receipt() {
+    let root = temp_root("stateless-endpoint-reader-write-primary-fetch");
+    let writer = NodeId::from_legacy_named("node_stateless_endpoint_writer").expect("writer node");
+    let primary =
+        NodeId::from_legacy_named("node_stateless_endpoint_primary").expect("primary node");
+    let object_id = DfsObjectId::from_legacy_named("obj_stateless_endpoint_fetch").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_stateless_endpoint_fetch_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_stateless_endpoint_fetch_2").expect("version");
+    let file_system = file_system(primary.clone());
+    let control_plane = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![writer.clone(), primary.clone()]).expect("kv"),
+    );
+    control_plane.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![writer.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let primary_content_root = root.join("primary-content");
+    let primary_metadata_root = root.join("primary-metadata");
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut primary_backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("services"),
+            &primary_metadata_root,
+        )
+        .expect("primary metadata");
+        primary_backend
+            .put_file_system(&file_system)
+            .expect("primary filesystem");
+    }
+    let primary_for_sender = primary.clone();
+    let primary_content_for_sender = primary_content_root.clone();
+    let primary_metadata_for_sender = primary_metadata_root.clone();
+    let control_plane_for_sender = control_plane.clone();
+    let trace_for_sender = Arc::clone(&trace);
+    let sender: DfsProtocolFrameSender = Arc::new(move |_endpoint, command, _timeout| {
+        if let MeshMessageBody::Protocol(protocol) = &command.frame.message.body
+            && protocol.protocol == DFS_PROTOCOL
+            && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
+        {
+            trace_for_sender
+                .lock()
+                .expect("trace")
+                .push(format!("in:{message:?}"));
+        }
+        let content = LocalContentStore::new(&primary_content_for_sender).expect("content");
+        let metadata = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("services"),
+            &primary_metadata_for_sender,
+        )
+        .expect("metadata");
+        let result = process_dfs_protocol_frame(
+            primary_for_sender.clone(),
+            command.frame.clone(),
+            content,
+            Box::new(metadata),
+            Some(Box::new(control_plane_for_sender.clone())),
+        )
+        .expect("process stateless primary frame");
+        for event in &result.events {
+            trace_for_sender
+                .lock()
+                .expect("trace")
+                .push(format!("event:{event:?}"));
+        }
+        for frame in &result.outbound_frames {
+            if let MeshMessageBody::Protocol(protocol) = &frame.message.body
+                && protocol.protocol == DFS_PROTOCOL
+                && let Ok(message) = protocol.decode::<DfsNetworkMessage>()
+            {
+                trace_for_sender
+                    .lock()
+                    .expect("trace")
+                    .push(format!("out:{message:?}"));
+            }
+        }
+        Ok(DfsProtocolFrameResponse {
+            request_id: command.request_id.clone(),
+            outbound_frames: result.outbound_frames,
+        })
+    });
+    let transport = DfsEndpointTransport::with_connect_timeout(
+        writer.clone(),
+        vec![test_endpoint(&primary, "192.0.2.44:21353")],
+        Duration::from_millis(1),
+        sender,
+    );
+    let writer_content = LocalContentStore::new(root.join("writer-content")).expect("content");
+    let mut dfs =
+        NetworkedDfsService::new(transport, writer_content).with_control_plane(control_plane);
+    dfs.add_file_system(file_system.clone())
+        .expect("writer filesystem");
+    let mut object = file_metadata(primary.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id = object_id.clone();
+    object.path = "/services/stateless-fetch.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![writer.clone()];
+    dfs.add_object_metadata(object).expect("writer object");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_reader(
+            DfsWriteRequest {
+                file_system_id: file_system.file_system_id,
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: writer.clone(),
+            },
+            std::io::Cursor::new(b"stateless routed reader bytes".to_vec()),
+            vec![writer.clone(), primary.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("routed reader write");
+    let NetworkedDfsWriteOutcome::Pending { mut intent_id, .. } = outcome else {
+        panic!("expected pending routed write, got {outcome:?}");
+    };
+    let mut committed = None;
+    for _ in 0..20 {
+        let _ = dfs.process_incoming().expect("process routed frames");
+        let next = dfs.write_outcome(&intent_id).expect("write outcome");
+        match next {
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id: next_intent_id,
+                ..
+            } => {
+                intent_id = next_intent_id;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => {
+                committed = Some(outcome);
+                break;
+            }
+        }
+    }
+    let committed = committed.unwrap_or_else(|| {
+        panic!(
+            "routed write should commit; trace={:?}",
+            trace.lock().expect("trace")
+        )
+    });
+
+    assert!(matches!(
+        committed,
+        NetworkedDfsWriteOutcome::Committed {
+            version,
+            repair_jobs,
+            ..
+        } if version == version_2 && repair_jobs.is_empty()
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stage_response_restores_transient_intent_record_without_visible_object() {
     let root = temp_root("stage-response-restores-transient-intent-record");
     let primary =
