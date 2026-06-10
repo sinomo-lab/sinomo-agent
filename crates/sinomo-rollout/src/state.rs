@@ -48,6 +48,8 @@ pub struct PendingShadowRollout {
     pub main_binary: PathBuf,
     pub shadow_binary: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_main_binary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_shadow_binary: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_main_binary: Option<PathBuf>,
@@ -466,6 +468,7 @@ pub fn stage_pending_shadow_rollout(
         source: activation.source.clone(),
         main_binary: pending.main_binary().to_path_buf(),
         shadow_binary: activation.shadow_binary.clone(),
+        staged_main_binary: activation.staged_main_binary.clone(),
         staged_shadow_binary: activation.staged_shadow_binary.clone(),
         previous_main_binary: pending.previous_main_binary().map(Path::to_path_buf),
         previous_shadow_binary: pending.previous_shadow_binary().to_path_buf(),

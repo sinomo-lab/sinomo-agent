@@ -400,6 +400,9 @@ fn complete_pending_shadow_rollout_after_start(
     if !sinomo_rollout::same_path_if_exists(&current, &finalize.shadow_binary) {
         return Ok(());
     }
+    if rehydrate_main_activation_if_staged_main_is_pending(paths, rollout_paths, &finalize)? {
+        return Ok(());
+    }
     record_shadow_rollout_finalized(
         rollout_paths,
         &finalize,
@@ -423,6 +426,55 @@ fn complete_pending_shadow_rollout_after_start(
     );
     publish_rollout_progress_to_cluster(paths);
     Ok(())
+}
+
+fn rehydrate_main_activation_if_staged_main_is_pending(
+    paths: &DaemonPaths,
+    rollout_paths: &SelfRolloutPaths,
+    finalize: &sinomo_rollout::PendingShadowRollout,
+) -> Result<bool, DaemonError> {
+    let staged_main = finalize
+        .staged_main_binary
+        .clone()
+        .or_else(|| {
+            let default_staged = rollout_staged_main_binary(rollout_paths);
+            default_staged.exists().then_some(default_staged)
+        })
+        .filter(|path| path.exists());
+    let Some(staged_main) = staged_main else {
+        return Ok(false);
+    };
+    let activation = RolloutMainActivation {
+        source: finalize.source.clone(),
+        main_binary: finalize.main_binary.clone(),
+        shadow_binary: finalize.shadow_binary.clone(),
+        staged_main_binary: Some(staged_main.clone()),
+        staged_shadow_binary: finalize.staged_shadow_binary.clone(),
+        previous_main_binary: finalize.previous_main_binary.clone(),
+        main_host: finalize.main_host.clone(),
+        main_port: finalize.main_port,
+        shadow_port: finalize.shadow_port,
+        requested_at: finalize.requested_at.clone(),
+        mode: finalize.mode.clone(),
+    };
+    write_main_activation(rollout_paths, &activation)?;
+    let detail = format!(
+        "shadow finalization deferred because staged main binary {} is still pending",
+        staged_main.display()
+    );
+    write_cluster_rollout_progress(
+        paths,
+        rollout_paths,
+        "in-progress",
+        &finalize.mode,
+        Some(detail),
+        &finalize.source,
+        &finalize.requested_at,
+        "main-promotion-pending",
+        4,
+        "rehydrated pending main activation",
+    )?;
+    Ok(true)
 }
 
 /// Re-executes the shadow supervisor in place from `target`, preserving the listen
@@ -624,7 +676,10 @@ pub fn run_shadow_daemon_supervision_loop(
         }
 
         if let Some(pending) = pending_rollout.as_ref() {
-            if matches!(main_probe_status, DaemonProbeStatus::Running(_)) {
+            if pending_rollout_probe_matches_candidate(
+                &main_probe_status,
+                supervised_main.as_ref().map(|child| child.id()),
+            ) {
                 let _ = promote_shadow_main_rollout(
                     &rollout_paths,
                     pending,
@@ -787,10 +842,12 @@ pub fn run_shadow_daemon_supervision_loop(
                 detail: source.to_string(),
             })? {
                 if let Some(pending) = pending_rollout.take() {
+                    let candidate_pid = child.id();
                     match handle_pending_shadow_main_process_exit(
                         &rollout_paths,
                         &main_paths,
                         &pending,
+                        candidate_pid,
                         status,
                         &options.host,
                         options.port,
@@ -1026,6 +1083,16 @@ fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
 
 fn should_shadow_start_main(main_restart_suppressed: bool, pending_main_activation: bool) -> bool {
     pending_main_activation || !main_restart_suppressed
+}
+
+fn pending_rollout_probe_matches_candidate(
+    probe_status: &DaemonProbeStatus,
+    candidate_pid: Option<u32>,
+) -> bool {
+    matches!(
+        (probe_status, candidate_pid),
+        (DaemonProbeStatus::Running(status), Some(pid)) if status.pid == pid
+    )
 }
 
 fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) -> bool {
@@ -2470,6 +2537,7 @@ pub fn handle_pending_shadow_main_process_exit(
     rollout_paths: &SelfRolloutPaths,
     main_paths: &DaemonPaths,
     pending: &ShadowMainRolloutMonitor,
+    candidate_pid: u32,
     status: ExitStatus,
     shadow_host: &str,
     shadow_port: u16,
@@ -2478,9 +2546,9 @@ pub fn handle_pending_shadow_main_process_exit(
     let observation = crate::main_exit_observation_from_status(status);
     if observation.exit_code == Some(0)
         && observation.signal.is_none()
-        && matches!(
-            probe_daemon_status(main_paths, probe_timeout),
-            DaemonProbeStatus::Running(_)
+        && pending_rollout_probe_matches_candidate(
+            &probe_daemon_status(main_paths, probe_timeout),
+            Some(candidate_pid),
         )
     {
         let main_options =
@@ -3188,10 +3256,7 @@ mod tests {
         staged_names.sort();
         assert_eq!(
             staged_names,
-            vec![
-                format!("sinomo{}", std::env::consts::EXE_SUFFIX),
-                format!("sinomo-shadow{}", std::env::consts::EXE_SUFFIX)
-            ]
+            vec![format!("sinomo{}", std::env::consts::EXE_SUFFIX)]
         );
         std::fs::remove_dir_all(root).ok();
     }
@@ -3339,6 +3404,10 @@ mod tests {
             pending_shadow.previous_main_binary.as_deref(),
             Some(activation.main_binary.as_path())
         );
+        assert_eq!(
+            pending_shadow.staged_main_binary.as_deref(),
+            activation.staged_main_binary.as_deref()
+        );
         assert!(!shadow_reexec_request_path(&rollout_paths).exists());
         assert!(rollout_paths.shadow_binary.exists());
         std::fs::remove_dir_all(root).ok();
@@ -3388,6 +3457,82 @@ mod tests {
     }
 
     #[test]
+    fn shadow_start_completion_rehydrates_pending_main_when_staged_main_remains() {
+        let root = temp_rollout_test_root("shadow-start-rehydrates-main");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let current_exe = env::current_exe().expect("current exe");
+        let staged_main = rollout_staged_main_binary(&rollout_paths);
+        fs::create_dir_all(staged_main.parent().expect("staged parent")).expect("staged parent");
+        fs::copy(&current_exe, &staged_main).expect("staged main");
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.shadow_binary = current_exe.clone();
+        let previous_shadow_binary = root.join("previous-shadow");
+        fs::copy(&current_exe, &previous_shadow_binary).expect("previous shadow");
+        let monitor = ShadowMainRolloutMonitor {
+            activation,
+            main_options: crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21353,
+            },
+            previous_main_binary: rollout_paths.main_binary.clone(),
+            previous_shadow_binary,
+            diagnostics: CandidateMainDiagnostics {
+                stdout_log: root.join("stdout.log"),
+                stderr_log: root.join("stderr.log"),
+                diagnostics_path: root.join("diagnostics.json"),
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        stage_pending_shadow_rollout(&rollout_paths, &monitor, "127.0.0.1", 21354)
+            .expect("pending shadow");
+        remove_main_activation(&rollout_paths);
+
+        complete_pending_shadow_rollout_after_start(
+            &DaemonPaths::with_root(root.join("shadow-daemon")),
+            &rollout_paths,
+        )
+        .expect("complete pending shadow");
+
+        assert!(rollout_shadow_finalize_path(&rollout_paths).exists());
+        let activation = read_rollout_main_activation(&rollout_paths)
+            .expect("read main activation")
+            .expect("main activation");
+        assert_eq!(
+            activation.staged_main_binary.as_deref(),
+            Some(staged_main.as_path())
+        );
+        let status = read_rollout_status(&rollout_paths)
+            .expect("read status")
+            .expect("status");
+        assert_eq!(status.status, "in-progress");
+        assert_eq!(status.phase.as_deref(), Some("main-promotion-pending"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn pending_rollout_probe_requires_candidate_pid() {
+        let mut status = test_daemon_status(42);
+        assert!(pending_rollout_probe_matches_candidate(
+            &DaemonProbeStatus::Running(status.clone()),
+            Some(42)
+        ));
+        status.pid = 7;
+        assert!(!pending_rollout_probe_matches_candidate(
+            &DaemonProbeStatus::Running(status),
+            Some(42)
+        ));
+        assert!(!pending_rollout_probe_matches_candidate(
+            &DaemonProbeStatus::NotRunning,
+            Some(42)
+        ));
+        assert!(!pending_rollout_probe_matches_candidate(
+            &DaemonProbeStatus::Running(test_daemon_status(42)),
+            None
+        ));
+    }
+
+    #[test]
     fn daemon_control_port_released_requires_bindable_port() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test port");
         let port = listener.local_addr().expect("local addr").port();
@@ -3418,6 +3563,26 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         ))
+    }
+
+    fn test_daemon_status(pid: u32) -> DaemonStatus {
+        DaemonStatus {
+            pid,
+            host: "127.0.0.1".to_string(),
+            port: 21353,
+            address: "127.0.0.1:21353".to_string(),
+            version: "0.1.0".to_string(),
+            commit: Some("test".to_string()),
+            target_os: Some(std::env::consts::OS.to_string()),
+            target_arch: Some(std::env::consts::ARCH.to_string()),
+            executable: None,
+            rollout: None,
+            started_at: "2026-05-08T00:00:00Z".to_string(),
+            data_dir: PathBuf::from("/tmp/sinomo-test"),
+            lock_file: PathBuf::from("/tmp/sinomo-test/daemon.lock"),
+            cluster: None,
+            idle_stats: None,
+        }
     }
 
     fn test_main_activation(rollout_paths: &SelfRolloutPaths) -> RolloutMainActivation {
