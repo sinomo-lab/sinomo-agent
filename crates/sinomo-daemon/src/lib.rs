@@ -33,7 +33,7 @@ pub use client::{
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
     send_daemon_rpc_to_endpoint_async, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
-    send_dfs_metadata_snapshot_install_to_endpoint_async,
+    send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_protocol_frame_to_endpoint,
     send_dfs_protocol_frame_to_endpoint_async,
 };
 pub(crate) use client::{
@@ -48,6 +48,7 @@ pub(crate) use client::{
     send_dfs_metadata_snapshot_install_to_endpoint_on_runtime,
     send_dfs_protocol_frame_to_endpoint_on_runtime,
 };
+pub use cluster::commit_cluster_kv_txn_with_quorum;
 pub use control::{
     handle_daemon_sandbox_checkpoint, handle_daemon_sandbox_create, handle_daemon_sandbox_destroy,
     handle_daemon_sandbox_http_fetch, handle_daemon_sandbox_http_fetch_to_file,

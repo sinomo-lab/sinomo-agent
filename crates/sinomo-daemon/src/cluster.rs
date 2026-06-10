@@ -4342,6 +4342,21 @@ fn fan_out_committed_cluster_raft_command_on_runtime(
     }
 }
 
+pub fn commit_cluster_kv_txn_with_quorum(
+    paths: &ClusterPaths,
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+) -> Result<KvSnapshot, DaemonError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| DaemonError::Io {
+            path: "tokio runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    commit_cluster_kv_txn_with_quorum_on_runtime(paths, state, txn, runtime.handle())
+}
+
 pub(crate) fn commit_cluster_kv_txn_with_quorum_on_runtime(
     paths: &ClusterPaths,
     state: &mut ClusterBootstrapState,

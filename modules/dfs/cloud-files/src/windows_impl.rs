@@ -704,7 +704,7 @@ impl DfsControlPlaneKvClient for DfsCloudFilesControlPlaneKvClient {
 
     fn txn(&mut self, txn: KvTxn) -> std::result::Result<KvTxnResponse, KvError> {
         let mut state = network::read_cluster_state(&self.cluster_paths)
-            .map_err(|source| self.network_error(source))?;
+            .map_err(|source| self.daemon_error(source))?;
         let snapshot =
             daemon::commit_cluster_kv_txn_with_quorum(&self.cluster_paths, &mut state, txn)
                 .map_err(|source| self.daemon_error(source))?;

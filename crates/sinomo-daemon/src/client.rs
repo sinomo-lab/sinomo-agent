@@ -980,6 +980,26 @@ pub(crate) fn send_dfs_protocol_frame_to_endpoint_on_runtime(
     )
 }
 
+pub fn send_dfs_protocol_frame_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &DfsProtocolFrameCommand,
+    connect_timeout: Duration,
+) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| DaemonError::Io {
+            path: "tokio runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    send_dfs_protocol_frame_to_endpoint_on_runtime(
+        endpoint,
+        request,
+        connect_timeout,
+        runtime.handle(),
+    )
+}
+
 pub async fn send_dfs_protocol_frame_to_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     request: &DfsProtocolFrameCommand,
