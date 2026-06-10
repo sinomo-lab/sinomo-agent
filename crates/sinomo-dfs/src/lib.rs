@@ -15371,25 +15371,41 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         };
         let expected_request_id = pending
             .repair_inflight_request_ids
-            .get(&response.replica_node_id)
-            .ok_or_else(|| DfsError::Distributed {
+            .get(&response.replica_node_id);
+        if let Some(expected_request_id) = expected_request_id {
+            if expected_request_id != &response.request_id {
+                return Err(DfsError::Distributed {
+                    message: format!(
+                        "unexpected DFS repair response request id for intent {} from {}: expected {}, actual {}",
+                        response.intent_id,
+                        response.replica_node_id,
+                        expected_request_id,
+                        response.request_id
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        if !pending.repair_inflight_request_ids.is_empty() {
+            return Err(DfsError::Distributed {
                 message: format!(
                     "unexpected DFS repair response source for intent {}: {}",
                     response.intent_id, response.replica_node_id
                 ),
-            })?;
-        if expected_request_id != &response.request_id {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "unexpected DFS repair response request id for intent {} from {}: expected {}, actual {}",
-                    response.intent_id,
-                    response.replica_node_id,
-                    expected_request_id,
-                    response.request_id
-                ),
             });
         }
-        Ok(())
+        if self.coordinator.repair_jobs().iter().any(|job| {
+            job.intent_id == response.intent_id
+                && job.missing_replica_node_id == response.replica_node_id
+        }) {
+            return Ok(());
+        }
+        Err(DfsError::Distributed {
+            message: format!(
+                "unexpected DFS repair response source for intent {}: {}",
+                response.intent_id, response.replica_node_id
+            ),
+        })
     }
 
     fn ensure_response_matches_pending_write(
@@ -15726,6 +15742,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 reason,
             });
         }
+        self.restore_pending_write_for_intent_if_missing(&response.intent_id, &response.object_id)?;
         match response.result {
             DfsBlobTransferResult::Committed { ref content_hash }
             | DfsBlobTransferResult::Durable { ref content_hash } => {

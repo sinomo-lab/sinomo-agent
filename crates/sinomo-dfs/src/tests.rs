@@ -10801,6 +10801,103 @@ fn repair_response_conflicting_receipt_preserves_retry_state() {
 }
 
 #[test]
+fn stateless_repair_response_restores_pending_write_without_inflight_request() {
+    let root = temp_root("stateless-repair-response-restores-pending");
+    let owner = NodeId::from_legacy_named("node_stateless_repair_owner").expect("node");
+    let replica = NodeId::from_legacy_named("node_stateless_repair_replica").expect("node");
+    let object_id = DfsObjectId::from_legacy_named("obj_stateless_repair").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
+    let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
+    let bytes = b"stateless repair response bytes";
+    let mut dfs = networked_sifs_with_backend(&root, owner.clone());
+    let mut metadata = file_metadata(owner.clone());
+    metadata.object_id = object_id.clone();
+    metadata.version = version_1.clone();
+    metadata.policy = DfsObjectPolicy::ReplicatedEventual;
+    dfs.add_object_metadata(metadata).expect("metadata");
+    let manifest = dfs
+        .content
+        .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
+        .expect("content");
+    let intent = dfs
+        .coordinator
+        .create_intent(
+            sifs_file_system_id(),
+            object_id.clone(),
+            Some(version_1),
+            version_2.clone(),
+            owner.clone(),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("policy"),
+        )
+        .expect("intent");
+    dfs.pending_writes.insert(
+        intent.intent_id.clone(),
+        pending_networked_write(
+            object_id.clone(),
+            version_2.clone(),
+            manifest.content_hash.clone(),
+            manifest.size_bytes,
+        ),
+    );
+    dfs.coordinator
+        .record_durable_receipt(&intent.intent_id, owner.clone())
+        .expect("owner receipt");
+    dfs.apply_committed_intent(&intent.intent_id)
+        .expect("commit with missing replica");
+    assert_eq!(dfs.coordinator.repair_jobs().len(), 1);
+    drop(dfs);
+
+    let mut recovered = networked_sifs_with_backend(&root, owner.clone());
+    let pending = recovered
+        .pending_writes
+        .get(&intent.intent_id)
+        .expect("hydrated pending repair");
+    assert!(
+        pending.repair_inflight_request_ids.is_empty(),
+        "fresh service instance should not have volatile repair inflight state"
+    );
+
+    let event = recovered
+        .handle_repair_replica_response(
+            replica.clone(),
+            DfsRepairReplicaResponse {
+                request_id: "dfs_net_req_stateless_repair_response".to_string(),
+                intent_id: intent.intent_id.clone(),
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                version: version_2.clone(),
+                replica_node_id: replica.clone(),
+                result: DfsBlobTransferResult::Durable {
+                    content_hash: manifest.content_hash.clone(),
+                },
+            },
+        )
+        .expect("stateless repair response");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::ReplicaRepaired {
+            intent_id: ref repaired_intent,
+            object_id: ref repaired_object,
+            replica_node_id: ref repaired_replica,
+            ..
+        } if repaired_intent == &intent.intent_id
+            && repaired_object == &object_id
+            && repaired_replica == &replica
+    ));
+    assert!(recovered.coordinator.repair_jobs().is_empty());
+    assert!(
+        !recovered.pending_writes.contains_key(&intent.intent_id),
+        "fully repaired committed intent should be removed after stateless response"
+    );
+    let object = recovered.metadata().object(&object_id).expect("object");
+    assert!(object.current_locations.contains(&owner));
+    assert!(object.current_locations.contains(&replica));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn repair_command_conflicting_receipt_does_not_commit_visible_metadata() {
     let root = temp_root("repair-command-conflicting-receipt-no-visible-commit");
     let owner = NodeId::from_legacy_named("node_repair_cmd_owner").expect("node");
