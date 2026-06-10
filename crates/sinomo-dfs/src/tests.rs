@@ -11000,6 +11000,179 @@ fn repair_command_conflicting_receipt_does_not_commit_visible_metadata() {
 }
 
 #[test]
+fn repair_command_accepts_current_replica_after_metadata_primary_moves() {
+    let root = temp_root("repair-command-current-replica-after-primary-move");
+    let source = NodeId::from_legacy_named("node_repair_moved_current_replica").expect("source");
+    let target = NodeId::from_legacy_named("node_repair_moved_primary").expect("target");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_moved_primary").expect("object");
+    let version_1 = DfsVersion::from_legacy_named("version_repair_moved_1").expect("base version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_repair_moved_2").expect("target version");
+    let file_system = file_system(source.clone());
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![target.clone()]).expect("kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: target.clone(),
+                replica_node_ids: vec![source.clone()],
+                epoch: 2,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let network = InProcessNetwork::new();
+    let _source_mailbox = network.add_node(source.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(target.clone()), content)
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    let mut object = file_metadata(source.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id = object_id.clone();
+    object.path = "/services/repair-after-primary-move.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![source.clone()];
+    dfs.add_object_metadata(object.clone()).expect("metadata");
+    let bytes = b"repair bytes from current replica after metadata primary moved";
+    let content_hash = content_hash(bytes);
+
+    let event = dfs
+        .handle_repair_replica(
+            source.clone(),
+            DfsRepairReplicaCommand {
+                request_id: "dfs_net_req_repair_moved_primary".to_string(),
+                intent_id: "dfs_intent_repair_moved_primary".to_string(),
+                file_system_id: file_system.file_system_id,
+                object_id: object_id.clone(),
+                expected_base_version: Some(version_1),
+                version: version_2.clone(),
+                content_hash: content_hash.clone(),
+                bytes: bytes.to_vec(),
+                object_metadata: Some(object),
+            },
+        )
+        .expect("repair command");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::ReplicaRepaired {
+            object_id: repaired_object_id,
+            replica_node_id,
+            ..
+        } if repaired_object_id == object_id && replica_node_id == target
+    ));
+    let manifest = dfs
+        .content()
+        .read_manifest(object_id.as_str(), version_2.as_str())
+        .expect("repaired manifest");
+    assert_eq!(manifest.content_hash, content_hash);
+    let object = dfs
+        .current_read_object_metadata(&object_id)
+        .expect("repaired object metadata");
+    assert_eq!(object.version, version_2);
+    assert!(object.current_locations.contains(&target));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn repair_command_rejects_unknown_object_from_non_primary_metadata_source() {
+    let root = temp_root("repair-command-unknown-object-non-primary-source");
+    let source = NodeId::from_legacy_named("node_repair_unknown_source").expect("source");
+    let primary = NodeId::from_legacy_named("node_repair_unknown_primary").expect("primary");
+    let target = NodeId::from_legacy_named("node_repair_unknown_target").expect("target");
+    let object_id = DfsObjectId::from_legacy_named("obj_repair_unknown_primary").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_repair_unknown_1").expect("base version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_repair_unknown_2").expect("target version");
+    let file_system = file_system(source.clone());
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary.clone()]).expect("kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id.clone(),
+                shard_id: "services".to_string(),
+                primary_node_id: primary.clone(),
+                replica_node_ids: vec![target.clone()],
+                epoch: 2,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let network = InProcessNetwork::new();
+    let _source_mailbox = network.add_node(source.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(target), content)
+        .with_control_plane(shared_kv)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    let mut object = file_metadata(source.clone());
+    object.file_system_id = file_system.file_system_id.clone();
+    object.object_id = object_id.clone();
+    object.path = "/services/unknown-repair.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![source.clone()];
+    let bytes = b"unknown object metadata should require shard primary";
+    let content_hash = content_hash(bytes);
+
+    let event = dfs
+        .handle_repair_replica(
+            source,
+            DfsRepairReplicaCommand {
+                request_id: "dfs_net_req_repair_unknown_primary".to_string(),
+                intent_id: "dfs_intent_repair_unknown_primary".to_string(),
+                file_system_id: file_system.file_system_id,
+                object_id: object_id.clone(),
+                expected_base_version: Some(version_1),
+                version: version_2,
+                content_hash,
+                bytes: bytes.to_vec(),
+                object_metadata: Some(object),
+            },
+        )
+        .expect("repair command");
+
+    assert!(matches!(
+        event,
+        NetworkedDfsServiceEvent::RepairRejected {
+            object_id: rejected_object_id,
+            reason,
+            ..
+        } if rejected_object_id == object_id
+            && reason.contains("source is not current metadata shard primary")
+            && reason.contains(primary.as_str())
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stage_command_conflicting_receipt_does_not_store_orphan_content() {
     let root = temp_root("stage-command-conflicting-receipt-no-orphan-content");
     let owner = NodeId::from_legacy_named("node_stage_cmd_owner").expect("node");

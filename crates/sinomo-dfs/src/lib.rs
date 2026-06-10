@@ -20193,30 +20193,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
         object_metadata: Option<&DfsObjectMetadata>,
     ) -> Result<(), DfsError> {
-        let object = match self.current_read_object_metadata(object_id) {
-            Ok(object) => object,
+        let (object, object_from_command) = match self.current_read_object_metadata(object_id) {
+            Ok(object) => (object, false),
             Err(DfsError::UnknownObject { .. }) => {
-                object_metadata
+                let object = object_metadata
                     .cloned()
                     .ok_or_else(|| DfsError::UnknownObject {
                         object_id: object_id.clone(),
-                    })?
+                    })?;
+                (object, true)
             }
             Err(error) => return Err(error),
         };
-        let requester_is_metadata_primary = match self.select_metadata_shard_for_object(&object)? {
-            Some(shard) if &shard.primary_node_id != requester_node_id => {
-                return Err(DfsError::UnauthorizedReplicaCommand {
-                    source_node_id: requester_node_id.clone(),
-                    reason: format!(
-                        "source is not current metadata shard primary for {}; primary is {} at epoch {}",
-                        object.file_system_id, shard.primary_node_id, shard.epoch
-                    ),
-                });
-            }
-            Some(_) => true,
-            None => false,
-        };
+        let metadata_shard = self.select_metadata_shard_for_object(&object)?;
+        let requester_is_metadata_primary = metadata_shard
+            .as_ref()
+            .is_some_and(|shard| &shard.primary_node_id == requester_node_id);
         if let Some(backend) = self.metadata_backend.as_ref() {
             if let Some(intent) = backend.get_intent(object_id, intent_id)? {
                 if &intent.coordinator_node_id != requester_node_id {
@@ -20242,15 +20234,27 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(());
         }
 
-        if &object.owner_node_id == requester_node_id {
-            return Ok(());
-        }
-        if matches!(
-            object.policy,
-            DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
-        ) && object.current_locations.contains(requester_node_id)
+        if !object_from_command || metadata_shard.is_none() {
+            if &object.owner_node_id == requester_node_id {
+                return Ok(());
+            }
+            if matches!(
+                object.policy,
+                DfsObjectPolicy::ReplicatedEventual | DfsObjectPolicy::ReplicatedConfirmed
+            ) && object.current_locations.contains(requester_node_id)
+            {
+                return Ok(());
+            }
+        } else if object_metadata.is_some()
+            && let Some(shard) = metadata_shard.as_ref()
         {
-            return Ok(());
+            return Err(DfsError::UnauthorizedReplicaCommand {
+                source_node_id: requester_node_id.clone(),
+                reason: format!(
+                    "source is not current metadata shard primary for {}; primary is {} at epoch {}",
+                    object.file_system_id, shard.primary_node_id, shard.epoch
+                ),
+            });
         }
 
         Err(DfsError::UnauthorizedReplicaCommand {
