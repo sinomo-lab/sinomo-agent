@@ -59,11 +59,17 @@ struct SandboxActiveExecutions {
 }
 
 fn background_dfs_maintenance_enabled() -> bool {
-    matches!(
+    background_dfs_maintenance_enabled_for(
         std::env::var("SINOMO_ENABLE_BACKGROUND_DFS_MAINTENANCE")
             .ok()
             .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+fn background_dfs_maintenance_enabled_for(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "0" | "false" | "no" | "off")
     )
 }
 
@@ -4192,6 +4198,20 @@ mod tests {
             Duration::from_millis(1),
             "overdue work should not create a zero-duration spin"
         );
+    }
+
+    #[test]
+    fn background_dfs_maintenance_defaults_on_with_disable_override() {
+        assert!(background_dfs_maintenance_enabled_for(None));
+        assert!(background_dfs_maintenance_enabled_for(Some("1")));
+        assert!(background_dfs_maintenance_enabled_for(Some("true")));
+        assert!(background_dfs_maintenance_enabled_for(Some(" yes ")));
+        assert!(background_dfs_maintenance_enabled_for(Some("unexpected")));
+
+        assert!(!background_dfs_maintenance_enabled_for(Some("0")));
+        assert!(!background_dfs_maintenance_enabled_for(Some("false")));
+        assert!(!background_dfs_maintenance_enabled_for(Some(" no ")));
+        assert!(!background_dfs_maintenance_enabled_for(Some("OFF")));
     }
 
     #[test]
