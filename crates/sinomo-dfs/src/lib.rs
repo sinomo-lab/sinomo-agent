@@ -9685,6 +9685,26 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     return Ok(());
                 }
             }
+            Err(error @ DfsDistributedError::BaseVersionConflict { .. }) => {
+                if self
+                    .current_read_object_metadata(&intent_record.object_id)
+                    .is_ok_and(|object| {
+                        object.version == intent_record.target_version
+                            && intent_record
+                                .content_hash
+                                .as_deref()
+                                .is_none_or(|content_hash| {
+                                    object.content_hash.as_deref() == Some(content_hash)
+                                })
+                    })
+                {
+                    if matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
+                        self.restore_visible_committed_object_location_receipts(intent_record)?;
+                    }
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
             Err(error) => return Err(error.into()),
         }
 
@@ -12947,6 +12967,39 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn send_untracked_completed_routed_write_response_if_committed(
+        &mut self,
+        intent_id: &str,
+        object_id: &DfsObjectId,
+    ) -> Result<(), DfsError> {
+        let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
+            return Ok(());
+        };
+        if !matches!(intent.state, DfsWriteIntentState::Committed)
+            || intent.requesting_node_id == self.node_id
+            || self.pending_remote_write_responses.contains_key(intent_id)
+        {
+            return Ok(());
+        }
+        let outcome = self.write_outcome(intent_id)?;
+        if !matches!(outcome, NetworkedDfsWriteOutcome::Committed { .. }) {
+            return Ok(());
+        }
+        let result = DfsDistributedWriteResult::Outcome { outcome };
+        let metadata_journal_batch =
+            self.routed_write_response_metadata_journal_batch(object_id, &result, None)?;
+        self.send_dfs_message_if_routable(
+            &intent.requesting_node_id,
+            DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                request_id: intent.intent_id,
+                object_id: object_id.clone(),
+                result,
+                metadata_journal_batch,
+            }),
+        )?;
+        Ok(())
+    }
+
     fn ensure_routed_write_object_metadata(
         &mut self,
         request: &DfsWriteRequest,
@@ -14829,33 +14882,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     content_hash: content_hash.clone(),
                 };
                 self.try_apply_committed_intent_if_ready(&updated_intent.intent_id)?;
-                if self
-                    .coordinator
-                    .intent(&updated_intent.intent_id)
-                    .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
-                    && updated_intent.requesting_node_id != self.node_id
-                    && !self
-                        .pending_remote_write_responses
-                        .contains_key(&updated_intent.intent_id)
-                {
-                    let outcome = self.write_outcome(&updated_intent.intent_id)?;
-                    let result = DfsDistributedWriteResult::Outcome { outcome };
-                    let metadata_journal_batch = self
-                        .routed_write_response_metadata_journal_batch(
-                            &response.object_id,
-                            &result,
-                            None,
-                        )?;
-                    self.send_dfs_message_if_routable(
-                        &updated_intent.requesting_node_id,
-                        DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
-                            request_id: updated_intent.intent_id.clone(),
-                            object_id: response.object_id.clone(),
-                            result,
-                            metadata_journal_batch,
-                        }),
-                    )?;
-                }
+                self.send_untracked_completed_routed_write_response_if_committed(
+                    &updated_intent.intent_id,
+                    &response.object_id,
+                )?;
                 if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
                     pending
                         .stage_inflight_request_ids
@@ -16594,6 +16624,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         self.coordinator
             .record_durable_receipt(intent_id, local_node_id)?;
         self.try_apply_committed_intent_if_ready(intent_id)?;
+        self.send_untracked_completed_routed_write_response_if_committed(intent_id, object_id)?;
         self.cleanup_committed_pending_write_if_repaired(intent_id);
         Ok(())
     }

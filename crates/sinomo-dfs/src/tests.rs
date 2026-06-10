@@ -5489,6 +5489,105 @@ fn stage_response_commits_restored_pending_intent_without_inflight_request_id() 
 }
 
 #[test]
+fn fetch_receipt_completion_sends_untracked_routed_write_response() {
+    let root = temp_root("fetch-receipt-sends-untracked-routed-response");
+    let primary =
+        NodeId::from_legacy_named("node_fetch_receipt_response_primary").expect("primary");
+    let requester =
+        NodeId::from_legacy_named("node_fetch_receipt_response_requester").expect("requester");
+    let object_id = DfsObjectId::from_legacy_named("obj_fetch_receipt_response").expect("object");
+    let version_1 =
+        DfsVersion::from_legacy_named("version_fetch_receipt_response_1").expect("version");
+    let version_2 =
+        DfsVersion::from_legacy_named("version_fetch_receipt_response_2").expect("version");
+    let bytes = b"fetch receipt completion must notify stateless routed writer";
+    let network = InProcessNetwork::new();
+    let mut requester_mailbox = network.add_node(requester.clone());
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let manifest = content
+        .put_object_version(object_id.as_str(), version_2.as_str(), bytes)
+        .expect("local fetched content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(primary.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut object = file_metadata(primary.clone());
+    object.object_id = object_id.clone();
+    object.path = "/services/stateless-fetch-response.txt".to_string();
+    object.version = version_1.clone();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    object.current_locations = vec![requester.clone()];
+    dfs.add_object_metadata(object).expect("object metadata");
+
+    let outcome = dfs
+        .write_distributed_eventual_from_remote_manifest_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: object_id.clone(),
+                target_version: version_2.clone(),
+                requesting_node_id: requester.clone(),
+            },
+            Some(version_1),
+            manifest.content_hash.clone(),
+            manifest.size_bytes,
+            vec![requester.clone(), primary.clone()],
+            DfsReplicationPolicy::new(2, 2).expect("policy"),
+        )
+        .expect("pending remote-manifest write");
+    let NetworkedDfsWriteOutcome::Pending {
+        intent_id,
+        durable_receipts,
+        required_receipts,
+    } = outcome
+    else {
+        panic!("expected pending write, got {outcome:?}");
+    };
+    assert_eq!(durable_receipts, 1);
+    assert_eq!(required_receipts, 2);
+    let _ = drain_dfs_messages(&mut requester_mailbox);
+
+    dfs.record_local_pending_write_receipt_if_desired(
+        &intent_id,
+        &object_id,
+        &version_2,
+        &manifest.content_hash,
+    )
+    .expect("record local fetched receipt");
+
+    let messages = drain_dfs_messages(&mut requester_mailbox);
+    assert!(
+        messages.iter().any(|message| {
+            matches!(
+                message,
+                DfsNetworkMessage::DistributedWriteResponse(DfsDistributedWriteResponse {
+                    request_id,
+                    object_id: response_object_id,
+                    result:
+                        DfsDistributedWriteResult::Outcome {
+                            outcome:
+                                NetworkedDfsWriteOutcome::Committed {
+                                    intent_id: response_intent_id,
+                                    version,
+                                    content_hash,
+                                    ..
+                                },
+                        },
+                    ..
+                }) if request_id == &intent_id
+                    && response_intent_id == &intent_id
+                    && response_object_id == &object_id
+                    && version == &version_2
+                    && content_hash == &manifest.content_hash
+            )
+        }),
+        "primary must notify the routed requester after local fetch receipt commits, got {messages:?}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn stage_response_restores_transient_intent_record_without_visible_object() {
     let root = temp_root("stage-response-restores-transient-intent-record");
     let primary =
