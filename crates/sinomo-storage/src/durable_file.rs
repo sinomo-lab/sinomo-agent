@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
-#[cfg(windows)]
-use std::{fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 use thiserror::Error;
 
 pub const DEFAULT_OBJECT_FILE_MAX_READ_BYTES: u64 = 128 * 1024 * 1024;
