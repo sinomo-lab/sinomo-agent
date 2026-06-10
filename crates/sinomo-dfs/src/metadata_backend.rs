@@ -5219,19 +5219,9 @@ impl LocalSobjMetadataBackend {
                         current: current.version,
                     });
                 }
-                for node_id in required_replica_node_ids {
-                    if !self.tables.receipts.contains_key(&(
-                        object_id.clone(),
-                        committed_version.clone(),
-                        node_id.clone(),
-                    )) {
-                        return Err(MetadataBackendError::Conflict {
-                            object_id: object_id.clone(),
-                            expected: previous_version.clone(),
-                            current: current.version.clone(),
-                        });
-                    }
-                }
+                // A replayed commit entry is authoritative after source validation. Short
+                // read-your-write replay windows can arrive without every receipt entry; the
+                // commit payload is still enough to make the object/version visible locally.
                 let commit_record = DfsVisibleVersionCommitRecord {
                     expected_version: previous_version.clone(),
                     committed_object: normalized_object_metadata(committed_object),
@@ -5455,19 +5445,9 @@ impl LocalSobjMetadataBackend {
                         current: current.version,
                     });
                 }
-                for node_id in required_replica_node_ids {
-                    if !self.tables.receipts.contains_key(&(
-                        object_id.clone(),
-                        committed_version.clone(),
-                        node_id.clone(),
-                    )) {
-                        return Err(MetadataBackendError::Conflict {
-                            object_id: object_id.clone(),
-                            expected: previous_version.clone(),
-                            current: current.version.clone(),
-                        });
-                    }
-                }
+                // A replayed commit entry is authoritative after source validation. Short
+                // read-your-write replay windows can arrive without every receipt entry; the
+                // commit payload is still enough to make the object/version visible locally.
                 let commit_record = DfsVisibleVersionCommitRecord {
                     expected_version: previous_version.clone(),
                     committed_object: normalized_object_metadata(committed_object),
@@ -14606,6 +14586,111 @@ mod tests {
                 source_shard_id: DfsMetadataShardId::new("shard-leader"),
                 replayed_through_sequence: batch.next_after_sequence,
             }]
+        );
+
+        cleanup(&leader_root);
+        cleanup(&follower_root);
+    }
+
+    #[test]
+    fn local_backend_replays_authoritative_commit_without_receipt_entry() {
+        let leader_root = temp_root("local_backend_replays_authoritative_commit_leader");
+        let follower_root = temp_root("local_backend_replays_authoritative_commit_follower");
+        let mut leader =
+            LocalSobjMetadataBackend::new(DfsMetadataShardId::new("shard-leader"), &leader_root)
+                .expect("leader backend");
+        let mut follower = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("shard-follower"),
+            &follower_root,
+        )
+        .expect("follower backend");
+
+        let file_system = file_system();
+        let initial = object(version("version_1"));
+        leader.put_file_system(&file_system).expect("filesystem");
+        leader.put_object(&initial).expect("object");
+
+        let mut committed = initial.clone();
+        committed.version = version("version_2");
+        committed.content_hash = Some("blake3:new".to_string());
+        committed.current_locations.push(node("node_replica"));
+        let visible_version = DfsObjectVersionRecord {
+            file_system_id: committed.file_system_id.clone(),
+            object_id: committed.object_id.clone(),
+            version: committed.version.clone(),
+            content_hash: committed.content_hash.clone(),
+            size_bytes: Some(3),
+            locations: committed.current_locations.clone(),
+            created_by_event_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            visible: true,
+        };
+        let receipt = DfsReplicaReceiptRecord {
+            receipt: DfsWriteReceipt {
+                file_system_id: committed.file_system_id.clone(),
+                object_id: committed.object_id.clone(),
+                committed_version: committed.version.clone(),
+                owner_node_id: node("node_owner"),
+                event_id: EventId::from_legacy_named("evt_missing_receipt_commit").expect("event"),
+            },
+            replica_node_id: node("node_replica"),
+            content_hash: committed.content_hash.clone(),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        leader.put_receipt(&receipt).expect("receipt");
+        leader
+            .commit_visible_version(
+                &initial.version,
+                &committed,
+                &visible_version,
+                std::slice::from_ref(&receipt.replica_node_id),
+            )
+            .expect("commit");
+
+        let mut subscription = leader.subscribe(0);
+        let mut batch = leader
+            .poll_subscription(&mut subscription)
+            .expect("journal batch");
+        batch
+            .entries
+            .retain(|entry| !matches!(entry.mutation, DfsMetadataMutation::PutReceipt { .. }));
+        assert_eq!(batch.entries.len(), 3);
+        let source_sequence_base = JOURNAL_SEGMENT_ENTRY_LIMIT + 128;
+        for (offset, entry) in batch.entries.iter_mut().enumerate() {
+            entry.sequence = source_sequence_base + offset as u64;
+        }
+        batch.next_after_sequence = batch
+            .entries
+            .last()
+            .expect("non-empty replay batch")
+            .sequence;
+
+        assert_eq!(
+            follower
+                .apply_journal_batch(&batch)
+                .expect("apply commit without receipt"),
+            3
+        );
+        assert_eq!(
+            follower
+                .get_object(&committed.object_id)
+                .expect("object")
+                .expect("object")
+                .version,
+            committed.version
+        );
+        assert_eq!(
+            follower
+                .get_version(&committed.object_id, &committed.version)
+                .expect("version"),
+            Some(normalized_version_record(&visible_version))
+        );
+        assert!(
+            follower
+                .receipts_for_version(&committed.object_id, &committed.version)
+                .expect("receipts")
+                .is_empty(),
+            "the commit entry alone should make the write visible; receipts may replay later"
         );
 
         cleanup(&leader_root);
