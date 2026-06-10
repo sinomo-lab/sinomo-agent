@@ -3663,8 +3663,19 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
             metadata_backend_configured: true,
             ..DfsLifecycleMaintenanceReport::default()
         }],
-        scheduled_repairs: Vec::new(),
-        followup_events: Vec::new(),
+        scheduled_repairs: vec![DistributedRepairJob {
+            intent_id: "intent-observation-repair".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            missing_replica_node_id: target.clone(),
+        }],
+        followup_events: vec![NetworkedDfsServiceEvent::RepairRejected {
+            intent_id: "intent-observation-repair".to_string(),
+            object_id: object_id.clone(),
+            replica_node_id: target.clone(),
+            reason: "network authorization denied".to_string(),
+        }],
         metadata_replication: DfsMetadataJournalReplicationReport {
             outcomes: vec![
                 DfsMetadataJournalReplicationOutcome::Applied {
@@ -3710,6 +3721,13 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
                 "DFS anti-entropy issue {object_id} {version} /services/dfs-observation.txt: missing local content (repaired=true)"
             ),
             format!("DFS anti-entropy {file_system_id} stopped after reaching the issue limit"),
+            "DFS repairs: scheduled=1, followups=1".to_string(),
+            format!(
+                "DFS repair scheduled intent-observation-repair {object_id} {version} -> {target}"
+            ),
+            format!(
+                "DFS repair rejected intent-observation-repair {object_id} by {target}: network authorization denied"
+            ),
             format!("replicated 3 DFS metadata journal entries to {target}"),
             format!("repaired DFS metadata replica {target} with snapshot through 12"),
             format!("DFS metadata replication to {target} failed: timeout"),

@@ -1989,6 +1989,10 @@ pub fn dfs_maintenance_tick_observations(
     notice_lines.extend(dfs_lifecycle_maintenance_notice_lines(
         &report.lifecycle_reports,
     ));
+    notice_lines.extend(dfs_repair_maintenance_notice_lines(
+        &report.scheduled_repairs,
+        &report.followup_events,
+    ));
     notice_lines.extend(dfs_metadata_replication_notice_lines(
         &report.metadata_replication,
     ));
@@ -2063,6 +2067,77 @@ pub fn dfs_lifecycle_maintenance_notice_lines(
             ));
         }
     }
+    lines
+}
+
+pub fn dfs_repair_maintenance_notice_lines(
+    scheduled_repairs: &[DistributedRepairJob],
+    followup_events: &[NetworkedDfsServiceEvent],
+) -> Vec<String> {
+    let repair_followups = followup_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+                    | NetworkedDfsServiceEvent::RepairRejected { .. }
+                    | NetworkedDfsServiceEvent::BlobFetched { .. }
+                    | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
+            )
+        })
+        .count();
+    if scheduled_repairs.is_empty() && repair_followups == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = vec![format!(
+        "DFS repairs: scheduled={}, followups={}",
+        scheduled_repairs.len(),
+        repair_followups
+    )];
+    lines.extend(scheduled_repairs.iter().map(|job| {
+        format!(
+            "DFS repair scheduled {} {} {} -> {}",
+            job.intent_id, job.object_id, job.version, job.missing_replica_node_id
+        )
+    }));
+    lines.extend(followup_events.iter().filter_map(|event| match event {
+        NetworkedDfsServiceEvent::ReplicaRepaired {
+            intent_id,
+            object_id,
+            version,
+            replica_node_id,
+            ..
+        } => Some(format!(
+            "DFS repair completed {intent_id} {object_id} {version} on {replica_node_id}"
+        )),
+        NetworkedDfsServiceEvent::RepairRejected {
+            intent_id,
+            object_id,
+            replica_node_id,
+            reason,
+        } => Some(format!(
+            "DFS repair rejected {intent_id} {object_id} by {replica_node_id}: {reason}"
+        )),
+        NetworkedDfsServiceEvent::BlobFetched {
+            intent_id,
+            object_id,
+            version,
+            source_node_id,
+            ..
+        } => Some(format!(
+            "DFS repair fetched {intent_id} {object_id} {version} from {source_node_id}"
+        )),
+        NetworkedDfsServiceEvent::BlobFetchRejected {
+            intent_id,
+            object_id,
+            source_node_id,
+            reason,
+        } => Some(format!(
+            "DFS repair fetch rejected {intent_id} {object_id} from {source_node_id}: {reason}"
+        )),
+        _ => None,
+    }));
     lines
 }
 

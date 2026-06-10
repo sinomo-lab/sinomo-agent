@@ -699,19 +699,19 @@ fn daemon_maintenance_sleep_duration(
     shadow_finalization_due: Option<Duration>,
 ) -> Duration {
     let mut next_due = cluster_next_due;
+    next_due = next_due
+        .min(daemon_maintenance_interval_remaining(
+            now,
+            last_dfs_maintenance,
+            DAEMON_DFS_MAINTENANCE_INTERVAL,
+        ))
+        .min(daemon_maintenance_interval_remaining(
+            now,
+            last_rollout_telemetry,
+            DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
+        ));
     if let Some(shadow_finalization_due) = shadow_finalization_due {
-        next_due = next_due
-            .min(daemon_maintenance_interval_remaining(
-                now,
-                last_dfs_maintenance,
-                DAEMON_DFS_MAINTENANCE_INTERVAL,
-            ))
-            .min(daemon_maintenance_interval_remaining(
-                now,
-                last_rollout_telemetry,
-                DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
-            ))
-            .min(shadow_finalization_due);
+        next_due = next_due.min(shadow_finalization_due);
     }
     daemon_sleep_duration_or_min(next_due)
 }
@@ -4192,6 +4192,20 @@ mod tests {
             ),
             Duration::from_secs(5),
             "active rollout fallback polling can still wake sooner than cluster maintenance"
+        );
+        let almost_due_dfs = now
+            .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL - Duration::from_secs(1))
+            .expect("almost due dfs instant");
+        assert_eq!(
+            daemon_maintenance_sleep_duration(
+                now,
+                Duration::from_secs(600),
+                almost_due_dfs,
+                now,
+                None,
+            ),
+            Duration::from_secs(1),
+            "DFS maintenance must wake on its own even when no shadow finalization is pending"
         );
         assert_eq!(
             daemon_maintenance_sleep_duration(now, Duration::ZERO, last_dfs, last_rollout, None,),
