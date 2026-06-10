@@ -2610,7 +2610,6 @@ pub(crate) async fn refresh_daemon_node_status_in_kv_async(
     Ok(outcome)
 }
 
-#[cfg(test)]
 pub(crate) fn ensure_daemon_status_cluster(
     paths: &DaemonPaths,
     status: &mut crate::DaemonStatus,

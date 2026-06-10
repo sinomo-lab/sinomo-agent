@@ -11,7 +11,7 @@ pub mod theme;
 pub mod ui;
 
 use sui::{
-    Application, WindowBuilder, WindowRenderOptions, WindowStemDarkening, WindowTextHinting,
+    App, Window, WindowRenderOptions, WindowStemDarkening, WindowTextHinting,
     default_sui_logo_image,
 };
 
@@ -33,15 +33,14 @@ fn render_options() -> WindowRenderOptions {
 
 /// Construct the application around a given shared state. Exposed so headless
 /// tooling (visual tests) can build and render the same widget tree the app uses.
-pub fn build_application(shared: Shared) -> sui::Result<Application> {
-    let mut app = Application::new().with_window_render_options(render_options());
-    let logo = default_sui_logo_image(96)?;
-    app.register_image(logo_image_handle(), logo)?;
-    Ok(app.window(
-        WindowBuilder::new()
-            .title("Sinomo")
-            .root(Shell::new(shared)),
-    ))
+pub fn build_application(shared: Shared) -> sui::Result<App> {
+    App::new()
+        .render_options(render_options())
+        .with_resources(|resources| {
+            let logo = default_sui_logo_image(96)?;
+            resources.image(logo_image_handle(), logo)
+        })
+        .map(|app| app.window(Window::new("Sinomo").root(Shell::new(shared))))
 }
 
 /// Build a fully-resolved shared state with a starting tab. Uses a synchronous, daemonless
@@ -56,13 +55,10 @@ pub fn boot(initial_tab: Tab) -> Shared {
 
 /// Build a runtime with render options applied (for headless tooling/tests).
 pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
-    let app = build_application(shared)?;
-    let options = app.initial_window_render_options();
-    let runtime = app.build()?;
-    if let Some(options) = options {
-        for window_id in runtime.window_ids() {
-            sui::set_window_render_options(window_id, options);
-        }
+    let runtime = build_application(shared)?.build()?;
+    let options = render_options();
+    for window_id in runtime.window_ids() {
+        sui::set_window_render_options(window_id, options);
     }
     Ok(runtime)
 }
@@ -75,9 +71,9 @@ pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
 pub fn run() -> sui::Result<()> {
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
-    app.run_with(move |waker| {
+    app.run_with_handle(move |ui| {
         // Stash a waker so background work (e.g. provider device-login) can refresh the UI.
-        shared.borrow_mut().waker = Some(waker.clone());
+        shared.borrow_mut().waker = Some(ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
         std::thread::Builder::new()
@@ -85,11 +81,11 @@ pub fn run() -> sui::Result<()> {
             .spawn(move || {
                 let backend = Backend::connect(|status| {
                     let _ = tx.send(ConnectEvent::Status(status.to_string()));
-                    waker.wake();
+                    ui.wake();
                 });
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Connected(Box::new(backend)));
-                waker.wake();
+                ui.wake();
             })
             .expect("spawn connect thread");
     })

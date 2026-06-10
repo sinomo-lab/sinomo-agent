@@ -93,7 +93,7 @@ pub struct AppState {
     pub connect_rx: Option<Receiver<ConnectEvent>>,
     /// Wakes the UI from background threads (set once the event loop is up). Used by long-running
     /// async work like provider device-login to refresh the UI as it progresses.
-    pub waker: Option<sui::Waker>,
+    pub waker: Option<sui::UiHandle>,
 }
 
 impl AppState {

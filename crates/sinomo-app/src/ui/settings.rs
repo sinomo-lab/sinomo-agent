@@ -313,7 +313,7 @@ impl SettingsState {
     /// Start a provider's OAuth device-login flow on a background thread. Progress + the result
     /// arrive via a channel drained on the UI wake (`pump_device_login`); `waker` lets the worker
     /// refresh the UI as it proceeds.
-    fn begin_device_login(&mut self, index: usize, waker: Option<sui::Waker>) {
+    fn begin_device_login(&mut self, index: usize, waker: Option<sui::UiHandle>) {
         let Some(form) = self.provider_forms.get(index) else {
             return;
         };

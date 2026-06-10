@@ -941,6 +941,9 @@ fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::Cluster
     network::ClusterKvTxnQuorumOptions {
         allow_forwarding,
         raft_append_timeout: Duration::from_secs(10),
+        raft_append_replication_options: cli_cluster_raft_append_replication_options(
+            Duration::from_secs(10),
+        ),
         forward_options: network::ClusterKvTxnForwardOptions {
             timeout: Duration::from_secs(10),
             tcp_command_timeout: Duration::from_secs(8),

@@ -1010,7 +1010,7 @@ where
     Ok((frame, permit))
 }
 
-#[cfg(test)]
+#[cfg(any(feature = "iroh-transport", test))]
 async fn read_exact_iroh_proxy_frame_async<R>(
     reader: &mut R,
     buf: &mut [u8],

@@ -1228,6 +1228,9 @@ fn dfs_fuse_cluster_kv_txn_quorum_options(
     network::ClusterKvTxnQuorumOptions {
         allow_forwarding,
         raft_append_timeout: FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        raft_append_replication_options: dfs_fuse_cluster_raft_append_replication_options(
+            FUSE_CLUSTER_RAFT_APPEND_TIMEOUT,
+        ),
         forward_options: dfs_fuse_cluster_kv_txn_forward_options(),
         leader_election_options: dfs_fuse_cluster_raft_leader_election_options(),
         voter_reachability_options: dfs_fuse_cluster_voter_reachability_options(),
@@ -1697,10 +1700,6 @@ impl DfsTransportIdentity for DfsFuseEndpointTransport {
 }
 
 impl DfsFrameTransport for DfsFuseEndpointTransport {
-    fn local_node_id(&self) -> &NodeId {
-        DfsTransportIdentity::local_node_id(self)
-    }
-
     fn send(
         &mut self,
         target_node_id: &NodeId,
