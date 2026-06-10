@@ -2101,6 +2101,7 @@ impl ClusterNetworkMaintenance {
                 remote_repo: desired.remote_repo,
                 source_bundle: desired.source_bundle,
                 source_head: desired.source_head,
+                force_source_overwrite: desired.force_source_overwrite,
                 host: desired
                     .host
                     .unwrap_or_else(|| SINOMO_DAEMON_DEFAULT_HOST.to_string()),

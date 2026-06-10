@@ -17,13 +17,14 @@ use sinomo_rollout::{
     ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest,
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutProgressUpdate,
     ClusterRolloutUploadArtifactSpec, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
-    MainExitObservation, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
-    RolloutActivationStrategy, RolloutFailureDiagnostics, RolloutMainActivation,
-    SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV,
-    SelfRolloutPaths, classify_main_exit, clear_rollout_status, cluster_rollout_progress_status,
-    deploy_managed_source_bundle, ensure_rollout_layout, install_binary_atomically,
-    managed_source_status, read_pending_shadow_rollout, read_rollout_main_activation,
-    read_tail_lossy, record_activation_failure, record_main_activation_staged,
+    MainExitObservation, ManagedSourceDeployOptions, PendingShadowRolloutContext,
+    ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutActivationStrategy, RolloutFailureDiagnostics,
+    RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
+    SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, classify_main_exit, clear_rollout_status,
+    cluster_rollout_progress_status, deploy_managed_source_bundle_with_options,
+    ensure_rollout_layout, install_binary_atomically, managed_source_status,
+    read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
+    record_activation_failure, record_main_activation_staged,
     record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
     record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
     rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_main_activation_path,
@@ -2398,7 +2399,13 @@ pub fn handle_daemon_rollout_build_request(
             path: bundle_path.display().to_string(),
             detail: source.to_string(),
         })?;
-        deploy_managed_source_bundle(&rollout_paths, &bundle_path)?;
+        deploy_managed_source_bundle_with_options(
+            &rollout_paths,
+            &bundle_path,
+            ManagedSourceDeployOptions {
+                force_overwrite: request.force_source_overwrite,
+            },
+        )?;
         if let Some(expected_head) = request.source_head.as_deref() {
             let status = managed_source_status(&rollout_paths)?;
             if !source_heads_match(status.head.as_deref(), expected_head) {

@@ -220,6 +220,7 @@ mod tests {
             mode: Some("cluster-remote-build".to_string()),
             source_head: Some("abc123".to_string()),
             source_bundle: None,
+            force_source_overwrite: true,
             remote_repo: None,
             host: Some("127.0.0.1".to_string()),
             port: Some(21353),

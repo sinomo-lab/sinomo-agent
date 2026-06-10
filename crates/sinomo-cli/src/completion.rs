@@ -1105,14 +1105,14 @@ fn slash_command_registry() -> CommandSpec {
                         "init-source",
                         "initialize managed source repo",
                         vec![],
-                        opts(&["--repo"]),
+                        opts(&["--repo", "--force-source", "--force-overwrite"]),
                         vec![],
                     ),
                     cmd(
                         "import-source",
                         "merge external repo into managed source",
                         vec![],
-                        opts(&["--repo"]),
+                        opts(&["--repo", "--force-source", "--force-overwrite"]),
                         vec![],
                     ),
                     cmd(
@@ -1126,14 +1126,26 @@ fn slash_command_registry() -> CommandSpec {
                         "apply-external",
                         "import then apply managed source",
                         vec![],
-                        opts(&["--repo", "--host", "--port"]),
+                        opts(&[
+                            "--repo",
+                            "--force-source",
+                            "--force-overwrite",
+                            "--host",
+                            "--port",
+                        ]),
                         vec![],
                     ),
                     cmd(
                         "apply",
                         "build and stage managed source",
                         vec![],
-                        opts(&["--repo", "--host", "--port"]),
+                        opts(&[
+                            "--repo",
+                            "--force-source",
+                            "--force-overwrite",
+                            "--host",
+                            "--port",
+                        ]),
                         vec![],
                     ),
                     cmd(
@@ -1145,6 +1157,8 @@ fn slash_command_registry() -> CommandSpec {
                             "--binary",
                             "--target",
                             "--remote-build",
+                            "--force-source",
+                            "--force-overwrite",
                             "--remote-repo",
                             "--skip-local",
                         ]),
@@ -1774,6 +1788,8 @@ fn option_for_name(name: &'static str) -> OptionSpec {
         | "--no-start"
         | "--no-stop"
         | "--remote-build"
+        | "--force-source"
+        | "--force-overwrite"
         | "--skip-local"
         | "--shadow-telemetry"
         | "--enable-auto-promotion"
@@ -1918,6 +1934,7 @@ fn option_detail(name: &str) -> &'static str {
         "--library-name" => "native library file name",
         "--source" => "source label",
         "--target" => "target host:port",
+        "--force-source" | "--force-overwrite" => "stash and overwrite managed source",
         "--daemon" => "use daemon-backed storage",
         "--container-runtime" => "container runtime",
         "--container-image" => "container image",

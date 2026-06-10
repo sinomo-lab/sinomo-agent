@@ -109,15 +109,18 @@ pub use protocol::{
 };
 pub use service::{RolloutService, register_services};
 pub use source::{
-    LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact, ManagedSourceStatus,
-    RolloutBuiltArtifacts, RolloutStatusView, create_source_repo_bundle,
-    create_source_repo_bundle_bytes, deploy_managed_source_bundle, deploy_managed_source_repo,
-    deploy_managed_source_repo_or_current, discover_current_git_repo, ensure_rollout_source_repo,
-    managed_source_status, prepare_local_rollout_artifacts, prepare_rollout_dev_artifacts,
-    prepare_rollout_dev_binary, prepare_rollout_source_bundle, remove_dir_if_exists,
-    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_build_dev_binary,
-    rollout_remote_repo_path, rollout_source_head, rollout_status_view, source_heads_match,
-    stage_local_rollout_artifacts, sync_external_repo_from_managed,
+    LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact, ManagedSourceDeployOptions,
+    ManagedSourceStatus, RolloutBuiltArtifacts, RolloutStatusView, create_source_repo_bundle,
+    create_source_repo_bundle_bytes, deploy_managed_source_bundle,
+    deploy_managed_source_bundle_with_options, deploy_managed_source_repo,
+    deploy_managed_source_repo_or_current, deploy_managed_source_repo_or_current_with_options,
+    deploy_managed_source_repo_with_options, discover_current_git_repo, ensure_rollout_source_repo,
+    ensure_rollout_source_repo_with_options, managed_source_status,
+    prepare_local_rollout_artifacts, prepare_local_rollout_artifacts_with_options,
+    prepare_rollout_dev_artifacts, prepare_rollout_dev_binary, prepare_rollout_source_bundle,
+    remove_dir_if_exists, rollout_artifact_suffix, rollout_build_dev_artifacts,
+    rollout_build_dev_binary, rollout_remote_repo_path, rollout_source_head, rollout_status_view,
+    source_heads_match, stage_local_rollout_artifacts, sync_external_repo_from_managed,
 };
 pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,

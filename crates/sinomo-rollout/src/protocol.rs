@@ -97,6 +97,8 @@ pub struct ClusterRolloutBuildRequest {
     pub source_bundle: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_head: Option<String>,
+    #[serde(default)]
+    pub force_source_overwrite: bool,
     pub host: String,
     pub port: u16,
     pub shadow_port: u16,
@@ -163,6 +165,7 @@ fn cluster_native_dylib_module_artifact_from_local(
 pub fn prepare_cluster_rollout_build_request(
     source: impl Into<String>,
     remote_repo: Option<PathBuf>,
+    force_source_overwrite: bool,
     host: impl Into<String>,
     port: u16,
     shadow_port: u16,
@@ -173,6 +176,7 @@ pub fn prepare_cluster_rollout_build_request(
         remote_repo,
         source_bundle: None,
         source_head: None,
+        force_source_overwrite,
         host: host.into(),
         port,
         shadow_port,
@@ -315,6 +319,7 @@ mod tests {
         let request = prepare_cluster_rollout_build_request(
             "source",
             Some(PathBuf::from("/repo")),
+            true,
             "127.0.0.1",
             21353,
             21354,
@@ -325,6 +330,7 @@ mod tests {
         assert_eq!(request.remote_repo, Some(PathBuf::from("/repo")));
         assert_eq!(request.source_bundle, None);
         assert_eq!(request.source_head, None);
+        assert!(request.force_source_overwrite);
         assert_eq!(request.host, "127.0.0.1");
         assert_eq!(request.port, 21353);
         assert_eq!(request.shadow_port, 21354);

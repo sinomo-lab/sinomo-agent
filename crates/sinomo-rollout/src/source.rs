@@ -398,8 +398,16 @@ pub fn prepare_local_rollout_artifacts(
     paths: &SelfRolloutPaths,
     repo: Option<&Path>,
 ) -> Result<LocalRolloutArtifacts, RolloutError> {
+    prepare_local_rollout_artifacts_with_options(paths, repo, ManagedSourceDeployOptions::default())
+}
+
+pub fn prepare_local_rollout_artifacts_with_options(
+    paths: &SelfRolloutPaths,
+    repo: Option<&Path>,
+    source_options: ManagedSourceDeployOptions,
+) -> Result<LocalRolloutArtifacts, RolloutError> {
     ensure_rollout_layout(paths)?;
-    ensure_rollout_source_repo(paths, repo)?;
+    ensure_rollout_source_repo_with_options(paths, repo, source_options)?;
     let plan = paths.plan();
     let built_artifacts = rollout_build_dev_artifacts(&plan.build_dir, &plan.build_log)?;
     stage_local_rollout_artifacts(paths, built_artifacts)
@@ -429,11 +437,24 @@ pub fn rollout_remote_repo_path(paths: &SelfRolloutPaths, repo: Option<&Path>) -
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ManagedSourceDeployOptions {
+    pub force_overwrite: bool,
+}
+
 pub fn ensure_rollout_source_repo(
     paths: &SelfRolloutPaths,
     repo: Option<&Path>,
 ) -> Result<(), RolloutError> {
-    deploy_managed_source_repo_or_current(paths, repo).map(|_| ())
+    ensure_rollout_source_repo_with_options(paths, repo, ManagedSourceDeployOptions::default())
+}
+
+pub fn ensure_rollout_source_repo_with_options(
+    paths: &SelfRolloutPaths,
+    repo: Option<&Path>,
+    options: ManagedSourceDeployOptions,
+) -> Result<(), RolloutError> {
+    deploy_managed_source_repo_or_current_with_options(paths, repo, options).map(|_| ())
 }
 
 pub fn create_source_repo_bundle_bytes(
@@ -464,11 +485,23 @@ pub fn deploy_managed_source_repo(
     paths: &SelfRolloutPaths,
     source_repo: &Path,
 ) -> Result<(), RolloutError> {
+    deploy_managed_source_repo_with_options(
+        paths,
+        source_repo,
+        ManagedSourceDeployOptions::default(),
+    )
+}
+
+pub fn deploy_managed_source_repo_with_options(
+    paths: &SelfRolloutPaths,
+    source_repo: &Path,
+    options: ManagedSourceDeployOptions,
+) -> Result<(), RolloutError> {
     if same_path_if_exists(source_repo, &paths.source_repo) {
         return Ok(());
     }
     if paths.source_repo.join(".git").exists() {
-        return merge_external_repo_into_managed(paths, source_repo);
+        return merge_external_repo_into_managed(paths, source_repo, options);
     }
     let Some(parent) = paths.source_repo.parent() else {
         return Err(RolloutError::Io {
@@ -526,12 +559,29 @@ pub fn sync_external_repo_from_managed(
 ) -> Result<(), RolloutError> {
     require_git_repo(&paths.source_repo, "managed source repo")?;
     require_git_repo(external_repo, "external source repo")?;
-    merge_repo_head(external_repo, &paths.source_repo, "sinomo-internal")
+    merge_repo_head(
+        external_repo,
+        &paths.source_repo,
+        "sinomo-internal",
+        ManagedSourceDeployOptions::default(),
+    )
 }
 
 pub fn deploy_managed_source_repo_or_current(
     paths: &SelfRolloutPaths,
     repo: Option<&Path>,
+) -> Result<PathBuf, RolloutError> {
+    deploy_managed_source_repo_or_current_with_options(
+        paths,
+        repo,
+        ManagedSourceDeployOptions::default(),
+    )
+}
+
+pub fn deploy_managed_source_repo_or_current_with_options(
+    paths: &SelfRolloutPaths,
+    repo: Option<&Path>,
+    options: ManagedSourceDeployOptions,
 ) -> Result<PathBuf, RolloutError> {
     let source = match repo {
         Some(repo) => repo.to_path_buf(),
@@ -540,7 +590,7 @@ pub fn deploy_managed_source_repo_or_current(
             detail: source.to_string(),
         })?,
     };
-    deploy_managed_source_repo(paths, &source)?;
+    deploy_managed_source_repo_with_options(paths, &source, options)?;
     Ok(source)
 }
 
@@ -597,13 +647,25 @@ pub fn deploy_managed_source_bundle(
     paths: &SelfRolloutPaths,
     bundle_path: &Path,
 ) -> Result<(), RolloutError> {
+    deploy_managed_source_bundle_with_options(
+        paths,
+        bundle_path,
+        ManagedSourceDeployOptions::default(),
+    )
+}
+
+pub fn deploy_managed_source_bundle_with_options(
+    paths: &SelfRolloutPaths,
+    bundle_path: &Path,
+    options: ManagedSourceDeployOptions,
+) -> Result<(), RolloutError> {
     if !bundle_path.exists() {
         return Err(RolloutError::MissingArtifact {
             artifact: bundle_path.display().to_string(),
         });
     }
     if paths.source_repo.join(".git").exists() {
-        return merge_bundle_head_into_managed(paths, bundle_path);
+        return merge_bundle_head_into_managed(paths, bundle_path, options);
     }
     let Some(parent) = paths.source_repo.parent() else {
         return Err(RolloutError::Io {
@@ -713,16 +775,18 @@ pub struct RolloutStatusView {
 fn merge_external_repo_into_managed(
     paths: &SelfRolloutPaths,
     source_repo: &Path,
+    options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
     require_git_repo(&paths.source_repo, "managed source repo")?;
     require_git_repo(source_repo, "external source repo")?;
-    merge_repo_head(&paths.source_repo, source_repo, "sinomo-external")?;
+    merge_repo_head(&paths.source_repo, source_repo, "sinomo-external", options)?;
     remove_all_git_remotes(&paths.source_repo)
 }
 
 fn merge_bundle_head_into_managed(
     paths: &SelfRolloutPaths,
     bundle_path: &Path,
+    options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
     require_git_repo(&paths.source_repo, "managed source repo")?;
     let fetch = Command::new("git")
@@ -747,7 +811,7 @@ fn merge_bundle_head_into_managed(
             stderr: String::from_utf8_lossy(&fetch.stderr).trim().to_string(),
         });
     }
-    update_managed_repo_to_fetched_head(&paths.source_repo)?;
+    update_managed_repo_to_fetched_head(&paths.source_repo, options)?;
     remove_all_git_remotes(&paths.source_repo)
 }
 
@@ -755,6 +819,7 @@ fn merge_repo_head(
     destination_repo: &Path,
     source_repo: &Path,
     remote_name: &str,
+    options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
     let _ = run_git(destination_repo, &["remote", "remove", remote_name]);
     run_git_paths(
@@ -766,15 +831,27 @@ fn merge_repo_head(
     let remove_result = run_git(destination_repo, &["remote", "remove", remote_name]);
     fetch_result?;
     remove_result?;
-    update_managed_repo_to_fetched_head(destination_repo)
+    update_managed_repo_to_fetched_head(destination_repo, options)
 }
 
-fn update_managed_repo_to_fetched_head(repo: &Path) -> Result<(), RolloutError> {
+fn update_managed_repo_to_fetched_head(
+    repo: &Path,
+    options: ManagedSourceDeployOptions,
+) -> Result<(), RolloutError> {
+    if options.force_overwrite {
+        preserve_dirty_managed_source(repo)?;
+        return reset_managed_repo_to_fetched_head(repo);
+    }
+
     if run_git(repo, &["merge", "--ff-only", "FETCH_HEAD"]).is_ok() {
         return Ok(());
     }
 
     ensure_clean_git_worktree(repo)?;
+    reset_managed_repo_to_fetched_head(repo)
+}
+
+fn reset_managed_repo_to_fetched_head(repo: &Path) -> Result<(), RolloutError> {
     let current = git_one_line(repo, &["rev-parse", "HEAD"])?;
     if !current.is_empty() {
         run_git(
@@ -783,6 +860,27 @@ fn update_managed_repo_to_fetched_head(repo: &Path) -> Result<(), RolloutError> 
         )?;
     }
     run_git(repo, &["reset", "--hard", "FETCH_HEAD"]).map(|_| ())
+}
+
+fn preserve_dirty_managed_source(repo: &Path) -> Result<(), RolloutError> {
+    let status = run_git(repo, &["status", "--porcelain"])?;
+    if status.trim().is_empty() {
+        return Ok(());
+    }
+    run_git(
+        repo,
+        &[
+            "stash",
+            "push",
+            "--include-untracked",
+            "-m",
+            &format!(
+                "sinomo-managed-source-force-overwrite-{}",
+                rollout_artifact_suffix()
+            ),
+        ],
+    )
+    .map(|_| ())
 }
 
 fn ensure_clean_git_worktree(repo: &Path) -> Result<(), RolloutError> {
@@ -1149,6 +1247,115 @@ default-members = [
         assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
         assert_eq!(backup, diverged_head);
         assert!(!paths.source_repo.join("local.txt").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deploy_managed_source_bundle_force_overwrite_stashes_dirty_managed_repo() {
+        let root = unique_temp("sinomo-rollout-source-bundle-force");
+        let external = root.join("external");
+        let data = root.join("data");
+        let bundle = root.join("source.bundle");
+        fs::create_dir_all(&external).expect("external dir");
+        run_git_for_test(&external, &["init"]);
+        run_git_for_test(&external, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&external, &["config", "user.name", "Sinomo Test"]);
+        fs::write(external.join("Cargo.toml"), "[workspace]\n").expect("cargo");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "initial"]);
+
+        let paths = SelfRolloutPaths::new(&data);
+        deploy_managed_source_repo(&paths, &external).expect("initial deploy");
+        let local_manifest = "[workspace]\nlocal = true\n";
+        fs::write(paths.source_repo.join("Cargo.toml"), local_manifest).expect("dirty cargo");
+        fs::write(paths.source_repo.join("untracked.txt"), "local only\n").expect("untracked");
+
+        let external_manifest = "[workspace]\nresolver = \"3\"\n";
+        fs::write(external.join("Cargo.toml"), external_manifest).expect("cargo update");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "second"]);
+        let expected_head = git_one_line(&external, &["rev-parse", "HEAD"]).expect("expected head");
+        create_source_repo_bundle(&external, &bundle).expect("source bundle");
+
+        let error = deploy_managed_source_bundle(&paths, &bundle)
+            .expect_err("dirty managed source should require force");
+        assert!(
+            error
+                .to_string()
+                .contains("managed source worktree has local changes")
+        );
+        assert_eq!(
+            fs::read_to_string(paths.source_repo.join("Cargo.toml")).expect("dirty manifest"),
+            local_manifest
+        );
+
+        deploy_managed_source_bundle_with_options(
+            &paths,
+            &bundle,
+            ManagedSourceDeployOptions {
+                force_overwrite: true,
+            },
+        )
+        .expect("force bundle deploy");
+        let status = managed_source_status(&paths).expect("status");
+        let stash = git_one_line(&paths.source_repo, &["stash", "list", "--max-count=1"])
+            .expect("stash list");
+
+        assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
+        assert_eq!(
+            fs::read_to_string(paths.source_repo.join("Cargo.toml")).expect("manifest"),
+            external_manifest
+        );
+        assert!(!paths.source_repo.join("untracked.txt").exists());
+        assert!(stash.contains("sinomo-managed-source-force-overwrite-"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn deploy_managed_source_bundle_force_overwrite_resets_dirty_same_head() {
+        let root = unique_temp("sinomo-rollout-source-bundle-force-same-head");
+        let external = root.join("external");
+        let data = root.join("data");
+        let bundle = root.join("source.bundle");
+        fs::create_dir_all(&external).expect("external dir");
+        run_git_for_test(&external, &["init"]);
+        run_git_for_test(&external, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&external, &["config", "user.name", "Sinomo Test"]);
+        let external_manifest = "[workspace]\n";
+        fs::write(external.join("Cargo.toml"), external_manifest).expect("cargo");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "initial"]);
+        let expected_head = git_one_line(&external, &["rev-parse", "HEAD"]).expect("expected head");
+
+        let paths = SelfRolloutPaths::new(&data);
+        deploy_managed_source_repo(&paths, &external).expect("initial deploy");
+        fs::write(
+            paths.source_repo.join("Cargo.toml"),
+            "[workspace]\nlocal = true\n",
+        )
+        .expect("dirty cargo");
+        fs::write(paths.source_repo.join("untracked.txt"), "local only\n").expect("untracked");
+        create_source_repo_bundle(&external, &bundle).expect("source bundle");
+
+        deploy_managed_source_bundle_with_options(
+            &paths,
+            &bundle,
+            ManagedSourceDeployOptions {
+                force_overwrite: true,
+            },
+        )
+        .expect("force bundle deploy");
+        let status = managed_source_status(&paths).expect("status");
+        let stash = git_one_line(&paths.source_repo, &["stash", "list", "--max-count=1"])
+            .expect("stash list");
+
+        assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
+        assert_eq!(
+            fs::read_to_string(paths.source_repo.join("Cargo.toml")).expect("manifest"),
+            external_manifest
+        );
+        assert!(!paths.source_repo.join("untracked.txt").exists());
+        assert!(stash.contains("sinomo-managed-source-force-overwrite-"));
         fs::remove_dir_all(root).ok();
     }
 

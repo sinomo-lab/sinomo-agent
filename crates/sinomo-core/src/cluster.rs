@@ -49,6 +49,8 @@ pub struct ClusterRolloutDesiredRecord {
     pub source_head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
     pub source_bundle: Option<Vec<u8>>,
+    #[serde(default)]
+    pub force_source_overwrite: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_repo: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

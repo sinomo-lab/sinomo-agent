@@ -28,6 +28,7 @@ pub(crate) struct RolloutOptions {
     pub(crate) shadow_port: u16,
     pub(crate) skip_local: bool,
     pub(crate) remote_build: bool,
+    pub(crate) force_source_overwrite: bool,
 }
 
 impl Default for RolloutOptions {
@@ -42,6 +43,7 @@ impl Default for RolloutOptions {
             shadow_port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
             skip_local: false,
             remote_build: false,
+            force_source_overwrite: false,
         }
     }
 }
@@ -224,6 +226,7 @@ pub(crate) fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, C
             }
             "--skip-local" => options.skip_local = true,
             "--remote-build" => options.remote_build = true,
+            "--force-source" | "--force-overwrite" => options.force_source_overwrite = true,
             _ => return Err(CliError::Usage),
         }
         index += 1;
@@ -503,7 +506,11 @@ pub(crate) fn rollout_paths_from_defaults() -> Result<SelfRolloutPaths, CliError
 pub(crate) fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
     ensure_rollout_layout(&paths)?;
-    ensure_rollout_source_repo(&paths, options.repo.as_deref())?;
+    ensure_rollout_source_repo_with_options(
+        &paths,
+        options.repo.as_deref(),
+        rollout_source_deploy_options(&options),
+    )?;
     println!("source repo: {}", paths.source_repo.display());
     Ok(())
 }
@@ -511,7 +518,11 @@ pub(crate) fn rollout_init_source(options: RolloutOptions) -> Result<(), CliErro
 pub(crate) fn rollout_import_source(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
     ensure_rollout_layout(&paths)?;
-    ensure_rollout_source_repo(&paths, options.repo.as_deref())?;
+    ensure_rollout_source_repo_with_options(
+        &paths,
+        options.repo.as_deref(),
+        rollout_source_deploy_options(&options),
+    )?;
     println!("imported external source into managed repo");
     println!("  managed source: {}", paths.source_repo.display());
     print_managed_source_status(&paths)?;
@@ -984,7 +995,11 @@ pub(crate) fn print_managed_source_status_view(status: ManagedSourceStatus) {
 pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
     let paths = rollout_paths_from_defaults()?;
     let rollout_plan = paths.plan();
-    let artifacts = prepare_local_rollout_artifacts(&paths, options.repo.as_deref())?;
+    let artifacts = prepare_local_rollout_artifacts_with_options(
+        &paths,
+        options.repo.as_deref(),
+        rollout_source_deploy_options(&options),
+    )?;
 
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let installed_modules = rollout_install_local_rollout_native_dylib_modules(
@@ -1067,6 +1082,7 @@ pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
     let build_request = prepare_cluster_rollout_build_request(
         source.clone(),
         options.remote_repo.clone(),
+        options.force_source_overwrite,
         options.host.clone(),
         options.port,
         options.shadow_port,
@@ -1219,6 +1235,7 @@ fn publish_cluster_rollout_desired(
         mode: Some("cluster-remote-build".to_string()),
         source_head: source_head.map(str::to_string),
         source_bundle: None,
+        force_source_overwrite: options.force_source_overwrite,
         remote_repo: options.remote_repo.clone(),
         host: Some(options.host.clone()),
         port: Some(options.port),
@@ -1253,6 +1270,12 @@ fn publish_cluster_rollout_desired(
     )?;
     let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
     Ok(())
+}
+
+fn rollout_source_deploy_options(options: &RolloutOptions) -> ManagedSourceDeployOptions {
+    ManagedSourceDeployOptions {
+        force_overwrite: options.force_source_overwrite,
+    }
 }
 
 pub(crate) fn rollout_source_bundle(

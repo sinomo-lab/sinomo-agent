@@ -131,9 +131,9 @@ pub(super) fn print_rollout_help() {
     println!("Rollout:");
     println!("  sinomo rollout");
     println!("      Show rollout commands.");
-    println!("  sinomo rollout init-source [--repo <path>]");
+    println!("  sinomo rollout init-source [--repo <path>] [--force-source]");
     println!("      Initialize or merge an external git checkout into the managed source repo.");
-    println!("  sinomo rollout import-source [--repo <path>]");
+    println!("  sinomo rollout import-source [--repo <path>] [--force-source]");
     println!(
         "      Merge external repo changes into the managed source repo without retaining external remotes."
     );
@@ -141,19 +141,26 @@ pub(super) fn print_rollout_help() {
     println!(
         "      Merge managed source changes, including self-evolution commits, into an external repo."
     );
-    println!("  sinomo rollout apply-external [--repo <path>] [--host <host>] [--port <port>]");
+    println!(
+        "  sinomo rollout apply-external [--repo <path>] [--force-source] [--host <host>] [--port <port>]"
+    );
     println!(
         "      Import external repo changes into managed source, then build and apply the managed source."
     );
-    println!("  sinomo rollout apply [--repo <path>] [--host <host>] [--port <port>]");
+    println!(
+        "  sinomo rollout apply [--repo <path>] [--force-source] [--host <host>] [--port <port>]"
+    );
     println!(
         "      Build the data-directory source repo, stage main and shadow binaries, then verify main health."
     );
     println!(
-        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--remote-repo <path>] [--skip-local]"
+        "  sinomo rollout cluster [--repo <path> | --binary <path>] [--target <host:port>] [--remote-build] [--force-source] [--remote-repo <path>] [--skip-local]"
     );
     println!(
         "      Build or use a dev binary for compatible nodes, or ask targets to build from their own source repo, then activate through shadow supervision or the main-only shadow bootstrap path."
+    );
+    println!(
+        "      --force-source stashes local changes in the managed source repo before overwriting it with the rollout source."
     );
     println!(
         "  sinomo rollout advance [--node <node-id>] [--scorecard <path> | --module-replay-report <path> | --shadow-telemetry [--shadow-telemetry-limit <n>]] [--incident <event-id>] [--user-corrections <n>] [--rollback-trigger <trigger>] [--evidence <ref>]"

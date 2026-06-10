@@ -12050,6 +12050,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
             "--remote-build".to_string(),
             "--remote-repo".to_string(),
             "/srv/sinomo-agent".to_string(),
+            "--force-source".to_string(),
             "--target".to_string(),
             "192.0.2.11:21353".to_string(),
             "--skip-local".to_string(),
@@ -12058,8 +12059,17 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         RolloutCliCommand::Cluster(RolloutOptions {
             remote_build: true,
             remote_repo: Some(std::path::PathBuf::from("/srv/sinomo-agent")),
+            force_source_overwrite: true,
             targets: vec!["192.0.2.11:21353".to_string()],
             skip_local: true,
+            ..RolloutOptions::default()
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&["apply".to_string(), "--force-overwrite".to_string()])
+            .expect("apply force overwrite"),
+        RolloutCliCommand::Apply(RolloutOptions {
+            force_source_overwrite: true,
             ..RolloutOptions::default()
         })
     );
@@ -12997,6 +13007,7 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
         remote_repo: None,
         source_bundle: None,
         source_head: None,
+        force_source_overwrite: false,
         host: "127.0.0.1".to_string(),
         port: 21_353,
         shadow_port: 21_354,
@@ -13084,6 +13095,7 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
         remote_repo: None,
         source_bundle: Some(std::fs::read(&bundle).expect("bundle bytes")),
         source_head: Some(expected_head.clone()),
+        force_source_overwrite: false,
         host: "127.0.0.1".to_string(),
         port: 21_353,
         shadow_port: 21_354,
