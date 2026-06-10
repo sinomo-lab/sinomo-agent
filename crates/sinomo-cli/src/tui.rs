@@ -123,9 +123,13 @@ pub(crate) fn runtime_main_agent_handler_for_tui_with_data_dir(
     ),
     CliError,
 > {
-    let (runtime_config, _) = load_tui_model_runtime_config(data_dir, daemon.is_some())?;
-    let handler =
-        RuntimeMainAgentInteractionHandler::from_runtime_config(&data_dir, runtime_config)?;
+    let daemon_connected = daemon.is_some();
+    let (runtime_config, _) = load_tui_model_runtime_config(data_dir, daemon_connected)?;
+    let handler = RuntimeMainAgentInteractionHandler::from_default_model_config(
+        data_dir,
+        runtime_config,
+        daemon_connected,
+    )?;
     Ok((handler, daemon))
 }
 
@@ -6405,6 +6409,52 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
                 .with_tool_registry(main_agent_config_tool_registry(data_dir)?),
         )
+    }
+
+    fn from_default_model_config(
+        data_dir: &SinomoDataDir,
+        runtime_config: ModelRuntimeConfig,
+        daemon_connected: bool,
+    ) -> Result<Self, CliError> {
+        let thinking = ThinkingControl::default();
+        let tool_registry = main_agent_config_tool_registry(data_dir)?;
+        let (config, _) =
+            with_tui_model_config_mode(daemon_connected, || load_model_config_for_node(data_dir))?;
+        let resolved = resolve_default_model(Some(&config), None)?;
+        if resolved.provider == default_main_agent_chat_model_provider()
+            && resolved.model == default_main_agent_chat_model_id()
+        {
+            return Ok(Self::from_runtime_config(data_dir, runtime_config)?
+                .with_tool_registry(tool_registry));
+        }
+        let account =
+            provider_account_config(&config, &resolved.provider, Some(&resolved.account)).cloned();
+        let options = provider_options_for_model(account.as_ref(), &resolved.model);
+        Ok(Self::with_thinking(
+            DefaultMainAgentChatModel::configured(
+                data_dir,
+                resolved.provider.clone(),
+                resolved.model.clone(),
+                account,
+                runtime_config,
+            ),
+            resolved.provider,
+            resolved.model,
+            thinking,
+        )
+        .with_tool_registry(tool_registry)
+        .with_account_and_options(Some(resolved.account), options))
+    }
+
+    fn with_account_and_options(
+        mut self,
+        account: Option<String>,
+        options: LanguageModelProviderOptions,
+    ) -> Self {
+        self.account = account;
+        self.reasoning_effort = options.reasoning_effort;
+        self.reasoning_budget_tokens = options.reasoning_budget_tokens;
+        self
     }
 
     fn switch_to_selection(

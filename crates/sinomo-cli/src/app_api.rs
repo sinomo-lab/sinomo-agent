@@ -6,7 +6,7 @@
 //! never depends on `tui` internals.
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sinomo_agent::{
     AgentCatalog, AgentDefinition, AgentItem, AgentModelEvent, AgentRuntimeEvent,
@@ -28,6 +28,7 @@ use crate::tui::{
 
 type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
+const APP_CHAT_RUNTIME_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The active agent / model selection, as plain strings.
 #[derive(Clone, Debug, Default)]
@@ -222,11 +223,16 @@ fn drain_runtime_events(
     let mut terminal = false;
     let mut failure = None;
     let mut streamed_text = String::new();
+    let start_deadline = Instant::now() + APP_CHAT_RUNTIME_START_TIMEOUT;
 
     loop {
         let events = runtime.handler_mut().drain_runtime_events()?;
         if events.is_empty() {
             if saw_worker && !terminal {
+                thread::sleep(APP_CHAT_RUNTIME_DRAIN_INTERVAL);
+                continue;
+            }
+            if !terminal && Instant::now() < start_deadline {
                 thread::sleep(APP_CHAT_RUNTIME_DRAIN_INTERVAL);
                 continue;
             }
@@ -328,8 +334,12 @@ fn forward_model_event(
             "model started: {provider}/{model}"
         ))),
         AgentModelEvent::AssistantTextDelta { delta, .. } => {
-            streamed_text.push_str(&delta);
-            on_event(ChatStreamEvent::Token(delta));
+            for event in split_chunk(&delta) {
+                if let ChatStreamEvent::Token(token) = &event {
+                    streamed_text.push_str(token);
+                }
+                on_event(event);
+            }
         }
         AgentModelEvent::AssistantReasoningSummary { summary, .. } => {
             if !summary.trim().is_empty() {
@@ -389,7 +399,11 @@ fn forward_output(output: InteractionOutput, on_event: &mut dyn FnMut(ChatStream
                 on_event(event);
             }
         }
-        InteractionOutput::Line(line) => on_event(ChatStreamEvent::Token(line)),
+        InteractionOutput::Line(line) => {
+            for event in split_chunk(&line) {
+                on_event(event);
+            }
+        }
         InteractionOutput::ModelUsage {
             provider, model, ..
         } => on_event(ChatStreamEvent::Usage { provider, model }),
@@ -684,5 +698,41 @@ mod tests {
         assert!(matches!(final_state, RuntimeDrainState::Running));
         assert_eq!(events, vec!["token:hello", "token: world"]);
         assert_eq!(streamed_text, "hello world");
+    }
+
+    #[test]
+    fn progress_lines_are_forwarded_as_notices() {
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+
+        forward_output(
+            InteractionOutput::Line(
+                "<sinomo_progress>waiting for configured model runtime</sinomo_progress>"
+                    .to_string(),
+            ),
+            &mut on_event,
+        );
+
+        assert_eq!(events, vec!["notice:waiting for configured model runtime"]);
+    }
+
+    #[test]
+    fn progress_model_deltas_are_forwarded_as_notices() {
+        let mut streamed_text = String::new();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+
+        forward_model_event(
+            AgentModelEvent::AssistantTextDelta {
+                step_index: 0,
+                delta: "<sinomo_progress>waiting for configured model runtime</sinomo_progress>"
+                    .to_string(),
+            },
+            &mut streamed_text,
+            &mut on_event,
+        );
+
+        assert_eq!(events, vec!["notice:waiting for configured model runtime"]);
+        assert!(streamed_text.is_empty());
     }
 }

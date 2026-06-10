@@ -1692,6 +1692,7 @@ pub fn view(shared: Shared) -> impl Widget {
 mod tests {
     use super::*;
     use crate::backend::Backend;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn submit_pushes_user_and_agent_placeholder_and_sets_streaming() {
@@ -1839,5 +1840,93 @@ mod tests {
             Some("ping")
         );
         assert!(state.input.is_empty(), "the draft is cleared after sending");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_app_chat_persists_and_reloads_session_through_sifs() {
+        if std::env::var_os("SINOMO_LIVE_APP_CHAT_SMOKE").is_none() {
+            return;
+        }
+        let backend = Backend::connect(|_| {});
+        let mut state = ChatState::new(&backend);
+        wait_for(&mut state, Duration::from_secs(20), |state| {
+            !state.session_id.is_empty()
+        });
+
+        state.handle.send_command(ChatCommand::SetModel {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            account: "default".to_string(),
+        });
+        wait_for(&mut state, Duration::from_secs(20), |state| {
+            state.info.provider == "deepseek" && state.info.model == "deepseek-v4-pro"
+        });
+
+        let prompt = "Reply with exactly: sinomo-app-live-ok";
+        state.set_draft(prompt.to_string());
+        state.submit();
+        wait_for(&mut state, Duration::from_secs(90), |state| {
+            !state.streaming
+                && state.messages.iter().any(|message| {
+                    message.role == ChatRole::Agent && message.text.contains("sinomo-app-live-ok")
+                })
+        });
+
+        let session_id = state.session_id.clone();
+        assert!(!session_id.is_empty(), "session id is assigned");
+        let local_session_dir = state
+            .data_dir
+            .root()
+            .join("app")
+            .join("sessions")
+            .join(&session_id);
+        std::fs::remove_dir_all(&local_session_dir).expect("remove local session cache");
+
+        let reloaded =
+            sessions::load_transcript(&state.data_dir, &session_id).expect("reload from sifs");
+        assert!(
+            reloaded
+                .messages
+                .iter()
+                .any(|message| message.role == "user" && message.text == prompt),
+            "user prompt persisted"
+        );
+        assert!(
+            reloaded
+                .messages
+                .iter()
+                .any(|message| message.role == "agent"
+                    && message.text.contains("sinomo-app-live-ok")),
+            "agent response persisted"
+        );
+    }
+
+    fn wait_for(
+        state: &mut ChatState,
+        timeout: Duration,
+        predicate: impl Fn(&ChatState) -> bool,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let events = state.handle.drain();
+            for event in events {
+                state.apply_event(event);
+            }
+            if predicate(state) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let snapshot = state
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
+        panic!(
+            "condition was not met within {:?}; streaming={}, notice={:?}, messages={}",
+            timeout, state.streaming, state.notice, snapshot
+        );
     }
 }
