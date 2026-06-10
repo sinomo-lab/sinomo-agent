@@ -4,7 +4,7 @@ use super::support::{normalize_sandbox_sifs_root, sandbox_fs_error_from_dfs, san
 use super::virtual_devices::*;
 
 #[derive(Debug)]
-pub struct SifsSandboxFileSystem<T: NetworkTransport> {
+pub struct SifsSandboxFileSystem<T: DfsFrameTransport> {
     pub dfs: NetworkedDfsService<T>,
     root: String,
     mounts: Vec<SandboxMount>,
@@ -12,7 +12,7 @@ pub struct SifsSandboxFileSystem<T: NetworkTransport> {
     replica_candidates: Vec<NodeId>,
 }
 
-impl<T: NetworkTransport> SifsSandboxFileSystem<T> {
+impl<T: DfsFrameTransport> SifsSandboxFileSystem<T> {
     pub fn new(dfs: NetworkedDfsService<T>, manifest: &SandboxInstanceManifest) -> Self {
         let replica_candidates = vec![dfs.node_id().clone()];
         Self {
@@ -811,7 +811,7 @@ struct SifsMountResolution {
     mode: SandboxMountMode,
 }
 
-impl<T: NetworkTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
+impl<T: DfsFrameTransport> SandboxFileSystem for SifsSandboxFileSystem<T> {
     fn stat(&self, path: &SandboxPath) -> Result<SandboxMetadata, SandboxFsError> {
         let resolved = self.resolve_path(path, false)?;
         let mut metadata = self.stat_raw(&resolved)?;

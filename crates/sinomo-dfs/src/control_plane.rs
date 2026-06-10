@@ -13,6 +13,8 @@ use sinomo_kv::{
     InProcessRaftKvCluster, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
 use sinomo_node::NodeId;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 const DFS_KV_PREFIX: &str = "/dfs";
@@ -94,6 +96,26 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError>;
+}
+
+pub type DfsControlPlaneKvFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, KvError>> + Send + 'a>>;
+
+pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
+    fn get_async<'a>(&'a self, key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>>;
+
+    fn range_prefix_async<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> DfsControlPlaneKvFuture<'a, Vec<KvEntry>>;
+
+    fn put_async<'a>(
+        &'a mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> DfsControlPlaneKvFuture<'a, KvRevision>;
+
+    fn txn_async<'a>(&'a mut self, txn: KvTxn) -> DfsControlPlaneKvFuture<'a, KvTxnResponse>;
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +202,31 @@ impl DfsControlPlaneKvClient for InProcessRaftKvCluster {
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
         InProcessRaftKvCluster::txn_response(self, txn)
+    }
+}
+
+impl AsyncDfsControlPlaneKvClient for InProcessRaftKvCluster {
+    fn get_async<'a>(&'a self, key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
+        Box::pin(async move { DfsControlPlaneKvClient::get(self, key) })
+    }
+
+    fn range_prefix_async<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
+        Box::pin(async move { DfsControlPlaneKvClient::range_prefix(self, prefix) })
+    }
+
+    fn put_async<'a>(
+        &'a mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> DfsControlPlaneKvFuture<'a, KvRevision> {
+        Box::pin(async move { InProcessRaftKvCluster::put(self, key, value) })
+    }
+
+    fn txn_async<'a>(&'a mut self, txn: KvTxn) -> DfsControlPlaneKvFuture<'a, KvTxnResponse> {
+        Box::pin(async move { InProcessRaftKvCluster::txn_response(self, txn) })
     }
 }
 
@@ -284,6 +331,131 @@ impl<'a> DfsControlPlaneStore<'a> {
         T: DeserializeOwned,
     {
         let Some(entry) = self.kv.get(key)? else {
+            return Ok(None);
+        };
+        entry.decode().map(Some)
+    }
+}
+
+pub struct DfsControlPlaneAsyncStore<'a> {
+    pub(crate) kv: &'a mut dyn AsyncDfsControlPlaneKvClient,
+}
+
+impl<'a> DfsControlPlaneAsyncStore<'a> {
+    pub fn new(kv: &'a mut dyn AsyncDfsControlPlaneKvClient) -> Self {
+        Self { kv }
+    }
+
+    pub async fn put_file_system_config(
+        &mut self,
+        config: &DfsFileSystemConfig,
+    ) -> Result<(), KvError> {
+        self.put_serde(&file_system_config_key(&config.file_system_id), config)
+            .await
+    }
+
+    pub async fn get_file_system_config(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsFileSystemConfig>, KvError> {
+        self.get_serde(&file_system_config_key(file_system_id))
+            .await
+    }
+
+    pub async fn put_metadata_shard(
+        &mut self,
+        shard: &DfsMetadataShardConfig,
+    ) -> Result<(), KvError> {
+        self.put_serde(
+            &metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+            shard,
+        )
+        .await
+    }
+
+    pub async fn get_metadata_shard(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+        self.get_serde(&metadata_shard_key(file_system_id, shard_id))
+            .await
+    }
+
+    pub async fn list_metadata_shards(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Vec<DfsMetadataShardConfig>, KvError> {
+        let mut shards: Vec<DfsMetadataShardConfig> = self
+            .kv
+            .range_prefix_async(&format!("{}/", metadata_shards_prefix(file_system_id)))
+            .await?
+            .into_iter()
+            .map(|entry| entry.decode())
+            .collect::<Result<Vec<_>, _>>()?;
+        shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
+        Ok(shards)
+    }
+
+    pub async fn select_metadata_shard_for_path(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+        select_metadata_shard_config_for_path(
+            self.list_metadata_shards(file_system_id).await?,
+            path,
+        )
+    }
+
+    pub async fn transfer_metadata_shard_primary(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        shard_id: &str,
+        expected_epoch: u64,
+        new_primary_node_id: NodeId,
+    ) -> Result<Option<DfsMetadataShardConfig>, KvError> {
+        let key = metadata_shard_key(file_system_id, shard_id);
+        let Some(entry) = self.kv.get_async(&key).await? else {
+            return Ok(None);
+        };
+        let mut current: DfsMetadataShardConfig = entry.decode()?;
+        if current.epoch != expected_epoch {
+            return Ok(None);
+        }
+
+        current.primary_node_id = new_primary_node_id;
+        current.epoch = current.epoch.saturating_add(1);
+        let response = self
+            .kv
+            .txn_async(KvTxn {
+                compares: vec![KvCompare::ValueEquals {
+                    key: key.clone(),
+                    value: entry.value,
+                }],
+                success: vec![KvOp::put_serde(key, &current, None)?],
+                failure: Vec::new(),
+            })
+            .await?;
+
+        Ok(response.succeeded.then_some(current))
+    }
+
+    async fn put_serde<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
+    where
+        T: Serialize,
+    {
+        self.kv
+            .put_async(key.to_string(), sinomo_kv::encode_kv_value(value)?)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_serde<T>(&self, key: &str) -> Result<Option<T>, KvError>
+    where
+        T: DeserializeOwned,
+    {
+        let Some(entry) = self.kv.get_async(key).await? else {
             return Ok(None);
         };
         entry.decode().map(Some)

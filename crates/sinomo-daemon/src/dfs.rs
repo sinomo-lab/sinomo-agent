@@ -1,6 +1,9 @@
 use crate::{
-    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_metadata_journal_batch_to_endpoint,
-    send_dfs_metadata_snapshot_install_to_endpoint, send_dfs_protocol_frame_to_endpoint,
+    DaemonError, DaemonPaths, DaemonRunOptions, send_dfs_metadata_journal_batch_to_endpoint_async,
+    send_dfs_metadata_journal_batch_to_endpoint_on_runtime,
+    send_dfs_metadata_snapshot_install_to_endpoint_async,
+    send_dfs_metadata_snapshot_install_to_endpoint_on_runtime,
+    send_dfs_protocol_frame_to_endpoint_async, send_dfs_protocol_frame_to_endpoint_on_runtime,
 };
 use sinomo_core::ClusterEndpointRecord;
 #[cfg(test)]
@@ -15,17 +18,18 @@ use sinomo_dfs::{
     sifs_node_files_path,
 };
 use sinomo_dfs::{
-    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDefaultClusterBootstrapOptions,
-    DfsDefaultClusterSmokeOptions, DfsEndpointTransport, DfsMaintenanceTickOptions,
-    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataPeerTransportError, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsPeerTransport, DfsPeerTransportError,
-    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, NetworkedDfsService,
+    DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsEndpointTransport,
+    DfsMaintenanceTickOptions, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationOptions,
+    DfsMetadataJournalReplicationReport, DfsMetadataPeerTransportError,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsPeerTransport,
+    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
+    DfsProtocolFrameSender, NetworkedDfsService,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{ClusterPaths, NetworkTransport};
+use sinomo_network::ClusterPaths;
 use std::sync::Arc;
 #[cfg(test)]
 use time::OffsetDateTime;
@@ -42,12 +46,14 @@ pub(crate) fn default_distributed_dfs_enabled() -> bool {
 #[derive(Clone, Debug)]
 struct DaemonDfsControlPlaneKvClient {
     cluster_paths: ClusterPaths,
+    runtime: tokio::runtime::Handle,
 }
 
 impl DaemonDfsControlPlaneKvClient {
-    fn new(cluster_paths: &ClusterPaths) -> Self {
+    fn new_on_runtime(cluster_paths: &ClusterPaths, runtime: &tokio::runtime::Handle) -> Self {
         Self {
             cluster_paths: cluster_paths.clone(),
+            runtime: runtime.clone(),
         }
     }
 
@@ -82,36 +88,110 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     }
 
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
-        crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths(
+        crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths_on_runtime(
             &self.cluster_paths,
             txn,
             true,
+            &self.runtime,
         )
         .map_err(|source| self.daemon_error(source))
+    }
+}
+
+impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
+    fn get_async<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
+        Box::pin(
+            async move { sinomo_kv::read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key) },
+        )
+    }
+
+    fn range_prefix_async<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
+        Box::pin(async move {
+            sinomo_kv::read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
+        })
+    }
+
+    fn put_async<'a>(
+        &'a mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, KvRevision> {
+        Box::pin(async move {
+            let response = self
+                .txn_async(KvTxn {
+                    compares: Vec::new(),
+                    success: vec![KvOp::Put {
+                        key,
+                        value,
+                        lease_id: None,
+                    }],
+                    failure: Vec::new(),
+                })
+                .await?;
+            Ok(response.revision)
+        })
+    }
+
+    fn txn_async<'a>(
+        &'a mut self,
+        txn: KvTxn,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, KvTxnResponse> {
+        Box::pin(async move {
+            crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
+                &self.cluster_paths,
+                txn,
+                true,
+                &self.runtime,
+            )
+            .await
+            .map_err(|source| self.daemon_error(source))
+        })
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonDfsDataPlaneHost {
     paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
 }
 
 impl DaemonDfsDataPlaneHost {
-    pub(crate) fn new(paths: DaemonPaths) -> Self {
-        Self { paths }
+    pub(crate) fn new_on_runtime(paths: DaemonPaths, runtime: &tokio::runtime::Handle) -> Self {
+        Self {
+            paths,
+            runtime: runtime.clone(),
+        }
     }
 }
 
 impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
-    fn run_smoke(&self) -> Result<sinomo_dfs::DfsSmokeReport, DfsDataPlaneHostError> {
-        run_daemon_dfs_smoke(&self.paths).map_err(daemon_dfs_data_plane_error)
+    fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, sinomo_dfs::DfsSmokeReport> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            run_daemon_dfs_smoke_async(&paths, &runtime)
+                .await
+                .map_err(daemon_dfs_data_plane_error)
+        })
     }
 
-    fn handle_protocol_frame(
-        &self,
+    fn handle_protocol_frame<'a>(
+        &'a self,
         command: DfsProtocolFrameCommand,
-    ) -> Result<DfsProtocolFrameResponse, DfsDataPlaneHostError> {
-        handle_daemon_dfs_protocol_frame(&self.paths, command).map_err(daemon_dfs_data_plane_error)
+    ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            handle_daemon_dfs_protocol_frame_async(&paths, command, &runtime)
+                .await
+                .map_err(daemon_dfs_data_plane_error)
+        })
     }
 }
 
@@ -119,23 +199,29 @@ fn daemon_dfs_data_plane_error(source: DaemonError) -> DfsDataPlaneHostError {
     DfsDataPlaneHostError::new(source.to_string())
 }
 
-pub(crate) fn with_daemon_dfs_control_plane<T: NetworkTransport>(
+pub(crate) fn with_daemon_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsFrameTransport>(
     service: NetworkedDfsService<T>,
     cluster_paths: &ClusterPaths,
+    runtime: Option<&tokio::runtime::Handle>,
 ) -> NetworkedDfsService<T> {
-    if let Some(control_plane) = daemon_dfs_control_plane_client(cluster_paths) {
+    if let Some(control_plane) = daemon_dfs_control_plane_client_on_runtime(cluster_paths, runtime)
+    {
         service.with_boxed_control_plane(control_plane)
     } else {
         service
     }
 }
 
-fn daemon_dfs_control_plane_client(
+fn daemon_dfs_control_plane_client_on_runtime(
     cluster_paths: &ClusterPaths,
+    runtime: Option<&tokio::runtime::Handle>,
 ) -> Option<Box<dyn sinomo_dfs::DfsControlPlaneKvClient>> {
+    let runtime = runtime?;
     cluster_paths.kv_snapshot.exists().then(|| {
-        Box::new(DaemonDfsControlPlaneKvClient::new(cluster_paths))
-            as Box<dyn sinomo_dfs::DfsControlPlaneKvClient>
+        Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
+            cluster_paths,
+            runtime,
+        )) as Box<dyn sinomo_dfs::DfsControlPlaneKvClient>
     })
 }
 
@@ -143,55 +229,183 @@ pub(crate) fn daemon_dfs_endpoint_transport(
     local_node_id: sinomo_node::NodeId,
     endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
 ) -> DfsEndpointTransport {
-    DfsEndpointTransport::new(local_node_id, endpoints, daemon_dfs_protocol_frame_sender())
+    DfsEndpointTransport::new(
+        local_node_id,
+        endpoints,
+        Arc::new(|_endpoint, _command, _timeout| {
+            Err(DfsPeerTransportError::new(
+                "local-only DFS endpoint transport cannot send without the daemon-owned Tokio runtime",
+            ))
+        }),
+    )
+}
+
+pub(crate) fn daemon_dfs_endpoint_transport_on_runtime(
+    local_node_id: sinomo_node::NodeId,
+    endpoints: impl IntoIterator<Item = ClusterEndpointRecord>,
+    runtime: &tokio::runtime::Handle,
+) -> DfsEndpointTransport {
+    DfsEndpointTransport::new_with_senders(
+        local_node_id,
+        endpoints,
+        daemon_dfs_protocol_frame_sender_on_runtime(runtime),
+        sinomo_dfs::async_dfs_protocol_frame_sender_from_peer_transport(
+            daemon_dfs_async_peer_transport(runtime),
+        ),
+    )
 }
 
 #[derive(Clone, Debug)]
-struct DaemonDfsPeerTransport;
+struct DaemonDfsBlockingPeerTransport {
+    runtime: tokio::runtime::Handle,
+}
 
-impl DfsPeerTransport for DaemonDfsPeerTransport {
+#[derive(Clone, Debug)]
+struct DaemonDfsAsyncPeerTransport {
+    runtime: tokio::runtime::Handle,
+}
+
+impl DfsPeerTransport for DaemonDfsBlockingPeerTransport {
     fn send_protocol_frame(
         &self,
         endpoint: &ClusterEndpointRecord,
         command: &DfsProtocolFrameCommand,
-        timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> Result<DfsProtocolFrameResponse, DfsPeerTransportError> {
-        send_dfs_protocol_frame_to_endpoint(endpoint, command, timeout)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        send_dfs_protocol_frame_to_endpoint_on_runtime(
+            endpoint,
+            command,
+            connect_timeout,
+            &self.runtime,
+        )
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 
     fn send_metadata_journal_batch(
         &self,
         endpoint: &ClusterEndpointRecord,
         command: &DfsMetadataJournalBatchCommand,
-        timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError> {
-        send_dfs_metadata_journal_batch_to_endpoint(endpoint, command, timeout)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+        send_dfs_metadata_journal_batch_to_endpoint_on_runtime(
+            endpoint,
+            command,
+            connect_timeout,
+            &self.runtime,
+        )
+        .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
     }
 
     fn send_metadata_snapshot_install(
         &self,
         endpoint: &ClusterEndpointRecord,
         command: &DfsMetadataSnapshotInstallCommand,
-        timeout: std::time::Duration,
+        connect_timeout: std::time::Duration,
     ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError> {
-        send_dfs_metadata_snapshot_install_to_endpoint(endpoint, command, timeout)
-            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+        send_dfs_metadata_snapshot_install_to_endpoint_on_runtime(
+            endpoint,
+            command,
+            connect_timeout,
+            &self.runtime,
+        )
+        .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
     }
 }
 
-fn daemon_dfs_peer_transport() -> Arc<dyn DfsPeerTransport> {
-    Arc::new(DaemonDfsPeerTransport)
+impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsAsyncPeerTransport {
+    fn send_protocol_frame_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsProtocolFrameCommand,
+        connect_timeout: std::time::Duration,
+    ) -> sinomo_dfs::DfsPeerTransportFuture<
+        'a,
+        Result<DfsProtocolFrameResponse, DfsPeerTransportError>,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            send_dfs_protocol_frame_to_endpoint_async(endpoint, command, connect_timeout, &runtime)
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        })
+    }
+
+    fn send_metadata_journal_batch_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsMetadataJournalBatchCommand,
+        connect_timeout: std::time::Duration,
+    ) -> sinomo_dfs::DfsPeerTransportFuture<
+        'a,
+        Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            send_dfs_metadata_journal_batch_to_endpoint_async(
+                endpoint,
+                command,
+                connect_timeout,
+                &runtime,
+            )
+            .await
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+        })
+    }
+
+    fn send_metadata_snapshot_install_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsMetadataSnapshotInstallCommand,
+        connect_timeout: std::time::Duration,
+    ) -> sinomo_dfs::DfsPeerTransportFuture<
+        'a,
+        Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>,
+    > {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            send_dfs_metadata_snapshot_install_to_endpoint_async(
+                endpoint,
+                command,
+                connect_timeout,
+                &runtime,
+            )
+            .await
+            .map_err(|source| DfsMetadataPeerTransportError::new(source.to_string()))
+        })
+    }
 }
 
-fn daemon_dfs_protocol_frame_sender() -> DfsProtocolFrameSender {
-    sinomo_dfs::dfs_protocol_frame_sender_from_peer_transport(daemon_dfs_peer_transport())
+fn daemon_dfs_blocking_peer_transport_on_runtime(
+    runtime: &tokio::runtime::Handle,
+) -> Arc<dyn DfsPeerTransport> {
+    Arc::new(DaemonDfsBlockingPeerTransport {
+        runtime: runtime.clone(),
+    })
+}
+
+fn daemon_dfs_async_peer_transport(
+    runtime: &tokio::runtime::Handle,
+) -> Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> {
+    Arc::new(DaemonDfsAsyncPeerTransport {
+        runtime: runtime.clone(),
+    })
+}
+
+fn daemon_dfs_protocol_frame_sender_on_runtime(
+    runtime: &tokio::runtime::Handle,
+) -> DfsProtocolFrameSender {
+    sinomo_dfs::dfs_protocol_frame_sender_from_peer_transport(
+        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
+    )
 }
 
 #[cfg(test)]
 fn daemon_dfs_metadata_snapshot_install_sender() -> DfsMetadataSnapshotInstallSender {
-    sinomo_dfs::dfs_metadata_snapshot_install_sender_from_peer_transport(daemon_dfs_peer_transport())
+    Arc::new(|_endpoint, _command, _timeout| {
+        Err(DfsMetadataPeerTransportError::new(
+            "test DFS metadata snapshot sender has no daemon runtime",
+        ))
+    })
 }
 
 // DFS inspection request/response types live in `sinomo-dfs`; this module only
@@ -213,35 +427,69 @@ pub(crate) fn open_daemon_dfs_metadata_backend(
     sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths).map_err(Into::into)
 }
 
-fn handle_daemon_dfs_protocol_frame(
+async fn handle_daemon_dfs_protocol_frame_async(
     paths: &DaemonPaths,
     command: DfsProtocolFrameCommand,
+    runtime: &tokio::runtime::Handle,
 ) -> Result<DfsProtocolFrameResponse, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let peer_transport = daemon_dfs_peer_transport();
-    let control_plane = daemon_dfs_control_plane_client(&cluster_paths);
-    #[cfg(not(test))]
-    let result = sinomo_dfs::schedule_cluster_dfs_protocol_frame_command_metadata_publish(
-        data_dir,
-        cluster_paths,
-        command,
-        peer_transport,
-        control_plane,
-        sinomo_dfs::DfsMetadataPublishScheduleOptions::default(),
-        DfsMetadataJournalReplicationOptions::default(),
-        log_dfs_metadata_replication_report,
-        |error| {
-            eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
-        },
-    )?;
-    #[cfg(test)]
+    let control_plane = daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
+    let process_data_dir = data_dir.clone();
+    let process_cluster_paths = cluster_paths.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        sinomo_dfs::process_cluster_dfs_protocol_frame_command(
+            &process_data_dir,
+            &process_cluster_paths,
+            command,
+            control_plane,
+        )
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "DFS protocol frame".to_string(),
+        detail: format!("DFS protocol frame task failed: {source}"),
+    })??;
+    let Some(result) = result else {
+        return Err(DaemonError::ClusterOrphan);
+    };
+    let sinomo_dfs::DfsProtocolFrameCommandProcessResult { response, events } = result;
+    if sinomo_dfs::dfs_events_should_publish_metadata(&events) {
+        sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime(
+            runtime.clone(),
+            data_dir,
+            cluster_paths,
+            daemon_dfs_async_peer_transport(runtime),
+            &events,
+            sinomo_dfs::DfsMetadataPublishScheduleOptions::default(),
+            DfsMetadataJournalReplicationOptions::default(),
+            log_dfs_metadata_replication_report,
+            |error| {
+                eprintln!(
+                    "sinomo daemon DFS metadata publish after protocol mutation failed: {error}"
+                );
+            },
+        );
+    }
+    Ok(response)
+}
+
+#[cfg(test)]
+fn handle_daemon_dfs_protocol_frame_on_runtime(
+    paths: &DaemonPaths,
+    command: DfsProtocolFrameCommand,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DfsProtocolFrameResponse, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let control_plane = daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
     let result = sinomo_dfs::run_cluster_dfs_protocol_frame_command_with_metadata_publish(
         &data_dir,
         &cluster_paths,
         command,
-        peer_transport,
+        daemon_dfs_blocking_peer_transport_on_runtime(runtime),
         control_plane,
         DfsMetadataJournalReplicationOptions::default(),
         log_dfs_metadata_replication_report,
@@ -260,27 +508,36 @@ fn handle_daemon_dfs_protocol_frame(
     Ok(result.response)
 }
 
-pub(crate) fn ensure_default_distributed_dfs(
+pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
     publish_cluster_control: bool,
+    runtime: tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    sinomo_dfs::ensure_default_cluster_dfs(
-        &data_dir,
+    let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
         &cluster_paths,
-        Box::new(DaemonDfsControlPlaneKvClient::new(&cluster_paths)),
+        &runtime,
+    ));
+    sinomo_dfs::ensure_default_cluster_dfs_async(
+        data_dir,
+        cluster_paths,
+        control_plane,
         DfsDefaultClusterBootstrapOptions {
             publish_cluster_control,
             local_endpoint: format!("loopback://{}:{}", options.host, options.port),
         },
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
-pub(crate) fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(), DaemonError> {
+pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(), DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -290,13 +547,15 @@ pub(crate) fn run_daemon_dfs_maintenance_tick(paths: &DaemonPaths) -> Result<(),
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let Some(report) = sinomo_dfs::run_cluster_dfs_maintenance_tick_with_peer_transport(
-        &data_dir,
-        &cluster_paths,
-        daemon_dfs_peer_transport(),
-        daemon_dfs_control_plane_client(&cluster_paths),
+    let Some(report) = sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport(
+        runtime,
+        data_dir,
+        cluster_paths.clone(),
+        daemon_dfs_async_peer_transport(runtime),
+        daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
         DfsMaintenanceTickOptions::default(),
-    )?
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -348,26 +607,40 @@ fn publish_default_dfs_metadata_journal_with_senders(
     )?)
 }
 
-fn run_daemon_dfs_smoke(paths: &DaemonPaths) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
+async fn run_daemon_dfs_smoke_async(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_dfs::DfsSmokeReport, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let options = DaemonRunOptions::default();
     let local_endpoint = format!("loopback://{}:{}", options.host, options.port);
-    let Some(report) = sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
-        &data_dir,
-        &cluster_paths,
-        daemon_dfs_peer_transport(),
-        Box::new(DaemonDfsControlPlaneKvClient::new(&cluster_paths)),
-        daemon_dfs_control_plane_client(&cluster_paths),
-        DfsDefaultClusterSmokeOptions {
-            bootstrap: DfsDefaultClusterBootstrapOptions {
-                publish_cluster_control: true,
-                local_endpoint,
+    let runtime = runtime.clone();
+    let Some(report) = tokio::task::spawn_blocking(move || {
+        sinomo_dfs::run_default_cluster_dfs_smoke_with_peer_transport(
+            &data_dir,
+            &cluster_paths,
+            daemon_dfs_blocking_peer_transport_on_runtime(&runtime),
+            Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
+                &cluster_paths,
+                &runtime,
+            )),
+            daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&runtime)),
+            DfsDefaultClusterSmokeOptions {
+                bootstrap: DfsDefaultClusterBootstrapOptions {
+                    publish_cluster_control: true,
+                    local_endpoint,
+                },
+                smoke: sinomo_dfs::DfsSmokeOptions::default(),
             },
-            smoke: sinomo_dfs::DfsSmokeOptions::default(),
-        },
-    )?
+        )
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "DFS smoke".to_string(),
+        detail: format!("DFS smoke task failed: {source}"),
+    })??
     else {
         return Err(DaemonError::ClusterOrphan);
     };
@@ -403,16 +676,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn append_cluster_raft_command(
+        paths: &ClusterPaths,
+        node_id: &NodeId,
+        command: sinomo_kv::KvCommand,
+    ) -> Result<sinomo_kv::KvSnapshot, sinomo_network::NetworkError> {
+        paths
+            .kv_paths()
+            .raft_store()
+            .append_command_and_publish(
+                node_id,
+                command,
+                sinomo_network::cluster_kv_key_can_defer_materialized_snapshot,
+            )
+            .map_err(Into::into)
+    }
+
+    fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
+        crate::build_daemon_async_runtime(name).expect("test daemon runtime")
+    }
+
     fn test_default_cluster_bootstrap_host(
         data_dir: &SinomoDataDir,
         cluster_paths: &ClusterPaths,
         local_node_id: NodeId,
+        runtime: &tokio::runtime::Handle,
     ) -> sinomo_dfs::DfsControlPlaneDefaultClusterBootstrapHost {
         sinomo_dfs::DfsControlPlaneDefaultClusterBootstrapHost::new(
             data_dir.clone(),
             cluster_paths.clone(),
             local_node_id,
-            Box::new(DaemonDfsControlPlaneKvClient::new(cluster_paths)),
+            Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
+                cluster_paths,
+                runtime,
+            )),
         )
     }
 
@@ -574,7 +871,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -740,7 +1037,13 @@ mod tests {
             .expect("status before maintenance");
         assert_eq!(status.pending_namespace_job_count, 1);
 
-        run_daemon_dfs_maintenance_tick(&paths).expect("maintenance tick");
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-namespace-jobs");
+        runtime
+            .block_on(run_daemon_dfs_maintenance_tick_on_runtime(
+                &paths,
+                runtime.handle(),
+            ))
+            .expect("maintenance tick");
 
         let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
             .expect("status after maintenance");
@@ -845,7 +1148,13 @@ mod tests {
                 .expect("missing object metadata");
         }
 
-        run_daemon_dfs_maintenance_tick(&paths).expect("maintenance tick");
+        let runtime = daemon_test_runtime("daemon-dfs-maintenance-anti-entropy");
+        runtime
+            .block_on(run_daemon_dfs_maintenance_tick_on_runtime(
+                &paths,
+                runtime.handle(),
+            ))
+            .expect("maintenance tick");
 
         let backend =
             open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata backend");
@@ -922,7 +1231,7 @@ mod tests {
             },
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &node_id,
             sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
@@ -1055,7 +1364,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -1131,7 +1440,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -1296,7 +1605,7 @@ mod tests {
                 },
                 default_policy: DfsObjectPolicy::ReplicatedEventual,
             };
-            sinomo_network::append_cluster_raft_command(
+            append_cluster_raft_command(
                 &cluster_paths,
                 &local,
                 sinomo_kv::KvCommand::Op(
@@ -1426,7 +1735,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -1581,7 +1890,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -1685,7 +1994,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -1800,7 +2109,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -1956,7 +2265,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &local,
             sinomo_kv::KvCommand::Op(
@@ -2028,7 +2337,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &replica,
             sinomo_kv::KvCommand::Txn(sinomo_kv::KvTxn {
@@ -2103,12 +2412,14 @@ mod tests {
             },
         };
 
-        let response = handle_daemon_dfs_protocol_frame(
+        let runtime = daemon_test_runtime("daemon-dfs-protocol-frame-replica-stage");
+        let response = handle_daemon_dfs_protocol_frame_on_runtime(
             &paths,
             DfsProtocolFrameCommand {
                 request_id: "dfs_protocol_frame_rpc_1".to_string(),
                 frame,
             },
+            runtime.handle(),
         )
         .expect("protocol frame");
 
@@ -2173,12 +2484,14 @@ mod tests {
             },
         };
 
-        let error = handle_daemon_dfs_protocol_frame(
+        let runtime = daemon_test_runtime("daemon-dfs-protocol-frame-wrong-target");
+        let error = handle_daemon_dfs_protocol_frame_on_runtime(
             &paths,
             DfsProtocolFrameCommand {
                 request_id: "dfs_protocol_frame_rpc_wrong_target".to_string(),
                 frame,
             },
+            runtime.handle(),
         )
         .expect_err("wrong target rejected");
         assert!(error.to_string().contains("does not match local node"));
@@ -2305,7 +2618,7 @@ mod tests {
             assignment: DfsMetadataShardAssignment::Root,
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
             sinomo_kv::KvCommand::Op(
@@ -2319,10 +2632,12 @@ mod tests {
         )
         .expect("write old shard");
 
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-migrates-shard-primary");
         let mut host = test_default_cluster_bootstrap_host(
             &data_dir,
             &cluster_paths,
             state.local_node_id.clone(),
+            runtime.handle(),
         );
         let migrated = sinomo_dfs::default_cluster_metadata_shard_with_host(
             &mut host,
@@ -2336,7 +2651,7 @@ mod tests {
         assert_eq!(migrated.primary_node_id, expected_primary);
         assert_eq!(migrated.epoch, 10);
 
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
             sinomo_kv::KvCommand::Op(
@@ -2379,10 +2694,12 @@ mod tests {
         );
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-default-path-shards");
         let mut host = test_default_cluster_bootstrap_host(
             &data_dir,
             &cluster_paths,
             state.local_node_id.clone(),
+            runtime.handle(),
         );
         let shards =
             sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
@@ -2455,7 +2772,7 @@ mod tests {
             },
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
-        sinomo_network::append_cluster_raft_command(
+        append_cluster_raft_command(
             &cluster_paths,
             &state.local_node_id,
             sinomo_kv::KvCommand::Op(
@@ -2474,10 +2791,12 @@ mod tests {
                 .expect("services backend");
         backend.put_file_system(&file_system).expect("filesystem");
 
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-waits-for-shard-transfer");
         let mut host = test_default_cluster_bootstrap_host(
             &data_dir,
             &cluster_paths,
             state.local_node_id.clone(),
+            runtime.handle(),
         );
         let waiting =
             sinomo_dfs::default_cluster_metadata_shards_with_host(&mut host, &state, &file_system)
@@ -2569,7 +2888,14 @@ mod tests {
                 .expect("legacy services object");
         }
 
-        ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), true)
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-migrates-legacy");
+        runtime
+            .block_on(ensure_default_distributed_dfs_async_on_runtime(
+                &paths,
+                &DaemonRunOptions::default(),
+                true,
+                runtime.handle().clone(),
+            ))
             .expect("bootstrap dfs");
 
         let shards = sinomo_kv::read_cluster_kv_prefix_entries(
@@ -2650,7 +2976,14 @@ mod tests {
         assert_ne!(sinomo_dfs::default_cluster_sifs_owner(&state), local);
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
 
-        ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), false)
+        let runtime = daemon_test_runtime("default-dfs-bootstrap-non-primary");
+        runtime
+            .block_on(ensure_default_distributed_dfs_async_on_runtime(
+                &paths,
+                &DaemonRunOptions::default(),
+                false,
+                runtime.handle().clone(),
+            ))
             .expect("bootstrap dfs");
 
         let backend = LocalSobjMetadataBackend::new(
@@ -2693,10 +3026,19 @@ mod tests {
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
         sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
             .expect("sync raft");
-        ensure_default_distributed_dfs(&paths, &DaemonRunOptions::default(), true)
+        let runtime = daemon_test_runtime("daemon-dfs-smoke-single-node");
+        runtime
+            .block_on(ensure_default_distributed_dfs_async_on_runtime(
+                &paths,
+                &DaemonRunOptions::default(),
+                true,
+                runtime.handle().clone(),
+            ))
             .expect("bootstrap dfs");
 
-        let report = run_daemon_dfs_smoke(&paths).expect("dfs smoke");
+        let report = runtime
+            .block_on(run_daemon_dfs_smoke_async(&paths, runtime.handle()))
+            .expect("dfs smoke");
 
         assert_eq!(report.requested_replica_node_ids, vec![local.clone()]);
         assert_eq!(report.committed_replica_node_ids, vec![local]);

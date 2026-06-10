@@ -9,6 +9,7 @@ pub use cli::{
 };
 pub use native_host::*;
 
+use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
@@ -20,11 +21,12 @@ use sinomo_core::{
 use sinomo_events::{EventId, EventStore, EventStoreError, StoredEvent};
 use sinomo_node::{NodeId, NodeIdentity};
 use sinomo_object::{LengthMode, serde_ext};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -649,6 +651,10 @@ impl ModuleRegistration {
         self.surfaces = surfaces;
         self
     }
+
+    pub fn validate_surfaces(&self) -> Result<(), ModuleSurfaceError> {
+        self.surfaces.validate()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -813,6 +819,81 @@ impl ModuleSurfaces {
         self.capabilities.exports.push(capability);
         self
     }
+
+    pub fn object_rpc_route_descriptors(
+        &self,
+    ) -> Result<Vec<ModuleObjectRpcRouteDescriptor>, ModuleSurfaceError> {
+        self.validate()?;
+        self.object_rpc_routes
+            .iter()
+            .map(ModuleObjectRpcRoute::descriptor)
+            .collect()
+    }
+
+    pub fn object_rpc_route_descriptor(
+        &self,
+        route: &str,
+    ) -> Result<Option<ModuleObjectRpcRouteDescriptor>, ModuleSurfaceError> {
+        self.validate()?;
+        self.object_rpc_routes
+            .iter()
+            .find(|candidate| candidate.route == route)
+            .map(ModuleObjectRpcRoute::descriptor)
+            .transpose()
+    }
+
+    pub fn validate(&self) -> Result<(), ModuleSurfaceError> {
+        let mut object_rpc_routes = BTreeSet::new();
+        let exported_capabilities = self
+            .capabilities
+            .exports
+            .iter()
+            .map(CapabilityName::as_str)
+            .collect::<BTreeSet<_>>();
+        for route in &self.object_rpc_routes {
+            route.validate()?;
+            if !object_rpc_routes.insert(route.route.as_str()) {
+                return Err(ModuleSurfaceError::DuplicateObjectRpcRoute {
+                    route: route.route.clone(),
+                });
+            }
+            if !exported_capabilities.contains(route.operation.as_str()) {
+                return Err(ModuleSurfaceError::ObjectRpcRouteOperationNotExported {
+                    route: route.route.clone(),
+                    operation: route.operation.clone(),
+                });
+            }
+        }
+
+        let mut storage_owners = BTreeSet::new();
+        for owner in &self.storage_owners {
+            validate_module_surface_text(owner, "module storage owner")?;
+            if !storage_owners.insert(owner.as_str()) {
+                return Err(ModuleSurfaceError::DuplicateStorageOwner {
+                    owner: owner.clone(),
+                });
+            }
+        }
+
+        let mut imports = BTreeSet::new();
+        for capability in &self.capabilities.imports {
+            if !imports.insert(capability.as_str()) {
+                return Err(ModuleSurfaceError::DuplicateCapabilityImport {
+                    capability: capability.as_str().to_string(),
+                });
+            }
+        }
+        let mut exports = BTreeSet::new();
+        for capability in &self.capabilities.exports {
+            if !exports.insert(capability.as_str()) {
+                return Err(ModuleSurfaceError::DuplicateCapabilityExport {
+                    capability: capability.as_str().to_string(),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -912,6 +993,15 @@ pub struct ModuleObjectRpcRoute {
     pub auth: ModuleRouteAuth,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleObjectRpcRouteDescriptor {
+    pub route: String,
+    pub category: String,
+    pub operation: CapabilityName,
+    pub auth_scope: String,
+    pub required_capabilities: Vec<CapabilityName>,
+}
+
 impl ModuleObjectRpcRoute {
     pub fn new(
         route: impl Into<String>,
@@ -926,6 +1016,45 @@ impl ModuleObjectRpcRoute {
             auth,
         }
     }
+
+    pub fn validate(&self) -> Result<(), ModuleSurfaceError> {
+        validate_module_object_rpc_route_path(&self.route)?;
+        validate_module_surface_token(&self.category, "module object RPC route category")?;
+        CapabilityName::new(self.operation.clone()).map_err(|source| {
+            ModuleSurfaceError::InvalidObjectRpcRouteOperation {
+                route: self.route.clone(),
+                operation: self.operation.clone(),
+                detail: source.to_string(),
+            }
+        })?;
+        Ok(())
+    }
+
+    pub fn auth_scope(&self) -> &'static str {
+        self.auth.as_scope()
+    }
+
+    pub fn operation_capability(&self) -> Result<CapabilityName, ModuleSurfaceError> {
+        CapabilityName::new(self.operation.clone()).map_err(|source| {
+            ModuleSurfaceError::InvalidObjectRpcRouteOperation {
+                route: self.route.clone(),
+                operation: self.operation.clone(),
+                detail: source.to_string(),
+            }
+        })
+    }
+
+    pub fn descriptor(&self) -> Result<ModuleObjectRpcRouteDescriptor, ModuleSurfaceError> {
+        self.validate()?;
+        let operation = self.operation_capability()?;
+        Ok(ModuleObjectRpcRouteDescriptor {
+            route: self.route.clone(),
+            category: self.category.clone(),
+            operation: operation.clone(),
+            auth_scope: self.auth_scope().to_string(),
+            required_capabilities: vec![operation],
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -937,6 +1066,17 @@ pub enum ModuleRouteAuth {
     Admin,
 }
 
+impl ModuleRouteAuth {
+    pub fn as_scope(self) -> &'static str {
+        match self {
+            Self::LocalCommand => "local-command",
+            Self::LocalOrClusterMember => "local-or-cluster-member",
+            Self::ClusterMember => "cluster-member",
+            Self::Admin => "admin",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ModuleRegistry {
     registrations: BTreeMap<ModuleId, ModuleRegistration>,
@@ -946,6 +1086,13 @@ pub struct ModuleRegistry {
 impl ModuleRegistry {
     pub fn builder() -> ModuleRegistryBuilder {
         ModuleRegistryBuilder::default()
+    }
+
+    pub fn to_builder(&self) -> ModuleRegistryBuilder {
+        ModuleRegistryBuilder {
+            registrations: self.registrations.clone(),
+            registration_order: self.registration_order.clone(),
+        }
     }
 
     pub fn get(&self, module_id: &ModuleId) -> Option<&ModuleRegistration> {
@@ -969,6 +1116,183 @@ impl ModuleRegistry {
     pub fn is_empty(&self) -> bool {
         self.registrations.is_empty()
     }
+
+    pub fn validate(&self) -> Result<(), ModuleRegistryError> {
+        let mut ordered_ids = BTreeSet::new();
+        for module_id in &self.registration_order {
+            if !ordered_ids.insert(module_id.clone()) {
+                return Err(ModuleRegistryError::InvalidRegistrationOrder {
+                    detail: format!("module {module_id} appears more than once"),
+                });
+            }
+            if !self.registrations.contains_key(module_id) {
+                return Err(ModuleRegistryError::InvalidRegistrationOrder {
+                    detail: format!("ordered module {module_id} has no registration"),
+                });
+            }
+        }
+        if ordered_ids.len() != self.registrations.len() {
+            return Err(ModuleRegistryError::InvalidRegistrationOrder {
+                detail: "registration order does not cover every module".to_string(),
+            });
+        }
+
+        let mut object_rpc_routes = BTreeMap::<String, ModuleId>::new();
+        for (module_id, registration) in &self.registrations {
+            if registration.module_id() != module_id {
+                return Err(ModuleRegistryError::InvalidRegistrationOrder {
+                    detail: format!(
+                        "registration key {module_id} does not match manifest module id {}",
+                        registration.module_id()
+                    ),
+                });
+            }
+            registration.validate_surfaces().map_err(|source| {
+                ModuleRegistryError::InvalidModuleSurfaces {
+                    module_id: module_id.clone(),
+                    detail: source.to_string(),
+                }
+            })?;
+            for descriptor in registration
+                .surfaces
+                .object_rpc_route_descriptors()
+                .map_err(|source| ModuleRegistryError::InvalidModuleSurfaces {
+                    module_id: module_id.clone(),
+                    detail: source.to_string(),
+                })?
+            {
+                if let Some(previous_module_id) =
+                    object_rpc_routes.insert(descriptor.route.clone(), module_id.clone())
+                {
+                    return Err(ModuleRegistryError::DuplicateObjectRpcRoute {
+                        route: descriptor.route,
+                        first_module_id: previous_module_id,
+                        second_module_id: module_id.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ModuleRegistrySnapshot {
+    version: u64,
+    generated_at: OffsetDateTime,
+    registry: Arc<ModuleRegistry>,
+}
+
+impl ModuleRegistrySnapshot {
+    fn new(version: u64, registry: ModuleRegistry) -> Result<Self, ModuleRegistryError> {
+        registry.validate()?;
+        Ok(Self {
+            version,
+            generated_at: OffsetDateTime::now_utc(),
+            registry: Arc::new(registry),
+        })
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn generated_at(&self) -> OffsetDateTime {
+        self.generated_at
+    }
+
+    pub fn registry(&self) -> &ModuleRegistry {
+        &self.registry
+    }
+
+    pub fn registry_arc(&self) -> Arc<ModuleRegistry> {
+        Arc::clone(&self.registry)
+    }
+}
+
+#[derive(Clone)]
+pub struct ModuleRegistrySnapshotStore {
+    active: Arc<ArcSwap<ModuleRegistrySnapshot>>,
+    update_lock: Arc<Mutex<()>>,
+}
+
+impl std::fmt::Debug for ModuleRegistrySnapshotStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModuleRegistrySnapshotStore")
+            .field("active_version", &self.active.load().version())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ModuleRegistrySnapshotStore {
+    fn default() -> Self {
+        Self::new(ModuleRegistry::default()).expect("empty module registry should validate")
+    }
+}
+
+impl ModuleRegistrySnapshotStore {
+    pub fn new(registry: ModuleRegistry) -> Result<Self, ModuleRegistryError> {
+        let snapshot = Arc::new(ModuleRegistrySnapshot::new(1, registry)?);
+        Ok(Self {
+            active: Arc::new(ArcSwap::from(snapshot)),
+            update_lock: Arc::new(Mutex::new(())),
+        })
+    }
+
+    pub fn active_snapshot(&self) -> Result<Arc<ModuleRegistrySnapshot>, ModuleRegistryError> {
+        Ok(self.active.load_full())
+    }
+
+    pub fn replace_registry(
+        &self,
+        registry: ModuleRegistry,
+    ) -> Result<Arc<ModuleRegistrySnapshot>, ModuleRegistryError> {
+        let _guard =
+            self.update_lock
+                .lock()
+                .map_err(|source| ModuleRegistryError::SnapshotLock {
+                    detail: source.to_string(),
+                })?;
+        let active = self.active.load();
+        let version = active.version().saturating_add(1);
+        let snapshot = Arc::new(ModuleRegistrySnapshot::new(version, registry)?);
+        self.active.store(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+
+    pub fn register(
+        &self,
+        registration: ModuleRegistration,
+    ) -> Result<Arc<ModuleRegistrySnapshot>, ModuleRegistryError> {
+        self.register_validated(registration, |_| Ok(()))
+    }
+
+    pub fn register_validated(
+        &self,
+        registration: ModuleRegistration,
+        validate: impl FnOnce(Arc<ModuleRegistrySnapshot>) -> Result<(), ModuleRegistryError>,
+    ) -> Result<Arc<ModuleRegistrySnapshot>, ModuleRegistryError> {
+        let _guard =
+            self.update_lock
+                .lock()
+                .map_err(|source| ModuleRegistryError::SnapshotLock {
+                    detail: source.to_string(),
+                })?;
+        let active = self.active.load();
+        let registry = active
+            .registry()
+            .to_builder()
+            .register(registration)?
+            .try_build()?;
+        let snapshot = Arc::new(ModuleRegistrySnapshot::new(
+            active.version().saturating_add(1),
+            registry,
+        )?);
+        validate(Arc::clone(&snapshot))?;
+        self.active.store(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -986,16 +1310,28 @@ impl ModuleRegistryBuilder {
         if self.registrations.contains_key(&module_id) {
             return Err(ModuleRegistryError::DuplicateModuleId { module_id });
         }
+        registration.validate_surfaces().map_err(|source| {
+            ModuleRegistryError::InvalidModuleSurfaces {
+                module_id: module_id.clone(),
+                detail: source.to_string(),
+            }
+        })?;
         self.registration_order.push(module_id.clone());
         self.registrations.insert(module_id, registration);
         Ok(self)
     }
 
-    pub fn build(self) -> ModuleRegistry {
-        ModuleRegistry {
+    pub fn try_build(self) -> Result<ModuleRegistry, ModuleRegistryError> {
+        let registry = ModuleRegistry {
             registrations: self.registrations,
             registration_order: self.registration_order,
-        }
+        };
+        registry.validate()?;
+        Ok(registry)
+    }
+
+    pub fn build(self) -> ModuleRegistry {
+        self.try_build().expect("valid module registry")
     }
 }
 
@@ -1003,6 +1339,111 @@ impl ModuleRegistryBuilder {
 pub enum ModuleRegistryError {
     #[error("duplicate module registration for {module_id}")]
     DuplicateModuleId { module_id: ModuleId },
+    #[error("invalid module surfaces for {module_id}: {detail}")]
+    InvalidModuleSurfaces { module_id: ModuleId, detail: String },
+    #[error(
+        "duplicate module object RPC route `{route}` from {first_module_id} and {second_module_id}"
+    )]
+    DuplicateObjectRpcRoute {
+        route: String,
+        first_module_id: ModuleId,
+        second_module_id: ModuleId,
+    },
+    #[error("invalid module registry order: {detail}")]
+    InvalidRegistrationOrder { detail: String },
+    #[error("module registry snapshot lock failed: {detail}")]
+    SnapshotLock { detail: String },
+    #[error("module registry snapshot validation failed: {detail}")]
+    SnapshotValidation { detail: String },
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ModuleSurfaceError {
+    #[error("module object RPC route `{route}` is invalid: {detail}")]
+    InvalidObjectRpcRoute { route: String, detail: String },
+    #[error("module object RPC route `{route}` operation `{operation}` is invalid: {detail}")]
+    InvalidObjectRpcRouteOperation {
+        route: String,
+        operation: String,
+        detail: String,
+    },
+    #[error("duplicate module object RPC route `{route}`")]
+    DuplicateObjectRpcRoute { route: String },
+    #[error("module object RPC route `{route}` operation `{operation}` is not exported")]
+    ObjectRpcRouteOperationNotExported { route: String, operation: String },
+    #[error("module storage owner `{owner}` is invalid: {detail}")]
+    InvalidStorageOwner { owner: String, detail: String },
+    #[error("duplicate module storage owner `{owner}`")]
+    DuplicateStorageOwner { owner: String },
+    #[error("duplicate module capability import `{capability}`")]
+    DuplicateCapabilityImport { capability: String },
+    #[error("duplicate module capability export `{capability}`")]
+    DuplicateCapabilityExport { capability: String },
+}
+
+fn validate_module_object_rpc_route_path(route: &str) -> Result<(), ModuleSurfaceError> {
+    if route.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+            route: route.to_string(),
+            detail: "route must be non-empty".to_string(),
+        });
+    }
+    if !route.starts_with('/') {
+        return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+            route: route.to_string(),
+            detail: "route must start with /".to_string(),
+        });
+    }
+    if route.chars().any(char::is_control) {
+        return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+            route: route.to_string(),
+            detail: "route must not contain control characters".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_module_surface_token(value: &str, context: &str) -> Result<(), ModuleSurfaceError> {
+    if value.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+            route: value.to_string(),
+            detail: format!("{context} must be non-empty"),
+        });
+    }
+    if value != value.trim() {
+        return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+            route: value.to_string(),
+            detail: format!("{context} must not have leading or trailing whitespace"),
+        });
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'))
+    {
+        return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+            route: value.to_string(),
+            detail: format!(
+                "{context} must contain only ASCII letters, digits, '.', '-', '_', or ':'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_module_surface_text(value: &str, context: &str) -> Result<(), ModuleSurfaceError> {
+    if value.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidStorageOwner {
+            owner: value.to_string(),
+            detail: format!("{context} must be non-empty"),
+        });
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ModuleSurfaceError::InvalidStorageOwner {
+            owner: value.to_string(),
+            detail: format!("{context} must not contain control characters"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -2474,6 +2915,91 @@ mod tests {
         assert_eq!(registry.len(), 2);
     }
 
+    fn native_rust_registration_with_object_route(
+        module_id_name: &str,
+        route: &str,
+        operation: &str,
+    ) -> ModuleRegistration {
+        let module_id = ModuleId::from_legacy_named(module_id_name).expect("module");
+        ModuleRegistration::native_rust(
+            module_id,
+            "0.1.0",
+            module_id_name,
+            module_id_name,
+            "sinomo.test.module.v1",
+            TrustRing::R1TrustedRuntime,
+            module_id_name,
+        )
+        .with_surfaces(
+            ModuleSurfaces::default()
+                .with_object_rpc_route(ModuleObjectRpcRoute::new(
+                    route,
+                    "test-module",
+                    operation,
+                    ModuleRouteAuth::LocalOrClusterMember,
+                ))
+                .with_capability_export(CapabilityName::new(operation).expect("capability")),
+        )
+    }
+
+    #[test]
+    fn module_registry_snapshot_store_swaps_validated_immutable_snapshots() {
+        let store = ModuleRegistrySnapshotStore::default();
+        let initial = store.active_snapshot().expect("initial snapshot");
+        let registration = native_rust_registration_with_object_route(
+            "module.snapshot.first",
+            "/module/snapshot/first",
+            "module.snapshot.first.read",
+        );
+        let module_id = registration.module_id().clone();
+
+        let updated = store.register(registration).expect("register module");
+
+        assert_eq!(updated.version(), initial.version() + 1);
+        assert!(
+            initial.registry().is_empty(),
+            "existing readers must keep the old immutable registry snapshot"
+        );
+        assert!(updated.registry().contains(&module_id));
+        assert_eq!(
+            store.active_snapshot().expect("active snapshot").version(),
+            updated.version()
+        );
+    }
+
+    #[test]
+    fn module_registry_snapshot_store_rejects_duplicate_object_rpc_routes_before_swap() {
+        let store = ModuleRegistrySnapshotStore::default();
+        let first = native_rust_registration_with_object_route(
+            "module.snapshot.duplicate.first",
+            "/module/snapshot/duplicate",
+            "module.snapshot.duplicate.first.read",
+        );
+        let second = native_rust_registration_with_object_route(
+            "module.snapshot.duplicate.second",
+            "/module/snapshot/duplicate",
+            "module.snapshot.duplicate.second.read",
+        );
+        let first_snapshot = store.register(first).expect("first registration");
+
+        let error = store
+            .register(second)
+            .expect_err("duplicate route should be rejected before swap");
+
+        assert!(matches!(
+            error,
+            ModuleRegistryError::DuplicateObjectRpcRoute { ref route, .. }
+                if route == "/module/snapshot/duplicate"
+        ));
+        let active = store.active_snapshot().expect("active snapshot");
+        assert_eq!(
+            active.version(),
+            first_snapshot.version(),
+            "failed registration must leave the previous snapshot active"
+        );
+        assert_eq!(active.registry().len(), 1);
+    }
+
     #[test]
     fn native_rust_registration_constructor_pairs_manifest_and_backend() {
         let module_id = ModuleId::from_legacy_named("module.dfs").expect("module");
@@ -2524,6 +3050,7 @@ mod tests {
                 ))
                 .with_event_kind_name("dfs.metadata.updated")
                 .with_storage_owner("sinomo-dfs")
+                .with_capability_export(CapabilityName::new("dfs.status.read").expect("capability"))
                 .with_capability_export(
                     CapabilityName::new("dfs.metadata.replicate").expect("capability"),
                 ),
@@ -2539,13 +3066,144 @@ mod tests {
             ModuleRouteAuth::LocalOrClusterMember
         );
         assert_eq!(
+            decoded.surfaces.object_rpc_routes[0].auth_scope(),
+            "local-or-cluster-member"
+        );
+        assert_eq!(
+            decoded.surfaces.object_rpc_routes[0]
+                .operation_capability()
+                .expect("operation capability")
+                .as_str(),
+            "dfs.status.read"
+        );
+        assert_eq!(
             decoded.surfaces.event_kinds[0].as_str(),
             "dfs.metadata.updated"
         );
         assert_eq!(decoded.surfaces.storage_owners[0], "sinomo-dfs");
+        assert!(
+            decoded
+                .surfaces
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "dfs.metadata.replicate")
+        );
+        let descriptors = decoded
+            .surfaces
+            .object_rpc_route_descriptors()
+            .expect("route descriptors");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].route, "/dfs/status");
+        assert_eq!(descriptors[0].category, "dfs");
+        assert_eq!(descriptors[0].auth_scope, "local-or-cluster-member");
+        assert_eq!(descriptors[0].operation.as_str(), "dfs.status.read");
+        assert_eq!(descriptors[0].required_capabilities.len(), 1);
         assert_eq!(
-            decoded.surfaces.capabilities.exports[0].as_str(),
-            "dfs.metadata.replicate"
+            descriptors[0].required_capabilities[0].as_str(),
+            "dfs.status.read"
+        );
+        let descriptor = decoded
+            .surfaces
+            .object_rpc_route_descriptor("/dfs/status")
+            .expect("route descriptor lookup")
+            .expect("known route descriptor");
+        assert_eq!(descriptor, descriptors[0]);
+        assert!(
+            decoded
+                .surfaces
+                .object_rpc_route_descriptor("/dfs/missing")
+                .expect("missing route descriptor lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn module_surface_validation_rejects_invalid_object_rpc_routes() {
+        let invalid_path = ModuleSurfaces::default()
+            .with_object_rpc_route(ModuleObjectRpcRoute::new(
+                "dfs/status",
+                "dfs",
+                "dfs.status.read",
+                ModuleRouteAuth::LocalOrClusterMember,
+            ))
+            .with_capability_export(CapabilityName::new("dfs.status.read").expect("capability"))
+            .validate()
+            .expect_err("route without path prefix");
+        assert!(
+            matches!(invalid_path, ModuleSurfaceError::InvalidObjectRpcRoute { ref detail, .. }
+                if detail.contains("must start with /")),
+            "unexpected error: {invalid_path}"
+        );
+
+        let missing_export = ModuleSurfaces::default()
+            .with_object_rpc_route(ModuleObjectRpcRoute::new(
+                "/dfs/status",
+                "dfs",
+                "dfs.status.read",
+                ModuleRouteAuth::LocalOrClusterMember,
+            ))
+            .validate()
+            .expect_err("route operation must be exported");
+        assert!(matches!(
+            missing_export,
+            ModuleSurfaceError::ObjectRpcRouteOperationNotExported {
+                route,
+                operation,
+            } if route == "/dfs/status" && operation == "dfs.status.read"
+        ));
+
+        let duplicate = ModuleSurfaces::default()
+            .with_object_rpc_route(ModuleObjectRpcRoute::new(
+                "/dfs/status",
+                "dfs",
+                "dfs.status.read",
+                ModuleRouteAuth::LocalOrClusterMember,
+            ))
+            .with_object_rpc_route(ModuleObjectRpcRoute::new(
+                "/dfs/status",
+                "dfs",
+                "dfs.inspection.read",
+                ModuleRouteAuth::LocalOrClusterMember,
+            ))
+            .with_capability_export(CapabilityName::new("dfs.status.read").expect("capability"))
+            .with_capability_export(CapabilityName::new("dfs.inspection.read").expect("capability"))
+            .validate()
+            .expect_err("duplicate route must be rejected");
+        assert!(matches!(
+            duplicate,
+            ModuleSurfaceError::DuplicateObjectRpcRoute { route } if route == "/dfs/status"
+        ));
+    }
+
+    #[test]
+    fn module_registry_rejects_invalid_registration_surfaces() {
+        let module_id = ModuleId::from_legacy_named("module.invalid_surface").expect("module");
+        let registration = ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "invalid",
+            "invalid",
+            "sinomo.invalid.v1",
+            TrustRing::R1TrustedRuntime,
+            "invalid",
+        )
+        .with_surfaces(ModuleSurfaces::default().with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                "/invalid/route",
+                "invalid",
+                "invalid.route.invoke",
+                ModuleRouteAuth::Admin,
+            ),
+        ));
+
+        let error = ModuleRegistry::builder()
+            .register(registration)
+            .expect_err("invalid surfaces");
+        assert!(
+            matches!(error, ModuleRegistryError::InvalidModuleSurfaces { module_id: ref observed, ref detail }
+                if observed == &module_id && detail.contains("operation `invalid.route.invoke` is not exported")),
+            "unexpected error: {error}"
         );
     }
 

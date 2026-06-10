@@ -29,6 +29,7 @@ use sinomo_runtime::dfs::{
     publish_cluster_dfs_metadata_journal, sifs_file_system_id,
 };
 use sinomo_runtime::eval::CommandRunResult;
+use sinomo_runtime::kv::read_cluster_kv_prefix_entries;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use std::collections::BTreeSet;
@@ -2686,8 +2687,8 @@ fn open_evolution_sifs_sharded_metadata_backend(
         return Ok(None);
     }
     let file_system_id = sifs_file_system_id();
-    let entries = network::read_cluster_kv_prefix_entries(
-        cluster_paths,
+    let entries = read_cluster_kv_prefix_entries(
+        &cluster_paths.kv_paths(),
         &format!("{}/", metadata_shards_prefix(&file_system_id)),
     )
     .map_err(|source| EvolutionPersistenceError::Sifs {

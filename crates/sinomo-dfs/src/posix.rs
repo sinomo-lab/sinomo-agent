@@ -9,16 +9,15 @@
 use crate::namespace::{initial_version, metadata_path, next_version, object_id_for_path};
 use crate::{
     DfsControlPlaneStore, DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem,
-    DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord, DfsNamespaceJobStatus,
-    DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsReadData, DfsReadRangeData,
-    DfsReplicationPolicy, NetworkedDfsRangeReadOutcome, NetworkedDfsRangeReadStreamOutcome,
-    NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome, NetworkedDfsService,
-    NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
+    DfsFrameTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
+    DfsNamespaceJobStatus, DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsReadData,
+    DfsReadRangeData, DfsReplicationPolicy, NetworkedDfsRangeReadOutcome,
+    NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome,
+    NetworkedDfsService, NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
 };
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_events::EventId;
-use sinomo_network::NetworkTransport;
 use sinomo_node::NodeId;
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
@@ -159,7 +158,7 @@ impl DfsWriteOptions {
     }
 }
 
-impl<T: NetworkTransport> NetworkedDfsService<T> {
+impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     fn settle_ready_write_outcome(
         &mut self,
         outcome: NetworkedDfsWriteOutcome,

@@ -12,8 +12,10 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+arc-swap.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
@@ -21,4 +23,4 @@ sinomo-network = { path = "../sinomo-network" }
 
 [dev-dependencies]
 serde.workspace = true
-tokio = { version = "1.44", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

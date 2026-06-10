@@ -14,12 +14,16 @@ use sinomo_dfs_cloud_files_api::{
 use sinomo_runtime::core::ClusterEndpointRecord;
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsObjectKind, DfsPosixError, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, LocalContentStore, NetworkedDfsService,
+    self, DfsControlPlaneKvClient, DfsFrameTransport, DfsObjectKind, DfsPosixError,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsTransportIdentity, LocalContentStore,
+    NetworkedDfsService,
 };
-use sinomo_runtime::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
+use sinomo_runtime::kv::{
+    KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse, read_cluster_kv_entry,
+    read_cluster_kv_prefix_entries,
+};
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, InboundFrame, NetworkError, NetworkFrame, NetworkTransport};
+use sinomo_runtime::network::{self, InboundFrame, NetworkError, NetworkFrame};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
     NTSTATUS, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -638,8 +642,8 @@ fn open_metadata_backend(
 ) -> Result<Box<dyn dfs::DfsMetadataBackend>, CloudFilesModuleError> {
     if cluster_paths.state.exists() {
         let file_system_id = dfs::sifs_file_system_id();
-        let mut shards = network::read_cluster_kv_prefix_entries(
-            cluster_paths,
+        let mut shards = read_cluster_kv_prefix_entries(
+            &cluster_paths.kv_paths(),
             &format!("{}/", dfs::metadata_shards_prefix(&file_system_id)),
         )
         .map_err(error("network"))?
@@ -668,13 +672,6 @@ struct DfsCloudFilesControlPlaneKvClient {
 }
 
 impl DfsCloudFilesControlPlaneKvClient {
-    fn network_error(&self, source: NetworkError) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.kv_snapshot.display().to_string(),
-            detail: source.to_string(),
-        }
-    }
-
     fn daemon_error(&self, source: impl std::fmt::Display) -> KvError {
         KvError::Io {
             path: self.cluster_paths.kv_snapshot.display().to_string(),
@@ -685,13 +682,11 @@ impl DfsCloudFilesControlPlaneKvClient {
 
 impl DfsControlPlaneKvClient for DfsCloudFilesControlPlaneKvClient {
     fn get(&self, key: &str) -> std::result::Result<Option<KvEntry>, KvError> {
-        network::read_cluster_kv_entry(&self.cluster_paths, key)
-            .map_err(|source| self.network_error(source))
+        read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
     }
 
     fn range_prefix(&self, prefix: &str) -> std::result::Result<Vec<KvEntry>, KvError> {
-        network::read_cluster_kv_prefix_entries(&self.cluster_paths, prefix)
-            .map_err(|source| self.network_error(source))
+        read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> std::result::Result<KvRevision, KvError> {
@@ -784,7 +779,7 @@ impl DfsCloudFilesEndpointTransport {
         frame: NetworkFrame,
         require_local_source: bool,
     ) -> std::result::Result<(), NetworkError> {
-        if require_local_source && &frame.source_node_id != self.local_node_id() {
+        if require_local_source && frame.source_node_id != self.local_node_id {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
                 source_node_id: frame.source_node_id,
@@ -836,11 +831,13 @@ impl DfsCloudFilesEndpointTransport {
     }
 }
 
-impl NetworkTransport for DfsCloudFilesEndpointTransport {
+impl DfsTransportIdentity for DfsCloudFilesEndpointTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
+}
 
+impl DfsFrameTransport for DfsCloudFilesEndpointTransport {
     fn send(
         &mut self,
         target_node_id: &NodeId,

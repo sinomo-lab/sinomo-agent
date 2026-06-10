@@ -3,12 +3,10 @@ use super::*;
 #[cfg(test)]
 pub(crate) use network::advertised_peer_route_targets;
 #[cfg(test)]
-pub(crate) use network::build_cluster_raft_append_request_from_next_index;
+pub(crate) use network::apply_cluster_node_role;
 #[cfg(test)]
 pub(crate) use network::cluster_connectivity_sync_ops;
 pub(crate) use network::cluster_invite_publish_targets;
-#[cfg(test)]
-pub(crate) use network::cluster_raft_known_leader_id;
 #[cfg(test)]
 pub(crate) use network::cluster_state_sync_txn;
 #[cfg(test)]
@@ -20,24 +18,34 @@ pub(crate) use network::invite_communication_channels;
 #[cfg(test)]
 pub(crate) use network::invite_introducer_endpoint;
 #[cfg(test)]
-pub(crate) use network::read_cluster_kv_store;
-#[cfg(test)]
 pub(crate) use network::read_cluster_members_from_kv;
 #[cfg(test)]
 pub(crate) use network::read_cluster_node_statuses_from_kv;
 #[cfg(test)]
 pub(crate) use network::sign_cluster_join_invite;
-#[cfg(test)]
-pub(crate) use network::{apply_cluster_node_role, apply_cluster_raft_role};
 pub(crate) use network::{
-    cluster_join_command, cluster_raft_local_is_voter, cluster_raft_quorum_size,
-    cluster_state_needs_join_registration, cluster_status_summary_label,
+    cluster_join_command, cluster_state_needs_join_registration, cluster_status_summary_label,
     decode_cluster_join_invite, encode_cluster_join_invite, extract_invite_from_join_command,
     invite_introducer_endpoint_from_state, is_remote_usable_invite_endpoint,
     verify_cluster_join_invite_signature,
 };
 #[cfg(test)]
 pub(crate) use network::{compact_default_invite_introducers, push_unique_introducer};
+#[cfg(test)]
+pub(crate) use sinomo_runtime::node::apply_cluster_raft_role;
+
+#[cfg(test)]
+pub(crate) fn build_cluster_raft_append_request_from_next_index(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    next_index: u64,
+) -> Result<sinomo_runtime::kv::ClusterRaftAppendRequest, network::NetworkError> {
+    paths
+        .kv_paths()
+        .raft_store()
+        .build_cluster_raft_append_request_from_next_index(state, next_index)
+        .map_err(Into::into)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ClusterCliCommand {
@@ -473,6 +481,82 @@ pub(crate) fn cluster_paths_from_defaults() -> Result<ClusterPaths, CliError> {
     Ok(ClusterPaths::new(&data_dir))
 }
 
+fn cluster_kv_raft_store(paths: &ClusterPaths) -> sinomo_runtime::kv::ClusterKvRaftStore {
+    paths.kv_paths().raft_store()
+}
+
+fn append_cluster_raft_command(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: sinomo_runtime::kv::KvCommand,
+) -> Result<KvSnapshot, network::NetworkError> {
+    cluster_kv_raft_store(paths)
+        .append_command_and_publish(
+            node_id,
+            command,
+            network::cluster_kv_key_can_defer_materialized_snapshot,
+        )
+        .map_err(Into::into)
+}
+
+pub(crate) fn cluster_raft_known_leader_id(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, network::NetworkError> {
+    Ok(cluster_kv_raft_store(paths)
+        .known_leader_id(&state.local_node_id)?
+        .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
+}
+
+pub(crate) fn locked_cluster_raft_known_leader_id(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Option<NodeId>, network::NetworkError> {
+    Ok(cluster_kv_raft_store(paths)
+        .locked_known_leader_id(&state.local_node_id)?
+        .filter(|leader_id| sinomo_runtime::kv::cluster_kv_raft_node_is_voter(state, leader_id)))
+}
+
+pub(crate) fn locked_cluster_raft_local_is_leader(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<bool, network::NetworkError> {
+    Ok(sinomo_runtime::kv::cluster_kv_raft_local_is_voter(state)
+        && locked_cluster_raft_known_leader_id(paths, state)?.as_ref()
+            == Some(&state.local_node_id))
+}
+
+#[cfg(test)]
+pub(crate) fn set_cluster_raft_leader(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    term: u64,
+) -> Result<KvSnapshot, network::NetworkError> {
+    cluster_kv_raft_store(paths)
+        .set_leader_and_write_snapshot_if_changed(node_id, term)
+        .map_err(Into::into)
+}
+
+pub(crate) fn locked_set_cluster_raft_leader(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    term: u64,
+) -> Result<KvSnapshot, network::NetworkError> {
+    cluster_kv_raft_store(paths)
+        .locked_set_leader_and_write_snapshot_if_changed(node_id, term)
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
+pub(crate) fn clear_cluster_raft_leader(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<KvSnapshot, network::NetworkError> {
+    cluster_kv_raft_store(paths)
+        .clear_leader_and_write_snapshot_if_changed(node_id)
+        .map_err(Into::into)
+}
+
 pub(crate) fn require_cluster_bootstrap_state() -> Result<ClusterBootstrapState, CliError> {
     let paths = cluster_paths_from_defaults()?;
     read_cluster_state(&paths)
@@ -502,7 +586,7 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
             detail: format!(
                 "quorum unavailable; cluster-dependent operations are paused ({} reachable voters, {} required)",
                 cluster_reachable_voter_count(&paths, &state),
-                cluster_raft_quorum_size(&state)
+                sinomo_runtime::kv::cluster_kv_raft_quorum_size_for_state(&state)
             ),
         })
     }
@@ -548,10 +632,7 @@ pub(crate) fn cluster_init_with_paths(
     );
     network::assign_local_daemon_member_public_keys(&mut state, main_public_key, shadow_public_key);
     network::write_cluster_state(paths, &state)?;
-    {
-        let _raft_guard = network::lock_cluster_raft_operation()?;
-        network::set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
-    }
+    locked_set_cluster_raft_leader(paths, &state.local_node_id, 1)?;
     sync_cluster_state_to_kv(paths, &state)?;
 
     println!("cluster initialized: {}", state.cluster_id);
@@ -589,7 +670,7 @@ pub(crate) fn cluster_invite_with_paths(
 ) -> Result<RenderedClusterInvite, CliError> {
     paths.ensure()?;
     let state = read_cluster_state(paths)?;
-    if !cluster_raft_local_is_voter(&state) {
+    if !sinomo_runtime::kv::cluster_kv_raft_local_is_voter(&state) {
         return Err(cluster_invite_requires_voter_error(paths, &state));
     }
     let now = OffsetDateTime::now_utc();
@@ -641,7 +722,9 @@ pub(crate) fn publish_cluster_invitation(
     .map(|_| ())
     {
         Ok(()) => Ok(()),
-        Err(CliError::ClusterReadOnly { .. }) if !cluster_raft_local_is_voter(state) => {
+        Err(CliError::ClusterReadOnly { .. })
+            if !sinomo_runtime::kv::cluster_kv_raft_local_is_voter(state) =>
+        {
             publish_cluster_invitation_via_voter(paths, state, invite)
         }
         Err(error) => Err(error),
@@ -918,9 +1001,9 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         fn send_raft_append(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &network::ClusterRaftAppendRequest,
+            _request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
             _timeout: Duration,
-        ) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+        ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
             Err(unsupported_join_reconciliation_transport(
                 "cluster join raft append",
             ))
@@ -929,9 +1012,9 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
         fn send_raft_vote(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
-            _request: &network::ClusterRaftVoteRequest,
+            _request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
             _timeout: Duration,
-        ) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
+        ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
             Err(unsupported_join_reconciliation_transport(
                 "cluster join raft vote",
             ))
@@ -963,18 +1046,6 @@ pub(crate) fn reconcile_cluster_join_with_introducers(
                     detail: source.to_string(),
                 }
             })
-        }
-
-        fn send_cluster_kv_watch_events(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &sinomo_runtime::kv::ClusterKvWatchEventsRequest,
-            _timeout: Duration,
-        ) -> Result<sinomo_runtime::kv::ClusterKvWatchEventsResponse, network::NetworkError>
-        {
-            Err(unsupported_join_reconciliation_transport(
-                "cluster join kv watch events",
-            ))
         }
 
         fn send_cluster_member_publish(
@@ -1579,7 +1650,7 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             paths: &ClusterPaths,
             state: &ClusterBootstrapState,
         ) -> Result<Option<NodeId>, network::NetworkError> {
-            network::cluster_raft_known_leader_id(paths, state).or(Ok(None))
+            cluster_raft_known_leader_id(paths, state).or(Ok(None))
         }
 
         fn fetch_cluster_kv_snapshot(
@@ -1601,11 +1672,13 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
             local_node_id: &NodeId,
             snapshot: KvSnapshot,
         ) -> Result<bool, network::NetworkError> {
-            network::locked_restore_cluster_raft_from_snapshot_if_newer(
-                paths,
-                local_node_id,
-                snapshot,
-            )
+            let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
+                .map_err(network::NetworkError::from)?;
+            paths
+                .kv_paths()
+                .local_cache()
+                .restore_raft_from_snapshot_if_newer(local_node_id.clone(), snapshot)
+                .map_err(network::NetworkError::from)
         }
     }
 
@@ -1626,8 +1699,19 @@ fn refresh_cluster_kv_from_reachable_voters(paths: &ClusterPaths) -> Result<(), 
 }
 
 #[cfg(test)]
+pub(crate) fn read_cluster_kv_store(
+    paths: &ClusterPaths,
+) -> Result<sinomo_runtime::kv::InProcessKvStore, CliError> {
+    let state = network::read_cluster_state_without_kv(paths)?;
+    sinomo_runtime::kv::read_cluster_kv_store_for_node(&paths.kv_paths(), state.local_node_id)
+        .map_err(Into::into)
+}
+
+#[cfg(test)]
 pub(crate) fn read_cluster_kv_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
-    match network::read_cluster_kv_snapshot(paths) {
+    match sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+        .map_err(network::NetworkError::from)
+    {
         Ok(snapshot) => Ok(snapshot),
         Err(error) => {
             eprintln!("warning: ignoring unreadable cluster kv snapshot: {error}");
@@ -1642,8 +1726,9 @@ pub(crate) fn write_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), CliError> {
-    network::write_cluster_kv_snapshot_if_changed(paths, snapshot)
+    sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(&paths.kv_paths(), snapshot)
         .map(|_| ())
+        .map_err(network::NetworkError::from)
         .map_err(Into::into)
 }
 
@@ -1651,9 +1736,13 @@ pub(crate) fn write_imported_cluster_kv_snapshot(
     paths: &ClusterPaths,
     snapshot: &KvSnapshot,
 ) -> Result<(), CliError> {
-    network::write_imported_cluster_kv_snapshot_if_changed(paths, snapshot)
-        .map(|_| ())
-        .map_err(Into::into)
+    sinomo_runtime::kv::write_imported_cluster_kv_snapshot_if_changed(
+        &paths.kv_paths(),
+        snapshot,
+        network::cluster_kv_key_can_defer_materialized_snapshot,
+    )
+    .map(|_| ())
+    .map_err(Into::into)
 }
 
 pub(crate) fn sync_cluster_state_to_kv(
@@ -1681,7 +1770,7 @@ pub(crate) fn expire_cluster_network_records_in_kv(
             state: &mut ClusterBootstrapState,
             txn: KvTxn,
         ) -> Result<KvSnapshot, Self::Error> {
-            network::append_cluster_raft_command(
+            append_cluster_raft_command(
                 paths,
                 &state.local_node_id,
                 sinomo_runtime::kv::KvCommand::Txn(txn),
@@ -1709,7 +1798,7 @@ impl network::ClusterInvitePublishHost for CliClusterInvitePublishHost {
         state: &mut ClusterBootstrapState,
         txn: KvTxn,
     ) -> Result<KvSnapshot, Self::Error> {
-        network::append_cluster_raft_command(
+        append_cluster_raft_command(
             paths,
             &state.local_node_id,
             sinomo_runtime::kv::KvCommand::Txn(txn),

@@ -46,5 +46,7 @@ sinomo-storage = { path = "../sinomo-storage" }
 thiserror.workspace = true
 time.workspace = true
 tokio = { version = "1.44", features = ["rt-multi-thread"] }
+tower-layer = "0.3"
+tower-service = "0.3"
 
 [dev-dependencies]

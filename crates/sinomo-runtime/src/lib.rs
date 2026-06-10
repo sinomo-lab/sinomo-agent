@@ -96,7 +96,13 @@ pub mod r1 {
     }
 
     pub mod modules {
-        pub use sinomo_module::{ModuleRegistration, ModuleRegistry, ModuleRegistryError};
+        pub use sinomo_module::{
+            ModuleRegistration, ModuleRegistry, ModuleRegistryError, ModuleRegistrySnapshot,
+            ModuleRegistrySnapshotStore,
+        };
+        use std::collections::BTreeSet;
+        use std::future::Future;
+        use std::sync::Arc;
 
         pub struct NativeRustModuleBinding {
             pub registration_key: &'static str,
@@ -148,8 +154,115 @@ pub mod r1 {
                 .register(sinomo_dfs::dfs_module_registration())?
                 .register(sinomo_rollout::rollout_module_registration())?
                 .register(sinomo_observe::observe_module_registration())?
-                .build();
+                .try_build()?;
             Ok(registry)
+        }
+
+        pub fn module_object_rpc_route_descriptor_to_network(
+            descriptor: &sinomo_module::ModuleObjectRpcRouteDescriptor,
+        ) -> sinomo_network::ObjectRouteDescriptor {
+            let mut route = sinomo_network::ObjectRouteDescriptor::new(
+                descriptor.route.clone(),
+                descriptor.category.clone(),
+                format!(
+                    "module object RPC operation {}",
+                    descriptor.operation.as_str()
+                ),
+                "sinomo_network::ObjectRpcRequest",
+                "sinomo_network::ObjectRpcResponse",
+            )
+            .with_auth_scope(descriptor.auth_scope.clone())
+            .observable("module.operation", descriptor.operation.as_str());
+            for capability in &descriptor.required_capabilities {
+                route = route.require_capability(capability.as_str());
+            }
+            route
+        }
+
+        pub fn module_registration_object_rpc_route_descriptors(
+            registration: &ModuleRegistration,
+        ) -> Result<Vec<sinomo_network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError>
+        {
+            Ok(registration
+                .surfaces
+                .object_rpc_route_descriptors()?
+                .iter()
+                .map(module_object_rpc_route_descriptor_to_network)
+                .collect::<Vec<_>>())
+        }
+
+        pub fn module_registry_object_rpc_route_descriptors(
+            registry: &ModuleRegistry,
+        ) -> Result<Vec<sinomo_network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError>
+        {
+            let mut seen_routes = BTreeSet::new();
+            let mut descriptors = Vec::new();
+            for registration in registry.registrations() {
+                for descriptor in module_registration_object_rpc_route_descriptors(registration)? {
+                    if !seen_routes.insert(descriptor.route.clone()) {
+                        return Err(sinomo_module::ModuleSurfaceError::DuplicateObjectRpcRoute {
+                            route: descriptor.route,
+                        });
+                    }
+                    descriptors.push(descriptor);
+                }
+            }
+            Ok(descriptors)
+        }
+
+        pub fn module_registry_snapshot_object_rpc_route_descriptors(
+            snapshot: &ModuleRegistrySnapshot,
+        ) -> Result<Vec<sinomo_network::ObjectRouteDescriptor>, sinomo_module::ModuleSurfaceError>
+        {
+            module_registry_object_rpc_route_descriptors(snapshot.registry())
+        }
+
+        pub const MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY: &str =
+            "module.registry.snapshot_version";
+
+        pub fn install_module_registry_snapshot_routes<F, Fut>(
+            router: &sinomo_network::ObjectRpcRouter,
+            snapshot: &ModuleRegistrySnapshot,
+            handler: F,
+        ) -> Result<Arc<sinomo_network::ObjectRpcRouteRegistry>, sinomo_network::NetworkError>
+        where
+            F: Fn(sinomo_network::ObjectRpcRequest) -> Fut + Clone + Send + Sync + 'static,
+            Fut: Future<
+                    Output = Result<
+                        sinomo_network::ObjectRpcResponse,
+                        sinomo_network::NetworkError,
+                    >,
+                > + Send
+                + 'static,
+        {
+            let snapshot_version = snapshot.version().to_string();
+            let descriptors = module_registry_snapshot_object_rpc_route_descriptors(snapshot)
+                .map_err(module_surface_error_to_network_error)?
+                .into_iter()
+                .map(|descriptor| {
+                    descriptor.observable(
+                        MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
+                        snapshot_version.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            router.replace_route_set(
+                |descriptor| {
+                    descriptor
+                        .observability
+                        .contains_key(MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY)
+                },
+                descriptors,
+                handler,
+            )
+        }
+
+        fn module_surface_error_to_network_error(
+            error: sinomo_module::ModuleSurfaceError,
+        ) -> sinomo_network::NetworkError {
+            sinomo_network::NetworkError::Serialization {
+                detail: error.to_string(),
+            }
         }
 
         pub fn internal_native_rust_module_bindings() -> &'static [NativeRustModuleBinding] {
@@ -201,10 +314,12 @@ pub use r1::{
 #[cfg(test)]
 mod tests {
     use super::modules::{
-        internal_module_registry, internal_module_table, native_rust_binding_for_registration,
+        MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY,
+        install_module_registry_snapshot_routes, internal_module_registry, internal_module_table,
+        module_registry_object_rpc_route_descriptors, native_rust_binding_for_registration,
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
-    use super::{core, dfs, module, observe, rollout, service};
+    use super::{core, daemon, dfs, module, network, observe, rollout, service};
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {
@@ -272,6 +387,24 @@ mod tests {
         assert!(report.covered.iter().any(|path| {
             path.relative_path == "sandbox/runtime/active.sobj" && path.module == "sinomo-sandbox"
         }));
+    }
+
+    #[test]
+    fn runtime_daemon_facade_exports_async_rpc_clients() {
+        let _ = daemon::send_daemon_rpc_async;
+        let _ = daemon::send_daemon_rpc_to_endpoint_async;
+        let _ = daemon::fetch_daemon_status_from_endpoint_async;
+        let _ = daemon::send_dfs_protocol_frame_to_endpoint_async;
+        let _ = daemon::send_dfs_metadata_journal_batch_to_endpoint_async;
+        let _ = daemon::send_dfs_metadata_snapshot_install_to_endpoint_async;
+        let request =
+            network::ObjectRpcRequest::encode_body("/test/stream", "test", &()).expect("request");
+        let _future = daemon::send_daemon_rpc_stream_async(
+            "127.0.0.1:0",
+            &request,
+            network::DaemonRpcTimeouts::connect_and_idle(std::time::Duration::from_millis(1)),
+            |_response| Ok(false),
+        );
     }
 
     #[test]
@@ -434,6 +567,204 @@ mod tests {
                 .any(|route| route.route == observe::OBSERVE_EVENTS_ROUTE
                     && route.category == observe::OBSERVE_RPC_CATEGORY
                     && route.auth == module::ModuleRouteAuth::LocalCommand)
+        );
+    }
+
+    #[test]
+    fn runtime_internal_module_rpc_surfaces_convert_to_network_descriptors() {
+        let registry = internal_module_registry().expect("module registry");
+        let descriptors =
+            module_registry_object_rpc_route_descriptors(&registry).expect("route descriptors");
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.route == dfs::DFS_STATUS_ROUTE
+                && descriptor.category == dfs::DFS_RPC_CATEGORY
+                && descriptor.auth_scope.as_deref() == Some("local-or-cluster-member")
+                && descriptor
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| capability == "dfs.status.read")
+        }));
+        assert!(descriptors.iter().any(|descriptor| {
+            descriptor.route == rollout::ROLLOUT_BUILD_ROUTE
+                && descriptor.category == rollout::ROLLOUT_RPC_CATEGORY
+                && descriptor.auth_scope.as_deref() == Some("admin")
+                && descriptor
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| capability == "rollout.build.apply")
+        }));
+
+        let mut builder = network::ObjectRpcRouteRegistry::builder();
+        for descriptor in descriptors {
+            builder = builder
+                .try_register_route(descriptor, |request| async move {
+                    network::ObjectRpcResponse::encode_body(request.route, &())
+                })
+                .expect("register module descriptor in network registry");
+        }
+        let snapshot = builder
+            .try_build()
+            .expect("module descriptors should validate as a network route snapshot");
+        assert!(snapshot.version() >= 1);
+        assert!(
+            snapshot
+                .catalog()
+                .routes
+                .contains_key(rollout::ROLLOUT_BUILD_ROUTE)
+        );
+    }
+
+    #[test]
+    fn runtime_installs_module_snapshot_routes_into_network_router_snapshot() {
+        let module_id =
+            module::ModuleId::from_legacy_named("module.runtime.snapshot").expect("module");
+        let route = "/module/runtime/snapshot";
+        let registration = module::ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "runtime-snapshot-module",
+            "runtime-snapshot-module",
+            "runtime-snapshot-module-v1",
+            core::TrustRing::R1TrustedRuntime,
+            "runtime-snapshot-module",
+        )
+        .with_surfaces(
+            module::ModuleSurfaces::default()
+                .with_object_rpc_route(module::ModuleObjectRpcRoute::new(
+                    route,
+                    "runtime-snapshot",
+                    "runtime.snapshot.read",
+                    module::ModuleRouteAuth::LocalOrClusterMember,
+                ))
+                .with_capability_export(
+                    core::CapabilityName::new("runtime.snapshot.read").expect("capability"),
+                ),
+        );
+        let registry = module::ModuleRegistry::builder()
+            .register(registration)
+            .expect("register")
+            .try_build()
+            .expect("registry");
+        let store = module::ModuleRegistrySnapshotStore::new(registry).expect("snapshot store");
+        let module_snapshot = store.active_snapshot().expect("module snapshot");
+        let router = network::ObjectRpcRouter::new();
+        let old_network_snapshot = router.route_registry_snapshot();
+
+        let installed = install_module_registry_snapshot_routes(
+            &router,
+            &module_snapshot,
+            |request| async move { network::ObjectRpcResponse::encode_body(request.route, &()) },
+        )
+        .expect("install module routes");
+
+        assert!(installed.version() > old_network_snapshot.version());
+        assert!(!old_network_snapshot.catalog().routes.contains_key(route));
+        let active = router.route_registry_snapshot();
+        let descriptor = active
+            .catalog()
+            .routes
+            .get(route)
+            .expect("installed module route");
+        assert_eq!(descriptor.category, "runtime-snapshot");
+        let expected_snapshot_version = module_snapshot.version().to_string();
+        assert_eq!(
+            descriptor
+                .observability
+                .get("module.registry.snapshot_version")
+                .map(String::as_str),
+            Some(expected_snapshot_version.as_str())
+        );
+        assert!(
+            descriptor
+                .required_capabilities
+                .contains(&"runtime.snapshot.read".to_string())
+        );
+    }
+
+    #[test]
+    fn runtime_module_snapshot_route_install_replaces_previous_module_routes() {
+        fn registration(
+            module_name: &str,
+            route: &str,
+            capability: &str,
+        ) -> module::ModuleRegistration {
+            let module_id = module::ModuleId::from_legacy_named(module_name).expect("module");
+            module::ModuleRegistration::native_rust(
+                module_id,
+                "0.1.0",
+                module_name,
+                module_name,
+                "runtime-snapshot-module-v1",
+                core::TrustRing::R1TrustedRuntime,
+                module_name,
+            )
+            .with_surfaces(
+                module::ModuleSurfaces::default()
+                    .with_object_rpc_route(module::ModuleObjectRpcRoute::new(
+                        route,
+                        "runtime-snapshot",
+                        capability,
+                        module::ModuleRouteAuth::LocalOrClusterMember,
+                    ))
+                    .with_capability_export(
+                        core::CapabilityName::new(capability).expect("capability"),
+                    ),
+            )
+        }
+
+        let first_route = "/module/runtime/snapshot/first";
+        let second_route = "/module/runtime/snapshot/second";
+        let first_registry = module::ModuleRegistry::builder()
+            .register(registration(
+                "module.runtime.snapshot.first",
+                first_route,
+                "runtime.snapshot.first.read",
+            ))
+            .expect("register first")
+            .try_build()
+            .expect("first registry");
+        let store =
+            module::ModuleRegistrySnapshotStore::new(first_registry).expect("snapshot store");
+        let router = network::ObjectRpcRouter::new();
+        let first_snapshot = store.active_snapshot().expect("first snapshot");
+
+        install_module_registry_snapshot_routes(&router, &first_snapshot, |request| async move {
+            network::ObjectRpcResponse::encode_body(request.route.clone(), &request.route)
+        })
+        .expect("install first snapshot");
+        assert!(router.catalog().routes.contains_key(first_route));
+
+        let second_registry = module::ModuleRegistry::builder()
+            .register(registration(
+                "module.runtime.snapshot.second",
+                second_route,
+                "runtime.snapshot.second.read",
+            ))
+            .expect("register second")
+            .try_build()
+            .expect("second registry");
+        let second_snapshot = store
+            .replace_registry(second_registry)
+            .expect("replace module registry");
+        install_module_registry_snapshot_routes(&router, &second_snapshot, |request| async move {
+            network::ObjectRpcResponse::encode_body(request.route.clone(), &request.route)
+        })
+        .expect("install second snapshot");
+
+        let active = router.route_registry_snapshot();
+        assert!(!active.catalog().routes.contains_key(first_route));
+        let second_descriptor = active
+            .catalog()
+            .routes
+            .get(second_route)
+            .expect("second route installed");
+        let expected_snapshot_version = second_snapshot.version().to_string();
+        assert_eq!(
+            second_descriptor
+                .observability
+                .get(MODULE_REGISTRY_SNAPSHOT_VERSION_OBSERVABILITY_KEY)
+                .map(String::as_str),
+            Some(expected_snapshot_version.as_str())
         );
     }
 

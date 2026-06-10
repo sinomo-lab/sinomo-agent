@@ -95,7 +95,6 @@ use sinomo_runtime::daemon::{
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
     git_is_available as daemon_git_is_available,
-    handle_daemon_connection as daemon_handle_daemon_connection,
     install_managed_source_repo as daemon_install_managed_source_repo,
     installed_daemon_paths as daemon_installed_daemon_paths, invite_introducers_from_daemon_status,
     managed_source_git_status_lines as daemon_managed_source_git_status_lines,
@@ -153,9 +152,7 @@ use sinomo_runtime::daemon::{
     handle_daemon_sandbox_reboot as daemon_handle_daemon_sandbox_reboot,
     handle_daemon_sandbox_resume as daemon_handle_daemon_sandbox_resume,
     handle_daemon_sandbox_run_process_plan as daemon_handle_daemon_sandbox_run_process_plan,
-    handle_daemon_sandbox_run_process_plan_stream as daemon_handle_daemon_sandbox_run_process_plan_stream,
     handle_daemon_sandbox_run_toolchain as daemon_handle_daemon_sandbox_run_toolchain,
-    handle_daemon_sandbox_run_toolchain_stream as daemon_handle_daemon_sandbox_run_toolchain_stream,
     handle_daemon_sandbox_status as daemon_handle_daemon_sandbox_status,
     handle_daemon_sandbox_toolchain_add_artifact as daemon_handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command as daemon_handle_daemon_sandbox_toolchain_add_command,
@@ -1680,16 +1677,48 @@ fn daemon_fetch_cluster_kv_snapshot(
     address: &str,
     timeout: Duration,
 ) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
-    let request = network::cluster_kv_snapshot_rpc_request()?;
+    let request = cluster_kv_snapshot_rpc_request()?;
     let response = daemon_send_daemon_rpc(address, &request, timeout)?;
-    network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+    decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
 }
 
 fn daemon_fetch_cluster_kv_snapshot_from_endpoint(
     endpoint: &ClusterEndpointRecord,
     timeout: Duration,
 ) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
-    let request = network::cluster_kv_snapshot_rpc_request()?;
+    let request = cluster_kv_snapshot_rpc_request()?;
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)?;
-    network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+    decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+}
+
+fn cluster_kv_snapshot_rpc_request() -> Result<network::ObjectRpcRequest, KvError> {
+    let payload = sinomo_runtime::kv::cluster_kv_snapshot_rpc_payload()?;
+    Ok(network::ObjectRpcRequest::from_encoded_body(
+        payload.route,
+        payload.category,
+        payload.body,
+    ))
+}
+
+fn cluster_kv_txn_rpc_request(txn: &KvTxn) -> Result<network::ObjectRpcRequest, KvError> {
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(txn)?;
+    Ok(network::ObjectRpcRequest::from_encoded_body(
+        payload.route,
+        payload.category,
+        payload.body,
+    ))
+}
+
+fn decode_cluster_kv_snapshot_rpc_response(
+    response: &network::ObjectRpcResponse,
+) -> Result<KvSnapshot, network::NetworkError> {
+    response.error_detail()?;
+    sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
+}
+
+fn decode_cluster_kv_txn_rpc_response(
+    response: &network::ObjectRpcResponse,
+) -> Result<KvTxnResponse, network::NetworkError> {
+    response.error_detail()?;
+    sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body).map_err(Into::into)
 }

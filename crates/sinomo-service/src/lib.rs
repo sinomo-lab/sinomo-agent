@@ -18,14 +18,16 @@
 //! Routes that need consensus call [`ServiceContext::require_cluster`] and degrade to
 //! [`ServiceError::NotClustered`] in local-only mode.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use sinomo_kv::{KvEntry, KvError, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
-use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse};
+use sinomo_network::{NetworkError, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteReadiness};
 
 /// Whether the host should keep serving after a request (`Stop` == daemon shutdown).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,12 +41,27 @@ pub enum ServiceDisposition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceSigner {
     Local,
+    LocalNode { node_id: String, public_key: String },
     Remote { node_id: String, public_key: String },
 }
 
 impl ServiceSigner {
     pub fn is_local(&self) -> bool {
-        matches!(self, ServiceSigner::Local)
+        matches!(self, ServiceSigner::Local | ServiceSigner::LocalNode { .. })
+    }
+
+    pub fn cluster_identity(&self) -> Option<(&str, &str)> {
+        match self {
+            ServiceSigner::Local => None,
+            ServiceSigner::LocalNode {
+                node_id,
+                public_key,
+            }
+            | ServiceSigner::Remote {
+                node_id,
+                public_key,
+            } => Some((node_id.as_str(), public_key.as_str())),
+        }
     }
 }
 
@@ -74,8 +91,11 @@ pub trait ClusterAccess: Send + Sync {
     fn kv_get(&self, key: &str) -> Result<Option<KvEntry>, ServiceError>;
     /// Read all cluster-KV entries under a key prefix.
     fn kv_range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, ServiceError>;
-    /// Commit a cluster-KV transaction (quorum-replicated by the host).
-    fn kv_commit(&self, txn: KvTxn) -> Result<KvTxnResponse, ServiceError>;
+    /// Commit a cluster-KV transaction through the host-owned async runtime.
+    fn kv_commit_async<'a>(
+        &'a self,
+        txn: KvTxn,
+    ) -> Pin<Box<dyn Future<Output = Result<KvTxnResponse, ServiceError>> + Send + 'a>>;
 }
 
 /// Where a service's response frame(s) go: one [`ResponseSink::emit`] for a unary reply,
@@ -124,18 +144,107 @@ pub trait Service: Send + Sync {
     fn name(&self) -> &'static str;
     /// The object-RPC routes this service owns (matched against `ObjectRpcRequest::route`).
     fn routes(&self) -> &'static [&'static str];
+    /// The object-RPC route/category pairs this service owns.
+    ///
+    /// The default maps every route to [`Service::name`]. Services whose diagnostic name
+    /// differs from their wire category should override this.
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        self.routes()
+            .iter()
+            .copied()
+            .map(|route| ServiceRoute::new(route, self.name()))
+            .collect()
+    }
     /// Serve a request whose route this service owns, writing the reply via `ctx.sink`,
     /// and report whether the host should keep running.
     fn handle(&self, ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_>;
 }
 
-/// Dispatches object-RPC requests to the service that owns the request's route. The
-/// returned future is `'static`, so the host can spawn each request independently and
-/// services never block one another.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRoute {
+    pub route: String,
+    pub category: String,
+    pub auth_scope: Option<String>,
+    pub required_capabilities: Vec<String>,
+    pub concurrency_limit: Option<usize>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl ServiceRoute {
+    pub fn new(route: impl Into<String>, category: impl Into<String>) -> Self {
+        Self {
+            route: route.into(),
+            category: category.into(),
+            auth_scope: None,
+            required_capabilities: Vec::new(),
+            concurrency_limit: None,
+            timeout_ms: None,
+        }
+    }
+
+    pub fn from_route_metadata<I, S>(
+        route: impl Into<String>,
+        category: impl Into<String>,
+        auth_scope: impl Into<String>,
+        required_capabilities: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(route, category)
+            .with_auth_scope(auth_scope)
+            .require_capabilities(required_capabilities)
+    }
+
+    pub fn with_auth_scope(mut self, scope: impl Into<String>) -> Self {
+        self.auth_scope = Some(scope.into());
+        self
+    }
+
+    pub fn require_capability(mut self, capability: impl Into<String>) -> Self {
+        self.required_capabilities.push(capability.into());
+        self
+    }
+
+    pub fn require_capabilities<I, S>(mut self, capabilities: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.required_capabilities
+            .extend(capabilities.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
+        self.concurrency_limit = Some(limit);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout_ms = Some(timeout.as_millis().min(u128::from(u64::MAX)) as u64);
+        self
+    }
+}
+
+#[derive(Clone)]
+struct RouteOwner {
+    service_index: usize,
+    category: String,
+    auth_scope: Option<String>,
+    required_capabilities: Vec<String>,
+    concurrency_limit: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+/// Dispatches object-RPC requests to the service that owns the request's route and
+/// category. The returned future is `'static`, so the host can spawn each request
+/// independently and services never block one another.
 #[derive(Default, Clone)]
 pub struct ServiceRegistry {
     services: Vec<Arc<dyn Service>>,
-    by_route: BTreeMap<&'static str, usize>,
+    by_route: BTreeMap<String, RouteOwner>,
 }
 
 impl ServiceRegistry {
@@ -144,16 +253,43 @@ impl ServiceRegistry {
     }
 
     /// Route `request` to its owning service, returning a spawnable `'static` future.
-    /// Unknown routes resolve to [`ServiceError::UnknownRoute`].
+    /// Unknown routes resolve to [`ServiceError::UnknownRoute`]; known routes with a
+    /// mismatched category fail before invoking the handler. Generic route policy
+    /// such as timeout and concurrency is metadata for the host object-RPC Tower
+    /// layer; direct registry dispatch invokes the handler without owning that
+    /// policy itself.
     pub fn dispatch(
         &self,
         ctx: ServiceContext,
         request: ObjectRpcRequest,
     ) -> ServiceFuture<'static> {
+        self.dispatch_direct(ctx, request)
+    }
+
+    /// Route `request` to its owning service without adding another policy layer.
+    /// Network-owned object-RPC Tower middleware is the single owner for generic
+    /// route timeout and concurrency policy.
+    pub fn dispatch_direct(
+        &self,
+        ctx: ServiceContext,
+        request: ObjectRpcRequest,
+    ) -> ServiceFuture<'static> {
         match self.by_route.get(request.route.as_str()) {
-            Some(&index) => {
-                let service = Arc::clone(&self.services[index]);
+            Some(owner) if request.category == owner.category => {
+                let service = Arc::clone(&self.services[owner.service_index]);
                 Box::pin(async move { service.handle(ctx, request).await })
+            }
+            Some(owner) => {
+                let route = request.route.clone();
+                let expected = owner.category.to_string();
+                let actual = request.category;
+                Box::pin(async move {
+                    Err(ServiceError::Network(NetworkError::Serialization {
+                        detail: format!(
+                            "service route {route} expected category {expected}, got {actual}"
+                        ),
+                    }))
+                })
             }
             None => Box::pin(async move { Err(ServiceError::UnknownRoute(request.route)) }),
         }
@@ -169,6 +305,38 @@ impl ServiceRegistry {
         self.by_route.len()
     }
 
+    /// Route/category pairs owned by this registry, sorted by route.
+    pub fn route_categories(&self) -> Vec<ServiceRoute> {
+        self.by_route
+            .iter()
+            .map(|(route, owner)| ServiceRoute {
+                route: route.clone(),
+                category: owner.category.clone(),
+                auth_scope: owner.auth_scope.clone(),
+                required_capabilities: owner.required_capabilities.clone(),
+                concurrency_limit: owner.concurrency_limit,
+                timeout_ms: owner.timeout_ms,
+            })
+            .collect()
+    }
+
+    pub fn route_readiness(&self, route: &str) -> Option<ObjectRpcRouteReadiness> {
+        let owner = self.by_route.get(route)?;
+        Some(ObjectRpcRouteReadiness {
+            route: route.to_string(),
+            category: owner.category.clone(),
+            concurrency_limit: owner.concurrency_limit,
+            available_concurrency: None,
+            timeout_ms: owner.timeout_ms,
+        })
+    }
+
+    pub fn category_for_route(&self, route: &str) -> Option<&str> {
+        self.by_route
+            .get(route)
+            .map(|owner| owner.category.as_str())
+    }
+
     /// Whether any registered service owns `route`. Lets a host dispatch registry-owned
     /// routes and fall through to its own handling for the rest.
     pub fn owns(&self, route: &str) -> bool {
@@ -176,25 +344,135 @@ impl ServiceRegistry {
     }
 }
 
+#[derive(Clone)]
+pub struct ServiceRegistrySnapshot {
+    version: u64,
+    registry: Arc<ServiceRegistry>,
+}
+
+impl std::fmt::Debug for ServiceRegistrySnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceRegistrySnapshot")
+            .field("version", &self.version)
+            .field("service_names", &self.registry.service_names())
+            .field("route_count", &self.registry.route_count())
+            .finish()
+    }
+}
+
+impl ServiceRegistrySnapshot {
+    fn new(version: u64, registry: ServiceRegistry) -> Self {
+        Self {
+            version,
+            registry: Arc::new(registry),
+        }
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn registry(&self) -> &ServiceRegistry {
+        &self.registry
+    }
+
+    pub fn registry_arc(&self) -> Arc<ServiceRegistry> {
+        Arc::clone(&self.registry)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceRegistrySnapshotError {
+    #[error("service registry snapshot lock failed: {detail}")]
+    SnapshotLock { detail: String },
+}
+
+#[derive(Clone)]
+pub struct ServiceRegistrySnapshotStore {
+    active: Arc<ArcSwap<ServiceRegistrySnapshot>>,
+    update_lock: Arc<Mutex<()>>,
+}
+
+impl std::fmt::Debug for ServiceRegistrySnapshotStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceRegistrySnapshotStore")
+            .field("active_version", &self.active.load().version())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for ServiceRegistrySnapshotStore {
+    fn default() -> Self {
+        Self::new(ServiceRegistry::default())
+    }
+}
+
+impl ServiceRegistrySnapshotStore {
+    pub fn new(registry: ServiceRegistry) -> Self {
+        let snapshot = Arc::new(ServiceRegistrySnapshot::new(1, registry));
+        Self {
+            active: Arc::new(ArcSwap::from(snapshot)),
+            update_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub fn active_snapshot(&self) -> Arc<ServiceRegistrySnapshot> {
+        self.active.load_full()
+    }
+
+    pub fn replace_registry(
+        &self,
+        registry: ServiceRegistry,
+    ) -> Result<Arc<ServiceRegistrySnapshot>, ServiceRegistrySnapshotError> {
+        let _guard = self.update_lock.lock().map_err(|source| {
+            ServiceRegistrySnapshotError::SnapshotLock {
+                detail: source.to_string(),
+            }
+        })?;
+        let active = self.active.load();
+        let snapshot = Arc::new(ServiceRegistrySnapshot::new(
+            active.version().saturating_add(1),
+            registry,
+        ));
+        self.active.store(Arc::clone(&snapshot));
+        Ok(snapshot)
+    }
+}
+
 /// Builds a [`ServiceRegistry`], rejecting duplicate route ownership.
 #[derive(Default)]
 pub struct ServiceRegistryBuilder {
     services: Vec<Arc<dyn Service>>,
-    by_route: BTreeMap<&'static str, usize>,
+    by_route: BTreeMap<String, RouteOwner>,
 }
 
 impl ServiceRegistryBuilder {
-    /// Register a service, mapping each of its routes to it.
+    /// Register a service, mapping each of its route/category pairs to it.
     ///
     /// # Panics
     /// Panics if two services claim the same route — a construction-time wiring bug.
     pub fn register(mut self, service: impl Service + 'static) -> Self {
         let index = self.services.len();
-        for &route in service.routes() {
-            if let Some(previous) = self.by_route.insert(route, index) {
+        let service_routes = validate_service_route_categories(&service);
+        for route in service_routes {
+            let concurrency_limit = route.concurrency_limit;
+            if let Some(previous) = self.by_route.insert(
+                route.route.clone(),
+                RouteOwner {
+                    service_index: index,
+                    category: route.category,
+                    auth_scope: route.auth_scope,
+                    required_capabilities: route.required_capabilities,
+                    concurrency_limit,
+                    timeout_ms: route.timeout_ms,
+                },
+            ) {
                 panic!(
-                    "service route `{route}` is claimed by both `{}` and `{}`",
-                    self.services[previous].name(),
+                    "service route `{}` is claimed by both `{}` and `{}`",
+                    route.route,
+                    self.services[previous.service_index].name(),
                     service.name()
                 );
             }
@@ -211,10 +489,61 @@ impl ServiceRegistryBuilder {
     }
 }
 
+fn validate_service_route_categories(service: &impl Service) -> Vec<ServiceRoute> {
+    let mut declared_routes: BTreeSet<&'static str> = service.routes().iter().copied().collect();
+    let mut seen_routes = BTreeSet::new();
+    let service_routes = service.route_categories();
+    for route in &service_routes {
+        assert!(
+            !route.route.trim().is_empty(),
+            "service `{}` declared an empty route",
+            service.name()
+        );
+        assert!(
+            !route.category.trim().is_empty(),
+            "service `{}` route `{}` declared an empty category",
+            service.name(),
+            route.route
+        );
+        assert!(
+            seen_routes.insert(route.route.as_str()),
+            "service `{}` declared route `{}` more than once",
+            service.name(),
+            route.route
+        );
+        assert!(
+            !matches!(route.concurrency_limit, Some(0)),
+            "service `{}` route `{}` declared a zero concurrency limit",
+            service.name(),
+            route.route
+        );
+        assert!(
+            !matches!(route.timeout_ms, Some(0)),
+            "service `{}` route `{}` declared a zero timeout",
+            service.name(),
+            route.route
+        );
+        assert!(
+            declared_routes.remove(route.route.as_str()),
+            "service `{}` route category for `{}` is not listed in routes()",
+            service.name(),
+            route.route
+        );
+    }
+    assert!(
+        declared_routes.is_empty(),
+        "service `{}` routes() entries missing route categories: {:?}",
+        service.name(),
+        declared_routes
+    );
+    service_routes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct EchoService;
 
@@ -268,11 +597,15 @@ mod tests {
         let registry = ServiceRegistry::builder().register(EchoService).build();
         assert_eq!(registry.route_count(), 1);
         assert_eq!(registry.service_names(), vec!["echo"]);
+        assert_eq!(registry.category_for_route("/test/echo"), Some("echo"));
+        assert_eq!(
+            registry.route_categories(),
+            vec![ServiceRoute::new("/test/echo", "echo")]
+        );
 
         let sink = CollectingSink::default();
         let frames = Arc::clone(&sink.frames);
-        let request =
-            ObjectRpcRequest::encode_body("/test/echo", "test.category", &()).expect("encode");
+        let request = ObjectRpcRequest::encode_body("/test/echo", "echo", &()).expect("encode");
         let disposition = registry
             .dispatch(local_context(sink), request)
             .await
@@ -287,6 +620,406 @@ mod tests {
             .await
             .expect_err("unknown route");
         assert!(matches!(error, ServiceError::UnknownRoute(route) if route == "/test/missing"));
+    }
+
+    #[tokio::test]
+    async fn registry_rejects_category_mismatch_before_handler() {
+        let registry = ServiceRegistry::builder().register(EchoService).build();
+        let sink = CollectingSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let request =
+            ObjectRpcRequest::encode_body("/test/echo", "wrong.category", &()).expect("encode");
+
+        let error = registry
+            .dispatch(local_context(sink), request)
+            .await
+            .expect_err("category mismatch");
+
+        assert!(
+            matches!(error, ServiceError::Network(NetworkError::Serialization { ref detail })
+                if detail.contains("expected category echo")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            frames.lock().expect("frames").is_empty(),
+            "handler should not emit a response when route category validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_accepts_service_route_category_override() {
+        struct DiagnosticNameService;
+
+        impl Service for DiagnosticNameService {
+            fn name(&self) -> &'static str {
+                "diagnostic-name"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/wire-category"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![ServiceRoute::new("/test/wire-category", "wire.category")]
+            }
+
+            fn handle(
+                &self,
+                mut ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async move {
+                    let response =
+                        ObjectRpcResponse::encode_body("/test/wire-category", &"ok".to_string())?;
+                    ctx.respond(response)?;
+                    Ok(ServiceDisposition::Continue)
+                })
+            }
+        }
+
+        let registry = ServiceRegistry::builder()
+            .register(DiagnosticNameService)
+            .build();
+        assert_eq!(
+            registry.category_for_route("/test/wire-category"),
+            Some("wire.category")
+        );
+
+        let sink = CollectingSink::default();
+        let frames = Arc::clone(&sink.frames);
+        let request = ObjectRpcRequest::encode_body("/test/wire-category", "wire.category", &())
+            .expect("encode");
+        registry
+            .dispatch(local_context(sink), request)
+            .await
+            .expect("dispatch");
+
+        assert_eq!(frames.lock().expect("frames").len(), 1);
+    }
+
+    #[test]
+    fn service_route_accepts_bulk_required_capabilities() {
+        assert_eq!(
+            ServiceRoute::from_route_metadata(
+                "/test/module",
+                "module",
+                "admin",
+                ["module.read", "module.write"],
+            ),
+            ServiceRoute::new("/test/module", "module")
+                .with_auth_scope("admin")
+                .require_capability("module.read")
+                .require_capability("module.write")
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_preserves_route_policy_metadata() {
+        struct PolicyService;
+
+        impl Service for PolicyService {
+            fn name(&self) -> &'static str {
+                "policy"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/policy"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![
+                    ServiceRoute::new("/test/policy", "policy")
+                        .with_auth_scope("admin")
+                        .require_capability("policy.write")
+                        .with_concurrency_limit(4)
+                        .with_timeout(Duration::from_millis(250)),
+                ]
+            }
+
+            fn handle(
+                &self,
+                mut ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async move {
+                    let response =
+                        ObjectRpcResponse::encode_body("/test/policy", &"ok".to_string())?;
+                    ctx.respond(response)?;
+                    Ok(ServiceDisposition::Continue)
+                })
+            }
+        }
+
+        let registry = ServiceRegistry::builder().register(PolicyService).build();
+
+        assert_eq!(
+            registry.route_categories(),
+            vec![
+                ServiceRoute::new("/test/policy", "policy")
+                    .with_auth_scope("admin")
+                    .require_capability("policy.write")
+                    .with_concurrency_limit(4)
+                    .with_timeout(Duration::from_millis(250))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_snapshot_store_swaps_active_registry_without_invalidating_old_snapshots() {
+        struct ReplacementService;
+
+        impl Service for ReplacementService {
+            fn name(&self) -> &'static str {
+                "replacement"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/replacement"]
+            }
+
+            fn handle(
+                &self,
+                mut ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async move {
+                    let response = ObjectRpcResponse::encode_body(
+                        "/test/replacement",
+                        &"replacement-ok".to_string(),
+                    )?;
+                    ctx.respond(response)?;
+                    Ok(ServiceDisposition::Continue)
+                })
+            }
+        }
+
+        let store = ServiceRegistrySnapshotStore::new(
+            ServiceRegistry::builder().register(EchoService).build(),
+        );
+        let old_snapshot = store.active_snapshot();
+        assert_eq!(old_snapshot.version(), 1);
+        assert_eq!(
+            old_snapshot.registry().category_for_route("/test/echo"),
+            Some("echo")
+        );
+
+        let new_snapshot = store
+            .replace_registry(
+                ServiceRegistry::builder()
+                    .register(ReplacementService)
+                    .build(),
+            )
+            .expect("replace registry");
+        assert_eq!(new_snapshot.version(), 2);
+        assert_eq!(store.active_snapshot().version(), 2);
+        assert_eq!(
+            store
+                .active_snapshot()
+                .registry()
+                .category_for_route("/test/replacement"),
+            Some("replacement")
+        );
+
+        let old_sink = CollectingSink::default();
+        let old_frames = Arc::clone(&old_sink.frames);
+        let old_request = ObjectRpcRequest::encode_body("/test/echo", "echo", &()).expect("old");
+        old_snapshot
+            .registry_arc()
+            .dispatch(local_context(old_sink), old_request)
+            .await
+            .expect("old snapshot dispatch");
+        assert_eq!(old_frames.lock().expect("old frames").len(), 1);
+
+        let active_sink = CollectingSink::default();
+        let active_frames = Arc::clone(&active_sink.frames);
+        let active_request =
+            ObjectRpcRequest::encode_body("/test/replacement", "replacement", &()).expect("active");
+        store
+            .active_snapshot()
+            .registry_arc()
+            .dispatch(local_context(active_sink), active_request)
+            .await
+            .expect("active snapshot dispatch");
+        assert_eq!(active_frames.lock().expect("active frames").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_dispatch_preserves_policy_metadata_without_owning_policy() {
+        struct LimitedService {
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+            both_entered: Arc<tokio::sync::Notify>,
+            release: tokio::sync::watch::Receiver<bool>,
+        }
+
+        impl Service for LimitedService {
+            fn name(&self) -> &'static str {
+                "limited"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/limited"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![
+                    ServiceRoute::new("/test/limited", "limited")
+                        .with_concurrency_limit(1)
+                        .with_timeout(Duration::from_millis(250)),
+                ]
+            }
+
+            fn handle(
+                &self,
+                mut ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                let active = Arc::clone(&self.active);
+                let max_active = Arc::clone(&self.max_active);
+                let both_entered = Arc::clone(&self.both_entered);
+                let mut release = self.release.clone();
+                Box::pin(async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    if current >= 2 {
+                        both_entered.notify_one();
+                    }
+                    while !*release.borrow() {
+                        release.changed().await.map_err(|_| {
+                            ServiceError::Service("release signal closed".to_string())
+                        })?;
+                    }
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let response = ObjectRpcResponse::encode_body("/test/limited", &"ok")?;
+                    ctx.respond(response)?;
+                    Ok(ServiceDisposition::Continue)
+                })
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let both_entered = Arc::new(tokio::sync::Notify::new());
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let registry = Arc::new(
+            ServiceRegistry::builder()
+                .register(LimitedService {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                    both_entered: Arc::clone(&both_entered),
+                    release: release_rx,
+                })
+                .build(),
+        );
+        let initial = registry
+            .route_readiness("/test/limited")
+            .expect("initial readiness");
+        assert_eq!(initial.concurrency_limit, Some(1));
+        assert_eq!(initial.available_concurrency, None);
+        assert_eq!(initial.timeout_ms, Some(250));
+        assert!(initial.is_ready());
+
+        let first_request =
+            ObjectRpcRequest::encode_body("/test/limited", "limited", &()).expect("first request");
+        let first = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .dispatch(local_context(CollectingSink::default()), first_request)
+                    .await
+            }
+        });
+
+        let second_request =
+            ObjectRpcRequest::encode_body("/test/limited", "limited", &()).expect("second request");
+        let second = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .dispatch(local_context(CollectingSink::default()), second_request)
+                    .await
+            }
+        });
+
+        both_entered.notified().await;
+        let in_flight = registry
+            .route_readiness("/test/limited")
+            .expect("in-flight readiness");
+        assert_eq!(in_flight.available_concurrency, None);
+        assert!(in_flight.is_ready());
+
+        release_tx.send(true).expect("release handlers");
+        first.await.expect("first task").expect("first dispatch");
+        second.await.expect("second task").expect("second dispatch");
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "declared a zero concurrency limit")]
+    fn registry_rejects_zero_service_route_concurrency_limit() {
+        struct ZeroLimitService;
+
+        impl Service for ZeroLimitService {
+            fn name(&self) -> &'static str {
+                "zero-limit"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/zero-limit"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![ServiceRoute::new("/test/zero-limit", "zero-limit").with_concurrency_limit(0)]
+            }
+
+            fn handle(
+                &self,
+                _ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async { Ok(ServiceDisposition::Continue) })
+            }
+        }
+
+        let _ = ServiceRegistry::builder()
+            .register(ZeroLimitService)
+            .build();
+    }
+
+    #[test]
+    #[should_panic(expected = "declared a zero timeout")]
+    fn registry_rejects_zero_service_route_timeout() {
+        struct ZeroTimeoutService;
+
+        impl Service for ZeroTimeoutService {
+            fn name(&self) -> &'static str {
+                "zero-timeout"
+            }
+
+            fn routes(&self) -> &'static [&'static str] {
+                &["/test/zero-timeout"]
+            }
+
+            fn route_categories(&self) -> Vec<ServiceRoute> {
+                vec![
+                    ServiceRoute::new("/test/zero-timeout", "zero-timeout")
+                        .with_timeout(Duration::ZERO),
+                ]
+            }
+
+            fn handle(
+                &self,
+                _ctx: ServiceContext,
+                _request: ObjectRpcRequest,
+            ) -> ServiceFuture<'_> {
+                Box::pin(async { Ok(ServiceDisposition::Continue) })
+            }
+        }
+
+        let _ = ServiceRegistry::builder()
+            .register(ZeroTimeoutService)
+            .build();
     }
 
     #[tokio::test]
@@ -336,7 +1069,7 @@ mod tests {
         );
 
         let slow_request =
-            ObjectRpcRequest::encode_body("/test/slow", "test.category", &()).expect("encode");
+            ObjectRpcRequest::encode_body("/test/slow", "slow", &()).expect("encode");
         let slow = tokio::spawn({
             let registry = Arc::clone(&registry);
             async move {
@@ -347,7 +1080,7 @@ mod tests {
         });
 
         let fast_request =
-            ObjectRpcRequest::encode_body("/test/echo", "test.category", &()).expect("encode");
+            ObjectRpcRequest::encode_body("/test/echo", "echo", &()).expect("encode");
         let started = Instant::now();
         registry
             .dispatch(local_context(CollectingSink::default()), fast_request)

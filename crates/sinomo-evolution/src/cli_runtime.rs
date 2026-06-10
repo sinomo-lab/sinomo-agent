@@ -775,7 +775,9 @@ fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
     }
     #[cfg(test)]
     {
-        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+        return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map_err(network::NetworkError::from)
+            .map_err(Into::into);
     }
     #[cfg(not(test))]
     {
@@ -796,12 +798,15 @@ fn commit_registry_trust_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Re
         }
         other => other.into(),
     })?;
-    let (snapshot, _) = network::append_cluster_raft_command_with_response(
-        &paths,
-        &state.local_node_id,
-        sinomo_runtime::kv::KvCommand::Txn(txn),
-    )?;
-    network::write_imported_cluster_kv_snapshot_if_changed(&paths, &snapshot)?;
+    paths
+        .kv_paths()
+        .raft_store()
+        .append_command_with_response_and_publish(
+            &state.local_node_id,
+            sinomo_runtime::kv::KvCommand::Txn(txn),
+            network::cluster_kv_key_can_defer_materialized_snapshot,
+        )
+        .map_err(network::NetworkError::from)?;
     Ok(())
 }
 
@@ -815,18 +820,17 @@ fn commit_registry_trust_cluster_txn(
             detail: "clustered trusted signer registry writes require the local daemon".to_string(),
         });
     };
-    let request = network::ObjectRpcRequest::encode_body(
-        sinomo_runtime::kv::CLUSTER_KV_TXN_ROUTE,
-        sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
-        &txn,
-    )
-    .map_err(CliError::from)?;
+    let request: network::ObjectRpcRequest = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&txn)
+        .map_err(network::NetworkError::from)?
+        .into();
     let response = sinomo_runtime::daemon::send_daemon_rpc(
         &status.address,
         &request,
         DAEMON_CLUSTER_KV_TXN_TIMEOUT,
     )?;
-    let _: KvTxnResponse = response.decode_body().map_err(CliError::from)?;
+    response.error_detail().map_err(CliError::from)?;
+    let _: KvTxnResponse = sinomo_runtime::kv::decode_cluster_kv_txn_rpc_body(&response.body)
+        .map_err(network::NetworkError::from)?;
     Ok(())
 }
 
@@ -869,9 +873,12 @@ fn daemon_fetch_cluster_kv_snapshot(
     address: &str,
     timeout: Duration,
 ) -> Result<KvSnapshot, sinomo_runtime::daemon::DaemonError> {
-    let request = network::cluster_kv_snapshot_rpc_request()?;
+    let payload = sinomo_runtime::kv::cluster_kv_snapshot_rpc_payload()?;
+    let request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(address, &request, timeout)?;
-    network::decode_cluster_kv_snapshot_rpc_response(&response).map_err(Into::into)
+    response.error_detail()?;
+    sinomo_runtime::kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
 }
 
 fn model_config_uses_cluster(data_dir: &SinomoDataDir) -> bool {
@@ -905,7 +912,9 @@ fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, Cli
     }
     #[cfg(test)]
     {
-        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+        return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map_err(network::NetworkError::from)
+            .map_err(Into::into);
     }
     #[cfg(not(test))]
     {

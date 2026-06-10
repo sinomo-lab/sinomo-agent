@@ -193,7 +193,6 @@ pub(crate) fn run_shadow_daemon_with_paths(
         cluster,
         DAEMON_ROLLOUT_TIMEOUT,
         DAEMON_PROBE_TIMEOUT,
-        handle_daemon_connection,
     )
     .map_err(Into::into)
 }
@@ -520,13 +519,6 @@ pub(crate) fn stop_daemon_with_paths(
     }
 }
 
-pub(crate) fn handle_daemon_connection(
-    stream: &mut network::DaemonControlStream,
-    paths: &DaemonPaths,
-) -> Result<bool, CliError> {
-    daemon_handle_daemon_connection(stream, paths).map_err(Into::into)
-}
-
 pub(crate) fn cli_current_cluster_kv_store(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -586,7 +578,11 @@ pub(crate) fn handle_daemon_cluster_kv_txn_request(
         cli_cluster_kv_txn_quorum_options(true),
         &mut CliClusterKvTxnQuorumHost,
     )?;
-    network::write_imported_cluster_kv_snapshot_if_changed(&cluster_paths, &result.snapshot)?;
+    sinomo_runtime::kv::write_imported_cluster_kv_snapshot_if_changed(
+        &cluster_paths.kv_paths(),
+        &result.snapshot,
+        network::cluster_kv_key_can_defer_materialized_snapshot,
+    )?;
     Ok(result.txn_response.unwrap_or(KvTxnResponse {
         succeeded: true,
         revision: result.snapshot.revision,
@@ -602,7 +598,7 @@ impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, network::NetworkError> {
-        network::locked_cluster_raft_known_leader_id(paths, state)
+        locked_cluster_raft_known_leader_id(paths, state)
     }
 
     fn fetch_cluster_kv_snapshot(
@@ -610,10 +606,10 @@ impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        let request = network::cluster_kv_snapshot_rpc_request()?;
+        let request = cluster_kv_snapshot_rpc_request()?;
         let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
             .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot refresh", error))?;
-        network::decode_cluster_kv_snapshot_rpc_response(&response)
+        decode_cluster_kv_snapshot_rpc_response(&response)
     }
 
     fn restore_cluster_raft_from_snapshot_if_newer(
@@ -622,7 +618,13 @@ impl network::ClusterKvSnapshotRefreshHost for CliClusterKvSnapshotRefreshHost {
         local_node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, network::NetworkError> {
-        network::locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
+            .map_err(network::NetworkError::from)?;
+        paths
+            .kv_paths()
+            .local_cache()
+            .restore_raft_from_snapshot_if_newer(local_node_id.clone(), snapshot)
+            .map_err(network::NetworkError::from)
     }
 }
 
@@ -632,9 +634,14 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
     fn refresh_current_cluster_kv_store(
         &mut self,
         paths: &ClusterPaths,
-        _state: &ClusterBootstrapState,
+        state: &ClusterBootstrapState,
     ) -> Result<(), network::NetworkError> {
-        network::read_cluster_kv_store(paths).map(|_| ())
+        sinomo_runtime::kv::read_cluster_kv_store_for_node(
+            &paths.kv_paths(),
+            state.local_node_id.clone(),
+        )
+        .map(|_| ())
+        .map_err(network::NetworkError::from)
     }
 
     fn local_is_raft_leader(
@@ -642,7 +649,7 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<bool, network::NetworkError> {
-        network::locked_cluster_raft_local_is_leader(paths, state)
+        locked_cluster_raft_local_is_leader(paths, state)
     }
 
     fn forward_cluster_kv_txn_to_voter(
@@ -697,10 +704,7 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
         options: network::ClusterRaftQuorumCommitOptions,
     ) -> Result<network::ClusterRaftQuorumCommitResult, network::NetworkError> {
         let mut host = CliClusterRaftQuorumCommitHost {
-            storage: network::LocalClusterRaftCommandStorage::new(
-                paths,
-                state.local_node_id.clone(),
-            ),
+            storage: CliClusterRaftCommandStorage::new(paths, state.local_node_id.clone()),
         };
         network::commit_cluster_raft_command_with_quorum_driver(
             paths, state, command, options, &mut host,
@@ -709,7 +713,73 @@ impl network::ClusterKvTxnQuorumHost for CliClusterKvTxnQuorumHost {
 }
 
 struct CliClusterRaftQuorumCommitHost<'a> {
-    storage: network::LocalClusterRaftCommandStorage<'a>,
+    storage: CliClusterRaftCommandStorage<'a>,
+}
+
+struct CliClusterRaftCommandStorage<'a> {
+    paths: &'a ClusterPaths,
+    local_node_id: NodeId,
+}
+
+impl<'a> CliClusterRaftCommandStorage<'a> {
+    fn new(paths: &'a ClusterPaths, local_node_id: NodeId) -> Self {
+        Self {
+            paths,
+            local_node_id,
+        }
+    }
+
+    fn raft_store(&self) -> sinomo_runtime::kv::ClusterKvRaftStore {
+        self.paths.kv_paths().raft_store()
+    }
+}
+
+impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftCommandStorage<'_> {
+    type Error = network::NetworkError;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect(
+        &mut self,
+        command: sinomo_runtime::kv::KvCommand,
+    ) -> Result<sinomo_runtime::kv::ClusterKvRaftUncommittedAppend, network::NetworkError> {
+        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
+            .map_err(network::NetworkError::from)?;
+        self.raft_store()
+            .append_command_uncommitted_or_no_effect(&self.local_node_id, command)
+            .map_err(Into::into)
+    }
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+        &mut self,
+    ) -> Result<(), network::NetworkError> {
+        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
+            .map_err(network::NetworkError::from)?;
+        let snapshot = self
+            .raft_store()
+            .discard_uncommitted_tail_and_clear_leader(&self.local_node_id)
+            .map_err(network::NetworkError::from)?;
+        sinomo_runtime::kv::write_cluster_kv_snapshot_if_changed(&self.paths.kv_paths(), &snapshot)
+            .map_err(network::NetworkError::from)?;
+        Ok(())
+    }
+
+    fn commit_cluster_raft_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> Result<sinomo_runtime::kv::ClusterKvRaftCommitResult, network::NetworkError> {
+        let _raft_guard = sinomo_runtime::kv::lock_cluster_kv_raft_operation()
+            .map_err(network::NetworkError::from)?;
+        let store = self.raft_store();
+        let result = store
+            .commit_index_with_events(&self.local_node_id, index)
+            .map_err(network::NetworkError::from)?;
+        store
+            .publish_commit_result(
+                &result,
+                network::cluster_kv_key_can_defer_materialized_snapshot,
+            )
+            .map_err(network::NetworkError::from)?;
+        Ok(result)
+    }
 }
 
 impl sinomo_runtime::kv::ClusterKvRaftCommandStorage for CliClusterRaftQuorumCommitHost<'_> {
@@ -751,7 +821,7 @@ impl network::ClusterRaftQuorumTransportHost for CliClusterRaftQuorumCommitHost<
         state: &ClusterBootstrapState,
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
-    ) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+    ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
         network::replicate_cluster_raft_to_endpoint_with_host(
             paths,
             state,
@@ -772,7 +842,11 @@ impl network::ClusterRaftAppendReplicationHost for CliClusterRaftAppendReplicati
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<u64, network::NetworkError> {
-        Ok(network::open_cluster_raft_kv_node(paths, &state.local_node_id)?.last_log_index())
+        paths
+            .kv_paths()
+            .raft_store()
+            .last_log_index(&state.local_node_id)
+            .map_err(Into::into)
     }
 
     fn build_raft_append_request(
@@ -780,16 +854,20 @@ impl network::ClusterRaftAppendReplicationHost for CliClusterRaftAppendReplicati
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
         next_index: u64,
-    ) -> Result<network::ClusterRaftAppendRequest, network::NetworkError> {
-        network::build_cluster_raft_append_request_from_next_index(paths, state, next_index)
+    ) -> Result<sinomo_runtime::kv::ClusterRaftAppendRequest, network::NetworkError> {
+        paths
+            .kv_paths()
+            .raft_store()
+            .build_cluster_raft_append_request_from_next_index(state, next_index)
+            .map_err(Into::into)
     }
 
     fn send_raft_append(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &network::ClusterRaftAppendRequest,
+        request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
         timeout: Duration,
-    ) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
+    ) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
         cli_send_cluster_raft_append(endpoint, request, timeout)
     }
 }
@@ -800,9 +878,9 @@ impl network::ClusterRaftVoteTransportHost for CliClusterRaftLeaderElectionHost 
     fn send_raft_vote(
         &mut self,
         endpoint: &ClusterEndpointRecord,
-        request: &network::ClusterRaftVoteRequest,
+        request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
         timeout: Duration,
-    ) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
+    ) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
         cli_send_cluster_raft_vote(endpoint, request, timeout)
     }
 }
@@ -815,7 +893,7 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
         paths: &ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<Option<NodeId>, network::NetworkError> {
-        network::locked_cluster_raft_known_leader_id(paths, state)
+        locked_cluster_raft_known_leader_id(paths, state)
     }
 
     fn send_cluster_kv_txn(
@@ -832,10 +910,10 @@ impl network::ClusterKvTxnForwardHost for CliClusterKvTxnForwardHost {
         endpoint: &ClusterEndpointRecord,
         timeout: Duration,
     ) -> Result<KvSnapshot, network::NetworkError> {
-        let request = network::cluster_kv_snapshot_rpc_request()?;
+        let request = cluster_kv_snapshot_rpc_request()?;
         let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
             .map_err(|error| cli_daemon_rpc_network_error("cluster kv snapshot", error))?;
-        network::decode_cluster_kv_snapshot_rpc_response(&response)
+        decode_cluster_kv_snapshot_rpc_response(&response)
     }
 
     fn relay_peers(
@@ -869,7 +947,9 @@ fn cli_cluster_kv_txn_quorum_options(allow_forwarding: bool) -> network::Cluster
             iroh_command_timeout: Duration::from_secs(6),
         },
         leader_election_options: network::ClusterRaftLeaderElectionOptions {
-            max_attempts: network::CLUSTER_RAFT_LEADER_ELECTION_ATTEMPTS,
+            kv: sinomo_runtime::kv::ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_runtime::kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
             timeout: Duration::from_secs(10),
             tcp_command_timeout: Duration::from_secs(8),
             iroh_command_timeout: Duration::from_secs(6),
@@ -912,32 +992,40 @@ fn cli_send_cluster_kv_txn(
     txn: &KvTxn,
     timeout: Duration,
 ) -> Result<KvTxnResponse, network::NetworkError> {
-    let request = network::cluster_kv_txn_rpc_request(txn)?;
+    let request = cluster_kv_txn_rpc_request(txn)?;
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &request, timeout)
         .map_err(|error| cli_daemon_rpc_network_error("cluster kv txn", error))?;
-    network::decode_cluster_kv_txn_rpc_response(&response)
+    decode_cluster_kv_txn_rpc_response(&response)
 }
 
 fn cli_send_cluster_raft_append(
     endpoint: &ClusterEndpointRecord,
-    request: &network::ClusterRaftAppendRequest,
+    request: &sinomo_runtime::kv::ClusterRaftAppendRequest,
     timeout: Duration,
-) -> Result<network::ClusterRaftAppendResponse, network::NetworkError> {
-    let rpc_request = network::cluster_raft_append_rpc_request(request)?;
+) -> Result<sinomo_runtime::kv::ClusterRaftAppendResponse, network::NetworkError> {
+    let payload = sinomo_runtime::kv::cluster_raft_append_rpc_payload(request)?;
+    let rpc_request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(|error| cli_daemon_rpc_network_error("cluster raft append", error))?;
-    network::decode_cluster_raft_append_rpc_response(&response)
+    response.error_detail()?;
+    sinomo_runtime::kv::decode_cluster_raft_append_rpc_response_body(&response.body)
+        .map_err(Into::into)
 }
 
 fn cli_send_cluster_raft_vote(
     endpoint: &ClusterEndpointRecord,
-    request: &network::ClusterRaftVoteRequest,
+    request: &sinomo_runtime::kv::ClusterRaftVoteRequest,
     timeout: Duration,
-) -> Result<network::ClusterRaftVoteResponse, network::NetworkError> {
-    let rpc_request = network::cluster_raft_vote_rpc_request(request)?;
+) -> Result<sinomo_runtime::kv::ClusterRaftVoteResponse, network::NetworkError> {
+    let payload = sinomo_runtime::kv::cluster_raft_vote_rpc_payload(request)?;
+    let rpc_request =
+        network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = daemon_send_daemon_rpc_to_endpoint(endpoint, &rpc_request, timeout)
         .map_err(|error| cli_daemon_rpc_network_error("cluster raft vote", error))?;
-    network::decode_cluster_raft_vote_rpc_response(&response)
+    response.error_detail()?;
+    sinomo_runtime::kv::decode_cluster_raft_vote_rpc_response_body(&response.body)
+        .map_err(Into::into)
 }
 
 fn cli_daemon_rpc_network_error(

@@ -1,13 +1,14 @@
 use crate::prelude::*;
 use crate::rpc::{
-    CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_SCOPE_LOCAL, CLUSTER_HEALTH_SCOPE_METADATA_KEY,
-    ObjectRpcRequest, ObjectRpcResponse,
+    CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_HEALTH_SCOPE_LOCAL,
+    CLUSTER_HEALTH_SCOPE_METADATA_KEY, ObjectRpcRequest, ObjectRpcResponse,
 };
 use crate::storage::{
-    DAEMON_MAIN_CLUSTER_ROLE, DAEMON_MAIN_RUN_CAPABILITY, DAEMON_SHADOW_CLUSTER_ROLE,
-    DAEMON_SHADOW_SUPERVISE_CAPABILITY, advertised_peer_route_targets,
+    ClusterMembershipRpcFuture, DAEMON_MAIN_CLUSTER_ROLE, DAEMON_MAIN_RUN_CAPABILITY,
+    DAEMON_SHADOW_CLUSTER_ROLE, DAEMON_SHADOW_SUPERVISE_CAPABILITY, advertised_peer_route_targets,
     discover_peer_route_ip_candidates, iroh_endpoint_public_key,
     live_cluster_member_probe_possible, read_cluster_node_statuses_from_kv, read_cluster_state,
+    read_cluster_state_async,
 };
 use crate::{
     ClusterConnectivityGraph, ClusterConnectivityRecord, ClusterConnectivityState, ClusterPaths,
@@ -24,11 +25,7 @@ pub struct ClusterHealthRow {
 }
 
 pub fn cluster_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(
-        CLUSTER_HEALTH_ROUTE,
-        sinomo_kv::CLUSTER_KV_RPC_CATEGORY,
-        &(),
-    )
+    ObjectRpcRequest::encode_body(CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, &())
 }
 
 pub fn cluster_local_health_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
@@ -72,9 +69,9 @@ pub fn handle_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>(
             )?;
             ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
         }
-        other => {
-            ObjectRpcResponse::encode_error(other, format!("unknown cluster health route: {other}"))
-        }
+        other => Err(NetworkError::UnknownRoute {
+            route: other.to_string(),
+        }),
     }
 }
 
@@ -86,6 +83,45 @@ pub fn handle_current_cluster_health_rpc_request<P: ClusterStatusProbe + ?Sized>
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state = read_cluster_state(paths)?;
     handle_cluster_health_rpc_request(paths, &state, probe, request, observed_at)
+}
+
+pub async fn handle_cluster_health_rpc_request_async<P: ClusterStatusAsyncProbe + ?Sized>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    request: ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    match request.route.as_str() {
+        CLUSTER_HEALTH_ROUTE => {
+            let _: () = request.decode_body()?;
+            let rows = cluster_health_rows_with_async_probe(
+                paths,
+                state,
+                probe,
+                !cluster_health_rpc_request_is_local_scope(&request),
+                observed_at,
+            )
+            .await?;
+            ObjectRpcResponse::encode_body(CLUSTER_HEALTH_ROUTE, &rows)
+        }
+        other => Err(NetworkError::UnknownRoute {
+            route: other.to_string(),
+        }),
+    }
+}
+
+pub async fn handle_current_cluster_health_rpc_request_async<
+    P: ClusterStatusAsyncProbe + ?Sized,
+>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    probe: &P,
+    request: ObjectRpcRequest,
+    observed_at: OffsetDateTime,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let state = read_cluster_state_async(runtime, paths).await?;
+    handle_cluster_health_rpc_request_async(paths, &state, probe, request, observed_at).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,6 +154,22 @@ pub trait ClusterStatusProbe {
         _member: &ClusterMemberRecord,
     ) -> Option<Vec<ClusterHealthRow>> {
         None
+    }
+}
+
+pub trait ClusterStatusAsyncProbe {
+    fn probe_member_status_async<'a>(
+        &'a self,
+        state: &'a ClusterBootstrapState,
+        member: &'a ClusterMemberRecord,
+    ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>>;
+
+    fn peer_local_health_rows_async<'a>(
+        &'a self,
+        _state: &'a ClusterBootstrapState,
+        _member: &'a ClusterMemberRecord,
+    ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
+        Box::pin(async { Ok(None) })
     }
 }
 
@@ -168,6 +220,65 @@ pub fn cluster_health_rows_with_probe<P: ClusterStatusProbe + ?Sized>(
     }
     if include_peer_views {
         merge_reachable_peer_health_rows(state, &mut rows, probe);
+    }
+    rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
+    Ok(rows)
+}
+
+pub async fn cluster_health_rows_with_async_probe<P: ClusterStatusAsyncProbe + ?Sized>(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    probe: &P,
+    include_peer_views: bool,
+    observed_at: OffsetDateTime,
+) -> Result<Vec<ClusterHealthRow>, NetworkError> {
+    let paths_for_statuses = paths.clone();
+    let stored_statuses = tokio::task::spawn_blocking(move || {
+        read_cluster_node_statuses_from_kv(&paths_for_statuses)
+    })
+    .await
+    .map_err(|source| NetworkError::Io {
+        operation: "cluster health status read".to_string(),
+        detail: format!("cluster health status read task failed: {source}"),
+    })??;
+    let mut rows = Vec::new();
+    for member in &state.members {
+        if matches!(member.state, ClusterMemberState::Removed) {
+            continue;
+        }
+        let live = probe.probe_member_status_async(state, member).await?;
+        let stored = stored_statuses
+            .iter()
+            .find(|status| status.node_id == member.node_id)
+            .cloned();
+        let live_online = live.is_some();
+        let mut status = if let Some(live) = live {
+            let mut live = live;
+            if live.rollout.is_none() {
+                live.rollout = stored.as_ref().and_then(|status| status.rollout.clone());
+            }
+            live
+        } else if let Some(stored) = stored {
+            stored
+        } else {
+            unknown_cluster_node_status(state, member, observed_at)
+        };
+        let availability = if live_online {
+            ClusterNodeAvailability::Online
+        } else if live_cluster_member_probe_possible(state, member) {
+            ClusterNodeAvailability::Offline
+        } else {
+            ClusterNodeAvailability::Unknown
+        };
+        status.availability = availability.clone();
+        rows.push(ClusterHealthRow {
+            member: member.clone(),
+            status,
+            availability,
+        });
+    }
+    if include_peer_views {
+        merge_reachable_peer_health_rows_async(state, &mut rows, probe).await?;
     }
     rows.sort_by(|left, right| left.member.node_id.cmp(&right.member.node_id));
     Ok(rows)
@@ -357,6 +468,62 @@ fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(
             break;
         }
     }
+}
+
+async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Sized>(
+    state: &ClusterBootstrapState,
+    rows: &mut [ClusterHealthRow],
+    probe: &P,
+) -> Result<(), NetworkError> {
+    if !rows
+        .iter()
+        .any(|row| row.availability != ClusterNodeAvailability::Online)
+    {
+        return Ok(());
+    }
+
+    let mut peer_members = rows
+        .iter()
+        .filter(|row| {
+            row.availability == ClusterNodeAvailability::Online
+                && row.member.node_id != state.local_node_id
+                && row
+                    .member
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
+        })
+        .map(|row| row.member.clone())
+        .collect::<Vec<_>>();
+    peer_members.sort_by_key(|member| {
+        (
+            std::cmp::Reverse(
+                member
+                    .endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
+                    .count(),
+            ),
+            member.node_id.clone(),
+        )
+    });
+
+    for member in peer_members
+        .into_iter()
+        .take(CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS)
+    {
+        let Some(peer_rows) = probe.peer_local_health_rows_async(state, &member).await? else {
+            continue;
+        };
+        merge_online_peer_health_rows(rows, peer_rows);
+        if rows
+            .iter()
+            .all(|row| row.availability == ClusterNodeAvailability::Online)
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn merge_online_peer_health_rows(rows: &mut [ClusterHealthRow], peer_rows: Vec<ClusterHealthRow>) {

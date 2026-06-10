@@ -1,37 +1,268 @@
 use crate::prelude::*;
 use crate::storage::{
-    MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS, MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    LocalClusterRaftCommandStorage, MAX_CLUSTER_CONNECTIVITY_SOURCE_RECORDS,
     MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS, MAX_PUBLIC_ENDPOINT_REACHABILITY_CACHE_ENTRIES,
     cluster_member_removal_txns_from_store, cluster_member_update_ops_from_store,
     cluster_raft_config_from_store,
 };
 use crate::*;
+use sinomo_kv::ClusterKvRaftConfigRecord;
 
 use sinomo_core::{
     CapabilityName, ClusterCertificate, ClusterEndpointPrivacy, ClusterEndpointRecord,
     ClusterEndpointSource, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState,
     ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
     ClusterTransportKind, Confidence, EventEnvelope, EventKind, LatencyClass, PrivacyClass,
-    RollbackPolicy, RolloutPlan, RolloutStrategy, RoutingMetadata, RoutingScope, Salience, Source,
-    TrustRing,
+    RoutingMetadata, RoutingScope, Salience, Source,
 };
 use sinomo_events::{EventId, EventStore, InMemoryEventStore, ReplayQuery, SessionId};
 use sinomo_kv::{
-    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY,
-    CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_CANCEL_ROUTE,
-    CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG, CLUSTER_KV_WATCH_DRAIN_ROUTE,
-    CLUSTER_KV_WATCH_PREFIX_ROUTE, ClusterKvRaftCommandStorage, ClusterKvRaftUncommittedAppend,
-    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, DurableRaftKvNode, InProcessKvStore,
-    KvCommand, KvCompare, KvEntry, KvError, KvEventKind, KvOp, KvOpResponse, KvRevision,
-    KvSnapshot, KvTxn, LeaseId, RaftAppendEntriesRequest, RaftRequestVoteRequest, RaftSnapshot,
-    cluster_kv_watch_events_noop_response,
+    CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_SNAPSHOT_ROUTE,
+    CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_WATCH_DEFERRED_CURSOR_MAX_REVISION_LAG,
+    CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_CATEGORY, CLUSTER_RAFT_VOTE_ROUTE,
+    ClusterKvRaftCommandStorage, ClusterKvRaftLeaderElectionOptions,
+    ClusterKvRaftUncommittedAppend, ClusterKvWatchAllocatorState, ClusterKvWatchCancelRequest,
+    ClusterKvWatchCancelResponse, ClusterKvWatchDrainRequest, ClusterKvWatchEventsRequest,
+    ClusterKvWatchEventsResponse, ClusterKvWatchPrefixRequest, ClusterKvWatchRegistration,
+    ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
+    ClusterRaftVoteResponse, InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEventKind,
+    KvOp, KvOpResponse, KvRevision, KvSnapshot, KvTxn, LeaseId, MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS, MAX_CLUSTER_KV_WATCH_EVENT_RECORD_BYTES,
+    MAX_CLUSTER_KV_WATCH_EVENTS, RaftAppendEntriesRequest, RaftAppendEntriesResponse,
+    RaftRequestVoteRequest, RaftSnapshot,
 };
 use sinomo_node::NodeId;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex, mpsc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tower_service::Service;
+
+fn object_rpc_request_from_kv_payload(payload: sinomo_kv::ClusterKvRpcPayload) -> ObjectRpcRequest {
+    ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body)
+}
+
+fn object_rpc_response_from_kv_payload(
+    payload: sinomo_kv::ClusterKvRpcPayload,
+) -> ObjectRpcResponse {
+    ObjectRpcResponse::from_encoded_body(payload.route, payload.body)
+}
+
+#[test]
+fn cluster_network_rpc_route_metadata_matches_owned_routes() {
+    assert_eq!(
+        CLUSTER_HEALTH_RPC_ROUTE_METADATA,
+        &[(CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY)]
+    );
+    assert_eq!(
+        CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA,
+        &[
+            (
+                CLUSTER_JOIN_CHALLENGE_ROUTE,
+                CLUSTER_MEMBERSHIP_RPC_CATEGORY
+            ),
+            (CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY),
+            (
+                CLUSTER_INVITE_PUBLISH_ROUTE,
+                CLUSTER_MEMBERSHIP_RPC_CATEGORY
+            ),
+            (
+                CLUSTER_MEMBER_PUBLISH_ROUTE,
+                CLUSTER_MEMBERSHIP_RPC_CATEGORY
+            ),
+        ]
+    );
+    assert_eq!(
+        CLUSTER_ROUTING_RPC_ROUTE_METADATA,
+        &[(CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_CATEGORY)]
+    );
+}
+
+#[test]
+fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
+    struct NoopClusterStatusProbe;
+
+    impl ClusterStatusProbe for NoopClusterStatusProbe {
+        fn probe_member_status(
+            &self,
+            _state: &ClusterBootstrapState,
+            _member: &ClusterMemberRecord,
+        ) -> Option<ClusterNodeStatusRecord> {
+            panic!("unknown-route dispatch must not probe member status")
+        }
+
+        fn peer_local_health_rows(
+            &self,
+            _state: &ClusterBootstrapState,
+            _member: &ClusterMemberRecord,
+        ) -> Option<Vec<ClusterHealthRow>> {
+            panic!("unknown-route dispatch must not fetch peer health rows")
+        }
+    }
+
+    impl ClusterStatusAsyncProbe for NoopClusterStatusProbe {
+        fn probe_member_status_async<'a>(
+            &'a self,
+            _state: &'a ClusterBootstrapState,
+            _member: &'a ClusterMemberRecord,
+        ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+            Box::pin(async {
+                panic!("unknown-route dispatch must not probe member status asynchronously")
+            })
+        }
+
+        fn peer_local_health_rows_async<'a>(
+            &'a self,
+            _state: &'a ClusterBootstrapState,
+            _member: &'a ClusterMemberRecord,
+        ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
+            Box::pin(async {
+                panic!("unknown-route dispatch must not fetch peer health rows asynchronously")
+            })
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-direct-rpc-unknown-route-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let now = OffsetDateTime::now_utc();
+    let state = ClusterBootstrapState::initialized_locally(
+        ClusterId::from_legacy_named("cluster_direct_rpc_unknown_route").expect("cluster"),
+        "direct rpc unknown route",
+        NodeId::from_legacy_named("node_direct_rpc_unknown_route").expect("node"),
+        "local",
+        "pk-local",
+        now,
+    );
+    let unknown_route = "/cluster/not-registered";
+
+    let health_request =
+        ObjectRpcRequest::encode_body(unknown_route, CLUSTER_HEALTH_RPC_CATEGORY, &())
+            .expect("health unknown route request");
+    let health_error = handle_cluster_health_rpc_request(
+        &paths,
+        &state,
+        &NoopClusterStatusProbe,
+        health_request,
+        now,
+    )
+    .expect_err("unknown health route should be a dispatch error");
+    assert!(
+        matches!(health_error, NetworkError::UnknownRoute { ref route } if route == unknown_route)
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let async_health_request =
+        ObjectRpcRequest::encode_body(unknown_route, CLUSTER_HEALTH_RPC_CATEGORY, &())
+            .expect("async health unknown route request");
+    let async_health_error = runtime
+        .block_on(handle_cluster_health_rpc_request_async(
+            &paths,
+            &state,
+            &NoopClusterStatusProbe,
+            async_health_request,
+            now,
+        ))
+        .expect_err("unknown async health route should be a dispatch error");
+    assert!(
+        matches!(async_health_error, NetworkError::UnknownRoute { ref route } if route == unknown_route)
+    );
+
+    let raft_request = ObjectRpcRequest::encode_body(unknown_route, CLUSTER_RAFT_RPC_CATEGORY, &())
+        .expect("raft unknown route request");
+    let raft_error = handle_cluster_raft_rpc_request(
+        &paths,
+        raft_request,
+        &ClusterAuthenticatedPeer {
+            node_id: "node-direct-rpc-unknown-route".to_string(),
+            public_key: "pk-local".to_string(),
+        },
+    )
+    .expect_err("unknown raft route should be a dispatch error");
+    assert!(
+        matches!(raft_error, NetworkError::UnknownRoute { ref route } if route == unknown_route)
+    );
+
+    let membership_request =
+        ObjectRpcRequest::encode_body(unknown_route, CLUSTER_MEMBERSHIP_RPC_CATEGORY, &())
+            .expect("membership unknown route request");
+    let mut join_host = UnusedClusterJoinRegistrationHost;
+    let mut member_host = RecordingClusterMemberPublishHost::default();
+    let mut invite_host = UnusedClusterInvitePublishHost;
+    let membership_error =
+        handle_cluster_membership_rpc_request_with_hosts::<NetworkError, _, _, _>(
+            &paths,
+            membership_request,
+            "node-direct-rpc-unknown-route",
+            "pk-local",
+            now,
+            &mut join_host,
+            &mut member_host,
+            &mut invite_host,
+        )
+        .expect_err("unknown membership route should be a dispatch error");
+    assert!(
+        matches!(membership_error, NetworkError::UnknownRoute { ref route } if route == unknown_route)
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn iroh_endpoint_record_async_helpers_round_trip_on_passed_runtime() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-iroh-endpoint-async-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let cluster_id = ClusterId::from_legacy_named("cluster_iroh_endpoint_async").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_iroh_endpoint_async").expect("node");
+    let record = IrohEndpointRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        endpoint_public_key: "iroh_endpoint_async_public_key".to_string(),
+        direct_addresses: vec!["192.0.2.10:32000".to_string()],
+        relay_url: Some("https://relay.example./".to_string()),
+        relay_mode: IrohRelayMode::Default,
+        expires_after_tick: 42,
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    runtime
+        .block_on(write_iroh_endpoint_record_async(
+            runtime.handle(),
+            &paths,
+            &record,
+        ))
+        .expect("write iroh endpoint record async");
+    let loaded = runtime
+        .block_on(read_iroh_endpoint_record_async(
+            runtime.handle(),
+            &paths,
+            &node_id,
+        ))
+        .expect("read iroh endpoint record async");
+
+    assert_eq!(loaded, record);
+    std::fs::remove_dir_all(root).ok();
+}
 
 #[cfg(feature = "iroh-transport")]
 #[test]
@@ -103,6 +334,40 @@ fn iroh_secret_key_creation_is_atomic_under_concurrency() {
 
 #[cfg(feature = "iroh-transport")]
 #[test]
+fn iroh_secret_key_async_helper_uses_passed_runtime() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-iroh-secret-async-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    let node_id = NodeId::from_legacy_named("node_iroh_secret_async").expect("node");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let public_key = runtime
+        .block_on(iroh_public_key_for_node_async(
+            runtime.handle(),
+            &paths,
+            &node_id,
+        ))
+        .expect("load iroh public key async");
+    let persisted_public_key = load_or_create_iroh_secret_key(&paths, &node_id)
+        .expect("load persisted iroh secret")
+        .public()
+        .to_string();
+
+    assert_eq!(public_key, persisted_public_key);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[cfg(feature = "iroh-transport")]
+#[test]
 fn iroh_secret_key_lock_wait_is_bounded() {
     use fs2::FileExt;
 
@@ -153,6 +418,25 @@ fn iroh_secret_key_lock_wait_is_bounded() {
     std::fs::remove_dir_all(root).ok();
 }
 
+fn object_rpc_router_from_registry(registry: Arc<ObjectRpcRouteRegistry>) -> ObjectRpcRouter {
+    ObjectRpcRouter::from_route_registry(registry).expect("valid object rpc route registry")
+}
+
+fn object_rpc_router_with_route<F, Fut>(
+    descriptor: ObjectRouteDescriptor,
+    handler: F,
+) -> ObjectRpcRouter
+where
+    F: Fn(ObjectRpcRequest) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<ObjectRpcResponse, NetworkError>> + Send + 'static,
+{
+    object_rpc_router_from_registry(
+        ObjectRpcRouteRegistry::builder()
+            .register_route(descriptor, handler)
+            .build(),
+    )
+}
+
 #[test]
 fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
     use tower_service::Service;
@@ -169,32 +453,49 @@ fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
             )
         ]
     );
-    let increment_route = category.routes[0].clone();
-    let mut router = ObjectRpcRouter::new()
-        .register_category_definition(category)
-        .register_route(increment_route, |request| async move {
-            let value: u64 = request.decode_body()?;
-            ObjectRpcResponse::encode_body(request.route, &(value + 1))
-        });
-
-    assert!(router.catalog().categories.contains_key("cluster.kv"));
-    assert!(
-        router
-            .catalog()
-            .routes
-            .contains_key("/cluster/kv/increment")
+    let increment_route = category.routes[0]
+        .clone()
+        .with_auth_scope("cluster-member")
+        .require_capability("cluster.kv.write");
+    let mut router = object_rpc_router_from_registry(
+        ObjectRpcRouteRegistry::builder()
+            .register_category(category.category.clone())
+            .register_route(increment_route, |request| async move {
+                let value: u64 = request.decode_body()?;
+                ObjectRpcResponse::encode_body(request.route, &(value + 1))
+            })
+            .build(),
     );
-    let descriptor = router
-        .catalog()
+
+    let catalog = router.catalog();
+    assert!(catalog.categories.contains_key("cluster.kv"));
+    assert!(catalog.routes.contains_key("/cluster/kv/increment"));
+    let descriptor = catalog
         .routes
         .get("/cluster/kv/increment")
         .expect("route descriptor");
     assert_eq!(descriptor.input_type, "u64");
     assert_eq!(descriptor.output_type, "u64");
+    assert_eq!(descriptor.auth_scope.as_deref(), Some("cluster-member"));
+    assert_eq!(
+        descriptor.required_capabilities,
+        vec!["cluster.kv.write".to_string()]
+    );
+    let snapshot = router.catalog_snapshot();
+    assert_eq!(snapshot.version, router.route_registry_snapshot().version());
+    assert_eq!(
+        snapshot.generated_at,
+        router.route_registry_snapshot().generated_at()
+    );
 
     let request = ObjectRpcRequest::encode_body("/cluster/kv/increment", "cluster.kv", &41_u64)
         .expect("request");
     assert!(request.body.starts_with(sinomo_object::MAGIC));
+    let request_body_view = sinomo_object::DocumentView::parse(&request.body).expect("rpc body");
+    assert_eq!(
+        request_body_view.metadata.length_mode,
+        sinomo_object::LengthMode::U64
+    );
 
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let response = runtime
@@ -202,6 +503,1029 @@ fn object_rpc_router_exposes_binary_routes_and_catalog_metadata() {
         .expect("route response");
     assert!(response.body.starts_with(sinomo_object::MAGIC));
     assert_eq!(response.decode_body::<u64>().expect("decode"), 42);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_rpc_route_policy_layer_enforces_shared_route_concurrency() {
+    use tower_layer::Layer;
+
+    #[derive(Clone)]
+    struct HoldingRoute {
+        descriptor: ObjectRouteDescriptor,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ObjectRpcRouteCatalog for HoldingRoute {
+        fn object_rpc_route_descriptor(&self, route: &str) -> Option<ObjectRouteDescriptor> {
+            (route == self.descriptor.route).then(|| self.descriptor.clone())
+        }
+    }
+
+    impl Service<ObjectRpcRequest> for HoldingRoute {
+        type Response = ObjectRpcResponse;
+        type Error = NetworkError;
+        type Future = ObjectRpcFuture;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                let _: () = request.decode_body()?;
+                entered.notify_one();
+                release.notified().await;
+                ObjectRpcResponse::encode_body(request.route, &"released".to_string())
+            })
+        }
+    }
+
+    let descriptor = ObjectRouteDescriptor::for_types::<(), String>(
+        "/test/policy",
+        "test.policy",
+        "policy route",
+    )
+    .with_concurrency_limit(1);
+    let mut catalog = ServiceCatalog::default();
+    catalog.register_route(descriptor.clone());
+    let layer = ObjectRpcRoutePolicyLayer::new(catalog).expect("policy layer");
+    let service = HoldingRoute {
+        descriptor,
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let mut policy_service = layer.layer(service.clone());
+
+    let initial = policy_service
+        .object_rpc_route_readiness("/test/policy")
+        .expect("initial readiness");
+    assert_eq!(initial.concurrency_limit, Some(1));
+    assert_eq!(initial.available_concurrency, Some(1));
+
+    let mut in_flight_service = policy_service.clone();
+    let in_flight = tokio::spawn(async move {
+        call_object_rpc_service_async(
+            &mut in_flight_service,
+            ObjectRpcRequest::encode_body("/test/policy", "test.policy", &()).expect("request"),
+        )
+        .await
+    });
+    service.entered.notified().await;
+
+    let saturated = policy_service
+        .object_rpc_route_readiness("/test/policy")
+        .expect("saturated readiness");
+    assert_eq!(saturated.available_concurrency, Some(0));
+    let second_error = call_object_rpc_service_async(
+        &mut policy_service,
+        ObjectRpcRequest::encode_body("/test/policy", "test.policy", &()).expect("request"),
+    )
+    .await
+    .expect_err("second request should saturate route");
+    assert!(
+        matches!(second_error, NetworkError::ObjectRpcRouteSaturated { ref route, concurrency_limit }
+            if route == "/test/policy" && concurrency_limit == 1),
+        "unexpected saturation error: {second_error}"
+    );
+
+    service.release.notify_one();
+    let response = in_flight
+        .await
+        .expect("join in-flight request")
+        .expect("in-flight response");
+    assert_eq!(
+        response.decode_body::<String>().expect("decode"),
+        "released"
+    );
+    let recovered = policy_service
+        .object_rpc_route_readiness("/test/policy")
+        .expect("recovered readiness");
+    assert_eq!(recovered.available_concurrency, Some(1));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn object_rpc_route_policy_layer_enforces_route_timeout() {
+    use tower_layer::Layer;
+
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/policy-timeout", "test", "timeout")
+            .with_timeout(Duration::from_millis(5));
+    let mut catalog = ServiceCatalog::default();
+    catalog.register_route(descriptor.clone());
+    let layer = ObjectRpcRoutePolicyLayer::new(catalog).expect("policy layer");
+    let router = object_rpc_router_with_route(descriptor, |request| async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        ObjectRpcResponse::encode_body(request.route, &())
+    });
+    let mut service = layer.layer(router);
+
+    let request =
+        ObjectRpcRequest::encode_body("/test/policy-timeout", "test", &()).expect("request");
+    let error = call_object_rpc_service_async(&mut service, request)
+        .await
+        .expect_err("route should time out in policy layer");
+    assert!(
+        matches!(error, NetworkError::Io { ref operation, ref detail }
+            if operation.contains("/test/policy-timeout") && detail.contains("timed out")),
+        "unexpected timeout error: {error}"
+    );
+}
+
+#[test]
+fn object_rpc_router_swaps_prebuilt_route_snapshot_without_disrupting_in_flight_calls() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let descriptor = ObjectRouteDescriptor::for_types::<(), String>(
+            "/test/snapshot",
+            "test",
+            "snapshot route",
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+        let router = object_rpc_router_with_route(descriptor.clone(), {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            move |request| {
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                async move {
+                    if let Some(entered) = entered.lock().expect("entered lock").take() {
+                        entered.send(()).expect("notify old handler entered");
+                    }
+                    let release = release
+                        .lock()
+                        .expect("release lock")
+                        .take()
+                        .expect("release receiver");
+                    release.await.expect("release old handler");
+                    ObjectRpcResponse::encode_body(request.route, &"old".to_string())
+                }
+            }
+        });
+        let original_version = router.route_registry_snapshot().version();
+        let old_call = tokio::spawn({
+            let mut router = router.clone();
+            async move {
+                let request =
+                    ObjectRpcRequest::encode_body("/test/snapshot", "test", &()).expect("request");
+                router.call(request).await
+            }
+        });
+        entered_rx.await.expect("old handler entered");
+
+        let next_registry = router
+            .route_registry_snapshot()
+            .to_builder()
+            .replace_route(descriptor, |request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"new".to_string())
+            })
+            .build();
+        assert!(next_registry.version() > original_version);
+        router
+            .replace_route_registry(next_registry)
+            .expect("replace route registry");
+
+        let new_request =
+            ObjectRpcRequest::encode_body("/test/snapshot", "test", &()).expect("new request");
+        let mut new_router = router.clone();
+        let new_response = new_router.call(new_request).await.expect("new response");
+        assert_eq!(
+            new_response.decode_body::<String>().expect("decode new"),
+            "new"
+        );
+
+        release_tx.send(()).expect("release old handler");
+        let old_response = old_call
+            .await
+            .expect("join old call")
+            .expect("old response");
+        assert_eq!(
+            old_response.decode_body::<String>().expect("decode old"),
+            "old"
+        );
+    });
+}
+
+#[test]
+fn object_rpc_router_accepts_prebuilt_registry_snapshot() {
+    use tower_service::Service;
+
+    let mut router = object_rpc_router_with_route(
+        ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route"),
+        |request| async move { ObjectRpcResponse::encode_body(request.route, &"base".to_string()) },
+    );
+    let base_version = router.route_registry_snapshot().version();
+    let next_registry = router
+        .route_registry_snapshot()
+        .to_builder()
+        .register_route(
+            ObjectRouteDescriptor::for_types::<(), String>("/test/module", "test", "module route"),
+            |request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"module".to_string())
+            },
+        )
+        .build();
+    assert!(next_registry.version() > base_version);
+    assert!(next_registry.catalog().routes.contains_key("/test/base"));
+    assert!(next_registry.catalog().routes.contains_key("/test/module"));
+    router
+        .replace_route_registry(next_registry)
+        .expect("replace route registry");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        for (route, expected) in [("/test/base", "base"), ("/test/module", "module")] {
+            let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("request");
+            let response = router.call(request).await.expect("response");
+            assert_eq!(response.decode_body::<String>().expect("decode"), expected);
+        }
+    });
+}
+
+#[test]
+fn object_rpc_router_updates_route_registry_from_active_snapshot() {
+    use tower_service::Service;
+
+    let base_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route");
+    let mut router = object_rpc_router_with_route(base_descriptor.clone(), |request| async move {
+        ObjectRpcResponse::encode_body(request.route, &"old".to_string())
+    });
+    let old_snapshot = router.route_registry_snapshot();
+
+    let installed = router
+        .update_route_registry(|builder| {
+            builder
+                .try_replace_route(base_descriptor, |request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"new".to_string())
+                })?
+                .try_register_route(
+                    ObjectRouteDescriptor::for_types::<(), String>(
+                        "/test/module",
+                        "test",
+                        "module route",
+                    ),
+                    |request| async move {
+                        ObjectRpcResponse::encode_body(request.route, &"module".to_string())
+                    },
+                )
+        })
+        .expect("update route registry");
+
+    assert!(installed.version() > old_snapshot.version());
+    assert!(old_snapshot.catalog().routes.contains_key("/test/base"));
+    assert!(!old_snapshot.catalog().routes.contains_key("/test/module"));
+    assert!(router.catalog().routes.contains_key("/test/module"));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        for (route, expected) in [("/test/base", "new"), ("/test/module", "module")] {
+            let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("request");
+            let response = router.call(request).await.expect("response");
+            assert_eq!(response.decode_body::<String>().expect("decode"), expected);
+        }
+    });
+}
+
+#[test]
+fn object_rpc_router_replaces_marked_route_set_atomically() {
+    use tower_service::Service;
+
+    const GROUP_KEY: &str = "test.route.group";
+
+    let base_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route");
+    let old_group_descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/group/old", "test", "old group")
+            .observable(GROUP_KEY, "old");
+    let router = object_rpc_router_from_registry(
+        ObjectRpcRouteRegistry::builder()
+            .register_route(base_descriptor, |request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"base".to_string())
+            })
+            .register_route(old_group_descriptor, |request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"old".to_string())
+            })
+            .build(),
+    );
+    let old_snapshot = router.route_registry_snapshot();
+
+    let installed =
+        router
+            .replace_route_set(
+                |descriptor| descriptor.observability.contains_key(GROUP_KEY),
+                [ObjectRouteDescriptor::for_types::<(), String>(
+                    "/test/group/new",
+                    "test",
+                    "new group",
+                )
+                .observable(GROUP_KEY, "new")],
+                |request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"new".to_string())
+                },
+            )
+            .expect("replace route set");
+
+    assert!(installed.version() > old_snapshot.version());
+    assert!(
+        old_snapshot
+            .catalog()
+            .routes
+            .contains_key("/test/group/old"),
+        "in-flight readers keep the old immutable route snapshot"
+    );
+    let active = router.route_registry_snapshot();
+    assert!(active.catalog().routes.contains_key("/test/base"));
+    assert!(!active.catalog().routes.contains_key("/test/group/old"));
+    assert!(active.catalog().routes.contains_key("/test/group/new"));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let mut active_router = router.clone();
+        for (route, expected) in [("/test/base", "base"), ("/test/group/new", "new")] {
+            let request = ObjectRpcRequest::encode_body(route, "test", &()).expect("request");
+            let response = active_router.call(request).await.expect("response");
+            assert_eq!(response.decode_body::<String>().expect("decode"), expected);
+        }
+        let missing =
+            ObjectRpcRequest::encode_body("/test/group/old", "test", &()).expect("request");
+        assert!(matches!(
+            active_router
+                .call(missing)
+                .await
+                .expect_err("old group route should be removed"),
+            NetworkError::UnknownRoute { .. }
+        ));
+    });
+}
+
+#[test]
+fn object_rpc_service_helper_polls_ready_before_call() {
+    struct ReadyCheckedService {
+        ready_polled: Arc<AtomicBool>,
+    }
+
+    impl Service<ObjectRpcRequest> for ReadyCheckedService {
+        type Response = ObjectRpcResponse;
+        type Error = NetworkError;
+        type Future = ObjectRpcFuture;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.ready_polled.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
+            let ready_polled = Arc::clone(&self.ready_polled);
+            Box::pin(async move {
+                if !ready_polled.load(Ordering::SeqCst) {
+                    return Err(NetworkError::Io {
+                        operation: "ready-checked-service".to_string(),
+                        detail: "call ran before poll_ready".to_string(),
+                    });
+                }
+                ObjectRpcResponse::encode_body(request.route, &"ready".to_string())
+            })
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let mut service = ReadyCheckedService {
+            ready_polled: Arc::new(AtomicBool::new(false)),
+        };
+        let request = ObjectRpcRequest::encode_body("/test/ready", "test", &()).expect("request");
+        let response = call_object_rpc_service_async(&mut service, request)
+            .await
+            .expect("response");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "ready");
+    });
+}
+
+#[test]
+fn object_rpc_router_constructs_from_prebuilt_registry_snapshot() {
+    use tower_service::Service;
+
+    let registry = ObjectRpcRouteRegistry::builder()
+        .register_route(
+            ObjectRouteDescriptor::for_types::<(), String>(
+                "/test/prebuilt",
+                "test",
+                "prebuilt route",
+            ),
+            |request| async move {
+                ObjectRpcResponse::encode_body(request.route, &"prebuilt".to_string())
+            },
+        )
+        .build();
+    let registry_version = registry.version();
+    let mut router =
+        ObjectRpcRouter::from_route_registry(Arc::clone(&registry)).expect("prebuilt router");
+
+    assert!(Arc::ptr_eq(&router.route_registry_snapshot(), &registry));
+    assert_eq!(router.catalog_snapshot().version, registry_version);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let request =
+            ObjectRpcRequest::encode_body("/test/prebuilt", "test", &()).expect("prebuilt request");
+        let response = router.call(request).await.expect("prebuilt response");
+        assert_eq!(
+            response.decode_body::<String>().expect("decode"),
+            "prebuilt"
+        );
+    });
+}
+
+#[test]
+fn object_rpc_router_new_accepts_first_generated_registry_snapshot() {
+    use tower_service::Service;
+
+    let mut router = ObjectRpcRouter::new();
+    assert_eq!(router.route_registry_snapshot().version(), 0);
+    let registry =
+        ObjectRpcRouteRegistry::builder()
+            .register_route(
+                ObjectRouteDescriptor::for_types::<(), String>(
+                    "/test/first-generated",
+                    "test",
+                    "first generated route",
+                ),
+                |request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"first".to_string())
+                },
+            )
+            .build();
+    assert_eq!(registry.version(), 1);
+    router
+        .replace_route_registry(registry)
+        .expect("fresh router should accept the first generated registry");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let request = ObjectRpcRequest::encode_body("/test/first-generated", "test", &())
+            .expect("first generated request");
+        let response = router.call(request).await.expect("first response");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "first");
+    });
+}
+
+#[test]
+fn object_rpc_router_rejects_stale_prebuilt_registry_snapshot() {
+    use tower_service::Service;
+
+    let mut router = object_rpc_router_with_route(
+        ObjectRouteDescriptor::for_types::<(), String>("/test/base", "test", "base route"),
+        |request| async move { ObjectRpcResponse::encode_body(request.route, &"base".to_string()) },
+    );
+    let stale_base = router.route_registry_snapshot();
+    let newer_registry =
+        stale_base
+            .to_builder()
+            .register_route(
+                ObjectRouteDescriptor::for_types::<(), String>(
+                    "/test/newer",
+                    "test",
+                    "newer route",
+                ),
+                |request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"newer".to_string())
+                },
+            )
+            .build();
+    router
+        .replace_route_registry(newer_registry)
+        .expect("replace with newer registry");
+
+    let stale_registry =
+        stale_base
+            .to_builder()
+            .register_route(
+                ObjectRouteDescriptor::for_types::<(), String>(
+                    "/test/stale-only",
+                    "test",
+                    "stale route",
+                ),
+                |request| async move {
+                    ObjectRpcResponse::encode_body(request.route, &"stale".to_string())
+                },
+            )
+            .build();
+    let error = router
+        .replace_route_registry(stale_registry)
+        .expect_err("stale snapshot must not replace a newer active registry");
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("is not newer than active version")),
+        "unexpected error: {error}"
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let newer_request =
+            ObjectRpcRequest::encode_body("/test/newer", "test", &()).expect("newer request");
+        let newer_response = router.call(newer_request).await.expect("newer response");
+        assert_eq!(
+            newer_response
+                .decode_body::<String>()
+                .expect("decode newer"),
+            "newer"
+        );
+        let stale_request =
+            ObjectRpcRequest::encode_body("/test/stale-only", "test", &()).expect("stale request");
+        let error = router
+            .call(stale_request)
+            .await
+            .expect_err("stale route must not be installed");
+        assert!(
+            matches!(error, NetworkError::UnknownRoute { ref route }
+                if route == "/test/stale-only"),
+            "unexpected error: {error}"
+        );
+    });
+}
+
+#[test]
+fn object_rpc_authorization_layer_enforces_descriptor_policy_before_handler() {
+    use tower_layer::Layer;
+    use tower_service::Service;
+
+    let handled = Arc::new(AtomicUsize::new(0));
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/authorized", "test", "authorized")
+            .with_auth_scope("cluster-member")
+            .require_capability("cluster.kv.write");
+    let router = object_rpc_router_with_route(descriptor, {
+        let handled = Arc::clone(&handled);
+        move |request| {
+            let handled = Arc::clone(&handled);
+            async move {
+                handled.fetch_add(1, Ordering::SeqCst);
+                ObjectRpcResponse::encode_body(request.route, &"allowed".to_string())
+            }
+        }
+    });
+    let layer = ObjectRpcAuthorizationLayer::new(|descriptor, context| async move {
+        let scope = context.metadata.get("auth.scope").map(String::as_str);
+        if descriptor.auth_scope.as_deref() != scope {
+            return Err(NetworkError::AuthDenied);
+        }
+        let capability_set = context
+            .metadata
+            .get("auth.capabilities")
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .collect::<std::collections::BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        if descriptor
+            .required_capabilities
+            .iter()
+            .any(|capability| !capability_set.contains(capability.as_str()))
+        {
+            return Err(NetworkError::AuthDenied);
+        }
+        Ok(())
+    });
+    let router = ServiceCategoryLayer::new("test", "test routes").layer(router);
+    let mut router = layer.layer(router);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let denied =
+            ObjectRpcRequest::encode_body("/test/authorized", "test", &()).expect("denied");
+        let error = router
+            .call(denied)
+            .await
+            .expect_err("missing auth metadata should be denied");
+        assert_eq!(error, NetworkError::AuthDenied);
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            0,
+            "authorization must run before route handler"
+        );
+
+        let mut allowed =
+            ObjectRpcRequest::encode_body("/test/authorized", "test", &()).expect("allowed");
+        allowed
+            .metadata
+            .insert("auth.scope".to_string(), "cluster-member".to_string());
+        allowed.metadata.insert(
+            "auth.capabilities".to_string(),
+            "cluster.kv.read,cluster.kv.write".to_string(),
+        );
+        let response = router.call(allowed).await.expect("authorized response");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "allowed");
+        assert_eq!(handled.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+fn object_rpc_authorization_layer_preserves_route_readiness() {
+    use tower_layer::Layer;
+    use tower_service::Service;
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/auth-ready", "test", "auth ready")
+            .with_concurrency_limit(1)
+            .with_timeout(Duration::from_millis(250));
+    let router = object_rpc_router_with_route(descriptor, {
+        let entered = Arc::clone(&entered);
+        let release = Arc::clone(&release);
+        move |request| {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            async move {
+                entered.notify_one();
+                release.notified().await;
+                ObjectRpcResponse::encode_body(request.route, &"ready".to_string())
+            }
+        }
+    });
+    let service = ObjectRpcRoutePolicyLayer::new(router.catalog())
+        .expect("policy layer")
+        .layer(router);
+    let service = ServiceCategoryLayer::new("test", "test routes").layer(service);
+    let service = ObjectRpcAuthorizationLayer::new(|_, _| async { Ok(()) }).layer(service);
+
+    let initial = service
+        .object_rpc_route_readiness("/test/auth-ready")
+        .expect("composed route readiness");
+    assert_eq!(initial.concurrency_limit, Some(1));
+    assert_eq!(initial.available_concurrency, Some(1));
+    assert_eq!(initial.timeout_ms, Some(250));
+    assert!(initial.is_ready());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let mut call_service = service.clone();
+        let request =
+            ObjectRpcRequest::encode_body("/test/auth-ready", "test", &()).expect("request");
+        let in_flight = tokio::spawn(async move { call_service.call(request).await });
+        entered.notified().await;
+
+        let saturated = service
+            .object_rpc_route_readiness("/test/auth-ready")
+            .expect("saturated composed route readiness");
+        assert_eq!(saturated.available_concurrency, Some(0));
+        assert!(saturated.is_saturated());
+
+        release.notify_one();
+        let response = in_flight
+            .await
+            .expect("join authorized call")
+            .expect("authorized response");
+        assert_eq!(
+            response.decode_body::<String>().expect("decode response"),
+            "ready"
+        );
+    });
+
+    let recovered = service
+        .object_rpc_route_readiness("/test/auth-ready")
+        .expect("recovered composed route readiness");
+    assert_eq!(recovered.available_concurrency, Some(1));
+    assert!(recovered.is_ready());
+}
+
+#[test]
+fn object_rpc_authorization_service_calls_poll_ready_inner_instance() {
+    use tower_layer::Layer;
+
+    struct ReadyTokenService {
+        descriptor: ObjectRouteDescriptor,
+        ready: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Clone for ReadyTokenService {
+        fn clone(&self) -> Self {
+            Self {
+                descriptor: self.descriptor.clone(),
+                ready: false,
+                calls: Arc::clone(&self.calls),
+            }
+        }
+    }
+
+    impl ObjectRpcRouteCatalog for ReadyTokenService {
+        fn object_rpc_route_descriptor(&self, route: &str) -> Option<ObjectRouteDescriptor> {
+            (route == self.descriptor.route).then(|| self.descriptor.clone())
+        }
+    }
+
+    impl Service<ObjectRpcRequest> for ReadyTokenService {
+        type Response = ObjectRpcResponse;
+        type Error = NetworkError;
+        type Future = ObjectRpcFuture;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.ready = true;
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: ObjectRpcRequest) -> Self::Future {
+            let ready = self.ready;
+            self.ready = false;
+            let calls = Arc::clone(&self.calls);
+            Box::pin(async move {
+                if !ready {
+                    return Err(NetworkError::Io {
+                        operation: "ready-token-service".to_string(),
+                        detail: "authorization wrapper called an inner service clone that was not poll-ready"
+                            .to_string(),
+                    });
+                }
+                calls.fetch_add(1, Ordering::SeqCst);
+                ObjectRpcResponse::encode_body(request.route, &"ready".to_string())
+            })
+        }
+    }
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<(), String>("/test/ready-auth", "test", "ready auth");
+    let inner = ReadyTokenService {
+        descriptor,
+        ready: false,
+        calls: Arc::clone(&calls),
+    };
+    let layer = ObjectRpcAuthorizationLayer::new(|_, _| async { Ok(()) });
+    let mut service = layer.layer(inner);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let request =
+            ObjectRpcRequest::encode_body("/test/ready-auth", "test", &()).expect("request");
+        let response = call_object_rpc_service_async(&mut service, request)
+            .await
+            .expect("response");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "ready");
+    });
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn object_rpc_route_registry_rejects_zero_runtime_limits() {
+    let zero_concurrency =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/zero-concurrency", "test", "zero")
+            .with_concurrency_limit(0);
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(zero_concurrency, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_build()
+    {
+        Ok(_) => panic!("zero concurrency limit must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("zero concurrency limit")),
+        "unexpected error: {error}"
+    );
+
+    let zero_timeout =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/zero-timeout", "test", "zero")
+            .with_timeout(Duration::ZERO);
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(zero_timeout, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_build()
+    {
+        Ok(_) => panic!("zero timeout must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("zero timeout")),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn object_rpc_route_registry_rejects_invalid_dynamic_route_descriptors() {
+    let missing_path_prefix =
+        ObjectRouteDescriptor::for_types::<(), ()>("test/no-prefix", "test", "bad route");
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(missing_path_prefix, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_build()
+    {
+        Ok(_) => panic!("non-path route must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("must start with /")),
+        "unexpected error: {error}"
+    );
+
+    let empty_auth_scope =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/empty-auth", "test", "bad auth")
+            .with_auth_scope(" ");
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(empty_auth_scope, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_build()
+    {
+        Ok(_) => panic!("empty auth scope must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("auth scope") && detail.contains("non-empty")),
+        "unexpected error: {error}"
+    );
+
+    let invalid_capability =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/bad-capability", "test", "bad cap")
+            .require_capability("read");
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(invalid_capability, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_build()
+    {
+        Ok(_) => panic!("invalid capability must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("capability read is invalid")),
+        "unexpected error: {error}"
+    );
+
+    let duplicate_capability =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/duplicate-capability", "test", "dup cap")
+            .require_capability("cluster.kv.read")
+            .require_capability("cluster.kv.read");
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(duplicate_capability, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_build()
+    {
+        Ok(_) => panic!("duplicate capability must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("duplicate capability cluster.kv.read")),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn object_rpc_route_registry_builder_rejects_duplicate_routes() {
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/duplicate", "test", "duplicate route");
+    let error = match ObjectRpcRouteRegistry::builder()
+        .register_route(descriptor.clone(), |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        })
+        .try_register_route(descriptor, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        }) {
+        Ok(_) => panic!("duplicate route registration must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::Serialization { ref detail }
+            if detail.contains("duplicate object rpc route /test/duplicate")),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn object_rpc_route_registry_builder_rejects_replacing_unknown_route() {
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<(), ()>("/test/missing", "test", "missing route");
+    let error = match ObjectRpcRouteRegistry::builder()
+        .try_replace_route(descriptor, |request| async move {
+            ObjectRpcResponse::encode_body(request.route, &())
+        }) {
+        Ok(_) => panic!("unknown route replacement must be rejected"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(error, NetworkError::UnknownRoute { ref route } if route == "/test/missing"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn object_rpc_router_rejects_category_mismatch() {
+    use tower_service::Service;
+
+    let mut router = object_rpc_router_with_route(
+        ObjectRouteDescriptor::for_types::<(), ()>(
+            "/cluster/kv/category-check",
+            "cluster.kv",
+            "category check",
+        ),
+        |request| async move { ObjectRpcResponse::encode_body(request.route, &()) },
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let request = ObjectRpcRequest::encode_body("/cluster/kv/category-check", "rollout", &())
+            .expect("request");
+        let error = router
+            .call(request)
+            .await
+            .expect_err("category mismatch should fail");
+        assert!(
+            matches!(error, NetworkError::Serialization { ref detail }
+                if detail.contains("expected category cluster.kv")),
+            "unexpected error: {error}"
+        );
+    });
+}
+
+#[test]
+fn object_rpc_router_reports_route_specific_readiness() {
+    let descriptor =
+        ObjectRouteDescriptor::for_types::<u64, u64>("/test/readiness", "test", "ready route")
+            .with_concurrency_limit(1)
+            .with_timeout(Duration::from_millis(250));
+    let router = object_rpc_router_with_route(descriptor, |request| async move {
+        let value: u64 = request.decode_body()?;
+        ObjectRpcResponse::encode_body(request.route, &value)
+    });
+
+    let initial = router
+        .route_readiness("/test/readiness")
+        .expect("route readiness");
+    assert_eq!(initial.route, "/test/readiness");
+    assert_eq!(initial.category, "test");
+    assert_eq!(initial.concurrency_limit, Some(1));
+    assert_eq!(initial.available_concurrency, None);
+    assert_eq!(initial.timeout_ms, Some(250));
+    assert!(initial.is_ready());
+    assert!(!initial.is_saturated());
+    assert!(
+        router.route_readiness("/test/missing").is_none(),
+        "unknown routes should not report dispatch readiness"
+    );
 }
 
 #[test]
@@ -212,7 +1536,7 @@ fn object_rpc_frame_transport_serves_binary_request_response() {
         .expect("runtime");
     runtime.block_on(async {
         let (mut client, mut server) = tokio::io::duplex(4096);
-        let mut router = ObjectRpcRouter::new().register_route(
+        let mut router = object_rpc_router_with_route(
             ObjectRouteDescriptor::for_types::<u64, u64>(
                 "/cluster/kv/increment",
                 "cluster.kv",
@@ -224,15 +1548,21 @@ fn object_rpc_frame_transport_serves_binary_request_response() {
             },
         );
         let server_task = tokio::spawn(async move {
-            serve_object_rpc_frame_async(&mut server, &mut router, 4096)
-                .await
-                .expect("serve frame");
+            serve_object_rpc_frame_async(
+                &mut server,
+                &mut router,
+                4096,
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("serve frame");
         });
         let request = ObjectRpcRequest::encode_body("/cluster/kv/increment", "cluster.kv", &41_u64)
             .expect("request");
-        let response = call_object_rpc_frame_async(&mut client, &request, 4096)
-            .await
-            .expect("response");
+        let response =
+            call_object_rpc_frame_async(&mut client, &request, 4096, ObjectFrameIoOptions::none())
+                .await
+                .expect("response");
 
         server_task.await.expect("server task");
         assert_eq!(response.decode_body::<u64>().expect("decode"), 42);
@@ -267,9 +1597,9 @@ fn cluster_kv_txn_rpc_preserves_nested_sobj_values_as_raw_bytes() {
         success: vec![op],
         failure: Vec::new(),
     };
-    let request =
-        ObjectRpcRequest::encode_body(CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_RPC_CATEGORY, &txn)
-            .expect("encode txn request");
+    let request = object_rpc_request_from_kv_payload(
+        sinomo_kv::cluster_kv_txn_rpc_payload(&txn).expect("encode txn request"),
+    );
     assert!(
         request
             .body
@@ -288,102 +1618,6 @@ fn cluster_kv_txn_rpc_preserves_nested_sobj_values_as_raw_bytes() {
 }
 
 #[test]
-fn cluster_kv_raft_rpc_helpers_preserve_network_route_contracts() {
-    let node_id = NodeId::from_legacy_named("node_cluster_rpc_helpers").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
-        ClusterId::from_legacy_named("cluster_rpc_helpers").expect("cluster"),
-        "rpc helpers",
-        node_id.clone(),
-        "node",
-        "pk",
-        OffsetDateTime::now_utc(),
-    );
-
-    let txn = KvTxn {
-        compares: Vec::new(),
-        success: vec![KvOp::Put {
-            key: "/rpc/helper".to_string(),
-            value: b"value".to_vec(),
-            lease_id: None,
-        }],
-        failure: Vec::new(),
-    };
-    let txn_request = cluster_kv_txn_rpc_request(&txn).expect("txn request");
-    assert_eq!(txn_request.route, CLUSTER_KV_TXN_ROUTE);
-    assert_eq!(txn_request.category, CLUSTER_KV_RPC_CATEGORY);
-    assert_eq!(txn_request.decode_body::<KvTxn>().expect("txn body"), txn);
-
-    let append_request = ClusterRaftAppendRequest {
-        state: state.clone(),
-        append: RaftAppendEntriesRequest {
-            term: 2,
-            leader_id: node_id.clone(),
-            prev_log_index: 1,
-            prev_log_term: 1,
-            entries: Vec::new(),
-            leader_commit: 1,
-        },
-        snapshot: None,
-    };
-    let append_rpc = cluster_raft_append_rpc_request(&append_request).expect("append request");
-    assert_eq!(append_rpc.route, CLUSTER_RAFT_APPEND_ROUTE);
-    assert_eq!(append_rpc.category, CLUSTER_RAFT_RPC_CATEGORY);
-    assert_eq!(
-        append_rpc
-            .decode_body::<ClusterRaftAppendRequest>()
-            .expect("append body"),
-        append_request
-    );
-
-    let vote_request = ClusterRaftVoteRequest {
-        state: state.clone(),
-        vote: RaftRequestVoteRequest {
-            term: 2,
-            candidate_id: node_id.clone(),
-            last_log_index: 1,
-            last_log_term: 1,
-        },
-    };
-    let vote_rpc = cluster_raft_vote_rpc_request(&vote_request).expect("vote request");
-    assert_eq!(vote_rpc.route, CLUSTER_RAFT_VOTE_ROUTE);
-    assert_eq!(vote_rpc.category, CLUSTER_RAFT_RPC_CATEGORY);
-    assert_eq!(
-        vote_rpc
-            .decode_body::<ClusterRaftVoteRequest>()
-            .expect("vote body"),
-        vote_request
-    );
-
-    let snapshot = KvSnapshot {
-        revision: KvRevision(7),
-        compacted_revision: KvRevision::ZERO,
-        entries: Vec::new(),
-        leases: Vec::new(),
-        events: Vec::new(),
-    };
-    let snapshot_response = ObjectRpcResponse::encode_body(CLUSTER_KV_SNAPSHOT_ROUTE, &snapshot)
-        .expect("snapshot response");
-    assert_eq!(
-        decode_cluster_kv_snapshot_rpc_response(&snapshot_response).expect("snapshot body"),
-        snapshot
-    );
-
-    let watch_request = ClusterKvWatchEventsRequest {
-        state,
-        leader_id: node_id,
-        events: Vec::new(),
-    };
-    assert_eq!(
-        cluster_kv_watch_events_noop_response(&watch_request),
-        Some(ClusterKvWatchEventsResponse {
-            accepted: true,
-            detail: "no watch events to fan out".to_string(),
-            stored_events: 0,
-        })
-    );
-}
-
-#[test]
 fn async_object_frame_helpers_round_trip_binary_payloads() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -392,13 +1626,18 @@ fn async_object_frame_helpers_round_trip_binary_payloads() {
     runtime.block_on(async {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let writer = tokio::spawn(async move {
-            write_object_frame_async(&mut client, &DaemonControlRequest::new("RPC /test/status"))
-                .await
-                .expect("write frame");
-        });
-        let request: DaemonControlRequest = read_object_frame_async(&mut server, 4096)
+            write_object_frame_async(
+                &mut client,
+                &DaemonControlRequest::new("RPC /test/status"),
+                ObjectFrameIoOptions::none(),
+            )
             .await
-            .expect("read frame");
+            .expect("write frame");
+        });
+        let request: DaemonControlRequest =
+            read_object_frame_async(&mut server, 4096, ObjectFrameIoOptions::none())
+                .await
+                .expect("read frame");
         writer.await.expect("writer task");
         assert_eq!(request.command, "RPC /test/status");
     });
@@ -417,9 +1656,10 @@ fn async_daemon_control_client_round_trips_object_frames() {
         let address = listener.local_addr().expect("address").to_string();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest = read_object_frame_async(&mut stream, 4096)
-                .await
-                .expect("read request");
+            let request: DaemonControlRequest =
+                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("read request");
             assert_eq!(request.command, "RPC /test/status");
             assert_eq!(request.rpc.as_ref().expect("rpc").route, "/test/status");
             let rpc_response = ObjectRpcResponse::encode_body("/test/status", &"OK".to_string())
@@ -427,18 +1667,78 @@ fn async_daemon_control_client_round_trips_object_frames() {
             write_object_frame_async(
                 &mut stream,
                 &DaemonControlResponse::rpc(String::new(), rpc_response),
+                ObjectFrameIoOptions::none(),
             )
             .await
             .expect("write response");
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let response = send_daemon_rpc_raw_async(
+        let response = send_daemon_rpc_to_address_async(
             &address,
             "RPC /test/status",
             None,
             &request,
-            std::time::Duration::from_secs(1),
+            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
+        )
+        .await
+        .expect("response");
+        server.await.expect("server");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
+    });
+}
+
+#[test]
+fn async_cluster_endpoint_rpc_uses_tcp_transport() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: DaemonControlRequest =
+                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("read request");
+            assert_eq!(request.command, "RPC /test/endpoint-async");
+            assert_eq!(
+                request.rpc.as_ref().expect("rpc").route,
+                "/test/endpoint-async"
+            );
+            let rpc_response =
+                ObjectRpcResponse::encode_body("/test/endpoint-async", &"OK".to_string())
+                    .expect("rpc response");
+            write_object_frame_async(
+                &mut stream,
+                &DaemonControlResponse::rpc(String::new(), rpc_response),
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("write response");
+        });
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_core::Id::generate(),
+            node_id: NodeId::from_legacy_named("node_async_endpoint_rpc").expect("node"),
+            transport: ClusterTransportKind::LanTcp,
+            address,
+            source: ClusterEndpointSource::KvMembership,
+            privacy: ClusterEndpointPrivacy::Lan,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+        let request =
+            ObjectRpcRequest::encode_body("/test/endpoint-async", "test", &()).expect("request");
+        let response = send_daemon_rpc_to_cluster_endpoint_async(
+            &endpoint,
+            "RPC /test/endpoint-async",
+            None,
+            &request,
+            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
         )
         .await
         .expect("response");
@@ -462,9 +1762,10 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
         let address = listener.local_addr().expect("address").to_string();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest = read_object_frame_async(&mut stream, 4096)
-                .await
-                .expect("read request");
+            let request: DaemonControlRequest =
+                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("read request");
             assert_eq!(request.command, "RPC /test/slow");
             let rpc_response = ObjectRpcResponse::encode_body("/test/slow", &"OK".to_string())
                 .expect("rpc response");
@@ -483,17 +1784,102 @@ fn async_daemon_control_client_timeout_is_idle_not_total_transfer() {
         });
         let request =
             ObjectRpcRequest::encode_body("/test/slow", "test", &()).expect("rpc request");
-        let response = send_daemon_rpc_raw_async(
+        let response = send_daemon_rpc_to_address_async(
             &address,
             "RPC /test/slow",
             None,
             &request,
-            Duration::from_millis(25),
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(25)),
         )
         .await
         .expect("response");
         server.await.expect("server");
         assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
+    });
+}
+
+#[test]
+fn async_daemon_control_client_without_idle_timeout_allows_response_gap() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: DaemonControlRequest =
+                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("read request");
+            assert_eq!(request.command, "RPC /test/no-idle-timeout");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            let rpc_response =
+                ObjectRpcResponse::encode_body("/test/no-idle-timeout", &"OK".to_string())
+                    .expect("rpc response");
+            write_object_frame_async(
+                &mut stream,
+                &DaemonControlResponse::rpc(String::new(), rpc_response),
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("write response");
+        });
+        let request = ObjectRpcRequest::encode_body("/test/no-idle-timeout", "test", &())
+            .expect("rpc request");
+        let response = send_daemon_rpc_to_address_async(
+            &address,
+            "RPC /test/no-idle-timeout",
+            None,
+            &request,
+            DaemonRpcTimeouts::connect_only(Duration::from_millis(20)),
+        )
+        .await
+        .expect("response");
+        server.await.expect("server");
+        assert_eq!(response.decode_body::<String>().expect("decode"), "OK");
+    });
+}
+
+#[test]
+fn async_daemon_control_client_explicit_idle_timeout_still_fails_on_stall() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address").to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let request: DaemonControlRequest =
+                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("read request");
+            assert_eq!(request.command, "RPC /test/idle-timeout");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+        });
+        let request =
+            ObjectRpcRequest::encode_body("/test/idle-timeout", "test", &()).expect("rpc request");
+        let error = send_daemon_rpc_to_address_async(
+            &address,
+            "RPC /test/idle-timeout",
+            None,
+            &request,
+            DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("explicit idle timeout should fail");
+        server.await.expect("server");
+        assert!(
+            error.to_string().contains("timed out"),
+            "unexpected error: {error}"
+        );
     });
 }
 
@@ -510,22 +1896,27 @@ fn async_daemon_rpc_client_rejects_non_rpc_response() {
         let address = listener.local_addr().expect("address").to_string();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
-            let request: DaemonControlRequest = read_object_frame_async(&mut stream, 4096)
-                .await
-                .expect("read request");
+            let request: DaemonControlRequest =
+                read_object_frame_async(&mut stream, 4096, ObjectFrameIoOptions::none())
+                    .await
+                    .expect("read request");
             assert_eq!(request.command, "RPC /test/status");
-            write_object_frame_async(&mut stream, &DaemonControlResponse::new("OK"))
-                .await
-                .expect("write response");
+            write_object_frame_async(
+                &mut stream,
+                &DaemonControlResponse::new("OK"),
+                ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("write response");
         });
         let request =
             ObjectRpcRequest::encode_body("/test/status", "test", &()).expect("rpc request");
-        let error = send_daemon_rpc_raw_async(
+        let error = send_daemon_rpc_to_address_async(
             &address,
             "RPC /test/status",
             None,
             &request,
-            std::time::Duration::from_secs(1),
+            DaemonRpcTimeouts::connect_only(Duration::from_secs(1)),
         )
         .await
         .expect_err("non-rpc response");
@@ -546,23 +1937,69 @@ fn daemon_rpc_response_helper_rejects_framed_rpc_errors() {
     assert!(error.to_string().contains("proxy failed"));
 }
 
+#[cfg(not(feature = "iroh-transport"))]
 #[test]
-fn daemon_rpc_blocking_wrapper_works_inside_current_thread_runtime() {
+fn iroh_daemon_rpc_async_reports_missing_transport_feature() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("current-thread runtime");
+    let request = ObjectRpcRequest::encode_body(DAEMON_STATUS_ROUTE, DAEMON_RPC_CATEGORY, &())
+        .expect("request");
 
-    let value = runtime
-        .block_on(async {
-            crate::roaming::block_on_daemon_rpc(async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                Ok::<_, NetworkError>(42_u64)
-            })
-        })
-        .expect("blocking wrapper");
+    let error = runtime
+        .block_on(send_daemon_rpc_to_address_async(
+            "iroh://example",
+            "daemon/status",
+            None,
+            &request,
+            DaemonRpcTimeouts::connect_only(Duration::from_millis(1)),
+        ))
+        .expect_err("missing iroh feature");
 
-    assert_eq!(value, 42);
+    match error {
+        NetworkError::Io { operation, detail } => {
+            assert_eq!(operation, "send iroh daemon rpc");
+            assert!(detail.contains("without iroh-transport"));
+        }
+        error => panic!("unexpected error: {error}"),
+    }
+}
+
+#[cfg(not(feature = "iroh-transport"))]
+#[test]
+fn iroh_daemon_proxy_explicit_runtime_reports_missing_transport_feature() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-no-iroh-proxy-runtime-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+
+    let error = match runtime.block_on(start_iroh_daemon_proxy(
+        runtime.handle().clone(),
+        paths,
+        ClusterId::from_legacy_named("cluster_no_iroh_proxy_runtime").expect("cluster"),
+        NodeId::from_legacy_named("node_no_iroh_proxy_runtime").expect("node"),
+        "127.0.0.1:0".to_string(),
+    )) {
+        Ok(_) => panic!("missing iroh proxy feature should fail"),
+        Err(error) => error,
+    };
+
+    match error {
+        NetworkError::Io { operation, detail } => {
+            assert_eq!(operation, "start iroh daemon proxy");
+            assert!(detail.contains("without iroh-transport"));
+        }
+        error => panic!("unexpected error: {error}"),
+    }
 }
 
 #[test]
@@ -613,54 +2050,6 @@ fn daemon_control_stream_idle_timeout_configures_blocking_timeouts() {
         initial_write_timeout,
         "refreshing the read phase should not lengthen the write timeout"
     );
-}
-
-#[test]
-fn daemon_control_resolver_uses_socket_addresses_and_bounds_dns_workers() {
-    let resolved = crate::roaming::resolve_daemon_control_socket_address_with_timeout(
-        "127.0.0.1:21353",
-        Duration::from_millis(1),
-    )
-    .expect("socket address resolves without DNS");
-
-    assert_eq!(
-        resolved,
-        "127.0.0.1:21353"
-            .parse::<std::net::SocketAddr>()
-            .expect("socket address")
-    );
-    assert_eq!(
-        crate::roaming::daemon_control_dns_worker_count_for_test(),
-        0,
-        "already-normalized daemon control addresses must not consume DNS workers"
-    );
-
-    let mut permits = Vec::new();
-    for _ in 0..crate::roaming::MAX_DAEMON_CONTROL_DNS_WORKERS {
-        permits.push(
-            crate::roaming::try_acquire_daemon_control_dns_worker()
-                .expect("reserve daemon control dns worker"),
-        );
-    }
-
-    let error = crate::roaming::resolve_daemon_control_socket_address_with_timeout(
-        "localhost:21353",
-        Duration::from_millis(1),
-    )
-    .expect_err("dns worker saturation");
-
-    assert_eq!(
-        error,
-        NetworkError::Io {
-            operation: "resolve daemon control address localhost:21353".to_string(),
-            detail: format!(
-                "daemon control DNS worker limit reached ({})",
-                crate::roaming::MAX_DAEMON_CONTROL_DNS_WORKERS
-            ),
-        }
-    );
-
-    drop(permits);
 }
 
 #[test]
@@ -1221,7 +2610,7 @@ fn iroh_daemon_proxy_admission_limit_releases_permits() {
     );
     assert!(
         crate::roaming::IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES
-            >= (crate::IROH_DAEMON_COMMAND_MAX_BYTES * 2) + 8
+            >= crate::IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12)
     );
     let limiter = Arc::new(tokio::sync::Semaphore::new(2));
     let first =
@@ -1273,8 +2662,7 @@ fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
     let request =
         ObjectRpcRequest::encode_body("/test/proxy-error", "test", &()).expect("rpc request");
     let control = DaemonControlRequest::rpc("RPC /test/proxy-error", request);
-    let mut payload = Vec::new();
-    write_object_frame_blocking(&mut payload, &control).expect("control frame");
+    let payload = encode_object_frame_to_vec(&control).expect("control frame");
 
     let route = crate::roaming::iroh_proxy_route_hint(&payload);
     assert_eq!(route, "/test/proxy-error");
@@ -1288,9 +2676,8 @@ fn iroh_daemon_proxy_error_frame_preserves_rpc_route_and_budget() {
     .expect("error response frame");
     assert_eq!(budget.in_flight_bytes(), frame.len());
 
-    let mut cursor = std::io::Cursor::new(frame);
     let response: DaemonControlResponse =
-        read_object_frame_blocking(&mut cursor, IROH_DAEMON_COMMAND_MAX_BYTES)
+        decode_single_object_frame_from_slice(&frame, IROH_DAEMON_COMMAND_MAX_BYTES)
             .expect("decode control response");
     let rpc = response.rpc.expect("rpc response");
     assert_eq!(rpc.route, "/test/proxy-error");
@@ -1354,8 +2741,7 @@ fn iroh_daemon_response_decode_reports_partial_frame_body() {
 #[test]
 fn iroh_daemon_response_decode_rejects_trailing_bytes() {
     let response = DaemonControlResponse::new("ok");
-    let mut bytes = Vec::new();
-    write_object_frame_blocking(&mut bytes, &response).expect("encode response frame");
+    let mut bytes = encode_object_frame_to_vec(&response).expect("encode response frame");
     bytes.extend_from_slice(b"junk");
 
     let error = crate::roaming::decode_iroh_daemon_control_response_bytes(&bytes)
@@ -1365,7 +2751,7 @@ fn iroh_daemon_response_decode_rejects_trailing_bytes() {
         error,
         NetworkError::Io {
             operation: "read iroh daemon response".to_string(),
-            detail: "daemon returned 4 trailing bytes after response frame".to_string(),
+            detail: "object frame has 4 trailing bytes".to_string(),
         }
     );
 }
@@ -1384,9 +2770,9 @@ fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
         )
     );
 
-    let range =
-        ObjectRpcRequest::encode_body(CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY, &"/")
-            .expect("range request");
+    let range = object_rpc_request_from_kv_payload(
+        sinomo_kv::cluster_kv_range_prefix_rpc_payload("/").expect("range request"),
+    );
     assert!(
         crate::roaming::iroh_daemon_control_request_allows_response_retry(
             &DaemonControlRequest::rpc(format!("RPC {CLUSTER_KV_RANGE_PREFIX_ROUTE}"), range)
@@ -1471,18 +2857,70 @@ fn iroh_daemon_response_reader_returns_after_complete_frame_without_eof() {
     runtime.block_on(async {
         let (mut writer, mut reader) = tokio::io::duplex(4096);
         let response = DaemonControlResponse::new("ok");
-        write_object_frame_async(&mut writer, &response)
+        write_object_frame_async(&mut writer, &response, ObjectFrameIoOptions::none())
             .await
             .expect("write response frame");
 
         let decoded = crate::roaming::read_iroh_daemon_control_response_async(
             &mut reader,
-            Duration::from_millis(50),
+            DaemonRpcTimeouts::connect_only(Duration::from_millis(50)),
         )
         .await
         .expect("complete response frame should not wait for EOF");
 
         assert_eq!(decoded.body, "ok");
+    });
+}
+
+#[test]
+fn iroh_daemon_command_idle_timeout_applies_to_final_flush() {
+    struct StuckFlushWriter;
+
+    impl tokio::io::AsyncWrite for StuckFlushWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let mut writer = StuckFlushWriter;
+        let error = crate::roaming::write_iroh_daemon_control_request_bytes_with_idle_timeout(
+            &mut writer,
+            b"request",
+            Duration::from_millis(5),
+        )
+        .await
+        .expect_err("flush should be bounded by idle timeout");
+
+        assert_eq!(
+            error,
+            NetworkError::Io {
+                operation: "write iroh daemon command".to_string(),
+                detail: "timed out after 5ms without flush progress".to_string(),
+            }
+        );
     });
 }
 
@@ -1561,6 +2999,27 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
         drop(permit);
         assert_eq!(budget.in_flight_bytes(), 0);
 
+        let budget = crate::roaming::IrohProxyByteBudget::new(16);
+        let (mut writer, mut reader) = tokio::io::duplex(32);
+        let mut extended_frame = crate::OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL
+            .to_be_bytes()
+            .to_vec();
+        extended_frame.extend_from_slice(&4_u64.to_be_bytes());
+        extended_frame.extend_from_slice(&[1, 2, 3, 4]);
+        writer
+            .write_all(&extended_frame)
+            .await
+            .expect("write extended frame");
+
+        let (frame, permit) =
+            crate::roaming::read_iroh_proxy_frame_async(&mut reader, &budget, "test")
+                .await
+                .expect("read extended proxy frame");
+        assert_eq!(frame, extended_frame);
+        assert_eq!(budget.in_flight_bytes(), 16);
+        drop(permit);
+        assert_eq!(budget.in_flight_bytes(), 0);
+
         let budget = crate::roaming::IrohProxyByteBudget::new(7);
         let (mut writer, mut reader) = tokio::io::duplex(16);
         writer
@@ -1614,7 +3073,7 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
             .write_all(&4_u32.to_be_bytes())
             .await
             .expect("write length for timeout");
-        let error = crate::roaming::read_iroh_proxy_frame_async_with_timeout(
+        let error = crate::roaming::read_iroh_proxy_frame_async_with_idle_timeout(
             &mut reader,
             &budget,
             "test",
@@ -1625,8 +3084,8 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
         assert_eq!(
             error,
             NetworkError::Io {
-                operation: "read iroh daemon test frame".to_string(),
-                detail: "timed out after 10ms".to_string(),
+                operation: "read iroh daemon test frame body".to_string(),
+                detail: "timed out after 10ms without body read progress".to_string(),
             }
         );
         assert_eq!(
@@ -1635,8 +3094,34 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
             "timed-out frame reads must release the reserved proxy budget"
         );
 
+        let budget = crate::roaming::IrohProxyByteBudget::new(16);
+        let (mut writer, mut reader) = tokio::io::duplex(16);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(&4_u32.to_be_bytes())
+                .await
+                .expect("write length for slow body");
+            for byte in [1_u8, 2, 3, 4] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                writer.write_all(&[byte]).await.expect("write body byte");
+            }
+        });
+        let (frame, permit) = crate::roaming::read_iroh_proxy_frame_async_with_idle_timeout(
+            &mut reader,
+            &budget,
+            "test",
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("body read should continue while bytes make progress");
+        assert_eq!(frame, [0, 0, 0, 4, 1, 2, 3, 4]);
+        assert_eq!(budget.in_flight_bytes(), 8);
+        drop(permit);
+        writer_task.await.expect("slow body writer");
+        assert_eq!(budget.in_flight_bytes(), 0);
+
         let (mut writer, _reader) = tokio::io::duplex(1);
-        let error = crate::roaming::write_iroh_proxy_frame_async_with_timeout(
+        let error = crate::roaming::write_iroh_proxy_frame_async_with_idle_timeout(
             &mut writer,
             &[7_u8; 1024],
             "test response",
@@ -1647,8 +3132,8 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
         assert_eq!(
             error,
             NetworkError::Io {
-                operation: "write iroh daemon test response frame".to_string(),
-                detail: "timed out after 10ms".to_string(),
+                operation: "write iroh daemon proxy frame".to_string(),
+                detail: "timed out after 10ms without test response write progress".to_string(),
             }
         );
     });
@@ -4403,7 +5888,7 @@ fn cluster_network_probe_targets_include_remote_shadow_endpoints() {
 #[test]
 fn public_ip_endpoint_is_marked_internet_direct() {
     let node_id = NodeId::from_legacy_named("node_public_endpoint").expect("node");
-    let endpoints = daemon_advertised_endpoints_from_addresses(
+    let endpoints = daemon_advertised_endpoints_from_static_addresses(
         &node_id,
         "127.0.0.1:21353".to_string(),
         "0.0.0.0",
@@ -4411,6 +5896,8 @@ fn public_ip_endpoint_is_marked_internet_direct() {
         0,
         &["10.0.0.41".parse().expect("private")],
         &["198.18.0.76".parse().expect("public")],
+        true,
+        None,
     );
 
     assert!(endpoints.iter().any(|endpoint| {
@@ -4419,10 +5906,20 @@ fn public_ip_endpoint_is_marked_internet_direct() {
     }));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_local_route_ip_discovery_filters_loopback_target() {
+    let candidates = crate::lan::discover_local_ip_candidates_for_targets_async(["127.0.0.1:9"
+        .parse::<SocketAddr>()
+        .expect("loopback target")])
+    .await;
+
+    assert!(candidates.is_empty());
+}
+
 #[test]
 fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
     let node_id = NodeId::from_legacy_named("node_shadow_public_endpoint").expect("node");
-    let endpoints = daemon_advertised_endpoints_from_addresses_with_public_discovery(
+    let endpoints = daemon_advertised_endpoints_from_static_addresses(
         &node_id,
         "127.0.0.1:21354".to_string(),
         "0.0.0.0",
@@ -4431,6 +5928,7 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
         &["10.0.0.41".parse().expect("private")],
         &["198.18.0.76".parse().expect("public")],
         false,
+        None,
     );
 
     assert!(
@@ -4447,18 +5945,17 @@ fn public_ip_discovery_can_be_disabled_for_shadow_endpoint_advertisements() {
 #[test]
 fn advertise_host_adds_stable_hostname_endpoint_for_wildcard_bind() {
     let node_id = NodeId::from_legacy_named("node_network_advertise_hostname").expect("node");
-    let endpoints =
-        daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host(
-            &node_id,
-            "127.0.0.1:21353".to_string(),
-            "0.0.0.0",
-            21353,
-            0,
-            &["172.24.0.4".parse().expect("lan ip")],
-            &[],
-            true,
-            Some("node4"),
-        );
+    let endpoints = daemon_advertised_endpoints_from_static_addresses(
+        &node_id,
+        "127.0.0.1:21353".to_string(),
+        "0.0.0.0",
+        21353,
+        0,
+        &["172.24.0.4".parse().expect("lan ip")],
+        &[],
+        true,
+        Some("node4"),
+    );
 
     assert!(endpoints.iter().any(|endpoint| {
         endpoint.node_id == node_id
@@ -4501,6 +5998,33 @@ fn default_lan_ip_discovery_cache_reuses_recent_result() {
     crate::lan::clear_default_lan_ip_discovery_cache();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_default_lan_ip_discovery_cache_reuses_recent_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_default_lan_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let first = crate::lan::cached_default_lan_ip_candidates_with_async(|| async {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec!["10.0.0.21".parse().expect("ip")]
+    })
+    .await;
+    let second = crate::lan::cached_default_lan_ip_candidates_with_async(|| async {
+        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec!["10.0.0.22".parse().expect("ip")]
+    })
+    .await;
+
+    assert_eq!(first, vec!["10.0.0.21".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        second, first,
+        "bursty async LAN IP discovery should reuse the short cache"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_default_lan_ip_discovery_cache();
+}
+
 #[test]
 fn public_ip_discovery_cache_reuses_recent_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
@@ -4527,6 +6051,50 @@ fn public_ip_discovery_cache_reuses_recent_result() {
     assert_eq!(
         second, first,
         "recent public IP discovery should be served from cache"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    crate::lan::clear_public_ip_discovery_cache();
+}
+
+#[test]
+fn async_public_ip_discovery_cache_reuses_recent_result() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    crate::lan::clear_public_ip_discovery_cache();
+    let calls = std::sync::atomic::AtomicU64::new(0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let first = runtime.block_on(
+        crate::lan::cached_default_public_ip_candidates_for_local_ips_with_async(
+            std::iter::empty(),
+            || async {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::lan::PublicIpDiscoveryResult::Complete(vec![
+                    "203.0.113.110".parse().expect("ip"),
+                ])
+            },
+        ),
+    );
+    let second = runtime.block_on(
+        crate::lan::cached_default_public_ip_candidates_for_local_ips_with_async(
+            std::iter::empty(),
+            || async {
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::lan::PublicIpDiscoveryResult::Complete(vec![
+                    "203.0.113.111".parse().expect("ip"),
+                ])
+            },
+        ),
+    );
+
+    assert_eq!(first, vec!["203.0.113.110".parse::<IpAddr>().expect("ip")]);
+    assert_eq!(
+        second, first,
+        "async public IP discovery should share the same cache contract as sync discovery"
     );
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     crate::lan::clear_public_ip_discovery_cache();
@@ -4826,61 +6394,85 @@ fn public_ip_discovery_empty_cache_expires_before_positive_result() {
 }
 
 #[test]
-fn public_ip_dns_worker_limit_releases_permits() {
-    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
-        .lock()
-        .expect("cache mutex");
-    let permits = (0..crate::lan::MAX_PUBLIC_IP_DNS_WORKERS)
-        .map(|_| crate::lan::try_acquire_public_ip_dns_worker().expect("dns worker permit"))
-        .collect::<Vec<_>>();
-
-    assert!(
-        crate::lan::try_acquire_public_ip_dns_worker().is_none(),
-        "public IP discovery should not spawn unbounded DNS timeout workers"
+fn public_ip_discovery_response_parser_filters_private_and_duplicate_ips() {
+    let parsed = crate::lan::parse_public_ip_discovery_response(
+        "HTTP/1.0 200 OK\r\n\r\n93.184.216.34 10.0.0.1 93.184.216.34",
     );
 
-    drop(permits);
-    let replacement =
-        crate::lan::try_acquire_public_ip_dns_worker().expect("released dns worker permit");
-    drop(replacement);
+    assert_eq!(parsed, vec!["93.184.216.34".parse::<IpAddr>().expect("ip")]);
 }
 
 #[test]
-fn public_ip_discovery_reports_deferred_when_dns_workers_saturated() {
-    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
-        .lock()
-        .expect("cache mutex");
-    let permits = (0..crate::lan::MAX_PUBLIC_IP_DNS_WORKERS)
-        .map(|_| crate::lan::try_acquire_public_ip_dns_worker().expect("dns worker permit"))
-        .collect::<Vec<_>>();
+fn async_public_ip_discovery_fetcher_reads_bounded_local_service_response() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let result =
-        crate::lan::discover_public_ip_candidates_from_hosts_with_status(&[("api.ipify.org", "/")]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public ip fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 256];
+            let read = stream.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /ip HTTP/1.0"));
+            assert!(request.contains("Host: fixture.local"));
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\n\r\n93.184.216.35\n")
+                .await
+                .expect("write response");
+        });
 
-    assert_eq!(
-        result,
-        crate::lan::PublicIpDiscoveryResult::Deferred(Vec::new()),
-        "DNS worker saturation should be treated as deferred discovery, not a negative result"
-    );
-    drop(permits);
+        let parsed = crate::lan::fetch_public_ip_candidates_from_service_async(
+            "fixture.local",
+            "/ip",
+            address,
+        )
+        .await
+        .expect("fetch public ip");
+        server.await.expect("server");
+
+        assert_eq!(parsed, vec!["93.184.216.35".parse::<IpAddr>().expect("ip")]);
+    });
 }
 
 #[test]
-fn public_ip_discovery_response_read_is_bounded() {
-    let mut response = b"HTTP/1.0 200 OK\r\n\r\n".to_vec();
-    response.extend(
-        std::iter::repeat(b'1')
-            .take(crate::lan::MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES as usize + 4096),
-    );
+fn async_public_endpoint_reachability_probe_connects_to_local_listener() {
+    let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
+        .lock()
+        .expect("cache mutex");
+    clear_public_endpoint_reachability_cache();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
 
-    let read = crate::lan::read_public_ip_discovery_response(std::io::Cursor::new(response))
-        .expect("read capped response");
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public endpoint fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await.expect("accept reachability probe");
+        });
 
-    assert_eq!(
-        read.len(),
-        crate::lan::MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES as usize,
-        "public IP discovery must not read unbounded HTTP response bodies"
-    );
+        assert!(
+            public_endpoint_is_reachable_for_local_ips_async(
+                address.ip(),
+                address.port(),
+                std::iter::empty(),
+            )
+            .await,
+            "async public endpoint reachability should use a nonblocking TCP probe"
+        );
+        server.await.expect("server");
+    });
+    clear_public_endpoint_reachability_cache();
 }
 
 #[test]
@@ -5105,8 +6697,8 @@ fn default_iroh_relay_urls_match_iroh_n0_preset_hosts() {
 }
 
 #[cfg(feature = "iroh-transport")]
-#[test]
-fn iroh_daemon_proxy_round_trips_rpc_request() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn iroh_daemon_proxy_round_trips_rpc_request() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind daemon fixture");
     let daemon_address = listener
         .local_addr()
@@ -5137,22 +6729,25 @@ fn iroh_daemon_proxy_round_trips_rpc_request() {
     ));
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     paths.ensure().expect("cluster paths");
-    let record = start_iroh_daemon_proxy(
+    let proxy = start_iroh_daemon_proxy(
+        tokio::runtime::Handle::current(),
         paths.clone(),
         ClusterId::from_legacy_named("cluster_iroh_proxy").expect("cluster"),
         NodeId::from_legacy_named("node_iroh_proxy").expect("node"),
         daemon_address,
     )
+    .await
     .expect("start iroh proxy");
 
     let request = ObjectRpcRequest::encode_body("/test/ping", "test", &()).expect("rpc request");
-    let response = send_daemon_rpc_to_cluster_endpoint(
-        &record.endpoint(),
+    let response = send_daemon_rpc_to_cluster_endpoint_async(
+        &proxy.endpoint(),
         "RPC /test/ping",
         None,
         &request,
-        std::time::Duration::from_secs(5),
+        DaemonRpcTimeouts::connect_only(std::time::Duration::from_secs(5)),
     )
+    .await
     .expect("send iroh daemon rpc");
 
     assert_eq!(response.decode_body::<String>().expect("decode"), "PONG");
@@ -5926,10 +7521,10 @@ fn cluster_kv_watch_event_fanout_batches_split_on_payload_size() {
     );
 }
 
-#[test]
-fn committed_cluster_raft_fanout_dedupes_targets_and_batches_watch_events() {
+#[tokio::test]
+async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_events() {
     let root = std::env::temp_dir().join(format!(
-        "sinomo-network-committed-raft-fanout-{}",
+        "sinomo-network-async-committed-raft-fanout-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -5939,9 +7534,9 @@ fn committed_cluster_raft_fanout_dedupes_targets_and_batches_watch_events() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
     let (mut state, local, peer) = cluster_raft_handler_test_state(
-        "cluster_committed_raft_fanout",
-        "node_committed_raft_fanout_local",
-        "node_committed_raft_fanout_peer",
+        "cluster_async_committed_raft_fanout",
+        "node_async_committed_raft_fanout_local",
+        "node_async_committed_raft_fanout_peer",
     );
     state
         .members
@@ -5949,15 +7544,15 @@ fn committed_cluster_raft_fanout_dedupes_targets_and_batches_watch_events() {
         .find(|member| member.node_id == peer)
         .expect("peer member")
         .endpoints = vec![
-        daemon_lan_endpoint(&peer, "10.80.0.2:21353".to_string(), 10),
-        daemon_lan_endpoint(&peer, "10.80.0.3:21353".to_string(), 20),
+        daemon_lan_endpoint(&peer, "10.81.0.2:21353".to_string(), 10),
+        daemon_lan_endpoint(&peer, "10.81.0.3:21353".to_string(), 20),
     ];
     write_cluster_state(&paths, &state).expect("write cluster state");
 
     let events = (0..(sinomo_kv::CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS + 2))
         .map(|index| KvEvent {
             revision: KvRevision(index as u64 + 1),
-            key: format!("/watch/committed/fanout/{index}"),
+            key: format!("/watch/async/committed/fanout/{index}"),
             kind: KvEventKind::Put {
                 value: index.to_string().into_bytes(),
             },
@@ -5965,17 +7560,21 @@ fn committed_cluster_raft_fanout_dedupes_targets_and_batches_watch_events() {
         .collect::<Vec<_>>();
     let expected_batches = sinomo_kv::cluster_kv_watch_event_fanout_batches(&events).len();
     let mut host = RecordingCommittedFanoutHost::default();
+    let runtime = tokio::runtime::Handle::current();
 
-    let report = fan_out_committed_cluster_raft_command_with_host(
+    let report = fan_out_committed_cluster_raft_command_async_with_host(
+        &runtime,
         &paths,
         &state,
         &events,
         ClusterRaftCommittedFanoutOptions {
-            raft_append_timeout: Duration::from_millis(20),
-            watch_event_timeout: Duration::from_millis(30),
+            raft_append_timeout: Duration::from_millis(21),
+            watch_event_timeout: Duration::from_millis(31),
         },
         &mut host,
-    );
+    )
+    .await
+    .expect("async fanout");
 
     assert_eq!(report.attempted_endpoints, 1);
     assert_eq!(report.replicated_nodes, vec![peer.clone()]);
@@ -5985,13 +7584,13 @@ fn committed_cluster_raft_fanout_dedupes_targets_and_batches_watch_events() {
     assert!(
         host.append_timeouts
             .iter()
-            .all(|timeout| *timeout == Duration::from_millis(20))
+            .all(|timeout| *timeout == Duration::from_millis(21))
     );
     assert_eq!(host.watch_batches.len(), expected_batches);
     assert!(host.watch_batches.iter().all(|batch| {
         batch.node_id == peer
             && batch.leader_id == local
-            && batch.timeout == Duration::from_millis(30)
+            && batch.timeout == Duration::from_millis(31)
             && !batch.revisions.is_empty()
     }));
     assert_eq!(
@@ -6222,7 +7821,7 @@ fn cluster_raft_config_from_store_rejects_oversized_member_prefix() {
         "pk-member-config-limit",
         now,
     );
-    let current_config = ClusterRaftConfigRecord {
+    let current_config = ClusterKvRaftConfigRecord {
         cluster_id,
         term: 1,
         kv_revision: 1,
@@ -6552,42 +8151,61 @@ fn cluster_raft_rpc_dispatch_decodes_and_encodes_append_and_vote() {
         public_key: "peer-public-key".to_string(),
     };
 
-    let append_rpc = cluster_raft_append_rpc_request(&ClusterRaftAppendRequest {
-        state: peer_state.clone(),
-        snapshot: None,
-        append: RaftAppendEntriesRequest {
-            term: 1,
-            leader_id: peer_node_id.clone(),
-            prev_log_index: 0,
-            prev_log_term: 0,
-            entries: Vec::new(),
-            leader_commit: 0,
-        },
-    })
-    .expect("append rpc");
+    let append_rpc = object_rpc_request_from_kv_payload(
+        sinomo_kv::cluster_raft_append_rpc_payload(&ClusterRaftAppendRequest {
+            state: peer_state.clone(),
+            snapshot: None,
+            append: RaftAppendEntriesRequest {
+                term: 1,
+                leader_id: peer_node_id.clone(),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            },
+        })
+        .expect("append rpc payload"),
+    );
     let append_response =
         handle_cluster_raft_rpc_request(&paths, append_rpc, &peer).expect("append dispatch");
     assert_eq!(append_response.route, CLUSTER_RAFT_APPEND_ROUTE);
+    append_response
+        .error_detail()
+        .expect("append response success");
     let append_response =
-        decode_cluster_raft_append_rpc_response(&append_response).expect("append response");
+        sinomo_kv::decode_cluster_raft_append_rpc_response_body(&append_response.body)
+            .expect("append response");
     assert!(append_response.accepted);
     assert!(append_response.append.success);
 
-    let vote_rpc = cluster_raft_vote_rpc_request(&ClusterRaftVoteRequest {
-        state: peer_state,
-        vote: RaftRequestVoteRequest {
-            term: 2,
-            candidate_id: peer_node_id.clone(),
-            last_log_index: 0,
-            last_log_term: 0,
-        },
-    })
-    .expect("vote rpc");
-    let vote_response =
-        handle_cluster_raft_rpc_request(&paths, vote_rpc, &peer).expect("vote dispatch");
+    let vote_rpc = object_rpc_request_from_kv_payload(
+        sinomo_kv::cluster_raft_vote_rpc_payload(&ClusterRaftVoteRequest {
+            state: peer_state,
+            vote: RaftRequestVoteRequest {
+                term: 2,
+                candidate_id: peer_node_id.clone(),
+                last_log_index: 0,
+                last_log_term: 0,
+            },
+        })
+        .expect("vote rpc payload"),
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let vote_response = runtime
+        .block_on(handle_cluster_raft_rpc_request_async(
+            runtime.handle(),
+            &paths,
+            vote_rpc,
+            &peer,
+        ))
+        .expect("async vote dispatch");
     assert_eq!(vote_response.route, CLUSTER_RAFT_VOTE_ROUTE);
-    let vote_response =
-        decode_cluster_raft_vote_rpc_response(&vote_response).expect("vote response");
+    vote_response.error_detail().expect("vote response success");
+    let vote_response = sinomo_kv::decode_cluster_raft_vote_rpc_response_body(&vote_response.body)
+        .expect("vote response");
     assert!(vote_response.accepted);
     assert!(vote_response.vote.vote_granted);
     std::fs::remove_dir_all(root).ok();
@@ -6721,7 +8339,11 @@ impl ClusterRaftAppendReplicationHost for RecordingRaftAppendHost {
         state: &ClusterBootstrapState,
         next_index: u64,
     ) -> Result<ClusterRaftAppendRequest, NetworkError> {
-        build_cluster_raft_append_request_from_next_index(paths, state, next_index)
+        paths
+            .kv_paths()
+            .raft_store()
+            .build_cluster_raft_append_request_from_next_index(state, next_index)
+            .map_err(Into::into)
     }
 
     fn send_raft_append(
@@ -6780,19 +8402,20 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for RecordingQuorumCommitHost {
         &mut self,
         command: KvCommand,
     ) -> Result<sinomo_kv::ClusterKvRaftUncommittedAppend, NetworkError> {
-        append_cluster_raft_command_uncommitted_or_no_effect(
-            self.paths(),
-            self.local_node_id(),
-            command,
-        )
+        let paths = self.paths().clone();
+        let local_node_id = self.local_node_id().clone();
+        LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+            .append_cluster_raft_command_uncommitted_or_no_effect(command)
     }
 
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
         &mut self,
     ) -> Result<(), NetworkError> {
         self.discarded = true;
-        discard_cluster_raft_uncommitted_tail_and_clear_leader(self.paths(), self.local_node_id())
-            .map(|_| ())
+        let paths = self.paths().clone();
+        let local_node_id = self.local_node_id().clone();
+        LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+            .discard_cluster_raft_uncommitted_tail_and_clear_leader()
     }
 
     fn commit_cluster_raft_index_with_events(
@@ -6800,7 +8423,10 @@ impl sinomo_kv::ClusterKvRaftCommandStorage for RecordingQuorumCommitHost {
         index: u64,
     ) -> Result<sinomo_kv::ClusterKvRaftCommitResult, NetworkError> {
         self.committed_indices.push(index);
-        commit_cluster_raft_index_with_events(self.paths(), self.local_node_id(), index)
+        let paths = self.paths().clone();
+        let local_node_id = self.local_node_id().clone();
+        LocalClusterRaftCommandStorage::new(&paths, local_node_id)
+            .commit_cluster_raft_index_with_events(index)
     }
 }
 
@@ -6870,49 +8496,55 @@ struct RecordedWatchBatch {
     timeout: Duration,
 }
 
-impl ClusterRaftCommittedFanoutHost for RecordingCommittedFanoutHost {
-    fn replicate_cluster_raft_to_endpoint(
-        &mut self,
-        _paths: &ClusterPaths,
-        state: &ClusterBootstrapState,
-        endpoint: &ClusterEndpointRecord,
-        watch_events: &[KvEvent],
+impl ClusterRaftCommittedFanoutAsyncHost for RecordingCommittedFanoutHost {
+    fn replicate_cluster_raft_to_endpoint_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        endpoint: &'a ClusterEndpointRecord,
+        watch_events: &'a [KvEvent],
         timeout: Duration,
-    ) -> Result<ClusterRaftAppendReplicationOutcome, NetworkError> {
+    ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendReplicationOutcome> {
         self.appended_nodes.push(endpoint.node_id.clone());
         self.appended_event_counts.push(watch_events.len());
         self.append_timeouts.push(timeout);
-        Ok(ClusterRaftAppendReplicationOutcome {
-            response: ClusterRaftAppendResponse {
-                accepted: true,
-                detail: "accepted".to_string(),
-                state: state.clone(),
-                append: sinomo_kv::RaftAppendEntriesResponse {
-                    term: 1,
-                    success: true,
-                    match_index: 1,
+        let state = state.clone();
+        Box::pin(async move {
+            Ok(ClusterRaftAppendReplicationOutcome {
+                response: ClusterRaftAppendResponse {
+                    accepted: true,
+                    detail: "accepted".to_string(),
+                    state,
+                    append: sinomo_kv::RaftAppendEntriesResponse {
+                        term: 1,
+                        success: true,
+                        match_index: 1,
+                    },
                 },
-            },
-            watch_event_fanout_needed: true,
+                watch_event_fanout_needed: true,
+            })
         })
     }
 
-    fn send_cluster_kv_watch_events(
-        &mut self,
-        endpoint: &ClusterEndpointRecord,
-        request: &ClusterKvWatchEventsRequest,
+    fn send_cluster_kv_watch_events_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterKvWatchEventsRequest,
         timeout: Duration,
-    ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
+    ) -> ClusterMembershipRpcFuture<'a, ClusterKvWatchEventsResponse> {
         self.watch_batches.push(RecordedWatchBatch {
             node_id: endpoint.node_id.clone(),
             leader_id: request.leader_id.clone(),
             revisions: request.events.iter().map(|event| event.revision).collect(),
             timeout,
         });
-        Ok(ClusterKvWatchEventsResponse {
-            accepted: true,
-            detail: "accepted".to_string(),
-            stored_events: request.events.len(),
+        let stored_events = request.events.len();
+        Box::pin(async move {
+            Ok(ClusterKvWatchEventsResponse {
+                accepted: true,
+                detail: "accepted".to_string(),
+                stored_events,
+            })
         })
     }
 }
@@ -6927,6 +8559,19 @@ impl ClusterVoterReachabilityHost for RecordingVoterReachabilityHost {
     fn probe_voter(&mut self, endpoint: &ClusterEndpointRecord, timeout: Duration) -> bool {
         self.probes.push((endpoint.node_id.clone(), timeout));
         self.reachable.contains(&endpoint.node_id)
+    }
+}
+
+impl ClusterVoterReachabilityAsyncHost for RecordingVoterReachabilityHost {
+    fn probe_voter_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async move {
+            self.probes.push((endpoint.node_id.clone(), timeout));
+            Ok(self.reachable.contains(&endpoint.node_id))
+        })
     }
 }
 
@@ -7024,10 +8669,12 @@ impl ClusterKvTxnForwardHost for RecordingKvTxnForwardHost {
         ));
         match request.route.as_str() {
             CLUSTER_KV_TXN_ROUTE => {
-                ObjectRpcResponse::encode_body(CLUSTER_KV_TXN_ROUTE, &self.txn_response)
+                let payload = sinomo_kv::cluster_kv_txn_response_rpc_payload(&self.txn_response)?;
+                Ok(object_rpc_response_from_kv_payload(payload))
             }
             CLUSTER_KV_SNAPSHOT_ROUTE => {
-                ObjectRpcResponse::encode_body(CLUSTER_KV_SNAPSHOT_ROUTE, &self.snapshot)
+                let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(&self.snapshot)?;
+                Ok(object_rpc_response_from_kv_payload(payload))
             }
             route => ObjectRpcResponse::encode_error(route, "unexpected route"),
         }
@@ -7161,7 +8808,7 @@ fn voter_reachability_test_options() -> ClusterVoterReachabilityOptions {
 
 fn leader_election_test_options() -> ClusterRaftLeaderElectionOptions {
     ClusterRaftLeaderElectionOptions {
-        max_attempts: 1,
+        kv: ClusterKvRaftLeaderElectionOptions { max_attempts: 1 },
         timeout: Duration::from_secs(10),
         tcp_command_timeout: Duration::from_secs(8),
         iroh_command_timeout: Duration::from_secs(6),
@@ -7195,6 +8842,15 @@ fn kv_txn_quorum_test_options(allow_forwarding: bool) -> ClusterKvTxnQuorumOptio
     ClusterKvTxnQuorumOptions {
         allow_forwarding,
         raft_append_timeout: Duration::from_secs(10),
+        raft_append_replication_options: ClusterRaftAppendReplicationOptions {
+            max_attempts: 7,
+            timeout: Duration::from_secs(10),
+            tcp_command_timeout: Duration::from_secs(8),
+            iroh_command_timeout: Duration::from_secs(6),
+            tcp_foreground_attempt_timeout: Duration::from_secs(3),
+            public_foreground_attempt_timeout: Duration::from_secs(4),
+            iroh_foreground_attempt_timeout: Duration::from_secs(5),
+        },
         forward_options: kv_txn_forward_test_options(),
         leader_election_options: leader_election_test_options(),
         voter_reachability_options: voter_reachability_test_options(),
@@ -7276,6 +8932,8 @@ fn cluster_control_plane_timeouts_derive_driver_options() {
         ClusterKvTxnQuorumOptions {
             allow_forwarding: true,
             raft_append_timeout: Duration::from_secs(10),
+            raft_append_replication_options: timeouts
+                .raft_append_replication_options(Duration::from_secs(10)),
             forward_options: timeouts.kv_txn_forward_options(),
             leader_election_options: timeouts.leader_election_options(),
             voter_reachability_options: timeouts.voter_reachability_options(),
@@ -7342,15 +9000,6 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
             _timeout: Duration,
         ) -> Result<KvSnapshot, NetworkError> {
             panic!("membership forwarding should not fetch kv snapshots")
-        }
-
-        fn send_cluster_kv_watch_events(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterKvWatchEventsRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
-            panic!("membership forwarding should not send watch events")
         }
 
         fn send_cluster_member_publish(
@@ -7529,15 +9178,6 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
             panic!("local observation should not fetch kv snapshots")
         }
 
-        fn send_cluster_kv_watch_events(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterKvWatchEventsRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
-            panic!("local observation should not send watch events")
-        }
-
         fn send_cluster_member_publish(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -7674,15 +9314,6 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
             _timeout: Duration,
         ) -> Result<KvSnapshot, NetworkError> {
             panic!("membership preparation should not fetch kv snapshots")
-        }
-
-        fn send_cluster_kv_watch_events(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterKvWatchEventsRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
-            panic!("membership preparation should not send watch events")
         }
 
         fn send_cluster_member_publish(
@@ -7857,15 +9488,6 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
             _timeout: Duration,
         ) -> Result<KvSnapshot, NetworkError> {
             panic!("cache hook test should not fetch kv snapshots")
-        }
-
-        fn send_cluster_kv_watch_events(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterKvWatchEventsRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
-            panic!("cache hook test should not send watch events")
         }
 
         fn send_cluster_member_publish(
@@ -8411,6 +10033,67 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
 }
 
 #[test]
+fn cluster_voter_reachability_async_probes_remote_live_voters_until_quorum() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-voter-reachability-async-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_voter_reachability_async").expect("cluster");
+    let local = NodeId::from_legacy_named("node_voter_reachability_async_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_voter_reachability_async_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "async remote voter reachability",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let mut remote_member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    remote_member.capabilities = main_daemon_capabilities(&remote_member.role);
+    remote_member.allowed_capabilities = remote_member.capabilities.clone();
+    remote_member.endpoints = vec![daemon_lan_endpoint(
+        &remote,
+        "10.49.0.3:21353".to_string(),
+        10,
+    )];
+    state.members.push(remote_member);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut host = RecordingVoterReachabilityHost {
+        reachable: BTreeSet::from([remote.clone()]),
+        ..Default::default()
+    };
+
+    let has_quorum = runtime
+        .block_on(cluster_has_local_quorum_async_with_host(
+            &paths,
+            &state,
+            voter_reachability_test_options(),
+            &mut host,
+        ))
+        .expect("async quorum");
+
+    assert!(has_quorum);
+    assert_eq!(host.probes, vec![(remote, Duration::from_secs(2))]);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-raft-quorum-commit-{}",
@@ -8640,7 +10323,9 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
         &paths,
         &state,
         ClusterRaftLeaderElectionOptions {
-            max_attempts: CLUSTER_RAFT_LEADER_ELECTION_ATTEMPTS,
+            kv: ClusterKvRaftLeaderElectionOptions {
+                max_attempts: sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS,
+            },
             timeout: Duration::from_secs(5),
             tcp_command_timeout: Duration::from_secs(5),
             iroh_command_timeout: Duration::from_secs(3),
@@ -8654,10 +10339,14 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
 
     assert!(elected);
     assert_eq!(
-        cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
+        paths
+            .kv_paths()
+            .raft_store()
+            .known_voter_leader_id(&state)
+            .expect("known leader"),
         Some(local_node_id)
     );
-    let expected_term = CLUSTER_RAFT_LEADER_ELECTION_TERM_BUMP + 1;
+    let expected_term = sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP + 1;
     assert_eq!(
         host.sent_votes,
         vec![(peer_node_id, expected_term, Duration::from_secs(1))]
@@ -9022,7 +10711,7 @@ fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot(
     };
 
     assert!(
-        !crate::storage::cluster_raft_append_request_needs_watch_event_fanout(
+        !sinomo_kv::cluster_raft_append_request_needs_watch_event_fanout(
             &request,
             std::slice::from_ref(&first)
         ),
@@ -9037,17 +10726,14 @@ fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot(
         kv: snapshot,
     });
     assert!(
-        !crate::storage::cluster_raft_append_request_needs_watch_event_fanout(
+        !sinomo_kv::cluster_raft_append_request_needs_watch_event_fanout(
             &request,
             std::slice::from_ref(&first)
         ),
         "snapshot installs that still contain the committed events do not need duplicate fanout"
     );
     assert!(
-        crate::storage::cluster_raft_append_request_needs_watch_event_fanout(
-            &request,
-            &[first, second]
-        ),
+        sinomo_kv::cluster_raft_append_request_needs_watch_event_fanout(&request, &[first, second]),
         "snapshot installs with a trimmed event tail still need fanout for omitted watch events"
     );
 }
@@ -9207,9 +10893,6 @@ fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
 
-    let rollout_node_prefix = cluster_module_rollout_node_prefix();
-    let rollout_desired_prefix = cluster_module_rollout_desired_prefix();
-    let rollout_reconcile_prefix = cluster_module_rollout_reconcile_prefix();
     let mut store = InProcessKvStore::new();
     for prefix in [
         "/cluster/members/",
@@ -9218,9 +10901,6 @@ fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
         "/cluster/node-status/",
         "/cluster/network/info/",
         "/cluster/network/connectivity/",
-        rollout_node_prefix.as_str(),
-        rollout_desired_prefix.as_str(),
-        rollout_reconcile_prefix.as_str(),
     ] {
         seed_raw_prefix_over_default_limit(&mut store, prefix);
     }
@@ -9237,21 +10917,6 @@ fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
     assert_default_range_limit(
         read_cluster_node_statuses_from_kv(&paths).expect_err("status range limit"),
         "/cluster/node-status/",
-    );
-    assert_default_range_limit(
-        read_cluster_module_rollout_statuses_from_kv(&paths)
-            .expect_err("rollout status range limit"),
-        &rollout_node_prefix,
-    );
-    assert_default_range_limit(
-        read_cluster_module_rollout_desired_from_kv(&paths)
-            .expect_err("rollout desired range limit"),
-        &rollout_desired_prefix,
-    );
-    assert_default_range_limit(
-        read_cluster_module_rollout_reconciliations_from_kv(&paths)
-            .expect_err("rollout reconciliation range limit"),
-        &rollout_reconcile_prefix,
     );
     assert_default_range_limit(
         read_cluster_network_info_from_kv(&paths).expect_err("network info range limit"),
@@ -9283,8 +10948,8 @@ fn cluster_kv_prefix_values_reader_is_bounded() {
     seed_raw_prefix_over_default_limit(&mut store, "/typed/default/");
     write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
 
-    let error = read_cluster_kv_prefix_values::<String>(&paths, "/typed/default/")
-        .expect_err("typed range limit");
+    let error =
+        read_cluster_kv_prefix_entries(&paths, "/typed/default/").expect_err("typed range limit");
     assert_default_range_limit(error, "/typed/default/");
 
     std::fs::remove_dir_all(root).ok();
@@ -9959,6 +11624,64 @@ impl ClusterJoinRegistrationHost for RecordingJoinRegistrationHost {
     }
 }
 
+impl ClusterMembershipRpcAsyncForwardHost for RecordingJoinRegistrationHost {
+    fn send_membership_rpc_async<'a>(
+        &'a mut self,
+        _endpoint: &'a ClusterEndpointRecord,
+        _request: &'a ObjectRpcRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+        Box::pin(async {
+            panic!("voter-local join registration should not forward membership RPCs")
+        })
+    }
+
+    fn relay_membership_rpc_to_voter_via_peer_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _voter: &'a ClusterEndpointRecord,
+        _peer: &'a ClusterEndpointRecord,
+        _request: &'a ObjectRpcRequest,
+    ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+        Box::pin(async { panic!("voter-local join registration should not relay membership RPCs") })
+    }
+}
+
+impl ClusterJoinRegistrationAsyncHost for RecordingJoinRegistrationHost {
+    fn local_daemon_membership_observation_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, Option<ClusterLocalDaemonMembershipObservation>> {
+        Box::pin(async move {
+            self.observations += 1;
+            Ok(self.observation.clone())
+        })
+    }
+
+    fn commit_join_registration_state_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.committed.push(state.clone());
+            sync_cluster_state_to_local_raft_unchecked(paths, state)
+        })
+    }
+
+    fn remember_successful_join_endpoint_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+        _endpoint: &'a ClusterEndpointRecord,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            self.remembered_targets += 1;
+            Ok(())
+        })
+    }
+}
+
 #[derive(Default)]
 struct RecordingJoinEndpointHost {
     remembered: Vec<ClusterEndpointRecord>,
@@ -10141,6 +11864,135 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
         &mut host,
     )
     .expect("handle join registration");
+
+    assert!(response.accepted, "join should be accepted");
+    assert_eq!(host.observations, 1);
+    assert_eq!(host.committed.len(), 1);
+    assert_eq!(
+        host.remembered_targets, 0,
+        "voter-local joins should not record forwarded targets"
+    );
+    let committed = &host.committed[0];
+    assert!(committed.members.iter().any(|member| {
+        member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
+    }));
+    let local_member = committed
+        .members
+        .iter()
+        .find(|member| member.node_id == issuer_node_id)
+        .expect("observed local member");
+    assert!(local_member.endpoints.contains(&observed_main_endpoint));
+    let snapshot = response
+        .kv_snapshot
+        .as_ref()
+        .expect("voter commit should attach kv snapshot");
+    let joined_from_snapshot: ClusterMemberRecord = snapshot
+        .get(&cluster_member_key(&joined_node_id))
+        .expect("joined member in committed snapshot")
+        .decode()
+        .expect("decode joined member");
+    assert_eq!(joined_from_snapshot.state, ClusterMemberState::Learner);
+    let stored = read_cluster_state_without_kv(&paths).expect("read stored state");
+    assert!(stored.members.iter().any(|member| {
+        member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
+    }));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cluster_join_registration_async_handler_voter_commits_through_host() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-join-async-handler-voter-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_join_async_handler_voter").expect("cluster");
+    let issuer_node_id =
+        NodeId::from_legacy_named("node_join_async_handler_voter_issuer").expect("issuer");
+    let joined_node_id =
+        NodeId::from_legacy_named("node_join_async_handler_voter_joined").expect("joined");
+    let issuer_identity =
+        sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "join async handler voter",
+        issuer_node_id.clone(),
+        "issuer",
+        issuer_identity.public_key.clone(),
+        now,
+    );
+    let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+    state.members[0].capabilities = capabilities.clone();
+    state.members[0].allowed_capabilities = capabilities;
+    write_cluster_state(&paths, &state).expect("write state");
+    let mut invite = ClusterJoinInvite {
+        invite_id: ClusterInviteId::from_legacy_named("invite_join_async_handler_voter")
+            .expect("invite"),
+        cluster_id: cluster_id.clone(),
+        cluster_name: Some("join async handler voter".to_string()),
+        cluster_public_key: issuer_identity.public_key.clone(),
+        invitation_secret: "secret-join-async-handler-voter".to_string(),
+        communication_channels: Vec::new(),
+        introducers: Vec::new(),
+        token_id: "token-join-async-handler-voter".to_string(),
+        expires_at: now + time::Duration::hours(1),
+        trust_domain: TrustDomain::new("trust.local").expect("trust domain"),
+        allowed_member_roles: vec![ClusterMemberRole::Learner],
+        issuer_node_id: issuer_node_id.clone(),
+        issuer_public_key: issuer_identity.public_key.clone(),
+        signature: String::new(),
+    };
+    invite.signature = sign_cluster_join_invite(&invite, &issuer_identity).expect("sign invite");
+    sync_cluster_invitation_to_kv(&paths, &invite).expect("sync invitation");
+    let learner_member = ClusterMemberRecord::pending_learner(
+        cluster_id,
+        joined_node_id.clone(),
+        "joined",
+        "pk-joined",
+        now,
+    );
+    let observed_main_endpoint =
+        daemon_lan_endpoint(&issuer_node_id, "10.42.1.10:21353".to_string(), 10);
+    let observed_shadow_endpoint = daemon_lan_endpoint(
+        &sinomo_node::shadow_daemon_node_id(&issuer_node_id),
+        "10.42.1.10:21354".to_string(),
+        10,
+    );
+    let mut host = RecordingJoinRegistrationHost {
+        observation: Some(ClusterLocalDaemonMembershipObservation {
+            main_endpoints: vec![observed_main_endpoint.clone()],
+            shadow_endpoints: vec![observed_shadow_endpoint],
+            main_public_key: issuer_identity.public_key.clone(),
+            shadow_public_key: "observed-async-shadow-public-key".to_string(),
+            timestamp: now,
+        }),
+        ..Default::default()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    let response = runtime
+        .block_on(handle_cluster_join_registration_request_async_with_host(
+            runtime.handle(),
+            &paths,
+            ClusterJoinRegistrationRequest {
+                invite: invite.clone(),
+                invitation_secret: invite.invitation_secret,
+                members: vec![learner_member],
+            },
+            now,
+            &mut host,
+        ))
+        .expect("handle async join registration");
 
     assert!(response.accepted, "join should be accepted");
     assert_eq!(host.observations, 1);
@@ -10656,15 +12508,6 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
             })
         }
 
-        fn send_cluster_kv_watch_events(
-            &mut self,
-            _endpoint: &ClusterEndpointRecord,
-            _request: &ClusterKvWatchEventsRequest,
-            _timeout: Duration,
-        ) -> Result<ClusterKvWatchEventsResponse, NetworkError> {
-            panic!("join reconciliation should not send watch events")
-        }
-
         fn send_cluster_member_publish(
             &mut self,
             _endpoint: &ClusterEndpointRecord,
@@ -11071,6 +12914,40 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
         }
     }
 
+    impl ClusterMembershipRpcAsyncForwardHost for RecordingForwardHost {
+        fn send_membership_rpc_async<'a>(
+            &'a mut self,
+            endpoint: &'a ClusterEndpointRecord,
+            request: &'a ObjectRpcRequest,
+        ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
+            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
+            self.direct.push(endpoint.node_id.clone());
+            Box::pin(async {
+                Err(NetworkError::Io {
+                    operation: "test join challenge direct rpc".to_string(),
+                    detail: "offline".to_string(),
+                })
+            })
+        }
+
+        fn relay_membership_rpc_to_voter_via_peer_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            voter: &'a ClusterEndpointRecord,
+            peer: &'a ClusterEndpointRecord,
+            request: &'a ObjectRpcRequest,
+        ) -> ClusterMembershipRpcFuture<'a, ObjectRpcResponse> {
+            assert_eq!(request.route, CLUSTER_JOIN_CHALLENGE_ROUTE);
+            assert_eq!(request.category, CLUSTER_MEMBERSHIP_RPC_CATEGORY);
+            self.relays
+                .push((voter.node_id.clone(), peer.node_id.clone()));
+            Box::pin(async {
+                ObjectRpcResponse::encode_body(CLUSTER_JOIN_CHALLENGE_ROUTE, &"proof".to_string())
+            })
+        }
+    }
+
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-join-challenge-forward-{}",
         std::time::SystemTime::now()
@@ -11143,7 +13020,28 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
 
     assert_eq!(proof, "proof");
     assert_eq!(host.direct, vec![voter_node.clone()]);
-    assert_eq!(host.relays, vec![(voter_node, peer_node)]);
+    assert_eq!(host.relays, vec![(voter_node.clone(), peer_node.clone())]);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut async_host = RecordingForwardHost {
+        direct: Vec::new(),
+        relays: Vec::new(),
+    };
+    let async_response = runtime
+        .block_on(forward_cluster_join_challenge_rpc_to_voter_async_with_host(
+            runtime.handle(),
+            &paths,
+            &request,
+            &mut async_host,
+        ))
+        .expect("async forward join challenge");
+    let async_proof: String = async_response.decode_body().expect("async proof body");
+    assert_eq!(async_proof, "proof");
+    assert_eq!(async_host.direct, vec![voter_node.clone()]);
+    assert_eq!(async_host.relays, vec![(voter_node, peer_node)]);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -11249,6 +13147,29 @@ impl ClusterInvitePublishHost for RecordingClusterInvitePublishHost {
     }
 }
 
+impl ClusterMemberMutationAsyncHost for RecordingClusterInvitePublishHost {
+    fn prepare_cluster_state_for_kv_sync_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.commits += 1;
+            self.last_txn = Some(txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        })
+    }
+}
+
 #[test]
 fn cluster_invite_publish_request_with_host_validates_and_delegates_commit() {
     let root = std::env::temp_dir().join(format!(
@@ -11326,6 +13247,52 @@ fn cluster_invite_publish_request_with_host_validates_and_delegates_commit() {
     assert_eq!(
         read_cluster_invitation_from_kv(&paths, &invite.invite_id).expect("published invite"),
         invite
+    );
+
+    let mut async_invite = invite.clone();
+    async_invite.invite_id =
+        ClusterInviteId::from_legacy_named("invite_publish_request_host_async").expect("invite");
+    async_invite.invitation_secret = "secret-invite-publish-request-host-async".to_string();
+    async_invite.token_id = "token-invite-publish-request-host-async".to_string();
+    async_invite.signature = String::new();
+    async_invite.signature =
+        sign_cluster_join_invite(&async_invite, &issuer_identity).expect("sign async invite");
+    let async_invite_key = cluster_invitation_key(&async_invite.invite_id);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut async_host = RecordingClusterInvitePublishHost::default();
+    let async_response = runtime
+        .block_on(handle_cluster_invite_publish_request_async_with_host(
+            runtime.handle(),
+            &paths,
+            ClusterInvitePublishRequest {
+                invite: async_invite.clone(),
+            },
+            issuer_node.as_str(),
+            &issuer_identity.public_key,
+            now,
+            &mut async_host,
+        ))
+        .expect("async invite publish response");
+    assert!(async_response.accepted);
+    assert_eq!(async_response.detail, "invite published");
+    assert!(async_response.kv_snapshot.is_some());
+    assert_eq!(async_host.commits, 1);
+    assert!(
+        async_host
+            .last_txn
+            .expect("async committed txn")
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &async_invite_key)),
+        "async network handler should plan invitation publication"
+    );
+    assert_eq!(
+        read_cluster_invitation_from_kv(&paths, &async_invite.invite_id)
+            .expect("async published invite"),
+        async_invite
     );
 
     let mut unauthorized_host = RecordingClusterInvitePublishHost::default();
@@ -11530,21 +13497,22 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     drop(node);
 
     // A caught-up follower (prev == snapshot index) gets a heartbeat, no snapshot.
-    let heartbeat = build_cluster_raft_append_request_from_next_index(
-        &paths,
-        &state,
-        last_log_index.saturating_add(1),
-    )
-    .expect("build heartbeat");
+    let heartbeat = paths
+        .kv_paths()
+        .raft_store()
+        .build_cluster_raft_append_request_from_next_index(&state, last_log_index.saturating_add(1))
+        .expect("build heartbeat");
     assert!(heartbeat.snapshot.is_none());
     assert!(heartbeat.append.entries.is_empty());
     assert_eq!(heartbeat.append.prev_log_index, snapshot_index);
 
     // A follower a few entries behind, but still within the retained tail, is caught
     // up with incremental entries — no snapshot install.
-    let near =
-        build_cluster_raft_append_request_from_next_index(&paths, &state, earliest_retained + 1)
-            .expect("build near catchup");
+    let near = paths
+        .kv_paths()
+        .raft_store()
+        .build_cluster_raft_append_request_from_next_index(&state, earliest_retained + 1)
+        .expect("build near catchup");
     assert!(
         near.snapshot.is_none(),
         "follower within the retained tail must be served incrementally"
@@ -11552,12 +13520,14 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
     assert!(!near.append.entries.is_empty());
 
     // A follower behind the retained tail still requires a full snapshot install.
-    let far = build_cluster_raft_append_request_from_next_index(
-        &paths,
-        &state,
-        earliest_retained.saturating_sub(1).max(1),
-    )
-    .expect("build far catchup");
+    let far = paths
+        .kv_paths()
+        .raft_store()
+        .build_cluster_raft_append_request_from_next_index(
+            &state,
+            earliest_retained.saturating_sub(1).max(1),
+        )
+        .expect("build far catchup");
     assert!(
         far.snapshot.is_some(),
         "follower behind the retained tail must receive a snapshot"
@@ -13463,6 +15433,29 @@ impl ClusterMemberPublishHost for RecordingClusterMemberPublishHost {
     }
 }
 
+impl ClusterMemberMutationAsyncHost for RecordingClusterMemberPublishHost {
+    fn prepare_cluster_state_for_kv_sync_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.commits += 1;
+            self.last_txn = Some(txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        })
+    }
+}
+
 struct UnusedClusterJoinRegistrationHost;
 
 impl ClusterMembershipRpcForwardHost for UnusedClusterJoinRegistrationHost {
@@ -13571,6 +15564,42 @@ impl ClusterLocalMemberPublishHost for RecordingClusterLocalMemberPublishHost {
     }
 }
 
+impl ClusterLocalMemberPublishAsyncHost for RecordingClusterLocalMemberPublishHost {
+    fn cluster_has_local_quorum_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a ClusterBootstrapState,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async move { Ok(self.has_quorum) })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            ClusterLocalMemberPublishHost::commit_cluster_kv_txn_with_quorum(
+                self, paths, state, txn,
+            )
+        })
+    }
+
+    fn send_cluster_member_publish_async<'a>(
+        &'a mut self,
+        endpoint: &'a ClusterEndpointRecord,
+        request: &'a ClusterMemberPublishRequest,
+        timeout: Duration,
+    ) -> ClusterMembershipRpcFuture<'a, ClusterMemberPublishResponse> {
+        Box::pin(async move {
+            ClusterLocalMemberPublishHost::send_cluster_member_publish(
+                self, endpoint, request, timeout,
+            )
+        })
+    }
+}
+
 #[test]
 fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
     let root = std::env::temp_dir().join(format!(
@@ -13634,6 +15663,47 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
             .get(&endpoint_key)
             .is_some(),
         "host-applied commit should persist the endpoint"
+    );
+
+    let mut async_published = state.members[0].clone();
+    let async_endpoint = daemon_lan_endpoint(&local, "10.47.0.8:21353".to_string(), 10);
+    async_published.endpoints = vec![async_endpoint.clone()];
+    let async_endpoint_key = cluster_endpoint_key(&local, &async_endpoint);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut async_host = RecordingClusterMemberPublishHost::default();
+    let async_response = runtime
+        .block_on(handle_cluster_member_publish_request_async_with_host(
+            runtime.handle(),
+            &paths,
+            ClusterMemberPublishRequest {
+                members: vec![async_published],
+            },
+            local.as_str(),
+            &mut async_host,
+        ))
+        .expect("async member publish response");
+    assert!(async_response.accepted);
+    assert_eq!(async_response.detail, "member endpoints published");
+    assert!(async_response.kv_snapshot.is_some());
+    assert_eq!(async_host.commits, 1);
+    assert!(
+        async_host
+            .last_txn
+            .expect("async committed txn")
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &async_endpoint_key)),
+        "async network handler should plan endpoint publication"
+    );
+    assert!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("snapshot after async publish")
+            .get(&async_endpoint_key)
+            .is_some(),
+        "async host-applied commit should persist the endpoint"
     );
 
     let mut unauthorized_host = RecordingClusterMemberPublishHost::default();
@@ -13780,6 +15850,65 @@ fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
 }
 
 #[test]
+fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-local-member-publish-async-commit-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_local_member_publish_async_commit").expect("cluster");
+    let local = NodeId::from_legacy_named("node_local_member_publish_async_commit").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "local member publish async commit",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    write_cluster_state(&paths, &state).expect("write state");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut host = RecordingClusterLocalMemberPublishHost {
+        has_quorum: true,
+        ..Default::default()
+    };
+    let snapshot = runtime
+        .block_on(publish_local_members_to_quorum_if_needed_async_with_host(
+            runtime.handle(),
+            &paths,
+            &state,
+            ClusterLocalMemberPublishOptions {
+                member_publish_timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        ))
+        .expect("async local member publish")
+        .expect("local quorum commit snapshot");
+
+    assert_eq!(host.commits, 1);
+    assert!(host.sends.is_empty());
+    assert!(
+        snapshot.get(&cluster_member_key(&local)).is_some(),
+        "async local voter quorum commit should publish the local member record"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
     let root = std::env::temp_dir().join(format!(
         "sinomo-network-local-member-publish-forward-{}",
@@ -13861,6 +15990,99 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
             .get("/member/published/by/voter")
             .is_some(),
         "accepted voter publish responses should refresh the local KV snapshot"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_member_publish_async_with_host_forwards_when_local_commit_is_unavailable() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-local-member-publish-async-forward-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_local_member_publish_async_forward")
+        .expect("cluster");
+    let local =
+        NodeId::from_legacy_named("node_local_member_publish_async_forward").expect("local");
+    let voter =
+        NodeId::from_legacy_named("node_local_member_publish_async_forward_voter").expect("voter");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "local member publish async forward",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        voter.clone(),
+        "remote voter",
+        "pk-voter",
+        now,
+    );
+    remote.capabilities = sinomo_node::main_daemon_capabilities(&remote.role);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &voter,
+        "10.48.1.7:21353".to_string(),
+        10,
+    )];
+    state.members.push(remote);
+    write_cluster_state(&paths, &state).expect("write state");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+    let mut imported_store = InProcessKvStore::new();
+    imported_store
+        .put("/member/async/published/by/voter", b"ok".to_vec(), None)
+        .expect("imported marker");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut host = RecordingClusterLocalMemberPublishHost {
+        has_quorum: false,
+        response: Some(ClusterMemberPublishResponse {
+            accepted: true,
+            detail: "published".to_string(),
+            state: state.clone(),
+            kv_snapshot: Some(imported_store.snapshot()),
+        }),
+        ..Default::default()
+    };
+    let result = runtime
+        .block_on(publish_local_members_to_quorum_if_needed_async_with_host(
+            runtime.handle(),
+            &paths,
+            &state,
+            ClusterLocalMemberPublishOptions {
+                member_publish_timeout: Duration::from_secs(7),
+            },
+            &mut host,
+        ))
+        .expect("async local member publish");
+
+    assert!(result.is_none());
+    assert_eq!(host.commits, 0);
+    assert_eq!(host.sends.len(), 1);
+    assert_eq!(host.sends[0].0, voter);
+    assert_eq!(host.sends[0].1, vec![local.clone()]);
+    assert_eq!(host.sends[0].2, Duration::from_secs(7));
+    assert!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("imported snapshot")
+            .get("/member/async/published/by/voter")
+            .is_some(),
+        "accepted async voter publish responses should refresh the local KV snapshot"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -13987,13 +16209,6 @@ fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
     write_cluster_state(&paths, &state).expect("write state");
 
     sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("initial unchecked sync");
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("cluster kv store")
-            .get(&cluster_rollout_desired_key())
-            .is_some(),
-        "initial unchecked sync should still seed rollout desired state"
-    );
     let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
     let wal_len_after_first = std::fs::metadata(&wal_path)
         .expect("wal after first sync")
@@ -14074,8 +16289,8 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         .decode()
         .expect("identity record");
     assert_eq!(identity.cluster_name, "network storage");
-    let raft_config: ClusterRaftConfigRecord = store
-        .get(&cluster_raft_config_key())
+    let raft_config: ClusterKvRaftConfigRecord = store
+        .get(&sinomo_kv::cluster_kv_raft_config_key())
         .expect("raft config record")
         .decode()
         .expect("raft config record");
@@ -14094,8 +16309,6 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         .decode()
         .expect("capability policy record");
     assert_eq!(policy.capabilities, state.members[0].capabilities);
-    assert!(store.get(&cluster_rollout_desired_key()).is_some());
-
     let status = ClusterNodeStatusRecord {
         cluster_id: state.cluster_id.clone(),
         node_id: state.local_node_id.clone(),
@@ -14134,26 +16347,15 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
     let mut clean_status = status.clone();
     clean_status.rollout = None;
 
-    sync_cluster_node_status_to_kv(&paths, status).expect("sync status");
+    sync_cluster_node_status_to_kv(&paths, status.clone()).expect("sync status");
     let statuses = read_cluster_node_statuses_from_kv(&paths).expect("statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].availability, ClusterNodeAvailability::Online);
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("cluster kv store")
-            .get(&cluster_rollout_node_key(&state.local_node_id))
-            .is_some()
-    );
+    assert_eq!(statuses[0].rollout, status.rollout);
     sync_cluster_node_status_to_kv(&paths, clean_status).expect("clear rollout status");
     let statuses = read_cluster_node_statuses_from_kv(&paths).expect("clean statuses");
     assert_eq!(statuses.len(), 1);
     assert_eq!(statuses[0].rollout, None);
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("cluster kv store")
-            .get(&cluster_rollout_node_key(&state.local_node_id))
-            .is_none()
-    );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
@@ -14165,6 +16367,398 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         .expect("async open");
     assert_eq!(async_node.node_id(), &state.local_node_id);
 
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn async_cluster_raft_append_request_builder_matches_sync_builder() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-async-raft-append-build-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_async_raft_append_build").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_async_raft_append_build").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "async raft append build",
+        node_id,
+        "async node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let sync_request = paths
+        .kv_paths()
+        .raft_store()
+        .build_cluster_raft_append_request_from_next_index(&state, 1)
+        .expect("sync build");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let async_request = runtime
+        .block_on(
+            paths
+                .kv_paths()
+                .raft_store()
+                .locked_build_cluster_raft_append_request_from_next_index_async(&state, 1),
+        )
+        .expect("async build");
+    let last_log_index = runtime
+        .block_on(
+            paths
+                .kv_paths()
+                .raft_store()
+                .locked_last_log_index_async(&state.local_node_id),
+        )
+        .expect("async last log index");
+
+    assert_eq!(async_request, sync_request);
+    assert!(last_log_index >= async_request.append.leader_commit);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
+    struct ScriptedAsyncRaftAppendHost {
+        last_index: u64,
+        next_indexes: Vec<u64>,
+        timeouts: Vec<Duration>,
+        sent: usize,
+        responses: std::collections::VecDeque<ClusterRaftAppendResponse>,
+    }
+
+    impl ClusterRaftAppendReplicationAsyncHost for ScriptedAsyncRaftAppendHost {
+        fn last_local_raft_log_index_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterMembershipRpcFuture<'a, u64> {
+            let last_index = self.last_index;
+            Box::pin(async move { Ok(last_index) })
+        }
+
+        fn build_raft_append_request_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            next_index: u64,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+            self.next_indexes.push(next_index);
+            let state = state.clone();
+            let leader_id = state.local_node_id.clone();
+            Box::pin(async move {
+                Ok(ClusterRaftAppendRequest {
+                    state,
+                    snapshot: None,
+                    append: RaftAppendEntriesRequest {
+                        term: 1,
+                        leader_id,
+                        prev_log_index: next_index.saturating_sub(1),
+                        prev_log_term: 1,
+                        entries: Vec::new(),
+                        leader_commit: next_index.saturating_sub(1),
+                    },
+                })
+            })
+        }
+
+        fn send_raft_append_async<'a>(
+            &'a mut self,
+            _endpoint: &'a ClusterEndpointRecord,
+            _request: &'a ClusterRaftAppendRequest,
+            timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            self.timeouts.push(timeout);
+            let response = self.responses.pop_front().expect("scripted response");
+            Box::pin(async move { Ok(response) })
+        }
+
+        fn on_raft_append_sent_async<'a>(&'a mut self) -> ClusterMembershipRpcFuture<'a, ()> {
+            self.sent += 1;
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn response(
+        state: &ClusterBootstrapState,
+        accepted: bool,
+        match_index: u64,
+    ) -> ClusterRaftAppendResponse {
+        ClusterRaftAppendResponse {
+            accepted,
+            detail: if accepted { "accepted" } else { "rejected" }.to_string(),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 1,
+                success: accepted,
+                match_index,
+            },
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-async-raft-append-retry-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_async_raft_append_retry").expect("cluster");
+    let local = NodeId::from_legacy_named("node_async_raft_append_retry_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_async_raft_append_retry_remote").expect("remote");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "async raft append retry",
+        local,
+        "local",
+        "pk-local",
+        now,
+    );
+    let endpoint = daemon_lan_endpoint(&remote, "10.70.0.2:21353".to_string(), 10);
+    let mut host = ScriptedAsyncRaftAppendHost {
+        last_index: 5,
+        next_indexes: Vec::new(),
+        timeouts: Vec::new(),
+        sent: 0,
+        responses: Vec::from([response(&state, false, 2), response(&state, true, 3)]).into(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let outcome = runtime
+        .block_on(replicate_cluster_raft_to_endpoint_async_with_host(
+            &paths,
+            &state,
+            &endpoint,
+            &[],
+            ClusterRaftAppendReplicationOptions {
+                timeout: Duration::from_secs(5),
+                max_attempts: 3,
+                tcp_command_timeout: Duration::from_secs(1),
+                iroh_command_timeout: Duration::from_secs(1),
+                tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                public_foreground_attempt_timeout: Duration::from_secs(1),
+                iroh_foreground_attempt_timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        ))
+        .expect("async replicate");
+
+    assert!(outcome.response.accepted);
+    assert_eq!(host.next_indexes, vec![6, 3]);
+    assert_eq!(host.sent, 2);
+    assert_eq!(host.timeouts.len(), 2);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
+    struct AcceptingAsyncQuorumHost {
+        sent_appends: usize,
+        connectivity_records: Vec<(NodeId, ClusterConnectivityState)>,
+        fanout_targets: Vec<NodeId>,
+    }
+
+    impl ClusterRaftAppendReplicationAsyncHost for AcceptingAsyncQuorumHost {
+        fn last_local_raft_log_index_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+        ) -> ClusterMembershipRpcFuture<'a, u64> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .raft_store()
+                    .locked_last_log_index_async(&state.local_node_id)
+                    .await
+                    .map_err(Into::into)
+            })
+        }
+
+        fn build_raft_append_request_async<'a>(
+            &'a mut self,
+            paths: &'a ClusterPaths,
+            state: &'a ClusterBootstrapState,
+            next_index: u64,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendRequest> {
+            Box::pin(async move {
+                paths
+                    .kv_paths()
+                    .raft_store()
+                    .locked_build_cluster_raft_append_request_from_next_index_async(
+                        state, next_index,
+                    )
+                    .await
+                    .map_err(Into::into)
+            })
+        }
+
+        fn send_raft_append_async<'a>(
+            &'a mut self,
+            _endpoint: &'a ClusterEndpointRecord,
+            request: &'a ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> ClusterMembershipRpcFuture<'a, ClusterRaftAppendResponse> {
+            self.sent_appends += 1;
+            let state = request.state.clone();
+            let match_index = request
+                .append
+                .entries
+                .last()
+                .map(|entry| entry.index)
+                .unwrap_or(request.append.prev_log_index);
+            Box::pin(async move {
+                Ok(ClusterRaftAppendResponse {
+                    accepted: true,
+                    detail: "accepted".to_string(),
+                    state,
+                    append: RaftAppendEntriesResponse {
+                        term: 1,
+                        success: true,
+                        match_index,
+                    },
+                })
+            })
+        }
+    }
+
+    impl ClusterRaftQuorumAsyncHost for AcceptingAsyncQuorumHost {
+        fn record_endpoint_command_connectivity(
+            &mut self,
+            _paths: &ClusterPaths,
+            _state: &ClusterBootstrapState,
+            endpoint: &ClusterEndpointRecord,
+            connectivity_state: ClusterConnectivityState,
+            _latency_ms: Option<u64>,
+        ) {
+            self.connectivity_records
+                .push((endpoint.node_id.clone(), connectivity_state));
+        }
+
+        fn fan_out_committed_cluster_raft_command_async<'a>(
+            &'a mut self,
+            _paths: ClusterPaths,
+            _state: ClusterBootstrapState,
+            _events: Vec<KvEvent>,
+            targets: Vec<ClusterEndpointRecord>,
+        ) -> ClusterMembershipRpcFuture<'a, ()> {
+            Box::pin(async move {
+                self.fanout_targets = targets
+                    .into_iter()
+                    .map(|endpoint| endpoint.node_id)
+                    .collect();
+                Ok(())
+            })
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-async-raft-quorum-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id = ClusterId::from_legacy_named("cluster_async_raft_quorum").expect("cluster");
+    let local = NodeId::from_legacy_named("node_async_raft_quorum_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_async_raft_quorum_remote").expect("remote");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "async raft quorum",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities =
+        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let mut remote_member =
+        ClusterMemberRecord::local_voter(cluster_id, remote.clone(), "remote", "pk-remote", now);
+    remote_member.capabilities =
+        vec![CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("capability")];
+    remote_member.allowed_capabilities = remote_member.capabilities.clone();
+    remote_member.endpoints = vec![daemon_lan_endpoint(
+        &remote,
+        "10.80.0.2:21353".to_string(),
+        10,
+    )];
+    state.members.push(remote_member);
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+    locked_set_cluster_raft_leader(&paths, &local, 1).expect("set leader");
+
+    let mut host = AcceptingAsyncQuorumHost {
+        sent_appends: 0,
+        connectivity_records: Vec::new(),
+        fanout_targets: Vec::new(),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let result = runtime
+        .block_on(commit_cluster_raft_command_with_quorum_async_with_host(
+            runtime.handle(),
+            &paths,
+            &mut state,
+            KvCommand::Op(KvOp::Put {
+                key: "/test/async-quorum".to_string(),
+                value: b"ok".to_vec(),
+                lease_id: None,
+            }),
+            ClusterRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(5),
+            },
+            ClusterRaftAppendReplicationOptions {
+                timeout: Duration::from_secs(5),
+                max_attempts: 3,
+                tcp_command_timeout: Duration::from_secs(1),
+                iroh_command_timeout: Duration::from_secs(1),
+                tcp_foreground_attempt_timeout: Duration::from_secs(1),
+                public_foreground_attempt_timeout: Duration::from_secs(1),
+                iroh_foreground_attempt_timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        ))
+        .expect("async quorum commit");
+
+    assert_eq!(
+        result
+            .snapshot
+            .get("/test/async-quorum")
+            .expect("committed value")
+            .value,
+        b"ok".to_vec()
+    );
+    assert_eq!(host.sent_appends, 1);
+    assert_eq!(
+        host.connectivity_records,
+        vec![(remote.clone(), ClusterConnectivityState::Healthy)]
+    );
+    assert!(host.fanout_targets.contains(&remote));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -14191,6 +16785,24 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
             member: &ClusterMemberRecord,
         ) -> Option<Vec<ClusterHealthRow>> {
             self.peer_rows.get(&member.node_id).cloned()
+        }
+    }
+
+    impl ClusterStatusAsyncProbe for StaticClusterStatusProbe {
+        fn probe_member_status_async<'a>(
+            &'a self,
+            _state: &'a ClusterBootstrapState,
+            member: &'a ClusterMemberRecord,
+        ) -> ClusterMembershipRpcFuture<'a, Option<ClusterNodeStatusRecord>> {
+            Box::pin(async move { Ok(self.live.get(&member.node_id).cloned()) })
+        }
+
+        fn peer_local_health_rows_async<'a>(
+            &'a self,
+            _state: &'a ClusterBootstrapState,
+            member: &'a ClusterMemberRecord,
+        ) -> ClusterMembershipRpcFuture<'a, Option<Vec<ClusterHealthRow>>> {
+            Box::pin(async move { Ok(self.peer_rows.get(&member.node_id).cloned()) })
         }
     }
 
@@ -14244,7 +16856,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
 
     let health_request = cluster_health_rpc_request().expect("health rpc request");
     assert_eq!(health_request.route, CLUSTER_HEALTH_ROUTE);
-    assert_eq!(health_request.category, CLUSTER_KV_RPC_CATEGORY);
+    assert_eq!(health_request.category, CLUSTER_HEALTH_RPC_CATEGORY);
     assert!(!cluster_health_rpc_request_is_local_scope(&health_request));
     let local_health_request =
         cluster_local_health_rpc_request().expect("local health rpc request");
@@ -14484,6 +17096,53 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
             .availability,
         ClusterNodeAvailability::Online,
         "reachable peer-local health rows can prove another member online"
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let async_rows = runtime
+        .block_on(cluster_health_rows_with_async_probe(
+            &paths, &state, &probe, true, now,
+        ))
+        .expect("async merged rows");
+    assert_eq!(async_rows.len(), merged_rows.len());
+    assert_eq!(
+        async_rows
+            .iter()
+            .find(|row| row.member.node_id == target_node)
+            .expect("async target row")
+            .availability,
+        ClusterNodeAvailability::Online
+    );
+    let async_merged_response = runtime
+        .block_on(handle_cluster_health_rpc_request_async(
+            &paths,
+            &state,
+            &probe,
+            cluster_health_rpc_request().expect("async health request"),
+            now,
+        ))
+        .expect("async merged health response");
+    let async_merged_response_rows = decode_cluster_health_rpc_response(&async_merged_response)
+        .expect("async merged response rows");
+    assert_eq!(async_merged_response_rows.len(), merged_response_rows.len());
+    let async_current_state_response = runtime
+        .block_on(handle_current_cluster_health_rpc_request_async(
+            runtime.handle(),
+            &paths,
+            &probe,
+            cluster_health_rpc_request().expect("async current-state health request"),
+            now,
+        ))
+        .expect("async current-state health response");
+    let async_current_state_rows =
+        decode_cluster_health_rpc_response(&async_current_state_response)
+            .expect("async current-state response rows");
+    assert_eq!(
+        async_current_state_rows.len(),
+        current_state_response_rows.len()
     );
 
     std::fs::remove_dir_all(root).ok();
@@ -14747,6 +17406,45 @@ impl ClusterNodeStatusPublishHost for RecordingClusterNodeStatusPublishHost {
     }
 }
 
+impl ClusterNodeStatusPublishAsyncHost for RecordingClusterNodeStatusPublishHost {
+    type Error = NetworkError;
+
+    fn published_node_status_matches_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _status: &'a ClusterNodeStatusRecord,
+    ) -> ClusterMembershipRpcFuture<'a, bool> {
+        Box::pin(async move {
+            self.cache_checks += 1;
+            Ok(self.cache_matches)
+        })
+    }
+
+    fn remember_published_node_status_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _status: &'a ClusterNodeStatusRecord,
+    ) -> ClusterMembershipRpcFuture<'a, ()> {
+        Box::pin(async move {
+            self.remembers += 1;
+            Ok(())
+        })
+    }
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.commits += 1;
+            self.last_txn = Some(txn.clone());
+            append_cluster_raft_command(paths, &state.local_node_id, KvCommand::Txn(txn))
+        })
+    }
+}
+
 #[test]
 fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
     let root = std::env::temp_dir().join(format!(
@@ -14793,7 +17491,6 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
         observed_at: now,
     };
     let status_key = cluster_node_status_key(&node_id);
-    let rollout_key = cluster_rollout_node_key(&node_id);
 
     let mut host = RecordingClusterNodeStatusPublishHost::default();
     let result = publish_cluster_node_status_to_quorum_with_host(&paths, status.clone(), &mut host)
@@ -14809,12 +17506,6 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
             .any(|op| matches!(op, KvOp::Put { key, .. } if key == &status_key)),
         "network driver should plan node-status publication"
     );
-    assert!(
-        txn.success
-            .iter()
-            .any(|op| matches!(op, KvOp::Delete { key } if key == &rollout_key)),
-        "network driver should plan rollout sidecar cleanup when status has no rollout"
-    );
 
     let mut stored_match_host = RecordingClusterNodeStatusPublishHost::default();
     let stored_match = publish_cluster_node_status_to_quorum_with_host(
@@ -14827,51 +17518,89 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
     assert_eq!(stored_match_host.commits, 0);
     assert_eq!(stored_match_host.remembers, 1);
 
-    let stale_rollout = ClusterNodeRolloutStatus {
-        status: "stale".to_string(),
-        mode: None,
-        detail: None,
-        phase: None,
-        progress_current: None,
-        progress_total: None,
-        progress_message: None,
-        source: None,
-        requested_at: None,
-        staged_at: None,
-        updated_at: Some("2026-06-07T00:00:00Z".to_string()),
-        failed_at: None,
-        diagnostics: None,
-        stdout_log: None,
-        stderr_log: None,
-        stdout_tail: None,
-        stderr_tail: None,
-    };
-    append_cluster_raft_command(
-        &paths,
-        &node_id,
-        KvCommand::Op(KvOp::put_serde(&rollout_key, &stale_rollout, None).expect("rollout put")),
-    )
-    .expect("inject stale rollout sidecar");
-    let mut cleanup_host = RecordingClusterNodeStatusPublishHost::default();
-    let cleanup =
-        publish_cluster_node_status_to_quorum_with_host(&paths, status.clone(), &mut cleanup_host)
-            .expect("cleanup stale rollout sidecar");
-    assert!(cleanup.is_some());
-    assert_eq!(cleanup_host.commits, 1);
-    assert!(
-        read_cluster_kv_current_snapshot(&paths)
-            .expect("snapshot after cleanup")
-            .get(&rollout_key)
-            .is_none(),
-        "stored stable node status must not hide stale rollout sidecar cleanup"
-    );
-
-    cleanup_host.cache_matches = true;
-    cleanup_host.commits = 0;
-    let cached = publish_cluster_node_status_to_quorum_with_host(&paths, status, &mut cleanup_host)
-        .expect("cached node status");
+    stored_match_host.cache_matches = true;
+    let cached =
+        publish_cluster_node_status_to_quorum_with_host(&paths, status, &mut stored_match_host)
+            .expect("cached node status");
     assert!(cached.is_none());
-    assert_eq!(cleanup_host.commits, 0);
+    assert_eq!(stored_match_host.commits, 0);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn node_status_async_quorum_publish_driver_delegates() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-node-status-async-quorum-driver-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_node_status_async_quorum_driver").expect("cluster");
+    let node_id = NodeId::from_legacy_named("node_status_async_quorum_driver").expect("node");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "node status async quorum driver",
+        node_id.clone(),
+        "node",
+        "public-key",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
+
+    let status = ClusterNodeStatusRecord {
+        cluster_id,
+        node_id: node_id.clone(),
+        process: "daemon-main".to_string(),
+        availability: ClusterNodeAvailability::Online,
+        daemon_version: "0.1.0-test".to_string(),
+        commit: None,
+        target_os: Some("test-os".to_string()),
+        target_arch: Some("test-arch".to_string()),
+        pid: Some(42),
+        address: Some("127.0.0.1:21353".to_string()),
+        bind_address: Some("0.0.0.0:21353".to_string()),
+        executable: Some("sinomo".to_string()),
+        rollout: None,
+        daemon_started_at: Some("2026-06-07T00:00:00Z".to_string()),
+        observed_at: now,
+    };
+    let status_key = cluster_node_status_key(&node_id);
+
+    let mut host = RecordingClusterNodeStatusPublishHost::default();
+    let result = runtime
+        .block_on(publish_cluster_node_status_to_quorum_async_with_host(
+            runtime.handle(),
+            &paths,
+            status,
+            &mut host,
+        ))
+        .expect("async node status publish");
+    assert!(result.is_some());
+    assert_eq!(host.cache_checks, 1);
+    assert_eq!(host.commits, 1);
+    assert_eq!(host.remembers, 1);
+    assert!(
+        host.last_txn
+            .as_ref()
+            .expect("committed txn")
+            .success
+            .iter()
+            .any(|op| matches!(op, KvOp::Put { key, .. } if key == &status_key)),
+        "async network driver should plan node-status publication"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -15018,48 +17747,6 @@ fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
             .len(),
         "stable node-status publishes should not append no-op raft entries"
     );
-    let stale_rollout = ClusterNodeRolloutStatus {
-        status: "stale".to_string(),
-        mode: None,
-        detail: None,
-        phase: None,
-        progress_current: None,
-        progress_total: None,
-        progress_message: None,
-        source: None,
-        requested_at: None,
-        staged_at: None,
-        updated_at: Some("2026-05-04T00:00:00Z".to_string()),
-        failed_at: None,
-        diagnostics: None,
-        stdout_log: None,
-        stderr_log: None,
-        stdout_tail: None,
-        stderr_tail: None,
-    };
-    append_cluster_raft_command(
-        &paths,
-        &node_id,
-        KvCommand::Op(
-            KvOp::put_serde(cluster_rollout_node_key(&node_id), &stale_rollout, None)
-                .expect("stale rollout put"),
-        ),
-    )
-    .expect("inject stale rollout sidecar");
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("store with stale rollout")
-            .get(&cluster_rollout_node_key(&node_id))
-            .is_some()
-    );
-    sync_cluster_node_status_to_kv(&paths, status).expect("clean stale rollout sidecar");
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("store after stale rollout cleanup")
-            .get(&cluster_rollout_node_key(&node_id))
-            .is_none(),
-        "node-status no-op guard must not skip stale rollout sidecar cleanup"
-    );
 
     let info = ClusterNetworkInfoRecord {
         cluster_id,
@@ -15086,379 +17773,6 @@ fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
         "stable fresh network-info publishes should not append no-op raft entries"
     );
 
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn cluster_module_rollout_status_syncs_to_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-module-rollout-status-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_module_rollout_status").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_module_rollout_status").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "module rollout status",
-        node_id.clone(),
-        "network node",
-        "public-key",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
-
-    let module_id =
-        sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-    let record = ClusterModuleRolloutStatusRecord {
-        cluster_id,
-        node_id: node_id.clone(),
-        rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_candidate").expect("rollout"),
-        module_id: module_id.clone(),
-        artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate").expect("artifact"),
-        stage: "canary".to_string(),
-        current_weight_bps: 500,
-        active_artifact_id: sinomo_core::Id::from_legacy_named("artifact_active").expect("active"),
-        previous_artifact_id: None,
-        candidate_artifact_id: Some(
-            sinomo_core::Id::from_legacy_named("artifact_candidate").expect("candidate"),
-        ),
-        shadow_artifact_id: None,
-        hot_swap_state: "active-candidate".to_string(),
-        telemetry_kind: Some("module.invocation.decision".to_string()),
-        telemetry_last_consumed_sequence: Some(sinomo_events::EventSequence(12)),
-        last_transition_record_id: Some(
-            sinomo_core::Id::from_legacy_named("transition_candidate").expect("transition"),
-        ),
-        updated_at: now,
-    };
-
-    sync_cluster_module_rollout_node_to_kv(&paths, &record).expect("sync module rollout status");
-    let statuses = read_cluster_module_rollout_statuses_from_kv(&paths).expect("statuses");
-
-    assert_eq!(statuses, vec![record]);
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("cluster kv store")
-            .get(&cluster_module_rollout_node_key(&node_id, &module_id))
-            .is_some()
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn cluster_module_rollout_desired_syncs_to_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-module-rollout-desired-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_module_rollout_desired").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_module_rollout_desired").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "module rollout desired",
-        node_id.clone(),
-        "network node",
-        "public-key",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
-
-    let module_id =
-        sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-    let rollout_plan_id =
-        sinomo_core::Id::from_legacy_named("rollout_desired_candidate").expect("rollout");
-    let desired = ClusterModuleRolloutDesiredRecord {
-        cluster_id,
-        state: "active".to_string(),
-        rollout_plan: RolloutPlan {
-            rollout_plan_id: rollout_plan_id.clone(),
-            artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate")
-                .expect("artifact"),
-            module_id: module_id.clone(),
-            target_ring: TrustRing::R3SandboxedModule,
-            strategy: RolloutStrategy::Shadow,
-            target_nodes: vec![node_id.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500, 2_500],
-            rollback_policy: RollbackPolicy::default(),
-        },
-        requested_by_node_id: node_id,
-        release_id: Some(sinomo_core::Id::from_legacy_named("release_job").expect("release")),
-        release_material_hash: Some("blake3:release".to_string()),
-        evidence_refs: vec!["registry://artifact-evidence/release_job".to_string()],
-        requested_at: Some("2026-06-01T00:00:00Z".to_string()),
-        updated_at: now,
-    };
-
-    sync_cluster_module_rollout_desired_to_kv(&paths, &desired)
-        .expect("sync module rollout desired");
-    let desired_records = read_cluster_module_rollout_desired_from_kv(&paths).expect("desired");
-
-    assert_eq!(desired_records, vec![desired]);
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("cluster kv store")
-            .get(&cluster_module_rollout_desired_key(
-                &module_id,
-                &rollout_plan_id
-            ))
-            .is_some()
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn cluster_module_rollout_reconciliation_syncs_to_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-module-rollout-reconcile-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_module_rollout_reconcile").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_module_rollout_reconcile").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "module rollout reconcile",
-        node_id.clone(),
-        "network node",
-        "public-key",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
-
-    let module_id =
-        sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-    let rollout_plan_id =
-        sinomo_core::Id::from_legacy_named("rollout_reconcile_candidate").expect("rollout");
-    let record = ClusterModuleRolloutReconciliationRecord {
-        cluster_id,
-        node_id: node_id.clone(),
-        rollout_plan_id: rollout_plan_id.clone(),
-        module_id: module_id.clone(),
-        artifact_id: sinomo_core::Id::from_legacy_named("artifact_candidate").expect("artifact"),
-        state: "blocked".to_string(),
-        reason: "release material is not available locally".to_string(),
-        release_id: Some(sinomo_core::Id::from_legacy_named("release_job").expect("release")),
-        release_material_hash: Some("blake3:release".to_string()),
-        local_runtime_stage: None,
-        updated_at: now,
-    };
-
-    sync_cluster_module_rollout_reconciliation_to_kv(&paths, &record)
-        .expect("sync module rollout reconciliation");
-    let records =
-        read_cluster_module_rollout_reconciliations_from_kv(&paths).expect("reconciliations");
-
-    assert_eq!(records, vec![record]);
-    assert!(
-        read_cluster_kv_store(&paths)
-            .expect("cluster kv store")
-            .get(&cluster_module_rollout_reconcile_key(
-                &node_id,
-                &module_id,
-                &rollout_plan_id
-            ))
-            .is_some()
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn stable_rollout_and_certificate_syncs_do_not_append_raft_log_entries() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-stable-rollout-put-noop-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-
-    let now = OffsetDateTime::now_utc();
-    let cluster_id =
-        ClusterId::from_legacy_named("cluster_stable_rollout_put_noop").expect("cluster");
-    let node_id = NodeId::from_legacy_named("node_stable_rollout_put_noop").expect("node");
-    let state = ClusterBootstrapState::initialized_locally(
-        cluster_id.clone(),
-        "stable rollout put noop",
-        node_id.clone(),
-        "network node",
-        "public-key",
-        now,
-    );
-    write_cluster_state(&paths, &state).expect("write state");
-    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync members");
-
-    let certificate = certificate(
-        cluster_id.clone(),
-        node_id.clone(),
-        node_id.clone(),
-        "stable-public-key",
-        now + time::Duration::seconds(86_400),
-    );
-    let rollout_desired = ClusterRolloutDesiredRecord {
-        cluster_id: cluster_id.clone(),
-        state: "active".to_string(),
-        source: Some("git".to_string()),
-        mode: Some("canary".to_string()),
-        source_head: Some("abc123".to_string()),
-        source_bundle: None,
-        remote_repo: None,
-        host: Some("127.0.0.1".to_string()),
-        port: Some(21353),
-        shadow_port: Some(21354),
-        requested_at: Some("2026-06-04T00:00:00Z".to_string()),
-        updated_at: now,
-    };
-    let rollout_status = ClusterNodeRolloutStatus {
-        status: "running".to_string(),
-        mode: Some("canary".to_string()),
-        detail: Some("stable repeat publish".to_string()),
-        phase: Some("stage".to_string()),
-        progress_current: Some(1),
-        progress_total: Some(2),
-        progress_message: Some("staged".to_string()),
-        source: Some("git".to_string()),
-        requested_at: Some("2026-06-04T00:00:00Z".to_string()),
-        staged_at: Some("2026-06-04T00:01:00Z".to_string()),
-        updated_at: Some("2026-06-04T00:02:00Z".to_string()),
-        failed_at: None,
-        diagnostics: None,
-        stdout_log: None,
-        stderr_log: None,
-        stdout_tail: None,
-        stderr_tail: None,
-    };
-
-    let module_id =
-        sinomo_core::Id::from_legacy_named("module.trigger.stable_rollout").expect("module");
-    let rollout_plan_id =
-        sinomo_core::Id::from_legacy_named("rollout_stable_repeat").expect("rollout");
-    let candidate_artifact_id =
-        sinomo_core::Id::from_legacy_named("artifact_stable_candidate").expect("candidate");
-    let active_artifact_id =
-        sinomo_core::Id::from_legacy_named("artifact_stable_active").expect("active");
-    let release_id = sinomo_core::Id::from_legacy_named("release_stable_repeat").expect("release");
-    let module_status = ClusterModuleRolloutStatusRecord {
-        cluster_id: cluster_id.clone(),
-        node_id: node_id.clone(),
-        rollout_plan_id: rollout_plan_id.clone(),
-        module_id: module_id.clone(),
-        artifact_id: candidate_artifact_id.clone(),
-        stage: "canary".to_string(),
-        current_weight_bps: 500,
-        active_artifact_id: active_artifact_id.clone(),
-        previous_artifact_id: None,
-        candidate_artifact_id: Some(candidate_artifact_id.clone()),
-        shadow_artifact_id: None,
-        hot_swap_state: "active-candidate".to_string(),
-        telemetry_kind: Some("module.invocation.decision".to_string()),
-        telemetry_last_consumed_sequence: Some(sinomo_events::EventSequence(42)),
-        last_transition_record_id: Some(
-            sinomo_core::Id::from_legacy_named("transition_stable_repeat").expect("transition"),
-        ),
-        updated_at: now,
-    };
-    let rollout_plan = RolloutPlan {
-        rollout_plan_id: rollout_plan_id.clone(),
-        artifact_id: candidate_artifact_id.clone(),
-        module_id: module_id.clone(),
-        target_ring: TrustRing::R3SandboxedModule,
-        strategy: RolloutStrategy::Canary,
-        target_nodes: vec![node_id.clone()],
-        initial_weight_bps: 500,
-        promotion_steps_bps: vec![1_000, 5_000],
-        rollback_policy: RollbackPolicy::default(),
-    };
-    let module_desired = ClusterModuleRolloutDesiredRecord {
-        cluster_id: cluster_id.clone(),
-        state: "active".to_string(),
-        rollout_plan,
-        requested_by_node_id: node_id.clone(),
-        release_id: Some(release_id.clone()),
-        release_material_hash: Some("blake3:stable-repeat".to_string()),
-        evidence_refs: vec!["registry://artifact-evidence/stable-repeat".to_string()],
-        requested_at: Some("2026-06-04T00:00:00Z".to_string()),
-        updated_at: now,
-    };
-    let reconciliation = ClusterModuleRolloutReconciliationRecord {
-        cluster_id,
-        node_id: node_id.clone(),
-        rollout_plan_id: rollout_plan_id.clone(),
-        module_id: module_id.clone(),
-        artifact_id: candidate_artifact_id,
-        state: "ready".to_string(),
-        reason: "candidate material verified".to_string(),
-        release_id: Some(release_id),
-        release_material_hash: Some("blake3:stable-repeat".to_string()),
-        local_runtime_stage: Some("loaded".to_string()),
-        updated_at: now,
-    };
-
-    sync_cluster_certificate_to_kv(&paths, &certificate).expect("sync certificate");
-    sync_cluster_rollout_desired_to_kv(&paths, &rollout_desired).expect("sync rollout desired");
-    sync_cluster_rollout_node_to_kv(&paths, &rollout_status, &node_id).expect("sync rollout node");
-    sync_cluster_module_rollout_node_to_kv(&paths, &module_status)
-        .expect("sync module rollout status");
-    sync_cluster_module_rollout_desired_to_kv(&paths, &module_desired)
-        .expect("sync module rollout desired");
-    sync_cluster_module_rollout_reconciliation_to_kv(&paths, &reconciliation)
-        .expect("sync module rollout reconciliation");
-
-    let wal_path = cluster_raft_wal_paths(&paths, &node_id).wal;
-    let wal_len_after_first = std::fs::metadata(&wal_path)
-        .expect("wal after first publishes")
-        .len();
-
-    sync_cluster_certificate_to_kv(&paths, &certificate).expect("repeat certificate");
-    sync_cluster_rollout_desired_to_kv(&paths, &rollout_desired).expect("repeat rollout desired");
-    sync_cluster_rollout_node_to_kv(&paths, &rollout_status, &node_id)
-        .expect("repeat rollout node");
-    sync_cluster_module_rollout_node_to_kv(&paths, &module_status)
-        .expect("repeat module rollout status");
-    sync_cluster_module_rollout_desired_to_kv(&paths, &module_desired)
-        .expect("repeat module rollout desired");
-    sync_cluster_module_rollout_reconciliation_to_kv(&paths, &reconciliation)
-        .expect("repeat module rollout reconciliation");
-
-    assert_eq!(
-        wal_len_after_first,
-        std::fs::metadata(&wal_path)
-            .expect("wal after stable repeats")
-            .len(),
-        "stable rollout and certificate syncs should not append no-op raft entries"
-    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -16818,7 +19132,7 @@ fn raft_config_allows_voter_removal_with_overlapping_quorum() {
     let node_a = NodeId::from_legacy_named("node_raft_config_overlap_a").expect("node a");
     let node_b = NodeId::from_legacy_named("node_raft_config_overlap_b").expect("node b");
     let node_c = NodeId::from_legacy_named("node_raft_config_overlap_c").expect("node c");
-    let current = ClusterRaftConfigRecord {
+    let current = ClusterKvRaftConfigRecord {
         cluster_id: cluster_id.clone(),
         term: 1,
         kv_revision: 1,
@@ -16827,7 +19141,7 @@ fn raft_config_allows_voter_removal_with_overlapping_quorum() {
         non_voting: Vec::new(),
         updated_at: OffsetDateTime::now_utc(),
     };
-    let next = ClusterRaftConfigRecord {
+    let next = ClusterKvRaftConfigRecord {
         cluster_id,
         term: 1,
         kv_revision: 1,
@@ -16837,7 +19151,8 @@ fn raft_config_allows_voter_removal_with_overlapping_quorum() {
         updated_at: OffsetDateTime::now_utc(),
     };
 
-    validate_raft_config_transition(&current, &next).expect("overlapping quorum");
+    sinomo_kv::validate_cluster_kv_raft_config_transition(&current, &next)
+        .expect("overlapping quorum");
 }
 
 #[test]
@@ -16846,7 +19161,7 @@ fn raft_config_rejects_voter_removal_without_old_quorum_overlap() {
         ClusterId::from_legacy_named("cluster_raft_config_no_overlap").expect("cluster");
     let node_a = NodeId::from_legacy_named("node_raft_config_no_overlap_a").expect("node a");
     let node_b = NodeId::from_legacy_named("node_raft_config_no_overlap_b").expect("node b");
-    let current = ClusterRaftConfigRecord {
+    let current = ClusterKvRaftConfigRecord {
         cluster_id: cluster_id.clone(),
         term: 1,
         kv_revision: 1,
@@ -16855,7 +19170,7 @@ fn raft_config_rejects_voter_removal_without_old_quorum_overlap() {
         non_voting: Vec::new(),
         updated_at: OffsetDateTime::now_utc(),
     };
-    let next = ClusterRaftConfigRecord {
+    let next = ClusterKvRaftConfigRecord {
         cluster_id,
         term: 1,
         kv_revision: 1,
@@ -16865,7 +19180,7 @@ fn raft_config_rejects_voter_removal_without_old_quorum_overlap() {
         updated_at: OffsetDateTime::now_utc(),
     };
 
-    assert!(validate_raft_config_transition(&current, &next).is_err());
+    assert!(sinomo_kv::validate_cluster_kv_raft_config_transition(&current, &next).is_err());
 }
 
 #[test]
@@ -17135,93 +19450,6 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     .expect("drain active watch");
     assert_eq!(drained.events, vec![event]);
     assert_eq!(drained.next_revision, KvRevision(2));
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
-fn cluster_kv_local_read_watch_rpc_dispatches_range_and_watch_lifecycle() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-read-watch-rpc-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let mut store = InProcessKvStore::new();
-    store
-        .put("/config/rpc/a", b"a".to_vec(), None)
-        .expect("seed range value");
-    write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
-
-    let range_request = ObjectRpcRequest::encode_body(
-        CLUSTER_KV_RANGE_PREFIX_ROUTE,
-        CLUSTER_KV_RPC_CATEGORY,
-        &"/config/rpc/".to_string(),
-    )
-    .expect("range request");
-    let range_response = handle_cluster_kv_read_watch_rpc_request(&paths, &range_request)
-        .expect("range response")
-        .expect("handled range response");
-    let entries: Vec<KvEntry> = range_response.decode_body().expect("range body");
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].key, "/config/rpc/a");
-    assert_eq!(entries[0].value, b"a".to_vec());
-
-    let watch_request = ObjectRpcRequest::encode_body(
-        CLUSTER_KV_WATCH_PREFIX_ROUTE,
-        CLUSTER_KV_RPC_CATEGORY,
-        &ClusterKvWatchPrefixRequest {
-            prefix: "/config/rpc/".to_string(),
-            start_revision: KvRevision(1),
-        },
-    )
-    .expect("watch request");
-    let watch_response = handle_cluster_kv_read_watch_rpc_request(&paths, &watch_request)
-        .expect("watch response")
-        .expect("handled watch response");
-    let watch: ClusterKvWatchRegistration = watch_response.decode_body().expect("watch body");
-    assert_eq!(watch.prefix, "/config/rpc/");
-    assert_eq!(watch.next_revision, KvRevision(1));
-
-    let drain_request = ObjectRpcRequest::encode_body(
-        CLUSTER_KV_WATCH_DRAIN_ROUTE,
-        CLUSTER_KV_RPC_CATEGORY,
-        &ClusterKvWatchDrainRequest {
-            watch_id: watch.watch_id,
-            wait_timeout_millis: 0,
-        },
-    )
-    .expect("drain request");
-    let drain_response = handle_cluster_kv_read_watch_rpc_request(&paths, &drain_request)
-        .expect("drain response")
-        .expect("handled drain response");
-    let drained: ClusterKvWatchDrainResponse = drain_response.decode_body().expect("drain body");
-    assert_eq!(drained.watch_id, watch.watch_id);
-    assert!(
-        drained
-            .events
-            .iter()
-            .any(|event| event.key == "/config/rpc/a")
-    );
-
-    let cancel_request = ObjectRpcRequest::encode_body(
-        CLUSTER_KV_WATCH_CANCEL_ROUTE,
-        CLUSTER_KV_RPC_CATEGORY,
-        &ClusterKvWatchCancelRequest {
-            watch_id: watch.watch_id,
-        },
-    )
-    .expect("cancel request");
-    let cancel_response = handle_cluster_kv_read_watch_rpc_request(&paths, &cancel_request)
-        .expect("cancel response")
-        .expect("handled cancel response");
-    let cancelled: ClusterKvWatchCancelResponse =
-        cancel_response.decode_body().expect("cancel body");
-    assert_eq!(cancelled.watch_id, watch.watch_id);
-    assert!(cancelled.cancelled);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -18308,21 +20536,6 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
             .is_empty()
     );
     assert!(
-        read_cluster_module_rollout_statuses_from_kv(&paths)
-            .expect("rollout statuses")
-            .is_empty()
-    );
-    assert!(
-        read_cluster_module_rollout_desired_from_kv(&paths)
-            .expect("rollout desired")
-            .is_empty()
-    );
-    assert!(
-        read_cluster_module_rollout_reconciliations_from_kv(&paths)
-            .expect("rollout reconciliations")
-            .is_empty()
-    );
-    assert!(
         read_cluster_network_info_from_kv(&paths)
             .expect("network info")
             .is_empty()
@@ -18508,7 +20721,7 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         },
     )
     .expect("create watch");
-    let (started_tx, started_rx) = mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let drain_paths = paths.clone();
     let handle = thread::spawn(move || {
         started_tx.send(()).expect("signal drain start");
@@ -18575,7 +20788,7 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
     reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_id);
     let drain_paths = paths.clone();
-    let (done_tx, done_rx) = mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let unrelated_handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
@@ -18612,7 +20825,10 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
         .expect("append unrelated watch event");
     thread::sleep(Duration::from_millis(75));
     assert!(
-        matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
         "unrelated prefix event should not wake the waiting watch"
     );
     assert_eq!(
@@ -18722,7 +20938,7 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     reset_cluster_kv_watch_drain_once_calls_for_test(&paths);
     reset_cluster_kv_watch_unchanged_wakeups_for_test(&paths, watch_a_id);
     let drain_paths = paths.clone();
-    let (done_tx, done_rx) = mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
     let handle = thread::spawn(move || {
         let started = Instant::now();
         let drained = drain_cluster_kv_watch(
@@ -18759,7 +20975,10 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
         .expect("append watch b event");
     thread::sleep(Duration::from_millis(75));
     assert!(
-        matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
         "an event matching another active watch should not complete watch a's long poll"
     );
     assert_eq!(
@@ -19281,7 +21500,7 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
     )
     .expect("create watch");
     let expected_watch_id = watch.watch_id;
-    let (started_tx, started_rx) = mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let drain_paths = paths.clone();
     let handle = thread::spawn(move || {
         started_tx.send(()).expect("signal drain start");
@@ -19384,7 +21603,7 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
         },
     )
     .expect("create watch");
-    let (started_tx, started_rx) = mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
     let drain_paths = paths.clone();
     let handle = thread::spawn(move || {
         started_tx.send(()).expect("signal drain start");
@@ -20398,7 +22617,9 @@ fn committed_raft_index_reports_only_new_events() {
         }),
     )
     .expect("append first");
-    commit_cluster_raft_index_with_events(&paths, &node_id, first.index).expect("commit first");
+    LocalClusterRaftCommandStorage::new(&paths, node_id.clone())
+        .commit_cluster_raft_index_with_events(first.index)
+        .expect("commit first");
     let second = append_cluster_raft_command_uncommitted(
         &paths,
         &node_id,
@@ -20421,8 +22642,9 @@ fn committed_raft_index_reports_only_new_events() {
     )
     .expect("append second");
 
-    let committed =
-        commit_cluster_raft_index_with_events(&paths, &node_id, second.index).expect("commit");
+    let committed = LocalClusterRaftCommandStorage::new(&paths, node_id.clone())
+        .commit_cluster_raft_index_with_events(second.index)
+        .expect("commit");
 
     assert_eq!(committed.events.len(), 2);
     assert_eq!(committed.events[0].key, "/committed/two");
@@ -20465,7 +22687,9 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
             }),
         )
         .expect("append");
-        commit_cluster_raft_index_with_events(&paths, &node_id, entry.index).expect("commit");
+        LocalClusterRaftCommandStorage::new(&paths, node_id.clone())
+            .commit_cluster_raft_index_with_events(entry.index)
+            .expect("commit");
     }
 
     let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
@@ -20473,81 +22697,6 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
     assert!(
         stored.kv.events.len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
         "raft snapshots should not retain an unbounded event tail"
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-struct ClusterRaftSnapshotByteLimitGuard {
-    previous: u64,
-}
-
-impl ClusterRaftSnapshotByteLimitGuard {
-    fn install(limit: u64) -> Self {
-        Self {
-            previous: crate::storage::set_cluster_kv_raft_snapshot_byte_limit_for_test(limit),
-        }
-    }
-}
-
-impl Drop for ClusterRaftSnapshotByteLimitGuard {
-    fn drop(&mut self) {
-        crate::storage::set_cluster_kv_raft_snapshot_byte_limit_for_test(self.previous);
-    }
-}
-
-#[test]
-fn cluster_raft_oversized_snapshot_with_compacted_events_is_idle_on_open() {
-    let _limit_guard = ClusterRaftSnapshotByteLimitGuard::install(1);
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-oversized-snapshot-idle-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let data_dir = SinomoDataDir::new(&root);
-    let paths = ClusterPaths::new(&data_dir);
-    paths.ensure().expect("cluster paths");
-    let node_id = NodeId::from_legacy_named("node_oversized_snapshot_idle").expect("node");
-    let wal_paths = cluster_raft_wal_paths(&paths, &node_id);
-
-    {
-        let mut node = DurableRaftKvNode::open(node_id.clone(), wal_paths.clone()).expect("open");
-        let entry = node
-            .append_local_command(
-                1,
-                KvCommand::Op(KvOp::Put {
-                    key: "/oversized/snapshot/value".to_string(),
-                    value: b"value".to_vec(),
-                    lease_id: None,
-                }),
-            )
-            .expect("append");
-        node.commit_to(entry.index).expect("commit");
-        node.compact_event_history_to(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
-        node.save_snapshot().expect("snapshot");
-        assert!(
-            node.store().event_history_len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
-            "fixture should have no compactable event-history tail"
-        );
-    }
-
-    let before = std::fs::metadata(&wal_paths.snapshot).expect("snapshot before");
-    assert!(
-        before.len() > 1,
-        "test threshold should make this ordinary snapshot look oversized"
-    );
-    thread::sleep(Duration::from_millis(20));
-    let reopened = open_cluster_raft_kv_node(&paths, &node_id).expect("open compacted snapshot");
-    assert_eq!(reopened.snapshot_index(), 1);
-    drop(reopened);
-    let after = std::fs::metadata(&wal_paths.snapshot).expect("snapshot after");
-
-    assert_eq!(before.len(), after.len());
-    assert_eq!(
-        before.modified().ok(),
-        after.modified().ok(),
-        "oversized snapshots without compactable event history should not be re-saved on idle open"
     );
     std::fs::remove_dir_all(root).ok();
 }
@@ -20867,6 +23016,18 @@ fn mdns_discovery_records_clamp_advertised_ttl() {
         helper_record.expires_after_tick,
         20 + crate::lan::MAX_SINOMO_LAN_DISCOVERY_TTL_TICKS,
         "direct record helpers should share the same TTL bound"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_mdns_discovery_socket_binds_and_drains_without_blocking() {
+    let socket = AsyncMdnsDiscoverySocket::bind_port(0)
+        .await
+        .expect("async mdns socket");
+
+    assert!(
+        socket.drain().expect("empty async mdns drain").is_empty(),
+        "fresh async mDNS socket should drain immediately without waiting for a datagram"
     );
 }
 
@@ -21664,6 +23825,7 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
     )
     .expect("write shadow iroh endpoint");
 
+    let mut async_state = state.clone();
     let changed =
         refresh_local_iroh_endpoints_from_disk(&paths, &mut state, updated_at).expect("refresh");
 
@@ -21691,6 +23853,56 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
                 == stable_iroh_endpoint_id(&shadow_node_id, "shadow_iroh_public_key")
             && endpoint.address == "iroh://shadow_iroh_public_key?relay=https://relay.example/"
     }));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let async_changed = runtime
+        .block_on(refresh_local_iroh_endpoints_from_disk_async(
+            runtime.handle(),
+            &paths,
+            &mut async_state,
+            updated_at,
+        ))
+        .expect("async refresh");
+    assert!(async_changed);
+    assert_eq!(async_state.updated_at, updated_at);
+    let async_main = async_state
+        .members
+        .iter()
+        .find(|member| member.node_id == local_node_id)
+        .expect("async main member");
+    assert!(async_main.endpoints.iter().any(|endpoint| {
+        endpoint.transport == ClusterTransportKind::Iroh
+            && endpoint.endpoint_id
+                == stable_iroh_endpoint_id(&local_node_id, "main_iroh_public_key")
+    }));
+    let mut async_membership_state = ClusterBootstrapState::initialized_locally(
+        ClusterId::from_legacy_named("cluster_refresh_local_iroh_membership").expect("cluster"),
+        "refresh local iroh membership async",
+        local_node_id.clone(),
+        "local",
+        "old-main-public-key",
+        now,
+    );
+    ensure_daemon_cluster_members(&mut async_membership_state, Vec::new(), Vec::new(), now);
+    let membership_refresh = runtime
+        .block_on(refresh_local_daemon_membership_from_disk_async(
+            runtime.handle(),
+            &paths,
+            &mut async_membership_state,
+            ClusterLocalDaemonMembershipObservation {
+                main_endpoints: Vec::new(),
+                shadow_endpoints: Vec::new(),
+                main_public_key: "async-main-public-key".to_string(),
+                shadow_public_key: "async-shadow-public-key".to_string(),
+                timestamp: updated_at,
+            },
+        ))
+        .expect("async membership refresh");
+    assert!(membership_refresh.iroh_endpoints_changed);
+    assert!(membership_refresh.public_keys_changed);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -22118,7 +24330,7 @@ fn in_process_transport_wait_for_incoming_wakes_on_send() {
     let mut transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
     let waiter_transport = transport_b.clone();
-    let (ready_tx, ready_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let waiter = thread::spawn(move || {
         ready_tx.send(()).expect("signal waiter ready");
         let started = Instant::now();
@@ -22166,64 +24378,6 @@ fn in_process_transport_wait_for_incoming_wakes_on_send() {
 }
 
 #[test]
-fn default_transport_wait_for_incoming_uses_pending_count_hint() {
-    #[derive(Clone)]
-    struct CountedPendingTransport {
-        local_node_id: NodeId,
-        pending: Arc<Mutex<usize>>,
-    }
-
-    impl NetworkTransport for CountedPendingTransport {
-        fn local_node_id(&self) -> &NodeId {
-            &self.local_node_id
-        }
-
-        fn send(
-            &mut self,
-            target_node_id: &NodeId,
-            _frame: NetworkFrame,
-        ) -> Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
-            })
-        }
-
-        fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-            Ok(Vec::new())
-        }
-
-        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-            Ok(Some(*self.pending.lock().expect("pending count")))
-        }
-    }
-
-    let transport = CountedPendingTransport {
-        local_node_id: NodeId::from_legacy_named("node_default_wait_hint").expect("node"),
-        pending: Arc::new(Mutex::new(1)),
-    };
-
-    let started = Instant::now();
-    assert!(
-        transport
-            .wait_for_incoming(Duration::from_secs(5))
-            .expect("wait with pending hint"),
-        "a transport with queued inbound frames should not report an idle wait"
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "pending-count-aware default waits should not sleep before reporting queued work"
-    );
-
-    *transport.pending.lock().expect("pending count") = 0;
-    assert!(
-        !transport
-            .wait_for_incoming(Duration::ZERO)
-            .expect("zero wait without pending hint"),
-        "zero-timeout default waits should remain idle when no frames are queued"
-    );
-}
-
-#[test]
 fn in_process_transport_rejects_unknown_targets() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_missing = NodeId::from_legacy_named("node_missing").expect("node");
@@ -22259,14 +24413,13 @@ fn in_process_transport_rejects_unknown_targets() {
     );
 }
 
-/// Look up a delivery's current status via a spawned service's ledger snapshot.
-async fn delivery_status<T, S>(
-    service: &NetworkServiceHandle<T, S>,
+/// Look up a delivery's current status via an async-transport spawned service.
+async fn async_delivery_status<S>(
+    service: &AsyncNetworkServiceHandle<S>,
     delivery_id: RouteDeliveryId,
 ) -> DeliveryStatus
 where
-    T: NetworkTransport + Send + 'static,
-    S: EventStore + Send + 'static,
+    S: Send + 'static,
 {
     service
         .ledger_records()
@@ -22279,17 +24432,379 @@ where
         .status
 }
 
+async fn send_async_test_frame<T: AsyncNetworkTransport>(
+    transport: &mut T,
+    target_node_id: &NodeId,
+    frame: NetworkFrame,
+) -> Result<(), NetworkError> {
+    transport
+        .send_async(target_node_id, frame, AsyncNetworkSendOptions::default())
+        .await
+}
+
+async fn drain_async_test_frames<T: AsyncNetworkTransport>(
+    transport: &mut T,
+) -> Result<Vec<InboundFrame>, NetworkError> {
+    transport.drain_incoming_async(usize::MAX).await
+}
+
 #[tokio::test]
-async fn network_service_delivers_event_and_processes_ack() {
-    let node_a = NodeId::from_legacy_named("node_a").expect("node");
-    let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let session_id = SessionId::from_legacy_named("sess_network").expect("session");
-    let network = InProcessNetwork::new();
+async fn network_service_async_can_spawn_on_explicit_runtime_handle() {
+    let node_a = NodeId::from_legacy_named("node_async_actor_spawn_on").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let transport = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_actor_spawn_on"));
+
+    let service = NetworkService::new(registry, transport)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
+
+    assert_eq!(
+        service
+            .pending_incoming_count()
+            .await
+            .expect("pending incoming"),
+        Some(0)
+    );
+    assert_eq!(
+        service.available_command_capacity(),
+        service.max_command_capacity()
+    );
+    assert!(service.max_command_capacity() > 0);
+    assert!(!service.is_command_queue_closed());
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_dropped_wait_command_releases_actor() {
+    struct StuckWaitTransport {
+        local_node_id: NodeId,
+        wait_entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncNetworkTransport for StuckWaitTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send_async<'a>(
+            &'a mut self,
+            target_node_id: &'a NodeId,
+            _frame: NetworkFrame,
+            _options: AsyncNetworkSendOptions,
+        ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
+            Box::pin(async move {
+                Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                })
+            })
+        }
+
+        fn drain_incoming_async<'a>(
+            &'a mut self,
+            _max_frames: usize,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn pending_incoming_count_async<'a>(
+            &'a mut self,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+            Box::pin(async { Ok(Some(0)) })
+        }
+
+        fn wait_for_incoming_async<'a>(
+            &'a mut self,
+            _timeout: Duration,
+        ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>> {
+            let wait_entered = Arc::clone(&self.wait_entered);
+            Box::pin(async move {
+                wait_entered.notify_one();
+                std::future::pending::<Result<bool, NetworkError>>().await
+            })
+        }
+    }
+
+    let local_node = NodeId::from_legacy_named("node_async_shutdown_timeout").expect("node");
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let transport = StuckWaitTransport {
+        local_node_id: local_node.clone(),
+        wait_entered: Arc::clone(&wait_entered),
+    };
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_shutdown_timeout"));
+    let service = Arc::new(
+        NetworkService::new(registry, transport)
+            .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new()),
+    );
+
+    let wait_task = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move {
+            service
+                .process_incoming_after_wait(Duration::from_secs(60))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), wait_entered.notified())
+        .await
+        .expect("actor entered stuck wait");
+    wait_task.abort();
+    assert!(
+        wait_task
+            .await
+            .expect_err("wait task aborted")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if service
+                .pending_incoming_count()
+                .await
+                .expect("actor accepts new commands")
+                == Some(0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped wait command should release actor");
+
+    let service = match Arc::try_unwrap(service) {
+        Ok(service) => service,
+        Err(_) => panic!("test still holds network service handle references"),
+    };
+    let store = service
+        .shutdown_with_timeout(Duration::from_secs(1))
+        .await
+        .expect("cancelled wait should let actor shut down");
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_dropped_pump_outbound_keeps_delivery_retryable() {
+    let node_a = NodeId::from_legacy_named("node_async_cancel_pump_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_cancel_pump_receiver").expect("node");
+    let network = AsyncInProcessNetwork::with_mailbox_capacity(1);
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    send_async_test_frame(
+        &mut transport_a,
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_a.clone(),
+                    tick: 1,
+                }),
+            },
+        },
+    )
+    .await
+    .expect("prefill target mailbox");
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_cancel_pump_sender"));
+    registry.register_node(node("node_async_cancel_pump_receiver"));
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_async_cancel_pump", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store.append(event).expect("append event");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored event");
+    let service = Arc::new(
+        NetworkService::new(registry, transport_a)
+            .spawn_on_runtime(tokio::runtime::Handle::current(), store),
+    );
+    let deliveries = service.enqueue_event(stored).await.expect("enqueue event");
+    assert_eq!(deliveries.len(), 1);
+    let delivery_id = deliveries[0].delivery_id;
+
+    let mut pump_task = tokio::spawn({
+        let service = Arc::clone(&service);
+        async move { service.pump_outbound().await }
+    });
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        result = &mut pump_task => panic!("pump should wait on target mailbox backpressure: {result:?}"),
+    }
+    pump_task.abort();
+    assert!(
+        pump_task
+            .await
+            .expect_err("pump task aborted")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if service
+                .pending_incoming_count()
+                .await
+                .expect("actor accepts new commands")
+                == Some(0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped pump command should release actor");
+    assert_eq!(
+        async_delivery_status(&service, delivery_id).await,
+        DeliveryStatus::Queued
+    );
+
+    assert_eq!(
+        drain_async_test_frames(&mut transport_b)
+            .await
+            .expect("drain prefilled frame")
+            .len(),
+        1
+    );
+    assert_eq!(service.pump_outbound().await.expect("retry send"), 1);
+    assert_eq!(
+        drain_async_test_frames(&mut transport_b)
+            .await
+            .expect("drain retried frame")
+            .len(),
+        1
+    );
+    assert_eq!(
+        async_delivery_status(&service, delivery_id).await,
+        DeliveryStatus::Sent
+    );
+
+    let service = match Arc::try_unwrap(service) {
+        Ok(service) => service,
+        Err(_) => panic!("test still holds network service handle references"),
+    };
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_dropped_heartbeat_send_releases_actor() {
+    let node_a = NodeId::from_legacy_named("node_async_cancel_heartbeat_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_cancel_heartbeat_receiver").expect("node");
+    let network = AsyncInProcessNetwork::with_mailbox_capacity(1);
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    send_async_test_frame(
+        &mut transport_a,
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_a.clone(),
+                    tick: 1,
+                }),
+            },
+        },
+    )
+    .await
+    .expect("prefill target mailbox");
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_cancel_heartbeat_sender"));
+    registry.register_node(node("node_async_cancel_heartbeat_receiver"));
+    let service = Arc::new(
+        NetworkService::new(registry, transport_a)
+            .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new()),
+    );
+
+    let mut heartbeat_task = tokio::spawn({
+        let service = Arc::clone(&service);
+        let target_node_id = node_b.clone();
+        async move { service.send_heartbeat(target_node_id, 2).await }
+    });
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        result = &mut heartbeat_task => panic!("heartbeat should wait on target mailbox backpressure: {result:?}"),
+    }
+    heartbeat_task.abort();
+    assert!(
+        heartbeat_task
+            .await
+            .expect_err("heartbeat task aborted")
+            .is_cancelled()
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if service
+                .pending_incoming_count()
+                .await
+                .expect("actor accepts new commands")
+                == Some(0)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped heartbeat command should release actor");
+
+    assert_eq!(
+        drain_async_test_frames(&mut transport_b)
+            .await
+            .expect("drain prefilled heartbeat")
+            .len(),
+        1
+    );
+    service
+        .send_heartbeat(node_b.clone(), 3)
+        .await
+        .expect("retry heartbeat");
+    let frames = drain_async_test_frames(&mut transport_b)
+        .await
+        .expect("drain retried heartbeat");
+    assert_eq!(frames.len(), 1);
+    assert!(matches!(
+        &frames[0].frame.message.body,
+        MeshMessageBody::Heartbeat(Heartbeat { tick: 3, .. })
+    ));
+
+    let service = match Arc::try_unwrap(service) {
+        Ok(service) => service,
+        Err(_) => panic!("test still holds network service handle references"),
+    };
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test]
+async fn network_service_async_transport_delivers_event_and_processes_ack() {
+    let node_a = NodeId::from_legacy_named("node_async_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_b").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_network_async").expect("session");
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
-    registry.register_node(node("node_a"));
-    registry.register_node(node("node_b"));
+    registry.register_node(node("node_async_a"));
+    registry.register_node(node("node_async_b"));
     registry
         .join_session(session_id.clone(), node_a.clone())
         .expect("join a");
@@ -22298,7 +24813,8 @@ async fn network_service_delivers_event_and_processes_ack() {
         .expect("join b");
 
     let mut store_a = InMemoryEventStore::new();
-    let event = fixture_event("evt_service_delivery", node_a.clone()).with_session(session_id);
+    let event =
+        fixture_event("evt_service_async_delivery", node_a.clone()).with_session(session_id);
     let receipt = store_a.append(event).expect("append");
     let stored = store_a
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
@@ -22306,11 +24822,18 @@ async fn network_service_delivers_event_and_processes_ack() {
         .pop()
         .expect("stored");
 
-    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store_a);
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
     let deliveries = service_a.enqueue_event(stored).await.expect("enqueue");
     assert_eq!(deliveries.len(), 2);
+    let remote_delivery_id = deliveries
+        .iter()
+        .find(|delivery| delivery.target_node_id == node_b)
+        .expect("remote delivery")
+        .delivery_id;
     assert_eq!(service_a.pump_outbound().await.expect("send"), 2);
 
     let outcomes = service_b.process_incoming().await.expect("process event");
@@ -22335,135 +24858,883 @@ async fn network_service_delivers_event_and_processes_ack() {
         .filter(|record| record.delivery.status == DeliveryStatus::Delivered)
         .count();
     assert_eq!(delivered, 1);
+    assert_eq!(
+        async_delivery_status(&service_a, remote_delivery_id).await,
+        DeliveryStatus::Delivered
+    );
     let store_a = service_a.shutdown().await;
     assert_eq!(store_a.len(), 1);
 }
 
-#[tokio::test]
-async fn process_incoming_keeps_event_when_ack_send_mailbox_is_full() {
-    let node_a = NodeId::from_legacy_named("node_ack_full_sender").expect("node");
-    let node_b = NodeId::from_legacy_named("node_ack_full_receiver").expect("node");
-    let network = InProcessNetwork::new();
-    let transport_a = network.add_node(node_a.clone());
+#[tokio::test(flavor = "current_thread")]
+async fn async_in_process_transport_applies_bounded_mpsc_backpressure() {
+    let node_a = NodeId::from_legacy_named("node_async_mpsc_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_mpsc_receiver").expect("node");
+    let network = AsyncInProcessNetwork::with_mailbox_capacity(1);
+    let mut transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
 
-    for index in 0..crate::peer::IN_PROCESS_MAILBOX_CAPACITY {
-        transport_b
-            .send(
-                &node_a,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(index as u64 + 1),
-                    source_node_id: node_b.clone(),
-                    target_node_id: node_a.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(index as u64 + 1),
-                        origin_node_id: node_b.clone(),
-                        target_node_id: node_a.clone(),
-                        body: MeshMessageBody::Heartbeat(Heartbeat {
-                            node_id: node_b.clone(),
-                            tick: index as u64,
-                        }),
-                    },
+    transport_a
+        .send_async(
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_a.clone(),
+                        tick: 1,
+                    }),
                 },
-            )
-            .expect("fill sender mailbox");
+            },
+            AsyncNetworkSendOptions::default(),
+        )
+        .await
+        .expect("first frame fits mailbox");
+
+    let second = transport_a.send_async(
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(2),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(2),
+                origin_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_a,
+                    tick: 2,
+                }),
+            },
+        },
+        AsyncNetworkSendOptions::default(),
+    );
+    tokio::pin!(second);
+
+    let completed_early = tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(5)) => false,
+        result = &mut second => {
+            result.expect("second send");
+            true
+        }
+    };
+
+    assert!(
+        !completed_early,
+        "bounded async mailbox should apply backpressure until the receiver drains"
+    );
+    assert_eq!(
+        transport_b
+            .drain_incoming_async(1)
+            .await
+            .expect("drain first")
+            .len(),
+        1
+    );
+    second.await.expect("second send completes after drain");
+    assert_eq!(
+        transport_b
+            .drain_incoming_async(usize::MAX)
+            .await
+            .expect("drain second")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_in_process_transport_zero_wait_reports_queued_frames() {
+    let node_a = NodeId::from_legacy_named("node_async_zero_wait_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_zero_wait_receiver").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+
+    transport_a
+        .send_async(
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(1),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(1),
+                    origin_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_a,
+                        tick: 1,
+                    }),
+                },
+            },
+            AsyncNetworkSendOptions::default(),
+        )
+        .await
+        .expect("queue frame");
+
+    assert_eq!(
+        transport_b
+            .pending_incoming_count_async()
+            .await
+            .expect("pending incoming"),
+        Some(1)
+    );
+    assert!(
+        transport_b
+            .wait_for_incoming_async(Duration::ZERO)
+            .await
+            .expect("zero wait"),
+        "zero-duration waits should report already queued async mailbox frames"
+    );
+    assert_eq!(
+        transport_b
+            .drain_incoming_async(usize::MAX)
+            .await
+            .expect("drain")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_in_process_transport_limits_concurrent_sends_per_target() {
+    fn heartbeat_frame(source: &NodeId, target: &NodeId, frame_id: u64) -> NetworkFrame {
+        NetworkFrame {
+            frame_id: NetworkFrameId(frame_id),
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(frame_id),
+                origin_node_id: source.clone(),
+                target_node_id: target.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: source.clone(),
+                    tick: frame_id,
+                }),
+            },
+        }
     }
 
+    let node_a = NodeId::from_legacy_named("node_async_send_limit_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_send_limit_b").expect("node");
+    let node_c = NodeId::from_legacy_named("node_async_send_limit_c").expect("node");
+    let node_filler = NodeId::from_legacy_named("node_async_send_limit_filler").expect("node");
+    let network = AsyncInProcessNetwork::with_mailbox_capacity_and_per_target_send_limit(1, 1);
+    let mut transport_a = network.add_node(node_a.clone());
+    let mut transport_b = network.add_node(node_b.clone());
+    let mut transport_c = network.add_node(node_c.clone());
+    let mut filler = network.add_node(node_filler.clone());
+
+    filler
+        .send_async(
+            &node_b,
+            heartbeat_frame(&node_filler, &node_b, 1),
+            AsyncNetworkSendOptions::default(),
+        )
+        .await
+        .expect("fill target mailbox");
+
+    let first_target = node_b.clone();
+    let first_frame = heartbeat_frame(&node_a, &node_b, 2);
+    let first_send = tokio::spawn(async move {
+        transport_a
+            .send_async(
+                &first_target,
+                first_frame,
+                AsyncNetworkSendOptions::default(),
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+
+    let error = transport_c
+        .send_async(
+            &node_b,
+            heartbeat_frame(&node_c, &node_b, 3),
+            AsyncNetworkSendOptions::timeout(Duration::from_millis(5)),
+        )
+        .await
+        .expect_err("second send attempt should share the target send limit");
+    assert!(
+        matches!(error, NetworkError::Io { ref operation, ref detail }
+            if operation == &format!("async transport send to {node_b}")
+                && detail == "timed out after 5ms"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(
+        transport_b
+            .drain_incoming_async(1)
+            .await
+            .expect("drain filler")
+            .len(),
+        1
+    );
+    first_send
+        .await
+        .expect("join first send")
+        .expect("first send should complete after the mailbox drains");
+    let remaining = transport_b
+        .drain_incoming_async(usize::MAX)
+        .await
+        .expect("drain first pending send");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].frame.frame_id, NetworkFrameId(2));
+}
+
+#[tokio::test]
+async fn network_service_async_mpsc_transport_delivers_event_and_processes_ack() {
+    let node_a = NodeId::from_legacy_named("node_async_mpsc_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_mpsc_b").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_network_async_mpsc").expect("session");
+    let network = AsyncInProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
-    registry.register_node(node("node_ack_full_sender"));
-    registry.register_node(node("node_ack_full_receiver"));
+    registry.register_node(node("node_async_mpsc_a"));
+    registry.register_node(node("node_async_mpsc_b"));
+    registry
+        .join_session(session_id.clone(), node_a.clone())
+        .expect("join a");
+    registry
+        .join_session(session_id.clone(), node_b.clone())
+        .expect("join b");
 
     let mut store_a = InMemoryEventStore::new();
     let event =
-        fixture_event("evt_ack_mailbox_full", node_a.clone()).with_target_node(node_b.clone());
+        fixture_event("evt_service_async_mpsc_delivery", node_a.clone()).with_session(session_id);
     let receipt = store_a.append(event).expect("append");
     let stored = store_a
         .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store_a);
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
-    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
-    assert_eq!(service_a.pump_outbound().await.expect("send event"), 1);
-    assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
-        DeliveryStatus::Sent
-    );
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
-    let outcomes = service_b
-        .process_incoming()
-        .await
-        .expect("event ingest should survive ack send failure");
-    assert!(matches!(
-        outcomes.as_slice(),
-        [
-            InboundOutcome::EventAccepted { .. },
-            InboundOutcome::AckSendFailed {
-                target_node_id,
-                detail,
-                ..
-            }
-        ] if target_node_id == &node_a && detail.contains("mailbox")
-    ));
+    let deliveries = service_a.enqueue_event(stored).await.expect("enqueue");
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(service_a.pump_outbound().await.expect("send"), 2);
 
+    let outcomes = service_b.process_incoming().await.expect("process event");
+    assert_eq!(outcomes.len(), 1);
     let store_b = service_b.shutdown().await;
     assert_eq!(store_b.len(), 1);
+
+    let ack_outcomes = service_a.process_incoming().await.expect("process ack");
+    assert_eq!(ack_outcomes.len(), 2);
+    assert_eq!(
+        ack_outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, InboundOutcome::AckAccepted { .. }))
+            .count(),
+        1
+    );
+    let store_a = service_a.shutdown().await;
+    assert_eq!(store_a.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_async_pump_timeout_cancels_in_flight_transport_send() {
+    struct BlockingSendTransport {
+        local_node_id: NodeId,
+        send_entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncNetworkTransport for BlockingSendTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send_async<'a>(
+            &'a mut self,
+            _target_node_id: &'a NodeId,
+            _frame: NetworkFrame,
+            _options: AsyncNetworkSendOptions,
+        ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
+            let send_entered = Arc::clone(&self.send_entered);
+            Box::pin(async move {
+                send_entered.notify_one();
+                std::future::pending::<Result<(), NetworkError>>().await
+            })
+        }
+
+        fn drain_incoming_async<'a>(
+            &'a mut self,
+            _max_frames: usize,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn pending_incoming_count_async<'a>(
+            &'a mut self,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+            Box::pin(async { Ok(Some(0)) })
+        }
+
+        fn wait_for_incoming_async<'a>(
+            &'a mut self,
+            _timeout: Duration,
+        ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>> {
+            Box::pin(async { Ok(false) })
+        }
+    }
+
+    let node_a = NodeId::from_legacy_named("node_async_send_timeout_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_send_timeout_b").expect("node");
+    let send_entered = Arc::new(tokio::sync::Notify::new());
+    let transport_a = BlockingSendTransport {
+        local_node_id: node_a.clone(),
+        send_entered: Arc::clone(&send_entered),
+    };
+
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_send_timeout_a"));
+    registry.register_node(node("node_async_send_timeout_b"));
+    let mut store_a = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_async_send_timeout", node_a.clone()).with_target_node(node_b.clone());
+    let receipt = store_a.append(event).expect("append");
+    let stored = store_a
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service_a = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
+    let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
+
+    let error = {
+        let command_policy = service_a.with_command_timeout(Duration::from_millis(5));
+        let pump = command_policy.pump_outbound();
+        tokio::pin!(pump);
+        tokio::select! {
+            _ = send_entered.notified() => {}
+            result = &mut pump => panic!("pump finished before entering the blocking transport send: {result:?}"),
+        }
+
+        pump.await
+            .expect_err("command deadline should cancel an in-flight transport send")
+    };
+
+    match error {
+        NetworkError::Io { operation, detail } => {
+            assert_eq!(operation, "network-service-command pump-outbound");
+            assert_eq!(detail, "timed out after 5ms");
+        }
+        error => panic!("unexpected error: {error}"),
+    }
+    let records = service_a
+        .with_command_timeout(Duration::from_millis(20))
+        .ledger_records()
+        .await
+        .expect("actor must be free for another command after timed-out transport send");
+    let record = records
+        .into_iter()
+        .find(|record| record.delivery.delivery_id == delivery_id)
+        .expect("delivery record");
+    assert_eq!(record.delivery.status, DeliveryStatus::Queued);
+    assert_eq!(record.attempts, 0);
     service_a.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_async_transport_timeout_uses_remaining_command_budget() {
+    struct RecordingTimeoutTransport {
+        local_node_id: NodeId,
+        wait_entered: Arc<tokio::sync::Notify>,
+        wait_delay: Duration,
+        sent_timeouts: Arc<Mutex<Vec<Option<Duration>>>>,
+    }
+
+    impl AsyncNetworkTransport for RecordingTimeoutTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send_async<'a>(
+            &'a mut self,
+            _target_node_id: &'a NodeId,
+            _frame: NetworkFrame,
+            options: AsyncNetworkSendOptions,
+        ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
+            let sent_timeouts = Arc::clone(&self.sent_timeouts);
+            Box::pin(async move {
+                sent_timeouts
+                    .lock()
+                    .expect("sent timeouts")
+                    .push(options.timeout_duration());
+                Ok(())
+            })
+        }
+
+        fn drain_incoming_async<'a>(
+            &'a mut self,
+            _max_frames: usize,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn pending_incoming_count_async<'a>(
+            &'a mut self,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+            Box::pin(async { Ok(Some(0)) })
+        }
+
+        fn wait_for_incoming_async<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>> {
+            let wait_entered = Arc::clone(&self.wait_entered);
+            let wait_delay = self.wait_delay.min(timeout);
+            Box::pin(async move {
+                wait_entered.notify_one();
+                tokio::time::sleep(wait_delay).await;
+                Ok(false)
+            })
+        }
+    }
+
+    let node_a = NodeId::from_legacy_named("node_async_remaining_budget_a").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_remaining_budget_b").expect("node");
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let sent_timeouts = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingTimeoutTransport {
+        local_node_id: node_a.clone(),
+        wait_entered: Arc::clone(&wait_entered),
+        wait_delay: Duration::from_millis(60),
+        sent_timeouts: Arc::clone(&sent_timeouts),
+    };
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_remaining_budget_a"));
+    registry.register_node(node("node_async_remaining_budget_b"));
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_async_remaining_budget", node_a.clone()).with_target_node(node_b);
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored event");
+    let service = NetworkService::new(registry, transport)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
+    service.enqueue_event(stored).await.expect("enqueue");
+
+    let (wait_result, pump_result) = {
+        let wait = service.process_incoming_after_wait(Duration::from_millis(60));
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = wait_entered.notified() => {}
+            result = &mut wait => panic!("actor wait finished before test could queue pump: {result:?}"),
+        }
+
+        let command_policy = service.with_command_timeout(Duration::from_millis(200));
+        let pump = command_policy.pump_outbound();
+        tokio::join!(wait, pump)
+    };
+    wait_result.expect("wait command");
+    assert_eq!(pump_result.expect("pump command"), 1);
+
+    let recorded = sent_timeouts
+        .lock()
+        .expect("sent timeouts")
+        .first()
+        .copied()
+        .flatten()
+        .expect("transport timeout");
+    assert!(
+        recorded < Duration::from_millis(180),
+        "transport send should receive the command's remaining budget, got {recorded:?}"
+    );
+    assert!(
+        recorded > Duration::ZERO,
+        "remaining command budget should stay positive for this test"
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn network_service_async_process_incoming_after_wait_times_out_empty() {
+    let node_a = NodeId::from_legacy_named("node_async_wait_empty").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let transport = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_wait_empty"));
+    let service = NetworkService::new(registry, transport)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
+
+    let outcomes = service
+        .process_incoming_after_wait(Duration::from_millis(5))
+        .await
+        .expect("wait for no incoming frames");
+
+    assert!(outcomes.is_empty());
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_async_wait_does_not_block_current_thread_runtime() {
+    let node_a = NodeId::from_legacy_named("node_async_wait_current_thread").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let transport = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_wait_current_thread"));
+    let service = NetworkService::new(registry, transport)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
+    let timer_won = {
+        let wait = service.process_incoming_after_wait(Duration::from_millis(80));
+        tokio::pin!(wait);
+        let timer = tokio::time::sleep(Duration::from_millis(5));
+        tokio::pin!(timer);
+
+        tokio::select! {
+            _ = &mut timer => true,
+            result = &mut wait => {
+                result.expect("wait should not fail");
+                false
+            }
+        }
+    };
+
+    assert!(
+        timer_won,
+        "async transport wait must yield instead of blocking a current-thread runtime"
+    );
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_async_command_timeout_bounds_waiting_for_actor_reply() {
+    let node_a = NodeId::from_legacy_named("node_async_command_timeout_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_command_timeout_receiver").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_command_timeout_sender"));
+    registry.register_node(node("node_async_command_timeout_receiver"));
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
+
+    let error = service_b
+        .with_command_timeout(Duration::from_millis(5))
+        .process_incoming_after_wait(Duration::from_secs(1))
+        .await
+        .expect_err("command deadline should bound actor reply wait");
+
+    match error {
+        NetworkError::Io { operation, detail } => {
+            assert_eq!(
+                operation,
+                "network-service-command process-incoming-after-wait"
+            );
+            assert_eq!(detail, "timed out after 5ms");
+        }
+        error => panic!("unexpected error: {error}"),
+    }
+
+    send_async_test_frame(
+        &mut transport_a,
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_a,
+                    tick: 1,
+                }),
+            },
+        },
+    )
+    .await
+    .expect("wake actor with inbound frame");
+
+    let store = service_b.shutdown().await;
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn network_service_actor_drops_timed_out_queued_commands_before_transport_work() {
+    struct BlockingWaitTransport {
+        local_node_id: NodeId,
+        wait_entered: Arc<tokio::sync::Notify>,
+        release_wait: Arc<tokio::sync::Notify>,
+        pending_count_calls: Arc<AtomicUsize>,
+    }
+
+    impl AsyncNetworkTransport for BlockingWaitTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+
+        fn send_async<'a>(
+            &'a mut self,
+            target_node_id: &'a NodeId,
+            _frame: NetworkFrame,
+            _options: AsyncNetworkSendOptions,
+        ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
+            Box::pin(async move {
+                Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                })
+            })
+        }
+
+        fn drain_incoming_async<'a>(
+            &'a mut self,
+            _max_frames: usize,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn pending_incoming_count_async<'a>(
+            &'a mut self,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+            let pending_count_calls = Arc::clone(&self.pending_count_calls);
+            Box::pin(async move {
+                pending_count_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(0))
+            })
+        }
+
+        fn wait_for_incoming_async<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>> {
+            let wait_entered = Arc::clone(&self.wait_entered);
+            let release_wait = Arc::clone(&self.release_wait);
+            Box::pin(async move {
+                wait_entered.notify_one();
+                tokio::select! {
+                    _ = release_wait.notified() => Ok(false),
+                    _ = tokio::time::sleep(timeout) => Ok(false),
+                }
+            })
+        }
+    }
+
+    let local_node = NodeId::from_legacy_named("node_async_drop_stale_command").expect("node");
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let release_wait = Arc::new(tokio::sync::Notify::new());
+    let pending_count_calls = Arc::new(AtomicUsize::new(0));
+    let transport = BlockingWaitTransport {
+        local_node_id: local_node,
+        wait_entered: Arc::clone(&wait_entered),
+        release_wait: Arc::clone(&release_wait),
+        pending_count_calls: Arc::clone(&pending_count_calls),
+    };
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_drop_stale_command"));
+    let service = NetworkService::new(registry, transport).spawn_on_runtime_with_options(
+        tokio::runtime::Handle::current(),
+        InMemoryEventStore::new(),
+        NetworkServiceActorOptions {
+            command_queue_capacity: 1,
+            inbound_batch_limit: 1,
+            outbound_batch_limit: 1,
+        },
+    );
+
+    {
+        let wait = service.process_incoming_after_wait(Duration::from_secs(60));
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = wait_entered.notified() => {}
+            result = &mut wait => panic!("actor wait finished before test queued stale command: {result:?}"),
+        }
+
+        let error = service
+            .with_command_timeout(Duration::from_millis(5))
+            .pending_incoming_count()
+            .await
+            .expect_err("queued request should time out while actor is busy");
+        assert!(
+            matches!(error, NetworkError::Io { ref operation, ref detail }
+                if operation == "network-service-command pending-incoming-count"
+                    && detail == "timed out after 5ms"),
+            "unexpected error: {error}"
+        );
+
+        release_wait.notify_one();
+        wait.await.expect("release actor wait");
+    }
+    service
+        .with_command_timeout(Duration::from_millis(50))
+        .ledger_records()
+        .await
+        .expect("actor should process commands after stale request is dropped");
+
+    assert_eq!(
+        pending_count_calls.load(Ordering::SeqCst),
+        0,
+        "timed-out queued commands should not perform transport work"
+    );
+
+    {
+        let wait = service.process_incoming_after_wait(Duration::from_secs(60));
+        tokio::pin!(wait);
+        tokio::select! {
+            _ = wait_entered.notified() => {}
+            result = &mut wait => panic!("actor wait finished before test filled command queue: {result:?}"),
+        }
+
+        let queued = service.ledger_records();
+        tokio::pin!(queued);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            result = &mut queued => panic!("queued request finished while actor was busy: {result:?}"),
+        }
+
+        let error = service
+            .with_command_options(NetworkServiceCommandOptions::fail_if_queue_full())
+            .pending_incoming_count()
+            .await
+            .expect_err("fail-fast request should report full actor queue");
+        assert!(
+            matches!(error, NetworkError::NetworkServiceCommandQueueFull {
+                ref operation,
+                max_commands: 1,
+            } if operation == "pending-incoming-count"),
+            "unexpected error: {error}"
+        );
+
+        release_wait.notify_one();
+        wait.await.expect("release second actor wait");
+        queued.await.expect("drain queued request");
+    }
+
+    let store = service.shutdown().await;
+    assert_eq!(store.len(), 0);
+}
+
+#[tokio::test]
+async fn network_service_async_process_incoming_after_wait_wakes_on_send() {
+    let node_a = NodeId::from_legacy_named("node_async_wait_sender").expect("node");
+    let node_b = NodeId::from_legacy_named("node_async_wait_receiver").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_async_wait_sender"));
+    registry.register_node(node("node_async_wait_receiver"));
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
+    let event =
+        fixture_event("evt_async_wait_receive", node_a.clone()).with_target_node(node_b.clone());
+
+    let frame = NetworkFrame {
+        frame_id: NetworkFrameId(1),
+        source_node_id: node_a.clone(),
+        target_node_id: node_b.clone(),
+        message: MeshMessage {
+            message_id: MeshMessageId(1),
+            origin_node_id: node_a,
+            target_node_id: node_b.clone(),
+            body: MeshMessageBody::Event {
+                delivery_id: RouteDeliveryId(77),
+                event: Box::new(event),
+            },
+        },
+    };
+    let sender = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        send_async_test_frame(&mut transport_a, &node_b, frame)
+            .await
+            .expect("send delayed frame");
+    };
+
+    let started = Instant::now();
+    let ((), outcomes) = tokio::join!(
+        sender,
+        service_b.process_incoming_after_wait(Duration::from_secs(5))
+    );
+    let outcomes = outcomes.expect("wait and process incoming frame");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "actor receive should wake on transport notification instead of waiting for timeout"
+    );
+    assert!(matches!(
+        outcomes.as_slice(),
+        [InboundOutcome::EventAccepted {
+            delivery_id: RouteDeliveryId(77),
+            ..
+        }]
+    ));
+    let store = service_b.shutdown().await;
+    assert_eq!(store.len(), 1);
 }
 
 #[tokio::test]
 async fn process_incoming_ignores_stale_ack_and_continues_batch() {
     let node_a = NodeId::from_legacy_named("node_stale_ack_receiver").expect("node");
     let node_b = NodeId::from_legacy_named("node_stale_ack_sender").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_stale_ack_receiver"));
     registry.register_node(node("node_stale_ack_sender"));
-    let service_a = NetworkService::new(registry, transport_a).spawn(InMemoryEventStore::new());
+    let service_a = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
-    transport_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: node_b.clone(),
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_b.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: node_b.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Ack(DeliveryAck {
-                        delivery_id: RouteDeliveryId(99),
-                        event_id: EventId::from_legacy_named("evt_stale_ack").expect("event"),
-                        target_node_id: node_b.clone(),
-                    }),
-                },
+                body: MeshMessageBody::Ack(DeliveryAck {
+                    delivery_id: RouteDeliveryId(99),
+                    event_id: EventId::from_legacy_named("evt_stale_ack").expect("event"),
+                    target_node_id: node_b.clone(),
+                }),
             },
-        )
-        .expect("send stale ack");
-    transport_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(2),
-                source_node_id: node_b.clone(),
+        },
+    )
+    .await
+    .expect("send stale ack");
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(2),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(2),
+                origin_node_id: node_b.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(2),
-                    origin_node_id: node_b.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_b.clone(),
-                        tick: 7,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_b.clone(),
+                    tick: 7,
+                }),
             },
-        )
-        .expect("send heartbeat after stale ack");
+        },
+    )
+    .await
+    .expect("send heartbeat after stale ack");
 
     let outcomes = service_a
         .process_incoming()
@@ -22490,10 +25761,9 @@ async fn process_incoming_ignores_stale_ack_and_continues_batch() {
 async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() {
     let node_a = NodeId::from_legacy_named("node_ack_event_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_ack_event_receiver").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
-    let transport_b = network.add_node(node_b.clone());
-    let mut ack_injector_b = transport_b.clone();
+    let mut transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_ack_event_sender"));
     registry.register_node(node("node_ack_event_receiver"));
@@ -22507,31 +25777,32 @@ async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() 
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store_a);
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
-    ack_injector_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(99),
-                source_node_id: node_b.clone(),
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(99),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(99),
+                origin_node_id: node_b.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(99),
-                    origin_node_id: node_b.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Ack(DeliveryAck {
-                        delivery_id,
-                        event_id: EventId::from_legacy_named("evt_ack_event_wrong").expect("event"),
-                        target_node_id: node_b.clone(),
-                    }),
-                },
+                body: MeshMessageBody::Ack(DeliveryAck {
+                    delivery_id,
+                    event_id: EventId::from_legacy_named("evt_ack_event_wrong").expect("event"),
+                    target_node_id: node_b.clone(),
+                }),
             },
-        )
-        .expect("inject wrong ack");
+        },
+    )
+    .await
+    .expect("inject wrong ack");
 
     let outcomes = service_a
         .process_incoming()
@@ -22545,10 +25816,12 @@ async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() 
         }] if *ignored_delivery_id == delivery_id && target_node_id == &node_b
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Sent
     );
 
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     let outcomes = service_b
         .process_incoming()
         .await
@@ -22569,7 +25842,7 @@ async fn process_incoming_ignores_mismatched_ack_event_until_real_ack_arrives() 
         }] if *accepted_delivery_id == delivery_id && target_node_id == &node_b
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Delivered
     );
 
@@ -22583,9 +25856,9 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
     let node_a = NodeId::from_legacy_named("node_ack_target_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_ack_target_receiver").expect("node");
     let node_c = NodeId::from_legacy_named("node_ack_target_wrong").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
-    network.add_node(node_b.clone());
+    let _transport_b = network.add_node(node_b.clone());
     let mut transport_c = network.add_node(node_c.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_ack_target_sender"));
@@ -22602,49 +25875,52 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let service_a = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
-    transport_c
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: node_c.clone(),
+    send_async_test_frame(
+        &mut transport_c,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_c.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_c.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: node_c.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Ack(DeliveryAck {
-                        delivery_id,
-                        event_id: expected_event_id,
-                        target_node_id: node_c.clone(),
-                    }),
-                },
+                body: MeshMessageBody::Ack(DeliveryAck {
+                    delivery_id,
+                    event_id: expected_event_id,
+                    target_node_id: node_c.clone(),
+                }),
             },
-        )
-        .expect("send wrong-source ack");
-    transport_c
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(2),
-                source_node_id: node_c.clone(),
+        },
+    )
+    .await
+    .expect("send wrong-source ack");
+    send_async_test_frame(
+        &mut transport_c,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(2),
+            source_node_id: node_c.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(2),
+                origin_node_id: node_c.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(2),
-                    origin_node_id: node_c.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_c.clone(),
-                        tick: 9,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_c.clone(),
+                    tick: 9,
+                }),
             },
-        )
-        .expect("send heartbeat after wrong-source ack");
+        },
+    )
+    .await
+    .expect("send heartbeat after wrong-source ack");
 
     let outcomes = service_a
         .process_incoming()
@@ -22665,7 +25941,7 @@ async fn process_incoming_ignores_wrong_source_ack_and_continues_batch() {
         ] if *ignored_delivery_id == delivery_id && target_node_id == &node_c && node_id == &node_c
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Sent
     );
     service_a.shutdown().await;
@@ -22676,7 +25952,7 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
     let node_a = NodeId::from_legacy_named("node_heartbeat_guard_local").expect("node");
     let node_b = NodeId::from_legacy_named("node_heartbeat_guard_offline").expect("node");
     let node_c = NodeId::from_legacy_named("node_heartbeat_guard_source").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     network.add_node(node_b.clone());
     let mut transport_c = network.add_node(node_c.clone());
@@ -22699,52 +25975,55 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let service_a = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("park offline"), 0);
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::WaitingForPeer
     );
-    transport_c
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: node_c.clone(),
+    send_async_test_frame(
+        &mut transport_c,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_c.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_c.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: node_c.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_b.clone(),
-                        tick: 11,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_b.clone(),
+                    tick: 11,
+                }),
             },
-        )
-        .expect("send mismatched heartbeat");
-    transport_c
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(2),
-                source_node_id: node_c.clone(),
+        },
+    )
+    .await
+    .expect("send mismatched heartbeat");
+    send_async_test_frame(
+        &mut transport_c,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(2),
+            source_node_id: node_c.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(2),
+                origin_node_id: node_c.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(2),
-                    origin_node_id: node_c.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_c.clone(),
-                        tick: 12,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_c.clone(),
+                    tick: 12,
+                }),
             },
-        )
-        .expect("send valid heartbeat");
+        },
+    )
+    .await
+    .expect("send valid heartbeat");
 
     let outcomes = service_a
         .process_incoming()
@@ -22765,7 +26044,7 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
         ] if node_id == &node_b && source_node_id == &node_c && received_node_id == &node_c
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::WaitingForPeer,
         "mismatched heartbeat must not requeue work for the offline peer"
     );
@@ -22781,7 +26060,7 @@ async fn process_incoming_ignores_mismatched_heartbeat_source_and_continues_batc
 async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() {
     let node_a = NodeId::from_legacy_named("node_message_target_local").expect("node");
     let node_b = NodeId::from_legacy_named("node_message_target_remote").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
@@ -22802,48 +26081,51 @@ async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() 
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let service_a = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("park offline"), 0);
-    transport_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: node_b.clone(),
-                target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: node_b.clone(),
-                    target_node_id: node_b.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_b.clone(),
-                        tick: 21,
-                    }),
-                },
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_b.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_b.clone(),
+                    tick: 21,
+                }),
             },
-        )
-        .expect("send message-target mismatch");
-    transport_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(2),
-                source_node_id: node_b.clone(),
+        },
+    )
+    .await
+    .expect("send message-target mismatch");
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(2),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(2),
+                origin_node_id: node_b.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(2),
-                    origin_node_id: node_b.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_b.clone(),
-                        tick: 22,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_b.clone(),
+                    tick: 22,
+                }),
             },
-        )
-        .expect("send valid heartbeat");
+        },
+    )
+    .await
+    .expect("send valid heartbeat");
 
     let outcomes = service_a
         .process_incoming()
@@ -22872,7 +26154,7 @@ async fn process_incoming_ignores_message_target_mismatch_and_continues_batch() 
             && node_id == &node_b
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Retrying
     );
     service_a.shutdown().await;
@@ -22883,7 +26165,7 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
     let node_a = NodeId::from_legacy_named("node_message_origin_local").expect("node");
     let node_b = NodeId::from_legacy_named("node_message_origin_remote").expect("node");
     let node_c = NodeId::from_legacy_named("node_message_origin_spoof").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
     network.add_node(node_c.clone());
@@ -22906,48 +26188,51 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry, transport_a).spawn(store_a);
+    let service_a = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("park offline"), 0);
-    transport_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(1),
-                source_node_id: node_b.clone(),
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(1),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(1),
+                origin_node_id: node_c.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(1),
-                    origin_node_id: node_c.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_b.clone(),
-                        tick: 31,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_b.clone(),
+                    tick: 31,
+                }),
             },
-        )
-        .expect("send message-origin mismatch");
-    transport_b
-        .send(
-            &node_a,
-            NetworkFrame {
-                frame_id: NetworkFrameId(2),
-                source_node_id: node_b.clone(),
+        },
+    )
+    .await
+    .expect("send message-origin mismatch");
+    send_async_test_frame(
+        &mut transport_b,
+        &node_a,
+        NetworkFrame {
+            frame_id: NetworkFrameId(2),
+            source_node_id: node_b.clone(),
+            target_node_id: node_a.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(2),
+                origin_node_id: node_b.clone(),
                 target_node_id: node_a.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(2),
-                    origin_node_id: node_b.clone(),
-                    target_node_id: node_a.clone(),
-                    body: MeshMessageBody::Heartbeat(Heartbeat {
-                        node_id: node_b.clone(),
-                        tick: 32,
-                    }),
-                },
+                body: MeshMessageBody::Heartbeat(Heartbeat {
+                    node_id: node_b.clone(),
+                    tick: 32,
+                }),
             },
-        )
-        .expect("send valid heartbeat");
+        },
+    )
+    .await
+    .expect("send valid heartbeat");
 
     let outcomes = service_a
         .process_incoming()
@@ -22976,7 +26261,7 @@ async fn process_incoming_ignores_message_origin_mismatch_and_continues_batch() 
             && node_id == &node_b
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Retrying
     );
     service_a.shutdown().await;
@@ -22987,7 +26272,7 @@ async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
     let node_a = NodeId::from_legacy_named("node_event_origin_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_event_origin_receiver").expect("node");
     let node_c = NodeId::from_legacy_named("node_event_origin_spoof").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     network.add_node(node_c.clone());
@@ -22995,7 +26280,8 @@ async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
     registry.register_node(node("node_event_origin_sender"));
     registry.register_node(node("node_event_origin_receiver"));
     registry.register_node(node("node_event_origin_spoof"));
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
     let spoofed_event =
         fixture_event("evt_inner_origin_spoof", node_c.clone()).with_target_node(node_b.clone());
@@ -23007,25 +26293,26 @@ async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
         (RouteDeliveryId(1), spoofed_event),
         (RouteDeliveryId(2), valid_event),
     ] {
-        transport_a
-            .send(
-                &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(delivery_id.0),
-                    source_node_id: node_a.clone(),
+        send_async_test_frame(
+            &mut transport_a,
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(delivery_id.0),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(delivery_id.0),
+                    origin_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(delivery_id.0),
-                        origin_node_id: node_a.clone(),
-                        target_node_id: node_b.clone(),
-                        body: MeshMessageBody::Event {
-                            delivery_id,
-                            event: Box::new(event),
-                        },
+                    body: MeshMessageBody::Event {
+                        delivery_id,
+                        event: Box::new(event),
                     },
                 },
-            )
-            .expect("send event");
+            },
+        )
+        .await
+        .expect("send event");
     }
 
     let outcomes = service_b
@@ -23055,7 +26342,9 @@ async fn process_incoming_ignores_event_origin_mismatch_and_continues_batch() {
             && accepted_event_id == &valid_event_id
     ));
 
-    let ack_frames = transport_a.drain_incoming().expect("ack frames");
+    let ack_frames = drain_async_test_frames(&mut transport_a)
+        .await
+        .expect("ack frames");
     assert_eq!(ack_frames.len(), 1);
     assert!(matches!(
         &ack_frames[0].frame.message.body,
@@ -23073,7 +26362,7 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
     let node_a = NodeId::from_legacy_named("node_event_target_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_event_target_receiver").expect("node");
     let node_c = NodeId::from_legacy_named("node_event_target_other").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     network.add_node(node_c.clone());
@@ -23081,7 +26370,8 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
     registry.register_node(node("node_event_target_sender"));
     registry.register_node(node("node_event_target_receiver"));
     registry.register_node(node("node_event_target_other"));
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
     let mistargeted_event =
         fixture_event("evt_inner_target_mismatch", node_a.clone()).with_target_node(node_c.clone());
@@ -23093,25 +26383,26 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
         (RouteDeliveryId(3), mistargeted_event),
         (RouteDeliveryId(4), valid_event),
     ] {
-        transport_a
-            .send(
-                &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(delivery_id.0),
-                    source_node_id: node_a.clone(),
+        send_async_test_frame(
+            &mut transport_a,
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(delivery_id.0),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(delivery_id.0),
+                    origin_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(delivery_id.0),
-                        origin_node_id: node_a.clone(),
-                        target_node_id: node_b.clone(),
-                        body: MeshMessageBody::Event {
-                            delivery_id,
-                            event: Box::new(event),
-                        },
+                    body: MeshMessageBody::Event {
+                        delivery_id,
+                        event: Box::new(event),
                     },
                 },
-            )
-            .expect("send event");
+            },
+        )
+        .await
+        .expect("send event");
     }
 
     let outcomes = service_b
@@ -23141,7 +26432,9 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
             && accepted_event_id == &valid_event_id
     ));
 
-    let ack_frames = transport_a.drain_incoming().expect("ack frames");
+    let ack_frames = drain_async_test_frames(&mut transport_a)
+        .await
+        .expect("ack frames");
     assert_eq!(ack_frames.len(), 1);
     assert!(matches!(
         &ack_frames[0].frame.message.body,
@@ -23158,13 +26451,14 @@ async fn process_incoming_ignores_event_target_mismatch_and_continues_batch() {
 async fn process_incoming_ignores_targetless_origin_only_events_and_continues_batch() {
     let node_a = NodeId::from_legacy_named("node_targetless_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_targetless_receiver").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_targetless_sender"));
     registry.register_node(node("node_targetless_receiver"));
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
     let session_without_id = fixture_event("evt_targetless_session_no_id", node_a.clone());
     let session_without_id_event_id = session_without_id.event_id.clone();
@@ -23180,25 +26474,26 @@ async fn process_incoming_ignores_targetless_origin_only_events_and_continues_ba
         (RouteDeliveryId(6), local_only),
         (RouteDeliveryId(7), trusted_network),
     ] {
-        transport_a
-            .send(
-                &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(delivery_id.0),
-                    source_node_id: node_a.clone(),
+        send_async_test_frame(
+            &mut transport_a,
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(delivery_id.0),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(delivery_id.0),
+                    origin_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(delivery_id.0),
-                        origin_node_id: node_a.clone(),
-                        target_node_id: node_b.clone(),
-                        body: MeshMessageBody::Event {
-                            delivery_id,
-                            event: Box::new(event),
-                        },
+                    body: MeshMessageBody::Event {
+                        delivery_id,
+                        event: Box::new(event),
                     },
                 },
-            )
-            .expect("send event");
+            },
+        )
+        .await
+        .expect("send event");
     }
 
     let outcomes = service_b
@@ -23239,7 +26534,9 @@ async fn process_incoming_ignores_targetless_origin_only_events_and_continues_ba
             && accepted_event_id == &trusted_network_event_id
     ));
 
-    let ack_frames = transport_a.drain_incoming().expect("ack frames");
+    let ack_frames = drain_async_test_frames(&mut transport_a)
+        .await
+        .expect("ack frames");
     assert_eq!(ack_frames.len(), 1);
     assert!(matches!(
         &ack_frames[0].frame.message.body,
@@ -23256,15 +26553,16 @@ async fn process_incoming_ignores_targetless_origin_only_events_and_continues_ba
 async fn network_service_pump_outbound_batches_large_ready_backlogs() {
     let node_a = NodeId::from_legacy_named("node_batch_sender").expect("node");
     let session_id = SessionId::from_legacy_named("sess_batch_delivery").expect("session");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_batch_sender"));
     let target_count = crate::peer::NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT + 1;
+    let mut _target_transports = Vec::with_capacity(target_count);
     for index in 0..target_count {
         let target_id = format!("node_batch_receiver_{index:03}");
         let target_node = NodeId::from_legacy_named(&target_id).expect("target node");
-        network.add_node(target_node.clone());
+        _target_transports.push(network.add_node(target_node.clone()));
         registry.register_node(node(&target_id));
         registry
             .join_session(session_id.clone(), target_node)
@@ -23279,7 +26577,8 @@ async fn network_service_pump_outbound_batches_large_ready_backlogs() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service = NetworkService::new(registry, transport_a).spawn(store);
+    let service = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
     let deliveries = service.enqueue_event(stored).await.expect("enqueue");
     assert_eq!(deliveries.len(), target_count);
 
@@ -23305,37 +26604,39 @@ async fn network_service_pump_outbound_batches_large_ready_backlogs() {
 async fn network_service_process_incoming_batches_large_mailboxes() {
     let node_a = NodeId::from_legacy_named("node_inbound_batch_sender").expect("node");
     let node_b = NodeId::from_legacy_named("node_inbound_batch_receiver").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let frame_count = crate::peer::NETWORK_SERVICE_INBOUND_BATCH_LIMIT + 1;
 
     for index in 0..frame_count {
-        transport_a
-            .send(
-                &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(index as u64 + 1),
-                    source_node_id: node_a.clone(),
+        send_async_test_frame(
+            &mut transport_a,
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(index as u64 + 1),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(index as u64 + 1),
+                    origin_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(index as u64 + 1),
-                        origin_node_id: node_a.clone(),
-                        target_node_id: node_b.clone(),
-                        body: MeshMessageBody::Heartbeat(Heartbeat {
-                            node_id: node_a.clone(),
-                            tick: index as u64,
-                        }),
-                    },
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_a.clone(),
+                        tick: index as u64,
+                    }),
                 },
-            )
-            .expect("enqueue inbound frame");
+            },
+        )
+        .await
+        .expect("enqueue inbound frame");
     }
 
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_inbound_batch_sender"));
     registry.register_node(node("node_inbound_batch_receiver"));
-    let service = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
     assert_eq!(
         service
@@ -23389,6 +26690,108 @@ async fn network_service_process_incoming_batches_large_mailboxes() {
 }
 
 #[tokio::test]
+async fn network_service_actor_options_bound_queue_and_batches() {
+    let options = NetworkServiceActorOptions {
+        command_queue_capacity: 3,
+        inbound_batch_limit: 2,
+        outbound_batch_limit: 2,
+    };
+
+    let node_a = NodeId::from_legacy_named("node_actor_options_sender").expect("node");
+    let session_id = SessionId::from_legacy_named("sess_actor_options").expect("session");
+    let network = AsyncInProcessNetwork::new();
+    let transport_a = network.add_node(node_a.clone());
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_actor_options_sender"));
+    let mut _target_transports = Vec::with_capacity(3);
+    for index in 0..3 {
+        let target_id = format!("node_actor_options_receiver_{index}");
+        let target_node = NodeId::from_legacy_named(&target_id).expect("target node");
+        _target_transports.push(network.add_node(target_node.clone()));
+        registry.register_node(node(&target_id));
+        registry
+            .join_session(session_id.clone(), target_node)
+            .expect("join target");
+    }
+
+    let mut store = InMemoryEventStore::new();
+    let event =
+        fixture_event("evt_actor_options_outbound", node_a.clone()).with_session(session_id);
+    let receipt = store.append(event).expect("append");
+    let stored = store
+        .replay(ReplayQuery::all().after(EventSequence(receipt.sequence.0 - 1)))
+        .expect("replay")
+        .pop()
+        .expect("stored");
+    let service = NetworkService::new(registry, transport_a).spawn_on_runtime_with_options(
+        tokio::runtime::Handle::current(),
+        store,
+        options,
+    );
+    assert_eq!(service.max_command_capacity(), 3);
+    assert_eq!(service.available_command_capacity(), 3);
+
+    let deliveries = service.enqueue_event(stored).await.expect("enqueue");
+    assert_eq!(deliveries.len(), 3);
+    assert_eq!(service.pump_outbound().await.expect("first batch"), 2);
+    assert_eq!(service.pump_outbound().await.expect("second batch"), 1);
+    service.shutdown().await;
+
+    let node_b = NodeId::from_legacy_named("node_actor_options_receiver").expect("node");
+    let network = AsyncInProcessNetwork::new();
+    let mut transport_a = network.add_node(node_a.clone());
+    let transport_b = network.add_node(node_b.clone());
+    for index in 0_u64..3 {
+        send_async_test_frame(
+            &mut transport_a,
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(index + 1),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(index + 1),
+                    origin_node_id: node_a.clone(),
+                    target_node_id: node_b.clone(),
+                    body: MeshMessageBody::Heartbeat(Heartbeat {
+                        node_id: node_a.clone(),
+                        tick: index,
+                    }),
+                },
+            },
+        )
+        .await
+        .expect("enqueue inbound frame");
+    }
+    let mut registry = PeerRegistry::new();
+    registry.register_node(node("node_actor_options_sender"));
+    registry.register_node(node("node_actor_options_receiver"));
+    let service = NetworkService::new(registry, transport_b).spawn_on_runtime_with_options(
+        tokio::runtime::Handle::current(),
+        InMemoryEventStore::new(),
+        options,
+    );
+
+    assert_eq!(
+        service
+            .process_incoming()
+            .await
+            .expect("first inbound batch")
+            .len(),
+        2
+    );
+    assert_eq!(
+        service
+            .process_incoming()
+            .await
+            .expect("second inbound batch")
+            .len(),
+        1
+    );
+    service.shutdown().await;
+}
+
+#[tokio::test]
 async fn network_service_process_incoming_skips_drain_when_transport_reports_empty() {
     #[derive(Clone)]
     struct CountingEmptyTransport {
@@ -23396,28 +26799,46 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
         drain_calls: Arc<Mutex<usize>>,
     }
 
-    impl NetworkTransport for CountingEmptyTransport {
+    impl AsyncNetworkTransport for CountingEmptyTransport {
         fn local_node_id(&self) -> &NodeId {
             &self.local_node_id
         }
 
-        fn send(
-            &mut self,
-            target_node_id: &NodeId,
+        fn send_async<'a>(
+            &'a mut self,
+            target_node_id: &'a NodeId,
             _frame: NetworkFrame,
-        ) -> Result<(), NetworkError> {
-            Err(NetworkError::UnknownNode {
-                node_id: target_node_id.clone(),
+            _options: AsyncNetworkSendOptions,
+        ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
+            Box::pin(async move {
+                Err(NetworkError::UnknownNode {
+                    node_id: target_node_id.clone(),
+                })
             })
         }
 
-        fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
-            *self.drain_calls.lock().expect("drain calls") += 1;
-            Ok(Vec::new())
+        fn drain_incoming_async<'a>(
+            &'a mut self,
+            _max_frames: usize,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+            let drain_calls = Arc::clone(&self.drain_calls);
+            Box::pin(async move {
+                *drain_calls.lock().expect("drain calls") += 1;
+                Ok(Vec::new())
+            })
         }
 
-        fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-            Ok(Some(0))
+        fn pending_incoming_count_async<'a>(
+            &'a mut self,
+        ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+            Box::pin(async { Ok(Some(0)) })
+        }
+
+        fn wait_for_incoming_async<'a>(
+            &'a mut self,
+            _timeout: Duration,
+        ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>> {
+            Box::pin(async { Ok(false) })
         }
     }
 
@@ -23429,7 +26850,8 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
     };
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_empty_inbound_hint"));
-    let service = NetworkService::new(registry, transport).spawn(InMemoryEventStore::new());
+    let service = NetworkService::new(registry, transport)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
 
     assert_eq!(
         service
@@ -23457,7 +26879,7 @@ async fn network_service_process_incoming_skips_drain_when_transport_reports_emp
 async fn delivery_ledger_suppresses_duplicate_event_targets() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
@@ -23470,7 +26892,8 @@ async fn delivery_ledger_suppresses_duplicate_event_targets() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service = NetworkService::new(registry, transport_a).spawn(store);
+    let service = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
 
     assert_eq!(
         service
@@ -23585,7 +27008,7 @@ fn in_process_transport_rejects_full_mailbox() {
 async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     // A bare transport handle injects the duplicate frames; only the receiver runs as
     // a service actor.
     let mut transport_a = network.add_node(node_a.clone());
@@ -23593,7 +27016,8 @@ async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
     registry.register_node(node("node_b"));
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     let event =
         fixture_event("evt_duplicate_inbound", node_a.clone()).with_target_node(node_b.clone());
 
@@ -23612,7 +27036,9 @@ async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
                 },
             },
         };
-        transport_a.send(&node_b, frame).expect("send duplicate");
+        send_async_test_frame(&mut transport_a, &node_b, frame)
+            .await
+            .expect("send duplicate");
     }
 
     let outcomes = service_b
@@ -23629,7 +27055,7 @@ async fn inbound_duplicate_event_is_acked_without_duplicate_append() {
 async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
     let node_a = NodeId::from_legacy_named("node_seen_eviction_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_seen_eviction_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let mut transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
@@ -23637,7 +27063,7 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
     registry.register_node(node("node_seen_eviction_b"));
     let service_b = NetworkService::new(registry, transport_b)
         .with_seen_event_cache_capacity(1)
-        .spawn(InMemoryEventStore::new());
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     let event_one =
         fixture_event("evt_seen_eviction_one", node_a.clone()).with_target_node(node_b.clone());
     let event_two =
@@ -23647,50 +27073,52 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
         (RouteDeliveryId(1), event_one.clone()),
         (RouteDeliveryId(2), event_two),
     ] {
-        transport_a
-            .send(
-                &node_b,
-                NetworkFrame {
-                    frame_id: NetworkFrameId(delivery_id.0),
-                    source_node_id: node_a.clone(),
+        send_async_test_frame(
+            &mut transport_a,
+            &node_b,
+            NetworkFrame {
+                frame_id: NetworkFrameId(delivery_id.0),
+                source_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                message: MeshMessage {
+                    message_id: MeshMessageId(delivery_id.0),
+                    origin_node_id: node_a.clone(),
                     target_node_id: node_b.clone(),
-                    message: MeshMessage {
-                        message_id: MeshMessageId(delivery_id.0),
-                        origin_node_id: node_a.clone(),
-                        target_node_id: node_b.clone(),
-                        body: MeshMessageBody::Event {
-                            delivery_id,
-                            event: Box::new(event),
-                        },
+                    body: MeshMessageBody::Event {
+                        delivery_id,
+                        event: Box::new(event),
                     },
                 },
-            )
-            .expect("send event");
+            },
+        )
+        .await
+        .expect("send event");
     }
 
     let outcomes = service_b.process_incoming().await.expect("process events");
     assert!(matches!(outcomes[0], InboundOutcome::EventAccepted { .. }));
     assert!(matches!(outcomes[1], InboundOutcome::EventAccepted { .. }));
 
-    transport_a
-        .send(
-            &node_b,
-            NetworkFrame {
-                frame_id: NetworkFrameId(3),
-                source_node_id: node_a.clone(),
+    send_async_test_frame(
+        &mut transport_a,
+        &node_b,
+        NetworkFrame {
+            frame_id: NetworkFrameId(3),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(3),
+                origin_node_id: node_a,
                 target_node_id: node_b.clone(),
-                message: MeshMessage {
-                    message_id: MeshMessageId(3),
-                    origin_node_id: node_a,
-                    target_node_id: node_b.clone(),
-                    body: MeshMessageBody::Event {
-                        delivery_id: RouteDeliveryId(3),
-                        event: Box::new(event_one),
-                    },
+                body: MeshMessageBody::Event {
+                    delivery_id: RouteDeliveryId(3),
+                    event: Box::new(event_one),
                 },
             },
-        )
-        .expect("send duplicate after cache eviction");
+        },
+    )
+    .await
+    .expect("send duplicate after cache eviction");
 
     let outcomes = service_b
         .process_incoming()
@@ -23711,7 +27139,7 @@ async fn inbound_duplicate_event_after_cache_eviction_is_deduped_by_store() {
 async fn retry_policy_marks_delivery_failed_after_max_attempts() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
@@ -23726,12 +27154,12 @@ async fn retry_policy_marks_delivery_failed_after_max_attempts() {
         .expect("stored");
     let service = NetworkService::new(registry, transport_a)
         .with_retry_policy(RetryPolicy { max_attempts: 2 })
-        .spawn(store);
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
     let delivery = service.enqueue_event(stored).await.expect("enqueue")[0].clone();
 
     assert!(service.pump_outbound().await.is_ok());
     assert_eq!(
-        delivery_status(&service, delivery.delivery_id).await,
+        async_delivery_status(&service, delivery.delivery_id).await,
         DeliveryStatus::Retrying
     );
     let before_wake = Instant::now();
@@ -23768,7 +27196,7 @@ async fn retry_policy_marks_delivery_failed_after_max_attempts() {
         .expect_err("final attempt should return send failure");
     assert!(matches!(error, NetworkError::UnknownNode { .. }));
     assert_eq!(
-        delivery_status(&service, delivery.delivery_id).await,
+        async_delivery_status(&service, delivery.delivery_id).await,
         DeliveryStatus::Failed
     );
     service.shutdown().await;
@@ -25021,7 +28449,7 @@ fn missed_heartbeats_degrade_then_mark_offline_without_removing_session() {
 async fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_a"));
@@ -25037,19 +28465,20 @@ async fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
         .expect("stored");
     let service_a = NetworkService::new(registry.clone(), transport_a)
         .with_retry_policy(RetryPolicy { max_attempts: 2 })
-        .spawn(store_a);
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store_a);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("first attempt"), 0);
     tokio::time::sleep(Duration::from_millis(120)).await;
     assert!(service_a.pump_outbound().await.is_err());
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Failed
     );
 
     let transport_b = network.add_node(node_b.clone());
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     service_b
         .send_heartbeat(node_a.clone(), 42)
         .await
@@ -25068,7 +28497,7 @@ async fn heartbeat_recovery_requeues_failed_delivery_for_drain() {
         }]
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Retrying
     );
 
@@ -25121,7 +28550,7 @@ fn session_routing_excludes_offline_participants() {
 async fn direct_target_offline_buffers_instead_of_sending() {
     let node_a = NodeId::from_legacy_named("node_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
@@ -25141,7 +28570,8 @@ async fn direct_target_offline_buffers_instead_of_sending() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service = NetworkService::new(registry, transport_a).spawn(store);
+    let service = NetworkService::new(registry, transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
     let delivery_id = service.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(
@@ -25150,14 +28580,20 @@ async fn direct_target_offline_buffers_instead_of_sending() {
         "known-offline direct targets should not create an avoidable pump wake"
     );
     assert_eq!(service.pump_outbound().await.expect("buffer offline"), 0);
-    assert_eq!(transport_b.drain_incoming().expect("drain").len(), 0);
     assert_eq!(
-        delivery_status(&service, delivery_id).await,
+        drain_async_test_frames(&mut transport_b)
+            .await
+            .expect("drain")
+            .len(),
+        0
+    );
+    assert_eq!(
+        async_delivery_status(&service, delivery_id).await,
         DeliveryStatus::WaitingForPeer
     );
     assert_eq!(service.pump_outbound().await.expect("still waiting"), 0);
     assert_eq!(
-        delivery_status(&service, delivery_id).await,
+        async_delivery_status(&service, delivery_id).await,
         DeliveryStatus::WaitingForPeer
     );
     service.shutdown().await;
@@ -25167,7 +28603,7 @@ async fn direct_target_offline_buffers_instead_of_sending() {
 async fn ordinary_heartbeat_does_not_requeue_in_flight_sent_delivery() {
     let node_a = NodeId::from_legacy_named("node_sent_heartbeat_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_sent_heartbeat_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
@@ -25182,13 +28618,15 @@ async fn ordinary_heartbeat_does_not_requeue_in_flight_sent_delivery() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store);
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Sent
     );
     service_b
@@ -25205,7 +28643,7 @@ async fn ordinary_heartbeat_does_not_requeue_in_flight_sent_delivery() {
     ));
     assert_eq!(service_a.pump_outbound().await.expect("no duplicate"), 0);
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Sent
     );
 
@@ -25217,7 +28655,7 @@ async fn ordinary_heartbeat_does_not_requeue_in_flight_sent_delivery() {
 async fn heartbeat_recovery_requeues_delivery_waiting_for_peer() {
     let node_a = NodeId::from_legacy_named("node_waiting_recovery_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_waiting_recovery_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let mut registry = PeerRegistry::new();
     registry.register_node(node("node_waiting_recovery_a"));
@@ -25236,17 +28674,19 @@ async fn heartbeat_recovery_requeues_delivery_waiting_for_peer() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store);
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("buffer offline"), 0);
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::WaitingForPeer
     );
 
     let transport_b = network.add_node(node_b.clone());
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     service_b
         .send_heartbeat(node_a.clone(), 42)
         .await
@@ -25265,7 +28705,7 @@ async fn heartbeat_recovery_requeues_delivery_waiting_for_peer() {
         }]
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Retrying
     );
     assert_eq!(service_a.pump_outbound().await.expect("send recovered"), 1);
@@ -25282,7 +28722,7 @@ async fn heartbeat_recovery_requeues_delivery_waiting_for_peer() {
 async fn missed_heartbeat_parks_sent_delivery_until_recovery() {
     let node_a = NodeId::from_legacy_named("node_sent_recovery_a").expect("node");
     let node_b = NodeId::from_legacy_named("node_sent_recovery_b").expect("node");
-    let network = InProcessNetwork::new();
+    let network = AsyncInProcessNetwork::new();
     let transport_a = network.add_node(node_a.clone());
     let transport_b = network.add_node(node_b.clone());
     let mut registry = PeerRegistry::new();
@@ -25296,13 +28736,15 @@ async fn missed_heartbeat_parks_sent_delivery_until_recovery() {
         .expect("replay")
         .pop()
         .expect("stored");
-    let service_a = NetworkService::new(registry.clone(), transport_a).spawn(store);
-    let service_b = NetworkService::new(registry, transport_b).spawn(InMemoryEventStore::new());
+    let service_a = NetworkService::new(registry.clone(), transport_a)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), store);
+    let service_b = NetworkService::new(registry, transport_b)
+        .spawn_on_runtime(tokio::runtime::Handle::current(), InMemoryEventStore::new());
     let delivery_id = service_a.enqueue_event(stored).await.expect("enqueue")[0].delivery_id;
 
     assert_eq!(service_a.pump_outbound().await.expect("send"), 1);
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Sent
     );
     assert_eq!(
@@ -25320,7 +28762,7 @@ async fn missed_heartbeat_parks_sent_delivery_until_recovery() {
         (PeerStatus::Suspect, 1)
     );
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::WaitingForPeer
     );
     assert_eq!(service_a.pump_outbound().await.expect("parked"), 0);
@@ -25342,7 +28784,7 @@ async fn missed_heartbeat_parks_sent_delivery_until_recovery() {
         }]
     ));
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Retrying
     );
     assert_eq!(service_a.pump_outbound().await.expect("resend"), 1);
@@ -25367,7 +28809,7 @@ async fn missed_heartbeat_parks_sent_delivery_until_recovery() {
     );
     service_a.process_incoming().await.expect("process acks");
     assert_eq!(
-        delivery_status(&service_a, delivery_id).await,
+        async_delivery_status(&service_a, delivery_id).await,
         DeliveryStatus::Delivered
     );
     service_a.shutdown().await;
@@ -25440,16 +28882,14 @@ struct LocalhostKvNode {
 
 impl LocalhostKvNode {
     fn start() -> Self {
-        let listener = DaemonControlListener::bind("127.0.0.1:0").expect("bind localhost kv node");
-        let address = listener.local_addr_string().expect("local addr");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind localhost kv node");
+        let address = listener.local_addr().expect("local addr").to_string();
         let store = Arc::new(Mutex::new(InProcessKvStore::new()));
         let handle_store = Arc::clone(&store);
         let handle = thread::spawn(move || {
             loop {
-                let mut stream = listener
-                    .accept()
-                    .expect("accept localhost kv request")
-                    .expect("blocking listener accepted stream");
+                let (stream, _address) = listener.accept().expect("accept localhost kv request");
+                let mut stream = DaemonControlStream::new(stream);
                 let request = read_localhost_kv_request(&mut stream);
                 let should_stop = matches!(request, Ok(LocalhostKvRequest::Stop));
                 let response = match request {
@@ -25520,7 +28960,8 @@ fn send_localhost_kv_request(
     address: &str,
     request: LocalhostKvRequest,
 ) -> Result<LocalhostKvResponse, String> {
-    let mut stream = DaemonControlStream::connect(address).map_err(|source| source.to_string())?;
+    let stream = std::net::TcpStream::connect(address).map_err(|source| source.to_string())?;
+    let mut stream = DaemonControlStream::new(stream);
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|source| source.to_string())?;

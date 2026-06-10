@@ -7,10 +7,13 @@
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 
-use crate::{ROLLOUT_DIAGNOSTICS_ROUTE, SelfRolloutPaths, rollout_diagnostics_report};
+use crate::{
+    ROLLOUT_DIAGNOSTICS_ROUTE, SelfRolloutPaths, rollout_diagnostics_report,
+    rollout_module_surfaces,
+};
 
 const ROLLOUT_ROUTES: &[&str] = &[ROLLOUT_DIAGNOSTICS_ROUTE];
 
@@ -32,6 +35,10 @@ impl Service for RolloutService {
         ROLLOUT_ROUTES
     }
 
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![rollout_service_route(ROLLOUT_DIAGNOSTICS_ROUTE)]
+    }
+
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
             match request.route.as_str() {
@@ -49,6 +56,23 @@ impl Service for RolloutService {
             }
         })
     }
+}
+
+fn rollout_service_route(route: &'static str) -> ServiceRoute {
+    let descriptor = rollout_module_surfaces()
+        .object_rpc_route_descriptor(route)
+        .expect("rollout module surfaces should be valid")
+        .unwrap_or_else(|| panic!("unknown rollout service route {route}"));
+    ServiceRoute::from_route_metadata(
+        descriptor.route,
+        descriptor.category,
+        descriptor.auth_scope,
+        descriptor
+            .required_capabilities
+            .into_iter()
+            .map(|capability| capability.to_string()),
+    )
+    .with_concurrency_limit(8)
 }
 
 pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
@@ -72,6 +96,37 @@ mod tests {
             self.frames.lock().expect("sink lock").push(response);
             Ok(())
         }
+    }
+
+    #[test]
+    fn rollout_service_route_metadata_matches_module_surfaces() {
+        let registry = register_services(ServiceRegistry::builder()).build();
+        let service_route = registry
+            .route_categories()
+            .into_iter()
+            .find(|route| route.route == ROLLOUT_DIAGNOSTICS_ROUTE)
+            .expect("rollout diagnostics service route");
+        let module_route = rollout_module_surfaces()
+            .object_rpc_route_descriptors()
+            .expect("rollout module surfaces")
+            .into_iter()
+            .find(|route| route.route == ROLLOUT_DIAGNOSTICS_ROUTE)
+            .expect("rollout diagnostics module route");
+
+        assert_eq!(service_route.category, module_route.category);
+        assert_eq!(
+            service_route.auth_scope.as_deref(),
+            Some(module_route.auth_scope.as_str())
+        );
+        assert_eq!(
+            service_route.required_capabilities,
+            module_route
+                .required_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(service_route.concurrency_limit, Some(8));
     }
 
     #[tokio::test]

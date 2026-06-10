@@ -6,7 +6,7 @@ use super::sifs::{restore_sandbox_filesystem_with_roots, snapshot_sandbox_filesy
 use super::staging::*;
 
 impl SifsStagedSandboxCommandRunner {
-    pub fn run_toolchain_process_plan_with_policy<T: NetworkTransport + Send + 'static>(
+    pub fn run_toolchain_process_plan_with_policy<T: DfsFrameTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         local_store: &LocalSandboxInstanceStore,
@@ -27,7 +27,7 @@ impl SifsStagedSandboxCommandRunner {
     }
 
     pub fn run_toolchain_process_plan_with_policy_and_output_sink<
-        T: NetworkTransport + Send + 'static,
+        T: DfsFrameTransport + Send + 'static,
     >(
         &self,
         dfs: NetworkedDfsService<T>,
@@ -142,7 +142,7 @@ impl SifsStagedSandboxCommandRunner {
 
     #[cfg(feature = "wasix-runtime")]
     #[allow(clippy::too_many_arguments)]
-    fn try_run_wasix_concurrent_process_pipeline<T: NetworkTransport + Send + 'static>(
+    fn try_run_wasix_concurrent_process_pipeline<T: DfsFrameTransport + Send + 'static>(
         &self,
         dfs: NetworkedDfsService<T>,
         _local_store: &LocalSandboxInstanceStore,

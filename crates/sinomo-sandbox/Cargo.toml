@@ -40,6 +40,7 @@ sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-registry = { path = "../sinomo-registry" }
 sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -7,7 +7,7 @@ use sinomo_core::{ClusterJoinInvite, ClusterMemberRecord, ClusterMemberRole, Clu
 use sinomo_kv::{
     CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_TXN_ROUTE,
     CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_WATCH_DRAIN_ROUTE, CLUSTER_KV_WATCH_EVENTS_ROUTE,
-    CLUSTER_KV_WATCH_PREFIX_ROUTE,
+    CLUSTER_KV_WATCH_PREFIX_ROUTE, CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_VOTE_ROUTE,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -319,8 +319,8 @@ pub fn authorize_authenticated_daemon_command(
             )
         }
         command
-            if command == daemon_rpc_command(sinomo_network::CLUSTER_RAFT_APPEND_ROUTE)
-                || command == daemon_rpc_command(sinomo_network::CLUSTER_RAFT_VOTE_ROUTE) =>
+            if command == daemon_rpc_command(CLUSTER_RAFT_APPEND_ROUTE)
+                || command == daemon_rpc_command(CLUSTER_RAFT_VOTE_ROUTE) =>
         {
             matches!(
                 authenticated.signer,

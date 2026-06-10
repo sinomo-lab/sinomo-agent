@@ -23,7 +23,7 @@ use sinomo_network::{
 
 use sinomo_service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 
 impl From<SandboxBackendError> for ServiceError {
@@ -76,6 +76,116 @@ pub fn register_services_with_factory(
     builder.register(SandboxService::new(factory))
 }
 
+fn dispatch_sandbox_backend_request(
+    backend: &mut dyn SandboxBackend,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, ServiceError> {
+    let response = match request.route.as_str() {
+        SANDBOX_CREATE_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &backend.create(payload)?)?
+        }
+        SANDBOX_STATUS_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_STATUS_ROUTE, &backend.status(payload)?)?
+        }
+        SANDBOX_UPDATE_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_UPDATE_ROUTE, &backend.update(payload)?)?
+        }
+        SANDBOX_CHECKPOINT_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_CHECKPOINT_ROUTE, &backend.checkpoint(payload)?)?
+        }
+        SANDBOX_RESUME_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_RESUME_ROUTE, &backend.resume(payload)?)?
+        }
+        SANDBOX_REBOOT_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_REBOOT_ROUTE, &backend.reboot(payload)?)?
+        }
+        SANDBOX_DESTROY_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_DESTROY_ROUTE, &backend.destroy(payload)?)?
+        }
+        SANDBOX_LIST_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_LIST_ROUTE, &backend.list(payload)?)?
+        }
+        SANDBOX_READ_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_READ_ROUTE, &backend.read(payload)?)?
+        }
+        SANDBOX_WRITE_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_WRITE_ROUTE, &backend.write(payload)?)?
+        }
+        SANDBOX_HTTP_FETCH_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(SANDBOX_HTTP_FETCH_ROUTE, &backend.http_fetch(payload)?)?
+        }
+        SANDBOX_HTTP_FETCH_TO_FILE_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
+                &backend.http_fetch_to_file(payload)?,
+            )?
+        }
+        SANDBOX_IMPORT_BUSYBOX_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_IMPORT_BUSYBOX_ROUTE,
+                &backend.import_busybox(payload)?,
+            )?
+        }
+        SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
+                &backend.toolchain_add_command(payload)?,
+            )?
+        }
+        SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
+                &backend.toolchain_add_artifact(payload)?,
+            )?
+        }
+        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
+                &backend.import_toolchain_package(payload)?,
+            )?
+        }
+        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
+                &backend.import_toolchain_package_from_path(payload)?,
+            )?
+        }
+        SANDBOX_RUN_TOOLCHAIN_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_RUN_TOOLCHAIN_ROUTE,
+                &backend.run_toolchain(payload)?,
+            )?
+        }
+        SANDBOX_RUN_PROCESS_PLAN_ROUTE => {
+            let payload = request.decode_body()?;
+            ObjectRpcResponse::encode_body(
+                SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+                &backend.run_process_plan(payload)?,
+            )?
+        }
+        other => return Err(ServiceError::UnknownRoute(other.to_string())),
+    };
+    Ok(response)
+}
+
 impl Service for SandboxService {
     fn name(&self) -> &'static str {
         "sandbox"
@@ -105,122 +215,25 @@ impl Service for SandboxService {
         ]
     }
 
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        self.routes()
+            .iter()
+            .copied()
+            .map(|route| ServiceRoute::new(route, self.name()).with_concurrency_limit(8))
+            .collect()
+    }
+
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let factory = Arc::clone(&self.factory);
         Box::pin(async move {
             let mut backend = factory.open(&ctx)?;
-            let response = match request.route.as_str() {
-                SANDBOX_CREATE_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_CREATE_ROUTE, &backend.create(payload)?)?
-                }
-                SANDBOX_STATUS_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_STATUS_ROUTE, &backend.status(payload)?)?
-                }
-                SANDBOX_UPDATE_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_UPDATE_ROUTE, &backend.update(payload)?)?
-                }
-                SANDBOX_CHECKPOINT_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_CHECKPOINT_ROUTE,
-                        &backend.checkpoint(payload)?,
-                    )?
-                }
-                SANDBOX_RESUME_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_RESUME_ROUTE, &backend.resume(payload)?)?
-                }
-                SANDBOX_REBOOT_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_REBOOT_ROUTE, &backend.reboot(payload)?)?
-                }
-                SANDBOX_DESTROY_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_DESTROY_ROUTE,
-                        &backend.destroy(payload)?,
-                    )?
-                }
-                SANDBOX_LIST_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_LIST_ROUTE, &backend.list(payload)?)?
-                }
-                SANDBOX_READ_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_READ_ROUTE, &backend.read(payload)?)?
-                }
-                SANDBOX_WRITE_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(SANDBOX_WRITE_ROUTE, &backend.write(payload)?)?
-                }
-                SANDBOX_HTTP_FETCH_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_HTTP_FETCH_ROUTE,
-                        &backend.http_fetch(payload)?,
-                    )?
-                }
-                SANDBOX_HTTP_FETCH_TO_FILE_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_HTTP_FETCH_TO_FILE_ROUTE,
-                        &backend.http_fetch_to_file(payload)?,
-                    )?
-                }
-                SANDBOX_IMPORT_BUSYBOX_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_IMPORT_BUSYBOX_ROUTE,
-                        &backend.import_busybox(payload)?,
-                    )?
-                }
-                SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE,
-                        &backend.toolchain_add_command(payload)?,
-                    )?
-                }
-                SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
-                        &backend.toolchain_add_artifact(payload)?,
-                    )?
-                }
-                SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE,
-                        &backend.import_toolchain_package(payload)?,
-                    )?
-                }
-                SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
-                        &backend.import_toolchain_package_from_path(payload)?,
-                    )?
-                }
-                SANDBOX_RUN_TOOLCHAIN_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_RUN_TOOLCHAIN_ROUTE,
-                        &backend.run_toolchain(payload)?,
-                    )?
-                }
-                SANDBOX_RUN_PROCESS_PLAN_ROUTE => {
-                    let payload = request.decode_body()?;
-                    ObjectRpcResponse::encode_body(
-                        SANDBOX_RUN_PROCESS_PLAN_ROUTE,
-                        &backend.run_process_plan(payload)?,
-                    )?
-                }
-                other => return Err(ServiceError::UnknownRoute(other.to_string())),
-            };
+            let response = tokio::task::spawn_blocking(move || {
+                dispatch_sandbox_backend_request(backend.as_mut(), request)
+            })
+            .await
+            .map_err(|source| {
+                ServiceError::Service(format!("sandbox backend task failed: {source}"))
+            })??;
             ctx.respond(response)?;
             Ok(ServiceDisposition::Continue)
         })
@@ -273,6 +286,13 @@ mod tests {
         assert_eq!(service.name(), "sandbox");
         assert!(service.routes().contains(&SANDBOX_STATUS_ROUTE));
         assert_eq!(service.routes().len(), 19);
+        let routes = service.route_categories();
+        assert_eq!(routes.len(), service.routes().len());
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.concurrency_limit == Some(8))
+        );
     }
 
     /// The service is registered, owns the route, opens a backend via the factory, and

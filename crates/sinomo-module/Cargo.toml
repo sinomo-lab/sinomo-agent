@@ -12,6 +12,7 @@ include = ["**/*.rs", "Cargo.toml", "wit/**"]
 ring = "r1"
 
 [dependencies]
+arc-swap.workspace = true
 base64 = "0.22"
 blake3.workspace = true
 libloading = "0.8"

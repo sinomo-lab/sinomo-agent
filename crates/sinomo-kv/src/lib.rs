@@ -16,16 +16,20 @@
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sinomo_core::ClusterBootstrapState;
+use sinomo_core::{
+    ClusterBootstrapState, ClusterMemberRecord, ClusterMemberRole, ClusterMemberState, Id,
+};
 use sinomo_node::NodeId;
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 use sinomo_storage::durable_file::{self, file_ino};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 use thiserror::Error;
@@ -52,13 +56,9 @@ pub const CLUSTER_KV_WATCH_PREFIX_ROUTE: &str = "/cluster/kv/watch-prefix";
 pub const CLUSTER_KV_WATCH_DRAIN_ROUTE: &str = "/cluster/kv/watch-drain";
 pub const CLUSTER_KV_WATCH_CANCEL_ROUTE: &str = "/cluster/kv/watch-cancel";
 pub const CLUSTER_KV_WATCH_EVENTS_ROUTE: &str = "/cluster/kv/watch-events";
-pub const CLUSTER_KV_READ_WATCH_ROUTES: &[&str] = &[
-    CLUSTER_KV_RANGE_PREFIX_ROUTE,
-    CLUSTER_KV_WATCH_PREFIX_ROUTE,
-    CLUSTER_KV_WATCH_DRAIN_ROUTE,
-    CLUSTER_KV_WATCH_CANCEL_ROUTE,
-    CLUSTER_KV_WATCH_EVENTS_ROUTE,
-];
+pub const CLUSTER_RAFT_RPC_CATEGORY: &str = "cluster.raft";
+pub const CLUSTER_RAFT_APPEND_ROUTE: &str = "/cluster/raft/append";
+pub const CLUSTER_RAFT_VOTE_ROUTE: &str = "/cluster/raft/vote";
 pub const CLUSTER_KV_LOCAL_READ_WATCH_ROUTES: &[&str] = &[
     CLUSTER_KV_RANGE_PREFIX_ROUTE,
     CLUSTER_KV_WATCH_PREFIX_ROUTE,
@@ -73,6 +73,19 @@ pub const CLUSTER_KV_RPC_ROUTES: &[&str] = &[
     CLUSTER_KV_WATCH_DRAIN_ROUTE,
     CLUSTER_KV_WATCH_CANCEL_ROUTE,
     CLUSTER_KV_WATCH_EVENTS_ROUTE,
+];
+pub const CLUSTER_KV_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
+    (CLUSTER_KV_SNAPSHOT_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_TXN_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_RANGE_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_WATCH_PREFIX_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_WATCH_DRAIN_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_WATCH_CANCEL_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+    (CLUSTER_KV_WATCH_EVENTS_ROUTE, CLUSTER_KV_RPC_CATEGORY),
+];
+pub const CLUSTER_RAFT_RPC_ROUTE_METADATA: &[(&str, &str)] = &[
+    (CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_CATEGORY),
+    (CLUSTER_RAFT_VOTE_ROUTE, CLUSTER_RAFT_RPC_CATEGORY),
 ];
 pub const MAX_CLUSTER_KV_WATCH_EVENTS: usize = 256;
 pub const CLUSTER_KV_WATCH_EVENT_FANOUT_BATCH_EVENTS: usize = MAX_CLUSTER_KV_WATCH_EVENTS;
@@ -93,6 +106,7 @@ pub const CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES: usize = MAX_KV_COMMAND_PAYL
 pub const MAX_CLUSTER_KV_MATERIALIZED_EVENTS: usize = 64;
 pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MAX_REVISION_LAG: u64 = 64;
 pub const CLUSTER_KV_DEFERRED_MATERIALIZED_MIN_INTERVAL: Duration = Duration::from_secs(300);
+pub const MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 /// Committed log entries kept in memory after a local snapshot compaction. A
 /// follower that has fallen at most this many entries behind can be caught up
@@ -107,6 +121,16 @@ pub const MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS: usize = 64;
 pub const RAFT_COMPACTION_RETAINED_ENTRIES: u64 = 256;
 pub const CLUSTER_KV_RAFT_LEADER_ELECTION_ATTEMPTS: usize = 3;
 pub const CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP: u64 = 64;
+static CLUSTER_KV_RAFT_OPERATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES: usize = MAX_ACTIVE_WATCHES * 2 + 128;
+static CLUSTER_KV_WATCH_NOTIFIER_CLOCK: AtomicU64 = AtomicU64::new(1);
+static CLUSTER_KV_WATCH_NOTIFIERS: LazyLock<Mutex<HashMap<PathBuf, ClusterKvWatchNotifierEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST: AtomicU64 =
+    AtomicU64::new(MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES);
+static CLUSTER_KV_WATCH_UNCHANGED_WAKEUPS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 const MAX_WAL_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_FILE_MAX_READ_BYTES;
 const RAFT_NODE_LOCK_WAIT: Duration = Duration::from_secs(2);
@@ -122,6 +146,17 @@ static KV_READ_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 /// detected and falls back to a real read + compare.
 static LAST_WRITTEN_OBJECT_FILES: LazyLock<durable_file::ObjectFileWriteMarkCache> =
     LazyLock::new(|| durable_file::ObjectFileWriteMarkCache::new(FILE_CACHE_CAPACITY));
+
+pub type ClusterKvRaftOperationGuard = MutexGuard<'static, ()>;
+
+pub fn lock_cluster_kv_raft_operation() -> Result<ClusterKvRaftOperationGuard, KvError> {
+    CLUSTER_KV_RAFT_OPERATION_LOCK
+        .lock()
+        .map_err(|error| KvError::Io {
+            path: "cluster kv raft operation lock".to_string(),
+            detail: format!("cluster kv raft operation lock poisoned: {error}"),
+        })
+}
 
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
@@ -225,6 +260,520 @@ impl ClusterKvPaths {
     pub fn watch_path(&self, watch_id: WatchId) -> PathBuf {
         self.watches.join(format!("watch-{}.sobj", watch_id.0))
     }
+
+    pub fn raft_store(&self) -> ClusterKvRaftStore {
+        ClusterKvRaftStore::new(self.clone(), default_cluster_kv_raft_compaction_policy())
+    }
+}
+
+struct ClusterKvWatchNotifierEntry {
+    generation: u64,
+    last_used: u64,
+    waiters: usize,
+    changed: Arc<Condvar>,
+}
+
+impl Default for ClusterKvWatchNotifierEntry {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            last_used: 0,
+            waiters: 0,
+            changed: Arc::new(Condvar::new()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvWatchObservedGeneration {
+    pub root: u64,
+    pub watch: u64,
+}
+
+fn cluster_kv_watch_notify_key(paths: &ClusterKvPaths) -> PathBuf {
+    paths.root.clone()
+}
+
+fn cluster_kv_watch_notify_key_for_watch(paths: &ClusterKvPaths, watch_id: WatchId) -> PathBuf {
+    paths.watch_path(watch_id)
+}
+
+fn cluster_kv_watch_notifier_tick() -> u64 {
+    CLUSTER_KV_WATCH_NOTIFIER_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
+
+fn evict_cluster_kv_watch_notifier_entry_if_needed(
+    guard: &mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    protected: &PathBuf,
+) {
+    if guard.contains_key(protected) || guard.len() < MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES {
+        return;
+    }
+    let eviction_candidate = guard
+        .iter()
+        .filter(|(path, entry)| *path != protected && entry.waiters == 0)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        guard.remove(&path);
+    }
+}
+
+fn ensure_cluster_kv_watch_notifier_entry<'a>(
+    guard: &'a mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    key: PathBuf,
+) -> &'a mut ClusterKvWatchNotifierEntry {
+    evict_cluster_kv_watch_notifier_entry_if_needed(guard, &key);
+    guard.entry(key).or_default()
+}
+
+fn finish_cluster_kv_watch_wait(
+    guard: &mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    key: &PathBuf,
+) {
+    if let Some(entry) = guard.get_mut(key) {
+        entry.waiters = entry.waiters.saturating_sub(1);
+        entry.last_used = cluster_kv_watch_notifier_tick();
+    }
+}
+
+pub fn cluster_kv_watch_generation(paths: &ClusterKvPaths) -> u64 {
+    CLUSTER_KV_WATCH_NOTIFIERS
+        .lock()
+        .ok()
+        .and_then(|guard| {
+            guard
+                .get(&cluster_kv_watch_notify_key(paths))
+                .map(|entry| entry.generation)
+        })
+        .unwrap_or(0)
+}
+
+pub fn cluster_kv_watch_observed_generation(
+    paths: &ClusterKvPaths,
+    watch_id: WatchId,
+) -> ClusterKvWatchObservedGeneration {
+    let root_key = cluster_kv_watch_notify_key(paths);
+    let watch_key = cluster_kv_watch_notify_key_for_watch(paths, watch_id);
+    CLUSTER_KV_WATCH_NOTIFIERS
+        .lock()
+        .map(|guard| ClusterKvWatchObservedGeneration {
+            root: guard
+                .get(&root_key)
+                .map(|entry| entry.generation)
+                .unwrap_or(0),
+            watch: guard
+                .get(&watch_key)
+                .map(|entry| entry.generation)
+                .unwrap_or(0),
+        })
+        .unwrap_or(ClusterKvWatchObservedGeneration { root: 0, watch: 0 })
+}
+
+pub fn notify_cluster_kv_watchers(paths: &ClusterKvPaths) {
+    let Ok(mut guard) = CLUSTER_KV_WATCH_NOTIFIERS.lock() else {
+        return;
+    };
+    let key = cluster_kv_watch_notify_key(paths);
+    let tick = cluster_kv_watch_notifier_tick();
+    let mut changed = Vec::new();
+    {
+        let entry = ensure_cluster_kv_watch_notifier_entry(&mut guard, key.clone());
+        entry.generation = entry.generation.saturating_add(1);
+        entry.last_used = tick;
+        changed.push(entry.changed.clone());
+    }
+    for (path, entry) in guard.iter_mut() {
+        if path != &key && path.starts_with(&paths.root) && entry.waiters > 0 {
+            entry.generation = entry.generation.saturating_add(1);
+            entry.last_used = tick;
+            changed.push(entry.changed.clone());
+        }
+    }
+    drop(guard);
+    for changed in changed {
+        changed.notify_all();
+    }
+}
+
+pub fn notify_cluster_kv_watchers_for_watch_ids(paths: &ClusterKvPaths, watch_ids: &[WatchId]) {
+    if watch_ids.is_empty() {
+        return;
+    }
+    let Ok(mut guard) = CLUSTER_KV_WATCH_NOTIFIERS.lock() else {
+        return;
+    };
+    let tick = cluster_kv_watch_notifier_tick();
+    let mut changed = Vec::new();
+    for watch_id in watch_ids {
+        let key = cluster_kv_watch_notify_key_for_watch(paths, *watch_id);
+        let entry = ensure_cluster_kv_watch_notifier_entry(&mut guard, key);
+        entry.generation = entry.generation.saturating_add(1);
+        entry.last_used = tick;
+        if entry.waiters > 0 {
+            changed.push(entry.changed.clone());
+        }
+    }
+    drop(guard);
+    for changed in changed {
+        changed.notify_all();
+    }
+}
+
+pub fn notify_cluster_kv_watchers_for_events(paths: &ClusterKvPaths, events: &[KvEvent]) {
+    if events.is_empty() {
+        return;
+    }
+    match list_cluster_kv_watch_registrations(paths)
+        .map(|registrations| cluster_kv_watch_ids_matching_events(&registrations, events))
+    {
+        Ok(watch_ids) => notify_cluster_kv_watchers_for_watch_ids(paths, &watch_ids),
+        Err(error) => {
+            eprintln!(
+                "warning: waking all cluster kv watch waiters after active watch lookup failed for {}: {}",
+                paths.watches.display(),
+                error
+            );
+            notify_cluster_kv_watchers(paths);
+        }
+    }
+}
+
+fn cluster_kv_watch_observed_generation_changed(
+    guard: &HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+    root_key: &PathBuf,
+    watch_key: &PathBuf,
+    observed_generation: ClusterKvWatchObservedGeneration,
+) -> bool {
+    guard
+        .get(root_key)
+        .map(|entry| entry.generation)
+        .unwrap_or(0)
+        != observed_generation.root
+        || guard
+            .get(watch_key)
+            .map(|entry| entry.generation)
+            .unwrap_or(0)
+            != observed_generation.watch
+}
+
+pub fn wait_for_cluster_kv_watch_change(
+    paths: &ClusterKvPaths,
+    observed_generation: u64,
+    timeout: Duration,
+) -> bool {
+    if timeout.is_zero() {
+        return false;
+    }
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    let key = cluster_kv_watch_notify_key(paths);
+    let Ok(mut guard) = CLUSTER_KV_WATCH_NOTIFIERS.lock() else {
+        return false;
+    };
+    let changed = {
+        let tick = cluster_kv_watch_notifier_tick();
+        let entry = ensure_cluster_kv_watch_notifier_entry(&mut guard, key.clone());
+        entry.waiters = entry.waiters.saturating_add(1);
+        entry.last_used = tick;
+        entry.changed.clone()
+    };
+    loop {
+        if guard.get(&key).map(|entry| entry.generation).unwrap_or(0) != observed_generation {
+            finish_cluster_kv_watch_wait(&mut guard, &key);
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            finish_cluster_kv_watch_wait(&mut guard, &key);
+            return false;
+        }
+        let (next_guard, wait) = match changed.wait_timeout(guard, remaining) {
+            Ok(result) => result,
+            Err(poisoned) => {
+                let (mut poisoned_guard, _) = poisoned.into_inner();
+                finish_cluster_kv_watch_wait(&mut poisoned_guard, &key);
+                return false;
+            }
+        };
+        guard = next_guard;
+        if let Some(entry) = guard.get_mut(&key) {
+            entry.last_used = cluster_kv_watch_notifier_tick();
+        }
+        if wait.timed_out() {
+            let changed =
+                guard.get(&key).map(|entry| entry.generation).unwrap_or(0) != observed_generation;
+            finish_cluster_kv_watch_wait(&mut guard, &key);
+            return changed;
+        }
+    }
+}
+
+pub fn wait_for_cluster_kv_watch_change_for_watch(
+    paths: &ClusterKvPaths,
+    watch_id: WatchId,
+    observed_generation: ClusterKvWatchObservedGeneration,
+    timeout: Duration,
+) -> bool {
+    if timeout.is_zero() {
+        return false;
+    }
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return false;
+    };
+    let root_key = cluster_kv_watch_notify_key(paths);
+    let watch_key = cluster_kv_watch_notify_key_for_watch(paths, watch_id);
+    let Ok(mut guard) = CLUSTER_KV_WATCH_NOTIFIERS.lock() else {
+        return false;
+    };
+    let changed = {
+        let tick = cluster_kv_watch_notifier_tick();
+        let entry = ensure_cluster_kv_watch_notifier_entry(&mut guard, watch_key.clone());
+        entry.waiters = entry.waiters.saturating_add(1);
+        entry.last_used = tick;
+        entry.changed.clone()
+    };
+    loop {
+        if cluster_kv_watch_observed_generation_changed(
+            &guard,
+            &root_key,
+            &watch_key,
+            observed_generation,
+        ) {
+            finish_cluster_kv_watch_wait(&mut guard, &watch_key);
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            finish_cluster_kv_watch_wait(&mut guard, &watch_key);
+            return false;
+        }
+        let (next_guard, wait) = match changed.wait_timeout(guard, remaining) {
+            Ok(result) => result,
+            Err(poisoned) => {
+                let (mut poisoned_guard, _) = poisoned.into_inner();
+                finish_cluster_kv_watch_wait(&mut poisoned_guard, &watch_key);
+                return false;
+            }
+        };
+        guard = next_guard;
+        let tick = cluster_kv_watch_notifier_tick();
+        if let Some(entry) = guard.get_mut(&watch_key) {
+            entry.last_used = tick;
+        }
+        if !wait.timed_out()
+            && !cluster_kv_watch_observed_generation_changed(
+                &guard,
+                &root_key,
+                &watch_key,
+                observed_generation,
+            )
+        {
+            record_cluster_kv_watch_unchanged_wakeup_for_test(&watch_key);
+        }
+        if wait.timed_out() {
+            let changed = cluster_kv_watch_observed_generation_changed(
+                &guard,
+                &root_key,
+                &watch_key,
+                observed_generation,
+            );
+            finish_cluster_kv_watch_wait(&mut guard, &watch_key);
+            return changed;
+        }
+    }
+}
+
+pub fn cluster_kv_watch_notifier_capacity_for_test() -> usize {
+    MAX_CLUSTER_KV_WATCH_NOTIFIER_ENTRIES
+}
+
+pub fn cluster_kv_watch_notifier_has_key_for_test(paths: &ClusterKvPaths) -> bool {
+    let key = cluster_kv_watch_notify_key(paths);
+    cluster_kv_watch_notifier_has_raw_key_for_test(&key)
+}
+
+pub fn cluster_kv_watch_notifier_has_raw_key_for_test(path: &Path) -> bool {
+    CLUSTER_KV_WATCH_NOTIFIERS
+        .lock()
+        .map(|guard| guard.contains_key(path))
+        .unwrap_or(false)
+}
+
+pub fn cluster_kv_watch_notifier_waiter_count_for_test(paths: &ClusterKvPaths) -> usize {
+    let key = cluster_kv_watch_notify_key(paths);
+    CLUSTER_KV_WATCH_NOTIFIERS
+        .lock()
+        .ok()
+        .and_then(|guard| guard.get(&key).map(|entry| entry.waiters))
+        .unwrap_or(0)
+}
+
+pub fn remove_cluster_kv_watch_notifier_entries_under_root_for_test(root: &Path) {
+    if let Ok(mut guard) = CLUSTER_KV_WATCH_NOTIFIERS.lock() {
+        guard.retain(|path, _| !path.starts_with(root));
+    }
+}
+
+pub fn touch_cluster_kv_watch_notifier_for_test(paths: &ClusterKvPaths) {
+    notify_cluster_kv_watchers(paths);
+}
+
+pub fn record_cluster_kv_watch_notifier_waiter_key_for_test(path: PathBuf) {
+    if let Ok(mut guard) = CLUSTER_KV_WATCH_NOTIFIERS.lock() {
+        evict_cluster_kv_watch_notifier_entry_if_needed(&mut guard, &path);
+        guard.insert(
+            path,
+            ClusterKvWatchNotifierEntry {
+                generation: 0,
+                last_used: cluster_kv_watch_notifier_tick(),
+                waiters: 1,
+                changed: Arc::new(Condvar::new()),
+            },
+        );
+    }
+}
+
+fn record_cluster_kv_watch_unchanged_wakeup_for_test(path: &PathBuf) {
+    if let Ok(mut wakeups) = CLUSTER_KV_WATCH_UNCHANGED_WAKEUPS_FOR_TEST.lock() {
+        *wakeups.entry(path.clone()).or_default() += 1;
+    }
+}
+
+pub fn reset_cluster_kv_watch_unchanged_wakeups_for_test(
+    paths: &ClusterKvPaths,
+    watch_id: WatchId,
+) {
+    let key = cluster_kv_watch_notify_key_for_watch(paths, watch_id);
+    if let Ok(mut wakeups) = CLUSTER_KV_WATCH_UNCHANGED_WAKEUPS_FOR_TEST.lock() {
+        wakeups.remove(&key);
+    }
+}
+
+pub fn cluster_kv_watch_unchanged_wakeups_for_test(
+    paths: &ClusterKvPaths,
+    watch_id: WatchId,
+) -> u64 {
+    let key = cluster_kv_watch_notify_key_for_watch(paths, watch_id);
+    CLUSTER_KV_WATCH_UNCHANGED_WAKEUPS_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|wakeups| wakeups.get(&key).copied())
+        .unwrap_or(0)
+}
+
+pub fn read_cluster_kv_cached_snapshot(paths: &ClusterKvPaths) -> Result<KvSnapshot, KvError> {
+    paths.local_cache().cached_snapshot()
+}
+
+pub fn read_cluster_kv_current_snapshot_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+) -> Result<KvSnapshot, KvError> {
+    paths
+        .local_cache()
+        .current_snapshot_without_materialized_refresh(node_id)
+}
+
+pub fn read_cluster_kv_current_snapshot_arc_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+) -> Result<Arc<KvSnapshot>, KvError> {
+    paths
+        .local_cache()
+        .current_snapshot_arc_without_materialized_refresh(node_id)
+}
+
+pub fn read_cluster_kv_store_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+) -> Result<InProcessKvStore, KvError> {
+    read_cluster_kv_current_snapshot_for_node(paths, node_id).map(InProcessKvStore::restore)
+}
+
+pub fn write_cluster_kv_snapshot(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+) -> Result<(), KvError> {
+    write_cluster_kv_materialized_snapshot_if_changed(paths, snapshot).map(|_| ())
+}
+
+pub fn write_cluster_kv_materialized_snapshot_if_changed(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+) -> Result<bool, KvError> {
+    let wrote = paths
+        .local_cache()
+        .write_snapshot_if_materialized_changed(snapshot)?;
+    if wrote {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(wrote)
+}
+
+pub fn write_cluster_kv_snapshot_if_changed(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+) -> Result<bool, KvError> {
+    let wrote = paths.local_cache().write_snapshot_if_changed(snapshot)?;
+    if wrote {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(wrote)
+}
+
+pub fn write_imported_cluster_kv_snapshot_if_changed<F>(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+    key_can_defer_materialized_snapshot: F,
+) -> Result<bool, KvError>
+where
+    F: FnMut(&str) -> bool,
+{
+    if cluster_kv_imported_snapshot_can_defer_materialized_delta(
+        paths,
+        snapshot,
+        key_can_defer_materialized_snapshot,
+    )? {
+        return Ok(false);
+    }
+    write_cluster_kv_snapshot_if_changed(paths, snapshot)
+}
+
+fn cluster_kv_imported_snapshot_can_defer_materialized_delta<F>(
+    paths: &ClusterKvPaths,
+    snapshot: &KvSnapshot,
+    key_can_defer_materialized_snapshot: F,
+) -> Result<bool, KvError>
+where
+    F: FnMut(&str) -> bool,
+{
+    let Some(existing) = paths.local_cache().cached_snapshot_arc_if_present()? else {
+        return Ok(false);
+    };
+    if !cluster_kv_snapshot_delta_only_deferable(
+        existing.as_ref(),
+        snapshot,
+        key_can_defer_materialized_snapshot,
+    ) {
+        return Ok(false);
+    }
+    Ok(cluster_kv_materialized_snapshot_is_fresh_enough_against(
+        existing.revision,
+        snapshot.revision,
+        cluster_kv_materialized_snapshot_age(paths),
+    ))
+}
+
+fn cluster_kv_materialized_snapshot_age(paths: &ClusterKvPaths) -> Option<Duration> {
+    let Ok(metadata) = fs::metadata(&paths.snapshot) else {
+        return None;
+    };
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
 }
 
 pub fn read_cluster_kv_entry(
@@ -685,6 +1234,19 @@ pub fn cluster_kv_events_contain_all(existing: &[KvEvent], incoming: &[KvEvent])
     incoming
         .iter()
         .all(|event| cluster_kv_events_contain(existing, event))
+}
+
+pub fn cluster_raft_append_request_needs_watch_event_fanout(
+    request: &ClusterRaftAppendRequest,
+    events: &[KvEvent],
+) -> bool {
+    if events.is_empty() {
+        return false;
+    }
+    let Some(snapshot) = request.snapshot.as_ref() else {
+        return false;
+    };
+    !cluster_kv_events_contain_all(&snapshot.kv.events, events)
 }
 
 pub fn cluster_kv_snapshot_compare(snapshot: &KvSnapshot, compare: &KvCompare) -> bool {
@@ -1321,6 +1883,154 @@ pub fn persist_cluster_kv_watch_drain_cursor(
     }
 }
 
+pub fn create_cluster_kv_watch_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+    request: ClusterKvWatchPrefixRequest,
+) -> Result<ClusterKvWatchRegistration, KvError> {
+    let snapshot = read_cluster_kv_current_snapshot_arc_for_node(paths, node_id)?;
+    let report = create_cluster_kv_watch_registration(
+        paths,
+        request,
+        snapshot.compacted_revision,
+        false,
+        MAX_CLUSTER_KV_ACTIVE_WATCHES,
+    )?;
+    if let Err(error) = write_cluster_kv_watch_allocator_state(paths, &report.allocator) {
+        let _ = remove_cluster_kv_watch_registration_file_if_exists(&report.watch_path);
+        return Err(error);
+    }
+    Ok(report.registration)
+}
+
+pub fn drain_cluster_kv_watch_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+    request: ClusterKvWatchDrainRequest,
+) -> Result<ClusterKvWatchDrainResponse, KvError> {
+    let wait_timeout = request.wait_timeout();
+    if wait_timeout.is_zero() {
+        return drain_cluster_kv_watch_once_for_node(paths, node_id, request.watch_id);
+    }
+
+    let Some(deadline) = Instant::now().checked_add(wait_timeout) else {
+        return drain_cluster_kv_watch_once_for_node(paths, node_id, request.watch_id);
+    };
+    loop {
+        let observed_generation = cluster_kv_watch_observed_generation(paths, request.watch_id);
+        let response =
+            drain_cluster_kv_watch_once_for_node(paths, node_id.clone(), request.watch_id)?;
+        if !response.events.is_empty() {
+            return Ok(response);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(response);
+        }
+        if !wait_for_cluster_kv_watch_change_for_watch(
+            paths,
+            request.watch_id,
+            observed_generation,
+            remaining,
+        ) {
+            return Ok(response);
+        }
+    }
+}
+
+fn drain_cluster_kv_watch_once_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+    watch_id: WatchId,
+) -> Result<ClusterKvWatchDrainResponse, KvError> {
+    let watch_path = paths.watch_path(watch_id);
+    let registration = match read_cluster_kv_watch_registration_file(&watch_path, watch_id) {
+        Ok(registration) => registration,
+        Err(error @ KvError::UnknownWatch { .. }) => {
+            let _ = remove_cluster_kv_watch_registration_file_if_exists(&watch_path);
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let durable_next_revision = registration.next_revision;
+    let snapshot = read_cluster_kv_current_snapshot_arc_for_node(paths, node_id)?;
+    let persisted_events = read_cluster_kv_watch_events(paths)?.events;
+    let report = match drain_cluster_kv_watch_registration(
+        registration,
+        durable_next_revision,
+        &persisted_events,
+        snapshot.as_ref(),
+        MAX_CLUSTER_KV_WATCH_DRAIN_PAYLOAD_BYTES,
+        false,
+        None,
+    ) {
+        Ok(report) => report,
+        Err(error @ KvError::Compacted { .. }) => {
+            let _ = cancel_cluster_kv_watch(paths, ClusterKvWatchCancelRequest { watch_id });
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
+    let _ = persist_cluster_kv_watch_drain_cursor(&watch_path, &report)?;
+    Ok(report.response)
+}
+
+pub fn cancel_cluster_kv_watch(
+    paths: &ClusterKvPaths,
+    request: ClusterKvWatchCancelRequest,
+) -> Result<ClusterKvWatchCancelResponse, KvError> {
+    let report = remove_cluster_kv_watch_registration_with_allocator(paths, request.watch_id)?;
+    if let Some(allocator) = report.allocator {
+        write_cluster_kv_watch_allocator_state(paths, &allocator)?;
+    }
+    if report.removed {
+        notify_cluster_kv_watchers(paths);
+    }
+    Ok(ClusterKvWatchCancelResponse {
+        watch_id: request.watch_id,
+        cancelled: report.removed,
+    })
+}
+
+pub fn append_cluster_kv_watch_events_for_active_watches_for_node(
+    paths: &ClusterKvPaths,
+    node_id: NodeId,
+    incoming: &[KvEvent],
+) -> Result<usize, KvError> {
+    if incoming.is_empty() || (!paths.watches.exists() && !paths.watches_next_id.exists()) {
+        return Ok(0);
+    }
+    let snapshot = read_cluster_kv_current_snapshot_arc_for_node(paths, node_id)?;
+    let active = cluster_kv_active_watch_registration_report(paths, snapshot.compacted_revision)?;
+    if let Some(allocator) = active.allocator {
+        write_cluster_kv_watch_allocator_state(paths, &allocator)?;
+    }
+    if !active.has_active {
+        return Ok(0);
+    }
+    let registrations = if let Some(scan) = active.scan {
+        scan.retained_registrations
+            .into_iter()
+            .map(|retained| retained.registration)
+            .collect::<Vec<_>>()
+    } else {
+        list_cluster_kv_watch_registrations(paths)?
+    };
+    let incoming = cluster_kv_watch_events_matching_registrations(&registrations, incoming);
+    if incoming.is_empty()
+        || incoming
+            .iter()
+            .all(|event| cluster_kv_events_contain(&snapshot.events, event))
+    {
+        return Ok(0);
+    }
+    let report = append_cluster_kv_watch_events_to_storage(paths, &incoming, None)?;
+    if !report.appended.is_empty() {
+        notify_cluster_kv_watchers_for_events(paths, &report.appended);
+    }
+    Ok(report.appended.len())
+}
+
 pub fn remove_cluster_kv_watch_registration_with_allocator(
     paths: &ClusterKvPaths,
     watch_id: WatchId,
@@ -1778,6 +2488,20 @@ pub fn cluster_kv_snapshot_rpc_payload() -> Result<ClusterKvRpcPayload, KvError>
     })
 }
 
+pub fn decode_cluster_kv_snapshot_rpc_request_body(body: &[u8]) -> Result<(), KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_snapshot_response_rpc_payload(
+    snapshot: &KvSnapshot,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_SNAPSHOT_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(snapshot)?,
+    })
+}
+
 pub fn decode_cluster_kv_snapshot_rpc_body(body: &[u8]) -> Result<KvSnapshot, KvError> {
     decode_cluster_kv_rpc_body(body)
 }
@@ -1790,8 +2514,30 @@ pub fn cluster_kv_txn_rpc_payload(txn: &KvTxn) -> Result<ClusterKvRpcPayload, Kv
     })
 }
 
+pub fn decode_cluster_kv_txn_rpc_request_body(body: &[u8]) -> Result<KvTxn, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_txn_response_rpc_payload(
+    response: &KvTxnResponse,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_TXN_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
 pub fn decode_cluster_kv_txn_rpc_body(body: &[u8]) -> Result<KvTxnResponse, KvError> {
     decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_kv_range_prefix_rpc_payload(prefix: &str) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_KV_RANGE_PREFIX_ROUTE,
+        category: CLUSTER_KV_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(&prefix.to_string())?,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1809,6 +2555,36 @@ pub struct ClusterKvWatchEventsResponse {
     pub stored_events: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftAppendRequest {
+    pub state: ClusterBootstrapState,
+    pub append: RaftAppendEntriesRequest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<RaftSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftAppendResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub state: ClusterBootstrapState,
+    pub append: RaftAppendEntriesResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftVoteRequest {
+    pub state: ClusterBootstrapState,
+    pub vote: RaftRequestVoteRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRaftVoteResponse {
+    pub accepted: bool,
+    pub detail: String,
+    pub state: ClusterBootstrapState,
+    pub vote: RaftRequestVoteResponse,
+}
+
 pub fn cluster_kv_watch_events_noop_response(
     request: &ClusterKvWatchEventsRequest,
 ) -> Option<ClusterKvWatchEventsResponse> {
@@ -1820,6 +2596,50 @@ pub fn cluster_kv_watch_events_noop_response(
             detail: "no watch events to fan out".to_string(),
             stored_events: 0,
         })
+}
+
+pub fn handle_cluster_kv_watch_events(
+    paths: &ClusterKvPaths,
+    local_state: &ClusterBootstrapState,
+    request: ClusterKvWatchEventsRequest,
+) -> Result<ClusterKvWatchEventsResponse, KvError> {
+    if let Err(limit) = validate_cluster_kv_watch_event_fanout_batch(&request.events) {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: limit.detail(),
+            stored_events: 0,
+        });
+    }
+    if request.state.cluster_id != local_state.cluster_id {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: format!(
+                "peer cluster `{}` does not match local cluster `{}`",
+                request.state.cluster_id, local_state.cluster_id
+            ),
+            stored_events: 0,
+        });
+    }
+    if !cluster_kv_raft_node_is_voter(local_state, &request.leader_id) {
+        return Ok(ClusterKvWatchEventsResponse {
+            accepted: false,
+            detail: format!(
+                "watch event fan-out rejected from unauthorized leader {}",
+                request.leader_id
+            ),
+            stored_events: 0,
+        });
+    }
+    let stored_events = append_cluster_kv_watch_events_for_active_watches_for_node(
+        paths,
+        local_state.local_node_id.clone(),
+        &request.events,
+    )?;
+    Ok(ClusterKvWatchEventsResponse {
+        accepted: true,
+        detail: "cluster kv watch events stored".to_string(),
+        stored_events,
+    })
 }
 
 pub fn cluster_kv_watch_events_rpc_payload(
@@ -1852,6 +2672,100 @@ pub fn decode_cluster_kv_watch_events_rpc_response_body(
     body: &[u8],
 ) -> Result<ClusterKvWatchEventsResponse, KvError> {
     decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_raft_append_rpc_payload(
+    request: &ClusterRaftAppendRequest,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_RAFT_APPEND_ROUTE,
+        category: CLUSTER_RAFT_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(request)?,
+    })
+}
+
+pub fn decode_cluster_raft_append_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterRaftAppendRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_raft_append_response_rpc_payload(
+    response: &ClusterRaftAppendResponse,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_RAFT_APPEND_ROUTE,
+        category: CLUSTER_RAFT_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_raft_append_rpc_response_body(
+    body: &[u8],
+) -> Result<ClusterRaftAppendResponse, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_raft_vote_rpc_payload(
+    request: &ClusterRaftVoteRequest,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_RAFT_VOTE_ROUTE,
+        category: CLUSTER_RAFT_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(request)?,
+    })
+}
+
+pub fn decode_cluster_raft_vote_rpc_request_body(
+    body: &[u8],
+) -> Result<ClusterRaftVoteRequest, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn cluster_raft_vote_response_rpc_payload(
+    response: &ClusterRaftVoteResponse,
+) -> Result<ClusterKvRpcPayload, KvError> {
+    Ok(ClusterKvRpcPayload {
+        route: CLUSTER_RAFT_VOTE_ROUTE,
+        category: CLUSTER_RAFT_RPC_CATEGORY,
+        body: encode_cluster_kv_rpc_body(response)?,
+    })
+}
+
+pub fn decode_cluster_raft_vote_rpc_response_body(
+    body: &[u8],
+) -> Result<ClusterRaftVoteResponse, KvError> {
+    decode_cluster_kv_rpc_body(body)
+}
+
+pub fn handle_cluster_raft_rpc_payload<A, V, E>(
+    route: &str,
+    body: &[u8],
+    append_handler: A,
+    vote_handler: V,
+) -> Result<Option<ClusterKvRpcPayload>, E>
+where
+    A: FnOnce(ClusterRaftAppendRequest) -> Result<ClusterRaftAppendResponse, E>,
+    V: FnOnce(ClusterRaftVoteRequest) -> Result<ClusterRaftVoteResponse, E>,
+    E: From<KvError>,
+{
+    match route {
+        CLUSTER_RAFT_APPEND_ROUTE => {
+            let request = decode_cluster_raft_append_rpc_request_body(body).map_err(E::from)?;
+            let response = append_handler(request)?;
+            Ok(Some(
+                cluster_raft_append_response_rpc_payload(&response).map_err(E::from)?,
+            ))
+        }
+        CLUSTER_RAFT_VOTE_ROUTE => {
+            let request = decode_cluster_raft_vote_rpc_request_body(body).map_err(E::from)?;
+            let response = vote_handler(request)?;
+            Ok(Some(
+                cluster_raft_vote_response_rpc_payload(&response).map_err(E::from)?,
+            ))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub trait ClusterKvLocalReadWatchHost {
@@ -3367,6 +4281,21 @@ pub struct ClusterKvRaftLocalVoteMetadata {
     pub last_log_term: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterKvRaftConfigRecord {
+    pub cluster_id: Id,
+    pub term: u64,
+    pub kv_revision: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voters: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub learners: Vec<NodeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_voting: Vec<NodeId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterKvRaftLeaderElectionOptions {
     pub max_attempts: usize,
@@ -3404,6 +4333,161 @@ pub trait ClusterKvRaftLeaderElectionHost {
 
 pub fn cluster_kv_raft_quorum_size(voter_count: usize) -> usize {
     voter_count / 2 + 1
+}
+
+pub fn cluster_kv_member_has_raft_vote(member: &ClusterMemberRecord) -> bool {
+    matches!(member.state, ClusterMemberState::Voter)
+        || (matches!(member.state, ClusterMemberState::Active)
+            && matches!(member.role, ClusterMemberRole::Voter))
+}
+
+pub fn cluster_kv_raft_node_is_voter(state: &ClusterBootstrapState, node_id: &NodeId) -> bool {
+    state.members.iter().any(|member| {
+        member.node_id == *node_id
+            && member.cluster_id == state.cluster_id
+            && member.state.is_authorized()
+            && cluster_kv_member_has_raft_vote(member)
+            && member
+                .capabilities
+                .iter()
+                .any(|capability| capability.as_str() == sinomo_node::DAEMON_MAIN_RUN_CAPABILITY)
+    })
+}
+
+pub fn cluster_kv_raft_candidate_is_authorized_voter(
+    state: &ClusterBootstrapState,
+    candidate_id: &NodeId,
+) -> bool {
+    cluster_kv_raft_node_is_voter(state, candidate_id)
+}
+
+pub fn cluster_kv_raft_local_is_voter(state: &ClusterBootstrapState) -> bool {
+    cluster_kv_raft_node_is_voter(state, &state.local_node_id)
+}
+
+pub fn cluster_kv_raft_voter_ids(state: &ClusterBootstrapState) -> BTreeSet<NodeId> {
+    state
+        .members
+        .iter()
+        .filter(|member| cluster_kv_raft_node_is_voter(state, &member.node_id))
+        .map(|member| member.node_id.clone())
+        .collect()
+}
+
+pub fn cluster_kv_raft_quorum_size_for_state(state: &ClusterBootstrapState) -> usize {
+    cluster_kv_raft_quorum_size(cluster_kv_raft_voter_ids(state).len())
+}
+
+pub fn cluster_kv_raft_config_key() -> String {
+    "/cluster/raft/config".to_string()
+}
+
+pub fn cluster_kv_raft_config_record_stable_eq(
+    left: &ClusterKvRaftConfigRecord,
+    right: &ClusterKvRaftConfigRecord,
+) -> bool {
+    left.cluster_id == right.cluster_id
+        && left.term == right.term
+        && left.voters == right.voters
+        && left.learners == right.learners
+        && left.non_voting == right.non_voting
+}
+
+pub fn cluster_kv_raft_config_member_role(
+    config: &ClusterKvRaftConfigRecord,
+    node_id: &NodeId,
+) -> Option<ClusterMemberRole> {
+    if config.voters.iter().any(|candidate| candidate == node_id) {
+        Some(ClusterMemberRole::Voter)
+    } else if config.learners.iter().any(|candidate| candidate == node_id) {
+        Some(ClusterMemberRole::Learner)
+    } else if config
+        .non_voting
+        .iter()
+        .any(|candidate| candidate == node_id)
+    {
+        Some(ClusterMemberRole::NonVoting)
+    } else {
+        None
+    }
+}
+
+pub fn cluster_kv_store_member_is_raft_voter(
+    store: &InProcessKvStore,
+    node_id: &NodeId,
+) -> Result<bool, KvError> {
+    let Some(config_entry) = store.get(&cluster_kv_raft_config_key()) else {
+        return Ok(false);
+    };
+    let config: ClusterKvRaftConfigRecord = config_entry.decode()?;
+    Ok(config.voters.iter().any(|voter| voter == node_id))
+}
+
+pub fn validate_cluster_kv_raft_config_transition(
+    current: &ClusterKvRaftConfigRecord,
+    next: &ClusterKvRaftConfigRecord,
+) -> Result<(), KvError> {
+    if current.cluster_id != next.cluster_id {
+        return Err(KvError::InvalidRaftConfigTransition {
+            detail: format!(
+                "cluster raft config cluster id changed from `{}` to `{}`",
+                current.cluster_id, next.cluster_id
+            ),
+        });
+    }
+    let current_voters = current.voters.iter().cloned().collect::<BTreeSet<_>>();
+    let next_voters = next.voters.iter().cloned().collect::<BTreeSet<_>>();
+    let removed_voters = current_voters
+        .difference(&next_voters)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !removed_voters.is_empty() {
+        let retained_voters = current_voters
+            .intersection(&next_voters)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let current_quorum = cluster_kv_raft_quorum_size(current_voters.len());
+        let next_quorum = cluster_kv_raft_quorum_size(next_voters.len());
+        if retained_voters.len() < current_quorum || retained_voters.len() < next_quorum {
+            return Err(KvError::InvalidRaftConfigTransition {
+                detail: format!(
+                    "raft voter removal requires overlapping old/new quorum; refusing to remove {}",
+                    removed_voters
+                        .iter()
+                        .map(NodeId::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+    }
+    let added_voters = next_voters
+        .difference(&current_voters)
+        .cloned()
+        .collect::<Vec<_>>();
+    if added_voters.len() > 1 {
+        return Err(KvError::InvalidRaftConfigTransition {
+            detail: format!(
+                "raft voter expansion is limited to one voter per committed config change; requested {} additions",
+                added_voters.len()
+            ),
+        });
+    }
+    if let Some(added_voter) = added_voters.first() {
+        let current_learners = current
+            .learners
+            .iter()
+            .chain(current.non_voting.iter())
+            .collect::<BTreeSet<_>>();
+        if !current_learners.contains(added_voter) {
+            return Err(KvError::InvalidRaftConfigTransition {
+                detail: format!(
+                    "raft voter `{added_voter}` must already be a committed learner or non-voting member before promotion"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn elect_cluster_kv_raft_leader_with_host<H>(
@@ -3475,6 +4559,113 @@ where
     Ok(false)
 }
 
+pub trait ClusterKvRaftLeaderElectionAsyncHost {
+    type Error: From<KvError>;
+
+    fn begin_election_attempt_async<'a>(
+        &'a mut self,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
+
+    fn local_vote_metadata_async<'a>(
+        &'a mut self,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftLocalVoteMetadata, Self::Error>;
+
+    fn apply_local_vote_async<'a>(
+        &'a mut self,
+        vote: RaftRequestVoteRequest,
+    ) -> ClusterKvRaftQuorumFuture<'a, RaftRequestVoteResponse, Self::Error>;
+
+    fn should_request_more_remote_votes(&mut self) -> bool;
+
+    fn request_remote_vote_async<'a>(
+        &'a mut self,
+        target_index: usize,
+        voter_id: &'a NodeId,
+        vote: &'a RaftRequestVoteRequest,
+    ) -> ClusterKvRaftQuorumFuture<'a, RaftRequestVoteResponse, Self::Error>;
+
+    fn observe_raft_term_async<'a>(
+        &'a mut self,
+        term: u64,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
+
+    fn set_raft_leader_async<'a>(
+        &'a mut self,
+        term: u64,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
+}
+
+pub async fn elect_cluster_kv_raft_leader_async_with_host<H>(
+    local_node_id: &NodeId,
+    voter_ids: impl IntoIterator<Item = NodeId>,
+    remote_vote_targets: impl IntoIterator<Item = NodeId>,
+    options: ClusterKvRaftLeaderElectionOptions,
+    host: &mut H,
+) -> Result<bool, H::Error>
+where
+    H: ClusterKvRaftLeaderElectionAsyncHost,
+{
+    let voter_ids = voter_ids.into_iter().collect::<BTreeSet<_>>();
+    if !voter_ids.contains(local_node_id) {
+        return Ok(false);
+    }
+    let quorum_size = cluster_kv_raft_quorum_size(voter_ids.len());
+    let remote_vote_targets = remote_vote_targets
+        .into_iter()
+        .filter(|voter_id| voter_id != local_node_id && voter_ids.contains(voter_id))
+        .collect::<Vec<_>>();
+
+    for _ in 0..options.max_attempts {
+        host.begin_election_attempt_async().await?;
+        let metadata = host.local_vote_metadata_async().await?;
+        let election_term = metadata
+            .current_term
+            .saturating_add(CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP);
+        let vote_request = RaftRequestVoteRequest {
+            term: election_term,
+            candidate_id: local_node_id.clone(),
+            last_log_index: metadata.last_log_index,
+            last_log_term: metadata.last_log_term,
+        };
+        let local_vote = host.apply_local_vote_async(vote_request.clone()).await?;
+        let mut highest_observed_term = local_vote.term.max(election_term);
+        let mut granted = BTreeSet::new();
+        if local_vote.vote_granted {
+            granted.insert(local_node_id.clone());
+        }
+
+        for (target_index, voter_id) in remote_vote_targets.iter().enumerate() {
+            if granted.len() >= quorum_size {
+                break;
+            }
+            if !host.should_request_more_remote_votes() {
+                break;
+            }
+            let Ok(response) = host
+                .request_remote_vote_async(target_index, voter_id, &vote_request)
+                .await
+            else {
+                continue;
+            };
+            highest_observed_term = highest_observed_term.max(response.term);
+            if response.vote_granted {
+                granted.insert(voter_id.clone());
+            }
+        }
+
+        if highest_observed_term > election_term {
+            host.observe_raft_term_async(highest_observed_term).await?;
+            continue;
+        }
+        if granted.len() < quorum_size {
+            return Ok(false);
+        }
+        host.set_raft_leader_async(election_term).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Storage-side contract for applying a cluster KV command to the local Raft log.
 ///
 /// Implementors own KV/Raft durability only. They must not choose peers, route
@@ -3497,9 +4688,878 @@ pub trait ClusterKvRaftCommandStorage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftQuorumCommitOptions {
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftQuorumCommitResult {
+    pub snapshot: KvSnapshot,
+    pub txn_response: Option<KvTxnResponse>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvTxnCommitResult {
+    pub snapshot: KvSnapshot,
+    pub txn_response: Option<KvTxnResponse>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClusterKvRaftTargetReplicationStatus {
+    Accepted,
+    Rejected,
+    Failed,
+}
+
+pub type ClusterKvRaftQuorumFuture<'a, T, E> =
+    Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftAppendReplicationOptions {
+    pub max_attempts: usize,
+    pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterKvRaftAppendReplicationOutcome {
+    pub response: ClusterRaftAppendResponse,
+    pub watch_event_fanout_needed: bool,
+}
+
+/// KV-owned append replication retry driver.
+///
+/// KV owns Raft log catch-up semantics: initial next-index selection, rejected
+/// append backoff, acceptance detection, and watch-event fanout eligibility.
+/// Hosts own durability access and transport-specific timeout/sending policy.
+pub trait ClusterKvRaftAppendReplicationHost {
+    type Error: From<KvError>;
+    type Target: Clone;
+
+    fn last_local_raft_log_index(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<u64, Self::Error>;
+
+    fn build_raft_append_request(
+        &mut self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, Self::Error>;
+
+    fn append_attempt_timeout(
+        &mut self,
+        target: &Self::Target,
+        remaining: Duration,
+        request: &ClusterRaftAppendRequest,
+    ) -> Duration;
+
+    fn on_raft_append_sent(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn send_raft_append(
+        &mut self,
+        target: &Self::Target,
+        request: &ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, Self::Error>;
+}
+
+pub trait ClusterKvRaftAppendReplicationAsyncHost {
+    type Error: From<KvError>;
+    type Target: Clone + Send + Sync;
+
+    fn last_local_raft_log_index_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, u64, Self::Error>;
+
+    fn build_raft_append_request_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        next_index: u64,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendRequest, Self::Error>;
+
+    fn append_attempt_timeout(
+        &mut self,
+        target: &Self::Target,
+        remaining: Duration,
+        request: &ClusterRaftAppendRequest,
+    ) -> Duration;
+
+    fn on_raft_append_sent_async<'a>(
+        &'a mut self,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn send_raft_append_async<'a>(
+        &'a mut self,
+        target: &'a Self::Target,
+        request: &'a ClusterRaftAppendRequest,
+        timeout: Duration,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error>;
+}
+
+pub fn replicate_cluster_kv_raft_to_target_with_host<H>(
+    state: &ClusterBootstrapState,
+    target: &H::Target,
+    watch_events: &[KvEvent],
+    options: ClusterKvRaftAppendReplicationOptions,
+    host: &mut H,
+) -> Result<ClusterKvRaftAppendReplicationOutcome, H::Error>
+where
+    H: ClusterKvRaftAppendReplicationHost,
+{
+    let deadline = Instant::now() + options.timeout;
+    let mut next_index = host.last_local_raft_log_index(state)?.saturating_add(1);
+    let mut last_response = None;
+    for _ in 0..options.max_attempts {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let request = host.build_raft_append_request(state, next_index)?;
+        let attempt_timeout = host.append_attempt_timeout(target, remaining, &request);
+        host.on_raft_append_sent()?;
+        let watch_event_fanout_needed =
+            cluster_raft_append_request_needs_watch_event_fanout(&request, watch_events);
+        let response = host.send_raft_append(target, &request, attempt_timeout)?;
+        if response.accepted {
+            return Ok(ClusterKvRaftAppendReplicationOutcome {
+                response,
+                watch_event_fanout_needed,
+            });
+        }
+        let rejected_next_index = response.append.match_index.saturating_add(1);
+        next_index = if rejected_next_index < next_index {
+            rejected_next_index
+        } else if response.append.match_index >= next_index {
+            next_index.saturating_div(2).max(1)
+        } else {
+            next_index.saturating_sub(1).max(1)
+        };
+        last_response = Some(response);
+    }
+    Ok(ClusterKvRaftAppendReplicationOutcome {
+        response: last_response.unwrap_or_else(|| ClusterRaftAppendResponse {
+            accepted: false,
+            detail: format!(
+                "raft append did not complete before {}ms catch-up budget",
+                options.timeout.as_millis()
+            ),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 0,
+                success: false,
+                match_index: 0,
+            },
+        }),
+        watch_event_fanout_needed: false,
+    })
+}
+
+pub async fn replicate_cluster_kv_raft_to_target_async_with_host<H>(
+    state: &ClusterBootstrapState,
+    target: &H::Target,
+    watch_events: &[KvEvent],
+    options: ClusterKvRaftAppendReplicationOptions,
+    host: &mut H,
+) -> Result<ClusterKvRaftAppendReplicationOutcome, H::Error>
+where
+    H: ClusterKvRaftAppendReplicationAsyncHost,
+{
+    let deadline = Instant::now() + options.timeout;
+    let mut next_index = host
+        .last_local_raft_log_index_async(state)
+        .await?
+        .saturating_add(1);
+    let mut last_response = None;
+    for _ in 0..options.max_attempts {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            break;
+        }
+        let request = host
+            .build_raft_append_request_async(state, next_index)
+            .await?;
+        let attempt_timeout = host.append_attempt_timeout(target, remaining, &request);
+        host.on_raft_append_sent_async().await?;
+        let watch_event_fanout_needed =
+            cluster_raft_append_request_needs_watch_event_fanout(&request, watch_events);
+        let response = host
+            .send_raft_append_async(target, &request, attempt_timeout)
+            .await?;
+        if response.accepted {
+            return Ok(ClusterKvRaftAppendReplicationOutcome {
+                response,
+                watch_event_fanout_needed,
+            });
+        }
+        let rejected_next_index = response.append.match_index.saturating_add(1);
+        next_index = if rejected_next_index < next_index {
+            rejected_next_index
+        } else if response.append.match_index >= next_index {
+            next_index.saturating_div(2).max(1)
+        } else {
+            next_index.saturating_sub(1).max(1)
+        };
+        last_response = Some(response);
+    }
+    Ok(ClusterKvRaftAppendReplicationOutcome {
+        response: last_response.unwrap_or_else(|| ClusterRaftAppendResponse {
+            accepted: false,
+            detail: format!(
+                "raft append did not complete before {}ms catch-up budget",
+                options.timeout.as_millis()
+            ),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 0,
+                success: false,
+                match_index: 0,
+            },
+        }),
+        watch_event_fanout_needed: false,
+    })
+}
+
+/// Storage-side Raft quorum commit driver.
+///
+/// KV owns the Raft append/commit/rollback decision flow and quorum accounting.
+/// The host owns all topology-specific work: choosing remote voter targets,
+/// transmitting append RPCs, merging any peer cluster-state observations, and
+/// reporting route/connectivity observations.
+pub trait ClusterKvRaftQuorumCommitHost: ClusterKvRaftCommandStorage {
+    type Target: Clone;
+
+    fn remote_voter_targets(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Vec<Self::Target>, Self::Error>;
+
+    fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId;
+
+    fn target_description(&self, target: &Self::Target) -> String {
+        self.target_node_id(target).to_string()
+    }
+
+    fn replicate_cluster_raft_to_target(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target: &Self::Target,
+        timeout: Duration,
+    ) -> Result<ClusterRaftAppendResponse, Self::Error>;
+
+    fn record_target_replication_status(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target: &Self::Target,
+        _status: ClusterKvRaftTargetReplicationStatus,
+        _latency_ms: Option<u64>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn observe_accepted_append_state(
+        &mut self,
+        _state: &mut ClusterBootstrapState,
+        _target: &Self::Target,
+        _peer_state: ClusterBootstrapState,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn fan_out_committed_cluster_raft_command(
+        &mut self,
+        _state: ClusterBootstrapState,
+        _events: Vec<KvEvent>,
+        _targets: Vec<Self::Target>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+}
+
+/// Async storage-side Raft quorum commit host.
+///
+/// This mirrors `ClusterKvRaftQuorumCommitHost`, but every operation that may
+/// cross an async storage or transport boundary is supplied by the caller. KV
+/// still owns the quorum decision flow; the host owns transport and topology.
+pub trait ClusterKvRaftQuorumCommitAsyncHost {
+    type Error: From<KvError> + ToString;
+    type Target: Clone + Send + Sync;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
+        &'a mut self,
+        command: KvCommand,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftUncommittedAppend, Self::Error>;
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader_async<'a>(
+        &'a mut self,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error>;
+
+    fn commit_cluster_raft_index_with_events_async<'a>(
+        &'a mut self,
+        index: u64,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftCommitResult, Self::Error>;
+
+    fn remote_voter_targets_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, Vec<Self::Target>, Self::Error>;
+
+    fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId;
+
+    fn target_description(&self, target: &Self::Target) -> String {
+        self.target_node_id(target).to_string()
+    }
+
+    fn replicate_cluster_raft_to_target_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        target: &'a Self::Target,
+        timeout: Duration,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error>;
+
+    fn record_target_replication_status_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+        _target: &'a Self::Target,
+        _status: ClusterKvRaftTargetReplicationStatus,
+        _latency_ms: Option<u64>,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn observe_accepted_append_state_async<'a>(
+        &'a mut self,
+        _state: &'a mut ClusterBootstrapState,
+        _target: &'a Self::Target,
+        _peer_state: ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn fan_out_committed_cluster_raft_command_async<'a>(
+        &'a mut self,
+        _state: ClusterBootstrapState,
+        _events: Vec<KvEvent>,
+        _targets: Vec<Self::Target>,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+}
+
+pub fn commit_cluster_kv_raft_command_with_quorum<H>(
+    state: &mut ClusterBootstrapState,
+    command: KvCommand,
+    options: ClusterKvRaftQuorumCommitOptions,
+    host: &mut H,
+) -> Result<ClusterKvRaftQuorumCommitResult, H::Error>
+where
+    H: ClusterKvRaftQuorumCommitHost,
+    H::Error: ToString,
+{
+    let entry = match host.append_cluster_raft_command_uncommitted_or_no_effect(command)? {
+        ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
+        ClusterKvRaftUncommittedAppend::NoEffect {
+            snapshot,
+            txn_response,
+        } => {
+            return Ok(ClusterKvRaftQuorumCommitResult {
+                snapshot,
+                txn_response,
+            });
+        }
+    };
+
+    let mut voter_acks = BTreeSet::new();
+    if cluster_kv_raft_local_is_voter(state) {
+        voter_acks.insert(state.local_node_id.clone());
+    }
+    let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
+    let mut failures = Vec::new();
+    let deadline = Instant::now() + options.timeout;
+    let targets = host.remote_voter_targets(state)?;
+    for target in &targets {
+        if voter_acks.len() >= quorum_size {
+            break;
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            failures.push(format!(
+                "raft command did not reach quorum before {}ms replication budget",
+                options.timeout.as_millis()
+            ));
+            break;
+        }
+        let started = Instant::now();
+        match host.replicate_cluster_raft_to_target(state, target, remaining) {
+            Ok(response) if response.accepted => {
+                host.record_target_replication_status(
+                    state,
+                    target,
+                    ClusterKvRaftTargetReplicationStatus::Accepted,
+                    Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                )?;
+                voter_acks.insert(host.target_node_id(target).clone());
+                host.observe_accepted_append_state(state, target, response.state)?;
+            }
+            Ok(response) => {
+                host.record_target_replication_status(
+                    state,
+                    target,
+                    ClusterKvRaftTargetReplicationStatus::Rejected,
+                    Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                )?;
+                failures.push(format!(
+                    "{} rejected append: {} (term {}, match_index {})",
+                    host.target_description(target),
+                    response.detail,
+                    response.append.term,
+                    response.append.match_index
+                ));
+            }
+            Err(error) => {
+                host.record_target_replication_status(
+                    state,
+                    target,
+                    ClusterKvRaftTargetReplicationStatus::Failed,
+                    None,
+                )?;
+                failures.push(format!(
+                    "{} failed: {}",
+                    host.target_description(target),
+                    error.to_string()
+                ));
+            }
+        }
+    }
+
+    if voter_acks.len() < quorum_size {
+        let _ = host.discard_cluster_raft_uncommitted_tail_and_clear_leader();
+        return Err(host.cluster_read_only_error(format!(
+            "raft command at index {} replicated to {} voters, {} required{}",
+            entry.index,
+            voter_acks.len(),
+            quorum_size,
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        )));
+    }
+
+    let commit = host.commit_cluster_raft_index_with_events(entry.index)?;
+    if !targets.is_empty() {
+        host.fan_out_committed_cluster_raft_command(state.clone(), commit.events.clone(), targets)?;
+    }
+    Ok(ClusterKvRaftQuorumCommitResult {
+        snapshot: commit.snapshot,
+        txn_response: commit.txn_response,
+    })
+}
+
+pub async fn commit_cluster_kv_raft_command_with_quorum_async<H>(
+    state: &mut ClusterBootstrapState,
+    command: KvCommand,
+    options: ClusterKvRaftQuorumCommitOptions,
+    host: &mut H,
+) -> Result<ClusterKvRaftQuorumCommitResult, H::Error>
+where
+    H: ClusterKvRaftQuorumCommitAsyncHost,
+{
+    let entry = match host
+        .append_cluster_raft_command_uncommitted_or_no_effect_async(command)
+        .await?
+    {
+        ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
+        ClusterKvRaftUncommittedAppend::NoEffect {
+            snapshot,
+            txn_response,
+        } => {
+            return Ok(ClusterKvRaftQuorumCommitResult {
+                snapshot,
+                txn_response,
+            });
+        }
+    };
+
+    let mut voter_acks = BTreeSet::new();
+    if cluster_kv_raft_local_is_voter(state) {
+        voter_acks.insert(state.local_node_id.clone());
+    }
+    let quorum_size = cluster_kv_raft_quorum_size_for_state(state);
+    let mut failures = Vec::new();
+    let deadline = Instant::now() + options.timeout;
+    let targets = host.remote_voter_targets_async(state).await?;
+    for target in &targets {
+        if voter_acks.len() >= quorum_size {
+            break;
+        }
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            failures.push(format!(
+                "raft command did not reach quorum before {}ms replication budget",
+                options.timeout.as_millis()
+            ));
+            break;
+        }
+        let started = Instant::now();
+        match host
+            .replicate_cluster_raft_to_target_async(state, target, remaining)
+            .await
+        {
+            Ok(response) if response.accepted => {
+                host.record_target_replication_status_async(
+                    state,
+                    target,
+                    ClusterKvRaftTargetReplicationStatus::Accepted,
+                    Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                )
+                .await?;
+                voter_acks.insert(host.target_node_id(target).clone());
+                host.observe_accepted_append_state_async(state, target, response.state)
+                    .await?;
+            }
+            Ok(response) => {
+                host.record_target_replication_status_async(
+                    state,
+                    target,
+                    ClusterKvRaftTargetReplicationStatus::Rejected,
+                    Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64),
+                )
+                .await?;
+                failures.push(format!(
+                    "{} rejected append: {} (term {}, match_index {})",
+                    host.target_description(target),
+                    response.detail,
+                    response.append.term,
+                    response.append.match_index
+                ));
+            }
+            Err(error) => {
+                host.record_target_replication_status_async(
+                    state,
+                    target,
+                    ClusterKvRaftTargetReplicationStatus::Failed,
+                    None,
+                )
+                .await?;
+                failures.push(format!(
+                    "{} failed: {}",
+                    host.target_description(target),
+                    error.to_string()
+                ));
+            }
+        }
+    }
+
+    if voter_acks.len() < quorum_size {
+        let _ = host
+            .discard_cluster_raft_uncommitted_tail_and_clear_leader_async()
+            .await;
+        return Err(host.cluster_read_only_error(format!(
+            "raft command at index {} replicated to {} voters, {} required{}",
+            entry.index,
+            voter_acks.len(),
+            quorum_size,
+            if failures.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", failures.join("; "))
+            }
+        )));
+    }
+
+    let commit = host
+        .commit_cluster_raft_index_with_events_async(entry.index)
+        .await?;
+    if !targets.is_empty() {
+        host.fan_out_committed_cluster_raft_command_async(
+            state.clone(),
+            commit.events.clone(),
+            targets,
+        )
+        .await?;
+    }
+    Ok(ClusterKvRaftQuorumCommitResult {
+        snapshot: commit.snapshot,
+        txn_response: commit.txn_response,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClusterKvTxnQuorumDriverOptions {
+    pub allow_forwarding: bool,
+}
+
+pub trait ClusterKvTxnQuorumHost {
+    type Error: From<KvError> + ToString;
+
+    fn refresh_current_cluster_kv_store(
+        &mut self,
+        _state: &ClusterBootstrapState,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn local_is_raft_leader(&mut self, state: &ClusterBootstrapState) -> Result<bool, Self::Error>;
+
+    fn forward_cluster_kv_txn_to_voter(
+        &mut self,
+        state: &ClusterBootstrapState,
+        txn: &KvTxn,
+    ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error>;
+
+    fn elect_cluster_raft_leader(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<bool, Self::Error>;
+
+    fn reachable_voter_count(
+        &mut self,
+        state: &ClusterBootstrapState,
+    ) -> Result<usize, Self::Error>;
+
+    fn semantic_txn_no_effect_response(
+        &mut self,
+        txn: &KvTxn,
+    ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error>;
+
+    fn commit_cluster_raft_txn_with_quorum(
+        &mut self,
+        state: &mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> Result<ClusterKvRaftQuorumCommitResult, Self::Error>;
+
+    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+}
+
+pub trait ClusterKvTxnQuorumAsyncHost {
+    type Error: From<KvError> + ToString;
+
+    fn refresh_current_cluster_kv_store_async<'a>(
+        &'a mut self,
+        _state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn local_is_raft_leader_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error>;
+
+    fn forward_cluster_kv_txn_to_voter_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        txn: &'a KvTxn,
+    ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error>;
+
+    fn elect_cluster_raft_leader_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, bool, Self::Error>;
+
+    fn reachable_voter_count_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+    ) -> ClusterKvRaftQuorumFuture<'a, usize, Self::Error>;
+
+    fn semantic_txn_no_effect_response_async<'a>(
+        &'a mut self,
+        txn: &'a KvTxn,
+    ) -> ClusterKvRaftQuorumFuture<'a, Option<ClusterKvTxnCommitResult>, Self::Error>;
+
+    fn commit_cluster_raft_txn_with_quorum_async<'a>(
+        &'a mut self,
+        state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftQuorumCommitResult, Self::Error>;
+
+    fn cluster_read_only_error(&mut self, detail: String) -> Self::Error;
+}
+
+pub fn commit_cluster_kv_txn_with_quorum_with_host<H>(
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+    options: ClusterKvTxnQuorumDriverOptions,
+    host: &mut H,
+) -> Result<ClusterKvTxnCommitResult, H::Error>
+where
+    H: ClusterKvTxnQuorumHost,
+{
+    let _ = host.refresh_current_cluster_kv_store(state);
+    if !cluster_kv_raft_local_is_voter(state) {
+        if options.allow_forwarding
+            && let Some(response) = host.forward_cluster_kv_txn_to_voter(state, &txn)?
+        {
+            return Ok(response);
+        }
+        let reachable_voters = host.reachable_voter_count(state)?;
+        return Err(host.cluster_read_only_error(format!(
+            "local node is not a Raft voter and could not forward to a voter ({} reachable voters, {} required)",
+            reachable_voters,
+            cluster_kv_raft_quorum_size_for_state(state)
+        )));
+    }
+
+    if !host.local_is_raft_leader(state)? {
+        let forwarding_failure = if options.allow_forwarding {
+            match host.forward_cluster_kv_txn_to_voter(state, &txn) {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => None,
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if !options.allow_forwarding {
+            return Err(host.cluster_read_only_error(
+                "forwarded cluster KV transaction reached a non-leader voter".to_string(),
+            ));
+        }
+        if !host.elect_cluster_raft_leader(state)? {
+            let detail = if let Some(forwarding_failure) = forwarding_failure {
+                format!(
+                    "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
+                    forwarding_failure.to_string()
+                )
+            } else {
+                "local node is not the Raft leader and could not win quorum".to_string()
+            };
+            return Err(host.cluster_read_only_error(detail));
+        }
+    }
+    if !host.local_is_raft_leader(state)? {
+        return Err(host.cluster_read_only_error(
+            "local node is not the Raft leader and could not win quorum".to_string(),
+        ));
+    }
+    if let Some(response) = host.semantic_txn_no_effect_response(&txn)? {
+        return Ok(response);
+    }
+    let commit = host.commit_cluster_raft_txn_with_quorum(state, txn)?;
+    Ok(ClusterKvTxnCommitResult {
+        snapshot: commit.snapshot,
+        txn_response: commit.txn_response,
+    })
+}
+
+pub async fn commit_cluster_kv_txn_with_quorum_async_with_host<H>(
+    state: &mut ClusterBootstrapState,
+    txn: KvTxn,
+    options: ClusterKvTxnQuorumDriverOptions,
+    host: &mut H,
+) -> Result<ClusterKvTxnCommitResult, H::Error>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let _ = host.refresh_current_cluster_kv_store_async(state).await;
+    if !cluster_kv_raft_local_is_voter(state) {
+        if options.allow_forwarding
+            && let Some(response) = host
+                .forward_cluster_kv_txn_to_voter_async(state, &txn)
+                .await?
+        {
+            return Ok(response);
+        }
+        let reachable_voters = host.reachable_voter_count_async(state).await?;
+        return Err(host.cluster_read_only_error(format!(
+            "local node is not a Raft voter and could not forward to a voter ({} reachable voters, {} required)",
+            reachable_voters,
+            cluster_kv_raft_quorum_size_for_state(state)
+        )));
+    }
+
+    if !host.local_is_raft_leader_async(state).await? {
+        let forwarding_failure = if options.allow_forwarding {
+            match host
+                .forward_cluster_kv_txn_to_voter_async(state, &txn)
+                .await
+            {
+                Ok(Some(response)) => return Ok(response),
+                Ok(None) => None,
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
+        if !options.allow_forwarding {
+            return Err(host.cluster_read_only_error(
+                "forwarded cluster KV transaction reached a non-leader voter".to_string(),
+            ));
+        }
+        if !host.elect_cluster_raft_leader_async(state).await? {
+            let detail = if let Some(forwarding_failure) = forwarding_failure {
+                format!(
+                    "local node is not the Raft leader and could not win quorum; forwarding also failed: {}",
+                    forwarding_failure.to_string()
+                )
+            } else {
+                "local node is not the Raft leader and could not win quorum".to_string()
+            };
+            return Err(host.cluster_read_only_error(detail));
+        }
+    }
+    if !host.local_is_raft_leader_async(state).await? {
+        return Err(host.cluster_read_only_error(
+            "local node is not the Raft leader and could not win quorum".to_string(),
+        ));
+    }
+    if let Some(response) = host.semantic_txn_no_effect_response_async(&txn).await? {
+        return Ok(response);
+    }
+    let commit = host
+        .commit_cluster_raft_txn_with_quorum_async(state, txn)
+        .await?;
+    Ok(ClusterKvTxnCommitResult {
+        snapshot: commit.snapshot,
+        txn_response: commit.txn_response,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClusterKvRaftCompactionPolicy {
     pub max_snapshot_bytes: u64,
     pub max_snapshot_events: usize,
+}
+
+pub fn default_cluster_kv_raft_compaction_policy() -> ClusterKvRaftCompactionPolicy {
+    ClusterKvRaftCompactionPolicy {
+        max_snapshot_bytes: cluster_kv_raft_snapshot_byte_limit(),
+        max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+    }
+}
+
+pub fn cluster_kv_raft_snapshot_byte_limit() -> u64 {
+    #[cfg(test)]
+    {
+        CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST.load(Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_cluster_kv_raft_snapshot_byte_limit_for_test(limit: u64) -> u64 {
+    CLUSTER_KV_RAFT_SNAPSHOT_BYTES_LIMIT_FOR_TEST.swap(limit, Ordering::Relaxed)
 }
 
 pub fn cluster_kv_raft_node_should_compact(
@@ -3590,10 +5650,15 @@ impl ClusterKvRaftStore {
     }
 
     pub async fn open_node_async(&self, node_id: &NodeId) -> Result<DurableRaftKvNode, KvError> {
-        let cache = self.paths.local_cache();
-        let mut node = cache.open_raft_node_async(node_id.clone()).await?;
-        self.compact_node_if_needed(&mut node)?;
-        Ok(node)
+        let store = self.clone();
+        let node_id = node_id.clone();
+        let error_path = store.wal_paths(&node_id).root.display().to_string();
+        tokio::task::spawn_blocking(move || store.open_node(&node_id))
+            .await
+            .map_err(|source| KvError::Io {
+                path: error_path,
+                detail: source.to_string(),
+            })?
     }
 
     pub fn build_append_entries_request_from_next_index(
@@ -3646,6 +5711,55 @@ impl ClusterKvRaftStore {
         })
     }
 
+    pub fn build_cluster_raft_append_request_from_next_index(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        let request = self.build_append_entries_request_from_next_index(
+            &state.local_node_id,
+            &state.local_node_id,
+            next_index,
+        )?;
+        Ok(ClusterRaftAppendRequest {
+            state: state.clone(),
+            snapshot: request.snapshot,
+            append: request.append,
+        })
+    }
+
+    pub fn locked_build_cluster_raft_append_request_from_next_index(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.build_cluster_raft_append_request_from_next_index(state, next_index)
+    }
+
+    pub async fn locked_build_cluster_raft_append_request_from_next_index_async(
+        &self,
+        state: &ClusterBootstrapState,
+        next_index: u64,
+    ) -> Result<ClusterRaftAppendRequest, KvError> {
+        let store = self.clone();
+        let state = state.clone();
+        let error_path = store
+            .wal_paths(&state.local_node_id)
+            .root
+            .display()
+            .to_string();
+        tokio::task::spawn_blocking(move || {
+            let _raft_guard = lock_cluster_kv_raft_operation()?;
+            store.build_cluster_raft_append_request_from_next_index(&state, next_index)
+        })
+        .await
+        .map_err(|source| KvError::Io {
+            path: error_path,
+            detail: source.to_string(),
+        })?
+    }
+
     pub fn restore_from_snapshot_if_newer(
         &self,
         node_id: &NodeId,
@@ -3654,6 +5768,27 @@ impl ClusterKvRaftStore {
         self.paths
             .local_cache()
             .restore_raft_from_snapshot_if_newer(node_id.clone(), snapshot)
+    }
+
+    pub fn restore_from_snapshot_if_newer_and_notify(
+        &self,
+        node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        let restored = self.restore_from_snapshot_if_newer(node_id, snapshot)?;
+        if restored {
+            notify_cluster_kv_watchers(&self.paths);
+        }
+        Ok(restored)
+    }
+
+    pub fn locked_restore_from_snapshot_if_newer_and_notify(
+        &self,
+        node_id: &NodeId,
+        snapshot: KvSnapshot,
+    ) -> Result<bool, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.restore_from_snapshot_if_newer_and_notify(node_id, snapshot)
     }
 
     pub fn local_vote_metadata(
@@ -3668,6 +5803,38 @@ impl ClusterKvRaftStore {
         })
     }
 
+    pub fn locked_local_vote_metadata(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<ClusterKvRaftLocalVoteMetadata, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.local_vote_metadata(node_id)
+    }
+
+    pub fn last_log_index(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        self.open_node(node_id).map(|node| node.last_log_index())
+    }
+
+    pub fn locked_last_log_index(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.last_log_index(node_id)
+    }
+
+    pub async fn locked_last_log_index_async(&self, node_id: &NodeId) -> Result<u64, KvError> {
+        let store = self.clone();
+        let node_id = node_id.clone();
+        let error_path = store.wal_paths(&node_id).root.display().to_string();
+        tokio::task::spawn_blocking(move || {
+            let _raft_guard = lock_cluster_kv_raft_operation()?;
+            store.last_log_index(&node_id)
+        })
+        .await
+        .map_err(|source| KvError::Io {
+            path: error_path,
+            detail: format!("cluster kv raft log index task failed: {source}"),
+        })?
+    }
+
     pub fn apply_vote(
         &self,
         node_id: &NodeId,
@@ -3675,6 +5842,33 @@ impl ClusterKvRaftStore {
     ) -> Result<RaftRequestVoteResponse, KvError> {
         let mut node = self.open_node(node_id)?;
         node.request_vote(vote)
+    }
+
+    pub fn locked_apply_vote(
+        &self,
+        node_id: &NodeId,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<RaftRequestVoteResponse, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.apply_vote(node_id, vote)
+    }
+
+    pub fn apply_vote_response(
+        &self,
+        state: &ClusterBootstrapState,
+        vote: RaftRequestVoteRequest,
+    ) -> Result<ClusterRaftVoteResponse, KvError> {
+        let vote = self.apply_vote(&state.local_node_id, vote)?;
+        Ok(ClusterRaftVoteResponse {
+            accepted: vote.vote_granted,
+            detail: if vote.vote_granted {
+                "raft vote granted".to_string()
+            } else {
+                "raft vote rejected by local hard state".to_string()
+            },
+            state: state.clone(),
+            vote,
+        })
     }
 
     pub fn apply_append_entries_with_optional_snapshot(
@@ -3687,6 +5881,23 @@ impl ClusterKvRaftStore {
         let outcome = node.apply_append_entries_with_optional_snapshot(snapshot, append)?;
         self.compact_node_if_needed(&mut node)?;
         Ok(outcome)
+    }
+
+    pub fn apply_append_entries_with_optional_snapshot_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        snapshot: Option<RaftSnapshot>,
+        append: RaftAppendEntriesRequest,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(RaftAppendEntriesApplyOutcome, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let outcome =
+            self.apply_append_entries_with_optional_snapshot(node_id, snapshot, append)?;
+        let wrote = self
+            .publish_append_entries_apply_outcome(&outcome, key_can_defer_materialized_snapshot)?;
+        Ok((outcome, wrote))
     }
 
     pub fn append_entries_rejection_response(
@@ -3712,11 +5923,92 @@ impl ClusterKvRaftStore {
         })
     }
 
+    pub fn cluster_raft_vote_rejection_response(
+        &self,
+        state: &ClusterBootstrapState,
+        detail: String,
+    ) -> Result<ClusterRaftVoteResponse, KvError> {
+        Ok(ClusterRaftVoteResponse {
+            accepted: false,
+            detail,
+            state: state.clone(),
+            vote: self.request_vote_rejection_response(&state.local_node_id)?,
+        })
+    }
+
+    pub fn known_leader_id(&self, node_id: &NodeId) -> Result<Option<NodeId>, KvError> {
+        // Read only the tiny hard-state file rather than opening the full Raft
+        // node, which may replay a large WAL. Topology validity remains the
+        // caller's job because KV does not interpret cluster membership.
+        self.wal_paths(node_id)
+            .read_persisted_hard_state()
+            .map(|hard_state| hard_state.leader_id)
+    }
+
+    pub fn locked_known_leader_id(&self, node_id: &NodeId) -> Result<Option<NodeId>, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.known_leader_id(node_id)
+    }
+
+    pub fn known_voter_leader_id(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, KvError> {
+        Ok(self
+            .known_leader_id(&state.local_node_id)?
+            .filter(|leader_id| cluster_kv_raft_node_is_voter(state, leader_id)))
+    }
+
+    pub fn locked_known_voter_leader_id(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.known_voter_leader_id(state)
+    }
+
+    pub fn local_is_leader(&self, state: &ClusterBootstrapState) -> Result<bool, KvError> {
+        Ok(
+            self.known_voter_leader_id(state)?.as_ref() == Some(&state.local_node_id)
+                && cluster_kv_raft_local_is_voter(state),
+        )
+    }
+
+    pub fn locked_local_is_leader(&self, state: &ClusterBootstrapState) -> Result<bool, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.local_is_leader(state)
+    }
+
     pub fn observe_term(&self, node_id: &NodeId, term: u64) -> Result<Option<KvSnapshot>, KvError> {
         let mut node = self.open_node(node_id)?;
         let changed = node.observe_term(term)?;
         self.compact_node_if_needed(&mut node)?;
         Ok(changed.then(|| node.store().snapshot()))
+    }
+
+    pub fn observe_term_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<bool, KvError> {
+        let snapshot = self.observe_term(node_id, term)?;
+        if let Some(snapshot) = snapshot {
+            self.paths
+                .local_cache()
+                .write_snapshot_if_changed(&snapshot)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn locked_observe_term_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<bool, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.observe_term_and_write_snapshot_if_changed(node_id, term)
     }
 
     pub fn set_leader(&self, node_id: &NodeId, term: u64) -> Result<KvSnapshot, KvError> {
@@ -3726,11 +6018,51 @@ impl ClusterKvRaftStore {
         Ok(node.store().snapshot())
     }
 
+    pub fn set_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<KvSnapshot, KvError> {
+        let snapshot = self.set_leader(node_id, term)?;
+        self.paths
+            .local_cache()
+            .write_snapshot_if_changed(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn locked_set_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+        term: u64,
+    ) -> Result<KvSnapshot, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.set_leader_and_write_snapshot_if_changed(node_id, term)
+    }
+
     pub fn clear_leader(&self, node_id: &NodeId) -> Result<KvSnapshot, KvError> {
         let mut node = self.open_node(node_id)?;
         node.clear_known_leader()?;
         self.compact_node_if_needed(&mut node)?;
         Ok(node.store().snapshot())
+    }
+
+    pub fn clear_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvSnapshot, KvError> {
+        let snapshot = self.clear_leader(node_id)?;
+        self.paths
+            .local_cache()
+            .write_snapshot_if_changed(&snapshot)?;
+        Ok(snapshot)
+    }
+
+    pub fn locked_clear_leader_and_write_snapshot_if_changed(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<KvSnapshot, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.clear_leader_and_write_snapshot_if_changed(node_id)
     }
 
     pub fn append_command_with_response(
@@ -3761,6 +6093,144 @@ impl ClusterKvRaftStore {
         })
     }
 
+    pub fn append_command(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<KvSnapshot, KvError> {
+        self.append_command_with_response(node_id, command)
+            .map(|result| result.snapshot)
+    }
+
+    pub fn append_command_with_response_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<ClusterKvRaftCommitResult, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let (result, _) = self.append_command_with_response_and_publish_report(
+            node_id,
+            command,
+            key_can_defer_materialized_snapshot,
+        )?;
+        Ok(result)
+    }
+
+    pub fn append_command_with_response_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(ClusterKvRaftCommitResult, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let result = self.append_command_with_response(node_id, command)?;
+        let wrote = self.publish_commit_result(&result, key_can_defer_materialized_snapshot)?;
+        Ok((result, wrote))
+    }
+
+    pub fn append_command_and_publish<F>(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<KvSnapshot, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.append_command_with_response_and_publish(
+            node_id,
+            command,
+            key_can_defer_materialized_snapshot,
+        )
+        .map(|result| result.snapshot)
+    }
+
+    pub fn publish_commit_result<F>(
+        &self,
+        result: &ClusterKvRaftCommitResult,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<bool, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let wrote = self.write_snapshot_after_commit(
+            &result.snapshot,
+            &result.events,
+            key_can_defer_materialized_snapshot,
+        )?;
+        notify_cluster_kv_watchers_for_events(&self.paths, &result.events);
+        Ok(wrote)
+    }
+
+    pub fn publish_append_entries_apply_outcome<F>(
+        &self,
+        outcome: &RaftAppendEntriesApplyOutcome,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<bool, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        if outcome.snapshot_restored {
+            let wrote = write_cluster_kv_snapshot_if_changed(&self.paths, &outcome.snapshot)?;
+            return Ok(wrote);
+        }
+        if outcome.committed_events.is_empty() {
+            return Ok(false);
+        }
+        let wrote = self.write_snapshot_after_commit(
+            &outcome.snapshot,
+            &outcome.committed_events,
+            key_can_defer_materialized_snapshot,
+        )?;
+        notify_cluster_kv_watchers_for_events(&self.paths, &outcome.committed_events);
+        Ok(wrote)
+    }
+
+    pub fn write_snapshot_after_commit<F>(
+        &self,
+        snapshot: &KvSnapshot,
+        events: &[KvEvent],
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<bool, KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        if cluster_kv_events_can_defer_materialized_snapshot(
+            events,
+            key_can_defer_materialized_snapshot,
+        ) && self.materialized_snapshot_is_fresh_enough(snapshot)
+        {
+            return Ok(false);
+        }
+        self.paths.local_cache().write_snapshot_if_changed(snapshot)
+    }
+
+    fn materialized_snapshot_is_fresh_enough(&self, snapshot: &KvSnapshot) -> bool {
+        let Some(existing) = self
+            .paths
+            .local_cache()
+            .cached_snapshot_arc_if_present()
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        cluster_kv_materialized_snapshot_is_fresh_enough_against(
+            existing.revision,
+            snapshot.revision,
+            self.materialized_snapshot_age(),
+        )
+    }
+
+    fn materialized_snapshot_age(&self) -> Option<Duration> {
+        cluster_kv_materialized_snapshot_age(&self.paths)
+    }
+
     pub fn append_command_uncommitted(
         &self,
         node_id: &NodeId,
@@ -3786,6 +6256,15 @@ impl ClusterKvRaftStore {
             .map(ClusterKvRaftUncommittedAppend::Appended)
     }
 
+    pub fn locked_append_command_uncommitted_or_no_effect(
+        &self,
+        node_id: &NodeId,
+        command: KvCommand,
+    ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.append_command_uncommitted_or_no_effect(node_id, command)
+    }
+
     pub fn discard_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
         let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
         let discarded = node.discard_uncommitted_tail()?;
@@ -3802,6 +6281,23 @@ impl ClusterKvRaftStore {
         node.clear_known_leader()?;
         self.compact_node_if_needed(&mut node)?;
         Ok(node.store().snapshot())
+    }
+
+    pub fn discard_uncommitted_tail_and_clear_leader_and_publish_report(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<(KvSnapshot, bool), KvError> {
+        let snapshot = self.discard_uncommitted_tail_and_clear_leader(node_id)?;
+        let wrote = write_cluster_kv_snapshot_if_changed(&self.paths, &snapshot)?;
+        Ok((snapshot, wrote))
+    }
+
+    pub fn locked_discard_uncommitted_tail_and_clear_leader_and_publish_report(
+        &self,
+        node_id: &NodeId,
+    ) -> Result<(KvSnapshot, bool), KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.discard_uncommitted_tail_and_clear_leader_and_publish_report(node_id)
     }
 
     pub fn commit_index_with_events(
@@ -3821,6 +6317,37 @@ impl ClusterKvRaftStore {
             txn_response,
             events,
         })
+    }
+
+    pub fn commit_index_with_events_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        commit_index: u64,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(ClusterKvRaftCommitResult, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let result = self.commit_index_with_events(node_id, commit_index)?;
+        let wrote = self.publish_commit_result(&result, key_can_defer_materialized_snapshot)?;
+        Ok((result, wrote))
+    }
+
+    pub fn locked_commit_index_with_events_and_publish_report<F>(
+        &self,
+        node_id: &NodeId,
+        commit_index: u64,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Result<(ClusterKvRaftCommitResult, bool), KvError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let _raft_guard = lock_cluster_kv_raft_operation()?;
+        self.commit_index_with_events_and_publish_report(
+            node_id,
+            commit_index,
+            key_can_defer_materialized_snapshot,
+        )
     }
 
     fn append_command_to_open_node(
@@ -3863,6 +6390,99 @@ impl ClusterKvRaftStore {
             .filter(|event| event.revision > before_revision)
             .cloned()
             .collect()
+    }
+}
+
+pub struct ClusterKvRaftLocalCommandStorage<F>
+where
+    F: FnMut(&str) -> bool,
+{
+    store: ClusterKvRaftStore,
+    node_id: NodeId,
+    key_can_defer_materialized_snapshot: F,
+    last_snapshot_publish_wrote: Option<bool>,
+}
+
+impl<F> ClusterKvRaftLocalCommandStorage<F>
+where
+    F: FnMut(&str) -> bool,
+{
+    pub fn new(
+        store: ClusterKvRaftStore,
+        node_id: NodeId,
+        key_can_defer_materialized_snapshot: F,
+    ) -> Self {
+        Self {
+            store,
+            node_id,
+            key_can_defer_materialized_snapshot,
+            last_snapshot_publish_wrote: None,
+        }
+    }
+
+    pub fn take_last_snapshot_publish_wrote(&mut self) -> Option<bool> {
+        self.last_snapshot_publish_wrote.take()
+    }
+
+    pub fn append_uncommitted_or_no_effect(
+        &mut self,
+        command: KvCommand,
+    ) -> Result<ClusterKvRaftUncommittedAppend, KvError> {
+        self.last_snapshot_publish_wrote = None;
+        self.store
+            .locked_append_command_uncommitted_or_no_effect(&self.node_id, command)
+    }
+
+    pub fn discard_uncommitted_tail_and_clear_leader(&mut self) -> Result<KvSnapshot, KvError> {
+        self.last_snapshot_publish_wrote = None;
+        let (snapshot, wrote) = self
+            .store
+            .locked_discard_uncommitted_tail_and_clear_leader_and_publish_report(&self.node_id)?;
+        self.last_snapshot_publish_wrote = Some(wrote);
+        Ok(snapshot)
+    }
+
+    pub fn commit_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> Result<ClusterKvRaftCommitResult, KvError> {
+        self.last_snapshot_publish_wrote = None;
+        let (result, wrote) = self
+            .store
+            .locked_commit_index_with_events_and_publish_report(
+                &self.node_id,
+                index,
+                &mut self.key_can_defer_materialized_snapshot,
+            )?;
+        self.last_snapshot_publish_wrote = Some(wrote);
+        Ok(result)
+    }
+}
+
+impl<F> ClusterKvRaftCommandStorage for ClusterKvRaftLocalCommandStorage<F>
+where
+    F: FnMut(&str) -> bool,
+{
+    type Error = KvError;
+
+    fn append_cluster_raft_command_uncommitted_or_no_effect(
+        &mut self,
+        command: KvCommand,
+    ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error> {
+        self.append_uncommitted_or_no_effect(command)
+    }
+
+    fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+        &mut self,
+    ) -> Result<(), Self::Error> {
+        self.discard_uncommitted_tail_and_clear_leader().map(|_| ())
+    }
+
+    fn commit_cluster_raft_index_with_events(
+        &mut self,
+        index: u64,
+    ) -> Result<ClusterKvRaftCommitResult, Self::Error> {
+        self.commit_index_with_events(index)
     }
 }
 
@@ -7104,6 +9724,47 @@ pub enum KvError {
     ConflictingLogEntry { index: u64 },
     #[error("missing committed raft entry at index {index}")]
     MissingCommittedEntry { index: u64 },
+    #[error("invalid raft config transition: {detail}")]
+    InvalidRaftConfigTransition { detail: String },
+}
+
+impl From<&ClusterBootstrapState> for ClusterKvRaftConfigRecord {
+    fn from(state: &ClusterBootstrapState) -> Self {
+        let mut voters = Vec::new();
+        let mut learners = Vec::new();
+        let mut non_voting = Vec::new();
+        for member in &state.members {
+            if !member.state.is_authorized() {
+                continue;
+            }
+            match member.state {
+                ClusterMemberState::Voter => voters.push(member.node_id.clone()),
+                ClusterMemberState::Learner => learners.push(member.node_id.clone()),
+                ClusterMemberState::NonVoting => non_voting.push(member.node_id.clone()),
+                ClusterMemberState::Active => match member.role {
+                    ClusterMemberRole::Voter => voters.push(member.node_id.clone()),
+                    ClusterMemberRole::Learner => learners.push(member.node_id.clone()),
+                    ClusterMemberRole::NonVoting => non_voting.push(member.node_id.clone()),
+                },
+                ClusterMemberState::Pending
+                | ClusterMemberState::Suspect
+                | ClusterMemberState::Offline
+                | ClusterMemberState::Removed => {}
+            }
+        }
+        voters.sort();
+        learners.sort();
+        non_voting.sort();
+        Self {
+            cluster_id: state.cluster_id.clone(),
+            term: state.term,
+            kv_revision: state.kv_revision,
+            voters,
+            learners,
+            non_voting,
+            updated_at: state.updated_at,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7125,10 +9786,63 @@ mod tests {
         assert_eq!(CLUSTER_KV_RPC_CATEGORY, "cluster.kv");
         assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_SNAPSHOT_ROUTE));
         assert!(CLUSTER_KV_RPC_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
-        for route in CLUSTER_KV_READ_WATCH_ROUTES {
-            assert!(CLUSTER_KV_RPC_ROUTES.contains(route));
+        for route in CLUSTER_KV_LOCAL_READ_WATCH_ROUTES
+            .iter()
+            .copied()
+            .chain([CLUSTER_KV_WATCH_EVENTS_ROUTE])
+        {
+            assert!(CLUSTER_KV_RPC_ROUTES.contains(&route));
         }
-        assert!(!CLUSTER_KV_READ_WATCH_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
+        assert_eq!(
+            CLUSTER_KV_RPC_ROUTE_METADATA.len(),
+            CLUSTER_KV_RPC_ROUTES.len()
+        );
+        for (index, route) in CLUSTER_KV_RPC_ROUTES.iter().copied().enumerate() {
+            assert_eq!(
+                CLUSTER_KV_RPC_ROUTE_METADATA[index],
+                (route, CLUSTER_KV_RPC_CATEGORY)
+            );
+        }
+        assert!(!CLUSTER_KV_LOCAL_READ_WATCH_ROUTES.contains(&CLUSTER_KV_TXN_ROUTE));
+    }
+
+    #[test]
+    fn cluster_kv_raft_config_helpers_report_roles_and_voters() {
+        let voter = NodeId::from_legacy_named("node_config_voter").expect("voter");
+        let learner = NodeId::from_legacy_named("node_config_learner").expect("learner");
+        let non_voting = NodeId::from_legacy_named("node_config_non_voting").expect("non-voting");
+        let missing = NodeId::from_legacy_named("node_config_missing").expect("missing");
+        let config = ClusterKvRaftConfigRecord {
+            cluster_id: Id::from_legacy_named("cluster_config").expect("cluster"),
+            term: 3,
+            kv_revision: 9,
+            voters: vec![voter.clone()],
+            learners: vec![learner.clone()],
+            non_voting: vec![non_voting.clone()],
+            updated_at: OffsetDateTime::now_utc(),
+        };
+
+        assert_eq!(
+            cluster_kv_raft_config_member_role(&config, &voter),
+            Some(ClusterMemberRole::Voter)
+        );
+        assert_eq!(
+            cluster_kv_raft_config_member_role(&config, &learner),
+            Some(ClusterMemberRole::Learner)
+        );
+        assert_eq!(
+            cluster_kv_raft_config_member_role(&config, &non_voting),
+            Some(ClusterMemberRole::NonVoting)
+        );
+        assert_eq!(cluster_kv_raft_config_member_role(&config, &missing), None);
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(cluster_kv_raft_config_key(), &config, None)
+            .expect("store config");
+        assert!(cluster_kv_store_member_is_raft_voter(&store, &voter).expect("voter check"));
+        assert!(!cluster_kv_store_member_is_raft_voter(&store, &learner).expect("learner check"));
+        assert!(!cluster_kv_store_member_is_raft_voter(&store, &missing).expect("missing check"));
     }
 
     #[test]
@@ -7137,7 +9851,7 @@ mod tests {
         assert_eq!(snapshot_payload.route, CLUSTER_KV_SNAPSHOT_ROUTE);
         assert_eq!(snapshot_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
-            decode_cluster_kv_rpc_body::<()>(&snapshot_payload.body)
+            decode_cluster_kv_snapshot_rpc_request_body(&snapshot_payload.body)
                 .expect("snapshot request body"),
             ()
         );
@@ -7155,7 +9869,7 @@ mod tests {
         assert_eq!(txn_payload.route, CLUSTER_KV_TXN_ROUTE);
         assert_eq!(txn_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
-            decode_cluster_kv_rpc_body::<KvTxn>(&txn_payload.body).expect("txn request body"),
+            decode_cluster_kv_txn_rpc_request_body(&txn_payload.body).expect("txn request body"),
             txn
         );
 
@@ -7166,9 +9880,13 @@ mod tests {
             leases: Vec::new(),
             events: Vec::new(),
         };
-        let snapshot_body = encode_cluster_kv_rpc_body(&snapshot).expect("snapshot response body");
+        let snapshot_response_payload =
+            cluster_kv_snapshot_response_rpc_payload(&snapshot).expect("snapshot response payload");
+        assert_eq!(snapshot_response_payload.route, CLUSTER_KV_SNAPSHOT_ROUTE);
+        assert_eq!(snapshot_response_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
-            decode_cluster_kv_snapshot_rpc_body(&snapshot_body).expect("snapshot response body"),
+            decode_cluster_kv_snapshot_rpc_body(&snapshot_response_payload.body)
+                .expect("snapshot response body"),
             snapshot
         );
 
@@ -7177,12 +9895,168 @@ mod tests {
             revision: KvRevision(9),
             responses: Vec::new(),
         };
-        let txn_response_body =
-            encode_cluster_kv_rpc_body(&txn_response).expect("txn response body");
+        let txn_response_payload =
+            cluster_kv_txn_response_rpc_payload(&txn_response).expect("txn response payload");
+        assert_eq!(txn_response_payload.route, CLUSTER_KV_TXN_ROUTE);
+        assert_eq!(txn_response_payload.category, CLUSTER_KV_RPC_CATEGORY);
         assert_eq!(
-            decode_cluster_kv_txn_rpc_body(&txn_response_body).expect("txn response body"),
+            decode_cluster_kv_txn_rpc_body(&txn_response_payload.body).expect("txn response body"),
             txn_response
         );
+
+        let range_payload =
+            cluster_kv_range_prefix_rpc_payload("/rpc/").expect("range prefix payload");
+        assert_eq!(range_payload.route, CLUSTER_KV_RANGE_PREFIX_ROUTE);
+        assert_eq!(range_payload.category, CLUSTER_KV_RPC_CATEGORY);
+        assert_eq!(
+            decode_cluster_kv_rpc_body::<String>(&range_payload.body).expect("range prefix body"),
+            "/rpc/"
+        );
+    }
+
+    #[test]
+    fn cluster_raft_rpc_payloads_encode_kv_owned_bodies() {
+        let node_id = NodeId::from_legacy_named("node_kv_raft_rpc_payloads").expect("node");
+        let state = ClusterBootstrapState::initialized_locally(
+            sinomo_core::Id::from_legacy_named("cluster_kv_raft_rpc_payloads").expect("cluster"),
+            "kv raft rpc payloads",
+            node_id.clone(),
+            "node",
+            "pk",
+            OffsetDateTime::now_utc(),
+        );
+        let append_request = ClusterRaftAppendRequest {
+            state: state.clone(),
+            append: RaftAppendEntriesRequest {
+                term: 2,
+                leader_id: node_id.clone(),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            },
+            snapshot: None,
+        };
+        let append_payload =
+            cluster_raft_append_rpc_payload(&append_request).expect("append payload");
+        assert_eq!(append_payload.route, CLUSTER_RAFT_APPEND_ROUTE);
+        assert_eq!(append_payload.category, CLUSTER_RAFT_RPC_CATEGORY);
+        assert_eq!(
+            decode_cluster_raft_append_rpc_request_body(&append_payload.body)
+                .expect("append request body"),
+            append_request
+        );
+        let append_response = ClusterRaftAppendResponse {
+            accepted: true,
+            detail: "accepted".to_string(),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 2,
+                success: true,
+                match_index: 1,
+            },
+        };
+        let append_response_payload = cluster_raft_append_response_rpc_payload(&append_response)
+            .expect("append response payload");
+        assert_eq!(
+            decode_cluster_raft_append_rpc_response_body(&append_response_payload.body)
+                .expect("append response body"),
+            append_response
+        );
+
+        let vote_request = ClusterRaftVoteRequest {
+            state: state.clone(),
+            vote: RaftRequestVoteRequest {
+                term: 3,
+                candidate_id: node_id,
+                last_log_index: 1,
+                last_log_term: 2,
+            },
+        };
+        let vote_payload = cluster_raft_vote_rpc_payload(&vote_request).expect("vote payload");
+        assert_eq!(vote_payload.route, CLUSTER_RAFT_VOTE_ROUTE);
+        assert_eq!(vote_payload.category, CLUSTER_RAFT_RPC_CATEGORY);
+        assert_eq!(
+            decode_cluster_raft_vote_rpc_request_body(&vote_payload.body)
+                .expect("vote request body"),
+            vote_request
+        );
+        let vote_response = ClusterRaftVoteResponse {
+            accepted: true,
+            detail: "granted".to_string(),
+            state,
+            vote: RaftRequestVoteResponse {
+                term: 3,
+                vote_granted: true,
+            },
+        };
+        let vote_response_payload =
+            cluster_raft_vote_response_rpc_payload(&vote_response).expect("vote response payload");
+        assert_eq!(
+            decode_cluster_raft_vote_rpc_response_body(&vote_response_payload.body)
+                .expect("vote response body"),
+            vote_response
+        );
+        assert_eq!(
+            CLUSTER_RAFT_RPC_ROUTE_METADATA,
+            [
+                (CLUSTER_RAFT_APPEND_ROUTE, CLUSTER_RAFT_RPC_CATEGORY),
+                (CLUSTER_RAFT_VOTE_ROUTE, CLUSTER_RAFT_RPC_CATEGORY)
+            ]
+        );
+
+        let dispatched_append = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+            append_payload.route,
+            &append_payload.body,
+            |request| {
+                assert_eq!(request, append_request);
+                Ok(append_response.clone())
+            },
+            |_| -> Result<ClusterRaftVoteResponse, KvError> {
+                panic!("append route must not call vote handler")
+            },
+        )
+        .expect("dispatch append")
+        .expect("append route");
+        assert_eq!(dispatched_append.route, CLUSTER_RAFT_APPEND_ROUTE);
+        assert_eq!(
+            decode_cluster_raft_append_rpc_response_body(&dispatched_append.body)
+                .expect("dispatched append response"),
+            append_response
+        );
+
+        let dispatched_vote = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+            vote_payload.route,
+            &vote_payload.body,
+            |_| -> Result<ClusterRaftAppendResponse, KvError> {
+                panic!("vote route must not call append handler")
+            },
+            |request| {
+                assert_eq!(request, vote_request);
+                Ok(vote_response.clone())
+            },
+        )
+        .expect("dispatch vote")
+        .expect("vote route");
+        assert_eq!(dispatched_vote.route, CLUSTER_RAFT_VOTE_ROUTE);
+        assert_eq!(
+            decode_cluster_raft_vote_rpc_response_body(&dispatched_vote.body)
+                .expect("dispatched vote response"),
+            vote_response
+        );
+
+        let unknown = handle_cluster_raft_rpc_payload::<_, _, KvError>(
+            "/cluster/raft/unknown",
+            &[],
+            |_| -> Result<ClusterRaftAppendResponse, KvError> {
+                panic!("unknown route must not call append handler")
+            },
+            |_| -> Result<ClusterRaftVoteResponse, KvError> {
+                panic!("unknown route must not call vote handler")
+            },
+        )
+        .expect("unknown route");
+        assert!(unknown.is_none());
     }
 
     #[derive(Debug, Default)]
@@ -7608,6 +10482,131 @@ mod tests {
     }
 
     #[test]
+    fn imported_cluster_kv_snapshot_defers_only_predicate_matched_materialized_delta() {
+        let root = temp_raft_root("sinomo-kv-imported-snapshot-deferral");
+        let paths = ClusterKvPaths::new(&root);
+        let key_can_defer = |key: &str| key.starts_with("/deferred/");
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/durable/a", b"same".to_vec(), None)
+            .expect("write durable seed");
+        store
+            .put("/deferred/a", b"old".to_vec(), None)
+            .expect("write deferred seed");
+        write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write initial snapshot");
+
+        let mut imported_store = InProcessKvStore::restore(store.snapshot());
+        imported_store
+            .put("/deferred/a", b"new".to_vec(), None)
+            .expect("write deferred import");
+        let wrote = write_imported_cluster_kv_snapshot_if_changed(
+            &paths,
+            &imported_store.snapshot(),
+            key_can_defer,
+        )
+        .expect("write imported deferred snapshot");
+        assert!(!wrote);
+        let cached = read_cluster_kv_cached_snapshot(&paths).expect("read cached snapshot");
+        assert_eq!(
+            cached
+                .get("/deferred/a")
+                .expect("deferred entry")
+                .value
+                .as_slice(),
+            b"old"
+        );
+
+        let mut durable_store = InProcessKvStore::restore(cached);
+        durable_store
+            .put("/durable/a", b"new".to_vec(), None)
+            .expect("write durable import");
+        let wrote = write_imported_cluster_kv_snapshot_if_changed(
+            &paths,
+            &durable_store.snapshot(),
+            key_can_defer,
+        )
+        .expect("write imported durable snapshot");
+        assert!(wrote);
+        let cached = read_cluster_kv_cached_snapshot(&paths).expect("read updated snapshot");
+        assert_eq!(
+            cached
+                .get("/durable/a")
+                .expect("durable entry")
+                .value
+                .as_slice(),
+            b"new"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_publish_helpers_materialize_snapshot_in_kv() {
+        let root = temp_raft_root("sinomo-kv-raft-publish-commit");
+        let paths = ClusterKvPaths::new(&root);
+        let store = paths.raft_store();
+        let mut kv = InProcessKvStore::new();
+        kv.put("/kv/a", b"a".to_vec(), None)
+            .expect("write commit entry");
+        let snapshot = kv.snapshot();
+        let result = ClusterKvRaftCommitResult {
+            snapshot: snapshot.clone(),
+            txn_response: None,
+            events: snapshot.events.clone(),
+        };
+
+        let wrote = store
+            .publish_commit_result(&result, |_| false)
+            .expect("publish commit result");
+        assert!(wrote);
+        let wrote = store
+            .publish_commit_result(&result, |_| false)
+            .expect("publish unchanged commit result");
+        assert!(!wrote);
+        let cached = read_cluster_kv_cached_snapshot(&paths).expect("read published snapshot");
+        assert_eq!(
+            cached
+                .get("/kv/a")
+                .expect("published entry")
+                .value
+                .as_slice(),
+            b"a"
+        );
+
+        let restored_root = temp_raft_root("sinomo-kv-raft-publish-restored");
+        let restored_paths = ClusterKvPaths::new(&restored_root);
+        let restored_store = restored_paths.raft_store();
+        let outcome = RaftAppendEntriesApplyOutcome {
+            response: RaftAppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 1,
+            },
+            snapshot: snapshot.clone(),
+            snapshot_restored: true,
+            committed_events: Vec::new(),
+        };
+        let wrote = restored_store
+            .publish_append_entries_apply_outcome(&outcome, |_| true)
+            .expect("publish restored append outcome");
+        assert!(wrote);
+        let cached =
+            read_cluster_kv_cached_snapshot(&restored_paths).expect("read restored snapshot");
+        assert_eq!(
+            cached
+                .get("/kv/a")
+                .expect("restored entry")
+                .value
+                .as_slice(),
+            b"a"
+        );
+
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(restored_root).ok();
+    }
+
+    #[test]
     fn cluster_kv_materialized_snapshot_freshness_uses_storage_thresholds() {
         assert!(cluster_kv_materialized_snapshot_is_fresh_enough_against(
             KvRevision(10),
@@ -7649,6 +10648,52 @@ mod tests {
         assert!(!cluster_kv_events_contain_all(
             &retained,
             &[test_kv_put_event(1, "/kv/a", b"changed")],
+        ));
+
+        let cluster_id = Id::from_legacy_named("cluster_kv_watch_fanout_needed").expect("cluster");
+        let leader_id =
+            NodeId::from_legacy_named("node_kv_watch_fanout_needed_leader").expect("leader");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "kv watch fanout needed",
+            leader_id.clone(),
+            "leader",
+            "pk-leader",
+            OffsetDateTime::now_utc(),
+        );
+        let first = test_kv_put_event(1, "/kv/watch/fanout/first", b"first");
+        let second = test_kv_put_event(2, "/kv/watch/fanout/second", b"second");
+        let append = RaftAppendEntriesRequest {
+            term: 1,
+            leader_id,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 1,
+        };
+        let mut request = ClusterRaftAppendRequest {
+            state,
+            append,
+            snapshot: None,
+        };
+        assert!(!cluster_raft_append_request_needs_watch_event_fanout(
+            &request,
+            std::slice::from_ref(&first),
+        ));
+        let mut fanout_snapshot = InProcessKvStore::new().snapshot();
+        fanout_snapshot.events = vec![first.clone()];
+        request.snapshot = Some(RaftSnapshot {
+            last_included_index: 1,
+            last_included_term: 1,
+            kv: fanout_snapshot,
+        });
+        assert!(!cluster_raft_append_request_needs_watch_event_fanout(
+            &request,
+            std::slice::from_ref(&first),
+        ));
+        assert!(cluster_raft_append_request_needs_watch_event_fanout(
+            &request,
+            &[first, second],
         ));
 
         let snapshot = KvSnapshot {
@@ -8379,6 +11424,223 @@ mod tests {
         assert_eq!(second.registration.watch_id, WatchId(2));
         assert!(second.scan.is_none());
         assert_eq!(second.allocator.active_watch_count, Some(2));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_lifecycle_helpers_create_drain_append_and_cancel() {
+        let root = temp_raft_root("sinomo-kv-watch-lifecycle-helper");
+        let paths = ClusterKvPaths::new(root.clone());
+        let node_id = NodeId::from_legacy_named("node_kv_watch_lifecycle").expect("node");
+        let mut store = InProcessKvStore::new();
+        store
+            .put("/watch/lifecycle/a", b"a".to_vec(), None)
+            .expect("seed snapshot event");
+        write_cluster_kv_snapshot(&paths, &store.snapshot()).expect("write snapshot");
+
+        let watch = create_cluster_kv_watch_for_node(
+            &paths,
+            node_id.clone(),
+            ClusterKvWatchPrefixRequest {
+                prefix: "/watch/lifecycle/".to_string(),
+                start_revision: KvRevision(1),
+            },
+        )
+        .expect("create watch");
+        assert_eq!(watch.watch_id, WatchId(1));
+        assert_eq!(
+            read_cluster_kv_watch_allocator_state(&paths)
+                .expect("allocator after create")
+                .active_watch_count,
+            Some(1)
+        );
+
+        let drained = drain_cluster_kv_watch_for_node(
+            &paths,
+            node_id.clone(),
+            ClusterKvWatchDrainRequest {
+                watch_id: watch.watch_id,
+                wait_timeout_millis: 0,
+            },
+        )
+        .expect("drain snapshot event");
+        assert_eq!(
+            drained
+                .events
+                .iter()
+                .map(|event| event.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/watch/lifecycle/a"]
+        );
+        assert_eq!(drained.next_revision, KvRevision(2));
+
+        let fanout = KvEvent {
+            revision: KvRevision(2),
+            key: "/watch/lifecycle/b".to_string(),
+            kind: KvEventKind::Put {
+                value: b"b".to_vec(),
+            },
+        };
+        assert_eq!(
+            append_cluster_kv_watch_events_for_active_watches_for_node(
+                &paths,
+                node_id.clone(),
+                std::slice::from_ref(&fanout),
+            )
+            .expect("append fanout event"),
+            1
+        );
+        let drained = drain_cluster_kv_watch_for_node(
+            &paths,
+            node_id,
+            ClusterKvWatchDrainRequest {
+                watch_id: watch.watch_id,
+                wait_timeout_millis: 0,
+            },
+        )
+        .expect("drain fanout event");
+        assert_eq!(drained.events, vec![fanout]);
+        assert_eq!(drained.next_revision, KvRevision(3));
+
+        let cancelled = cancel_cluster_kv_watch(
+            &paths,
+            ClusterKvWatchCancelRequest {
+                watch_id: watch.watch_id,
+            },
+        )
+        .expect("cancel watch");
+        assert!(cancelled.cancelled);
+        assert_eq!(
+            read_cluster_kv_watch_allocator_state(&paths)
+                .expect("allocator after cancel")
+                .active_watch_count,
+            Some(0)
+        );
+        assert!(
+            !cancel_cluster_kv_watch(
+                &paths,
+                ClusterKvWatchCancelRequest {
+                    watch_id: watch.watch_id,
+                },
+            )
+            .expect("cancel already removed watch")
+            .cancelled
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_handler_skips_storage_without_active_watchers() {
+        let root = temp_raft_root("sinomo-kv-watch-fanout-no-active-watchers");
+        let paths = ClusterKvPaths::new(root.clone());
+        write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
+            .expect("write empty snapshot");
+        let cluster_id =
+            Id::from_legacy_named("cluster_kv_watch_fanout_no_active").expect("cluster");
+        let leader_id =
+            NodeId::from_legacy_named("node_kv_watch_fanout_no_active_leader").expect("leader");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "kv watch fanout no active",
+            leader_id.clone(),
+            "leader",
+            "pk-leader",
+            OffsetDateTime::now_utc(),
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+
+        let response = handle_cluster_kv_watch_events(
+            &paths,
+            &state,
+            ClusterKvWatchEventsRequest {
+                state: state.clone(),
+                leader_id,
+                events: vec![test_kv_put_event(1, "/watch/fanout/no-active", b"value")],
+            },
+        )
+        .expect("watch event fanout response");
+
+        assert!(response.accepted);
+        assert_eq!(response.stored_events, 0);
+        assert!(
+            !paths.watch_events.exists(),
+            "no active watcher should avoid checkpoint writes"
+        );
+        assert!(
+            !paths.watch_events_log.exists(),
+            "no active watcher should avoid log appends"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_watch_event_handler_rejects_invalid_source_before_storage() {
+        let root = temp_raft_root("sinomo-kv-watch-fanout-reject-invalid-source");
+        let paths = ClusterKvPaths::new(root.clone());
+        let cluster_id = Id::from_legacy_named("cluster_kv_watch_fanout_reject").expect("cluster");
+        let leader_id =
+            NodeId::from_legacy_named("node_kv_watch_fanout_reject_leader").expect("leader");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "kv watch fanout reject",
+            leader_id.clone(),
+            "leader",
+            "pk-leader",
+            OffsetDateTime::now_utc(),
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+
+        let peer_cluster = Id::from_legacy_named("cluster_kv_watch_fanout_other").expect("cluster");
+        let mut peer_state = state.clone();
+        peer_state.cluster_id = peer_cluster;
+        let wrong_cluster = handle_cluster_kv_watch_events(
+            &paths,
+            &state,
+            ClusterKvWatchEventsRequest {
+                state: peer_state,
+                leader_id: leader_id.clone(),
+                events: vec![test_kv_put_event(
+                    1,
+                    "/watch/fanout/wrong-cluster",
+                    b"value",
+                )],
+            },
+        )
+        .expect("wrong cluster response");
+        assert!(!wrong_cluster.accepted);
+        assert_eq!(wrong_cluster.stored_events, 0);
+        assert!(
+            wrong_cluster
+                .detail
+                .contains("does not match local cluster"),
+            "unexpected detail: {}",
+            wrong_cluster.detail
+        );
+
+        let unauthorized = handle_cluster_kv_watch_events(
+            &paths,
+            &state,
+            ClusterKvWatchEventsRequest {
+                state: state.clone(),
+                leader_id: NodeId::from_legacy_named("node_kv_watch_fanout_intruder")
+                    .expect("node"),
+                events: vec![test_kv_put_event(2, "/watch/fanout/intruder", b"value")],
+            },
+        )
+        .expect("unauthorized leader response");
+        assert!(!unauthorized.accepted);
+        assert_eq!(unauthorized.stored_events, 0);
+        assert!(
+            unauthorized.detail.contains("unauthorized leader"),
+            "unexpected detail: {}",
+            unauthorized.detail
+        );
+        assert!(!paths.watch_events.exists());
+        assert!(!paths.watch_events_log.exists());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -12250,6 +15512,730 @@ mod tests {
         assert!(matches!(error, KvError::QuorumUnavailable { .. }));
     }
 
+    #[derive(Debug)]
+    enum QuorumCommitTestError {
+        Kv(KvError),
+        ReadOnly(String),
+    }
+
+    impl std::fmt::Display for QuorumCommitTestError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Kv(error) => write!(formatter, "{error}"),
+                Self::ReadOnly(detail) => write!(formatter, "cluster is read-only: {detail}"),
+            }
+        }
+    }
+
+    impl From<KvError> for QuorumCommitTestError {
+        fn from(error: KvError) -> Self {
+            Self::Kv(error)
+        }
+    }
+
+    fn quorum_commit_test_state(local: &NodeId, remote: &NodeId) -> ClusterBootstrapState {
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            Id::from_legacy_named("cluster_kv_quorum_driver").expect("cluster"),
+            "kv quorum driver",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let main_capability =
+            sinomo_core::CapabilityName::new(sinomo_node::DAEMON_MAIN_RUN_CAPABILITY.to_string())
+                .expect("main daemon capability");
+        state.members[0].role = ClusterMemberRole::Voter;
+        state.members[0].state = ClusterMemberState::Voter;
+        state.members[0].capabilities = vec![main_capability.clone()];
+        state.members[0].allowed_capabilities = vec![main_capability.clone()];
+        let mut remote_member = state.members[0].clone();
+        remote_member.node_id = remote.clone();
+        remote_member.display_name = "remote".to_string();
+        remote_member.node_public_key = "pk-remote".to_string();
+        remote_member.joined_at = now;
+        remote_member.updated_at = now;
+        state.members.push(remote_member);
+        state
+    }
+
+    #[derive(Default)]
+    struct QuorumCommitTestHost {
+        targets: Vec<NodeId>,
+        accepting_targets: BTreeSet<NodeId>,
+        appended: Option<KvLogEntry>,
+        committed_indices: Vec<u64>,
+        discarded: bool,
+        replicated_targets: Vec<NodeId>,
+        statuses: Vec<(NodeId, ClusterKvRaftTargetReplicationStatus)>,
+        fanout_targets: Vec<NodeId>,
+    }
+
+    impl ClusterKvRaftCommandStorage for QuorumCommitTestHost {
+        type Error = QuorumCommitTestError;
+
+        fn append_cluster_raft_command_uncommitted_or_no_effect(
+            &mut self,
+            command: KvCommand,
+        ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error> {
+            let entry = KvLogEntry {
+                index: 7,
+                term: 1,
+                command,
+                revision: KvRevision(1),
+            };
+            self.appended = Some(entry.clone());
+            Ok(ClusterKvRaftUncommittedAppend::Appended(entry))
+        }
+
+        fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+            &mut self,
+        ) -> Result<(), Self::Error> {
+            self.discarded = true;
+            Ok(())
+        }
+
+        fn commit_cluster_raft_index_with_events(
+            &mut self,
+            index: u64,
+        ) -> Result<ClusterKvRaftCommitResult, Self::Error> {
+            self.committed_indices.push(index);
+            let mut store = InProcessKvStore::new();
+            if let Some(KvLogEntry {
+                command:
+                    KvCommand::Op(KvOp::Put {
+                        key,
+                        value,
+                        lease_id,
+                    }),
+                ..
+            }) = self.appended.clone()
+            {
+                store.put(key, value, lease_id)?;
+            }
+            Ok(ClusterKvRaftCommitResult {
+                snapshot: store.snapshot(),
+                txn_response: None,
+                events: vec![test_kv_put_event(1, "/kv/quorum/fanout", b"ok")],
+            })
+        }
+    }
+
+    impl ClusterKvRaftQuorumCommitHost for QuorumCommitTestHost {
+        type Target = NodeId;
+
+        fn remote_voter_targets(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Vec<Self::Target>, Self::Error> {
+            Ok(self.targets.clone())
+        }
+
+        fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
+            target
+        }
+
+        fn replicate_cluster_raft_to_target(
+            &mut self,
+            state: &ClusterBootstrapState,
+            target: &Self::Target,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, Self::Error> {
+            self.replicated_targets.push(target.clone());
+            Ok(ClusterRaftAppendResponse {
+                accepted: self.accepting_targets.contains(target),
+                detail: "test append".to_string(),
+                state: state.clone(),
+                append: RaftAppendEntriesResponse {
+                    term: 1,
+                    success: self.accepting_targets.contains(target),
+                    match_index: 7,
+                },
+            })
+        }
+
+        fn record_target_replication_status(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            target: &Self::Target,
+            status: ClusterKvRaftTargetReplicationStatus,
+            _latency_ms: Option<u64>,
+        ) -> Result<(), Self::Error> {
+            self.statuses.push((target.clone(), status));
+            Ok(())
+        }
+
+        fn fan_out_committed_cluster_raft_command(
+            &mut self,
+            _state: ClusterBootstrapState,
+            _events: Vec<KvEvent>,
+            targets: Vec<Self::Target>,
+        ) -> Result<(), Self::Error> {
+            self.fanout_targets = targets;
+            Ok(())
+        }
+
+        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(detail)
+        }
+    }
+
+    impl ClusterKvRaftQuorumCommitAsyncHost for QuorumCommitTestHost {
+        type Error = QuorumCommitTestError;
+        type Target = NodeId;
+
+        fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
+            &'a mut self,
+            command: KvCommand,
+        ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftUncommittedAppend, Self::Error> {
+            Box::pin(async move {
+                ClusterKvRaftCommandStorage::append_cluster_raft_command_uncommitted_or_no_effect(
+                    self, command,
+                )
+            })
+        }
+
+        fn discard_cluster_raft_uncommitted_tail_and_clear_leader_async<'a>(
+            &'a mut self,
+        ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                ClusterKvRaftCommandStorage::discard_cluster_raft_uncommitted_tail_and_clear_leader(
+                    self,
+                )
+            })
+        }
+
+        fn commit_cluster_raft_index_with_events_async<'a>(
+            &'a mut self,
+            index: u64,
+        ) -> ClusterKvRaftQuorumFuture<'a, ClusterKvRaftCommitResult, Self::Error> {
+            Box::pin(async move {
+                ClusterKvRaftCommandStorage::commit_cluster_raft_index_with_events(self, index)
+            })
+        }
+
+        fn remote_voter_targets_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+        ) -> ClusterKvRaftQuorumFuture<'a, Vec<Self::Target>, Self::Error> {
+            Box::pin(async move { Ok(self.targets.clone()) })
+        }
+
+        fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
+            target
+        }
+
+        fn replicate_cluster_raft_to_target_async<'a>(
+            &'a mut self,
+            state: &'a ClusterBootstrapState,
+            target: &'a Self::Target,
+            _timeout: Duration,
+        ) -> ClusterKvRaftQuorumFuture<'a, ClusterRaftAppendResponse, Self::Error> {
+            Box::pin(async move {
+                self.replicated_targets.push(target.clone());
+                Ok(ClusterRaftAppendResponse {
+                    accepted: self.accepting_targets.contains(target),
+                    detail: "test append".to_string(),
+                    state: state.clone(),
+                    append: RaftAppendEntriesResponse {
+                        term: 1,
+                        success: self.accepting_targets.contains(target),
+                        match_index: 7,
+                    },
+                })
+            })
+        }
+
+        fn record_target_replication_status_async<'a>(
+            &'a mut self,
+            _state: &'a ClusterBootstrapState,
+            target: &'a Self::Target,
+            status: ClusterKvRaftTargetReplicationStatus,
+            _latency_ms: Option<u64>,
+        ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.statuses.push((target.clone(), status));
+                Ok(())
+            })
+        }
+
+        fn fan_out_committed_cluster_raft_command_async<'a>(
+            &'a mut self,
+            _state: ClusterBootstrapState,
+            _events: Vec<KvEvent>,
+            targets: Vec<Self::Target>,
+        ) -> ClusterKvRaftQuorumFuture<'a, (), Self::Error> {
+            Box::pin(async move {
+                self.fanout_targets = targets;
+                Ok(())
+            })
+        }
+
+        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(detail)
+        }
+    }
+
+    #[derive(Default)]
+    struct TxnQuorumDriverTestHost {
+        local_leader: bool,
+        forwarded: Option<ClusterKvTxnCommitResult>,
+        committed_txns: usize,
+        elected: bool,
+        reachable_voters: usize,
+    }
+
+    impl ClusterKvTxnQuorumHost for TxnQuorumDriverTestHost {
+        type Error = QuorumCommitTestError;
+
+        fn local_is_raft_leader(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<bool, Self::Error> {
+            Ok(self.local_leader)
+        }
+
+        fn forward_cluster_kv_txn_to_voter(
+            &mut self,
+            _state: &ClusterBootstrapState,
+            _txn: &KvTxn,
+        ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error> {
+            Ok(self.forwarded.clone())
+        }
+
+        fn elect_cluster_raft_leader(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<bool, Self::Error> {
+            self.elected = true;
+            self.local_leader = true;
+            Ok(true)
+        }
+
+        fn reachable_voter_count(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<usize, Self::Error> {
+            Ok(self.reachable_voters)
+        }
+
+        fn semantic_txn_no_effect_response(
+            &mut self,
+            _txn: &KvTxn,
+        ) -> Result<Option<ClusterKvTxnCommitResult>, Self::Error> {
+            Ok(None)
+        }
+
+        fn commit_cluster_raft_txn_with_quorum(
+            &mut self,
+            _state: &mut ClusterBootstrapState,
+            txn: KvTxn,
+        ) -> Result<ClusterKvRaftQuorumCommitResult, Self::Error> {
+            self.committed_txns = self.committed_txns.saturating_add(1);
+            let mut store = InProcessKvStore::new();
+            let txn_response = store.txn(txn)?;
+            Ok(ClusterKvRaftQuorumCommitResult {
+                snapshot: store.snapshot(),
+                txn_response: Some(txn_response),
+            })
+        }
+
+        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(detail)
+        }
+    }
+
+    #[test]
+    fn kv_txn_quorum_driver_commits_when_local_voter_is_leader() {
+        let local = NodeId::from_legacy_named("node_txn_driver_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = TxnQuorumDriverTestHost {
+            local_leader: true,
+            reachable_voters: 2,
+            ..TxnQuorumDriverTestHost::default()
+        };
+
+        let result = commit_cluster_kv_txn_with_quorum_with_host(
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/kv/txn-driver/local".to_string(),
+                    value: b"committed".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+            ClusterKvTxnQuorumDriverOptions {
+                allow_forwarding: false,
+            },
+            &mut host,
+        )
+        .expect("commit local leader txn");
+
+        assert_eq!(host.committed_txns, 1);
+        assert!(!host.elected);
+        assert_eq!(
+            result
+                .snapshot
+                .get("/kv/txn-driver/local")
+                .expect("committed key")
+                .value,
+            b"committed".to_vec()
+        );
+        assert_eq!(
+            result.txn_response.expect("txn response").revision,
+            result.snapshot.revision
+        );
+    }
+
+    #[test]
+    fn kv_txn_quorum_driver_forwards_when_local_node_is_not_voter() {
+        let local = NodeId::from_legacy_named("node_txn_driver_learner").expect("local");
+        let remote = NodeId::from_legacy_named("node_txn_driver_voter").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members[0].role = ClusterMemberRole::Learner;
+        state.members[0].state = ClusterMemberState::Learner;
+        let mut store = InProcessKvStore::new();
+        let txn_response = store
+            .txn(KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/kv/txn-driver/forwarded".to_string(),
+                    value: b"forwarded".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            })
+            .expect("seed forwarded response");
+        let forwarded = ClusterKvTxnCommitResult {
+            snapshot: store.snapshot(),
+            txn_response: Some(txn_response),
+        };
+        let mut host = TxnQuorumDriverTestHost {
+            forwarded: Some(forwarded.clone()),
+            reachable_voters: 1,
+            ..TxnQuorumDriverTestHost::default()
+        };
+
+        let result = commit_cluster_kv_txn_with_quorum_with_host(
+            &mut state,
+            KvTxn {
+                compares: Vec::new(),
+                success: vec![KvOp::Put {
+                    key: "/kv/txn-driver/forwarded".to_string(),
+                    value: b"forwarded".to_vec(),
+                    lease_id: None,
+                }],
+                failure: Vec::new(),
+            },
+            ClusterKvTxnQuorumDriverOptions {
+                allow_forwarding: true,
+            },
+            &mut host,
+        )
+        .expect("forward learner txn");
+
+        assert_eq!(result, forwarded);
+        assert_eq!(host.committed_txns, 0);
+        assert!(!host.elected);
+    }
+
+    struct AppendReplicationTestHost {
+        last_index: u64,
+        requested_next_indices: Vec<u64>,
+        responses: VecDeque<ClusterRaftAppendResponse>,
+        sent_count: usize,
+    }
+
+    impl ClusterKvRaftAppendReplicationHost for AppendReplicationTestHost {
+        type Error = QuorumCommitTestError;
+        type Target = NodeId;
+
+        fn last_local_raft_log_index(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<u64, Self::Error> {
+            Ok(self.last_index)
+        }
+
+        fn build_raft_append_request(
+            &mut self,
+            state: &ClusterBootstrapState,
+            next_index: u64,
+        ) -> Result<ClusterRaftAppendRequest, Self::Error> {
+            self.requested_next_indices.push(next_index);
+            Ok(ClusterRaftAppendRequest {
+                state: state.clone(),
+                append: RaftAppendEntriesRequest {
+                    term: 1,
+                    leader_id: state.local_node_id.clone(),
+                    prev_log_index: next_index.saturating_sub(1),
+                    prev_log_term: 1,
+                    entries: Vec::new(),
+                    leader_commit: next_index.saturating_sub(1),
+                },
+                snapshot: Some(RaftSnapshot {
+                    last_included_index: next_index.saturating_sub(1),
+                    last_included_term: 1,
+                    kv: test_kv_snapshot_with_events(Vec::new()),
+                }),
+            })
+        }
+
+        fn append_attempt_timeout(
+            &mut self,
+            _target: &Self::Target,
+            remaining: Duration,
+            _request: &ClusterRaftAppendRequest,
+        ) -> Duration {
+            remaining.min(Duration::from_secs(1))
+        }
+
+        fn on_raft_append_sent(&mut self) -> Result<(), Self::Error> {
+            self.sent_count = self.sent_count.saturating_add(1);
+            Ok(())
+        }
+
+        fn send_raft_append(
+            &mut self,
+            _target: &Self::Target,
+            _request: &ClusterRaftAppendRequest,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, Self::Error> {
+            self.responses
+                .pop_front()
+                .ok_or_else(|| QuorumCommitTestError::ReadOnly("missing append response".into()))
+        }
+    }
+
+    fn test_cluster_raft_append_response(
+        state: &ClusterBootstrapState,
+        accepted: bool,
+        match_index: u64,
+    ) -> ClusterRaftAppendResponse {
+        ClusterRaftAppendResponse {
+            accepted,
+            detail: "test append".to_string(),
+            state: state.clone(),
+            append: RaftAppendEntriesResponse {
+                term: 1,
+                success: accepted,
+                match_index,
+            },
+        }
+    }
+
+    #[test]
+    fn cluster_kv_raft_append_replication_retries_rejected_next_index_in_kv() {
+        let local = NodeId::from_legacy_named("node_kv_append_replication_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_kv_append_replication_remote").expect("remote");
+        let state = quorum_commit_test_state(&local, &remote);
+        let watch_event = test_kv_put_event(1, "/kv/append/watch", b"ok");
+        let mut host = AppendReplicationTestHost {
+            last_index: 5,
+            requested_next_indices: Vec::new(),
+            responses: VecDeque::from([
+                test_cluster_raft_append_response(&state, false, 2),
+                test_cluster_raft_append_response(&state, true, 5),
+            ]),
+            sent_count: 0,
+        };
+
+        let outcome = replicate_cluster_kv_raft_to_target_with_host(
+            &state,
+            &remote,
+            &[watch_event],
+            ClusterKvRaftAppendReplicationOptions {
+                max_attempts: 3,
+                timeout: Duration::from_secs(5),
+            },
+            &mut host,
+        )
+        .expect("append replication");
+
+        assert!(outcome.response.accepted);
+        assert!(outcome.watch_event_fanout_needed);
+        assert_eq!(host.requested_next_indices, vec![6, 3]);
+        assert_eq!(host.sent_count, 2);
+    }
+
+    #[test]
+    fn cluster_kv_raft_quorum_driver_commits_after_remote_voter_ack() {
+        let local = NodeId::from_legacy_named("node_kv_quorum_driver_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_kv_quorum_driver_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote.clone()],
+            accepting_targets: [remote.clone()].into_iter().collect(),
+            ..QuorumCommitTestHost::default()
+        };
+
+        let result = commit_cluster_kv_raft_command_with_quorum(
+            &mut state,
+            KvCommand::Op(KvOp::Put {
+                key: "/kv/quorum/committed".to_string(),
+                value: b"ok".to_vec(),
+                lease_id: None,
+            }),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        )
+        .expect("quorum commit");
+
+        assert_eq!(
+            result
+                .snapshot
+                .get("/kv/quorum/committed")
+                .expect("committed value")
+                .value,
+            b"ok".to_vec()
+        );
+        assert_eq!(host.committed_indices, vec![7]);
+        assert_eq!(host.replicated_targets, vec![remote.clone()]);
+        assert_eq!(
+            host.statuses,
+            vec![(
+                remote.clone(),
+                ClusterKvRaftTargetReplicationStatus::Accepted
+            )]
+        );
+        assert_eq!(host.fanout_targets, vec![remote]);
+        assert!(!host.discarded);
+    }
+
+    #[test]
+    fn cluster_kv_raft_quorum_async_driver_commits_after_remote_voter_ack() {
+        let local = NodeId::from_legacy_named("node_kv_quorum_async_driver_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_kv_quorum_async_driver_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote.clone()],
+            accepting_targets: [remote.clone()].into_iter().collect(),
+            ..QuorumCommitTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let result = runtime
+            .block_on(commit_cluster_kv_raft_command_with_quorum_async(
+                &mut state,
+                KvCommand::Op(KvOp::Put {
+                    key: "/kv/quorum/async-committed".to_string(),
+                    value: b"ok".to_vec(),
+                    lease_id: None,
+                }),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ))
+            .expect("async quorum commit");
+
+        assert_eq!(
+            result
+                .snapshot
+                .get("/kv/quorum/async-committed")
+                .expect("committed value")
+                .value,
+            b"ok".to_vec()
+        );
+        assert_eq!(host.committed_indices, vec![7]);
+        assert_eq!(host.replicated_targets, vec![remote.clone()]);
+        assert_eq!(
+            host.statuses,
+            vec![(
+                remote.clone(),
+                ClusterKvRaftTargetReplicationStatus::Accepted
+            )]
+        );
+        assert_eq!(host.fanout_targets, vec![remote]);
+        assert!(!host.discarded);
+    }
+
+    #[test]
+    fn cluster_kv_raft_quorum_driver_discards_uncommitted_entry_without_quorum() {
+        let local =
+            NodeId::from_legacy_named("node_kv_quorum_driver_no_quorum_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_kv_quorum_driver_no_quorum_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote.clone()],
+            ..QuorumCommitTestHost::default()
+        };
+
+        let error = commit_cluster_kv_raft_command_with_quorum(
+            &mut state,
+            KvCommand::Op(KvOp::Put {
+                key: "/kv/quorum/rejected".to_string(),
+                value: b"no".to_vec(),
+                lease_id: None,
+            }),
+            ClusterKvRaftQuorumCommitOptions {
+                timeout: Duration::from_secs(1),
+            },
+            &mut host,
+        )
+        .expect_err("no quorum");
+
+        assert!(matches!(error, QuorumCommitTestError::ReadOnly(_)));
+        assert!(host.discarded);
+        assert!(host.committed_indices.is_empty());
+        assert_eq!(
+            host.statuses,
+            vec![(remote, ClusterKvRaftTargetReplicationStatus::Rejected)]
+        );
+    }
+
+    #[test]
+    fn cluster_kv_raft_quorum_async_driver_discards_uncommitted_entry_without_quorum() {
+        let local = NodeId::from_legacy_named("node_kv_quorum_async_driver_no_quorum_local")
+            .expect("local");
+        let remote = NodeId::from_legacy_named("node_kv_quorum_async_driver_no_quorum_remote")
+            .expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        let mut host = QuorumCommitTestHost {
+            targets: vec![remote.clone()],
+            ..QuorumCommitTestHost::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let error = runtime
+            .block_on(commit_cluster_kv_raft_command_with_quorum_async(
+                &mut state,
+                KvCommand::Op(KvOp::Put {
+                    key: "/kv/quorum/async-rejected".to_string(),
+                    value: b"no".to_vec(),
+                    lease_id: None,
+                }),
+                ClusterKvRaftQuorumCommitOptions {
+                    timeout: Duration::from_secs(1),
+                },
+                &mut host,
+            ))
+            .expect_err("no quorum");
+
+        assert!(matches!(error, QuorumCommitTestError::ReadOnly(_)));
+        assert!(host.discarded);
+        assert!(host.committed_indices.is_empty());
+        assert_eq!(
+            host.statuses,
+            vec![(remote, ClusterKvRaftTargetReplicationStatus::Rejected)]
+        );
+    }
+
     #[test]
     fn learner_can_catch_up_from_snapshot() {
         let node_a = NodeId::from_legacy_named("node_a").expect("node");
@@ -12688,6 +16674,75 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    struct ClusterKvRaftSnapshotByteLimitGuard {
+        previous: u64,
+    }
+
+    impl ClusterKvRaftSnapshotByteLimitGuard {
+        fn install(limit: u64) -> Self {
+            Self {
+                previous: set_cluster_kv_raft_snapshot_byte_limit_for_test(limit),
+            }
+        }
+    }
+
+    impl Drop for ClusterKvRaftSnapshotByteLimitGuard {
+        fn drop(&mut self) {
+            set_cluster_kv_raft_snapshot_byte_limit_for_test(self.previous);
+        }
+    }
+
+    #[test]
+    fn cluster_kv_raft_store_oversized_snapshot_with_compacted_events_is_idle_on_open() {
+        let _limit_guard = ClusterKvRaftSnapshotByteLimitGuard::install(1);
+        let root = temp_raft_root("sinomo-kv-raft-oversized-snapshot-idle");
+        let node_id = NodeId::from_legacy_named("node_oversized_snapshot_idle").expect("node");
+        let paths = ClusterKvPaths::new(root.clone());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+
+        {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), wal_paths.clone()).expect("open");
+            let entry = node
+                .append_local_command(
+                    1,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/oversized/snapshot/value".to_string(),
+                        value: b"value".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .expect("append");
+            node.commit_to(entry.index).expect("commit");
+            node.compact_event_history_to(MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS);
+            node.save_snapshot().expect("snapshot");
+            assert!(
+                node.store().event_history_len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+                "fixture should have no compactable event-history tail"
+            );
+        }
+
+        let before = fs::metadata(&wal_paths.snapshot).expect("snapshot before");
+        assert!(
+            before.len() > 1,
+            "test threshold should make this ordinary snapshot look oversized"
+        );
+        thread::sleep(Duration::from_millis(20));
+        let store = ClusterKvRaftStore::new(paths, default_cluster_kv_raft_compaction_policy());
+        let reopened = store.open_node(&node_id).expect("open compacted snapshot");
+        assert_eq!(reopened.snapshot_index(), 1);
+        drop(reopened);
+        let after = fs::metadata(&wal_paths.snapshot).expect("snapshot after");
+
+        assert_eq!(before.len(), after.len());
+        assert_eq!(
+            before.modified().ok(),
+            after.modified().ok(),
+            "oversized snapshots without compactable event history should not be re-saved on idle open"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn cluster_kv_raft_compaction_policy_compacts_after_progress_watermark() {
         let root = temp_raft_root("sinomo-kv-compaction-policy-progress");
@@ -12737,6 +16792,55 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_raft_store_open_node_async_compacts_after_progress_watermark() {
+        let root = temp_raft_root("sinomo-kv-raft-store-async-open-compacts");
+        let node_id =
+            NodeId::from_legacy_named("node_raft_store_async_open_compacts").expect("node");
+        let paths = ClusterKvPaths::new(root.clone());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let command_count = RAFT_COMPACTION_RETAINED_ENTRIES
+            .saturating_mul(2)
+            .saturating_add(1);
+        {
+            let mut node =
+                DurableRaftKvNode::open(node_id.clone(), wal_paths.clone()).expect("open");
+            for index in 1..=command_count {
+                let entry = node
+                    .append_local_command(
+                        1,
+                        KvCommand::Op(KvOp::Put {
+                            key: format!("/async-open/compaction/{index}"),
+                            value: index.to_be_bytes().to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .expect("append");
+                node.commit_to(entry.index).expect("commit");
+            }
+            assert_eq!(node.snapshot_index(), 0);
+        }
+
+        let store = ClusterKvRaftStore::new(
+            paths,
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let node = runtime
+            .block_on(store.open_node_async(&node_id))
+            .expect("open async");
+
+        assert_eq!(node.snapshot_index(), command_count);
+        assert!(node.log().len() <= RAFT_COMPACTION_RETAINED_ENTRIES as usize);
+        drop(node);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn cluster_kv_raft_store_applies_vote_and_leader_updates() {
         let root = temp_raft_root("sinomo-kv-raft-store-vote-leader");
         let node_id = NodeId::from_legacy_named("node_raft_store_vote_leader").expect("node");
@@ -12762,6 +16866,7 @@ mod tests {
                 last_log_term: 0,
             }
         );
+        assert_eq!(store.last_log_index(&node_id).expect("last log index"), 0);
 
         let vote = store
             .apply_vote(
@@ -12802,6 +16907,13 @@ mod tests {
         assert_eq!(hard_state.current_term, 3);
         assert_eq!(hard_state.voted_for.as_ref(), Some(&node_id));
         assert_eq!(hard_state.leader_id.as_ref(), Some(&node_id));
+        assert_eq!(
+            store
+                .known_leader_id(&node_id)
+                .expect("known leader after set")
+                .as_ref(),
+            Some(&node_id)
+        );
 
         store.clear_leader(&node_id).expect("clear leader");
         let hard_state = paths
@@ -12811,6 +16923,12 @@ mod tests {
         assert_eq!(hard_state.current_term, 3);
         assert_eq!(hard_state.voted_for.as_ref(), Some(&node_id));
         assert!(hard_state.leader_id.is_none());
+        assert_eq!(
+            store
+                .known_leader_id(&node_id)
+                .expect("known leader after clear"),
+            None
+        );
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -12830,8 +16948,8 @@ mod tests {
             },
         );
 
-        let outcome = store
-            .apply_append_entries_with_optional_snapshot(
+        let (outcome, wrote_snapshot) = store
+            .apply_append_entries_with_optional_snapshot_and_publish(
                 &follower_id,
                 None,
                 RaftAppendEntriesRequest {
@@ -12851,10 +16969,12 @@ mod tests {
                     }],
                     leader_commit: 1,
                 },
+                |_| false,
             )
             .expect("apply append");
 
         assert!(outcome.response.success);
+        assert!(wrote_snapshot);
         assert!(!outcome.snapshot_restored);
         assert_eq!(outcome.committed_events.len(), 1);
         assert_eq!(outcome.committed_events[0].key, "/raft-store/append");
@@ -12863,6 +16983,14 @@ mod tests {
                 .snapshot
                 .get("/raft-store/append")
                 .expect("entry")
+                .value,
+            b"value".to_vec()
+        );
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&paths)
+                .expect("published snapshot")
+                .get("/raft-store/append")
+                .expect("published entry")
                 .value,
             b"value".to_vec()
         );
@@ -12893,6 +17021,72 @@ mod tests {
     }
 
     #[test]
+    fn cluster_kv_raft_store_builds_vote_responses() {
+        let root = temp_raft_root("sinomo-kv-raft-store-vote-response");
+        let paths = ClusterKvPaths::new(root.clone());
+        let local_id =
+            NodeId::from_legacy_named("node_raft_store_vote_response_local").expect("local");
+        let candidate_id = NodeId::from_legacy_named("node_raft_store_vote_response_candidate")
+            .expect("candidate");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            Id::from_legacy_named("cluster_raft_store_vote_response").expect("cluster"),
+            "raft vote response",
+            local_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        let capabilities = sinomo_node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
+        assert!(cluster_kv_raft_candidate_is_authorized_voter(
+            &state, &local_id
+        ));
+
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let granted = store
+            .apply_vote_response(
+                &state,
+                RaftRequestVoteRequest {
+                    term: 1,
+                    candidate_id: candidate_id.clone(),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                },
+            )
+            .expect("vote response");
+        assert!(granted.accepted);
+        assert_eq!(granted.detail, "raft vote granted");
+        assert_eq!(granted.state, state);
+        assert_eq!(
+            granted.vote,
+            RaftRequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            }
+        );
+
+        let rejected = store
+            .cluster_raft_vote_rejection_response(
+                &granted.state,
+                "raft vote rejected for unauthorized or mismatched candidate".to_string(),
+            )
+            .expect("vote rejection response");
+        assert!(!rejected.accepted);
+        assert!(!rejected.vote.vote_granted);
+        assert_eq!(rejected.vote.term, 1);
+        assert!(rejected.detail.contains("unauthorized"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn cluster_kv_raft_store_appends_commits_and_detects_no_effect_commands() {
         let root = temp_raft_root("sinomo-kv-raft-store-command");
         let node_id = NodeId::from_legacy_named("node_raft_store_command").expect("node");
@@ -12910,24 +17104,34 @@ mod tests {
             lease_id: None,
         });
 
-        let committed = store
-            .append_command_with_response(&node_id, put.clone())
+        let (committed, wrote_snapshot) = store
+            .append_command_with_response_and_publish_report(&node_id, put.clone(), |_| false)
             .expect("append and commit");
         assert_eq!(committed.snapshot.revision, KvRevision(1));
         assert_eq!(committed.events.len(), 1);
         assert_eq!(committed.events[0].key, "/raft-store/command");
         assert!(committed.txn_response.is_none());
+        assert!(wrote_snapshot);
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&paths)
+                .expect("published command snapshot")
+                .get("/raft-store/command")
+                .expect("published command")
+                .value,
+            b"value".to_vec()
+        );
         let hard_state = paths
             .raft_wal_paths(&node_id)
             .read_persisted_hard_state()
             .expect("read hard state after commit");
         assert_eq!(hard_state.commit_index, 1);
 
-        let no_effect_commit = store
-            .append_command_with_response(&node_id, put.clone())
+        let (no_effect_commit, no_effect_wrote_snapshot) = store
+            .append_command_with_response_and_publish_report(&node_id, put.clone(), |_| false)
             .expect("append no-effect command");
         assert_eq!(no_effect_commit.snapshot.revision, KvRevision(1));
         assert!(no_effect_commit.events.is_empty());
+        assert!(!no_effect_wrote_snapshot);
 
         let no_effect_uncommitted = store
             .append_command_uncommitted_or_no_effect(&node_id, put)
@@ -12956,12 +17160,78 @@ mod tests {
             )
             .expect("append uncommitted command");
         assert_eq!(append.index, 2);
-        let committed = store
-            .commit_index_with_events(&node_id, append.index)
+        let (committed, wrote_snapshot) = store
+            .commit_index_with_events_and_publish_report(&node_id, append.index, |_| false)
             .expect("commit uncommitted command");
         assert_eq!(committed.snapshot.revision, KvRevision(2));
         assert_eq!(committed.events.len(), 1);
         assert_eq!(committed.events[0].key, "/raft-store/pending");
+        assert!(wrote_snapshot);
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&paths)
+                .expect("published pending snapshot")
+                .get("/raft-store/pending")
+                .expect("published pending")
+                .value,
+            b"pending".to_vec()
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cluster_kv_raft_local_command_storage_appends_commits_and_discards() {
+        let root = temp_raft_root("sinomo-kv-local-command-storage");
+        let node_id = NodeId::from_legacy_named("node_kv_local_command_storage").expect("node");
+        let paths = ClusterKvPaths::new(root.clone());
+        let store = ClusterKvRaftStore::new(
+            paths.clone(),
+            ClusterKvRaftCompactionPolicy {
+                max_snapshot_bytes: u64::MAX,
+                max_snapshot_events: MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
+            },
+        );
+        let mut storage = ClusterKvRaftLocalCommandStorage::new(store, node_id, |_| false);
+
+        let entry = match storage
+            .append_uncommitted_or_no_effect(KvCommand::Op(KvOp::Put {
+                key: "/raft-local-storage/committed".to_string(),
+                value: b"committed".to_vec(),
+                lease_id: None,
+            }))
+            .expect("append command")
+        {
+            ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
+            ClusterKvRaftUncommittedAppend::NoEffect { .. } => {
+                panic!("fresh command should append")
+            }
+        };
+        let commit = storage
+            .commit_index_with_events(entry.index)
+            .expect("commit command");
+        assert_eq!(commit.events.len(), 1);
+        assert_eq!(storage.take_last_snapshot_publish_wrote(), Some(true));
+        assert_eq!(
+            read_cluster_kv_cached_snapshot(&paths)
+                .expect("published snapshot")
+                .get("/raft-local-storage/committed")
+                .expect("committed key")
+                .value,
+            b"committed".to_vec()
+        );
+
+        let _ = storage
+            .append_uncommitted_or_no_effect(KvCommand::Op(KvOp::Put {
+                key: "/raft-local-storage/discarded".to_string(),
+                value: b"discarded".to_vec(),
+                lease_id: None,
+            }))
+            .expect("append discarded command");
+        let discarded = storage
+            .discard_uncommitted_tail_and_clear_leader()
+            .expect("discard tail");
+        assert!(discarded.get("/raft-local-storage/discarded").is_none());
+        assert_eq!(storage.take_last_snapshot_publish_wrote(), Some(false));
 
         std::fs::remove_dir_all(root).ok();
     }

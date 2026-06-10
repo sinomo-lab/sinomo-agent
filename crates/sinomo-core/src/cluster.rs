@@ -1,5 +1,6 @@
-use crate::{CapabilityName, Id, TrustDomain};
+use crate::{CapabilityName, Id, TrustDomain, domain::RolloutPlan};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use time::OffsetDateTime;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq, Ord, PartialOrd)]
@@ -34,6 +35,137 @@ pub struct ClusterBootstrapState {
     pub initialized_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutDesiredRecord {
+    pub cluster_id: Id,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
+    pub source_bundle: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_repo: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModuleRolloutStatusRecord {
+    pub cluster_id: Id,
+    pub node_id: Id,
+    pub rollout_plan_id: Id,
+    pub module_id: Id,
+    pub artifact_id: Id,
+    pub stage: String,
+    pub current_weight_bps: u16,
+    pub active_artifact_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_artifact_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_artifact_id: Option<Id>,
+    pub hot_swap_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry_last_consumed_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_record_id: Option<Id>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModuleRolloutDesiredRecord {
+    pub cluster_id: Id,
+    pub state: String,
+    pub rollout_plan: RolloutPlan,
+    pub requested_by_node_id: Id,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_material_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_refs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterModuleRolloutReconciliationRecord {
+    pub cluster_id: Id,
+    pub node_id: Id,
+    pub rollout_plan_id: Id,
+    pub module_id: Id,
+    pub artifact_id: Id,
+    pub state: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_id: Option<Id>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_material_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_runtime_stage: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+pub fn cluster_rollout_desired_key() -> String {
+    "/cluster/rollout/desired".to_string()
+}
+
+pub fn cluster_module_rollout_node_prefix() -> String {
+    "/cluster/module-rollouts/nodes/".to_string()
+}
+
+pub fn cluster_module_rollout_node_key(node_id: &Id, module_id: &Id) -> String {
+    format!(
+        "{}{node_id}/{module_id}",
+        cluster_module_rollout_node_prefix()
+    )
+}
+
+pub fn cluster_module_rollout_desired_prefix() -> String {
+    "/cluster/module-rollouts/desired/".to_string()
+}
+
+pub fn cluster_module_rollout_desired_key(module_id: &Id, rollout_plan_id: &Id) -> String {
+    format!(
+        "{}{module_id}/{rollout_plan_id}",
+        cluster_module_rollout_desired_prefix()
+    )
+}
+
+pub fn cluster_module_rollout_reconcile_prefix() -> String {
+    "/cluster/module-rollouts/reconcile/".to_string()
+}
+
+pub fn cluster_module_rollout_reconcile_key(
+    node_id: &Id,
+    module_id: &Id,
+    rollout_plan_id: &Id,
+) -> String {
+    format!(
+        "{}{node_id}/{module_id}/{rollout_plan_id}",
+        cluster_module_rollout_reconcile_prefix()
+    )
 }
 
 impl ClusterBootstrapState {

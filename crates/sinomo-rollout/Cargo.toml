@@ -20,6 +20,7 @@ time.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }
+sinomo-kv = { path = "../sinomo-kv" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-module = { path = "../sinomo-module" }

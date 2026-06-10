@@ -29,6 +29,13 @@ pub enum NetworkError {
     UnknownDelivery { delivery_id: RouteDeliveryId },
     #[error("delivery ledger is full: max {max_records} records")]
     DeliveryLedgerFull { max_records: usize },
+    #[error(
+        "network service command queue is full during {operation}: max {max_commands} commands"
+    )]
+    NetworkServiceCommandQueueFull {
+        operation: String,
+        max_commands: usize,
+    },
     #[error("in-process mailbox for {node_id} is full: max {max_frames} frames")]
     MailboxFull { node_id: NodeId, max_frames: usize },
     #[error(
@@ -41,6 +48,11 @@ pub enum NetworkError {
     },
     #[error("unknown object rpc route: {route}")]
     UnknownRoute { route: String },
+    #[error("object rpc route {route} is saturated: max {concurrency_limit} in-flight requests")]
+    ObjectRpcRouteSaturated {
+        route: String,
+        concurrency_limit: usize,
+    },
     #[error(
         "delivery {delivery_id:?} acked by {acking_node_id}, expected {expected_target_node_id}"
     )]

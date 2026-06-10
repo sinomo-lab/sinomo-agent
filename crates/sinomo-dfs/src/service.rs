@@ -13,6 +13,8 @@
 //! plane routes bind to a [`DfsDataPlaneHost`], so `sinomo-dfs` still owns the
 //! route contract while an embedding process supplies cluster transport.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{
@@ -23,9 +25,9 @@ use crate::{
     DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataSnapshotInstallCommand,
     DfsMetadataSnapshotInstallResponse, DfsOperatorInspector, DfsOperatorStatus,
     DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsSmokeReport, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, ensure_default_cluster_aware_dfs_expose_config,
-    metadata_shards_prefix, open_local_sharded_metadata_backend, open_root_local_metadata_backend,
-    sifs_file_system_id,
+    default_dfs_metadata_shards_root, dfs_module_surfaces,
+    ensure_default_cluster_aware_dfs_expose_config, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend, sifs_file_system_id,
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
@@ -34,7 +36,7 @@ use sinomo_network::{
 
 use sinomo_service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 
 /// DFS control-plane service. Host-agnostic: it derives everything from the request's
@@ -59,6 +61,27 @@ pub fn register_data_plane_services(
     builder.register(DfsDataPlaneService::new(host))
 }
 
+fn dfs_service_route(route: &'static str) -> ServiceRoute {
+    let descriptor = dfs_module_surfaces()
+        .object_rpc_route_descriptor(route)
+        .expect("DFS module surfaces should be valid")
+        .unwrap_or_else(|| panic!("unknown DFS service route {route}"));
+    ServiceRoute::from_route_metadata(
+        descriptor.route,
+        descriptor.category,
+        descriptor.auth_scope,
+        descriptor
+            .required_capabilities
+            .into_iter()
+            .map(|capability| capability.to_string()),
+    )
+    .with_concurrency_limit(8)
+}
+
+fn dfs_service_routes(routes: &[&'static str]) -> Vec<ServiceRoute> {
+    routes.iter().copied().map(dfs_service_route).collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsDataPlaneHostError {
     detail: String,
@@ -81,13 +104,16 @@ impl std::fmt::Display for DfsDataPlaneHostError {
 impl std::error::Error for DfsDataPlaneHostError {}
 
 pub trait DfsDataPlaneHost: Send + Sync {
-    fn run_smoke(&self) -> Result<DfsSmokeReport, DfsDataPlaneHostError>;
+    fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport>;
 
-    fn handle_protocol_frame(
-        &self,
+    fn handle_protocol_frame<'a>(
+        &'a self,
         command: DfsProtocolFrameCommand,
-    ) -> Result<DfsProtocolFrameResponse, DfsDataPlaneHostError>;
+    ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse>;
 }
+
+pub type DfsDataPlaneHostFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, DfsDataPlaneHostError>> + Send + 'a>>;
 
 #[derive(Clone)]
 pub struct DfsDataPlaneService {
@@ -107,6 +133,10 @@ impl Service for DfsService {
 
     fn routes(&self) -> &'static [&'static str] {
         DFS_CONTROL_PLANE_ROUTES
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        dfs_service_routes(DFS_CONTROL_PLANE_ROUTES)
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -161,19 +191,25 @@ impl Service for DfsDataPlaneService {
         DFS_DATA_PLANE_ROUTES
     }
 
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        dfs_service_routes(DFS_DATA_PLANE_ROUTES)
+    }
+
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let host = Arc::clone(&self.host);
         Box::pin(async move {
             let response = match request.route.as_str() {
                 DFS_SMOKE_ROUTE => {
                     let _: () = request.decode_body()?;
-                    let report = host.run_smoke().map_err(service_error)?;
+                    let report = host.run_smoke().await.map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_SMOKE_ROUTE, &report)?
                 }
                 DFS_PROTOCOL_FRAME_ROUTE => {
                     let command: DfsProtocolFrameCommand = request.decode_body()?;
-                    let frame_response =
-                        host.handle_protocol_frame(command).map_err(service_error)?;
+                    let frame_response = host
+                        .handle_protocol_frame(command)
+                        .await
+                        .map_err(service_error)?;
                     ObjectRpcResponse::encode_body(DFS_PROTOCOL_FRAME_ROUTE, &frame_response)?
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -343,7 +379,7 @@ fn dfs_metadata_snapshot_install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DFS_RPC_CATEGORY;
+    use crate::{DFS_OBJECT_RPC_ROUTES, DFS_RPC_CATEGORY};
     use crate::{
         DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsExposeConfig,
         DfsMetadataJournalBatch, DfsMetadataJournalReplicationReport, DfsMetadataShardId,
@@ -376,45 +412,50 @@ mod tests {
     }
 
     impl DfsDataPlaneHost for StubDfsDataPlaneHost {
-        fn run_smoke(&self) -> Result<DfsSmokeReport, DfsDataPlaneHostError> {
-            *self.smoke_calls.lock().expect("smoke calls") += 1;
-            let local = sinomo_node::NodeId::from_legacy_named("node_dfs_service_data_plane_local")
-                .expect("local node");
-            Ok(DfsSmokeReport {
-                path: "/services/dfs-smoke/service-route.txt".to_string(),
-                file_system_id: sifs_file_system_id(),
-                object_id: DfsObjectId::from_legacy_named("obj_dfs_service_data_plane")
-                    .expect("object"),
-                version: DfsVersion::from_legacy_named("version_dfs_service_data_plane")
-                    .expect("version"),
-                content_hash: Some("hash".to_string()),
-                size_bytes: Some(4),
-                requested_replica_node_ids: vec![local.clone()],
-                committed_replica_node_ids: vec![local.clone()],
-                pending_repair_count: 0,
-                metadata_replication: DfsMetadataJournalReplicationReport {
-                    outcomes: Vec::new(),
-                },
-                attempts: vec![DfsSmokeAttempt {
-                    replica_node_ids: vec![local],
+        fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport> {
+            Box::pin(async move {
+                *self.smoke_calls.lock().expect("smoke calls") += 1;
+                let local =
+                    sinomo_node::NodeId::from_legacy_named("node_dfs_service_data_plane_local")
+                        .expect("local node");
+                Ok(DfsSmokeReport {
                     path: "/services/dfs-smoke/service-route.txt".to_string(),
-                    committed: true,
-                    detail: "ok".to_string(),
-                }],
+                    file_system_id: sifs_file_system_id(),
+                    object_id: DfsObjectId::from_legacy_named("obj_dfs_service_data_plane")
+                        .expect("object"),
+                    version: DfsVersion::from_legacy_named("version_dfs_service_data_plane")
+                        .expect("version"),
+                    content_hash: Some("hash".to_string()),
+                    size_bytes: Some(4),
+                    requested_replica_node_ids: vec![local.clone()],
+                    committed_replica_node_ids: vec![local.clone()],
+                    pending_repair_count: 0,
+                    metadata_replication: DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    },
+                    attempts: vec![DfsSmokeAttempt {
+                        replica_node_ids: vec![local],
+                        path: "/services/dfs-smoke/service-route.txt".to_string(),
+                        committed: true,
+                        detail: "ok".to_string(),
+                    }],
+                })
             })
         }
 
-        fn handle_protocol_frame(
-            &self,
+        fn handle_protocol_frame<'a>(
+            &'a self,
             command: DfsProtocolFrameCommand,
-        ) -> Result<DfsProtocolFrameResponse, DfsDataPlaneHostError> {
-            self.frame_request_ids
-                .lock()
-                .expect("frame request ids")
-                .push(command.request_id.clone());
-            Ok(DfsProtocolFrameResponse {
-                request_id: command.request_id,
-                outbound_frames: Vec::new(),
+        ) -> DfsDataPlaneHostFuture<'a, DfsProtocolFrameResponse> {
+            Box::pin(async move {
+                self.frame_request_ids
+                    .lock()
+                    .expect("frame request ids")
+                    .push(command.request_id.clone());
+                Ok(DfsProtocolFrameResponse {
+                    request_id: command.request_id,
+                    outbound_frames: Vec::new(),
+                })
             })
         }
     }
@@ -453,6 +494,49 @@ mod tests {
             .cloned()
             .expect("a response frame");
         (disposition, response)
+    }
+
+    #[test]
+    fn dfs_service_route_metadata_matches_module_surfaces() {
+        let registry = register_data_plane_services(
+            register_services(ServiceRegistry::builder()),
+            Arc::new(StubDfsDataPlaneHost::default()),
+        )
+        .build();
+        let service_routes = registry
+            .route_categories()
+            .into_iter()
+            .map(|route| (route.route.clone(), route))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let module_routes = dfs_module_surfaces()
+            .object_rpc_route_descriptors()
+            .expect("DFS module surfaces")
+            .into_iter()
+            .map(|descriptor| (descriptor.route.clone(), descriptor))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for route in DFS_OBJECT_RPC_ROUTES {
+            let service_route = service_routes
+                .get(*route)
+                .unwrap_or_else(|| panic!("service registry should own DFS route {route}"));
+            let module_route = module_routes
+                .get(*route)
+                .unwrap_or_else(|| panic!("module surfaces should declare DFS route {route}"));
+            assert_eq!(service_route.category, module_route.category);
+            assert_eq!(
+                service_route.auth_scope.as_deref(),
+                Some(module_route.auth_scope.as_str())
+            );
+            assert_eq!(
+                service_route.required_capabilities,
+                module_route
+                    .required_capabilities
+                    .iter()
+                    .map(|capability| capability.as_str().to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(service_route.concurrency_limit, Some(8));
+        }
     }
 
     #[tokio::test]

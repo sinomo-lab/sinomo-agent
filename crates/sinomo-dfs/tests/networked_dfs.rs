@@ -4,7 +4,7 @@ use sinomo_dfs::{
     DfsCommitVersionCommand, DfsConfirmedTimeoutAction, DfsConfirmedTimeoutOutcome,
     DfsConflictStatus, DfsControlPlaneStore, DfsDistributedWriteResult, DfsFetchBlobResponse,
     DfsFetchBlobResponseChunk, DfsFetchBlobResult, DfsFileSystem, DfsFileSystemId,
-    DfsMetadataBackend, DfsMetadataMutation, DfsMetadataReplicationOutcome,
+    DfsFrameTransport, DfsMetadataBackend, DfsMetadataMutation, DfsMetadataReplicationOutcome,
     DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardId, DfsNetworkMessage,
     DfsNodeAdvertisement, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord,
     DfsOwnerHandoffOutcome, DfsReadData, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
@@ -19,7 +19,7 @@ use sinomo_events::EventId;
 use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::{
     InProcessNetwork, MeshMessage, MeshMessageBody, MeshMessageId, NetworkFrame, NetworkFrameId,
-    NetworkTransport, ProtocolMessage,
+    ProtocolMessage,
 };
 use sinomo_node::NodeId;
 use std::fs;
@@ -12348,7 +12348,7 @@ fn blob_path_for_hash(root: &Path, hash: &str) -> PathBuf {
     root.join("blobs").join(&hex[..2]).join(hex)
 }
 
-fn send_dfs_test_message<T: NetworkTransport>(
+fn send_dfs_test_message<T: DfsFrameTransport>(
     transport: &mut T,
     source: &NodeId,
     target: &NodeId,

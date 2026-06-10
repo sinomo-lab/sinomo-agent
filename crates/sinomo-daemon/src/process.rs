@@ -48,6 +48,20 @@ pub fn prepare_background_command(command: &mut Command) {
     }
 }
 
+pub(crate) fn build_daemon_async_runtime(
+    label: &str,
+) -> Result<tokio::runtime::Runtime, DaemonError> {
+    tokio::runtime::Builder::new_multi_thread()
+        .thread_name(format!("sinomo-{label}-async"))
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|source| DaemonError::Io {
+            path: format!("build sinomo {label} async runtime"),
+            detail: source.to_string(),
+        })
+}
+
 /// Stdio for the supervised main daemon's stdout/stderr. Captures to
 /// `<SINOMO_DATA_DIR>/daemon/<name>` (appended) instead of discarding to `/dev/null`, so
 /// panics and errors raised while handling requests (e.g. a rollout activation) survive

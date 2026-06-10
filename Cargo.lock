@@ -109,6 +109,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5777,6 +5786,7 @@ dependencies = [
  "sinomo-sandbox-wasix-module",
  "time",
  "tokenizers",
+ "tokio",
  "wat",
 ]
 
@@ -5805,6 +5815,7 @@ name = "sinomo-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_bytes",
  "serde_json",
  "thiserror 2.0.18",
  "time",
@@ -5843,6 +5854,8 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "tokio",
+ "tower-layer",
+ "tower-service",
 ]
 
 [[package]]
@@ -6049,6 +6062,7 @@ dependencies = [
 name = "sinomo-module"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "blake3",
  "libloading 0.8.9",
@@ -6081,6 +6095,7 @@ dependencies = [
 name = "sinomo-network"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "base64 0.22.1",
  "blake3",
  "fs2",
@@ -6194,6 +6209,7 @@ dependencies = [
  "sinomo-core",
  "sinomo-dfs-cloud-files-api",
  "sinomo-events",
+ "sinomo-kv",
  "sinomo-local",
  "sinomo-module",
  "sinomo-network",
@@ -6335,6 +6351,7 @@ dependencies = [
 name = "sinomo-service"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "serde",
  "serde_json",
  "sinomo-core",

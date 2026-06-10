@@ -17,12 +17,12 @@ pub(crate) use sinomo_core::{
     RoutingMetadata, RoutingScope, Salience, Source,
 };
 pub(crate) use sinomo_dfs::{
-    DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions, NetworkedDfsService,
+    DfsFrameTransport, DfsObjectId, DfsObjectKind, DfsPosixError, DfsWriteOptions,
+    NetworkedDfsService,
 };
 pub(crate) use sinomo_events::{AppendReceipt, EventId, EventStore, EventStoreError};
 pub(crate) use sinomo_kv::{KvEntry, KvOp, KvSnapshot, KvTxn, decode_kv_value};
 pub(crate) use sinomo_module::ArtifactId;
-pub(crate) use sinomo_network::NetworkTransport;
 pub(crate) use sinomo_node::NodeId;
 pub(crate) use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};

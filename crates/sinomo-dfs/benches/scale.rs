@@ -1,12 +1,12 @@
 use serde_json::json;
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_dfs::{
-    DfsFileSystem, DfsFileSystemId, DfsMetadataShardId, DfsNamespaceJobStatus, DfsObjectId,
-    DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult, DfsReplicationPolicy,
-    DfsVersion, DfsWriteOptions, LocalContentStore, LocalSobjMetadataBackend,
+    DfsFileSystem, DfsFileSystemId, DfsFrameTransport, DfsMetadataShardId, DfsNamespaceJobStatus,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsOperationalMetrics, DfsReadResult,
+    DfsReplicationPolicy, DfsVersion, DfsWriteOptions, LocalContentStore, LocalSobjMetadataBackend,
     NetworkedDfsRangeReadOutcome, NetworkedDfsService, NetworkedDfsServiceEvent,
 };
-use sinomo_network::{InProcessNetwork, NetworkTransport};
+use sinomo_network::InProcessNetwork;
 use sinomo_node::NodeId;
 use std::env;
 use std::fs;
@@ -1816,7 +1816,7 @@ struct TreeListingReport {
     pages: usize,
 }
 
-fn create_tree_dirs<T: NetworkTransport>(
+fn create_tree_dirs<T: DfsFrameTransport>(
     dfs: &mut NetworkedDfsService<T>,
     root_path: &str,
     dirs: usize,
@@ -1828,7 +1828,7 @@ fn create_tree_dirs<T: NetworkTransport>(
     Ok(())
 }
 
-fn populate_tree_metadata<T: NetworkTransport>(
+fn populate_tree_metadata<T: DfsFrameTransport>(
     dfs: &mut NetworkedDfsService<T>,
     owner: &NodeId,
     label: &str,
@@ -1899,7 +1899,7 @@ fn tree_file_metadata(
     })
 }
 
-fn count_tree_entries_paged<T: NetworkTransport>(
+fn count_tree_entries_paged<T: DfsFrameTransport>(
     dfs: &NetworkedDfsService<T>,
     root_path: &str,
     dirs: usize,
@@ -1920,7 +1920,7 @@ fn count_tree_entries_paged<T: NetworkTransport>(
     Ok(report)
 }
 
-fn count_directory_entries_paged<T: NetworkTransport>(
+fn count_directory_entries_paged<T: DfsFrameTransport>(
     dfs: &NetworkedDfsService<T>,
     path: &str,
     page_size: usize,
@@ -2017,7 +2017,7 @@ fn patch_bytes(index: usize, len: usize) -> Vec<u8> {
     bytes
 }
 
-fn bench_object_metadata<T: NetworkTransport>(
+fn bench_object_metadata<T: DfsFrameTransport>(
     dfs: &NetworkedDfsService<T>,
     object_id: &DfsObjectId,
 ) -> BenchResult<DfsObjectMetadata> {

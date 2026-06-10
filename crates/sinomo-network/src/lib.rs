@@ -86,13 +86,16 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_events::{
         EventId, EventSequence, EventStore, EventStoreError, SessionId, StoredEvent,
     };
+    #[cfg(test)]
+    pub(crate) use sinomo_kv::KvLogEntry;
     pub(crate) use sinomo_kv::{
         ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, DurableRaftKvNode,
-        InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvLocalCache,
-        KvLogEntry, KvOp, KvRevision, KvSnapshot, KvTxn, KvTxnResponse, KvWalPaths, LeaseId,
-        RaftAppendEntriesRequest, RaftAppendEntriesResponse, RaftRequestVoteRequest,
-        RaftRequestVoteResponse, RaftSnapshot, WatchId,
+        InProcessKvStore, KvCommand, KvCompare, KvEntry, KvError, KvEvent, KvLocalCache, KvOp,
+        KvSnapshot, KvTxn, KvTxnResponse, LeaseId, RaftAppendEntriesRequest,
+        RaftAppendEntriesResponse, RaftRequestVoteRequest, RaftRequestVoteResponse, RaftSnapshot,
     };
+    #[cfg(test)]
+    pub(crate) use sinomo_kv::{KvRevision, KvWalPaths, WatchId};
     pub(crate) use sinomo_local::SinomoDataDir;
     pub(crate) use sinomo_node::{
         NodeAvailability, NodeHealth, NodeId, NodeProfile, daemon_lan_endpoint_id,
@@ -103,11 +106,7 @@ pub(crate) mod prelude {
     pub(crate) use std::fs;
     pub(crate) use std::io;
     pub(crate) use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-    #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::net::{Shutdown, TcpStream};
     pub(crate) use std::path::PathBuf;
-    #[cfg(feature = "iroh-transport")]
-    pub(crate) use std::sync::mpsc;
     pub(crate) use std::sync::{Arc, Mutex};
     #[cfg(feature = "iroh-transport")]
     pub(crate) use std::thread;

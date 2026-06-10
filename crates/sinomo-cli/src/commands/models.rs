@@ -913,7 +913,9 @@ fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, Cli
     }
     #[cfg(test)]
     {
-        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+        return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map_err(network::NetworkError::from)
+            .map_err(Into::into);
     }
     #[cfg(not(test))]
     {

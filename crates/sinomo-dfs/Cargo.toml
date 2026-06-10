@@ -18,6 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-events = { path = "../sinomo-events" }
@@ -31,7 +32,7 @@ sinomo-service = { path = "../sinomo-service" }
 sinomo-storage = { path = "../sinomo-storage" }
 
 [dev-dependencies]
-tokio = { version = "1.44", features = ["macros", "rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 
 [[bench]]
 name = "scale"

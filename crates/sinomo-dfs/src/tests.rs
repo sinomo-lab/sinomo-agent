@@ -1,7 +1,7 @@
 use super::*;
-use sinomo_core::{ClusterEndpointSource, ClusterTransportKind};
+use sinomo_core::{ClusterEndpointPrivacy, ClusterEndpointSource, ClusterTransportKind};
 use sinomo_kv::InProcessRaftKvCluster;
-use sinomo_network::InProcessNetwork;
+use sinomo_network::{AsyncInProcessNetwork, InProcessNetwork};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -45,11 +45,13 @@ impl ReceiveOnlyTransport {
     }
 }
 
-impl NetworkTransport for ReceiveOnlyTransport {
+impl DfsTransportIdentity for ReceiveOnlyTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
+}
 
+impl DfsFrameTransport for ReceiveOnlyTransport {
     fn send(&mut self, target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
         Err(NetworkError::UnknownNode {
             node_id: target_node_id.clone(),
@@ -65,11 +67,13 @@ struct FailingSendTransport {
     local_node_id: NodeId,
 }
 
-impl NetworkTransport for FailingSendTransport {
+impl DfsTransportIdentity for FailingSendTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
+}
 
+impl DfsFrameTransport for FailingSendTransport {
     fn send(&mut self, _target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
         Err(NetworkError::Io {
             operation: "test send".to_string(),
@@ -80,6 +84,51 @@ impl NetworkTransport for FailingSendTransport {
     fn drain_incoming(&mut self) -> Result<Vec<sinomo_network::InboundFrame>, NetworkError> {
         Ok(Vec::new())
     }
+}
+
+#[test]
+fn async_dfs_frame_transport_in_process_sends_waits_and_drains() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let network = AsyncInProcessNetwork::new();
+        let node_a = NodeId::from_legacy_named("node_dfs_async_frame_a").expect("node a");
+        let node_b = NodeId::from_legacy_named("node_dfs_async_frame_b").expect("node b");
+        let mut transport_a = network.add_node(node_a.clone());
+        let mut transport_b = network.add_node(node_b.clone());
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(7),
+            source_node_id: node_a.clone(),
+            target_node_id: node_b.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(11),
+                origin_node_id: node_a.clone(),
+                target_node_id: node_b.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: node_a,
+                    tick: 1,
+                }),
+            },
+        };
+
+        AsyncDfsFrameTransport::send_async(&mut transport_a, &node_b, frame)
+            .await
+            .expect("send");
+        assert!(
+            AsyncDfsFrameTransport::wait_for_incoming_async(&mut transport_b, Duration::ZERO)
+                .await
+                .expect("wait")
+        );
+        let inbound = AsyncDfsFrameTransport::drain_incoming_async(&mut transport_b)
+            .await
+            .expect("drain");
+
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0].received_by, node_b);
+        assert_eq!(inbound[0].frame.frame_id, NetworkFrameId(7));
+    });
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +149,40 @@ impl ClusterPathDfsControlPlaneKvClient {
             detail: source.to_string(),
         }
     }
+}
+
+fn append_cluster_raft_command(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: sinomo_kv::KvCommand,
+) -> Result<sinomo_kv::KvSnapshot, sinomo_network::NetworkError> {
+    paths
+        .kv_paths()
+        .raft_store()
+        .append_command_and_publish(
+            node_id,
+            command,
+            sinomo_network::cluster_kv_key_can_defer_materialized_snapshot,
+        )
+        .map_err(Into::into)
+}
+
+fn append_cluster_raft_command_with_response(
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+    command: sinomo_kv::KvCommand,
+) -> Result<(sinomo_kv::KvSnapshot, Option<sinomo_kv::KvTxnResponse>), sinomo_network::NetworkError>
+{
+    paths
+        .kv_paths()
+        .raft_store()
+        .append_command_with_response_and_publish(
+            node_id,
+            command,
+            sinomo_network::cluster_kv_key_can_defer_materialized_snapshot,
+        )
+        .map(|result| (result.snapshot, result.txn_response))
+        .map_err(Into::into)
 }
 
 impl DfsControlPlaneKvClient for ClusterPathDfsControlPlaneKvClient {
@@ -134,7 +217,7 @@ impl DfsControlPlaneKvClient for ClusterPathDfsControlPlaneKvClient {
     ) -> Result<sinomo_kv::KvTxnResponse, sinomo_kv::KvError> {
         let state = sinomo_network::read_cluster_state(&self.cluster_paths)
             .map_err(|source| self.kv_error(source))?;
-        let (snapshot, response) = sinomo_network::append_cluster_raft_command_with_response(
+        let (snapshot, response) = append_cluster_raft_command_with_response(
             &self.cluster_paths,
             &state.local_node_id,
             sinomo_kv::KvCommand::Txn(txn),
@@ -241,6 +324,47 @@ impl DfsPeerTransport for RecordingPeerTransport {
     }
 }
 
+impl AsyncDfsPeerTransport for RecordingPeerTransport {
+    fn send_protocol_frame_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsProtocolFrameCommand,
+        timeout: Duration,
+    ) -> DfsPeerTransportFuture<'a, Result<DfsProtocolFrameResponse, DfsPeerTransportError>> {
+        Box::pin(async move { self.send_protocol_frame(endpoint, command, timeout) })
+    }
+
+    fn send_metadata_journal_batch_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsMetadataJournalBatchCommand,
+        timeout: Duration,
+    ) -> DfsPeerTransportFuture<
+        'a,
+        Result<DfsMetadataJournalBatchResponse, DfsMetadataPeerTransportError>,
+    > {
+        Box::pin(async move { self.send_metadata_journal_batch(endpoint, command, timeout) })
+    }
+
+    fn send_metadata_snapshot_install_async<'a>(
+        &'a self,
+        endpoint: &'a ClusterEndpointRecord,
+        command: &'a DfsMetadataSnapshotInstallCommand,
+        timeout: Duration,
+    ) -> DfsPeerTransportFuture<
+        'a,
+        Result<DfsMetadataSnapshotInstallResponse, DfsMetadataPeerTransportError>,
+    > {
+        Box::pin(async move { self.send_metadata_snapshot_install(endpoint, command, timeout) })
+    }
+}
+
+fn recording_async_peer_transport(
+    peer: Arc<RecordingPeerTransport>,
+) -> Arc<dyn AsyncDfsPeerTransport> {
+    peer
+}
+
 #[test]
 fn dfs_peer_transport_adapters_delegate_all_routes() {
     let peer = Arc::new(RecordingPeerTransport::default());
@@ -323,11 +447,13 @@ fn dfs_peer_transport_adapters_delegate_all_routes() {
     std::fs::remove_dir_all(snapshot_root).ok();
 }
 
-impl NetworkTransport for CountingEmptyTransport {
+impl DfsTransportIdentity for CountingEmptyTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
+}
 
+impl DfsFrameTransport for CountingEmptyTransport {
     fn send(&mut self, target_node_id: &NodeId, _frame: NetworkFrame) -> Result<(), NetworkError> {
         Err(NetworkError::UnknownNode {
             node_id: target_node_id.clone(),
@@ -587,7 +713,7 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
             }],
         })
     });
-    let mut transport = DfsEndpointTransport::with_timeout(
+    let mut transport = DfsEndpointTransport::with_connect_timeout(
         local.clone(),
         vec![endpoint],
         Duration::from_millis(1),
@@ -616,6 +742,308 @@ fn endpoint_transport_sends_rpc_and_queues_returned_frames() {
     assert_eq!(incoming.len(), 1);
     assert_eq!(incoming[0].received_by, local);
     assert_eq!(incoming[0].frame.source_node_id, remote);
+}
+
+#[test]
+fn endpoint_transport_async_send_requires_async_sender() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_async_send_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_endpoint_async_send_remote").expect("remote");
+        let endpoint = test_endpoint(&remote, "192.0.2.14:21353");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_sender = Arc::clone(&calls);
+        let local_for_sender = local.clone();
+        let remote_for_sender = remote.clone();
+        let sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+            calls_for_sender
+                .lock()
+                .expect("calls lock")
+                .push((endpoint.node_id.clone(), command.frame.clone()));
+            Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: vec![NetworkFrame {
+                    frame_id: NetworkFrameId(100),
+                    source_node_id: remote_for_sender.clone(),
+                    target_node_id: local_for_sender.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(100),
+                        origin_node_id: remote_for_sender.clone(),
+                        target_node_id: local_for_sender.clone(),
+                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                            node_id: remote_for_sender.clone(),
+                            tick: 1,
+                        }),
+                    },
+                }],
+            })
+        });
+        let mut transport = DfsEndpointTransport::with_connect_timeout(
+            local.clone(),
+            vec![endpoint],
+            Duration::from_millis(1),
+            sender,
+        );
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(7),
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(7),
+                origin_node_id: local.clone(),
+                target_node_id: remote.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: local.clone(),
+                    tick: 7,
+                }),
+            },
+        };
+
+        let error = AsyncDfsFrameTransport::send_async(&mut transport, &remote, frame.clone())
+            .await
+            .expect_err("async send should require async sender");
+        assert!(error.to_string().contains("without an async sender"));
+        assert!(calls.lock().expect("calls lock").is_empty());
+        assert_eq!(
+            AsyncDfsFrameTransport::pending_incoming_count_async(&mut transport)
+                .await
+                .expect("pending frames"),
+            Some(0)
+        );
+    });
+}
+
+#[test]
+fn endpoint_transport_async_sender_does_not_require_sync_sender() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_async_only_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_dfs_endpoint_async_only_remote").expect("remote");
+        let endpoint = test_endpoint(&remote, "192.0.2.15:21353");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_sender = Arc::clone(&calls);
+        let local_for_sender = local.clone();
+        let remote_for_sender = remote.clone();
+        let sender: AsyncDfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+            let calls_for_sender = Arc::clone(&calls_for_sender);
+            let endpoint_node_id = endpoint.node_id.clone();
+            let request_id = command.request_id.clone();
+            let frame = command.frame.clone();
+            let local_for_sender = local_for_sender.clone();
+            let remote_for_sender = remote_for_sender.clone();
+            Box::pin(async move {
+                calls_for_sender
+                    .lock()
+                    .expect("calls lock")
+                    .push((endpoint_node_id, frame));
+                Ok(DfsProtocolFrameResponse {
+                    request_id,
+                    outbound_frames: vec![NetworkFrame {
+                        frame_id: NetworkFrameId(101),
+                        source_node_id: remote_for_sender.clone(),
+                        target_node_id: local_for_sender.clone(),
+                        message: MeshMessage {
+                            message_id: MeshMessageId(101),
+                            origin_node_id: remote_for_sender.clone(),
+                            target_node_id: local_for_sender.clone(),
+                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                                node_id: remote_for_sender,
+                                tick: 1,
+                            }),
+                        },
+                    }],
+                })
+            })
+        });
+        let mut transport = DfsEndpointTransport::with_connect_timeout_async(
+            local.clone(),
+            vec![endpoint],
+            Duration::from_millis(1),
+            sender,
+        );
+        let frame = NetworkFrame {
+            frame_id: NetworkFrameId(7),
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(7),
+                origin_node_id: local.clone(),
+                target_node_id: remote.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: local.clone(),
+                    tick: 7,
+                }),
+            },
+        };
+
+        assert!(
+            transport
+                .send(&remote, frame.clone())
+                .expect_err("sync send should be unavailable")
+                .to_string()
+                .contains("without a sync sender")
+        );
+        AsyncDfsFrameTransport::send_async(&mut transport, &remote, frame.clone())
+            .await
+            .expect("async send frame");
+        let recorded = calls.lock().expect("calls lock");
+        assert_eq!(recorded.as_slice(), &[(remote.clone(), frame)]);
+        drop(recorded);
+        let incoming = AsyncDfsFrameTransport::drain_incoming_async(&mut transport)
+            .await
+            .expect("incoming frames");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].received_by, local);
+        assert_eq!(incoming[0].frame.source_node_id, remote);
+    });
+}
+
+#[test]
+fn endpoint_transport_dual_senders_support_sync_and_async_sends() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let local = NodeId::from_legacy_named("node_dfs_endpoint_dual_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_endpoint_dual_remote").expect("remote");
+        let endpoint = test_endpoint(&remote, "192.0.2.16:21353");
+        let sync_calls = Arc::new(Mutex::new(Vec::new()));
+        let async_calls = Arc::new(Mutex::new(Vec::new()));
+
+        let sync_calls_for_sender = Arc::clone(&sync_calls);
+        let local_for_sync = local.clone();
+        let remote_for_sync = remote.clone();
+        let sync_sender: DfsProtocolFrameSender = Arc::new(move |endpoint, command, _timeout| {
+            sync_calls_for_sender
+                .lock()
+                .expect("sync calls lock")
+                .push((endpoint.node_id.clone(), command.frame.frame_id));
+            Ok(DfsProtocolFrameResponse {
+                request_id: command.request_id.clone(),
+                outbound_frames: vec![NetworkFrame {
+                    frame_id: NetworkFrameId(201),
+                    source_node_id: remote_for_sync.clone(),
+                    target_node_id: local_for_sync.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(201),
+                        origin_node_id: remote_for_sync.clone(),
+                        target_node_id: local_for_sync.clone(),
+                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                            node_id: remote_for_sync.clone(),
+                            tick: 201,
+                        }),
+                    },
+                }],
+            })
+        });
+
+        let async_calls_for_sender = Arc::clone(&async_calls);
+        let local_for_async = local.clone();
+        let remote_for_async = remote.clone();
+        let async_sender: AsyncDfsProtocolFrameSender =
+            Arc::new(move |endpoint, command, _timeout| {
+                let async_calls_for_sender = Arc::clone(&async_calls_for_sender);
+                let endpoint_node_id = endpoint.node_id.clone();
+                let request_id = command.request_id.clone();
+                let frame_id = command.frame.frame_id;
+                let local_for_async = local_for_async.clone();
+                let remote_for_async = remote_for_async.clone();
+                Box::pin(async move {
+                    async_calls_for_sender
+                        .lock()
+                        .expect("async calls lock")
+                        .push((endpoint_node_id, frame_id));
+                    Ok(DfsProtocolFrameResponse {
+                        request_id,
+                        outbound_frames: vec![NetworkFrame {
+                            frame_id: NetworkFrameId(301),
+                            source_node_id: remote_for_async.clone(),
+                            target_node_id: local_for_async.clone(),
+                            message: MeshMessage {
+                                message_id: MeshMessageId(301),
+                                origin_node_id: remote_for_async.clone(),
+                                target_node_id: local_for_async.clone(),
+                                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                                    node_id: remote_for_async.clone(),
+                                    tick: 301,
+                                }),
+                            },
+                        }],
+                    })
+                })
+            });
+
+        let mut transport = DfsEndpointTransport::with_connect_timeout_and_senders(
+            local.clone(),
+            vec![endpoint],
+            Duration::from_millis(1),
+            sync_sender,
+            async_sender,
+        );
+        let sync_frame = NetworkFrame {
+            frame_id: NetworkFrameId(11),
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(11),
+                origin_node_id: local.clone(),
+                target_node_id: remote.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: local.clone(),
+                    tick: 11,
+                }),
+            },
+        };
+        transport
+            .send(&remote, sync_frame)
+            .expect("sync send frame");
+        assert_eq!(
+            sync_calls.lock().expect("sync calls lock").as_slice(),
+            &[(remote.clone(), NetworkFrameId(11))]
+        );
+        assert!(async_calls.lock().expect("async calls lock").is_empty());
+        let incoming = transport.drain_incoming().expect("sync incoming frames");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].received_by, local);
+        assert_eq!(incoming[0].frame.source_node_id, remote);
+
+        let async_frame = NetworkFrame {
+            frame_id: NetworkFrameId(12),
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            message: MeshMessage {
+                message_id: MeshMessageId(12),
+                origin_node_id: local.clone(),
+                target_node_id: remote.clone(),
+                body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                    node_id: local.clone(),
+                    tick: 12,
+                }),
+            },
+        };
+        AsyncDfsFrameTransport::send_async(&mut transport, &remote, async_frame)
+            .await
+            .expect("async send frame");
+        assert_eq!(
+            async_calls.lock().expect("async calls lock").as_slice(),
+            &[(remote.clone(), NetworkFrameId(12))]
+        );
+        let incoming = AsyncDfsFrameTransport::drain_incoming_async(&mut transport)
+            .await
+            .expect("async incoming frames");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].received_by, local);
+        assert_eq!(incoming[0].frame.source_node_id, remote);
+    });
 }
 
 #[test]
@@ -679,7 +1107,7 @@ fn endpoint_transport_relays_remote_returned_frames_preserving_source() {
             outbound_frames: Vec::new(),
         })
     });
-    let mut transport = DfsEndpointTransport::with_timeout(
+    let mut transport = DfsEndpointTransport::with_connect_timeout(
         local.clone(),
         vec![primary_endpoint, replica_endpoint],
         Duration::from_millis(1),
@@ -766,7 +1194,7 @@ fn endpoint_transport_completes_synchronous_replica_write() {
             }],
         })
     });
-    let transport = DfsEndpointTransport::with_timeout(
+    let transport = DfsEndpointTransport::with_connect_timeout(
         local.clone(),
         vec![endpoint],
         Duration::from_millis(1),
@@ -850,6 +1278,72 @@ impl DfsMetadataJournalReplicationTransport for ApplyingMetadataJournalTransport
         self.snapshot_installs += 1;
         Err(DfsMetadataJournalReplicationTransportError::Failed {
             reason: "unexpected snapshot install".to_string(),
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SequenceConflictMetadataJournalTransport {
+    target_node_id: NodeId,
+    batches: usize,
+    snapshot_installs: usize,
+}
+
+impl SequenceConflictMetadataJournalTransport {
+    fn new(target_node_id: NodeId) -> Self {
+        Self {
+            target_node_id,
+            batches: 0,
+            snapshot_installs: 0,
+        }
+    }
+}
+
+impl DfsMetadataJournalReplicationTransport for SequenceConflictMetadataJournalTransport {
+    fn has_metadata_replication_route(&self, target_node_id: &NodeId) -> bool {
+        target_node_id == &self.target_node_id
+    }
+
+    fn send_metadata_journal_batch(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataJournalBatchCommand,
+        _timeout: Duration,
+    ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError> {
+        if !self.has_metadata_replication_route(target_node_id) {
+            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+        }
+        self.batches += 1;
+        Ok(DfsMetadataJournalBatchResponse {
+            request_id: command.request_id.clone(),
+            shard_id: command.batch.shard_id.clone(),
+            next_after_sequence: command.batch.next_after_sequence,
+            applied_entries: 0,
+            result: DfsMetadataJournalBatchResult::Rejected {
+                reason: "metadata journal sequence 1 already exists with a different entry"
+                    .to_string(),
+            },
+        })
+    }
+
+    fn send_metadata_snapshot_install(
+        &mut self,
+        target_node_id: &NodeId,
+        command: &DfsMetadataSnapshotInstallCommand,
+        _timeout: Duration,
+    ) -> Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>
+    {
+        if !self.has_metadata_replication_route(target_node_id) {
+            return Err(DfsMetadataJournalReplicationTransportError::MissingEndpoint);
+        }
+        self.snapshot_installs += 1;
+        Ok(DfsMetadataSnapshotInstallResponse {
+            request_id: command.request_id.clone(),
+            shard_id: command.shard_id.clone(),
+            next_after_sequence: command.next_after_sequence,
+            result: DfsMetadataSnapshotInstallResult::Installed {
+                archived_existing: true,
+            },
         })
     }
 }
@@ -1117,6 +1611,130 @@ fn temp_root(name: &str) -> PathBuf {
 }
 
 #[test]
+fn networked_dfs_builds_protocol_frames_without_transport_send() {
+    let root = temp_root("networked-dfs-builds-protocol-frames");
+    let local = NodeId::from_legacy_named("node_build_frame_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_build_frame_remote").expect("remote");
+    let object_id = DfsObjectId::from_legacy_named("obj_build_frame").expect("object");
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let mut dfs = NetworkedDfsService::new(ReceiveOnlyTransport::new(local.clone()), content);
+
+    let first = dfs
+        .next_dfs_network_frame(
+            &remote,
+            DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "read-1".to_string(),
+                object_id: object_id.clone(),
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
+            }),
+        )
+        .expect("first frame");
+
+    assert_eq!(first.frame_id, NetworkFrameId(1));
+    assert_eq!(first.source_node_id, local);
+    assert_eq!(first.target_node_id, remote);
+    assert_eq!(first.message.message_id, MeshMessageId(1));
+    assert_eq!(first.message.origin_node_id, first.source_node_id);
+    assert_eq!(first.message.target_node_id, first.target_node_id);
+    let MeshMessageBody::Protocol(protocol) = &first.message.body else {
+        panic!("expected DFS protocol frame");
+    };
+    assert_eq!(protocol.protocol, DFS_PROTOCOL);
+    match protocol
+        .decode::<DfsNetworkMessage>()
+        .expect("decode DFS payload")
+    {
+        DfsNetworkMessage::ReadRequest(request) => {
+            assert_eq!(request.request_id, "read-1");
+            assert_eq!(request.object_id, object_id);
+        }
+        other => panic!("unexpected DFS payload: {other:?}"),
+    }
+
+    let second = dfs
+        .next_dfs_network_frame(
+            &first.target_node_id.clone(),
+            DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                request_id: "read-2".to_string(),
+                object_id: DfsObjectId::from_legacy_named("obj_build_frame_second")
+                    .expect("object"),
+                range_offset: None,
+                range_max_bytes: None,
+                start_chunk_index: 0,
+                max_chunks: 0,
+            }),
+        )
+        .expect("second frame");
+    assert_eq!(second.frame_id, NetworkFrameId(2));
+    assert_eq!(second.message.message_id, MeshMessageId(2));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn networked_dfs_async_send_uses_shared_protocol_frame_path() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let root = temp_root("networked-dfs-async-send-shared-frame");
+        let network = AsyncInProcessNetwork::new();
+        let local = NodeId::from_legacy_named("node_async_frame_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_async_frame_remote").expect("remote");
+        let object_id = DfsObjectId::from_legacy_named("obj_async_frame").expect("object");
+        let content = LocalContentStore::new(root.join("content")).expect("content");
+        let mut dfs = NetworkedDfsService::new(network.add_node(local.clone()), content);
+        let mut remote_transport = network.add_node(remote.clone());
+
+        let sent = dfs
+            .send_dfs_message_if_routable_async(
+                &remote,
+                DfsNetworkMessage::ReadRequest(DfsReadRequest {
+                    request_id: "async-read-1".to_string(),
+                    object_id: object_id.clone(),
+                    range_offset: None,
+                    range_max_bytes: None,
+                    start_chunk_index: 0,
+                    max_chunks: 0,
+                }),
+            )
+            .await
+            .expect("async send");
+
+        assert!(sent);
+        let inbound = AsyncDfsFrameTransport::drain_incoming_async(&mut remote_transport)
+            .await
+            .expect("drain remote");
+        assert_eq!(inbound.len(), 1);
+        let frame = &inbound[0].frame;
+        assert_eq!(frame.frame_id, NetworkFrameId(1));
+        assert_eq!(frame.source_node_id, local);
+        assert_eq!(frame.target_node_id, remote);
+        assert_eq!(frame.message.message_id, MeshMessageId(1));
+        let MeshMessageBody::Protocol(protocol) = &frame.message.body else {
+            panic!("expected DFS protocol frame");
+        };
+        assert_eq!(protocol.protocol, DFS_PROTOCOL);
+        match protocol
+            .decode::<DfsNetworkMessage>()
+            .expect("decode DFS payload")
+        {
+            DfsNetworkMessage::ReadRequest(request) => {
+                assert_eq!(request.request_id, "async-read-1");
+                assert_eq!(request.object_id, object_id);
+            }
+            other => panic!("unexpected DFS payload: {other:?}"),
+        }
+
+        std::fs::remove_dir_all(root).ok();
+    });
+}
+
+#[test]
 fn protocol_frame_processor_rejects_wrong_target_node() {
     let root = temp_root("protocol_frame_wrong_target");
     let local = NodeId::from_legacy_named("node_protocol_frame_local").expect("local");
@@ -1260,20 +1878,6 @@ fn cluster_protocol_frame_handler_returns_none_without_cluster_state() {
     assert!(errors.is_empty());
     assert!(peer.calls.lock().expect("calls").is_empty());
 
-    let scheduled = schedule_cluster_dfs_protocol_frame_command_metadata_publish(
-        data_dir.clone(),
-        cluster_paths.clone(),
-        command,
-        peer.clone(),
-        None,
-        DfsMetadataPublishScheduleOptions::default(),
-        DfsMetadataJournalReplicationOptions::default(),
-        |_report| panic!("orphan protocol frame must not publish metadata"),
-        |_error| panic!("orphan protocol frame must not publish metadata"),
-    )
-    .expect("schedule handler");
-
-    assert!(scheduled.is_none());
     assert!(peer.calls.lock().expect("calls").is_empty());
     std::fs::remove_dir_all(root).ok();
 }
@@ -1735,7 +2339,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         "pk-replica",
         now,
     );
-    sinomo_network::apply_cluster_raft_role(
+    sinomo_node::apply_cluster_raft_role(
         &mut replica_member,
         sinomo_core::ClusterMemberRole::Voter,
         now,
@@ -1758,7 +2362,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    sinomo_network::append_cluster_raft_command(
+    append_cluster_raft_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -1863,7 +2467,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         "pk-replica",
         now,
     );
-    sinomo_network::apply_cluster_raft_role(
+    sinomo_node::apply_cluster_raft_role(
         &mut replica_member,
         sinomo_core::ClusterMemberRole::Voter,
         now,
@@ -1886,7 +2490,7 @@ fn cluster_smoke_opens_service_and_publishes_metadata() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    sinomo_network::append_cluster_raft_command(
+    append_cluster_raft_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -2516,7 +3120,7 @@ fn metadata_replication_cursor_advances_only_after_replica_ack() {
     );
 
     assert_eq!(
-        NetworkTransport::drain_incoming(&mut drop_replica_mailbox)
+        DfsFrameTransport::drain_incoming(&mut drop_replica_mailbox)
             .expect("drop first batch")
             .len(),
         1,
@@ -2867,17 +3471,23 @@ fn dfs_metadata_publish_scheduler_skips_read_only_events() {
         source_node_id: node,
         content_hash,
     }];
-    let start = schedule_dfs_metadata_publish_after_events(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let start = schedule_dfs_metadata_publish_after_events_async_on_runtime(
         scheduler,
+        runtime.handle().clone(),
         &events,
         DfsMetadataPublishScheduleOptions::default(),
-        || {
-            panic!("read-only events must not schedule a metadata publish");
+        || async {
+            Err::<DfsMetadataJournalReplicationReport, String>(
+                "read-only events must not schedule a metadata publish".to_string(),
+            )
         },
         |_report| {},
         |_error| {},
-    )
-    .expect("schedule skip");
+    );
     assert_eq!(start, None);
 }
 
@@ -2897,16 +3507,22 @@ fn default_dfs_metadata_publish_scheduler_skips_read_only_events() {
         source_node_id: node,
         content_hash,
     }];
-    let start = schedule_default_dfs_metadata_publish_after_events(
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let start = schedule_default_dfs_metadata_publish_after_events_async_on_runtime(
+        runtime.handle().clone(),
         &events,
         DfsMetadataPublishScheduleOptions::default(),
-        || {
-            panic!("read-only events must not schedule a metadata publish");
+        || async {
+            Err::<DfsMetadataJournalReplicationReport, String>(
+                "read-only events must not schedule a metadata publish".to_string(),
+            )
         },
         |_report| {},
         |_error| {},
-    )
-    .expect("default schedule skip");
+    );
     assert_eq!(start, None);
 }
 
@@ -3102,10 +3718,21 @@ fn dfs_maintenance_tick_observations_summarize_actionable_report() {
 }
 
 #[test]
-fn metadata_publish_scheduler_retries_incomplete_reports() {
+fn metadata_publish_scheduler_on_runtime_retries_incomplete_reports() {
     let scheduler = Box::leak(Box::new(DfsMetadataPublishScheduler::new()));
-    let node = NodeId::from_legacy_named("node_dfs_publish_scheduler").expect("node");
+    let node = NodeId::from_legacy_named("node_dfs_publish_scheduler_runtime").expect("node");
     let shard_id = DfsMetadataShardId::new("root");
+    let object_id =
+        DfsObjectId::from_legacy_named("obj_dfs_publish_scheduler_runtime").expect("object");
+    let version =
+        DfsVersion::from_legacy_named("version_dfs_publish_scheduler_runtime").expect("version");
+    let events = [NetworkedDfsServiceEvent::VersionCommitted {
+        intent_id: "intent_publish_scheduler_runtime".to_string(),
+        object_id,
+        version,
+        content_hash: "blake3:5555555555555555555555555555555555555555555555555555555555555555"
+            .to_string(),
+    }];
     let attempts = Arc::new(Mutex::new(0usize));
     let reports = Arc::new(Mutex::new(Vec::new()));
     let errors = Arc::new(Mutex::new(Vec::new()));
@@ -3114,52 +3741,58 @@ fn metadata_publish_scheduler_retries_incomplete_reports() {
     let shard_for_publish = shard_id.clone();
     let reports_for_callback = Arc::clone(&reports);
     let errors_for_callback = Arc::clone(&errors);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
 
-    let start = scheduler
-        .request_publish(
-            DfsMetadataPublishScheduleOptions {
-                max_retry_rounds: 1,
-                retry_delay: Duration::from_millis(1),
-                thread_name: "sinomo-dfs-metadata-publish-test".to_string(),
-            },
-            move || {
-                let mut attempts = attempts_for_publish.lock().expect("attempt lock");
-                *attempts += 1;
-                let outcomes = if *attempts == 1 {
-                    vec![DfsMetadataJournalReplicationOutcome::Failed {
-                        target_node_id: node_for_publish.clone(),
-                        shard_id: shard_for_publish.clone(),
-                        reason: "simulated transient failure".to_string(),
-                    }]
-                } else {
-                    vec![DfsMetadataJournalReplicationOutcome::NoChanges {
-                        target_node_id: node_for_publish.clone(),
-                        shard_id: shard_for_publish.clone(),
-                        after_sequence: 1,
-                    }]
-                };
-                Ok(DfsMetadataJournalReplicationReport { outcomes })
-            },
-            move |report| {
-                reports_for_callback
-                    .lock()
-                    .expect("reports lock")
-                    .push(report);
-            },
-            move |error| {
-                errors_for_callback.lock().expect("errors lock").push(error);
-            },
-        )
-        .expect("schedule publish");
+    let start = schedule_dfs_metadata_publish_after_events_async_on_runtime(
+        scheduler,
+        runtime.handle().clone(),
+        &events,
+        DfsMetadataPublishScheduleOptions {
+            max_retry_rounds: 1,
+            retry_delay: Duration::from_millis(1),
+        },
+        move || {
+            let mut attempts = attempts_for_publish.lock().expect("attempt lock");
+            *attempts += 1;
+            let outcomes = if *attempts == 1 {
+                vec![DfsMetadataJournalReplicationOutcome::Failed {
+                    target_node_id: node_for_publish.clone(),
+                    shard_id: shard_for_publish.clone(),
+                    reason: "simulated transient runtime failure".to_string(),
+                }]
+            } else {
+                vec![DfsMetadataJournalReplicationOutcome::NoChanges {
+                    target_node_id: node_for_publish.clone(),
+                    shard_id: shard_for_publish.clone(),
+                    after_sequence: 1,
+                }]
+            };
+            async move { Ok(DfsMetadataJournalReplicationReport { outcomes }) }
+        },
+        move |report| {
+            reports_for_callback
+                .lock()
+                .expect("reports lock")
+                .push(report);
+        },
+        move |error| {
+            errors_for_callback.lock().expect("errors lock").push(error);
+        },
+    );
 
-    assert_eq!(start, DfsMetadataPublishScheduleStart::Started);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if reports.lock().expect("reports lock").len() >= 2 {
-            break;
+    assert_eq!(start, Some(DfsMetadataPublishScheduleStart::Started));
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if reports.lock().expect("reports lock").len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    });
 
     assert_eq!(*attempts.lock().expect("attempt lock"), 2);
     assert!(errors.lock().expect("errors lock").is_empty());
@@ -3223,6 +3856,56 @@ fn metadata_journal_replication_helper_advances_backend_cursor_after_apply() {
     };
     assert_eq!(transport.batches, 1);
     assert_eq!(transport.snapshot_installs, 0);
+    assert_eq!(
+        backend
+            .metadata_replication_cursor(&replica, &shard_id)
+            .expect("replication cursor"),
+        next_after_sequence
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn metadata_journal_replication_repairs_sequence_conflict_with_snapshot() {
+    let root = temp_root("metadata-journal-helper-snapshot-repair");
+    let primary = NodeId::from_legacy_named("node_meta_snapshot_repair_primary").expect("primary");
+    let replica = NodeId::from_legacy_named("node_meta_snapshot_repair_replica").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(primary.clone());
+    let mut backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.join("metadata"))
+        .expect("metadata backend");
+    backend
+        .put_file_system(&file_system)
+        .expect("filesystem metadata");
+
+    let mut transport = SequenceConflictMetadataJournalTransport::new(replica.clone());
+    let outcomes = replicate_dfs_metadata_shard_to_target(
+        &mut backend,
+        &primary,
+        &replica,
+        &shard_id,
+        0,
+        &mut transport,
+        DfsMetadataJournalReplicationOptions {
+            max_batches_per_target: 1,
+            ..DfsMetadataJournalReplicationOptions::default()
+        },
+    )
+    .expect("replicate metadata journal with snapshot repair");
+
+    let next_after_sequence = backend.journal_last_sequence();
+    assert_eq!(transport.batches, 1);
+    assert_eq!(transport.snapshot_installs, 1);
+    assert_eq!(
+        outcomes,
+        vec![DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+            target_node_id: replica.clone(),
+            shard_id: shard_id.clone(),
+            next_after_sequence,
+            archived_existing: true,
+        }]
+    );
     assert_eq!(
         backend
             .metadata_replication_cursor(&replica, &shard_id)
@@ -3348,7 +4031,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         "pk-replica",
         now,
     );
-    sinomo_network::apply_cluster_raft_role(
+    sinomo_node::apply_cluster_raft_role(
         &mut replica_member,
         sinomo_core::ClusterMemberRole::Voter,
         now,
@@ -3371,7 +4054,7 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         assignment: DfsMetadataShardAssignment::Root,
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
-    sinomo_network::append_cluster_raft_command(
+    append_cluster_raft_command(
         &cluster_paths,
         &local,
         sinomo_kv::KvCommand::Op(
@@ -3445,6 +4128,318 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
     );
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn scheduled_cluster_metadata_publish_uses_async_peer_transport() {
+    let root = temp_root("scheduled-cluster-metadata-publish-async-peer");
+    let data_dir = SinomoDataDir::new(&root);
+    data_dir.ensure_root_layout().expect("root layout");
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        sinomo_network::ClusterId::from_legacy_named("cluster_dfs_scheduled_async_publish")
+            .expect("cluster");
+    let local = NodeId::from_legacy_named("node_dfs_scheduled_async_local").expect("local");
+    let replica = NodeId::from_legacy_named("node_dfs_scheduled_async_replica").expect("replica");
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "scheduled DFS metadata publish",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+        cluster_id.clone(),
+        replica.clone(),
+        "replica",
+        "pk-replica",
+        now,
+    );
+    sinomo_node::apply_cluster_raft_role(
+        &mut replica_member,
+        sinomo_core::ClusterMemberRole::Voter,
+        now,
+    );
+    replica_member
+        .endpoints
+        .push(test_endpoint(&replica, "10.77.0.3:21353"));
+    state.members.push(replica_member);
+    sinomo_network::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+    sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+        .expect("cluster raft state");
+
+    let file_system = distributed_sifs(local.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: local.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    append_cluster_raft_command(
+        &cluster_paths,
+        &local,
+        sinomo_kv::KvCommand::Op(
+            sinomo_kv::KvOp::put_serde(
+                metadata_shard_key(&file_system.file_system_id, "root"),
+                &shard,
+                None,
+            )
+            .expect("shard op"),
+        ),
+    )
+    .expect("write shard config");
+
+    let mut backend = LocalSobjMetadataBackend::new(
+        DfsMetadataShardId::new("root"),
+        data_dir.dfs_dir().join("metadata").join("root"),
+    )
+    .expect("metadata backend");
+    backend.put_file_system(&file_system).expect("filesystem");
+    let mut object = file_metadata(local.clone());
+    object.object_id =
+        DfsObjectId::from_legacy_named("obj_dfs_scheduled_async_publish").expect("object");
+    object.file_system_id = file_system.file_system_id.clone();
+    object.path = "/services/metadata/scheduled-async-publish.txt".to_string();
+    object.policy = DfsObjectPolicy::ReplicatedEventual;
+    backend.put_object(&object).expect("object");
+    drop(backend);
+
+    let event_object_id =
+        DfsObjectId::from_legacy_named("obj_dfs_scheduled_async_event").expect("event object");
+    let event_version =
+        DfsVersion::from_legacy_named("version_dfs_scheduled_async_event").expect("event version");
+    let events = [NetworkedDfsServiceEvent::VersionCommitted {
+        intent_id: "intent_dfs_scheduled_async_publish".to_string(),
+        object_id: event_object_id,
+        version: event_version,
+        content_hash: "blake3:6666666666666666666666666666666666666666666666666666666666666666"
+            .to_string(),
+    }];
+    let peer = Arc::new(RecordingPeerTransport::default());
+    let reports = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let reports_for_callback = Arc::clone(&reports);
+    let errors_for_callback = Arc::clone(&errors);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()
+        .expect("runtime");
+
+    let start =
+        schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime(
+            runtime.handle().clone(),
+            data_dir.clone(),
+            cluster_paths.clone(),
+            recording_async_peer_transport(peer.clone()),
+            &events,
+            DfsMetadataPublishScheduleOptions {
+                max_retry_rounds: 0,
+                retry_delay: Duration::from_millis(1),
+            },
+            DfsMetadataJournalReplicationOptions::default(),
+            move |report| reports_for_callback.lock().expect("reports").push(report),
+            move |error| errors_for_callback.lock().expect("errors").push(error),
+        );
+
+    assert_eq!(start, Some(DfsMetadataPublishScheduleStart::Started));
+    runtime.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if !reports.lock().expect("reports").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+
+    assert!(errors.lock().expect("errors").is_empty());
+    let calls = peer.calls.lock().expect("calls");
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].starts_with("journal:10.77.0.3:21353:dfs_meta_"));
+    assert!(calls[0].ends_with("_2"));
+    drop(calls);
+    assert_eq!(
+        reports.lock().expect("reports").as_slice(),
+        &[DfsMetadataJournalReplicationReport {
+            outcomes: vec![DfsMetadataJournalReplicationOutcome::Applied {
+                target_node_id: replica,
+                shard_id: DfsMetadataShardId::new("root"),
+                entries: 2,
+                next_after_sequence: 2,
+            }],
+        }]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let root = temp_root("async-cluster-metadata-publish-snapshot-repair");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_network::ClusterId::from_legacy_named("cluster_dfs_async_snapshot_repair")
+                .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_async_snapshot_local").expect("local");
+        let replica =
+            NodeId::from_legacy_named("node_dfs_async_snapshot_replica").expect("replica");
+        let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "async DFS metadata snapshot repair",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut replica_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            replica.clone(),
+            "replica",
+            "pk-replica",
+            now,
+        );
+        sinomo_node::apply_cluster_raft_role(
+            &mut replica_member,
+            sinomo_core::ClusterMemberRole::Voter,
+            now,
+        );
+        replica_member
+            .endpoints
+            .push(test_endpoint(&replica, "10.77.0.4:21353"));
+        state.members.push(replica_member);
+        sinomo_network::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+            .expect("cluster raft state");
+
+        let file_system = distributed_sifs(local.clone());
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![replica.clone()],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        append_cluster_raft_command(
+            &cluster_paths,
+            &local,
+            sinomo_kv::KvCommand::Op(
+                sinomo_kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("shard op"),
+            ),
+        )
+        .expect("write shard config");
+
+        let mut backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend");
+        backend.put_file_system(&file_system).expect("filesystem");
+        drop(backend);
+
+        let journal_attempts = Arc::new(Mutex::new(0usize));
+        let journal_attempts_for_sender = Arc::clone(&journal_attempts);
+        let sender: AsyncDfsMetadataJournalBatchSender =
+            Arc::new(move |_endpoint, command, _timeout| {
+                let journal_attempts = Arc::clone(&journal_attempts_for_sender);
+                Box::pin(async move {
+                    *journal_attempts.lock().expect("journal attempts") += 1;
+                    Ok(DfsMetadataJournalBatchResponse {
+                        request_id: command.request_id.clone(),
+                        shard_id: command.batch.shard_id.clone(),
+                        next_after_sequence: command.batch.next_after_sequence,
+                        applied_entries: 0,
+                        result: DfsMetadataJournalBatchResult::Rejected {
+                            reason:
+                                "metadata journal sequence 1 already exists with a different entry"
+                                    .to_string(),
+                        },
+                    })
+                })
+            });
+        let snapshot_installs = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_installs_for_sender = Arc::clone(&snapshot_installs);
+        let snapshot_sender: AsyncDfsMetadataSnapshotInstallSender =
+            Arc::new(move |endpoint, command, _timeout| {
+                let snapshot_installs = Arc::clone(&snapshot_installs_for_sender);
+                Box::pin(async move {
+                    snapshot_installs
+                        .lock()
+                        .expect("snapshot installs")
+                        .push((endpoint.address.clone(), command.next_after_sequence));
+                    Ok(DfsMetadataSnapshotInstallResponse {
+                        request_id: command.request_id.clone(),
+                        shard_id: command.shard_id.clone(),
+                        next_after_sequence: command.next_after_sequence,
+                        result: DfsMetadataSnapshotInstallResult::Installed {
+                            archived_existing: true,
+                        },
+                    })
+                })
+            });
+
+        let report = publish_cluster_dfs_metadata_journal_async(
+            &data_dir,
+            &cluster_paths,
+            sender,
+            snapshot_sender,
+            DfsMetadataJournalReplicationOptions::default(),
+        )
+        .await
+        .expect("publish metadata");
+
+        assert_eq!(*journal_attempts.lock().expect("journal attempts"), 1);
+        assert_eq!(
+            snapshot_installs
+                .lock()
+                .expect("snapshot installs")
+                .as_slice(),
+            &[("10.77.0.4:21353".to_string(), 1)]
+        );
+        assert_eq!(
+            report.outcomes,
+            vec![DfsMetadataJournalReplicationOutcome::SnapshotInstalled {
+                target_node_id: replica.clone(),
+                shard_id: DfsMetadataShardId::new("root"),
+                next_after_sequence: 1,
+                archived_existing: true,
+            }]
+        );
+        let backend = LocalSobjMetadataBackend::new(
+            DfsMetadataShardId::new("root"),
+            data_dir.dfs_dir().join("metadata").join("root"),
+        )
+        .expect("metadata backend");
+        assert_eq!(
+            backend
+                .metadata_replication_cursor(&replica, &DfsMetadataShardId::new("root"))
+                .expect("replication cursor"),
+            1
+        );
+
+        std::fs::remove_dir_all(root).ok();
+    });
 }
 
 #[test]
@@ -3562,6 +4557,137 @@ fn metadata_endpoint_transport_retries_mismatched_journal_response() {
         command.batch.next_after_sequence
     );
     assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+}
+
+#[test]
+fn async_metadata_endpoint_transport_retries_mismatched_journal_response() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let target =
+            NodeId::from_legacy_named("node_async_meta_endpoint_mismatch_target").expect("target");
+        let endpoints = vec![
+            test_endpoint(&target, "10.72.0.1:21353"),
+            test_endpoint(&target, "10.72.0.2:21353"),
+        ];
+        let attempts = Arc::new(Mutex::new(0usize));
+        let attempts_for_sender = Arc::clone(&attempts);
+        let sender: AsyncDfsMetadataJournalBatchSender =
+            Arc::new(move |_endpoint, command, _timeout| {
+                let attempts = Arc::clone(&attempts_for_sender);
+                Box::pin(async move {
+                    let mut attempts = attempts.lock().expect("attempts lock");
+                    *attempts += 1;
+                    Ok(DfsMetadataJournalBatchResponse {
+                        request_id: command.request_id.clone(),
+                        shard_id: command.batch.shard_id.clone(),
+                        next_after_sequence: if *attempts == 1 {
+                            command.batch.next_after_sequence + 1
+                        } else {
+                            command.batch.next_after_sequence
+                        },
+                        applied_entries: command.batch.entries.len(),
+                        result: DfsMetadataJournalBatchResult::Applied,
+                    })
+                })
+            });
+        let snapshot_sender: AsyncDfsMetadataSnapshotInstallSender =
+            Arc::new(move |_endpoint, command, _timeout| {
+                Box::pin(async move {
+                    Ok(DfsMetadataSnapshotInstallResponse {
+                        request_id: command.request_id.clone(),
+                        shard_id: command.shard_id.clone(),
+                        next_after_sequence: command.next_after_sequence,
+                        result: DfsMetadataSnapshotInstallResult::Installed {
+                            archived_existing: false,
+                        },
+                    })
+                })
+            });
+        let mut transport =
+            AsyncDfsMetadataEndpointTransport::new(endpoints, sender, snapshot_sender);
+        let command = DfsMetadataJournalBatchCommand {
+            request_id: "async-meta-endpoint-mismatch".to_string(),
+            source_node_id: None,
+            batch: DfsMetadataJournalBatch {
+                shard_id: DfsMetadataShardId::new("root"),
+                entries: Vec::new(),
+                next_after_sequence: 7,
+            },
+        };
+
+        let response = transport
+            .send_metadata_journal_batch_async(&target, &command, Duration::from_secs(5))
+            .await
+            .expect("second endpoint should return matching response");
+
+        assert_eq!(
+            response.next_after_sequence,
+            command.batch.next_after_sequence
+        );
+        assert_eq!(*attempts.lock().expect("attempts lock"), 2);
+    });
+}
+
+#[test]
+fn async_metadata_publish_after_events_obeys_metadata_event_gate() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let reports_for_publish = Arc::clone(&reports);
+        let errors_for_publish = Arc::clone(&errors);
+        let skipped = run_dfs_metadata_publish_after_events_async(
+            &[],
+            || async {
+                Ok(DfsMetadataJournalReplicationReport {
+                    outcomes: Vec::new(),
+                })
+            },
+            move |report| reports_for_publish.lock().expect("reports").push(report),
+            move |error| errors_for_publish.lock().expect("errors").push(error),
+        )
+        .await;
+        assert!(!skipped);
+        assert!(reports.lock().expect("reports").is_empty());
+        assert!(errors.lock().expect("errors").is_empty());
+
+        let object_id = DfsObjectId::from_legacy_named("obj_async_publish_gate").expect("object");
+        let version = DfsVersion::from_legacy_named("version_async_publish_gate").expect("version");
+        let events = vec![NetworkedDfsServiceEvent::VersionCommitted {
+            intent_id: "intent_async_publish_gate".to_string(),
+            object_id,
+            version,
+            content_hash: "blake3:gate".to_string(),
+        }];
+        let reports_for_publish = Arc::clone(&reports);
+        let errors_for_publish = Arc::clone(&errors);
+        let published = run_dfs_metadata_publish_after_events_async(
+            &events,
+            || async {
+                Ok(DfsMetadataJournalReplicationReport {
+                    outcomes: vec![DfsMetadataJournalReplicationOutcome::NoChanges {
+                        target_node_id: NodeId::from_legacy_named("node_async_publish_gate_target")
+                            .expect("target"),
+                        shard_id: DfsMetadataShardId::new("root"),
+                        after_sequence: 0,
+                    }],
+                })
+            },
+            move |report| reports_for_publish.lock().expect("reports").push(report),
+            move |error| errors_for_publish.lock().expect("errors").push(error),
+        )
+        .await;
+
+        assert!(published);
+        assert_eq!(reports.lock().expect("reports").len(), 1);
+        assert!(errors.lock().expect("errors").is_empty());
+    });
 }
 
 #[test]

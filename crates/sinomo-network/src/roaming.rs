@@ -1,4 +1,5 @@
 use crate::error::NetworkError;
+use crate::object::DaemonRpcTimeouts;
 use crate::peer::{EndpointCandidateStatus, PeerEndpointCandidate};
 use crate::prelude::*;
 use crate::storage::{ClusterPaths, read_object_file, write_object_file};
@@ -6,12 +7,10 @@ use crate::storage::{ClusterPaths, read_object_file, write_object_file};
 use crate::storage::{read_optional_object_file, write_object_file_create_new_serialized};
 #[cfg(feature = "iroh-transport")]
 use fs2::FileExt;
-#[cfg(feature = "iroh-transport")]
-use std::io::Write;
 
 pub const WEBRTC_SIGNALING_PROTOCOL: &str = "sinomo.webrtc-signaling.v1";
 pub const IROH_ROAMING_PROTOCOL: &str = "sinomo.iroh-roaming.v1";
-pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = 128 * 1024 * 1024;
+pub const IROH_DAEMON_COMMAND_MAX_BYTES: usize = crate::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 pub const IROH_DAEMON_ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const SINOMO_IROH_RELAY_URLS_ENV: &str = "SINOMO_IROH_RELAY_URLS";
 #[cfg(any(feature = "iroh-transport", test))]
@@ -41,16 +40,12 @@ pub(crate) const IROH_DAEMON_PROXY_MAX_CONNECTIONS: usize = 128;
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS: usize = 512;
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const IROH_DAEMON_PROXY_COMMAND_BUDGET_BYTES: usize =
+    IROH_DAEMON_COMMAND_MAX_BYTES.saturating_add(12);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) const IROH_DAEMON_PROXY_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) const MAX_DAEMON_CONTROL_DNS_WORKERS: usize = 8;
-#[cfg(any(feature = "iroh-transport", test))]
-static DAEMON_CONTROL_DNS_WORKERS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
 const SINOMO_DEFAULT_IROH_RELAY_URLS: &[&str] = &[
     "https://use1-1.relay.n0.iroh-canary.iroh.link./",
     "https://usw1-1.relay.n0.iroh-canary.iroh.link./",
@@ -274,6 +269,51 @@ impl IrohEndpointRecord {
             },
             priority: 90,
             last_observed_latency_ms: None,
+        }
+    }
+}
+
+pub struct IrohDaemonProxyHandle {
+    record: IrohEndpointRecord,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl IrohDaemonProxyHandle {
+    pub fn endpoint_record(&self) -> &IrohEndpointRecord {
+        &self.record
+    }
+
+    pub fn endpoint(&self) -> ClusterEndpointRecord {
+        self.record.endpoint()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
+    }
+
+    pub fn abort(&self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+    }
+
+    pub async fn join(mut self) -> Result<(), NetworkError> {
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        task.await.map_err(|source| NetworkError::Io {
+            operation: "iroh daemon proxy supervisor".to_string(),
+            detail: source.to_string(),
+        })
+    }
+}
+
+impl Drop for IrohDaemonProxyHandle {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
         }
     }
 }
@@ -524,6 +564,47 @@ pub fn load_or_create_iroh_secret_key(
     })
 }
 
+async fn spawn_roaming_disk_task_on_runtime<T, F>(
+    runtime: &tokio::runtime::Handle,
+    operation: &'static str,
+    task: F,
+) -> Result<T, NetworkError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, NetworkError> + Send + 'static,
+{
+    runtime
+        .spawn_blocking(task)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: operation.to_string(),
+            detail: source.to_string(),
+        })?
+}
+
+#[cfg(feature = "iroh-transport")]
+pub async fn load_or_create_iroh_secret_key_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<iroh::SecretKey, NetworkError> {
+    let paths = paths.clone();
+    let node_id = node_id.clone();
+    spawn_roaming_disk_task_on_runtime(runtime, "load iroh secret key", move || {
+        load_or_create_iroh_secret_key(&paths, &node_id)
+    })
+    .await
+}
+
+#[cfg(not(feature = "iroh-transport"))]
+pub async fn load_or_create_iroh_secret_key_async(
+    _runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<(), NetworkError> {
+    load_or_create_iroh_secret_key(paths, node_id)
+}
+
 #[cfg(feature = "iroh-transport")]
 pub fn iroh_public_key_for_node(
     paths: &ClusterPaths,
@@ -545,6 +626,27 @@ pub fn iroh_public_key_for_node(
     })
 }
 
+pub async fn iroh_public_key_for_node_async(
+    _runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<String, NetworkError> {
+    #[cfg(feature = "iroh-transport")]
+    {
+        return Ok(
+            load_or_create_iroh_secret_key_async(_runtime, paths, node_id)
+                .await?
+                .public()
+                .to_string(),
+        );
+    }
+
+    #[cfg(not(feature = "iroh-transport"))]
+    {
+        iroh_public_key_for_node(paths, node_id)
+    }
+}
+
 pub fn read_iroh_endpoint_record(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -553,11 +655,37 @@ pub fn read_iroh_endpoint_record(
     read_object_file(&path)
 }
 
+pub async fn read_iroh_endpoint_record_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    node_id: &NodeId,
+) -> Result<IrohEndpointRecord, NetworkError> {
+    let paths = paths.clone();
+    let node_id = node_id.clone();
+    spawn_roaming_disk_task_on_runtime(runtime, "read iroh endpoint record", move || {
+        read_iroh_endpoint_record(&paths, &node_id)
+    })
+    .await
+}
+
 pub fn write_iroh_endpoint_record(
     paths: &ClusterPaths,
     record: &IrohEndpointRecord,
 ) -> Result<(), NetworkError> {
     write_object_file(&iroh_endpoint_record_path(paths, &record.node_id), record)
+}
+
+pub async fn write_iroh_endpoint_record_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    record: &IrohEndpointRecord,
+) -> Result<(), NetworkError> {
+    let paths = paths.clone();
+    let record = record.clone();
+    spawn_roaming_disk_task_on_runtime(runtime, "write iroh endpoint record", move || {
+        write_iroh_endpoint_record(&paths, &record)
+    })
+    .await
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
@@ -577,9 +705,8 @@ pub(crate) fn try_acquire_iroh_proxy_permit(
 
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) fn iroh_proxy_route_hint(payload: &[u8]) -> String {
-    let mut cursor = std::io::Cursor::new(payload);
-    let Ok(request) = crate::read_object_frame_blocking::<_, crate::DaemonControlRequest>(
-        &mut cursor,
+    let Ok(request) = crate::decode_single_object_frame_from_slice::<crate::DaemonControlRequest>(
+        payload,
         IROH_DAEMON_COMMAND_MAX_BYTES,
     ) else {
         return IROH_DAEMON_PROXY_ERROR_ROUTE.to_string();
@@ -701,7 +828,7 @@ impl Drop for IrohProxyByteBudgetPermit {
 
 #[cfg(any(feature = "iroh-transport", test))]
 fn reserve_iroh_proxy_frame(
-    len_bytes: [u8; 4],
+    len_prefix: Vec<u8>,
     body_bytes: usize,
     budget: &IrohProxyByteBudget,
 ) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
@@ -711,10 +838,10 @@ fn reserve_iroh_proxy_frame(
             max_bytes: IROH_DAEMON_COMMAND_MAX_BYTES,
         });
     }
-    let frame_bytes = body_bytes + len_bytes.len();
+    let frame_bytes = crate::object::object_frame_total_bytes(len_prefix.len(), body_bytes)?;
     let permit = budget.try_acquire(frame_bytes)?;
     let mut frame = vec![0_u8; frame_bytes];
-    frame[..len_bytes.len()].copy_from_slice(&len_bytes);
+    frame[..len_prefix.len()].copy_from_slice(&len_prefix);
     Ok((frame, permit))
 }
 
@@ -728,14 +855,13 @@ pub(crate) fn encode_iroh_proxy_error_response_frame(
         String::new(),
         crate::ObjectRpcResponse::encode_error(route, detail)?,
     );
-    let mut frame = Vec::new();
-    crate::write_object_frame_blocking(&mut frame, &response)?;
+    let frame = crate::encode_object_frame_to_vec(&response)?;
     let permit = budget.try_acquire(frame.len())?;
     Ok((frame, permit))
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn write_iroh_proxy_frame_async_with_timeout<W>(
+pub(crate) async fn write_iroh_proxy_frame_async_with_idle_timeout<W>(
     writer: &mut W,
     frame: &[u8],
     scope: &str,
@@ -744,19 +870,14 @@ pub(crate) async fn write_iroh_proxy_frame_async_with_timeout<W>(
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use tokio::io::AsyncWriteExt;
-
-    match tokio::time::timeout(timeout, writer.write_all(frame)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(source)) => Err(NetworkError::Io {
-            operation: format!("write iroh daemon {scope} frame"),
-            detail: source.to_string(),
-        }),
-        Err(_) => Err(NetworkError::Io {
-            operation: format!("write iroh daemon {scope} frame"),
-            detail: format!("timed out after {timeout:?}"),
-        }),
-    }
+    crate::object::write_all_async_frame(
+        writer,
+        frame,
+        Some(timeout),
+        "write iroh daemon proxy frame",
+        scope,
+    )
+    .await
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -770,7 +891,7 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let (frame, _permit) = encode_iroh_proxy_error_response_frame(budget, route, detail)?;
-    write_iroh_proxy_frame_async_with_timeout(
+    write_iroh_proxy_frame_async_with_idle_timeout(
         writer,
         &frame,
         "proxy error response",
@@ -796,11 +917,32 @@ where
         "length",
     )
     .await?;
-    let body_bytes = u32::from_be_bytes(len_bytes) as usize;
-    let (mut frame, permit) = reserve_iroh_proxy_frame(len_bytes, body_bytes, budget)?;
+    let mut len_prefix = len_bytes.to_vec();
+    let extended_len_bytes =
+        if u32::from_be_bytes(len_bytes) == crate::OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL {
+            let mut extended_len_bytes = [0_u8; 8];
+            read_exact_iroh_proxy_frame_async(
+                reader,
+                &mut extended_len_bytes,
+                format!("read iroh daemon {scope} frame extended length"),
+                "extended length",
+            )
+            .await?;
+            len_prefix.extend_from_slice(&extended_len_bytes);
+            Some(extended_len_bytes)
+        } else {
+            None
+        };
+    let body_bytes = crate::object::object_frame_len_from_prefix(
+        len_bytes,
+        extended_len_bytes,
+        IROH_DAEMON_COMMAND_MAX_BYTES,
+    )?;
+    let prefix_bytes = len_prefix.len();
+    let (mut frame, permit) = reserve_iroh_proxy_frame(len_prefix, body_bytes, budget)?;
     read_exact_iroh_proxy_frame_async(
         reader,
-        &mut frame[len_bytes.len()..],
+        &mut frame[prefix_bytes..],
         format!("read iroh daemon {scope} frame body"),
         "body",
     )
@@ -812,7 +954,7 @@ where
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
-pub(crate) async fn read_iroh_proxy_frame_async_with_timeout<R>(
+pub(crate) async fn read_iroh_proxy_frame_async_with_idle_timeout<R>(
     reader: &mut R,
     budget: &IrohProxyByteBudget,
     scope: &str,
@@ -821,16 +963,54 @@ pub(crate) async fn read_iroh_proxy_frame_async_with_timeout<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    match tokio::time::timeout(timeout, read_iroh_proxy_frame_async(reader, budget, scope)).await {
-        Ok(result) => result,
-        Err(_) => Err(NetworkError::Io {
-            operation: format!("read iroh daemon {scope} frame"),
-            detail: format!("timed out after {timeout:?}"),
-        }),
+    let mut len_bytes = [0_u8; 4];
+    read_exact_iroh_proxy_frame_async_with_idle_timeout(
+        reader,
+        &mut len_bytes,
+        timeout,
+        format!("read iroh daemon {scope} frame length"),
+        "length",
+    )
+    .await?;
+    let mut len_prefix = len_bytes.to_vec();
+    let extended_len_bytes =
+        if u32::from_be_bytes(len_bytes) == crate::OBJECT_FRAME_EXTENDED_LENGTH_SENTINEL {
+            let mut extended_len_bytes = [0_u8; 8];
+            read_exact_iroh_proxy_frame_async_with_idle_timeout(
+                reader,
+                &mut extended_len_bytes,
+                timeout,
+                format!("read iroh daemon {scope} frame extended length"),
+                "extended length",
+            )
+            .await?;
+            len_prefix.extend_from_slice(&extended_len_bytes);
+            Some(extended_len_bytes)
+        } else {
+            None
+        };
+    let body_bytes = crate::object::object_frame_len_from_prefix(
+        len_bytes,
+        extended_len_bytes,
+        IROH_DAEMON_COMMAND_MAX_BYTES,
+    )?;
+    let prefix_bytes = len_prefix.len();
+    let (mut frame, permit) = reserve_iroh_proxy_frame(len_prefix, body_bytes, budget)?;
+    read_exact_iroh_proxy_frame_async_with_idle_timeout(
+        reader,
+        &mut frame[prefix_bytes..],
+        timeout,
+        format!("read iroh daemon {scope} frame body"),
+        "body",
+    )
+    .await?;
+    if let Some(observer) = crate::io_observer() {
+        observer.on_net_recv(frame.len() as u64);
     }
+    Ok((frame, permit))
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(test)]
 async fn read_exact_iroh_proxy_frame_async<R>(
     reader: &mut R,
     buf: &mut [u8],
@@ -865,62 +1045,44 @@ where
     Ok(())
 }
 
-#[cfg(feature = "iroh-transport")]
-fn read_iroh_proxy_frame_blocking<R>(
-    reader: &mut R,
-    budget: &IrohProxyByteBudget,
-    scope: &str,
-) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError>
-where
-    R: std::io::Read,
-{
-    let mut len_bytes = [0_u8; 4];
-    read_exact_iroh_proxy_frame_blocking(
-        reader,
-        &mut len_bytes,
-        format!("read iroh daemon {scope} frame length"),
-        "length",
-    )?;
-    let body_bytes = u32::from_be_bytes(len_bytes) as usize;
-    let (mut frame, permit) = reserve_iroh_proxy_frame(len_bytes, body_bytes, budget)?;
-    read_exact_iroh_proxy_frame_blocking(
-        reader,
-        &mut frame[len_bytes.len()..],
-        format!("read iroh daemon {scope} frame body"),
-        "body",
-    )?;
-    if let Some(observer) = crate::io_observer() {
-        observer.on_net_recv(frame.len() as u64);
-    }
-    Ok((frame, permit))
-}
-
-#[cfg(feature = "iroh-transport")]
-fn read_exact_iroh_proxy_frame_blocking<R>(
+#[cfg(any(feature = "iroh-transport", test))]
+async fn read_exact_iroh_proxy_frame_async_with_idle_timeout<R>(
     reader: &mut R,
     buf: &mut [u8],
+    idle_timeout: Duration,
     operation: String,
     part: &'static str,
 ) -> Result<(), NetworkError>
 where
-    R: std::io::Read,
+    R: tokio::io::AsyncRead + Unpin,
 {
+    use tokio::io::AsyncReadExt;
+
     let expected = buf.len();
     let mut read = 0_usize;
     while read < expected {
-        match reader.read(&mut buf[read..]) {
-            Ok(0) => {
+        match tokio::time::timeout(idle_timeout, reader.read(&mut buf[read..])).await {
+            Ok(Ok(0)) => {
                 return Err(NetworkError::Io {
                     operation,
                     detail: iroh_proxy_frame_eof_detail(part, read, expected),
                 });
             }
-            Ok(n) => read = read.saturating_add(n),
-            Err(source) if source.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(source) => {
+            Ok(Ok(n)) => read = read.saturating_add(n),
+            Ok(Err(source)) if source.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(Err(source)) => {
                 return Err(NetworkError::Io {
                     operation,
                     detail: source.to_string(),
+                });
+            }
+            Err(_) => {
+                return Err(NetworkError::Io {
+                    operation,
+                    detail: format!(
+                        "timed out after {}ms without {part} read progress",
+                        idle_timeout.as_millis()
+                    ),
                 });
             }
         }
@@ -938,94 +1100,77 @@ fn iroh_proxy_frame_eof_detail(part: &str, read: usize, expected: usize) -> Stri
 }
 
 #[cfg(feature = "iroh-transport")]
-pub fn start_iroh_daemon_proxy(
+enum IrohDaemonProxyReady {
+    Async(tokio::sync::oneshot::Sender<Result<IrohEndpointRecord, NetworkError>>),
+}
+
+#[cfg(feature = "iroh-transport")]
+impl IrohDaemonProxyReady {
+    fn send(self, result: Result<IrohEndpointRecord, NetworkError>) {
+        match self {
+            Self::Async(sender) => {
+                let _ = sender.send(result);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+fn send_iroh_daemon_proxy_ready(
+    ready: &mut Option<IrohDaemonProxyReady>,
+    result: Result<IrohEndpointRecord, NetworkError>,
+) {
+    if let Some(sender) = ready.take() {
+        sender.send(result);
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
+pub async fn start_iroh_daemon_proxy(
+    runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
     cluster_id: ClusterId,
     node_id: NodeId,
     daemon_address: String,
-) -> Result<IrohEndpointRecord, NetworkError> {
-    let (tx, rx) = mpsc::channel();
-    thread::Builder::new()
-        .name(format!("sinomo-iroh-{}", node_id.as_str()))
-        .spawn(move || {
-            let mut first_ready = Some(tx);
-            let mut restart_failures = 0_u32;
-            loop {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(source) => {
-                        let error = NetworkError::Io {
-                            operation: "start iroh runtime".to_string(),
-                            detail: source.to_string(),
-                        };
-                        if let Some(ready) = first_ready.take() {
-                            let _ = ready.send(Err(error));
-                            return;
-                        }
-                        eprintln!("sinomo iroh daemon proxy restart failed: {error}");
-                        restart_failures = restart_failures.saturating_add(1);
-                        thread::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id));
-                        continue;
-                    }
-                };
-                let secret_key = match load_or_create_iroh_secret_key(&paths, &node_id) {
-                    Ok(secret_key) => secret_key,
-                    Err(error) => {
-                        if let Some(ready) = first_ready.take() {
-                            let _ = ready.send(Err(error));
-                            return;
-                        }
-                        eprintln!("sinomo iroh daemon proxy restart failed: {error}");
-                        runtime.shutdown_timeout(Duration::from_millis(250));
-                        restart_failures = restart_failures.saturating_add(1);
-                        thread::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id));
-                        continue;
-                    }
-                };
-                let run_started = std::time::Instant::now();
-                let result = runtime.block_on(run_iroh_daemon_proxy(
-                    paths.clone(),
-                    cluster_id.clone(),
-                    node_id.clone(),
-                    daemon_address.clone(),
-                    secret_key,
-                    first_ready.take(),
-                ));
-                runtime.shutdown_timeout(Duration::from_millis(250));
-                if let Err(error) = result {
-                    eprintln!("sinomo iroh daemon proxy stopped: {error}");
-                } else {
-                    eprintln!("sinomo iroh daemon proxy stopped");
-                }
-                if run_started.elapsed() >= IROH_DAEMON_PROXY_STABLE_RUNTIME {
-                    restart_failures = 0;
-                } else {
-                    restart_failures = restart_failures.saturating_add(1);
-                }
-                thread::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id));
-            }
-        })
-        .map_err(|source| NetworkError::Io {
-            operation: "spawn iroh daemon proxy".to_string(),
-            detail: source.to_string(),
-        })?;
-    rx.recv().map_err(|source| NetworkError::Io {
-        operation: "start iroh daemon proxy".to_string(),
-        detail: source.to_string(),
-    })?
+) -> Result<IrohDaemonProxyHandle, NetworkError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let supervisor_runtime = runtime.clone();
+    let task = runtime.spawn(run_iroh_daemon_proxy_supervisor(
+        supervisor_runtime,
+        paths,
+        cluster_id,
+        node_id,
+        daemon_address,
+        Some(IrohDaemonProxyReady::Async(tx)),
+    ));
+    let record = match rx.await {
+        Ok(Ok(record)) => record,
+        Ok(Err(error)) => {
+            task.abort();
+            return Err(error);
+        }
+        Err(source) => {
+            task.abort();
+            return Err(NetworkError::Io {
+                operation: "start iroh daemon proxy".to_string(),
+                detail: source.to_string(),
+            });
+        }
+    };
+    Ok(IrohDaemonProxyHandle {
+        record,
+        task: Some(task),
+    })
 }
 
 #[cfg(not(feature = "iroh-transport"))]
-pub fn start_iroh_daemon_proxy(
+pub async fn start_iroh_daemon_proxy(
+    _runtime: tokio::runtime::Handle,
     _paths: ClusterPaths,
     _cluster_id: ClusterId,
     _node_id: NodeId,
     _daemon_address: String,
-) -> Result<IrohEndpointRecord, NetworkError> {
+) -> Result<IrohDaemonProxyHandle, NetworkError> {
     Err(NetworkError::Io {
         operation: "start iroh daemon proxy".to_string(),
         detail: "sinomo-network was built without iroh-transport".to_string(),
@@ -1033,20 +1178,70 @@ pub fn start_iroh_daemon_proxy(
 }
 
 #[cfg(feature = "iroh-transport")]
+async fn run_iroh_daemon_proxy_supervisor(
+    runtime: tokio::runtime::Handle,
+    paths: ClusterPaths,
+    cluster_id: ClusterId,
+    node_id: NodeId,
+    daemon_address: String,
+    mut first_ready: Option<IrohDaemonProxyReady>,
+) {
+    let mut restart_failures = 0_u32;
+    loop {
+        let secret_key =
+            match load_or_create_iroh_secret_key_async(&runtime, &paths, &node_id).await {
+                Ok(secret_key) => secret_key,
+                Err(error) => {
+                    if first_ready.is_some() {
+                        send_iroh_daemon_proxy_ready(&mut first_ready, Err(error));
+                        return;
+                    }
+                    eprintln!("sinomo iroh daemon proxy restart failed: {error}");
+                    restart_failures = restart_failures.saturating_add(1);
+                    tokio::time::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id))
+                        .await;
+                    continue;
+                }
+            };
+        let run_started = std::time::Instant::now();
+        let result = run_iroh_daemon_proxy(
+            runtime.clone(),
+            paths.clone(),
+            cluster_id.clone(),
+            node_id.clone(),
+            daemon_address.clone(),
+            secret_key,
+            first_ready.take(),
+        )
+        .await;
+        if let Err(error) = result {
+            eprintln!("sinomo iroh daemon proxy stopped: {error}");
+        } else {
+            eprintln!("sinomo iroh daemon proxy stopped");
+        }
+        if run_started.elapsed() >= IROH_DAEMON_PROXY_STABLE_RUNTIME {
+            restart_failures = 0;
+        } else {
+            restart_failures = restart_failures.saturating_add(1);
+        }
+        tokio::time::sleep(iroh_daemon_proxy_restart_delay(restart_failures, &node_id)).await;
+    }
+}
+
+#[cfg(feature = "iroh-transport")]
 async fn run_iroh_daemon_proxy(
+    runtime: tokio::runtime::Handle,
     paths: ClusterPaths,
     cluster_id: ClusterId,
     node_id: NodeId,
     daemon_address: String,
     secret_key: iroh::SecretKey,
-    mut ready: Option<mpsc::Sender<Result<IrohEndpointRecord, NetworkError>>>,
+    mut ready: Option<IrohDaemonProxyReady>,
 ) -> Result<(), NetworkError> {
     let builder = match sinomo_iroh_endpoint_builder() {
         Ok(builder) => builder,
         Err(error) => {
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(error.clone()));
-            }
+            send_iroh_daemon_proxy_ready(&mut ready, Err(error.clone()));
             return Err(error);
         }
     };
@@ -1062,20 +1257,25 @@ async fn run_iroh_daemon_proxy(
                 operation: "bind iroh endpoint".to_string(),
                 detail: source.to_string(),
             };
-            if let Some(ready) = ready.take() {
-                let _ = ready.send(Err(error.clone()));
-            }
+            send_iroh_daemon_proxy_ready(&mut ready, Err(error.clone()));
             return Err(error);
         }
     };
     let _ = tokio::time::timeout(IROH_DAEMON_ONLINE_TIMEOUT, endpoint.online()).await;
     let record = iroh_endpoint_record_from_addr(&cluster_id, &node_id, endpoint.addr());
-    if let Err(error) = write_iroh_endpoint_record(&paths, &record) {
+    let persist_result = write_iroh_endpoint_record_async(&runtime, &paths, &record)
+        .await
+        .map_err(|error| match error {
+            NetworkError::Io { detail, .. } => NetworkError::Io {
+                operation: "persist iroh endpoint record".to_string(),
+                detail,
+            },
+            other => other,
+        });
+    if let Err(error) = persist_result {
         eprintln!("sinomo iroh daemon endpoint record write failed: {error}");
     }
-    if let Some(ready) = ready.take() {
-        let _ = ready.send(Ok(record));
-    }
+    send_iroh_daemon_proxy_ready(&mut ready, Ok(record));
 
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(
         IROH_DAEMON_PROXY_MAX_CONNECTIONS,
@@ -1095,7 +1295,8 @@ async fn run_iroh_daemon_proxy(
         let daemon_address = daemon_address.clone();
         let command_limiter = command_limiter.clone();
         let command_byte_budget = command_byte_budget.clone();
-        tokio::spawn(async move {
+        let connection_runtime = runtime.clone();
+        runtime.spawn(async move {
             let _connection_permit = connection_permit;
             let Ok(connection) = connecting.await else {
                 return;
@@ -1141,10 +1342,10 @@ async fn run_iroh_daemon_proxy(
                 };
                 let daemon_address = daemon_address.clone();
                 let command_byte_budget = command_byte_budget.clone();
-                tokio::spawn(async move {
+                connection_runtime.spawn(async move {
                     let _command_permit = command_permit;
                     let (request, request_budget_permit) =
-                        match read_iroh_proxy_frame_async_with_timeout(
+                        match read_iroh_proxy_frame_async_with_idle_timeout(
                             &mut recv,
                             &command_byte_budget,
                             "command request",
@@ -1173,21 +1374,13 @@ async fn run_iroh_daemon_proxy(
                         };
                     let route_hint = iroh_proxy_route_hint(&request);
                     let forward_budget = command_byte_budget.clone();
-                    let response_result = tokio::task::spawn_blocking(move || {
-                        forward_daemon_control_payload(
-                            &daemon_address,
-                            &request,
-                            IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT,
-                            &forward_budget,
-                        )
-                    })
-                    .await
-                    .unwrap_or_else(|source| {
-                        Err(NetworkError::Io {
-                            operation: "forward iroh daemon command".to_string(),
-                            detail: source.to_string(),
-                        })
-                    });
+                    let response_result = forward_daemon_control_payload_async(
+                        &daemon_address,
+                        &request,
+                        DaemonRpcTimeouts::connect_only(IROH_DAEMON_PROXY_STREAM_IO_TIMEOUT),
+                        &forward_budget,
+                    )
+                    .await;
                     let (response, response_budget_permit) = match response_result {
                         Ok(result) => result,
                         Err(error) => {
@@ -1209,7 +1402,7 @@ async fn run_iroh_daemon_proxy(
                         }
                     };
                     drop(request_budget_permit);
-                    if write_iroh_proxy_frame_async_with_timeout(
+                    if write_iroh_proxy_frame_async_with_idle_timeout(
                         &mut send,
                         &response,
                         "proxy response",
@@ -1336,31 +1529,25 @@ pub fn iroh_endpoint_record_from_address(
 }
 
 #[cfg(feature = "iroh-transport")]
-pub fn send_iroh_daemon_rpc_raw(
+async fn send_iroh_daemon_control_request_to_address_async(
     address: &str,
-    command: &str,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeout: Duration,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::DaemonControlResponse, NetworkError> {
     let record = iroh_endpoint_record_from_address(
         address,
         &ClusterId::from_legacy_named("cluster_iroh_dial_placeholder").expect("static cluster id"),
         &NodeId::from_legacy_named("node_iroh_dial_placeholder").expect("static node id"),
     )?;
-    block_on_daemon_rpc(send_iroh_daemon_rpc_raw_async(
-        record, command, auth, request, timeout,
-    ))
+    send_iroh_daemon_control_request_async(record, request, timeouts).await
 }
 
 #[cfg(not(feature = "iroh-transport"))]
-pub fn send_iroh_daemon_rpc_raw(
+async fn send_iroh_daemon_control_request_to_address_async(
     address: &str,
-    _command: &str,
-    _auth: Option<&[u8]>,
-    _request: &crate::ObjectRpcRequest,
-    _timeout: Duration,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
+    _request: &crate::DaemonControlRequest,
+    _timeouts: DaemonRpcTimeouts,
+) -> Result<crate::DaemonControlResponse, NetworkError> {
     Err(NetworkError::Io {
         operation: "send iroh daemon rpc".to_string(),
         detail: format!("cannot dial {address}; sinomo-network was built without iroh-transport"),
@@ -1368,40 +1555,20 @@ pub fn send_iroh_daemon_rpc_raw(
 }
 
 #[cfg(feature = "iroh-transport")]
-async fn send_iroh_daemon_rpc_raw_async(
-    record: IrohEndpointRecord,
-    command: &str,
-    auth: Option<&[u8]>,
-    request: &crate::ObjectRpcRequest,
-    timeout: Duration,
-) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let control_request = match auth {
-        Some(auth) => {
-            crate::DaemonControlRequest::authenticated_rpc(command, request.clone(), auth.to_vec())
-        }
-        None => crate::DaemonControlRequest::rpc(command, request.clone()),
-    };
-    let response =
-        send_iroh_daemon_control_request_async(record, &control_request, timeout).await?;
-    daemon_rpc_response_from_control_response(response, "iroh daemon returned a non-rpc response")
-}
-
-#[cfg(feature = "iroh-transport")]
 async fn send_iroh_daemon_control_request_async(
     record: IrohEndpointRecord,
     request: &crate::DaemonControlRequest,
-    timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
     let remote_addr = iroh_endpoint_addr_from_record(&record)?;
-    let mut request_bytes = Vec::new();
-    crate::write_object_frame_blocking(&mut request_bytes, request)?;
+    let request_bytes = crate::encode_object_frame_to_vec(request)?;
     let mut attempt = 0_usize;
     loop {
         attempt += 1;
         match send_iroh_daemon_control_request_attempt_async(
             remote_addr.clone(),
             &request_bytes,
-            timeout,
+            timeouts,
         )
         .await
         {
@@ -1412,7 +1579,9 @@ async fn send_iroh_daemon_control_request_async(
                 if !retry {
                     return Err(error);
                 }
-                let Some(delay) = iroh_daemon_rpc_retry_delay(attempt, timeout) else {
+                let Some(delay) =
+                    iroh_daemon_rpc_retry_delay_with_budget(attempt, timeouts.connect_timeout)
+                else {
                     return Err(error);
                 };
                 tokio::time::sleep(delay).await;
@@ -1425,85 +1594,134 @@ async fn send_iroh_daemon_control_request_async(
 async fn send_iroh_daemon_control_request_attempt_async(
     remote_addr: iroh::EndpointAddr,
     request_bytes: &[u8],
-    idle_timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, IrohDaemonControlAttemptError> {
-    let endpoint = match tokio::time::timeout(idle_timeout, async {
+    let bind = async {
         sinomo_iroh_endpoint_builder()
             .map_err(|source| source.to_string())?
             .bind()
             .await
             .map_err(|source| source.to_string())
-    })
-    .await
-    {
-        Ok(Ok(endpoint)) => endpoint,
-        Ok(Err(source)) => {
-            return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                NetworkError::Io {
-                    operation: "bind iroh client endpoint".to_string(),
-                    detail: source.to_string(),
-                },
-            ));
+    };
+    let endpoint = if let Some(connect_timeout) = timeouts.connect_timeout {
+        match tokio::time::timeout(connect_timeout, bind).await {
+            Ok(Ok(endpoint)) => endpoint,
+            Ok(Err(source)) => {
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    NetworkError::Io {
+                        operation: "bind iroh client endpoint".to_string(),
+                        detail: source.to_string(),
+                    },
+                ));
+            }
+            Err(_) => {
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    iroh_daemon_command_timeout_error(connect_timeout),
+                ));
+            }
         }
-        Err(_) => {
-            return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                iroh_daemon_command_timeout_error(idle_timeout),
-            ));
+    } else {
+        match bind.await {
+            Ok(endpoint) => endpoint,
+            Err(source) => {
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    NetworkError::Io {
+                        operation: "bind iroh client endpoint".to_string(),
+                        detail: source.to_string(),
+                    },
+                ));
+            }
         }
     };
-    let online_timeout = idle_timeout.min(Duration::from_millis(1000));
-    let _ = tokio::time::timeout(online_timeout, endpoint.online()).await;
-    let connection = match tokio::time::timeout(
-        idle_timeout,
-        endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes()),
-    )
-    .await
-    {
-        Ok(Ok(connection)) => connection,
-        Ok(Err(source)) => {
-            close_iroh_endpoint(&endpoint).await;
-            return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                NetworkError::Io {
-                    operation: "connect iroh endpoint".to_string(),
-                    detail: source.to_string(),
-                },
-            ));
+    if let Some(connect_timeout) = timeouts.connect_timeout {
+        let online_timeout = connect_timeout.min(Duration::from_millis(1000));
+        let _ = tokio::time::timeout(online_timeout, endpoint.online()).await;
+    }
+
+    let connect = endpoint.connect(remote_addr, IROH_ROAMING_PROTOCOL.as_bytes());
+    let connection = if let Some(connect_timeout) = timeouts.connect_timeout {
+        match tokio::time::timeout(connect_timeout, connect).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(source)) => {
+                close_iroh_endpoint(&endpoint).await;
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    NetworkError::Io {
+                        operation: "connect iroh endpoint".to_string(),
+                        detail: source.to_string(),
+                    },
+                ));
+            }
+            Err(_) => {
+                close_iroh_endpoint(&endpoint).await;
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    iroh_daemon_command_timeout_error(connect_timeout),
+                ));
+            }
         }
-        Err(_) => {
-            close_iroh_endpoint(&endpoint).await;
-            return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                iroh_daemon_command_timeout_error(idle_timeout),
-            ));
-        }
-    };
-    let (mut send, mut recv) = match tokio::time::timeout(idle_timeout, connection.open_bi()).await
-    {
-        Ok(Ok(streams)) => streams,
-        Ok(Err(source)) => {
-            connection.close(0_u8.into(), b"open stream failed");
-            close_iroh_endpoint(&endpoint).await;
-            return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                NetworkError::Io {
-                    operation: "open iroh daemon stream".to_string(),
-                    detail: source.to_string(),
-                },
-            ));
-        }
-        Err(_) => {
-            connection.close(0_u8.into(), b"open stream timed out");
-            close_iroh_endpoint(&endpoint).await;
-            return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
-                iroh_daemon_command_timeout_error(idle_timeout),
-            ));
+    } else {
+        match connect.await {
+            Ok(connection) => connection,
+            Err(source) => {
+                close_iroh_endpoint(&endpoint).await;
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    NetworkError::Io {
+                        operation: "connect iroh endpoint".to_string(),
+                        detail: source.to_string(),
+                    },
+                ));
+            }
         }
     };
-    match write_iroh_daemon_control_request_bytes_with_idle_timeout(
-        &mut send,
-        request_bytes,
-        idle_timeout,
-    )
-    .await
-    {
+
+    let open = connection.open_bi();
+    let (mut send, mut recv) = if let Some(connect_timeout) = timeouts.connect_timeout {
+        match tokio::time::timeout(connect_timeout, open).await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(source)) => {
+                connection.close(0_u8.into(), b"open stream failed");
+                close_iroh_endpoint(&endpoint).await;
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    NetworkError::Io {
+                        operation: "open iroh daemon stream".to_string(),
+                        detail: source.to_string(),
+                    },
+                ));
+            }
+            Err(_) => {
+                connection.close(0_u8.into(), b"open stream timed out");
+                close_iroh_endpoint(&endpoint).await;
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    iroh_daemon_command_timeout_error(connect_timeout),
+                ));
+            }
+        }
+    } else {
+        match open.await {
+            Ok(streams) => streams,
+            Err(source) => {
+                connection.close(0_u8.into(), b"open stream failed");
+                close_iroh_endpoint(&endpoint).await;
+                return Err(IrohDaemonControlAttemptError::BeforeRequestAccepted(
+                    NetworkError::Io {
+                        operation: "open iroh daemon stream".to_string(),
+                        detail: source.to_string(),
+                    },
+                ));
+            }
+        }
+    };
+
+    let write_result = if let Some(idle_timeout) = timeouts.idle_timeout {
+        write_iroh_daemon_control_request_bytes_with_idle_timeout(
+            &mut send,
+            request_bytes,
+            idle_timeout,
+        )
+        .await
+    } else {
+        write_iroh_daemon_control_request_bytes(&mut send, request_bytes).await
+    };
+    match write_result {
         Ok(()) => {}
         Err(source) => {
             connection.close(0_u8.into(), b"write failed");
@@ -1521,7 +1739,7 @@ async fn send_iroh_daemon_control_request_attempt_async(
             },
         ));
     }
-    let response = match read_iroh_daemon_control_response_async(&mut recv, idle_timeout).await {
+    let response = match read_iroh_daemon_control_response_async(&mut recv, timeouts).await {
         Ok(response) => response,
         Err(error) => {
             connection.close(0_u8.into(), b"read failed");
@@ -1596,16 +1814,29 @@ pub(crate) fn iroh_daemon_response_error_is_retryable(error: &NetworkError) -> b
     )
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
+#[cfg(test)]
 pub(crate) fn iroh_daemon_rpc_retry_delay(attempt: usize, remaining: Duration) -> Option<Duration> {
-    if attempt >= IROH_DAEMON_RPC_MAX_ATTEMPTS || remaining <= Duration::from_millis(5) {
+    iroh_daemon_rpc_retry_delay_with_budget(attempt, Some(remaining))
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) fn iroh_daemon_rpc_retry_delay_with_budget(
+    attempt: usize,
+    remaining: Option<Duration>,
+) -> Option<Duration> {
+    if attempt >= IROH_DAEMON_RPC_MAX_ATTEMPTS
+        || remaining.is_some_and(|remaining| remaining <= Duration::from_millis(5))
+    {
         return None;
     }
     let shift = attempt.saturating_sub(1).min(5);
     let delay = IROH_DAEMON_RPC_RETRY_INITIAL
         .saturating_mul(2_u32.saturating_pow(u32::try_from(shift).unwrap_or(5)))
         .min(IROH_DAEMON_RPC_RETRY_MAX);
-    Some(delay.min(remaining.saturating_sub(Duration::from_millis(1))))
+    Some(match remaining {
+        Some(remaining) => delay.min(remaining.saturating_sub(Duration::from_millis(1))),
+        None => delay,
+    })
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -1617,7 +1848,30 @@ fn iroh_daemon_command_timeout_error(timeout: Duration) -> NetworkError {
 }
 
 #[cfg(feature = "iroh-transport")]
-async fn write_iroh_daemon_control_request_bytes_with_idle_timeout<W>(
+async fn write_iroh_daemon_control_request_bytes<W>(
+    writer: &mut W,
+    bytes: &[u8],
+) -> Result<(), NetworkError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+
+    writer
+        .write_all(bytes)
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "write iroh daemon command".to_string(),
+            detail: source.to_string(),
+        })?;
+    writer.flush().await.map_err(|source| NetworkError::Io {
+        operation: "write iroh daemon command".to_string(),
+        detail: source.to_string(),
+    })
+}
+
+#[cfg(any(feature = "iroh-transport", test))]
+pub(crate) async fn write_iroh_daemon_control_request_bytes_with_idle_timeout<W>(
     writer: &mut W,
     bytes: &[u8],
     idle_timeout: Duration,
@@ -1658,27 +1912,37 @@ where
             }
         }
     }
-    writer.flush().await.map_err(|source| NetworkError::Io {
-        operation: "write iroh daemon command".to_string(),
-        detail: source.to_string(),
-    })
+    match tokio::time::timeout(idle_timeout, writer.flush()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(source)) => Err(NetworkError::Io {
+            operation: "write iroh daemon command".to_string(),
+            detail: source.to_string(),
+        }),
+        Err(_) => Err(NetworkError::Io {
+            operation: "write iroh daemon command".to_string(),
+            detail: format!(
+                "timed out after {}ms without flush progress",
+                idle_timeout.as_millis()
+            ),
+        }),
+    }
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
 pub(crate) async fn read_iroh_daemon_control_response_async<R>(
     reader: &mut R,
-    timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::DaemonControlResponse, NetworkError>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    match crate::read_object_frame_async_with_idle_timeout(
+    let response = crate::read_object_frame_async(
         reader,
         IROH_DAEMON_COMMAND_MAX_BYTES,
-        timeout,
+        crate::ObjectFrameIoOptions::none().with_idle_timeout(timeouts.idle_timeout),
     )
-    .await
-    {
+    .await;
+    match response {
         Ok(response) => Ok(response),
         Err(error) => Err(iroh_daemon_response_frame_error(error)),
     }
@@ -1688,21 +1952,8 @@ where
 pub(crate) fn decode_iroh_daemon_control_response_bytes(
     response: &[u8],
 ) -> Result<crate::DaemonControlResponse, NetworkError> {
-    let mut cursor = std::io::Cursor::new(response);
-    let decoded: crate::DaemonControlResponse =
-        crate::read_object_frame_blocking(&mut cursor, IROH_DAEMON_COMMAND_MAX_BYTES)
-            .map_err(iroh_daemon_response_frame_error)?;
-    let consumed = cursor.position() as usize;
-    if consumed != response.len() {
-        return Err(NetworkError::Io {
-            operation: "read iroh daemon response".to_string(),
-            detail: format!(
-                "daemon returned {} trailing bytes after response frame",
-                response.len().saturating_sub(consumed)
-            ),
-        });
-    }
-    Ok(decoded)
+    crate::decode_single_object_frame_from_slice(response, IROH_DAEMON_COMMAND_MAX_BYTES)
+        .map_err(iroh_daemon_response_frame_error)
 }
 
 #[cfg(any(feature = "iroh-transport", test))]
@@ -1752,112 +2003,136 @@ fn iroh_endpoint_addr_from_record(
     Ok(addr)
 }
 
-pub fn send_daemon_rpc_to_cluster_endpoint(
+pub async fn send_daemon_rpc_to_cluster_endpoint_async(
     endpoint: &ClusterEndpointRecord,
     command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
-    timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    match endpoint.transport {
-        ClusterTransportKind::Iroh => {
-            send_iroh_daemon_rpc_raw(&endpoint.address, command, auth, request, timeout)
-        }
-        ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
-            send_daemon_rpc_raw(&endpoint.address, command, auth, request, timeout)
-        }
-        _ => Err(NetworkError::Io {
-            operation: format!("send daemon rpc to {}", endpoint.address),
-            detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
-        }),
-    }
+    send_daemon_rpc_to_target_async(
+        DaemonControlTarget::ClusterEndpoint(endpoint),
+        command,
+        auth,
+        request,
+        timeouts,
+    )
+    .await
 }
 
-/// Drive a daemon-RPC future to completion from synchronous code, whether or not the
-/// caller is already inside a Tokio runtime.
-///
-/// These helpers are synchronous wrappers over async I/O. They are called both with no
-/// ambient runtime (e.g. the CLI) and from within one: the daemon's service-seam adapter
-/// drives handlers via `block_on`, and a handler may then make a synchronous
-/// daemon-to-daemon RPC. Building a fresh runtime and calling `block_on` inline panics
-/// ("cannot start a runtime from within a runtime") when nested. On multi-threaded
-/// runtimes we can re-enter via `block_in_place`; on current-thread runtimes we run
-/// the short-lived control future on a scoped helper thread so mobile/current-thread
-/// callers do not panic.
-pub(crate) fn block_on_daemon_rpc<F, T>(future: F) -> Result<T, NetworkError>
-where
-    F: std::future::Future<Output = Result<T, NetworkError>> + Send,
-    T: Send,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            tokio::task::block_in_place(|| handle.block_on(future))
-        } else {
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(|| block_on_daemon_rpc_without_ambient_runtime(future))
-                    .join()
-                    .unwrap_or_else(|_| {
-                        Err(NetworkError::Io {
-                            operation: "drive daemon control runtime".to_string(),
-                            detail: "daemon control runtime thread panicked".to_string(),
-                        })
-                    })
-            })
-        };
-    }
-    block_on_daemon_rpc_without_ambient_runtime(future)
-}
-
-fn block_on_daemon_rpc_without_ambient_runtime<F, T>(future: F) -> Result<T, NetworkError>
-where
-    F: std::future::Future<Output = Result<T, NetworkError>>,
-{
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| NetworkError::Io {
-            operation: "start daemon control runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let output = runtime.block_on(future);
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    output
-}
-
-pub fn send_daemon_rpc_raw(
+pub async fn send_daemon_rpc_to_address_async(
     address: &str,
     command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
-    timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    block_on_daemon_rpc(send_daemon_rpc_raw_async(
-        address, command, auth, request, timeout,
-    ))
+    send_daemon_rpc_to_target_async(
+        DaemonControlTarget::Address(address),
+        command,
+        auth,
+        request,
+        timeouts,
+    )
+    .await
 }
 
-pub async fn send_daemon_rpc_raw_async(
-    address: &str,
+enum DaemonControlTarget<'a> {
+    Address(&'a str),
+    ClusterEndpoint(&'a ClusterEndpointRecord),
+}
+
+impl DaemonControlTarget<'_> {
+    fn non_rpc_detail(&self) -> String {
+        match self {
+            Self::Address(address) => {
+                format!("daemon control address {address} returned a non-rpc response")
+            }
+            Self::ClusterEndpoint(endpoint) => format!(
+                "daemon control endpoint {:?} returned a non-rpc response",
+                endpoint.node_id
+            ),
+        }
+    }
+}
+
+async fn send_daemon_rpc_to_target_async(
+    target: DaemonControlTarget<'_>,
     command: &str,
     auth: Option<&[u8]>,
     request: &crate::ObjectRpcRequest,
-    timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
 ) -> Result<crate::ObjectRpcResponse, NetworkError> {
-    let control_request = match auth {
+    let control_request = daemon_rpc_control_request(command, auth, request);
+    let non_rpc_detail = target.non_rpc_detail();
+    let response =
+        send_daemon_control_request_to_target_async(target, &control_request, timeouts).await?;
+    daemon_rpc_response_from_control_response(response, non_rpc_detail)
+}
+
+fn daemon_rpc_control_request(
+    command: &str,
+    auth: Option<&[u8]>,
+    request: &crate::ObjectRpcRequest,
+) -> crate::DaemonControlRequest {
+    match auth {
         Some(auth) => {
             crate::DaemonControlRequest::authenticated_rpc(command, request.clone(), auth.to_vec())
         }
         None => crate::DaemonControlRequest::rpc(command, request.clone()),
-    };
-    let response = send_daemon_control_request_async(address, &control_request, timeout).await?;
-    daemon_rpc_response_from_control_response(
-        response,
-        format!("daemon control address {address} returned a non-rpc response"),
-    )
+    }
+}
+
+async fn send_daemon_control_request_to_target_async(
+    target: DaemonControlTarget<'_>,
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::DaemonControlResponse, NetworkError> {
+    match target {
+        DaemonControlTarget::Address(address) => {
+            send_daemon_control_request_to_address_async(address, request, timeouts).await
+        }
+        DaemonControlTarget::ClusterEndpoint(endpoint) => match endpoint.transport {
+            ClusterTransportKind::Iroh => {
+                send_iroh_daemon_control_request_to_address_async(
+                    &endpoint.address,
+                    request,
+                    timeouts,
+                )
+                .await
+            }
+            ClusterTransportKind::LanTcp | ClusterTransportKind::Loopback => {
+                send_daemon_control_request_to_address_async(&endpoint.address, request, timeouts)
+                    .await
+            }
+            _ => Err(NetworkError::Io {
+                operation: format!("send daemon rpc to {}", endpoint.address),
+                detail: format!("unsupported daemon rpc transport {:?}", endpoint.transport),
+            }),
+        },
+    }
+}
+
+async fn send_daemon_control_request_to_address_async(
+    address: &str,
+    request: &crate::DaemonControlRequest,
+    timeouts: DaemonRpcTimeouts,
+) -> Result<crate::DaemonControlResponse, NetworkError> {
+    if daemon_rpc_address_uses_iroh(address) {
+        send_iroh_daemon_control_request_to_address_async(address, request, timeouts).await
+    } else {
+        crate::send_daemon_control_request_async(
+            address,
+            request,
+            timeouts,
+            IROH_DAEMON_COMMAND_MAX_BYTES,
+        )
+        .await
+    }
+}
+
+fn daemon_rpc_address_uses_iroh(address: &str) -> bool {
+    address.trim_start().starts_with("iroh://")
 }
 
 pub(crate) fn daemon_rpc_response_from_control_response(
@@ -1871,94 +2146,12 @@ pub(crate) fn daemon_rpc_response_from_control_response(
     Ok(rpc)
 }
 
-fn daemon_rpc_timeout_detail(timeout: Duration) -> String {
+#[cfg(feature = "iroh-transport")]
+fn daemon_control_timeout_detail(timeout: Duration) -> String {
     format!("timed out after {}ms", timeout.as_millis())
 }
 
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) struct DaemonControlDnsWorkerPermit;
-
-#[cfg(any(feature = "iroh-transport", test))]
-impl Drop for DaemonControlDnsWorkerPermit {
-    fn drop(&mut self) {
-        DAEMON_CONTROL_DNS_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn try_acquire_daemon_control_dns_worker() -> Option<DaemonControlDnsWorkerPermit> {
-    let mut current = DAEMON_CONTROL_DNS_WORKERS.load(std::sync::atomic::Ordering::Acquire);
-    loop {
-        if current >= MAX_DAEMON_CONTROL_DNS_WORKERS {
-            return None;
-        }
-        match DAEMON_CONTROL_DNS_WORKERS.compare_exchange_weak(
-            current,
-            current + 1,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(DaemonControlDnsWorkerPermit),
-            Err(actual) => current = actual,
-        }
-    }
-}
-
 #[cfg(test)]
-pub(crate) fn daemon_control_dns_worker_count_for_test() -> usize {
-    DAEMON_CONTROL_DNS_WORKERS.load(std::sync::atomic::Ordering::Acquire)
-}
-
-#[cfg(any(feature = "iroh-transport", test))]
-pub(crate) fn resolve_daemon_control_socket_address_with_timeout(
-    address: &str,
-    timeout: Duration,
-) -> Result<SocketAddr, NetworkError> {
-    if let Ok(socket_address) = address.parse::<SocketAddr>() {
-        return Ok(socket_address);
-    }
-    let Some(permit) = try_acquire_daemon_control_dns_worker() else {
-        return Err(NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: format!(
-                "daemon control DNS worker limit reached ({MAX_DAEMON_CONTROL_DNS_WORKERS})"
-            ),
-        });
-    };
-
-    let address = address.to_string();
-    let worker_address = address.clone();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _permit = permit;
-        let resolved = std::net::ToSocketAddrs::to_socket_addrs(&worker_address)
-            .map_err(|source| source.to_string())
-            .and_then(|mut addresses| {
-                addresses
-                    .next()
-                    .ok_or_else(|| "no socket addresses resolved".to_string())
-            });
-        let _ = sender.send(resolved);
-    });
-
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(socket_address)) => Ok(socket_address),
-        Ok(Err(detail)) => Err(NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail,
-        }),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: format!("timed out after {}ms", timeout.as_millis()),
-        }),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(NetworkError::Io {
-            operation: format!("resolve daemon control address {address}"),
-            detail: "resolver worker disconnected before returning an address".to_string(),
-        }),
-    }
-}
-
-#[cfg(any(feature = "iroh-transport", test))]
 pub(crate) fn configure_daemon_control_stream_idle_timeout(
     stream: &std::net::TcpStream,
     address: &str,
@@ -1985,65 +2178,85 @@ pub(crate) fn configure_daemon_control_stream_idle_timeout(
     Ok(())
 }
 
-async fn send_daemon_control_request_async(
-    address: &str,
-    request: &crate::DaemonControlRequest,
-    timeout: Duration,
-) -> Result<crate::DaemonControlResponse, NetworkError> {
-    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(address))
-        .await
-        .map_err(|_| NetworkError::Io {
-            operation: format!("connect daemon control address {address}"),
-            detail: daemon_rpc_timeout_detail(timeout),
-        })?
-        .map_err(|source| NetworkError::Io {
-            operation: format!("connect daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
-    crate::write_object_frame_async_with_idle_timeout(&mut stream, request, timeout)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: format!("write daemon control address {address}"),
-            detail: source.to_string(),
-        })?;
-    let response: crate::DaemonControlResponse = crate::read_object_frame_async_with_idle_timeout(
-        &mut stream,
-        IROH_DAEMON_COMMAND_MAX_BYTES,
-        timeout,
-    )
-    .await
-    .map_err(|source| NetworkError::Io {
-        operation: format!("read daemon control address {address}"),
-        detail: source.to_string(),
-    })?;
-    Ok(response)
-}
-
 #[cfg(feature = "iroh-transport")]
-fn forward_daemon_control_payload(
+async fn forward_daemon_control_payload_async(
     address: &str,
     payload: &[u8],
-    idle_timeout: Duration,
+    timeouts: DaemonRpcTimeouts,
     budget: &IrohProxyByteBudget,
 ) -> Result<(Vec<u8>, IrohProxyByteBudgetPermit), NetworkError> {
-    let socket_address = resolve_daemon_control_socket_address_with_timeout(address, idle_timeout)?;
-    let mut stream =
-        TcpStream::connect_timeout(&socket_address, idle_timeout).map_err(|source| {
-            NetworkError::Io {
+    use tokio::io::AsyncWriteExt;
+
+    let connect = tokio::net::TcpStream::connect(address);
+    let mut stream = if let Some(connect_timeout) = timeouts.connect_timeout {
+        tokio::time::timeout(connect_timeout, connect)
+            .await
+            .map_err(|_| NetworkError::Io {
                 operation: format!("connect daemon control address {address}"),
-                detail: source.to_string(),
-            }
+                detail: daemon_control_timeout_detail(connect_timeout),
+            })?
+    } else {
+        connect.await
+    }
+    .map_err(|source| NetworkError::Io {
+        operation: format!("connect daemon control address {address}"),
+        detail: source.to_string(),
+    })?;
+    if let Some(idle_timeout) = timeouts.idle_timeout {
+        crate::object::write_all_async_frame(
+            &mut stream,
+            payload,
+            Some(idle_timeout),
+            "write daemon control address",
+            "body",
+        )
+        .await
+        .map_err(|error| match error {
+            NetworkError::Io { detail, .. } => NetworkError::Io {
+                operation: format!("write daemon control address {address}"),
+                detail,
+            },
+            other => other,
         })?;
-    configure_daemon_control_stream_idle_timeout(&stream, address, idle_timeout, false, true)?;
-    stream
-        .write_all(payload)
-        .map_err(|source| NetworkError::Io {
-            operation: format!("write daemon control address {address}"),
+    } else {
+        write_iroh_daemon_control_request_bytes(&mut stream, payload)
+            .await
+            .map_err(|error| match error {
+                NetworkError::Io { detail, .. } => NetworkError::Io {
+                    operation: format!("write daemon control address {address}"),
+                    detail,
+                },
+                other => other,
+            })?;
+    }
+    if let Some(idle_timeout) = timeouts.idle_timeout {
+        tokio::time::timeout(idle_timeout, stream.shutdown())
+            .await
+            .map_err(|_| NetworkError::Io {
+                operation: format!("finish daemon control address {address}"),
+                detail: daemon_control_timeout_detail(idle_timeout),
+            })?
+            .map_err(|source| NetworkError::Io {
+                operation: format!("finish daemon control address {address}"),
+                detail: source.to_string(),
+            })?;
+    } else {
+        stream.shutdown().await.map_err(|source| NetworkError::Io {
+            operation: format!("finish daemon control address {address}"),
             detail: source.to_string(),
         })?;
-    let _ = stream.shutdown(Shutdown::Write);
-    configure_daemon_control_stream_idle_timeout(&stream, address, idle_timeout, true, false)?;
-    read_iroh_proxy_frame_blocking(&mut stream, budget, "command response")
+    }
+    if let Some(idle_timeout) = timeouts.idle_timeout {
+        read_iroh_proxy_frame_async_with_idle_timeout(
+            &mut stream,
+            budget,
+            "command response",
+            idle_timeout,
+        )
+        .await
+    } else {
+        read_iroh_proxy_frame_async(&mut stream, budget, "command response").await
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

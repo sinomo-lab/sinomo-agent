@@ -4113,7 +4113,9 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
     }
     #[cfg(test)]
     {
-        return network::read_cluster_kv_snapshot(paths).map_err(Into::into);
+        return sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map_err(network::NetworkError::from)
+            .map_err(Into::into);
     }
     #[cfg(not(test))]
     {
@@ -4126,11 +4128,12 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
 #[cfg(test)]
 fn commit_sandbox_policy_cluster_txn(data_dir: &SinomoDataDir, txn: KvTxn) -> Result<(), CliError> {
     let paths = ClusterPaths::new(data_dir);
-    let snapshot = network::read_cluster_kv_snapshot(&paths)
+    let snapshot = sinomo_kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
         .unwrap_or_else(|_| sinomo_kv::InProcessKvStore::new().snapshot());
     let mut store = sinomo_kv::InProcessKvStore::restore(snapshot);
     let _: KvTxnResponse = store.txn(txn)?;
-    network::write_cluster_kv_snapshot(&paths, &store.snapshot())?;
+    sinomo_kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
+        .map_err(network::NetworkError::from)?;
     Ok(())
 }
 
@@ -5322,7 +5325,7 @@ fn sandbox_daemon_execution_rpc_timeout(timeout_ms: u64) -> std::time::Duration 
     std::time::Duration::from_millis(timeout_ms.saturating_add(10_000))
 }
 
-fn sandbox_daemon_large_metadata_rpc_timeout() -> std::time::Duration {
+fn sandbox_daemon_metadata_rpc_connect_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(15 * 60)
 }
 
@@ -5768,7 +5771,11 @@ pub fn sandbox_toolchain_add_command_with_daemon(
         &request,
     )
     .map_err(CliError::from)?;
-    let response = send_daemon_rpc(&address, &rpc, sandbox_daemon_large_metadata_rpc_timeout())?;
+    let response = send_daemon_rpc(
+        &address,
+        &rpc,
+        sandbox_daemon_metadata_rpc_connect_timeout(),
+    )?;
     let response: crate::SandboxAddToolchainCommandResponse =
         response.decode_body().map_err(CliError::from)?;
     println!("toolchain: {}", response.manifest.toolchain_id);
@@ -5860,7 +5867,11 @@ pub fn sandbox_toolchain_add_artifact_with_daemon(
         &request,
     )
     .map_err(CliError::from)?;
-    let response = send_daemon_rpc(&address, &rpc, sandbox_daemon_large_metadata_rpc_timeout())?;
+    let response = send_daemon_rpc(
+        &address,
+        &rpc,
+        sandbox_daemon_metadata_rpc_connect_timeout(),
+    )?;
     let response: crate::SandboxAddToolchainArtifactResponse =
         response.decode_body().map_err(CliError::from)?;
     println!("toolchain: {}", response.manifest.toolchain_id);
@@ -7534,7 +7545,11 @@ pub fn sandbox_checkpoint_with_daemon(options: SandboxCheckpointOptions) -> Resu
         &request,
     )
     .map_err(CliError::from)?;
-    let response = send_daemon_rpc(&address, &rpc, sandbox_daemon_large_metadata_rpc_timeout())?;
+    let response = send_daemon_rpc(
+        &address,
+        &rpc,
+        sandbox_daemon_metadata_rpc_connect_timeout(),
+    )?;
     let response: crate::SandboxCheckpointResponse =
         response.decode_body().map_err(CliError::from)?;
     println!("checkpoint: {}", response.checkpoint.checkpoint_id);
@@ -7575,7 +7590,11 @@ pub fn sandbox_resume_with_daemon(options: SandboxResumeOptions) -> Result<(), C
         &request,
     )
     .map_err(CliError::from)?;
-    let response = send_daemon_rpc(&address, &rpc, sandbox_daemon_large_metadata_rpc_timeout())?;
+    let response = send_daemon_rpc(
+        &address,
+        &rpc,
+        sandbox_daemon_metadata_rpc_connect_timeout(),
+    )?;
     let response: crate::SandboxResumeResponse = response.decode_body().map_err(CliError::from)?;
     println!("sandbox resumed: {}", response.manifest.sandbox_id);
     println!("checkpoint: {}", request.checkpoint_id);

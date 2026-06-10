@@ -1212,7 +1212,7 @@ fn publish_cluster_rollout_desired(
 ) -> Result<(), CliError> {
     let paths = cluster_paths_from_defaults()?;
     let state = read_cluster_state(&paths)?;
-    let desired = network::ClusterRolloutDesiredRecord {
+    let desired = sinomo_runtime::r0::ClusterRolloutDesiredRecord {
         cluster_id: state.cluster_id,
         state: "active".to_string(),
         source: Some(source.to_string()),
@@ -1234,7 +1234,7 @@ fn publish_cluster_rollout_desired(
     let txn = KvTxn {
         compares: Vec::new(),
         success: vec![KvOp::put_serde(
-            network::cluster_rollout_desired_key(),
+            sinomo_runtime::r0::cluster_rollout_desired_key(),
             &desired,
             None,
         )?],

@@ -1,4 +1,6 @@
-use crate::{DaemonError, DaemonPaths, IdleStatsSnapshot, send_daemon_rpc};
+use crate::{
+    DaemonError, DaemonPaths, IdleStatsSnapshot, send_daemon_rpc_async, send_daemon_rpc_on_runtime,
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sinomo_core::{
@@ -6,7 +8,7 @@ use sinomo_core::{
     ClusterNodeAvailability, ClusterNodeRolloutStatus, ClusterNodeStatusRecord,
 };
 use sinomo_local::SinomoDataDir;
-use sinomo_network::ClusterId;
+use sinomo_network::{ClusterId, DaemonRpcTimeouts};
 use sinomo_node::NodeId;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -166,7 +168,49 @@ pub fn daemon_advertised_endpoints_for_state(
     )
 }
 
+pub async fn daemon_advertised_endpoints_for_state_async(
+    state: &ClusterBootstrapState,
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+) -> Vec<ClusterEndpointRecord> {
+    let allow_public_ip_discovery = sinomo_network::cluster_node_is_local_process(state, node_id);
+    daemon_advertised_endpoints_from_ips_async(
+        node_id,
+        options,
+        priority,
+        lan_ips,
+        route_ips,
+        allow_public_ip_discovery,
+    )
+    .await
+}
+
 fn daemon_advertised_endpoints_from_ips(
+    node_id: &NodeId,
+    options: &DaemonRunOptions,
+    priority: u16,
+    lan_ips: &[IpAddr],
+    route_ips: &[IpAddr],
+    allow_public_endpoints: bool,
+) -> Vec<ClusterEndpointRecord> {
+    let advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV).ok();
+    sinomo_network::daemon_advertised_endpoints_from_static_addresses(
+        node_id,
+        daemon_connect_address(&options.host, options.port),
+        &options.host,
+        options.port,
+        priority,
+        lan_ips,
+        route_ips,
+        allow_public_endpoints,
+        advertise_host.as_deref(),
+    )
+}
+
+async fn daemon_advertised_endpoints_from_ips_async(
     node_id: &NodeId,
     options: &DaemonRunOptions,
     priority: u16,
@@ -175,7 +219,7 @@ fn daemon_advertised_endpoints_from_ips(
     allow_public_ip_discovery: bool,
 ) -> Vec<ClusterEndpointRecord> {
     let advertise_host = std::env::var(SINOMO_DAEMON_ADVERTISE_HOST_ENV).ok();
-    sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host(
+    sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host_async(
         node_id,
         daemon_connect_address(&options.host, options.port),
         &options.host,
@@ -186,12 +230,32 @@ fn daemon_advertised_endpoints_from_ips(
         allow_public_ip_discovery,
         advertise_host.as_deref(),
     )
+    .await
 }
 
 pub fn current_shadow_daemon_options(data_dir: &Path, timeout: Duration) -> DaemonRunOptions {
     match probe_daemon_status(
         &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
         timeout,
+    ) {
+        DaemonProbeStatus::Running(status) => daemon_options_from_status(&status),
+        DaemonProbeStatus::Locked { status } => status
+            .as_ref()
+            .map(daemon_options_from_status)
+            .unwrap_or_else(DaemonRunOptions::shadow_default),
+        DaemonProbeStatus::NotRunning => DaemonRunOptions::shadow_default(),
+    }
+}
+
+pub(crate) fn current_shadow_daemon_options_on_runtime(
+    data_dir: &Path,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> DaemonRunOptions {
+    match probe_daemon_status_on_runtime(
+        &DaemonPaths::with_root(data_dir.join("shadow-daemon")),
+        timeout,
+        runtime,
     ) {
         DaemonProbeStatus::Running(status)
         | DaemonProbeStatus::Locked {
@@ -510,6 +574,155 @@ pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProb
         }
     }
 
+    stale_daemon_lock_probe(paths, status)
+}
+
+pub(crate) fn probe_daemon_status_on_runtime(
+    paths: &DaemonPaths,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> DaemonProbeStatus {
+    let status = read_daemon_status(paths).ok();
+    if let Some(status) = &status {
+        // Prefer the live status returned over the wire: it carries fields the
+        // on-disk snapshot never persists (e.g. idle_stats). Fall back to the
+        // on-disk status only for the liveness comparison.
+        if let Some(remote_status) =
+            probe_daemon_status_at_address_on_runtime(&status.address, timeout, runtime)
+            && daemon_status_matches_probe(status, &remote_status)
+        {
+            return DaemonProbeStatus::Running(remote_status);
+        }
+    }
+
+    stale_daemon_lock_probe(paths, status)
+}
+
+pub(crate) async fn probe_daemon_status_async(
+    paths: &DaemonPaths,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> DaemonProbeStatus {
+    probe_daemon_status_with_timeouts_async(
+        paths,
+        DaemonRpcTimeouts::connect_only(timeout),
+        runtime,
+    )
+    .await
+}
+
+pub(crate) async fn probe_daemon_status_with_timeouts_async(
+    paths: &DaemonPaths,
+    timeouts: DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+) -> DaemonProbeStatus {
+    let read_paths = paths.clone();
+    let status = runtime
+        .spawn_blocking(move || read_daemon_status(&read_paths).ok())
+        .await
+        .unwrap_or(None);
+    if let Some(status) = &status {
+        if let Some(remote_status) =
+            probe_daemon_status_at_address_with_timeouts_async(&status.address, timeouts, runtime)
+                .await
+            && daemon_status_matches_probe(status, &remote_status)
+        {
+            return DaemonProbeStatus::Running(remote_status);
+        }
+    }
+
+    let lock_paths = paths.clone();
+    let fallback_status = status.clone();
+    runtime
+        .spawn_blocking(move || stale_daemon_lock_probe(&lock_paths, status))
+        .await
+        .unwrap_or(DaemonProbeStatus::Locked {
+            status: fallback_status,
+        })
+}
+
+pub fn probe_daemon_status_at_address(address: &str, timeout: Duration) -> Option<DaemonStatus> {
+    let request = sinomo_network::ObjectRpcRequest::encode_body(
+        sinomo_network::DAEMON_STATUS_ROUTE,
+        sinomo_network::DAEMON_RPC_CATEGORY,
+        &(),
+    )
+    .ok()?;
+    crate::send_daemon_rpc(address, &request, timeout)
+        .ok()?
+        .decode_body::<DaemonStatus>()
+        .ok()
+}
+
+pub(crate) fn probe_daemon_status_at_address_on_runtime(
+    address: &str,
+    timeout: Duration,
+    runtime: &tokio::runtime::Handle,
+) -> Option<DaemonStatus> {
+    let request = sinomo_network::ObjectRpcRequest::encode_body(
+        sinomo_network::DAEMON_STATUS_ROUTE,
+        sinomo_network::DAEMON_RPC_CATEGORY,
+        &(),
+    )
+    .ok()?;
+    send_daemon_rpc_on_runtime(address, &request, timeout, runtime)
+        .ok()?
+        .decode_body::<DaemonStatus>()
+        .ok()
+}
+
+pub(crate) async fn probe_daemon_status_at_address_with_timeouts_async(
+    address: &str,
+    timeouts: DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+) -> Option<DaemonStatus> {
+    let request = sinomo_network::ObjectRpcRequest::encode_body(
+        sinomo_network::DAEMON_STATUS_ROUTE,
+        sinomo_network::DAEMON_RPC_CATEGORY,
+        &(),
+    )
+    .ok()?;
+    send_daemon_rpc_async(address, &request, timeouts, runtime)
+        .await
+        .ok()?
+        .decode_body::<DaemonStatus>()
+        .ok()
+}
+
+pub fn default_main_daemon_status(timeout: Duration) -> Result<Option<DaemonStatus>, DaemonError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let paths = DaemonPaths::new(&data_dir);
+    Ok(match probe_daemon_status(&paths, timeout) {
+        DaemonProbeStatus::Running(status) => Some(status),
+        DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
+    })
+}
+
+pub(crate) async fn default_main_daemon_status_with_timeouts_async(
+    timeouts: DaemonRpcTimeouts,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<DaemonStatus>, DaemonError> {
+    let paths = runtime
+        .spawn_blocking(|| {
+            let data_dir = SinomoDataDir::from_env_or_home()?;
+            data_dir.ensure_root_layout()?;
+            Ok::<_, DaemonError>(DaemonPaths::new(&data_dir))
+        })
+        .await
+        .map_err(|source| DaemonError::Network {
+            address: "daemon status probe".to_string(),
+            detail: format!("daemon status path task failed: {source}"),
+        })??;
+    Ok(
+        match probe_daemon_status_with_timeouts_async(&paths, timeouts, runtime).await {
+            DaemonProbeStatus::Running(status) => Some(status),
+            DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
+        },
+    )
+}
+
+fn stale_daemon_lock_probe(paths: &DaemonPaths, status: Option<DaemonStatus>) -> DaemonProbeStatus {
     if !paths.lock.exists() {
         let _ = fs::remove_file(&paths.status);
         return DaemonProbeStatus::NotRunning;
@@ -534,29 +747,6 @@ pub fn probe_daemon_status(paths: &DaemonPaths, timeout: Duration) -> DaemonProb
         }
         Err(_) => DaemonProbeStatus::Locked { status },
     }
-}
-
-pub fn probe_daemon_status_at_address(address: &str, timeout: Duration) -> Option<DaemonStatus> {
-    let request = sinomo_network::ObjectRpcRequest::encode_body(
-        sinomo_network::DAEMON_STATUS_ROUTE,
-        sinomo_network::DAEMON_RPC_CATEGORY,
-        &(),
-    )
-    .ok()?;
-    send_daemon_rpc(address, &request, timeout)
-        .ok()?
-        .decode_body::<DaemonStatus>()
-        .ok()
-}
-
-pub fn default_main_daemon_status(timeout: Duration) -> Result<Option<DaemonStatus>, DaemonError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
-    data_dir.ensure_root_layout()?;
-    let paths = DaemonPaths::new(&data_dir);
-    Ok(match probe_daemon_status(&paths, timeout) {
-        DaemonProbeStatus::Running(status) => Some(status),
-        DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
-    })
 }
 
 fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
@@ -625,7 +815,7 @@ mod tests {
     #[test]
     fn advertised_host_adds_stable_hostname_endpoint_for_wildcard_bind() {
         let node_id = NodeId::from_legacy_named("node_advertise_hostname").expect("node");
-        let endpoints = sinomo_network::daemon_advertised_endpoints_from_addresses_with_public_discovery_and_advertise_host(
+        let endpoints = sinomo_network::daemon_advertised_endpoints_from_static_addresses(
             &node_id,
             "127.0.0.1:21353".to_string(),
             "0.0.0.0",

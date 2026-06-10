@@ -33,14 +33,12 @@ use sinomo_rollout::{
     write_main_activation, write_rollout_status,
 };
 use std::env;
-use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -437,7 +435,7 @@ fn reexec_shadow_supervisor(
     }
 }
 
-pub fn run_shadow_daemon_supervision_loop<E, F>(
+pub fn run_shadow_daemon_supervision_loop(
     options: crate::DaemonRunOptions,
     shadow_paths: DaemonPaths,
     main_paths: DaemonPaths,
@@ -447,19 +445,14 @@ pub fn run_shadow_daemon_supervision_loop<E, F>(
     cluster: Option<DaemonClusterStatus>,
     finalize_timeout: Duration,
     probe_timeout: Duration,
-    handle_connection: F,
-) -> Result<(), DaemonError>
-where
-    E: Display + Send + 'static,
-    F: Fn(&mut sinomo_network::DaemonControlStream, &DaemonPaths) -> Result<bool, E>
-        + Send
-        + Sync
-        + 'static,
-{
+) -> Result<(), DaemonError> {
     let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
     let bind_address = format!("{}:{}", options.host, options.port);
-    let listener = sinomo_network::DaemonControlListener::bind(&bind_address)?;
-    listener.set_nonblocking(true)?;
+    let daemon_runtime = crate::build_daemon_async_runtime("shadow-daemon")?;
+    let daemon_runtime_handle = daemon_runtime.handle().clone();
+    let listener = daemon_runtime.block_on(sinomo_network::AsyncDaemonControlListener::bind(
+        &bind_address,
+    ))?;
     println!("sinomo shadow daemon listening on {bind_address}");
     crate::append_operational_event_best_effort(
         &shadow_paths,
@@ -480,6 +473,7 @@ where
         &shadow_paths,
         &options,
         cluster.as_ref(),
+        daemon_runtime_handle.clone(),
         "shadow daemon",
     ) {
         eprintln!("sinomo shadow daemon iroh proxy disabled: {error}");
@@ -494,7 +488,9 @@ where
             }),
         );
     }
-    if let Err(error) = start_shadow_daemon_status_publisher(&shadow_paths) {
+    if let Err(error) =
+        start_shadow_daemon_status_publisher(&shadow_paths, daemon_runtime_handle.clone())
+    {
         eprintln!("sinomo shadow daemon status publisher disabled: {error}");
         crate::append_operational_log_best_effort(
             &shadow_paths,
@@ -530,41 +526,54 @@ where
     let mut last_main_probe = Instant::now() - shadow_main_probe_interval(false);
     let mut next_pending_activation_shutdown_nudge = Instant::now();
     let mut main_probe_status = DaemonProbeStatus::NotRunning;
-    let handle_connection = Arc::new(handle_connection);
-    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
+    let (control_shutdown_tx, control_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (control_loop_tx, control_loop_rx) = std::sync::mpsc::channel::<Result<(), DaemonError>>();
+    let control_paths = shadow_paths.clone();
+    let control_bind_address = bind_address.clone();
+    let control_service_runtime = daemon_runtime_handle.clone();
+    let shadow_control_accept_task = daemon_runtime_handle.spawn(async move {
+        let result = match crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+            control_paths.clone(),
+            control_service_runtime.clone(),
+        )
+        .await
+        {
+            Ok(service_host) => {
+                crate::control::run_daemon_control_accept_loop(
+                    listener,
+                    control_paths,
+                    "shadow daemon".to_string(),
+                    control_bind_address,
+                    service_host,
+                    control_service_runtime,
+                    control_shutdown_tx,
+                    control_shutdown_rx,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let _ = control_loop_tx.send(result);
+    });
 
     loop {
-        if shutdown_rx.try_recv().is_ok() {
-            break;
-        }
-        let now = Instant::now();
-        match listener.accept() {
-            Ok(Some(mut stream)) => {
-                let client_paths = shadow_paths.clone();
-                let client_handler = Arc::clone(&handle_connection);
-                let client_shutdown_tx = shutdown_tx.clone();
-                thread::Builder::new()
-                    .name("sinomo-shadow-client".to_string())
-                    .spawn(move || match client_handler(&mut stream, &client_paths) {
-                        Ok(true) => {
-                            let _ = client_shutdown_tx.send(());
-                        }
-                        Ok(false) => {}
-                        Err(error) => eprintln!("sinomo shadow daemon client error: {error}"),
-                    })
-                    .map_err(|source| DaemonError::Io {
-                        path: "spawn shadow daemon client handler".to_string(),
-                        detail: source.to_string(),
-                    })?;
+        match control_loop_rx.try_recv() {
+            Ok(Ok(())) => break,
+            Ok(Err(error)) => {
+                shadow_control_accept_task.abort();
+                return Err(error);
             }
-            Ok(None) => {}
-            Err(source) => {
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                shadow_control_accept_task.abort();
                 return Err(DaemonError::Network {
                     address: bind_address.clone(),
-                    detail: source.to_string(),
+                    detail: "shadow daemon control accept loop stopped before reporting shutdown"
+                        .to_string(),
                 });
             }
         }
+        let now = Instant::now();
 
         let main_probe_interval = shadow_main_probe_interval(pending_rollout.is_some());
         if now.duration_since(last_main_probe) >= main_probe_interval {
@@ -893,6 +902,7 @@ where
 
         thread::sleep(shadow_idle_interval);
     }
+    shadow_control_accept_task.abort();
 
     // Compatibility for old pending re-exec requests. New rollouts are finalized
     // by the main daemon from the stable installed shadow path.

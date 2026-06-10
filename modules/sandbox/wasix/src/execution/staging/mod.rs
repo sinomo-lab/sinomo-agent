@@ -35,14 +35,14 @@ pub(super) fn load_local_toolchain_commands(
         .collect()
 }
 
-pub(super) fn load_sifs_toolchain_artifacts<T: NetworkTransport>(
+pub(super) fn load_sifs_toolchain_artifacts<T: DfsFrameTransport>(
     store: &mut SifsSandboxToolchainStore<T>,
     manifest: &SandboxToolchainManifest,
 ) -> Result<Vec<(String, Vec<u8>)>, SandboxToolchainError> {
     store.load_artifacts(manifest)
 }
 
-pub(super) fn load_sifs_toolchain_commands<T: NetworkTransport>(
+pub(super) fn load_sifs_toolchain_commands<T: DfsFrameTransport>(
     store: &mut SifsSandboxToolchainStore<T>,
     manifest: &SandboxToolchainManifest,
 ) -> Result<Vec<(String, Vec<u8>)>, SandboxToolchainError> {

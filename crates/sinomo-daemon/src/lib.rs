@@ -19,32 +19,45 @@ pub use auth::{
     daemon_rpc_command, sign_daemon_rpc_request_for_local_node,
     sign_daemon_rpc_request_from_data_dir,
 };
+#[cfg(test)]
+pub(crate) use client::send_daemon_rpc_raw;
 pub use client::{
     RemoteConfigClient, fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
-    send_daemon_rollout_binary, send_daemon_rollout_binary_to_endpoint,
-    send_daemon_rollout_binary_upload_chunk, send_daemon_rollout_binary_upload_chunk_to_endpoint,
+    fetch_daemon_status_from_endpoint_async, send_daemon_rollout_binary,
+    send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_binary_upload_chunk,
+    send_daemon_rollout_binary_upload_chunk_to_endpoint,
     send_daemon_rollout_binary_upload_finalize,
     send_daemon_rollout_binary_upload_finalize_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,
-    send_daemon_rollout_diagnostics, send_daemon_rpc, send_daemon_rpc_stream,
-    send_daemon_rpc_to_endpoint, send_daemon_shutdown_request,
+    send_daemon_rollout_diagnostics, send_daemon_rpc, send_daemon_rpc_async,
+    send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
+    send_daemon_rpc_to_endpoint_async, send_daemon_shutdown_request,
+    send_dfs_metadata_journal_batch_to_endpoint_async,
+    send_dfs_metadata_snapshot_install_to_endpoint_async,
+    send_dfs_protocol_frame_to_endpoint_async,
 };
 pub(crate) use client::{
-    send_cluster_kv_txn, send_cluster_kv_watch_events, send_cluster_raft_append,
-    send_cluster_raft_vote, send_dfs_metadata_journal_batch_to_endpoint,
-    send_dfs_metadata_snapshot_install_to_endpoint, send_dfs_protocol_frame_to_endpoint,
+    fetch_cluster_kv_snapshot_from_endpoint_async,
+    fetch_cluster_kv_snapshot_from_endpoint_on_runtime,
+    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_kv_txn_async,
+    send_cluster_kv_txn_on_runtime, send_cluster_kv_watch_events_async,
+    send_cluster_member_publish_async, send_cluster_member_publish_on_runtime,
+    send_cluster_raft_append_async, send_cluster_raft_append_on_runtime,
+    send_cluster_raft_vote_async, send_cluster_raft_vote_on_runtime, send_daemon_rpc_on_runtime,
+    send_daemon_rpc_to_endpoint_on_runtime, send_dfs_metadata_journal_batch_to_endpoint_on_runtime,
+    send_dfs_metadata_snapshot_install_to_endpoint_on_runtime,
+    send_dfs_protocol_frame_to_endpoint_on_runtime,
 };
 pub use control::{
-    handle_daemon_connection, handle_daemon_sandbox_checkpoint, handle_daemon_sandbox_create,
-    handle_daemon_sandbox_destroy, handle_daemon_sandbox_http_fetch,
-    handle_daemon_sandbox_http_fetch_to_file, handle_daemon_sandbox_import_busybox,
-    handle_daemon_sandbox_list, handle_daemon_sandbox_read, handle_daemon_sandbox_reboot,
-    handle_daemon_sandbox_resume, handle_daemon_sandbox_run_process_plan,
-    handle_daemon_sandbox_run_process_plan_stream, handle_daemon_sandbox_run_toolchain,
-    handle_daemon_sandbox_run_toolchain_stream, handle_daemon_sandbox_status,
-    handle_daemon_sandbox_toolchain_add_artifact, handle_daemon_sandbox_toolchain_add_command,
-    handle_daemon_sandbox_toolchain_import_package, handle_daemon_sandbox_update,
-    handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service, run_daemon_control_loop,
+    handle_daemon_sandbox_checkpoint, handle_daemon_sandbox_create, handle_daemon_sandbox_destroy,
+    handle_daemon_sandbox_http_fetch, handle_daemon_sandbox_http_fetch_to_file,
+    handle_daemon_sandbox_import_busybox, handle_daemon_sandbox_list, handle_daemon_sandbox_read,
+    handle_daemon_sandbox_reboot, handle_daemon_sandbox_resume,
+    handle_daemon_sandbox_run_process_plan, handle_daemon_sandbox_run_toolchain,
+    handle_daemon_sandbox_status, handle_daemon_sandbox_toolchain_add_artifact,
+    handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
+    handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
+    run_daemon_control_loop,
 };
 pub use error::DaemonError;
 pub use idle_stats::IdleStatsSnapshot;
@@ -73,8 +86,8 @@ pub(crate) use observe::{
 pub use paths::DaemonPaths;
 pub use process::start_daemon_command_process;
 pub(crate) use process::{
-    CandidateMainDiagnostics, main_exit_observation_from_status, prepare_background_command,
-    spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+    CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
+    prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
@@ -92,17 +105,17 @@ pub use status::{
     DaemonClusterRegistration, DaemonClusterStatus, DaemonLock, DaemonProbeStatus,
     DaemonRunOptions, DaemonStatus, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
     SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
-    current_shadow_daemon_options, daemon_advertised_endpoints_for_state, daemon_bind_address,
-    daemon_cluster_registration, daemon_cluster_status, daemon_connect_address,
-    daemon_options_from_status, daemon_package_version, daemon_status_matches_options,
-    default_main_daemon_status, invite_introducers_from_daemon_status, probe_daemon_status,
-    write_daemon_status,
+    current_shadow_daemon_options, daemon_advertised_endpoints_for_state,
+    daemon_advertised_endpoints_for_state_async, daemon_bind_address, daemon_cluster_registration,
+    daemon_cluster_status, daemon_connect_address, daemon_options_from_status,
+    daemon_package_version, daemon_status_matches_options, default_main_daemon_status,
+    invite_introducers_from_daemon_status, probe_daemon_status, write_daemon_status,
 };
 pub(crate) use status::{
-    current_daemon_cluster_options, daemon_cluster_options_from_status,
-    daemon_cluster_process_from_paths, daemon_cluster_status_matches,
-    daemon_probe_status_needs_restart_for_options, probe_daemon_status_at_address,
-    read_daemon_status,
+    current_daemon_cluster_options, current_shadow_daemon_options_on_runtime,
+    daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
+    daemon_cluster_status_matches, daemon_probe_status_needs_restart_for_options,
+    probe_daemon_status_async, probe_daemon_status_at_address, read_daemon_status,
 };
 
 pub fn register_storage_paths(

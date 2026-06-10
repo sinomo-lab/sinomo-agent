@@ -10,7 +10,7 @@ use sinomo_core::{
 };
 use sinomo_service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 use std::collections::VecDeque;
 use std::fs::{self, File};
@@ -809,6 +809,14 @@ impl Service for ObserveService {
         OBSERVE_ROUTES
     }
 
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        OBSERVE_ROUTES
+            .iter()
+            .copied()
+            .map(observe_service_route)
+            .collect()
+    }
+
     fn handle(
         &self,
         mut ctx: ServiceContext,
@@ -842,6 +850,23 @@ impl Service for ObserveService {
     }
 }
 
+fn observe_service_route(route: &'static str) -> ServiceRoute {
+    let descriptor = observe_module_surfaces()
+        .object_rpc_route_descriptor(route)
+        .expect("observe module surfaces should be valid")
+        .unwrap_or_else(|| panic!("unknown observe service route {route}"));
+    ServiceRoute::from_route_metadata(
+        descriptor.route,
+        descriptor.category,
+        descriptor.auth_scope,
+        descriptor
+            .required_capabilities
+            .into_iter()
+            .map(|capability| capability.to_string()),
+    )
+    .with_concurrency_limit(8)
+}
+
 fn service_error(error: ObserveError) -> ServiceError {
     ServiceError::Service(error.to_string())
 }
@@ -849,6 +874,46 @@ fn service_error(error: ObserveError) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_service::ServiceRegistry;
+
+    #[test]
+    fn observe_service_route_metadata_matches_module_surfaces() {
+        let registry = register_services(ServiceRegistry::builder()).build();
+        let service_routes = registry
+            .route_categories()
+            .into_iter()
+            .map(|route| (route.route.clone(), route))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let module_routes = observe_module_surfaces()
+            .object_rpc_route_descriptors()
+            .expect("observe module surfaces")
+            .into_iter()
+            .map(|descriptor| (descriptor.route.clone(), descriptor))
+            .collect::<std::collections::BTreeMap<_, _>>();
+
+        for route in OBSERVE_ROUTES {
+            let service_route = service_routes
+                .get(*route)
+                .unwrap_or_else(|| panic!("service registry should own observe route {route}"));
+            let module_route = module_routes
+                .get(*route)
+                .unwrap_or_else(|| panic!("module surfaces should declare observe route {route}"));
+            assert_eq!(service_route.category, module_route.category);
+            assert_eq!(
+                service_route.auth_scope.as_deref(),
+                Some(module_route.auth_scope.as_str())
+            );
+            assert_eq!(
+                service_route.required_capabilities,
+                module_route
+                    .required_capabilities
+                    .iter()
+                    .map(|capability| capability.as_str().to_string())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(service_route.concurrency_limit, Some(8));
+        }
+    }
 
     #[test]
     fn operational_events_are_filterable_and_limited() {

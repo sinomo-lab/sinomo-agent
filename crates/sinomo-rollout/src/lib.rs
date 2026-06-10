@@ -1,6 +1,7 @@
 //! Rollout paths, source management, staged binary activation, and rollout policy.
 
 mod artifact;
+mod cluster_kv;
 mod controller;
 mod error;
 mod module_load;
@@ -55,6 +56,13 @@ pub use artifact::{
     current_executable_should_update, install_binary_atomically, install_current_executable,
     restore_rollout_binary_from_backup, rollout_previous_binary_path, same_path_if_exists,
     stage_rollout_bytes, stage_rollout_file, stage_rollout_file_with_retry,
+};
+pub use cluster_kv::{
+    read_cluster_module_rollout_desired_from_kv,
+    read_cluster_module_rollout_reconciliations_from_kv,
+    read_cluster_module_rollout_statuses_from_kv, read_cluster_rollout_desired_from_kv,
+    sync_cluster_module_rollout_desired_to_kv, sync_cluster_module_rollout_node_to_kv,
+    sync_cluster_module_rollout_reconciliation_to_kv, sync_cluster_rollout_desired_to_kv,
 };
 pub use controller::{
     AppliedRolloutTransition, DEFAULT_SHADOW_TELEMETRY_LIMIT, RolloutAction, RolloutController,
@@ -227,6 +235,8 @@ pub fn rollout_module_capabilities() -> sinomo_core::ModuleCapabilities {
         exports: vec![
             rollout_capability("rollout.diagnostics.read"),
             rollout_capability("rollout.binary.apply"),
+            rollout_capability("rollout.binary-upload.chunk"),
+            rollout_capability("rollout.binary-upload.finalize"),
             rollout_capability("rollout.build.apply"),
             rollout_capability("rollout.shadow.finalize"),
             rollout_capability("rollout.status.clear"),

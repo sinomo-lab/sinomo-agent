@@ -14,7 +14,7 @@ use sinomo_local::SinomoDataDir;
 use sinomo_network::{ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_service::{
     ClusterAccess, Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRegistryBuilder,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -331,6 +331,19 @@ impl ConfigStore {
         write_config(data_dir, cluster, &definition, value, target)
     }
 
+    pub async fn set_async(
+        &self,
+        data_dir: &SinomoDataDir,
+        cluster: Option<&dyn ClusterAccess>,
+        key: &str,
+        value: Value,
+        target: ConfigWriteTarget,
+    ) -> Result<ConfigWriteResult, ConfigError> {
+        let definition = self.registry.get(key)?.clone();
+        definition.validate_value(&value)?;
+        write_config_async(data_dir, cluster, &definition, value, target).await
+    }
+
     pub fn set_typed<T: Serialize>(
         &self,
         data_dir: &SinomoDataDir,
@@ -521,6 +534,15 @@ impl Service for ConfigService {
         ]
     }
 
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![
+            ServiceRoute::new(CONFIG_CATALOG_ROUTE, CONFIG_RPC_CATEGORY),
+            ServiceRoute::new(CONFIG_SEARCH_ROUTE, CONFIG_RPC_CATEGORY),
+            ServiceRoute::new(CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY).with_concurrency_limit(8),
+            ServiceRoute::new(CONFIG_SET_ROUTE, CONFIG_RPC_CATEGORY).with_concurrency_limit(8),
+        ]
+    }
+
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let store = Arc::clone(&self.store);
         Box::pin(async move {
@@ -562,13 +584,15 @@ impl Service for ConfigService {
                 }
                 CONFIG_SET_ROUTE => {
                     let request: ConfigSetRequest = request.decode_body()?;
-                    let result = store.set(
-                        &ctx.data_dir,
-                        cluster,
-                        &request.key,
-                        request.value,
-                        request.target,
-                    )?;
+                    let result = store
+                        .set_async(
+                            &ctx.data_dir,
+                            cluster,
+                            &request.key,
+                            request.value,
+                            request.target,
+                        )
+                        .await?;
                     ObjectRpcResponse::encode_body(CONFIG_SET_ROUTE, &ConfigSetResponse { result })?
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
@@ -720,7 +744,57 @@ fn write_config(
                     detail: "config is local-only".to_string(),
                 });
             }
-            write_cluster_config(cluster, definition, value.clone())?;
+            let _ = cluster.ok_or_else(|| ConfigError::ClusterUnavailable {
+                key: definition.key.to_string(),
+            })?;
+            return Err(ConfigError::WriteTargetUnavailable {
+                key: definition.key.to_string(),
+                target,
+                detail: "cluster config writes require the async config service path".to_string(),
+            });
+        }
+        ConfigWriteTarget::Auto => unreachable!("auto target resolved above"),
+    }
+}
+
+async fn write_config_async(
+    data_dir: &SinomoDataDir,
+    cluster: Option<&dyn ClusterAccess>,
+    definition: &ConfigDefinition,
+    value: Value,
+    target: ConfigWriteTarget,
+) -> Result<ConfigWriteResult, ConfigError> {
+    let target = match target {
+        ConfigWriteTarget::Auto => {
+            default_write_target_for(definition.cluster_mode, cluster.is_some())
+        }
+        other => other,
+    };
+    match target {
+        ConfigWriteTarget::Local => {
+            if definition.cluster_mode == ConfigClusterMode::ClusterOnly {
+                return Err(ConfigError::WriteTargetUnavailable {
+                    key: definition.key.to_string(),
+                    target,
+                    detail: "config is cluster-only".to_string(),
+                });
+            }
+            write_local_config(data_dir, definition, value.clone())?;
+            Ok(ConfigWriteResult {
+                key: definition.key.clone(),
+                value,
+                source: ConfigValueSource::Local,
+            })
+        }
+        ConfigWriteTarget::Cluster => {
+            if definition.cluster_mode == ConfigClusterMode::LocalOnly {
+                return Err(ConfigError::WriteTargetUnavailable {
+                    key: definition.key.to_string(),
+                    target,
+                    detail: "config is local-only".to_string(),
+                });
+            }
+            write_cluster_config_async(cluster, definition, value.clone()).await?;
             Ok(ConfigWriteResult {
                 key: definition.key.clone(),
                 value,
@@ -830,7 +904,7 @@ fn read_cluster_config(
     Ok(None)
 }
 
-fn write_cluster_config(
+async fn write_cluster_config_async(
     cluster: Option<&dyn ClusterAccess>,
     definition: &ConfigDefinition,
     value: Value,
@@ -840,11 +914,12 @@ fn write_cluster_config(
     })?;
     let op = cluster_config_put_op(definition, value)?;
     cluster
-        .kv_commit(KvTxn {
+        .kv_commit_async(KvTxn {
             compares: Vec::new(),
             success: vec![op],
             failure: Vec::new(),
         })
+        .await
         .map_err(ConfigError::Service)?;
     Ok(())
 }
@@ -1180,23 +1255,34 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn kv_commit(&self, txn: KvTxn) -> Result<sinomo_kv::KvTxnResponse, ServiceError> {
-            let mut entries = self.entries.lock().expect("cluster lock");
-            for op in txn.success {
-                if let KvOp::Put { key, value, .. } = op {
-                    entries.insert(key, value);
+        fn kv_commit_async<'a>(
+            &'a self,
+            txn: KvTxn,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<sinomo_kv::KvTxnResponse, ServiceError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let mut entries = self.entries.lock().expect("cluster lock");
+                for op in txn.success {
+                    if let KvOp::Put { key, value, .. } = op {
+                        entries.insert(key, value);
+                    }
                 }
-            }
-            Ok(sinomo_kv::KvTxnResponse {
-                succeeded: true,
-                revision: KvRevision(1),
-                responses: Vec::new(),
+                Ok(sinomo_kv::KvTxnResponse {
+                    succeeded: true,
+                    revision: KvRevision(1),
+                    responses: Vec::new(),
+                })
             })
         }
     }
 
-    #[test]
-    fn cluster_override_local_prefers_cluster_when_available() {
+    #[tokio::test]
+    async fn cluster_override_local_prefers_cluster_when_available() {
         let root = std::env::temp_dir().join(format!(
             "sinomo-config-cluster-{}",
             std::time::SystemTime::now()
@@ -1217,13 +1303,14 @@ mod tests {
             .expect("local");
         let cluster = InMemoryCluster::default();
         store
-            .set(
+            .set_async(
                 &data_dir,
                 Some(&cluster),
                 "test.enabled",
                 Value::Bool(true),
                 ConfigWriteTarget::Cluster,
             )
+            .await
             .expect("cluster");
 
         let resolved = store

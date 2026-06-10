@@ -1,5 +1,8 @@
 use crate::error::NetworkError;
 use crate::prelude::*;
+use arc_swap::ArcSwap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Condvar;
 use std::time::Instant;
 
@@ -570,35 +573,52 @@ pub struct InboundFrame {
     pub frame: NetworkFrame,
 }
 
-pub trait NetworkTransport {
-    fn local_node_id(&self) -> &NodeId;
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
-    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        Ok(None)
-    }
-    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
-        if self
-            .pending_incoming_count()?
-            .is_some_and(|count| count > 0)
-        {
-            return Ok(true);
+pub type AsyncNetworkTransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AsyncNetworkSendOptions {
+    timeout: Option<Duration>,
+}
+
+impl AsyncNetworkSendOptions {
+    pub const fn timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
         }
-        if !timeout.is_zero() {
-            std::thread::sleep(timeout);
-        }
-        Ok(self
-            .pending_incoming_count()?
-            .is_some_and(|count| count > 0))
     }
 
-    fn drain_incoming_limited(
-        &mut self,
-        max_frames: usize,
-    ) -> Result<Vec<InboundFrame>, NetworkError> {
-        let _ = max_frames;
-        self.drain_incoming()
+    pub fn from_timeout(timeout: Option<Duration>) -> Self {
+        Self { timeout }
     }
+
+    pub const fn timeout_duration(self) -> Option<Duration> {
+        self.timeout
+    }
+}
+
+pub trait AsyncNetworkTransport {
+    fn local_node_id(&self) -> &NodeId;
+
+    fn send_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        frame: NetworkFrame,
+        options: AsyncNetworkSendOptions,
+    ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>>;
+
+    fn drain_incoming_async<'a>(
+        &'a mut self,
+        max_frames: usize,
+    ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>>;
+
+    fn pending_incoming_count_async<'a>(
+        &'a mut self,
+    ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>>;
+
+    fn wait_for_incoming_async<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>>;
 }
 
 pub(crate) const SEEN_EVENT_CACHE_CAPACITY: usize = 16_384;
@@ -746,16 +766,11 @@ pub enum NetworkStreamFrame {
     },
 }
 
-pub trait NetworkStreamTransport: NetworkTransport {
-    fn send_stream_frame(
-        &mut self,
-        target_node_id: &NodeId,
-        frame: NetworkStreamFrame,
-    ) -> Result<(), NetworkError>;
-
-    fn drain_stream_frames(&mut self) -> Result<Vec<(NodeId, NetworkStreamFrame)>, NetworkError>;
-}
-
+/// Synchronous in-memory frame harness.
+///
+/// This remains available for DFS and tests that drive frames manually. It is
+/// intentionally not an [`AsyncNetworkTransport`]; actor code uses
+/// [`AsyncInProcessNetwork`] or another async transport.
 #[derive(Clone, Debug, Default)]
 pub struct InProcessNetwork {
     inner: Arc<InProcessNetworkInner>,
@@ -804,12 +819,16 @@ pub struct InProcessTransport {
     inner: Arc<InProcessNetworkInner>,
 }
 
-impl NetworkTransport for InProcessTransport {
-    fn local_node_id(&self) -> &NodeId {
+impl InProcessTransport {
+    pub fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
 
-    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+    pub fn send(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkFrame,
+    ) -> Result<(), NetworkError> {
         if &frame.source_node_id != self.local_node_id() {
             return Err(NetworkError::FrameSourceMismatch {
                 local_node_id: self.local_node_id.clone(),
@@ -854,7 +873,7 @@ impl NetworkTransport for InProcessTransport {
         Ok(())
     }
 
-    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+    pub fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -872,7 +891,7 @@ impl NetworkTransport for InProcessTransport {
         Ok(mailbox.drain(..).collect())
     }
 
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+    pub fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         let inner = self
             .inner
             .state
@@ -890,7 +909,7 @@ impl NetworkTransport for InProcessTransport {
         Ok(Some(mailbox.len()))
     }
 
-    fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
+    pub fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         let mut inner = self
             .inner
             .state
@@ -938,7 +957,7 @@ impl NetworkTransport for InProcessTransport {
         Ok(!mailbox.is_empty())
     }
 
-    fn drain_incoming_limited(
+    pub fn drain_incoming_limited(
         &mut self,
         max_frames: usize,
     ) -> Result<Vec<InboundFrame>, NetworkError> {
@@ -961,6 +980,248 @@ impl NetworkTransport for InProcessTransport {
     }
 }
 
+#[derive(Clone)]
+pub struct AsyncInProcessNetwork {
+    inner: Arc<AsyncInProcessNetworkInner>,
+}
+
+impl Default for AsyncInProcessNetwork {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncInProcessNetwork {
+    pub fn new() -> Self {
+        Self::with_mailbox_capacity(IN_PROCESS_MAILBOX_CAPACITY)
+    }
+
+    pub fn with_mailbox_capacity(mailbox_capacity: usize) -> Self {
+        Self::with_mailbox_capacity_and_per_target_send_limit(mailbox_capacity, mailbox_capacity)
+    }
+
+    pub fn with_mailbox_capacity_and_per_target_send_limit(
+        mailbox_capacity: usize,
+        per_target_send_limit: usize,
+    ) -> Self {
+        Self {
+            inner: Arc::new(AsyncInProcessNetworkInner {
+                mailbox_capacity: mailbox_capacity.max(1),
+                per_target_send_limit: per_target_send_limit.max(1),
+                targets: ArcSwap::from_pointee(BTreeMap::new()),
+                target_update_lock: Mutex::new(()),
+            }),
+        }
+    }
+
+    pub fn add_node(&self, node_id: NodeId) -> AsyncInProcessTransport {
+        let (sender, incoming) = tokio::sync::mpsc::channel(self.inner.mailbox_capacity);
+        let target = AsyncInProcessTarget {
+            sender,
+            send_limiter: Arc::new(tokio::sync::Semaphore::new(
+                self.inner.per_target_send_limit,
+            )),
+        };
+        let _guard = self
+            .inner
+            .target_update_lock
+            .lock()
+            .expect("async in-process network target update lock");
+        let mut targets = (*self.inner.targets.load_full()).clone();
+        targets.insert(node_id.clone(), target);
+        self.inner.targets.store(Arc::new(targets));
+
+        AsyncInProcessTransport {
+            local_node_id: node_id,
+            inner: Arc::clone(&self.inner),
+            incoming,
+            pending: VecDeque::new(),
+        }
+    }
+}
+
+struct AsyncInProcessNetworkInner {
+    mailbox_capacity: usize,
+    per_target_send_limit: usize,
+    targets: ArcSwap<BTreeMap<NodeId, AsyncInProcessTarget>>,
+    target_update_lock: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct AsyncInProcessTarget {
+    sender: tokio::sync::mpsc::Sender<InboundFrame>,
+    send_limiter: Arc<tokio::sync::Semaphore>,
+}
+
+pub struct AsyncInProcessTransport {
+    local_node_id: NodeId,
+    inner: Arc<AsyncInProcessNetworkInner>,
+    incoming: tokio::sync::mpsc::Receiver<InboundFrame>,
+    pending: VecDeque<InboundFrame>,
+}
+
+impl AsyncInProcessTransport {
+    fn validate_outbound_frame(
+        &self,
+        target_node_id: &NodeId,
+        frame: &NetworkFrame,
+    ) -> Result<(), NetworkError> {
+        if frame.source_node_id != self.local_node_id {
+            return Err(NetworkError::FrameSourceMismatch {
+                local_node_id: self.local_node_id.clone(),
+                source_node_id: frame.source_node_id.clone(),
+            });
+        }
+
+        if &frame.target_node_id != target_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: target_node_id.clone(),
+                frame_target_node_id: frame.target_node_id.clone(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn target_channel(
+        &self,
+        target_node_id: &NodeId,
+    ) -> Result<AsyncInProcessTarget, NetworkError> {
+        self.inner
+            .targets
+            .load_full()
+            .get(target_node_id)
+            .cloned()
+            .ok_or_else(|| NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending.len() + self.incoming.len()
+    }
+}
+
+impl AsyncNetworkTransport for AsyncInProcessTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+
+    fn send_async<'a>(
+        &'a mut self,
+        target_node_id: &'a NodeId,
+        frame: NetworkFrame,
+        options: AsyncNetworkSendOptions,
+    ) -> AsyncNetworkTransportFuture<'a, Result<(), NetworkError>> {
+        Box::pin(async move {
+            self.validate_outbound_frame(target_node_id, &frame)?;
+            let target = self.target_channel(target_node_id)?;
+            send_async_in_process_frame(target, target_node_id, frame, options).await
+        })
+    }
+
+    fn drain_incoming_async<'a>(
+        &'a mut self,
+        max_frames: usize,
+    ) -> AsyncNetworkTransportFuture<'a, Result<Vec<InboundFrame>, NetworkError>> {
+        Box::pin(async move {
+            let take = max_frames.max(1);
+            let mut frames = self.pending.drain(..).collect::<Vec<_>>();
+            if frames.len() > take {
+                let retained = frames.split_off(take);
+                self.pending.extend(retained);
+                return Ok(frames);
+            }
+            while frames.len() < take {
+                let Ok(frame) = self.incoming.try_recv() else {
+                    break;
+                };
+                frames.push(frame);
+            }
+            Ok(frames)
+        })
+    }
+
+    fn pending_incoming_count_async<'a>(
+        &'a mut self,
+    ) -> AsyncNetworkTransportFuture<'a, Result<Option<usize>, NetworkError>> {
+        Box::pin(async move { Ok(Some(self.pending_count())) })
+    }
+
+    fn wait_for_incoming_async<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> AsyncNetworkTransportFuture<'a, Result<bool, NetworkError>> {
+        Box::pin(async move {
+            if self.pending_count() > 0 {
+                return Ok(true);
+            }
+            if timeout.is_zero() {
+                return Ok(false);
+            }
+            match tokio::time::timeout(timeout, self.incoming.recv()).await {
+                Ok(Some(frame)) => {
+                    self.pending.push_back(frame);
+                    Ok(true)
+                }
+                Ok(None) => Err(NetworkError::Io {
+                    operation: "async in-process receive".to_string(),
+                    detail: format!("mailbox for {} is closed", self.local_node_id),
+                }),
+                Err(_) => Ok(false),
+            }
+        })
+    }
+}
+
+async fn send_async_in_process_frame(
+    target: AsyncInProcessTarget,
+    target_node_id: &NodeId,
+    frame: NetworkFrame,
+    options: AsyncNetworkSendOptions,
+) -> Result<(), NetworkError> {
+    let inbound = InboundFrame {
+        received_by: target_node_id.clone(),
+        frame,
+    };
+    match options.timeout_duration() {
+        Some(timeout) => {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let _permit = tokio::time::timeout_at(deadline, target.send_limiter.acquire_owned())
+                .await
+                .map_err(|_| async_transport_send_timed_out(target_node_id, timeout))?
+                .map_err(|source| NetworkError::Io {
+                    operation: format!("async transport send to {target_node_id}"),
+                    detail: format!("send limiter closed: {source}"),
+                })?;
+            tokio::time::timeout_at(deadline, target.sender.send(inbound))
+                .await
+                .map_err(|_| async_transport_send_timed_out(target_node_id, timeout))?
+        }
+        None => {
+            let _permit = target
+                .send_limiter
+                .acquire_owned()
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: format!("async transport send to {target_node_id}"),
+                    detail: format!("send limiter closed: {source}"),
+                })?;
+            target.sender.send(inbound).await
+        }
+    }
+    .map_err(|_| NetworkError::UnknownNode {
+        node_id: target_node_id.clone(),
+    })
+}
+
+fn async_transport_send_timed_out(target_node_id: &NodeId, timeout: Duration) -> NetworkError {
+    NetworkError::Io {
+        operation: format!("async transport send to {target_node_id}"),
+        detail: format!("timed out after {}ms", timeout.as_millis()),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NetworkService<T> {
     router: InProcessRouter,
@@ -971,7 +1232,7 @@ pub struct NetworkService<T> {
     next_message_id: u64,
 }
 
-impl<T: NetworkTransport> NetworkService<T> {
+impl<T> NetworkService<T> {
     pub fn new(registry: PeerRegistry, transport: T) -> Self {
         Self {
             router: InProcessRouter::new(registry),
@@ -1005,20 +1266,19 @@ impl<T: NetworkTransport> NetworkService<T> {
     fn next_outbound_wake_at(&self) -> Option<Instant> {
         self.ledger.next_outbound_wake_at()
     }
+}
 
-    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        self.transport.pending_incoming_count()
-    }
-
-    fn enqueue_event(
+impl<T: AsyncNetworkTransport> NetworkService<T> {
+    fn enqueue_event_async(
         &mut self,
         stored_event: &StoredEvent,
     ) -> Result<Vec<RouteDelivery>, NetworkError> {
         let deliveries = self.router.route_event(stored_event)?;
+        let local_node_id = AsyncNetworkTransport::local_node_id(&self.transport).clone();
         let mut accepted = Vec::new();
 
         for mut delivery in deliveries {
-            if delivery.target_node_id != *self.transport.local_node_id()
+            if delivery.target_node_id != local_node_id
                 && !self.registry().is_routable(&delivery.target_node_id)
             {
                 delivery.status = DeliveryStatus::WaitingForPeer;
@@ -1035,15 +1295,20 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok(accepted)
     }
 
-    fn pump_outbound(&mut self) -> Result<usize, NetworkError> {
-        self.pump_outbound_limited(NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT)
+    async fn pending_incoming_count_async(&mut self) -> Result<Option<usize>, NetworkError> {
+        self.transport.pending_incoming_count_async().await
     }
 
-    fn pump_outbound_limited(&mut self, max_deliveries: usize) -> Result<usize, NetworkError> {
+    async fn pump_outbound_limited_async(
+        &mut self,
+        max_deliveries: usize,
+        send_deadline: Option<tokio::time::Instant>,
+    ) -> Result<usize, NetworkError> {
         if max_deliveries == 0 {
             return Ok(0);
         }
         self.ledger.expire_ack_deadlines_at(Instant::now());
+        let local_node_id = AsyncNetworkTransport::local_node_id(&self.transport).clone();
         let mut sent = 0;
         let delivery_ids = self
             .ledger
@@ -1055,15 +1320,26 @@ impl<T: NetworkTransport> NetworkService<T> {
                 continue;
             };
 
-            if record.delivery.target_node_id != *self.transport.local_node_id()
+            if record.delivery.target_node_id != local_node_id
                 && !self.registry().is_routable(&record.delivery.target_node_id)
             {
                 self.ledger.mark_waiting_for_peer(delivery_id)?;
                 continue;
             }
 
-            let frame = self.event_frame(&record);
-            match self.transport.send(&record.delivery.target_node_id, frame) {
+            let target_node_id = record.delivery.target_node_id.clone();
+            let frame = self.event_frame_for_local_node(&local_node_id, &record);
+            match self
+                .transport
+                .send_async(
+                    &target_node_id,
+                    frame,
+                    AsyncNetworkSendOptions::from_timeout(remaining_async_command_timeout(
+                        send_deadline,
+                    )),
+                )
+                .await
+            {
                 Ok(()) => {
                     self.ledger.mark_sent(delivery_id)?;
                     sent += 1;
@@ -1084,18 +1360,21 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok(sent)
     }
 
-    fn process_incoming<S: EventStore>(
+    async fn process_incoming_with_send_deadline_async<S: EventStore>(
         &mut self,
         store: &mut S,
+        max_inbound_frames: usize,
+        send_deadline: Option<tokio::time::Instant>,
     ) -> Result<Vec<InboundOutcome>, NetworkError> {
-        if self.transport.pending_incoming_count()? == Some(0) {
+        if self.transport.pending_incoming_count_async().await? == Some(0) {
             return Ok(Vec::new());
         }
         let inbound_frames = self
             .transport
-            .drain_incoming_limited(NETWORK_SERVICE_INBOUND_BATCH_LIMIT)?;
+            .drain_incoming_async(max_inbound_frames)
+            .await?;
         let mut outcomes = Vec::with_capacity(inbound_frames.len());
-        let local_node_id = self.transport.local_node_id().clone();
+        let local_node_id = AsyncNetworkTransport::local_node_id(&self.transport).clone();
 
         for inbound in inbound_frames {
             let source_node_id = inbound.frame.source_node_id.clone();
@@ -1142,10 +1421,24 @@ impl<T: NetworkTransport> NetworkService<T> {
                     let ack = DeliveryAck {
                         delivery_id,
                         event_id: event_id.clone(),
-                        target_node_id: self.transport.local_node_id().clone(),
+                        target_node_id: local_node_id.clone(),
                     };
-                    let ack_frame = self.ack_frame(ack_target_node_id.clone(), ack);
-                    if let Err(error) = self.transport.send(&ack_target_node_id, ack_frame) {
+                    let ack_frame = self.ack_frame_for_local_node(
+                        &local_node_id,
+                        ack_target_node_id.clone(),
+                        ack,
+                    );
+                    if let Err(error) = self
+                        .transport
+                        .send_async(
+                            &ack_target_node_id,
+                            ack_frame,
+                            AsyncNetworkSendOptions::from_timeout(remaining_async_command_timeout(
+                                send_deadline,
+                            )),
+                        )
+                        .await
+                    {
                         outcomes.push(InboundOutcome::AckSendFailed {
                             delivery_id,
                             event_id,
@@ -1223,16 +1516,42 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok(outcomes)
     }
 
-    fn send_heartbeat(&mut self, target_node_id: &NodeId, tick: u64) -> Result<(), NetworkError> {
-        let heartbeat = Heartbeat {
-            node_id: self.transport.local_node_id().clone(),
-            tick,
+    async fn process_incoming_after_wait_with_deadline_async<S: EventStore>(
+        &mut self,
+        store: &mut S,
+        timeout: Duration,
+        max_inbound_frames: usize,
+        command_deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<InboundOutcome>, NetworkError> {
+        let wait_timeout = match remaining_async_command_timeout(command_deadline) {
+            Some(remaining) => timeout.min(remaining),
+            None => timeout,
         };
-        let frame = self.heartbeat_frame(target_node_id.clone(), heartbeat);
-        self.transport.send(target_node_id, frame)
+        if !self.transport.wait_for_incoming_async(wait_timeout).await? {
+            return Ok(Vec::new());
+        }
+        self.process_incoming_with_send_deadline_async(store, max_inbound_frames, command_deadline)
+            .await
     }
 
-    fn record_missed_heartbeat(
+    async fn send_heartbeat_with_transport_deadline_async(
+        &mut self,
+        target_node_id: &NodeId,
+        frame: NetworkFrame,
+        send_deadline: Option<tokio::time::Instant>,
+    ) -> Result<(), NetworkError> {
+        self.transport
+            .send_async(
+                target_node_id,
+                frame,
+                AsyncNetworkSendOptions::from_timeout(remaining_async_command_timeout(
+                    send_deadline,
+                )),
+            )
+            .await
+    }
+
+    fn record_missed_heartbeat_async(
         &mut self,
         target_node_id: &NodeId,
         policy: HeartbeatPolicy,
@@ -1249,14 +1568,18 @@ impl<T: NetworkTransport> NetworkService<T> {
         Ok((status, waiting))
     }
 
-    fn event_frame(&mut self, record: &DeliveryRecord) -> NetworkFrame {
+    fn event_frame_for_local_node(
+        &mut self,
+        local_node_id: &NodeId,
+        record: &DeliveryRecord,
+    ) -> NetworkFrame {
         let frame = NetworkFrame {
             frame_id: NetworkFrameId(self.next_frame_id),
-            source_node_id: self.transport.local_node_id().clone(),
+            source_node_id: local_node_id.clone(),
             target_node_id: record.delivery.target_node_id.clone(),
             message: MeshMessage {
                 message_id: MeshMessageId(self.next_message_id),
-                origin_node_id: self.transport.local_node_id().clone(),
+                origin_node_id: local_node_id.clone(),
                 target_node_id: record.delivery.target_node_id.clone(),
                 body: MeshMessageBody::Event {
                     delivery_id: record.delivery.delivery_id,
@@ -1269,14 +1592,19 @@ impl<T: NetworkTransport> NetworkService<T> {
         frame
     }
 
-    fn ack_frame(&mut self, target_node_id: NodeId, ack: DeliveryAck) -> NetworkFrame {
+    fn ack_frame_for_local_node(
+        &mut self,
+        local_node_id: &NodeId,
+        target_node_id: NodeId,
+        ack: DeliveryAck,
+    ) -> NetworkFrame {
         let frame = NetworkFrame {
             frame_id: NetworkFrameId(self.next_frame_id),
-            source_node_id: self.transport.local_node_id().clone(),
+            source_node_id: local_node_id.clone(),
             target_node_id: target_node_id.clone(),
             message: MeshMessage {
                 message_id: MeshMessageId(self.next_message_id),
-                origin_node_id: self.transport.local_node_id().clone(),
+                origin_node_id: local_node_id.clone(),
                 target_node_id,
                 body: MeshMessageBody::Ack(ack),
             },
@@ -1286,14 +1614,19 @@ impl<T: NetworkTransport> NetworkService<T> {
         frame
     }
 
-    fn heartbeat_frame(&mut self, target_node_id: NodeId, heartbeat: Heartbeat) -> NetworkFrame {
+    fn heartbeat_frame_for_local_node(
+        &mut self,
+        local_node_id: &NodeId,
+        target_node_id: NodeId,
+        heartbeat: Heartbeat,
+    ) -> NetworkFrame {
         let frame = NetworkFrame {
             frame_id: NetworkFrameId(self.next_frame_id),
-            source_node_id: self.transport.local_node_id().clone(),
+            source_node_id: local_node_id.clone(),
             target_node_id: target_node_id.clone(),
             message: MeshMessage {
                 message_id: MeshMessageId(self.next_message_id),
-                origin_node_id: self.transport.local_node_id().clone(),
+                origin_node_id: local_node_id.clone(),
                 target_node_id,
                 body: MeshMessageBody::Heartbeat(heartbeat),
             },
@@ -1305,137 +1638,665 @@ impl<T: NetworkTransport> NetworkService<T> {
 }
 
 /// Bounded command-queue depth for a spawned [`NetworkService`] actor. Once this many
-/// commands are in flight, [`NetworkServiceHandle`] methods await room (backpressure).
+/// commands are in flight, [`AsyncNetworkServiceHandle`] methods await room (backpressure).
 const NETWORK_SERVICE_QUEUE_CAPACITY: usize = 256;
 pub(crate) const NETWORK_SERVICE_INBOUND_BATCH_LIMIT: usize = 256;
 pub(crate) const NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT: usize = 256;
 
-/// A unit of work run on the actor's owned [`NetworkService`] and event store.
-type NetworkServiceJob<T, S> = Box<dyn FnOnce(&mut NetworkService<T>, &mut S) + Send>;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetworkServiceActorOptions {
+    pub command_queue_capacity: usize,
+    pub inbound_batch_limit: usize,
+    pub outbound_batch_limit: usize,
+}
 
-impl<T: NetworkTransport + Send + 'static> NetworkService<T> {
-    /// Run this service as an asynchronous actor. The actor owns the transport, mesh
-    /// state, and event `store`, and serially drains/dispatches inbound frames, sends
-    /// acks, and flushes outbound deliveries in its own task. All interaction goes
-    /// through the returned [`NetworkServiceHandle`] over a bounded command queue —
-    /// this is the single message path for the service.
-    pub fn spawn<S: EventStore + Send + 'static>(self, store: S) -> NetworkServiceHandle<T, S> {
-        let (commands, mut requests) =
-            tokio::sync::mpsc::channel::<NetworkServiceJob<T, S>>(NETWORK_SERVICE_QUEUE_CAPACITY);
-        let task = tokio::spawn(async move {
+impl NetworkServiceActorOptions {
+    fn normalized(self) -> Self {
+        Self {
+            command_queue_capacity: self.command_queue_capacity.max(1),
+            inbound_batch_limit: self.inbound_batch_limit.max(1),
+            outbound_batch_limit: self.outbound_batch_limit.max(1),
+        }
+    }
+}
+
+impl Default for NetworkServiceActorOptions {
+    fn default() -> Self {
+        Self {
+            command_queue_capacity: NETWORK_SERVICE_QUEUE_CAPACITY,
+            inbound_batch_limit: NETWORK_SERVICE_INBOUND_BATCH_LIMIT,
+            outbound_batch_limit: NETWORK_SERVICE_OUTBOUND_BATCH_LIMIT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkServiceCommandBackpressure {
+    WaitForCapacity,
+    FailIfFull,
+}
+
+impl Default for NetworkServiceCommandBackpressure {
+    fn default() -> Self {
+        Self::WaitForCapacity
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetworkServiceCommandOptions {
+    timeout: Option<Duration>,
+    backpressure: NetworkServiceCommandBackpressure,
+}
+
+impl NetworkServiceCommandOptions {
+    pub const fn timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            backpressure: NetworkServiceCommandBackpressure::WaitForCapacity,
+        }
+    }
+
+    pub const fn fail_if_queue_full() -> Self {
+        Self {
+            timeout: None,
+            backpressure: NetworkServiceCommandBackpressure::FailIfFull,
+        }
+    }
+
+    pub const fn timeout_and_fail_if_queue_full(timeout: Duration) -> Self {
+        Self {
+            timeout: Some(timeout),
+            backpressure: NetworkServiceCommandBackpressure::FailIfFull,
+        }
+    }
+
+    pub const fn timeout_duration(self) -> Option<Duration> {
+        self.timeout
+    }
+
+    pub const fn backpressure(self) -> NetworkServiceCommandBackpressure {
+        self.backpressure
+    }
+}
+
+enum AsyncNetworkServiceCommand {
+    EnqueueEvent {
+        stored_event: StoredEvent,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<RouteDelivery>, NetworkError>>,
+    },
+    PumpOutbound {
+        send_deadline: Option<tokio::time::Instant>,
+        reply: tokio::sync::oneshot::Sender<Result<usize, NetworkError>>,
+    },
+    ProcessIncoming {
+        send_deadline: Option<tokio::time::Instant>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<InboundOutcome>, NetworkError>>,
+    },
+    ProcessIncomingAfterWait {
+        timeout: Duration,
+        command_deadline: Option<tokio::time::Instant>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<InboundOutcome>, NetworkError>>,
+    },
+    PendingIncomingCount {
+        reply: tokio::sync::oneshot::Sender<Result<Option<usize>, NetworkError>>,
+    },
+    SendHeartbeat {
+        target_node_id: NodeId,
+        tick: u64,
+        send_deadline: Option<tokio::time::Instant>,
+        reply: tokio::sync::oneshot::Sender<Result<(), NetworkError>>,
+    },
+    RecordMissedHeartbeat {
+        target_node_id: NodeId,
+        policy: HeartbeatPolicy,
+        reply: tokio::sync::oneshot::Sender<Result<(PeerStatus, usize), NetworkError>>,
+    },
+    LedgerRecords {
+        reply: tokio::sync::oneshot::Sender<Result<Vec<DeliveryRecord>, NetworkError>>,
+    },
+    NextOutboundWakeAt {
+        reply: tokio::sync::oneshot::Sender<Result<Option<Instant>, NetworkError>>,
+    },
+}
+
+impl AsyncNetworkServiceCommand {
+    fn caller_is_waiting(&self) -> bool {
+        match self {
+            Self::EnqueueEvent { reply, .. } => !reply.is_closed(),
+            Self::PumpOutbound { reply, .. } => !reply.is_closed(),
+            Self::ProcessIncoming { reply, .. } => !reply.is_closed(),
+            Self::ProcessIncomingAfterWait { reply, .. } => !reply.is_closed(),
+            Self::PendingIncomingCount { reply } => !reply.is_closed(),
+            Self::SendHeartbeat { reply, .. } => !reply.is_closed(),
+            Self::RecordMissedHeartbeat { reply, .. } => !reply.is_closed(),
+            Self::LedgerRecords { reply } => !reply.is_closed(),
+            Self::NextOutboundWakeAt { reply } => !reply.is_closed(),
+        }
+    }
+}
+
+fn remaining_async_command_timeout(deadline: Option<tokio::time::Instant>) -> Option<Duration> {
+    deadline.map(|deadline| {
+        deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or_default()
+    })
+}
+
+impl<T: AsyncNetworkTransport + Send + 'static> NetworkService<T> {
+    /// Run the async transport actor on the caller-owned Tokio runtime.
+    pub fn spawn_on_runtime<S: EventStore + Send + 'static>(
+        self,
+        runtime: tokio::runtime::Handle,
+        store: S,
+    ) -> AsyncNetworkServiceHandle<S> {
+        self.spawn_on_runtime_with_options(runtime, store, NetworkServiceActorOptions::default())
+    }
+
+    /// Run the async transport actor on the caller-owned Tokio runtime with explicit backpressure
+    /// and batch limits.
+    pub fn spawn_on_runtime_with_options<S: EventStore + Send + 'static>(
+        self,
+        runtime: tokio::runtime::Handle,
+        store: S,
+        options: NetworkServiceActorOptions,
+    ) -> AsyncNetworkServiceHandle<S> {
+        let options = options.normalized();
+        let (commands, mut requests) = tokio::sync::mpsc::channel::<AsyncNetworkServiceCommand>(
+            options.command_queue_capacity,
+        );
+        let task = runtime.spawn(async move {
             let mut service = self;
             let mut store = store;
-            while let Some(job) = requests.recv().await {
-                job(&mut service, &mut store);
+            while let Some(command) = requests.recv().await {
+                if !command.caller_is_waiting() {
+                    continue;
+                }
+                match command {
+                    AsyncNetworkServiceCommand::EnqueueEvent {
+                        stored_event,
+                        reply,
+                    } => {
+                        let _ = reply.send(service.enqueue_event_async(&stored_event));
+                    }
+                    AsyncNetworkServiceCommand::PumpOutbound {
+                        send_deadline,
+                        mut reply,
+                    } => {
+                        tokio::select! {
+                            result = service.pump_outbound_limited_async(
+                                options.outbound_batch_limit,
+                                send_deadline,
+                            ) => {
+                                let _ = reply.send(result);
+                            }
+                            _ = reply.closed() => {}
+                        }
+                    }
+                    AsyncNetworkServiceCommand::ProcessIncoming {
+                        send_deadline,
+                        reply,
+                    } => {
+                        let _ = reply.send(
+                            service
+                                .process_incoming_with_send_deadline_async(
+                                    &mut store,
+                                    options.inbound_batch_limit,
+                                    send_deadline,
+                                )
+                                .await,
+                        );
+                    }
+                    AsyncNetworkServiceCommand::ProcessIncomingAfterWait {
+                        timeout,
+                        command_deadline,
+                        mut reply,
+                    } => {
+                        tokio::select! {
+                            result = service.process_incoming_after_wait_with_deadline_async(
+                                &mut store,
+                                timeout,
+                                options.inbound_batch_limit,
+                                command_deadline,
+                            ) => {
+                                let _ = reply.send(result);
+                            }
+                            _ = reply.closed() => {}
+                        }
+                    }
+                    AsyncNetworkServiceCommand::PendingIncomingCount { reply } => {
+                        let _ = reply.send(service.pending_incoming_count_async().await);
+                    }
+                    AsyncNetworkServiceCommand::SendHeartbeat {
+                        target_node_id,
+                        tick,
+                        send_deadline,
+                        mut reply,
+                    } => {
+                        let local_node_id =
+                            AsyncNetworkTransport::local_node_id(&service.transport).clone();
+                        let heartbeat = Heartbeat {
+                            node_id: local_node_id.clone(),
+                            tick,
+                        };
+                        let frame = service.heartbeat_frame_for_local_node(
+                            &local_node_id,
+                            target_node_id.clone(),
+                            heartbeat,
+                        );
+                        tokio::select! {
+                            result = service.send_heartbeat_with_transport_deadline_async(
+                                &target_node_id,
+                                frame,
+                                send_deadline,
+                            ) => {
+                                let _ = reply.send(result);
+                            }
+                            _ = reply.closed() => {}
+                        }
+                    }
+                    AsyncNetworkServiceCommand::RecordMissedHeartbeat {
+                        target_node_id,
+                        policy,
+                        reply,
+                    } => {
+                        let _ = reply
+                            .send(service.record_missed_heartbeat_async(&target_node_id, policy));
+                    }
+                    AsyncNetworkServiceCommand::LedgerRecords { reply } => {
+                        let _ = reply.send(Ok(service
+                            .ledger()
+                            .records()
+                            .into_iter()
+                            .cloned()
+                            .collect()));
+                    }
+                    AsyncNetworkServiceCommand::NextOutboundWakeAt { reply } => {
+                        let _ = reply.send(Ok(service.next_outbound_wake_at()));
+                    }
+                }
             }
             store
         });
-        NetworkServiceHandle { commands, task }
+        AsyncNetworkServiceHandle { commands, task }
     }
 }
 
-/// Handle to a [`NetworkService`] running as an async actor (see
-/// [`NetworkService::spawn`]). The actor processes commands — and the inbound frames it
-/// drains from the transport — serially in its own task, so the shared mesh state needs
-/// no locking. Each method enqueues one command on the bounded queue and awaits its
-/// reply; backpressure falls out of the bounded queue when commands outpace the actor.
-pub struct NetworkServiceHandle<T, S> {
-    commands: tokio::sync::mpsc::Sender<NetworkServiceJob<T, S>>,
+/// Handle to a [`NetworkService`] running with an [`AsyncNetworkTransport`] actor
+/// (see [`NetworkService::spawn_on_runtime`]). Transport send/drain work is awaited inside
+/// the actor instead of running through synchronous transport calls.
+pub struct AsyncNetworkServiceHandle<S> {
+    commands: tokio::sync::mpsc::Sender<AsyncNetworkServiceCommand>,
     task: tokio::task::JoinHandle<S>,
 }
 
-impl<T, S> NetworkServiceHandle<T, S>
+impl<S> AsyncNetworkServiceHandle<S>
 where
-    T: NetworkTransport + Send + 'static,
-    S: EventStore + Send + 'static,
+    S: Send + 'static,
 {
-    async fn run_job<R, F>(&self, job: F) -> Result<R, NetworkError>
-    where
-        R: Send + 'static,
-        F: FnOnce(&mut NetworkService<T>, &mut S) -> R + Send + 'static,
-    {
-        let (reply, response) = tokio::sync::oneshot::channel();
-        let request: NetworkServiceJob<T, S> = Box::new(move |service, store| {
-            let _ = reply.send(job(service, store));
-        });
-        self.commands
-            .send(request)
-            .await
-            .map_err(|_| network_service_stopped())?;
-        response.await.map_err(|_| network_service_stopped())
+    pub fn available_command_capacity(&self) -> usize {
+        self.commands.capacity()
     }
 
-    /// Route `stored_event` to its targets and accept the resulting deliveries.
+    pub fn max_command_capacity(&self) -> usize {
+        self.commands.max_capacity()
+    }
+
+    pub fn is_command_queue_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
+    pub fn with_command_options(
+        &self,
+        options: NetworkServiceCommandOptions,
+    ) -> AsyncNetworkServiceCommands<'_, S> {
+        AsyncNetworkServiceCommands {
+            handle: self,
+            options,
+        }
+    }
+
+    pub fn with_command_timeout(&self, timeout: Duration) -> AsyncNetworkServiceCommands<'_, S> {
+        self.with_command_options(NetworkServiceCommandOptions::timeout(timeout))
+    }
+
+    async fn request<R>(
+        &self,
+        make_command: impl FnOnce(
+            tokio::sync::oneshot::Sender<Result<R, NetworkError>>,
+        ) -> AsyncNetworkServiceCommand,
+    ) -> Result<R, NetworkError>
+    where
+        R: Send + 'static,
+    {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(make_command(reply))
+            .await
+            .map_err(|_| network_service_stopped())?;
+        response.await.map_err(|_| network_service_stopped())?
+    }
+
+    async fn request_with_options<R>(
+        &self,
+        operation: &'static str,
+        options: NetworkServiceCommandOptions,
+        make_command: impl FnOnce(
+            tokio::sync::oneshot::Sender<Result<R, NetworkError>>,
+            Option<tokio::time::Instant>,
+        ) -> AsyncNetworkServiceCommand,
+    ) -> Result<R, NetworkError>
+    where
+        R: Send + 'static,
+    {
+        if matches!(
+            options.backpressure(),
+            NetworkServiceCommandBackpressure::FailIfFull
+        ) {
+            return self
+                .request_with_fail_fast_queue(operation, options, make_command)
+                .await;
+        }
+
+        let Some(timeout) = options.timeout_duration() else {
+            let (reply, response) = tokio::sync::oneshot::channel();
+            self.commands
+                .send(make_command(reply, None))
+                .await
+                .map_err(|_| network_service_stopped())?;
+            return response.await.map_err(|_| network_service_stopped())?;
+        };
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let command = make_command(reply, Some(deadline));
+        let permit = tokio::time::timeout_at(deadline, self.commands.reserve())
+            .await
+            .map_err(|_| network_service_command_timed_out(operation, timeout))?
+            .map_err(|_| network_service_stopped())?;
+        permit.send(command);
+        tokio::time::timeout_at(deadline, response)
+            .await
+            .map_err(|_| network_service_command_timed_out(operation, timeout))?
+            .map_err(|_| network_service_stopped())?
+    }
+
+    async fn request_with_fail_fast_queue<R>(
+        &self,
+        operation: &'static str,
+        options: NetworkServiceCommandOptions,
+        make_command: impl FnOnce(
+            tokio::sync::oneshot::Sender<Result<R, NetworkError>>,
+            Option<tokio::time::Instant>,
+        ) -> AsyncNetworkServiceCommand,
+    ) -> Result<R, NetworkError>
+    where
+        R: Send + 'static,
+    {
+        let deadline = options
+            .timeout_duration()
+            .map(|timeout| tokio::time::Instant::now() + timeout);
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let command = make_command(reply, deadline);
+        let permit = self.commands.try_reserve().map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                network_service_command_queue_full(operation, self.commands.max_capacity())
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => network_service_stopped(),
+        })?;
+        permit.send(command);
+        if let Some(timeout) = options.timeout_duration() {
+            let deadline = deadline.expect("deadline set with timeout");
+            return tokio::time::timeout_at(deadline, response)
+                .await
+                .map_err(|_| network_service_command_timed_out(operation, timeout))?
+                .map_err(|_| network_service_stopped())?;
+        }
+        response.await.map_err(|_| network_service_stopped())?
+    }
+
     pub async fn enqueue_event(
         &self,
         stored_event: StoredEvent,
     ) -> Result<Vec<RouteDelivery>, NetworkError> {
-        self.run_job(move |service, _store| service.enqueue_event(&stored_event))
-            .await?
+        self.request(|reply| AsyncNetworkServiceCommand::EnqueueEvent {
+            stored_event,
+            reply,
+        })
+        .await
     }
 
-    /// Flush ready outbound deliveries through the transport, returning the count sent.
     pub async fn pump_outbound(&self) -> Result<usize, NetworkError> {
-        self.run_job(|service, _store| service.pump_outbound())
-            .await?
+        self.request(|reply| AsyncNetworkServiceCommand::PumpOutbound {
+            send_deadline: None,
+            reply,
+        })
+        .await
     }
 
-    /// Drain the transport and dispatch every pending inbound frame (events, acks,
-    /// heartbeats, protocol), returning the outcomes in arrival order.
     pub async fn process_incoming(&self) -> Result<Vec<InboundOutcome>, NetworkError> {
-        self.run_job(|service, store| service.process_incoming(store))
-            .await?
+        self.request(|reply| AsyncNetworkServiceCommand::ProcessIncoming {
+            send_deadline: None,
+            reply,
+        })
+        .await
     }
 
-    /// Exact pending inbound-frame count when the underlying transport can report
-    /// it cheaply. A `None` result means callers should fall back to their normal
-    /// receive scheduling path.
+    pub async fn process_incoming_after_wait(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<InboundOutcome>, NetworkError> {
+        self.request(
+            |reply| AsyncNetworkServiceCommand::ProcessIncomingAfterWait {
+                timeout,
+                command_deadline: None,
+                reply,
+            },
+        )
+        .await
+    }
+
     pub async fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
-        self.run_job(|service, _store| service.pending_incoming_count())
-            .await?
+        self.request(|reply| AsyncNetworkServiceCommand::PendingIncomingCount { reply })
+            .await
     }
 
-    /// Send a heartbeat to `target_node_id`.
     pub async fn send_heartbeat(
         &self,
         target_node_id: NodeId,
         tick: u64,
     ) -> Result<(), NetworkError> {
-        self.run_job(move |service, _store| service.send_heartbeat(&target_node_id, tick))
-            .await?
+        self.request(|reply| AsyncNetworkServiceCommand::SendHeartbeat {
+            target_node_id,
+            tick,
+            send_deadline: None,
+            reply,
+        })
+        .await
     }
 
-    /// Record a missed heartbeat for `target_node_id` and park its pending deliveries
-    /// when the peer crosses into a non-routable state.
     pub async fn record_missed_heartbeat(
         &self,
         target_node_id: NodeId,
         policy: HeartbeatPolicy,
     ) -> Result<(PeerStatus, usize), NetworkError> {
-        self.run_job(move |service, _store| {
-            service.record_missed_heartbeat(&target_node_id, policy)
+        self.request(|reply| AsyncNetworkServiceCommand::RecordMissedHeartbeat {
+            target_node_id,
+            policy,
+            reply,
         })
-        .await?
+        .await
     }
 
-    /// Snapshot the delivery-ledger records.
     pub async fn ledger_records(&self) -> Result<Vec<DeliveryRecord>, NetworkError> {
-        self.run_job(|service, _store| service.ledger().records().into_iter().cloned().collect())
+        self.request(|reply| AsyncNetworkServiceCommand::LedgerRecords { reply })
             .await
     }
 
-    /// Earliest time a future [`NetworkServiceHandle::pump_outbound`] could make
-    /// progress for queued or retrying work. Schedulers can use this to sleep through
-    /// retry backoff windows instead of polling while no delivery is ready.
     pub async fn next_outbound_wake_at(&self) -> Result<Option<Instant>, NetworkError> {
-        self.run_job(|service, _store| service.next_outbound_wake_at())
+        self.request(|reply| AsyncNetworkServiceCommand::NextOutboundWakeAt { reply })
             .await
     }
 
-    /// Stop the actor and return the owned event store for inspection.
     pub async fn shutdown(self) -> S {
-        drop(self.commands);
-        self.task.await.expect("network service actor panicked")
+        self.try_shutdown()
+            .await
+            .expect("network service actor stopped unexpectedly")
+    }
+
+    pub async fn try_shutdown(self) -> Result<S, NetworkError> {
+        let Self { commands, task } = self;
+        drop(commands);
+        task.await.map_err(network_service_actor_join_error)
+    }
+
+    pub async fn shutdown_with_timeout(self, timeout: Duration) -> Result<S, NetworkError> {
+        let Self { commands, mut task } = self;
+        drop(commands);
+        match tokio::time::timeout(timeout, &mut task).await {
+            Ok(result) => result.map_err(network_service_actor_join_error),
+            Err(_) => {
+                task.abort();
+                Err(network_service_command_timed_out("shutdown", timeout))
+            }
+        }
+    }
+
+    pub fn abort(self) {
+        let Self { commands, task } = self;
+        drop(commands);
+        task.abort();
+    }
+}
+
+pub struct AsyncNetworkServiceCommands<'a, S> {
+    handle: &'a AsyncNetworkServiceHandle<S>,
+    options: NetworkServiceCommandOptions,
+}
+
+impl<S> AsyncNetworkServiceCommands<'_, S>
+where
+    S: Send + 'static,
+{
+    pub async fn enqueue_event(
+        &self,
+        stored_event: StoredEvent,
+    ) -> Result<Vec<RouteDelivery>, NetworkError> {
+        self.handle
+            .request_with_options("enqueue-event", self.options, |reply, _deadline| {
+                AsyncNetworkServiceCommand::EnqueueEvent {
+                    stored_event,
+                    reply,
+                }
+            })
+            .await
+    }
+
+    pub async fn pump_outbound(&self) -> Result<usize, NetworkError> {
+        self.handle
+            .request_with_options("pump-outbound", self.options, |reply, deadline| {
+                AsyncNetworkServiceCommand::PumpOutbound {
+                    send_deadline: deadline,
+                    reply,
+                }
+            })
+            .await
+    }
+
+    pub async fn process_incoming(&self) -> Result<Vec<InboundOutcome>, NetworkError> {
+        self.handle
+            .request_with_options("process-incoming", self.options, |reply, deadline| {
+                AsyncNetworkServiceCommand::ProcessIncoming {
+                    send_deadline: deadline,
+                    reply,
+                }
+            })
+            .await
+    }
+
+    pub async fn process_incoming_after_wait(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<InboundOutcome>, NetworkError> {
+        self.handle
+            .request_with_options(
+                "process-incoming-after-wait",
+                self.options,
+                |reply, deadline| AsyncNetworkServiceCommand::ProcessIncomingAfterWait {
+                    timeout,
+                    command_deadline: deadline,
+                    reply,
+                },
+            )
+            .await
+    }
+
+    pub async fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        self.handle
+            .request_with_options(
+                "pending-incoming-count",
+                self.options,
+                |reply, _deadline| AsyncNetworkServiceCommand::PendingIncomingCount { reply },
+            )
+            .await
+    }
+
+    pub async fn send_heartbeat(
+        &self,
+        target_node_id: NodeId,
+        tick: u64,
+    ) -> Result<(), NetworkError> {
+        self.handle
+            .request_with_options("send-heartbeat", self.options, |reply, deadline| {
+                AsyncNetworkServiceCommand::SendHeartbeat {
+                    target_node_id,
+                    tick,
+                    send_deadline: deadline,
+                    reply,
+                }
+            })
+            .await
+    }
+
+    pub async fn record_missed_heartbeat(
+        &self,
+        target_node_id: NodeId,
+        policy: HeartbeatPolicy,
+    ) -> Result<(PeerStatus, usize), NetworkError> {
+        self.handle
+            .request_with_options(
+                "record-missed-heartbeat",
+                self.options,
+                |reply, _deadline| AsyncNetworkServiceCommand::RecordMissedHeartbeat {
+                    target_node_id,
+                    policy,
+                    reply,
+                },
+            )
+            .await
+    }
+
+    pub async fn ledger_records(&self) -> Result<Vec<DeliveryRecord>, NetworkError> {
+        self.handle
+            .request_with_options("ledger-records", self.options, |reply, _deadline| {
+                AsyncNetworkServiceCommand::LedgerRecords { reply }
+            })
+            .await
+    }
+
+    pub async fn next_outbound_wake_at(&self) -> Result<Option<Instant>, NetworkError> {
+        self.handle
+            .request_with_options("next-outbound-wake-at", self.options, |reply, _deadline| {
+                AsyncNetworkServiceCommand::NextOutboundWakeAt { reply }
+            })
+            .await
+    }
+}
+
+fn network_service_actor_join_error(source: tokio::task::JoinError) -> NetworkError {
+    NetworkError::Io {
+        operation: "network-service-actor".to_string(),
+        detail: source.to_string(),
     }
 }
 
@@ -1443,6 +2304,20 @@ fn network_service_stopped() -> NetworkError {
     NetworkError::Io {
         operation: "network-service-command".to_string(),
         detail: "network service actor is no longer running".to_string(),
+    }
+}
+
+fn network_service_command_queue_full(operation: &str, max_commands: usize) -> NetworkError {
+    NetworkError::NetworkServiceCommandQueueFull {
+        operation: operation.to_string(),
+        max_commands,
+    }
+}
+
+fn network_service_command_timed_out(operation: &str, timeout: Duration) -> NetworkError {
+    NetworkError::Io {
+        operation: format!("network-service-command {operation}"),
+        detail: format!("timed out after {}ms", timeout.as_millis()),
     }
 }
 

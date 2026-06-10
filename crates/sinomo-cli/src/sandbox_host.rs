@@ -50,7 +50,11 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         paths: &sinomo_runtime::network::ClusterPaths,
     ) -> Option<Result<sinomo_runtime::kv::KvSnapshot, sinomo_runtime::sandbox::SandboxCliError>>
     {
-        Some(sinomo_runtime::network::read_cluster_kv_snapshot(paths).map_err(Into::into))
+        Some(
+            sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+                .map_err(sinomo_runtime::network::NetworkError::from)
+                .map_err(Into::into),
+        )
     }
 
     #[cfg(test)]
@@ -61,11 +65,12 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
     ) -> Option<Result<(), sinomo_runtime::sandbox::SandboxCliError>> {
         let paths = sinomo_runtime::network::ClusterPaths::new(data_dir);
         let result = (|| {
-            let snapshot = sinomo_runtime::network::read_cluster_kv_snapshot(&paths)
+            let snapshot = sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
                 .unwrap_or_else(|_| sinomo_runtime::kv::InProcessKvStore::new().snapshot());
             let mut store = sinomo_runtime::kv::InProcessKvStore::restore(snapshot);
             let _: sinomo_runtime::kv::KvTxnResponse = store.txn(txn.clone())?;
-            sinomo_runtime::network::write_cluster_kv_snapshot(&paths, &store.snapshot())?;
+            sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
+                .map_err(sinomo_runtime::network::NetworkError::from)?;
             Ok(())
         })();
         Some(result)

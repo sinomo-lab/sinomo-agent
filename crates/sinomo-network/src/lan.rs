@@ -3,10 +3,8 @@ use crate::object::SinomoObjectCodec;
 use crate::peer::{NetworkFrame, PeerEndpointCandidate};
 use crate::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{
-    LazyLock,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::future::Future;
+use std::sync::LazyLock;
 use std::time::Instant;
 
 const DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -15,12 +13,11 @@ pub(crate) const PUBLIC_IP_DISCOVERY_EMPTY_CACHE_TTL: Duration = Duration::from_
 pub(crate) const PUBLIC_IP_DISCOVERY_DEFERRED_CACHE_TTL: Duration = Duration::from_secs(30);
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_CACHE_ENTRIES: usize = 8;
 pub(crate) const MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES: u64 = 16 * 1024;
-pub(crate) const MAX_PUBLIC_IP_DNS_WORKERS: usize = 2;
+const PUBLIC_IP_DISCOVERY_IO_TIMEOUT: Duration = Duration::from_millis(750);
 static DEFAULT_LAN_IP_DISCOVERY_CACHE: LazyLock<Mutex<Option<LocalIpDiscoveryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 static PUBLIC_IP_DISCOVERY_CACHE: LazyLock<Mutex<PublicIpDiscoveryCache>> =
     LazyLock::new(|| Mutex::new(PublicIpDiscoveryCache::default()));
-static PUBLIC_IP_DNS_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
 struct LocalIpDiscoveryCacheEntry {
@@ -185,33 +182,6 @@ pub(crate) enum PublicIpDiscoveryResult {
     Deferred(Vec<IpAddr>),
 }
 
-#[derive(Debug)]
-pub(crate) struct PublicIpDnsWorkerPermit;
-
-impl Drop for PublicIpDnsWorkerPermit {
-    fn drop(&mut self) {
-        PUBLIC_IP_DNS_WORKERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-pub(crate) fn try_acquire_public_ip_dns_worker() -> Option<PublicIpDnsWorkerPermit> {
-    let mut current = PUBLIC_IP_DNS_WORKERS.load(Ordering::Acquire);
-    loop {
-        if current >= MAX_PUBLIC_IP_DNS_WORKERS {
-            return None;
-        }
-        match PUBLIC_IP_DNS_WORKERS.compare_exchange_weak(
-            current,
-            current + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return Some(PublicIpDnsWorkerPermit),
-            Err(observed) => current = observed,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LanQuicEndpointConfig {
     pub bind_address: String,
@@ -269,6 +239,11 @@ pub fn discover_default_lan_ip_candidates() -> Vec<IpAddr> {
     cached_default_lan_ip_candidates_with(discover_default_lan_ip_candidates_uncached)
 }
 
+pub async fn discover_default_lan_ip_candidates_async() -> Vec<IpAddr> {
+    cached_default_lan_ip_candidates_with_async(discover_default_lan_ip_candidates_uncached_async)
+        .await
+}
+
 pub(crate) fn cached_default_lan_ip_candidates_with(
     discover: impl FnOnce() -> Vec<IpAddr>,
 ) -> Vec<IpAddr> {
@@ -289,6 +264,28 @@ pub(crate) fn cached_default_lan_ip_candidates_with(
     candidates
 }
 
+pub(crate) async fn cached_default_lan_ip_candidates_with_async<F, Fut>(discover: F) -> Vec<IpAddr>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Vec<IpAddr>>,
+{
+    let now = Instant::now();
+    if let Ok(cache) = DEFAULT_LAN_IP_DISCOVERY_CACHE.lock()
+        && let Some(entry) = cache.as_ref()
+        && now.duration_since(entry.checked_at) < DEFAULT_LAN_IP_DISCOVERY_CACHE_TTL
+    {
+        return entry.candidates.clone();
+    }
+    let candidates = discover().await;
+    if let Ok(mut cache) = DEFAULT_LAN_IP_DISCOVERY_CACHE.lock() {
+        *cache = Some(LocalIpDiscoveryCacheEntry {
+            checked_at: now,
+            candidates: candidates.clone(),
+        });
+    }
+    candidates
+}
+
 fn discover_default_lan_ip_candidates_uncached() -> Vec<IpAddr> {
     let targets = ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"]
         .into_iter()
@@ -297,6 +294,25 @@ fn discover_default_lan_ip_candidates_uncached() -> Vec<IpAddr> {
     for ip in discover_interface_ip_candidates() {
         if !candidates.contains(&ip) {
             candidates.push(ip);
+        }
+    }
+    candidates
+}
+
+async fn discover_default_lan_ip_candidates_uncached_async() -> Vec<IpAddr> {
+    let targets = ["8.8.8.8:80", "1.1.1.1:80", "192.0.2.1:80"]
+        .into_iter()
+        .filter_map(|target| target.parse::<SocketAddr>().ok())
+        .collect::<Vec<_>>();
+    let route_candidates = discover_local_ip_candidates_for_targets_async(targets);
+    let interface_candidates = tokio::task::spawn_blocking(discover_interface_ip_candidates);
+    let (mut candidates, interface_candidates) =
+        tokio::join!(route_candidates, interface_candidates);
+    if let Ok(interface_candidates) = interface_candidates {
+        for ip in interface_candidates {
+            if !candidates.contains(&ip) {
+                candidates.push(ip);
+            }
         }
     }
     candidates
@@ -329,7 +345,7 @@ pub fn iroh_disabled_by_env() -> bool {
     std::env::var("SINOMO_DISABLE_IROH").ok().as_deref() == Some("1")
 }
 
-pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
+pub async fn discover_default_public_ip_candidates_async() -> Vec<IpAddr> {
     if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
         .ok()
         .as_deref()
@@ -337,15 +353,17 @@ pub fn discover_default_public_ip_candidates() -> Vec<IpAddr> {
     {
         return Vec::new();
     }
-    cached_default_public_ip_candidates_for_key_with(Vec::new(), || {
-        discover_public_ip_candidates_from_hosts_with_status(&[
+    cached_default_public_ip_candidates_for_key_with_async(Vec::new(), || async {
+        discover_public_ip_candidates_from_hosts_with_status_async(&[
             ("api.ipify.org", "/"),
             ("ifconfig.me", "/ip"),
         ])
+        .await
     })
+    .await
 }
 
-pub(crate) fn discover_default_public_ip_candidates_for_local_ips(
+pub(crate) async fn discover_default_public_ip_candidates_for_local_ips_async(
     local_ips: impl IntoIterator<Item = IpAddr>,
 ) -> Vec<IpAddr> {
     if std::env::var("SINOMO_DISABLE_PUBLIC_IP_DISCOVERY")
@@ -355,14 +373,17 @@ pub(crate) fn discover_default_public_ip_candidates_for_local_ips(
     {
         return Vec::new();
     }
-    cached_default_public_ip_candidates_for_local_ips_with(local_ips, || {
-        discover_public_ip_candidates_from_hosts_with_status(&[
+    cached_default_public_ip_candidates_for_local_ips_with_async(local_ips, || async {
+        discover_public_ip_candidates_from_hosts_with_status_async(&[
             ("api.ipify.org", "/"),
             ("ifconfig.me", "/ip"),
         ])
+        .await
     })
+    .await
 }
 
+#[cfg(test)]
 pub(crate) fn cached_default_public_ip_candidates_for_local_ips_with(
     local_ips: impl IntoIterator<Item = IpAddr>,
     discover: impl FnOnce() -> PublicIpDiscoveryResult,
@@ -370,6 +391,22 @@ pub(crate) fn cached_default_public_ip_candidates_for_local_ips_with(
     cached_default_public_ip_candidates_for_key_with(local_network_cache_key(local_ips), discover)
 }
 
+pub(crate) async fn cached_default_public_ip_candidates_for_local_ips_with_async<F, Fut>(
+    local_ips: impl IntoIterator<Item = IpAddr>,
+    discover: F,
+) -> Vec<IpAddr>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = PublicIpDiscoveryResult>,
+{
+    cached_default_public_ip_candidates_for_key_with_async(
+        local_network_cache_key(local_ips),
+        discover,
+    )
+    .await
+}
+
+#[cfg(test)]
 fn cached_default_public_ip_candidates_for_key_with(
     cache_key: Vec<IpAddr>,
     discover: impl FnOnce() -> PublicIpDiscoveryResult,
@@ -381,6 +418,42 @@ fn cached_default_public_ip_candidates_for_key_with(
         return candidates;
     }
     let result = discover();
+    let (candidates, complete) = match result {
+        PublicIpDiscoveryResult::Complete(candidates) => (candidates, true),
+        PublicIpDiscoveryResult::Deferred(candidates) if candidates.is_empty() => {
+            return candidates;
+        }
+        PublicIpDiscoveryResult::Deferred(candidates) => (candidates, false),
+    };
+    if let Ok(mut cache) = PUBLIC_IP_DISCOVERY_CACHE.lock() {
+        cache.insert(
+            cache_key,
+            PublicIpDiscoveryCacheEntry {
+                checked_at: now,
+                candidates: candidates.clone(),
+                complete,
+            },
+            now,
+        );
+    }
+    candidates
+}
+
+async fn cached_default_public_ip_candidates_for_key_with_async<F, Fut>(
+    cache_key: Vec<IpAddr>,
+    discover: F,
+) -> Vec<IpAddr>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = PublicIpDiscoveryResult>,
+{
+    let now = Instant::now();
+    if let Ok(cache) = PUBLIC_IP_DISCOVERY_CACHE.lock()
+        && let Some(candidates) = cache.get_fresh(&cache_key, now)
+    {
+        return candidates;
+    }
+    let result = discover().await;
     let (candidates, complete) = match result {
         PublicIpDiscoveryResult::Complete(candidates) => (candidates, true),
         PublicIpDiscoveryResult::Deferred(candidates) if candidates.is_empty() => {
@@ -427,14 +500,14 @@ pub(crate) fn age_public_ip_discovery_cache_for_test(age: Duration) {
     }
 }
 
-pub fn discover_public_ip_candidates_from_hosts(hosts: &[(&str, &str)]) -> Vec<IpAddr> {
-    match discover_public_ip_candidates_from_hosts_with_status(hosts) {
+pub async fn discover_public_ip_candidates_from_hosts_async(hosts: &[(&str, &str)]) -> Vec<IpAddr> {
+    match discover_public_ip_candidates_from_hosts_with_status_async(hosts).await {
         PublicIpDiscoveryResult::Complete(candidates)
         | PublicIpDiscoveryResult::Deferred(candidates) => candidates,
     }
 }
 
-pub(crate) fn discover_public_ip_candidates_from_hosts_with_status(
+pub(crate) async fn discover_public_ip_candidates_from_hosts_with_status_async(
     hosts: &[(&str, &str)],
 ) -> PublicIpDiscoveryResult {
     let mut candidates = Vec::new();
@@ -446,40 +519,20 @@ pub(crate) fn discover_public_ip_candidates_from_hosts_with_status(
         return PublicIpDiscoveryResult::Complete(candidates);
     }
     for (host, path) in hosts {
-        let address = match resolve_public_ip_service_address(host, Duration::from_millis(750)) {
+        let address = match resolve_public_ip_service_address_async(host).await {
             PublicIpServiceAddressResolution::Resolved(address) => address,
             PublicIpServiceAddressResolution::Unavailable => continue,
             PublicIpServiceAddressResolution::Deferred => {
                 return PublicIpDiscoveryResult::Deferred(candidates);
             }
         };
-        let Ok(mut stream) =
-            std::net::TcpStream::connect_timeout(&address, Duration::from_millis(750))
+        let Ok(service_candidates) =
+            fetch_public_ip_candidates_from_service_async(host, path, address).await
         else {
             continue;
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(750)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
-        let request = format!(
-            "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: sinomo-public-ip-discovery/0.1\r\nConnection: close\r\n\r\n"
-        );
-        if std::io::Write::write_all(&mut stream, request.as_bytes()).is_err() {
-            continue;
-        }
-        let Ok(response) = read_public_ip_discovery_response(&mut stream) else {
-            continue;
-        };
-        let body = response.rsplit("\r\n\r\n").next().unwrap_or(&response);
-        for token in body
-            .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\''))
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            let Ok(ip) = token.parse::<IpAddr>() else {
-                continue;
-            };
-            if is_invitable_ip(ip) && !is_private_or_link_local_ip(ip) && !candidates.contains(&ip)
-            {
+        for ip in service_candidates {
+            if !candidates.contains(&ip) {
                 candidates.push(ip);
             }
         }
@@ -487,13 +540,90 @@ pub(crate) fn discover_public_ip_candidates_from_hosts_with_status(
     PublicIpDiscoveryResult::Complete(candidates)
 }
 
-pub(crate) fn read_public_ip_discovery_response(
-    reader: impl std::io::Read,
-) -> std::io::Result<String> {
+pub(crate) async fn fetch_public_ip_candidates_from_service_async(
+    host: &str,
+    path: &str,
+    address: SocketAddr,
+) -> Result<Vec<IpAddr>, NetworkError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::time::timeout(
+        PUBLIC_IP_DISCOVERY_IO_TIMEOUT,
+        tokio::net::TcpStream::connect(address),
+    )
+    .await
+    .map_err(|_| NetworkError::Io {
+        operation: format!("connect public ip service {host}"),
+        detail: format!(
+            "timed out after {}ms",
+            PUBLIC_IP_DISCOVERY_IO_TIMEOUT.as_millis()
+        ),
+    })?
+    .map_err(|source| NetworkError::Io {
+        operation: format!("connect public ip service {host}"),
+        detail: source.to_string(),
+    })?;
+    let request = public_ip_discovery_http_request(host, path);
+    tokio::time::timeout(
+        PUBLIC_IP_DISCOVERY_IO_TIMEOUT,
+        stream.write_all(request.as_bytes()),
+    )
+    .await
+    .map_err(|_| NetworkError::Io {
+        operation: format!("write public ip service {host}"),
+        detail: format!(
+            "timed out after {}ms",
+            PUBLIC_IP_DISCOVERY_IO_TIMEOUT.as_millis()
+        ),
+    })?
+    .map_err(|source| NetworkError::Io {
+        operation: format!("write public ip service {host}"),
+        detail: source.to_string(),
+    })?;
+
     let mut response = String::new();
-    let mut limited = std::io::Read::take(reader, MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES);
-    std::io::Read::read_to_string(&mut limited, &mut response)?;
-    Ok(response)
+    let mut limited = stream.take(MAX_PUBLIC_IP_DISCOVERY_RESPONSE_BYTES);
+    tokio::time::timeout(
+        PUBLIC_IP_DISCOVERY_IO_TIMEOUT,
+        limited.read_to_string(&mut response),
+    )
+    .await
+    .map_err(|_| NetworkError::Io {
+        operation: format!("read public ip service {host}"),
+        detail: format!(
+            "timed out after {}ms",
+            PUBLIC_IP_DISCOVERY_IO_TIMEOUT.as_millis()
+        ),
+    })?
+    .map_err(|source| NetworkError::Io {
+        operation: format!("read public ip service {host}"),
+        detail: source.to_string(),
+    })?;
+    Ok(parse_public_ip_discovery_response(&response))
+}
+
+fn public_ip_discovery_http_request(host: &str, path: &str) -> String {
+    format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: sinomo-public-ip-discovery/0.1\r\nConnection: close\r\n\r\n"
+    )
+}
+
+pub(crate) fn parse_public_ip_discovery_response(response: &str) -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+    let body = response.rsplit("\r\n\r\n").next().unwrap_or(response);
+    for token in body
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | '"' | '\''))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        let Ok(ip) = token.parse::<IpAddr>() else {
+            continue;
+        };
+        if is_invitable_ip(ip) && !is_private_or_link_local_ip(ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -503,30 +633,15 @@ enum PublicIpServiceAddressResolution {
     Deferred,
 }
 
-fn resolve_public_ip_service_address(
-    host: &str,
-    timeout: Duration,
-) -> PublicIpServiceAddressResolution {
-    let Some(permit) = try_acquire_public_ip_dns_worker() else {
-        return PublicIpServiceAddressResolution::Deferred;
-    };
-    let host = host.to_string();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _permit = permit;
-        let address = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 80))
-            .ok()
-            .and_then(|mut addresses| addresses.next());
-        let _ = sender.send(address);
-    });
-    match receiver.recv_timeout(timeout) {
-        Ok(Some(address)) => PublicIpServiceAddressResolution::Resolved(address),
-        Ok(None) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            PublicIpServiceAddressResolution::Unavailable
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            PublicIpServiceAddressResolution::Deferred
-        }
+async fn resolve_public_ip_service_address_async(host: &str) -> PublicIpServiceAddressResolution {
+    let lookup = tokio::net::lookup_host((host, 80));
+    match tokio::time::timeout(PUBLIC_IP_DISCOVERY_IO_TIMEOUT, lookup).await {
+        Ok(Ok(mut addresses)) => addresses
+            .next()
+            .map(PublicIpServiceAddressResolution::Resolved)
+            .unwrap_or(PublicIpServiceAddressResolution::Unavailable),
+        Ok(Err(_)) => PublicIpServiceAddressResolution::Unavailable,
+        Err(_) => PublicIpServiceAddressResolution::Deferred,
     }
 }
 
@@ -558,6 +673,34 @@ where
             continue;
         };
         if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(address) = socket.local_addr() else {
+            continue;
+        };
+        let ip = address.ip();
+        if is_invitable_ip(ip) && !candidates.contains(&ip) {
+            candidates.push(ip);
+        }
+    }
+    candidates
+}
+
+pub async fn discover_local_ip_candidates_for_targets_async<I>(targets: I) -> Vec<IpAddr>
+where
+    I: IntoIterator<Item = SocketAddr>,
+{
+    let mut candidates = Vec::new();
+    for target in targets {
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let Ok(socket) = tokio::net::UdpSocket::bind(bind).await else {
+            continue;
+        };
+        if socket.connect(target).await.is_err() {
             continue;
         }
         let Ok(address) = socket.local_addr() else {
@@ -909,46 +1052,39 @@ fn clamped_lan_discovery_ttl_ticks(ttl_ticks: u64) -> u64 {
 }
 
 #[derive(Debug)]
-pub struct MdnsDiscoverySocket {
-    socket: UdpSocket,
+pub struct AsyncMdnsDiscoverySocket {
+    socket: tokio::net::UdpSocket,
     multicast_address: SocketAddrV4,
 }
 
-impl MdnsDiscoverySocket {
-    pub fn bind_default() -> Result<Self, NetworkError> {
-        Self::bind_port(SINOMO_LAN_DISCOVERY_PORT)
+impl AsyncMdnsDiscoverySocket {
+    pub async fn bind_default() -> Result<Self, NetworkError> {
+        Self::bind_port(SINOMO_LAN_DISCOVERY_PORT).await
     }
 
-    pub fn bind_port(port: u16) -> Result<Self, NetworkError> {
-        let socket =
-            UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port)).map_err(|source| {
-                NetworkError::Io {
-                    operation: "bind lan discovery socket".to_string(),
-                    detail: source.to_string(),
-                }
-            })?;
-        socket
-            .set_nonblocking(true)
+    pub async fn bind_port(port: u16) -> Result<Self, NetworkError> {
+        let socket = tokio::net::UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
+            .await
             .map_err(|source| NetworkError::Io {
-                operation: "set lan discovery nonblocking".to_string(),
+                operation: "bind async lan discovery socket".to_string(),
                 detail: source.to_string(),
             })?;
         socket
             .set_multicast_loop_v4(true)
             .map_err(|source| NetworkError::Io {
-                operation: "enable lan discovery multicast loopback".to_string(),
+                operation: "enable async lan discovery multicast loopback".to_string(),
                 detail: source.to_string(),
             })?;
         socket
             .set_multicast_ttl_v4(16)
             .map_err(|source| NetworkError::Io {
-                operation: "set lan discovery multicast ttl".to_string(),
+                operation: "set async lan discovery multicast ttl".to_string(),
                 detail: source.to_string(),
             })?;
         socket
-            .join_multicast_v4(&SINOMO_LAN_DISCOVERY_MULTICAST, &Ipv4Addr::UNSPECIFIED)
+            .join_multicast_v4(SINOMO_LAN_DISCOVERY_MULTICAST, Ipv4Addr::UNSPECIFIED)
             .map_err(|source| NetworkError::Io {
-                operation: "join lan discovery multicast group".to_string(),
+                operation: "join async lan discovery multicast group".to_string(),
                 detail: source.to_string(),
             })?;
 
@@ -958,15 +1094,16 @@ impl MdnsDiscoverySocket {
         })
     }
 
-    pub fn announce(
+    pub async fn announce(
         &self,
         advertisement: &MdnsDiscoveryAdvertisement,
     ) -> Result<usize, NetworkError> {
         let bytes = SinomoObjectCodec::default().encode(advertisement)?;
         self.socket
             .send_to(&bytes, self.multicast_address)
+            .await
             .map_err(|source| NetworkError::Io {
-                operation: "send lan discovery advertisement".to_string(),
+                operation: "send async lan discovery advertisement".to_string(),
                 detail: source.to_string(),
             })
     }
@@ -975,7 +1112,7 @@ impl MdnsDiscoverySocket {
         let mut advertisements = Vec::new();
         let mut buffer = [0_u8; 64 * 1024];
         for _ in 0..MAX_MDNS_DISCOVERY_DRAIN_DATAGRAMS {
-            match self.socket.recv_from(&mut buffer) {
+            match self.socket.try_recv_from(&mut buffer) {
                 Ok((received, _source)) => {
                     if let Some(advertisement) = decode_lan_discovery_datagram(&buffer[..received])
                     {
@@ -985,7 +1122,7 @@ impl MdnsDiscoverySocket {
                 Err(source) if source.kind() == io::ErrorKind::WouldBlock => break,
                 Err(source) => {
                     return Err(NetworkError::Io {
-                        operation: "receive lan discovery advertisement".to_string(),
+                        operation: "receive async lan discovery advertisement".to_string(),
                         detail: source.to_string(),
                     });
                 }
