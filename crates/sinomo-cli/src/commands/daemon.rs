@@ -11,6 +11,7 @@ pub(crate) enum DaemonCliCommand {
     ShadowStart(DaemonRunOptions),
     ShadowStatus(DaemonRunOptions),
     ShadowStop(DaemonRunOptions),
+    CompleteShadowRollout,
 }
 
 pub(crate) fn print_daemon_platform(status: &DaemonStatus) {
@@ -37,6 +38,9 @@ pub(crate) fn parse_daemon_command(args: &[String]) -> Result<DaemonCliCommand, 
         }
         Some((command, rest)) if command == "stop" => {
             Ok(DaemonCliCommand::Stop(parse_daemon_run_options(rest)?))
+        }
+        Some((command, [])) if command == "__complete-shadow-rollout" => {
+            Ok(DaemonCliCommand::CompleteShadowRollout)
         }
         _ => Err(CliError::Usage),
     }
@@ -112,6 +116,7 @@ pub(crate) fn run_daemon_cli_command(command: DaemonCliCommand) -> Result<(), Cl
         DaemonCliCommand::ShadowStart(options) => start_shadow_daemon(options),
         DaemonCliCommand::ShadowStatus(options) => print_shadow_daemon_status(options),
         DaemonCliCommand::ShadowStop(options) => stop_shadow_daemon(options),
+        DaemonCliCommand::CompleteShadowRollout => complete_shadow_rollout_from_helper(),
     }
 }
 
@@ -129,6 +134,13 @@ pub(crate) fn shadow_daemon_paths_from_defaults() -> Result<DaemonPaths, CliErro
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     Ok(DaemonPaths::for_shadow(&data_dir))
+}
+
+pub(crate) fn complete_shadow_rollout_from_helper() -> Result<(), CliError> {
+    let response =
+        daemon_handle_deferred_shadow_rollout_completion(&daemon_paths_from_defaults()?)?;
+    print!("{response}");
+    Ok(())
 }
 
 pub(crate) fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {

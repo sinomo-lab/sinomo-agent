@@ -70,7 +70,7 @@ pub fn install_binary_atomically(source: &Path, destination: &Path) -> Result<()
         detail: error.to_string(),
     })?;
     if destination.exists() {
-        let previous = destination.with_extension("previous");
+        let previous = rollout_previous_binary_path(destination);
         let _ = fs::remove_file(&previous);
         fs::rename(destination, &previous).map_err(|source| RolloutError::Io {
             path: format!("{} -> {}", destination.display(), previous.display()),
@@ -206,4 +206,39 @@ fn set_executable(_destination: &Path) -> Result<(), RolloutError> {
         })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn install_binary_atomically_preserves_executable_suffix_in_previous_backup() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-rollout-artifact-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("root");
+        let source = root.join("candidate.exe");
+        let destination = root.join("sinomo.exe");
+        fs::write(&source, b"candidate").expect("source");
+        fs::write(&destination, b"previous").expect("destination");
+
+        install_binary_atomically(&source, &destination).expect("install");
+
+        assert_eq!(
+            fs::read(&destination).expect("destination bytes"),
+            b"candidate"
+        );
+        assert_eq!(
+            fs::read(rollout_previous_binary_path(&destination)).expect("previous bytes"),
+            b"previous"
+        );
+        assert!(!root.join("sinomo.previous").exists());
+        let _ = fs::remove_dir_all(root);
+    }
 }

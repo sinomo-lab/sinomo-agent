@@ -49,6 +49,8 @@ pub struct PendingShadowRollout {
     pub shadow_binary: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staged_shadow_binary: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_main_binary: Option<PathBuf>,
     pub previous_shadow_binary: PathBuf,
     pub main_host: String,
     pub main_port: u16,
@@ -163,6 +165,9 @@ pub trait PendingShadowRolloutContext {
     fn main_binary(&self) -> &Path;
     fn main_host(&self) -> &str;
     fn main_port(&self) -> u16;
+    fn previous_main_binary(&self) -> Option<&Path> {
+        None
+    }
     fn previous_shadow_binary(&self) -> &Path;
 }
 
@@ -462,6 +467,7 @@ pub fn stage_pending_shadow_rollout(
         main_binary: pending.main_binary().to_path_buf(),
         shadow_binary: activation.shadow_binary.clone(),
         staged_shadow_binary: activation.staged_shadow_binary.clone(),
+        previous_main_binary: pending.previous_main_binary().map(Path::to_path_buf),
         previous_shadow_binary: pending.previous_shadow_binary().to_path_buf(),
         main_host: pending.main_host().to_string(),
         main_port: pending.main_port(),

@@ -7,6 +7,7 @@ use crate::{
     DaemonProbeStatus, DaemonStatus, daemon_connect_address, prepare_background_command,
     probe_daemon_status, read_daemon_status, send_daemon_shutdown_request,
     spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+    spawn_shadow_rollout_recovery_helper_process,
 };
 #[cfg(test)]
 use sinomo_rollout::read_rollout_status;
@@ -20,18 +21,18 @@ use sinomo_rollout::{
     MainExitObservation, ManagedSourceDeployOptions, PendingShadowRolloutContext,
     ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutActivationStrategy, RolloutFailureDiagnostics,
     RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
-    SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, classify_main_exit, clear_rollout_status,
-    cluster_rollout_progress_status, deploy_managed_source_bundle_with_options,
-    ensure_rollout_layout, install_binary_atomically, managed_source_status,
+    SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, activate_staged_rollout_binary,
+    classify_main_exit, clear_rollout_status, cluster_rollout_progress_status,
+    deploy_managed_source_bundle_with_options, ensure_rollout_layout, managed_source_status,
     read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
     record_activation_failure, record_main_activation_staged,
     record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
     record_shadow_rollout_finalized, remove_main_activation, remove_shadow_finalize,
-    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_main_activation_path,
-    rollout_remote_repo_path, rollout_shadow_finalize_path, rollout_staged_main_binary,
-    rollout_staged_shadow_binary, rollout_timestamp_now, source_heads_match,
-    stage_pending_shadow_rollout, stage_rollout_bytes, stage_rollout_file, write_json,
-    write_main_activation, write_rollout_status,
+    restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_artifacts,
+    rollout_main_activation_path, rollout_previous_binary_path, rollout_remote_repo_path,
+    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
+    rollout_timestamp_now, source_heads_match, stage_pending_shadow_rollout, stage_rollout_bytes,
+    stage_rollout_file, write_json, write_main_activation, write_rollout_status,
 };
 use std::env;
 use std::fs::{self, File};
@@ -272,6 +273,10 @@ impl PendingShadowRolloutContext for ShadowMainRolloutMonitor {
         self.main_options.port
     }
 
+    fn previous_main_binary(&self) -> Option<&Path> {
+        Some(&self.previous_main_binary)
+    }
+
     fn previous_shadow_binary(&self) -> &Path {
         &self.previous_shadow_binary
     }
@@ -350,15 +355,31 @@ fn take_shadow_reexec_request(rollout_paths: &SelfRolloutPaths) -> Option<PathBu
     }
 }
 
-fn install_rollout_file_atomically_with_retry(
-    source: &Path,
+fn activate_staged_rollout_binary_with_retry(
+    staged: &Path,
+    destination: &Path,
+    timeout: Duration,
+    retry_interval: Duration,
+) -> Result<Option<PathBuf>, DaemonError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match activate_staged_rollout_binary(staged, destination) {
+            Ok(previous) => return Ok(previous),
+            Err(_) if Instant::now() < deadline => thread::sleep(retry_interval),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn restore_rollout_binary_from_backup_with_retry(
+    backup: &Path,
     destination: &Path,
     timeout: Duration,
     retry_interval: Duration,
 ) -> Result<(), DaemonError> {
     let deadline = Instant::now() + timeout;
     loop {
-        match install_binary_atomically(source, destination) {
+        match restore_rollout_binary_from_backup(backup, destination) {
             Ok(()) => return Ok(()),
             Err(_) if Instant::now() < deadline => thread::sleep(retry_interval),
             Err(error) => return Err(error.into()),
@@ -1617,7 +1638,7 @@ fn stage_main_only_rollout_without_existing_shadow(
         .ok_or_else(|| DaemonError::NotRunning {
             detail: "main-only rollout requires a staged shadow binary".to_string(),
         })?;
-    install_rollout_file_atomically_with_retry(
+    let previous_shadow_binary = activate_staged_rollout_binary_with_retry(
         staged_shadow,
         &activation.shadow_binary,
         STABLE_BINARY_COPY_TIMEOUT,
@@ -1655,6 +1676,14 @@ fn stage_main_only_rollout_without_existing_shadow(
             previous_main,
             &format!("main-only rollout could not start stable shadow supervisor: {error}"),
         );
+        if let Some(previous_shadow_binary) = previous_shadow_binary.as_ref() {
+            let _ = restore_rollout_binary_from_backup_with_retry(
+                previous_shadow_binary,
+                &activation.shadow_binary,
+                STABLE_BINARY_COPY_TIMEOUT,
+                STABLE_BINARY_COPY_RETRY_INTERVAL,
+            );
+        }
         let _ = remove_main_activation(rollout_paths);
         return Err(error);
     }
@@ -1777,15 +1806,22 @@ fn rollout_staged_detail(
     }
 }
 
-fn stop_shadow_supervisor_for_rollout(
-    shadow_paths: &DaemonPaths,
+fn daemon_control_port_released(host: &str, port: u16) -> bool {
+    std::net::TcpListener::bind(daemon_connect_address(host, port)).is_ok()
+}
+
+fn stop_daemon_for_rollout(
+    daemon_paths: &DaemonPaths,
+    host: &str,
+    port: u16,
+    label: &str,
     timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
     let deadline = Instant::now() + timeout;
     let mut next_shutdown_nudge = Instant::now();
     loop {
-        match probe_daemon_status(shadow_paths, probe_timeout) {
+        match probe_daemon_status(daemon_paths, probe_timeout) {
             DaemonProbeStatus::Running(status) => {
                 if Instant::now() >= next_shutdown_nudge {
                     let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
@@ -1800,17 +1836,59 @@ fn stop_shadow_supervisor_for_rollout(
                     next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
                 }
             }
-            DaemonProbeStatus::Locked { status: None } => {}
-            DaemonProbeStatus::NotRunning => return Ok(()),
+            DaemonProbeStatus::Locked { status: None } => {
+                if daemon_control_port_released(host, port) {
+                    return Ok(());
+                }
+            }
+            DaemonProbeStatus::NotRunning => {
+                if daemon_control_port_released(host, port) {
+                    return Ok(());
+                }
+            }
         }
         if Instant::now() >= deadline {
             return Err(DaemonError::Network {
-                address: shadow_paths.root.display().to_string(),
-                detail: "shadow supervisor did not stop for rollout finalization".to_string(),
+                address: daemon_connect_address(host, port),
+                detail: format!("{label} did not release control listener for rollout"),
             });
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn stop_shadow_supervisor_for_rollout(
+    shadow_paths: &DaemonPaths,
+    shadow_host: &str,
+    shadow_port: u16,
+    timeout: Duration,
+    probe_timeout: Duration,
+) -> Result<(), DaemonError> {
+    stop_daemon_for_rollout(
+        shadow_paths,
+        shadow_host,
+        shadow_port,
+        "shadow supervisor",
+        timeout,
+        probe_timeout,
+    )
+}
+
+fn stop_main_daemon_for_rollout(
+    main_paths: &DaemonPaths,
+    main_host: &str,
+    main_port: u16,
+    timeout: Duration,
+    probe_timeout: Duration,
+) -> Result<(), DaemonError> {
+    stop_daemon_for_rollout(
+        main_paths,
+        main_host,
+        main_port,
+        "main daemon",
+        timeout,
+        probe_timeout,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1856,6 +1934,8 @@ fn ensure_shadow_supervisor_running_from_installed_path(
     }
     stop_shadow_supervisor_for_rollout(
         &shadow_paths,
+        shadow_host,
+        shadow_port,
         Duration::from_secs(15),
         DAEMON_PROBE_TIMEOUT,
     )?;
@@ -1905,19 +1985,46 @@ fn ensure_shadow_supervisor_running_from_installed_path(
 }
 
 pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<String, DaemonError> {
+    finalize_pending_shadow_rollout(paths, false, true)
+}
+
+pub fn handle_deferred_shadow_rollout_completion(
+    paths: &DaemonPaths,
+) -> Result<String, DaemonError> {
+    finalize_pending_shadow_rollout(paths, true, false)
+}
+
+fn finalize_pending_shadow_rollout(
+    paths: &DaemonPaths,
+    stop_main_first: bool,
+    defer_on_error: bool,
+) -> Result<String, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let Some(finalize) = read_pending_shadow_rollout(&rollout_paths)? else {
         return Ok("no pending shadow rollout\n".to_string());
     };
 
+    let main_paths = DaemonPaths::with_root(data_dir.join("daemon"));
     let shadow_paths = DaemonPaths::with_root(data_dir.join("shadow-daemon"));
     let mut detail = "shadow rollout finalized".to_string();
     let mut status = "accepted";
+    let mut previous_shadow_binary = finalize.previous_shadow_binary.clone();
 
     let outcome = (|| -> Result<(), DaemonError> {
+        if stop_main_first {
+            stop_main_daemon_for_rollout(
+                &main_paths,
+                &finalize.main_host,
+                finalize.main_port,
+                Duration::from_secs(30),
+                DAEMON_PROBE_TIMEOUT,
+            )?;
+        }
         stop_shadow_supervisor_for_rollout(
             &shadow_paths,
+            &finalize.shadow_host,
+            finalize.shadow_port,
             Duration::from_secs(15),
             DAEMON_PROBE_TIMEOUT,
         )?;
@@ -1926,12 +2033,14 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
             .as_ref()
             .filter(|path| path.exists())
         {
-            install_rollout_file_atomically_with_retry(
+            if let Some(backup) = activate_staged_rollout_binary_with_retry(
                 staged_shadow,
                 &finalize.shadow_binary,
                 STABLE_BINARY_COPY_TIMEOUT,
                 STABLE_BINARY_COPY_RETRY_INTERVAL,
-            )?;
+            )? {
+                previous_shadow_binary = backup;
+            }
         }
         ensure_shadow_supervisor_running_from_installed_path(
             data_dir,
@@ -1946,36 +2055,69 @@ pub fn handle_daemon_finalize_shadow_rollout(paths: &DaemonPaths) -> Result<Stri
     })();
 
     if let Err(error) = outcome {
+        if defer_on_error {
+            match spawn_shadow_rollout_recovery_helper_process() {
+                Ok(()) => {
+                    return Ok(format!(
+                        "deferred: shadow rollout finalization needs main process handoff after {error}\n"
+                    ));
+                }
+                Err(helper_error) => {
+                    eprintln!(
+                        "sinomo shadow rollout finalize helper spawn failed: {helper_error}; attempting inline rollback"
+                    );
+                }
+            }
+        }
         // The new supervisor did not become healthy. Restore the previous
-        // (known-good) binary and recover with verified, bounded retries so the
-        // node is not left without a supervisor.
+        // known-good binaries and recover with verified, bounded retries so the
+        // node is not left without a supervisor or on a half-activated build.
         let _ = take_shadow_reexec_request(&rollout_paths);
-        let _ = install_rollout_file_atomically_with_retry(
-            &finalize.previous_shadow_binary,
-            &finalize.shadow_binary,
-            STABLE_BINARY_COPY_TIMEOUT,
-            STABLE_BINARY_COPY_RETRY_INTERVAL,
-        );
-        match ensure_shadow_supervisor_running_from_installed_path(
-            data_dir,
-            &finalize.shadow_binary,
-            &finalize.main_binary,
-            &finalize.main_host,
-            finalize.main_port,
-            &finalize.shadow_host,
-            finalize.shadow_port,
-            SHADOW_RECOVERY_DEADLINE,
-        ) {
+        let recovery_result = (|| -> Result<(), DaemonError> {
+            stop_main_daemon_for_rollout(
+                &main_paths,
+                &finalize.main_host,
+                finalize.main_port,
+                Duration::from_secs(15),
+                DAEMON_PROBE_TIMEOUT,
+            )?;
+            if let Some(previous_main_binary) = finalize.previous_main_binary.as_ref() {
+                restore_rollout_binary_from_backup_with_retry(
+                    previous_main_binary,
+                    &finalize.main_binary,
+                    STABLE_BINARY_COPY_TIMEOUT,
+                    STABLE_BINARY_COPY_RETRY_INTERVAL,
+                )?;
+            }
+            restore_rollout_binary_from_backup_with_retry(
+                &previous_shadow_binary,
+                &finalize.shadow_binary,
+                STABLE_BINARY_COPY_TIMEOUT,
+                STABLE_BINARY_COPY_RETRY_INTERVAL,
+            )
+        })();
+        match recovery_result.and_then(|()| {
+            ensure_shadow_supervisor_running_from_installed_path(
+                data_dir,
+                &finalize.shadow_binary,
+                &finalize.main_binary,
+                &finalize.main_host,
+                finalize.main_port,
+                &finalize.shadow_host,
+                finalize.shadow_port,
+                SHADOW_RECOVERY_DEADLINE,
+            )
+        }) {
             Ok(()) => {
                 status = "rolled-back";
                 detail = format!(
-                    "candidate shadow did not become healthy ({error}); restored previous supervisor binary"
+                    "candidate shadow did not become healthy ({error}); restored previous main and shadow binaries"
                 );
             }
             Err(recovery_error) => {
                 status = "failed";
                 detail = format!(
-                    "candidate shadow failed ({error}) and recovery supervisor did not become healthy: {recovery_error}"
+                    "candidate shadow failed ({error}) and rollback supervisor did not become healthy: {recovery_error}"
                 );
                 eprintln!("sinomo shadow rollout finalize: {detail}");
             }
@@ -2208,7 +2350,13 @@ pub fn recover_failed_shadow_main_rollout(
         detail,
         Some(&diagnostics),
     )?;
-    let main_binary = pending.previous_main_binary.clone();
+    restore_rollout_binary_from_backup_with_retry(
+        &pending.previous_main_binary,
+        &pending.activation.main_binary,
+        STABLE_BINARY_COPY_TIMEOUT,
+        STABLE_BINARY_COPY_RETRY_INTERVAL,
+    )?;
+    let main_binary = pending.activation.main_binary.clone();
     remove_main_activation(rollout_paths);
     Ok(main_binary)
 }
@@ -2220,10 +2368,10 @@ pub fn start_shadow_main_if_needed(
     candidate_timeout: Duration,
 ) -> Result<ShadowMainStart, DaemonError> {
     if let Some(activation) = read_rollout_main_activation(rollout_paths)? {
-        let previous_main_binary = activation
+        let mut previous_main_binary = activation
             .previous_main_binary
             .clone()
-            .unwrap_or_else(|| main_binary.to_path_buf());
+            .unwrap_or_else(|| rollout_previous_binary_path(&activation.main_binary));
         let activation_main_options = crate::DaemonRunOptions {
             host: activation.main_host.clone(),
             port: activation.main_port,
@@ -2233,12 +2381,14 @@ pub fn start_shadow_main_if_needed(
             .as_ref()
             .filter(|path| path.exists())
         {
-            install_rollout_file_atomically_with_retry(
+            if let Some(backup) = activate_staged_rollout_binary_with_retry(
                 staged_main,
                 &activation.main_binary,
                 STABLE_BINARY_COPY_TIMEOUT,
                 STABLE_BINARY_COPY_RETRY_INTERVAL,
-            )?;
+            )? {
+                previous_main_binary = backup;
+            }
         }
         match spawn_candidate_main_daemon_process(
             &activation.main_binary,
@@ -2247,7 +2397,8 @@ pub fn start_shadow_main_if_needed(
         ) {
             Ok((child, diagnostics)) => {
                 let main_binary = activation.main_binary.clone();
-                let previous_shadow_binary = env::current_exe().unwrap_or_default();
+                let previous_shadow_binary =
+                    rollout_previous_binary_path(&activation.shadow_binary);
                 Ok(ShadowMainStart::Candidate {
                     child,
                     monitor: ShadowMainRolloutMonitor {
@@ -2268,7 +2419,13 @@ pub fn start_shadow_main_if_needed(
                     &previous_main_binary,
                     &format!("candidate main could not execute: {error}"),
                 )?;
-                let main_binary = previous_main_binary;
+                restore_rollout_binary_from_backup_with_retry(
+                    &previous_main_binary,
+                    &activation.main_binary,
+                    STABLE_BINARY_COPY_TIMEOUT,
+                    STABLE_BINARY_COPY_RETRY_INTERVAL,
+                )?;
+                let main_binary = activation.main_binary.clone();
                 remove_main_activation(rollout_paths);
                 let child = spawn_main_daemon_process(&main_binary, &activation_main_options).ok();
                 Ok(ShadowMainStart::Recovered {
@@ -3175,6 +3332,13 @@ mod tests {
         assert_eq!(promoted.port, activation.main_port);
         assert!(!rollout_main_activation_path(&rollout_paths).exists());
         assert!(rollout_shadow_finalize_path(&rollout_paths).exists());
+        let pending_shadow = read_pending_shadow_rollout(&rollout_paths)
+            .expect("read pending shadow")
+            .expect("pending shadow");
+        assert_eq!(
+            pending_shadow.previous_main_binary.as_deref(),
+            Some(activation.main_binary.as_path())
+        );
         assert!(!shadow_reexec_request_path(&rollout_paths).exists());
         assert!(rollout_paths.shadow_binary.exists());
         std::fs::remove_dir_all(root).ok();
@@ -3220,6 +3384,29 @@ mod tests {
             .expect("status");
         assert_eq!(status.status, "accepted");
         assert_eq!(status.phase.as_deref(), Some("shadow-finalized"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn daemon_control_port_released_requires_bindable_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test port");
+        let port = listener.local_addr().expect("local addr").port();
+
+        assert!(!daemon_control_port_released("127.0.0.1", port));
+        drop(listener);
+        assert!(daemon_control_port_released("127.0.0.1", port));
+    }
+
+    #[test]
+    fn deferred_shadow_rollout_completion_ignores_missing_pending_state() {
+        let root = temp_rollout_test_root("deferred-shadow-no-pending");
+        let paths = DaemonPaths::with_root(root.join("daemon"));
+
+        assert_eq!(
+            handle_deferred_shadow_rollout_completion(&paths).expect("deferred helper"),
+            "no pending shadow rollout\n"
+        );
+
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -89,13 +89,14 @@ pub use process::start_daemon_command_process;
 pub(crate) use process::{
     CandidateMainDiagnostics, build_daemon_async_runtime, main_exit_observation_from_status,
     prepare_background_command, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+    spawn_shadow_rollout_recovery_helper_process,
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
-    prepare_local_rollout_main_activation, run_shadow_daemon_supervision_loop,
-    shadow_main_binary_from_env, shadow_main_options_from_env, sleep_for_shadow_start_delay,
-    stage_rollout_main_activation, wait_for_local_shadow_rollout_completion,
-    wait_for_main_daemon_health,
+    handle_deferred_shadow_rollout_completion, prepare_local_rollout_main_activation,
+    run_shadow_daemon_supervision_loop, shadow_main_binary_from_env, shadow_main_options_from_env,
+    sleep_for_shadow_start_delay, stage_rollout_main_activation,
+    wait_for_local_shadow_rollout_completion, wait_for_main_daemon_health,
 };
 pub(crate) use rollout::{
     daemon_paths_are_shadow, handle_daemon_clear_rollout_status,

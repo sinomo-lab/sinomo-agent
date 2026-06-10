@@ -173,6 +173,14 @@ impl AsyncDaemonControlListener {
                 operation: format!("bind async daemon control listener {bind_address}"),
                 detail: source.to_string(),
             })?;
+        mark_daemon_control_listener_non_inheritable(&listener).map_err(|source| {
+            NetworkError::Io {
+                operation: format!(
+                    "mark async daemon control listener {bind_address} non-inheritable"
+                ),
+                detail: source.to_string(),
+            }
+        })?;
         Ok(Self {
             bind_address,
             listener,
@@ -202,6 +210,37 @@ impl AsyncDaemonControlListener {
                 detail: source.to_string(),
             })
     }
+}
+
+#[cfg(windows)]
+fn mark_daemon_control_listener_non_inheritable(
+    listener: &tokio::net::TcpListener,
+) -> std::io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawSocket;
+
+    type Handle = *mut c_void;
+
+    unsafe extern "system" {
+        fn SetHandleInformation(hObject: Handle, dwMask: u32, dwFlags: u32) -> i32;
+    }
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
+    let handle = listener.as_raw_socket() as usize as Handle;
+    let result = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_daemon_control_listener_non_inheritable(
+    _listener: &tokio::net::TcpListener,
+) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

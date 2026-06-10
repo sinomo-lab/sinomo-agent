@@ -12,6 +12,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub const SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS: &[&str] = &["daemon", "__complete-shadow-rollout"];
+
 #[derive(Clone, Debug)]
 pub struct CandidateMainDiagnostics {
     pub stdout_log: PathBuf,
@@ -165,6 +167,172 @@ pub fn spawn_candidate_main_daemon_process(
             diagnostics_path,
         },
     ))
+}
+
+pub fn spawn_shadow_rollout_recovery_helper_process() -> Result<(), DaemonError> {
+    let exe = env::current_exe().map_err(|source| DaemonError::Io {
+        path: "current executable".to_string(),
+        detail: source.to_string(),
+    })?;
+    spawn_detached_no_inherit(&exe, SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS)
+}
+
+#[cfg(not(windows))]
+fn spawn_detached_no_inherit(binary: &Path, args: &[&str]) -> Result<(), DaemonError> {
+    let mut command = Command::new(binary);
+    prepare_background_command(&mut command);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let _child = command.spawn().map_err(|source| DaemonError::Io {
+        path: binary.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn_detached_no_inherit(binary: &Path, args: &[&str]) -> Result<(), DaemonError> {
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::{null, null_mut};
+
+    type Bool = i32;
+    type Dword = u32;
+    type Handle = *mut c_void;
+    type Lpcwstr = *const u16;
+    type Lpwstr = *mut u16;
+    type Lpvoid = *mut c_void;
+
+    #[repr(C)]
+    struct StartupInfoW {
+        cb: Dword,
+        lp_reserved: Lpwstr,
+        lp_desktop: Lpwstr,
+        lp_title: Lpwstr,
+        dw_x: Dword,
+        dw_y: Dword,
+        dw_x_size: Dword,
+        dw_y_size: Dword,
+        dw_x_count_chars: Dword,
+        dw_y_count_chars: Dword,
+        dw_fill_attribute: Dword,
+        dw_flags: Dword,
+        w_show_window: u16,
+        cb_reserved2: u16,
+        lp_reserved2: *mut u8,
+        h_std_input: Handle,
+        h_std_output: Handle,
+        h_std_error: Handle,
+    }
+
+    #[repr(C)]
+    struct ProcessInformation {
+        h_process: Handle,
+        h_thread: Handle,
+        dw_process_id: Dword,
+        dw_thread_id: Dword,
+    }
+
+    unsafe extern "system" {
+        fn CreateProcessW(
+            lpApplicationName: Lpcwstr,
+            lpCommandLine: Lpwstr,
+            lpProcessAttributes: Lpvoid,
+            lpThreadAttributes: Lpvoid,
+            bInheritHandles: Bool,
+            dwCreationFlags: Dword,
+            lpEnvironment: Lpvoid,
+            lpCurrentDirectory: Lpcwstr,
+            lpStartupInfo: *mut StartupInfoW,
+            lpProcessInformation: *mut ProcessInformation,
+        ) -> Bool;
+        fn CloseHandle(hObject: Handle) -> Bool;
+    }
+
+    const CREATE_NEW_PROCESS_GROUP: Dword = 0x0000_0200;
+    const DETACHED_PROCESS: Dword = 0x0000_0008;
+    const CREATE_NO_WINDOW: Dword = 0x0800_0000;
+    const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
+
+    let mut command_line = windows_command_line(binary, args);
+    let mut startup: StartupInfoW = unsafe { zeroed() };
+    startup.cb = size_of::<StartupInfoW>() as Dword;
+    let mut process_info: ProcessInformation = unsafe { zeroed() };
+    let flags =
+        CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
+    let created = unsafe {
+        CreateProcessW(
+            null(),
+            command_line.as_mut_ptr(),
+            null_mut(),
+            null_mut(),
+            0,
+            flags,
+            null_mut(),
+            null(),
+            &mut startup,
+            &mut process_info,
+        )
+    };
+    if created == 0 {
+        return Err(DaemonError::Io {
+            path: binary.display().to_string(),
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    unsafe {
+        let _ = CloseHandle(process_info.h_thread);
+        let _ = CloseHandle(process_info.h_process);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_command_line(binary: &Path, args: &[&str]) -> Vec<u16> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut command = windows_quote_arg(&binary.as_os_str().to_string_lossy());
+    for arg in args {
+        command.push(' ');
+        command.push_str(&windows_quote_arg(arg));
+    }
+    OsStr::new(&command).encode_wide().chain([0]).collect()
+}
+
+#[cfg(windows)]
+fn windows_quote_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'))
+    {
+        return arg.to_string();
+    }
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 pub fn main_exit_observation_from_status(

@@ -13504,6 +13504,10 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
             port: 21_354,
         })
     );
+    assert_eq!(
+        parse_daemon_command(&["__complete-shadow-rollout".to_string()]).expect("helper"),
+        DaemonCliCommand::CompleteShadowRollout
+    );
 }
 
 #[test]

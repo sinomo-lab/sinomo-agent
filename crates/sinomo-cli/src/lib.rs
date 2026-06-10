@@ -95,6 +95,7 @@ use sinomo_runtime::daemon::{
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
     git_is_available as daemon_git_is_available,
+    handle_deferred_shadow_rollout_completion as daemon_handle_deferred_shadow_rollout_completion,
     install_managed_source_repo as daemon_install_managed_source_repo,
     installed_daemon_paths as daemon_installed_daemon_paths, invite_introducers_from_daemon_status,
     managed_source_git_status_lines as daemon_managed_source_git_status_lines,
