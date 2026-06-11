@@ -36,6 +36,7 @@ fn capture_tabs() {
 
     for (tab, name) in [
         (Tab::Sinomo, "sinomo"),
+        (Tab::Cluster, "cluster"),
         (Tab::Files, "files"),
         (Tab::Settings, "settings"),
     ] {
@@ -45,12 +46,63 @@ fn capture_tabs() {
     // Light-theme variants to validate the light palette.
     for (tab, name) in [
         (Tab::Sinomo, "sinomo-light"),
+        (Tab::Cluster, "cluster-light"),
         (Tab::Settings, "settings-light"),
     ] {
         let shared = boot(tab);
         shared.borrow_mut().theme_mode = AppThemeMode::Light;
         capture(shared, name);
     }
+}
+
+#[test]
+fn cluster_node_click_opens_detail_selection() {
+    use sinomo_app::backend::cluster::{ClusterNodeInfo, ClusterSnapshot};
+    use sinomo_app::ui::cluster::ClusterSelection;
+
+    fn node(id: &str) -> ClusterNodeInfo {
+        ClusterNodeInfo {
+            node_id: id.to_string(),
+            display_name: id.to_string(),
+            process: "daemon-main".to_string(),
+            node_role: "workstation".to_string(),
+            member_role: "voter".to_string(),
+            member_state: "voter".to_string(),
+            availability: "online".to_string(),
+            daemon_version: "test".to_string(),
+            commit: None,
+            platform: None,
+            pid: None,
+            address: None,
+            bind_address: None,
+            rollout: None,
+            observed_at: "now".to_string(),
+            public_reachable: false,
+            endpoints: Vec::new(),
+        }
+    }
+
+    let shared = boot(Tab::Cluster);
+    shared.cluster_mut().snapshot = ClusterSnapshot {
+        nodes: vec![node("node-a"), node("node-b"), node("node-c")],
+        source: "test".to_string(),
+        observed_at: "now".to_string(),
+        ..ClusterSnapshot::default()
+    };
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    let root = window.root();
+    app.run_until_idle().expect("settle cluster layout");
+
+    click_at(&root, 640.0, 206.0);
+    app.run_until_idle().expect("settle detail panel");
+
+    assert_eq!(
+        shared.cluster().selected,
+        Some(ClusterSelection::Node("node-a".to_string())),
+        "clicking a graph node selects it for the floating detail panel"
+    );
 }
 
 #[test]

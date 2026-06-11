@@ -15,14 +15,17 @@ use sui::DefaultTheme;
 use crate::backend::Backend;
 use crate::theme::{AppThemeMode, resolve_theme};
 use crate::ui::chat::ChatState;
+use crate::ui::cluster::ClusterState;
 use crate::ui::files::FilesState;
 use crate::ui::settings::SettingsState;
 
-/// The three top-level destinations shown in the title bar.
+/// The top-level destinations shown in the title bar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tab {
     /// AI chat with the Sinomo agent.
     Sinomo,
+    /// Cluster topology graph.
+    Cluster,
     /// SIFS distributed file browser.
     Files,
     /// App + cluster settings.
@@ -30,19 +33,21 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Sinomo, Tab::Files, Tab::Settings];
+    pub const ALL: [Tab; 4] = [Tab::Sinomo, Tab::Cluster, Tab::Files, Tab::Settings];
 
     pub fn index(self) -> usize {
         match self {
             Tab::Sinomo => 0,
-            Tab::Files => 1,
-            Tab::Settings => 2,
+            Tab::Cluster => 1,
+            Tab::Files => 2,
+            Tab::Settings => 3,
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Sinomo => "Sinomo",
+            Tab::Cluster => "Cluster",
             Tab::Files => "Files",
             Tab::Settings => "Settings",
         }
@@ -61,6 +66,7 @@ pub enum ConnectEvent {
 pub struct ReadyState {
     pub backend: Backend,
     pub chat: ChatState,
+    pub cluster: ClusterState,
     pub files: FilesState,
     pub settings: SettingsState,
 }
@@ -70,11 +76,13 @@ impl ReadyState {
     /// browser, loads config). Runs on the UI thread when the connection completes.
     pub fn build(backend: Backend) -> Self {
         let chat = ChatState::new(&backend);
+        let cluster = ClusterState::new(&backend);
         let files = FilesState::new(&backend);
         let settings = SettingsState::new(&backend);
         Self {
             backend,
             chat,
+            cluster,
             files,
             settings,
         }
@@ -205,6 +213,18 @@ impl Shared {
     pub fn files_mut(&self) -> RefMut<'_, FilesState> {
         RefMut::map(self.0.borrow_mut(), |s| {
             &mut s.ready.as_mut().expect("app is ready").files
+        })
+    }
+
+    pub fn cluster(&self) -> Ref<'_, ClusterState> {
+        Ref::map(self.0.borrow(), |s| {
+            &s.ready.as_ref().expect("app is ready").cluster
+        })
+    }
+
+    pub fn cluster_mut(&self) -> RefMut<'_, ClusterState> {
+        RefMut::map(self.0.borrow_mut(), |s| {
+            &mut s.ready.as_mut().expect("app is ready").cluster
         })
     }
 
