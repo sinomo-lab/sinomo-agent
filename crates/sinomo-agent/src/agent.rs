@@ -7037,6 +7037,7 @@ fn prefers_native_tool_protocol(provider: &str, model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     match provider.as_str() {
         "openai" | "openai-api" => model.contains("gpt") || model.starts_with('o'),
+        "codex" => model.contains("gpt") || model.contains("codex"),
         "deepseek" | "deepseek-api" => model.contains("deepseek"),
         _ => false,
     }

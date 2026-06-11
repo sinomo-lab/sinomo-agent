@@ -270,6 +270,7 @@ fn test_smoke(options: TestSmokeOptions) -> Result<(), CliError> {
         detail: format!("unknown provider `{}`", options.provider),
     })?;
     let test_id = match provider.as_str() {
+        CODEX_PROVIDER_ID => "lm.codex.native-tools",
         DeepSeekProvider::PROVIDER_ID => "lm.deepseek.native-tools",
         OpenAiProvider::PROVIDER_ID => "lm.openai.native-tools",
         other => {

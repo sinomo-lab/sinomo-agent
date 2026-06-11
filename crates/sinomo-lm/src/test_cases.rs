@@ -1,10 +1,11 @@
 use crate::{
-    DeepSeekProvider, LM_PROVIDER_CONFIG_KEY, LanguageModelMessage, LanguageModelRequest,
-    LanguageModelRequestItem, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelToolChoice, LanguageModelToolSpec, ModelConfig, ModelPaths, OpenAiProvider,
-    PROVIDER_DEFAULT_MODEL, collect_language_model_tool_calls,
-    complete_configured_model_request_with_account, model_config_from_cluster_kv_snapshot,
-    model_config_store, normalize_provider_account_name, provider_account_config,
+    CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, DeepSeekProvider, LM_PROVIDER_CONFIG_KEY,
+    LanguageModelMessage, LanguageModelRequest, LanguageModelRequestItem,
+    LanguageModelResponseFormat, LanguageModelRole, LanguageModelToolChoice, LanguageModelToolSpec,
+    ModelConfig, ModelPaths, OpenAiProvider, PROVIDER_DEFAULT_MODEL,
+    collect_language_model_tool_calls, complete_configured_model_request_with_account,
+    model_config_from_cluster_kv_snapshot, model_config_store, normalize_provider_account_name,
+    provider_account_config,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::test::{
@@ -19,6 +20,7 @@ pub fn register_lm_test_cases(builder: SinomoTestRegistryBuilder) -> SinomoTestR
     builder
         .register(deepseek_native_tools())
         .register(openai_native_tools())
+        .register(codex_native_tools())
 }
 
 sinomo_runtime::test::sinomo_test_case! {
@@ -33,6 +35,21 @@ sinomo_runtime::test::sinomo_test_case! {
         ],
         run: {
             live_native_tool_smoke(ctx, DeepSeekProvider::PROVIDER_ID)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn codex_native_tools(ctx) {
+        id: "lm.codex.native-tools",
+        summary: "Codex ChatGPT Responses native tool-call transcript smoke",
+        tags: ["lm", "codex", "gpt", "live", "native-tools"],
+        requirements: [
+            SinomoTestRequirement::ClusterRuntime,
+            SinomoTestRequirement::LiveNetwork,
+        ],
+        run: {
+            live_native_tool_smoke(ctx, CODEX_PROVIDER_ID)
         }
     }
 }
@@ -57,25 +74,37 @@ fn live_native_tool_smoke(ctx: &mut SinomoTestContext, provider: &str) -> Sinomo
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let account_name = normalize_provider_account_name(ctx.parameter("account"));
     let (config, config_source) = model_config_for_test(ctx, &data_dir)?;
-    let account = provider_account_config(&config, provider, Some(&account_name))
-        .cloned()
-        .ok_or_else(|| {
-            SinomoTestError::failed(format!(
-                "provider account `{provider}:{account_name}` is not configured"
-            ))
-        })?;
+    let account = if provider == CODEX_PROVIDER_ID {
+        provider_account_config(&config, provider, Some(&account_name)).cloned()
+    } else {
+        Some(
+            provider_account_config(&config, provider, Some(&account_name))
+                .cloned()
+                .ok_or_else(|| {
+                    SinomoTestError::failed(format!(
+                        "provider account `{provider}:{account_name}` is not configured"
+                    ))
+                })?,
+        )
+    };
     let model = ctx
         .parameter("model")
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| account.default_model.clone())
-        .unwrap_or_else(|| PROVIDER_DEFAULT_MODEL.to_string());
+        .or_else(|| {
+            account
+                .as_ref()
+                .and_then(|account| account.default_model.clone())
+        })
+        .unwrap_or_else(|| native_tool_smoke_default_model(provider));
     let tool = echo_tool_spec();
     let first_request = native_tool_call_request(provider, &model, tool.clone());
 
     ctx.record("provider", provider);
-    ctx.record("account", &account_name);
+    if account.is_some() {
+        ctx.record("account", &account_name);
+    }
     ctx.record("model", &model);
     ctx.record("config_source", &config_source);
 
@@ -83,7 +112,7 @@ fn live_native_tool_smoke(ctx: &mut SinomoTestContext, provider: &str) -> Sinomo
         &data_dir,
         provider,
         &model,
-        Some(&account),
+        account.as_ref(),
         None,
         &first_request,
     )
@@ -117,7 +146,7 @@ fn live_native_tool_smoke(ctx: &mut SinomoTestContext, provider: &str) -> Sinomo
         &data_dir,
         provider,
         &model,
-        Some(&account),
+        account.as_ref(),
         None,
         &second_request,
     )
@@ -176,6 +205,13 @@ fn model_config_for_test(
         config,
         ModelPaths::new(data_dir).config.display().to_string(),
     ))
+}
+
+fn native_tool_smoke_default_model(provider: &str) -> String {
+    match provider {
+        CODEX_PROVIDER_ID => CODEX_DEFAULT_MODEL.to_string(),
+        _ => PROVIDER_DEFAULT_MODEL.to_string(),
+    }
 }
 
 fn echo_tool_spec() -> LanguageModelToolSpec {
@@ -295,6 +331,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(ids.contains(&"lm.deepseek.native-tools".to_string()));
+        assert!(ids.contains(&"lm.codex.native-tools".to_string()));
         assert!(ids.contains(&"lm.openai.native-tools".to_string()));
     }
 

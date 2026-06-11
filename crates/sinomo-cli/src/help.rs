@@ -309,7 +309,7 @@ pub(super) fn print_test_help() {
     );
     println!("      Run one registered runtime test.");
     println!(
-        "  sinomo test smoke [--provider deepseek|openai] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json]"
+        "  sinomo test smoke [--provider codex|deepseek|openai] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json]"
     );
     println!("      Run the provider native-tool live smoke test.");
 }

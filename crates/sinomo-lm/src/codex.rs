@@ -1,11 +1,13 @@
 use crate::{
     LanguageModelCreditUsage, LanguageModelError, LanguageModelInvocation, LanguageModelMessage,
     LanguageModelProvider, LanguageModelProviderInfo, LanguageModelProviderOptions,
-    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
-    LanguageModelUsageLimit, LanguageModelUsageProvider, PROVIDER_DEFAULT_MODEL,
-    apply_provider_vendor_options_to_payload, read_provider_credentials_json_value, selected_model,
-    unix_timestamp, write_provider_credentials_json_value,
+    LanguageModelProviderUsage, LanguageModelRequest, LanguageModelRequestItem,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
+    LanguageModelRole, LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
+    LanguageModelToolSpec, LanguageModelUsage, LanguageModelUsageLimit, LanguageModelUsageProvider,
+    PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload,
+    read_provider_credentials_json_value, selected_model, unix_timestamp,
+    write_provider_credentials_json_value,
 };
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -744,12 +746,16 @@ pub struct DefaultCodexContextManager {
 
 impl CodexContextManager for DefaultCodexContextManager {
     fn prepare_messages(&self, request: &LanguageModelRequest) -> Vec<CodexMessage> {
-        let mut messages: Vec<CodexMessage> = request
-            .messages
-            .iter()
-            .filter(|message| message.role != LanguageModelRole::System)
-            .map(CodexMessage::from_language_model_message)
-            .collect();
+        let mut messages: Vec<CodexMessage> = if request.items.is_empty() {
+            request
+                .messages
+                .iter()
+                .filter(|message| message.role != LanguageModelRole::System)
+                .map(CodexMessage::from_language_model_message)
+                .collect()
+        } else {
+            codex_messages_from_request_items(&request.items)
+        };
         if let Some(max_messages) = self.max_messages
             && messages.len() > max_messages
         {
@@ -793,6 +799,10 @@ impl CodexToolRegistry {
                 is_error: true,
                 metadata: serde_json::Value::Null,
             })
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
     }
 }
 
@@ -935,7 +945,7 @@ where
         if let Some(system_prompt) = self.prompt_builder.build_system_prompt(request) {
             messages.insert(0, CodexMessage::system(system_prompt));
         }
-        let tools = self.tools.descriptors();
+        let tools = codex_tool_descriptors(self.tools.descriptors(), &request.tools);
 
         for _ in 0..self.config.max_iterations {
             on_event(LanguageModelStreamEvent::Started {
@@ -951,15 +961,32 @@ where
                 response_format: request.response_format.clone(),
                 metadata: request.metadata.clone(),
                 options: self.config.options.clone(),
+                tool_choice: request.tool_choice.clone(),
+                parallel_tool_calls: request.parallel_tool_calls,
             };
             let response = self.client.complete_streaming(&codex_request, on_event)?;
             if response.tool_calls.is_empty() {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
                     model,
+                    items: codex_language_model_response_items(&response),
                     content: response.content,
-                    items: Vec::new(),
                     tool_calls: Vec::new(),
+                    usage: response.usage,
+                });
+            }
+
+            if response
+                .tool_calls
+                .iter()
+                .any(|call| !self.tools.contains(&call.name))
+            {
+                return Ok(LanguageModelResponse {
+                    provider: self.config.provider_id.clone(),
+                    model,
+                    items: codex_language_model_response_items(&response),
+                    content: response.content,
+                    tool_calls: codex_language_model_tool_calls(&response.tool_calls),
                     usage: response.usage,
                 });
             }
@@ -1016,6 +1043,10 @@ pub struct CodexModelRequest {
         skip_serializing_if = "LanguageModelProviderOptions::is_default"
     )]
     pub options: LanguageModelProviderOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<LanguageModelToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl CodexModelRequest {
@@ -1413,6 +1444,12 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
     if !tools.is_empty() {
         payload["tools"] = serde_json::json!(tools);
     }
+    if let Some(tool_choice) = &request.tool_choice {
+        payload["tool_choice"] = codex_responses_tool_choice(tool_choice);
+    }
+    if let Some(parallel_tool_calls) = request.parallel_tool_calls {
+        payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
+    }
     if request.response_format == LanguageModelResponseFormat::JsonObject {
         payload["text"] = serde_json::json!({ "format": { "type": "json_object" } });
     }
@@ -1501,6 +1538,143 @@ fn openai_responses_input_item(message: &CodexMessage) -> serde_json::Value {
             "output": message.content,
         }),
         CodexRole::System => serde_json::Value::Null,
+    }
+}
+
+fn codex_messages_from_request_items(items: &[LanguageModelRequestItem]) -> Vec<CodexMessage> {
+    items
+        .iter()
+        .filter_map(codex_message_from_request_item)
+        .collect()
+}
+
+fn codex_message_from_request_item(item: &LanguageModelRequestItem) -> Option<CodexMessage> {
+    match item {
+        LanguageModelRequestItem::Message { role, content } => {
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(CodexMessage::new(
+                codex_role_from_language_model_role(role),
+                content.clone(),
+            ))
+        }
+        LanguageModelRequestItem::ToolCall {
+            call_id,
+            name,
+            input,
+        } => Some(CodexMessage::raw_item(serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": codex_tool_value_text(input),
+        }))),
+        LanguageModelRequestItem::ToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => Some(CodexMessage::tool_result(CodexToolResult {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            content: codex_tool_value_text(output),
+            is_error: false,
+            metadata: serde_json::Value::Null,
+        })),
+        LanguageModelRequestItem::Context { label, content } => {
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(CodexMessage::user(format!("{label}:\n{content}")))
+        }
+    }
+}
+
+fn codex_role_from_language_model_role(role: &LanguageModelRole) -> CodexRole {
+    match role {
+        LanguageModelRole::System => CodexRole::System,
+        LanguageModelRole::User => CodexRole::User,
+        LanguageModelRole::Assistant => CodexRole::Assistant,
+    }
+}
+
+fn codex_tool_descriptors(
+    mut descriptors: Vec<CodexToolDescriptor>,
+    tools: &[LanguageModelToolSpec],
+) -> Vec<CodexToolDescriptor> {
+    for tool in tools {
+        if descriptors
+            .iter()
+            .any(|descriptor| descriptor.name == tool.name)
+        {
+            continue;
+        }
+        descriptors.push(CodexToolDescriptor {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: normalized_codex_tool_input_schema(tool),
+        });
+    }
+    descriptors
+}
+
+fn normalized_codex_tool_input_schema(tool: &LanguageModelToolSpec) -> serde_json::Value {
+    if tool.input_schema.is_null() {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+        })
+    } else {
+        tool.input_schema.clone()
+    }
+}
+
+fn codex_tool_value_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+fn codex_responses_tool_choice(tool_choice: &LanguageModelToolChoice) -> serde_json::Value {
+    match tool_choice {
+        LanguageModelToolChoice::Auto => serde_json::json!("auto"),
+        LanguageModelToolChoice::None => serde_json::json!("none"),
+        LanguageModelToolChoice::Required => serde_json::json!("required"),
+        LanguageModelToolChoice::Tool { name } => {
+            serde_json::json!({ "type": "function", "name": name })
+        }
+    }
+}
+
+fn codex_language_model_response_items(
+    response: &CodexModelResponse,
+) -> Vec<LanguageModelResponseItem> {
+    let mut items = response
+        .tool_calls
+        .iter()
+        .map(|call| LanguageModelResponseItem::ToolCall {
+            call: codex_language_model_tool_call(call),
+        })
+        .collect::<Vec<_>>();
+    if !response.content.trim().is_empty() {
+        items.push(LanguageModelResponseItem::Message {
+            role: LanguageModelRole::Assistant,
+            content: response.content.clone(),
+        });
+    }
+    items
+}
+
+fn codex_language_model_tool_calls(calls: &[CodexToolCall]) -> Vec<LanguageModelToolCall> {
+    calls.iter().map(codex_language_model_tool_call).collect()
+}
+
+fn codex_language_model_tool_call(call: &CodexToolCall) -> LanguageModelToolCall {
+    LanguageModelToolCall {
+        call_id: Some(call.call_id.clone()),
+        name: call.name.clone(),
+        input: call.input.clone(),
+        summary: None,
     }
 }
 
@@ -1983,6 +2157,77 @@ mod tests {
     }
 
     #[test]
+    fn codex_returns_request_scoped_tool_calls_to_caller() {
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let client = FixtureCodexClient {
+            requests: Rc::clone(&requests),
+            responses: RefCell::new(vec![CodexModelResponse {
+                content: String::new(),
+                tool_calls: vec![CodexToolCall {
+                    call_id: "call_echo".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({ "text": "hello" }),
+                }],
+                continuation_items: vec![serde_json::json!({
+                    "type": "function_call",
+                    "call_id": "call_echo",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hello\"}"
+                })],
+                usage: None,
+                stream_events: Vec::new(),
+            }]),
+        };
+        let provider = CodexProvider::new(
+            CodexConfig::default(),
+            client,
+            CodexToolRegistry::new(),
+            DefaultCodexPromptBuilder::default(),
+            DefaultCodexContextManager::default(),
+        );
+        let mut request = request();
+        request.tools = vec![LanguageModelToolSpec {
+            name: "echo".to_string(),
+            description: "Echo text.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string" }
+                },
+                "required": ["text"]
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        }];
+        request.tool_choice = Some(LanguageModelToolChoice::Tool {
+            name: "echo".to_string(),
+        });
+        request.parallel_tool_calls = Some(false);
+
+        let response = provider.complete(&request).expect("codex response");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].call_id.as_deref(), Some("call_echo"));
+        assert_eq!(response.tool_calls[0].name, "echo");
+        assert!(response.items.iter().any(|item| matches!(
+            item,
+            LanguageModelResponseItem::ToolCall { call }
+                if call.call_id.as_deref() == Some("call_echo") && call.name == "echo"
+        )));
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tools[0].name, "echo");
+        assert_eq!(
+            requests[0].tool_choice,
+            Some(LanguageModelToolChoice::Tool {
+                name: "echo".to_string()
+            })
+        );
+        assert_eq!(requests[0].parallel_tool_calls, Some(false));
+    }
+
+    #[test]
     fn context_manager_can_limit_history() {
         let manager = DefaultCodexContextManager {
             max_messages: Some(1),
@@ -2003,6 +2248,40 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "new");
+    }
+
+    #[test]
+    fn context_manager_preserves_native_tool_transcript_items() {
+        let mut request = request();
+        request.items = vec![
+            LanguageModelRequestItem::message(LanguageModelRole::User, "Call echo."),
+            LanguageModelRequestItem::tool_call(
+                "call_echo",
+                "echo",
+                serde_json::json!({ "text": "hello" }),
+            ),
+            LanguageModelRequestItem::tool_call_output(
+                "call_echo",
+                "echo",
+                serde_json::json!({ "text": "hello" }),
+            ),
+        ];
+
+        let messages = DefaultCodexContextManager::default().prepare_messages(&request);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, CodexRole::User);
+        assert_eq!(
+            messages[1].raw_item.as_ref().unwrap()["type"],
+            "function_call"
+        );
+        assert_eq!(
+            messages[1].raw_item.as_ref().unwrap()["call_id"],
+            "call_echo"
+        );
+        assert_eq!(messages[2].role, CodexRole::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_echo"));
+        assert_eq!(messages[2].content, "{\"text\":\"hello\"}");
     }
 
     #[test]
@@ -2031,6 +2310,10 @@ mod tests {
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::Value::Null,
             options: LanguageModelProviderOptions::default(),
+            tool_choice: Some(LanguageModelToolChoice::Tool {
+                name: "read_context".to_string(),
+            }),
+            parallel_tool_calls: Some(false),
         });
 
         assert_eq!(payload["instructions"], "system prompt");
@@ -2044,6 +2327,9 @@ mod tests {
         );
         assert_eq!(payload["input"][2]["type"], "reasoning");
         assert_eq!(payload["input"][3]["type"], "function_call_output");
+        assert_eq!(payload["tool_choice"]["type"], "function");
+        assert_eq!(payload["tool_choice"]["name"], "read_context");
+        assert_eq!(payload["parallel_tool_calls"], false);
         assert!(payload.get("temperature").is_none());
         assert!(payload.get("max_output_tokens").is_none());
         assert_eq!(payload["text"]["format"]["type"], "json_object");
@@ -2064,6 +2350,8 @@ mod tests {
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::Value::Null,
             options: LanguageModelProviderOptions::default(),
+            tool_choice: None,
+            parallel_tool_calls: None,
         });
 
         assert_eq!(payload["input"].as_array().expect("input").len(), 1);
@@ -2085,6 +2373,8 @@ mod tests {
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::Value::Null,
             options: LanguageModelProviderOptions::default(),
+            tool_choice: None,
+            parallel_tool_calls: None,
         };
 
         assert_eq!(
@@ -2104,6 +2394,8 @@ mod tests {
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::Value::Null,
             options: LanguageModelProviderOptions::default(),
+            tool_choice: None,
+            parallel_tool_calls: None,
         });
 
         assert_eq!(payload["instructions"], CODEX_DEFAULT_INSTRUCTIONS);
@@ -2129,6 +2421,8 @@ mod tests {
             response_format: LanguageModelResponseFormat::Text,
             metadata: serde_json::Value::Null,
             options,
+            tool_choice: None,
+            parallel_tool_calls: None,
         });
 
         assert_eq!(payload["reasoning"]["effort"], "xhigh");
