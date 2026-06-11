@@ -839,6 +839,16 @@ Structured destination rejections abort the saga before anything mutated; transp
 
 Directory renames across shard primaries migrate the whole subtree through the same saga, scaled up: the root record moves first (the destination primary validates an empty or absent destination and adopts atomically; the tombstoned old root then hides the not-yet-moved children), and the subtree is walked in paged, resumable `CrossShardDirScan` frames that adopt every child at its target path and evict the source record — the per-shard journal shape is identical to a same-node cross-shard move, so replicas replay it with the existing machinery. The in-flight lock covers the entire source subtree (descendants and ancestors), freezing writes and namespace mutations against half-moved objects until the saga completes or aborts.
 
+Cross-shard saga safety rails:
+
+- Moves fence on in-flight distributed write state (open intents, pending writes, outstanding repairs) and reject with the retriable `Busy` error (`EAGAIN` at the POSIX boundary) so a settling write can never commit into a shard its node no longer owns; adopt frames re-read the object's current state on every attempt, so parked sagas resume against reality rather than a stale snapshot.
+- Adoptions are authority-checked on both ends: the receiver must own the destination shard, and the sender must be the configured primary of the record's source path.
+- Saga execution honors the bounded-step budget shared with the other namespace jobs, and adoption bundles cap shipped version history (older records remain in the source shard until lifecycle GC).
+- Routed-operation responses carry a bounded run of journal batches toward the shard head; requesters that remain behind continue with bounded `SyncPath` rounds, so read-your-write survives deep catch-up.
+- Replica-side object resolution prefers live records over cross-shard eviction tombstones, independent of shard naming or replay order.
+- A replica whose journal forked from the primary's stream (for example a locally bootstrapped node joining as a follower) is repaired in-service: a sequence-conflict rejection triggers a per-shard snapshot install over the same transport, mirroring the standalone publisher's reconciliation.
+- Stray routed-operation responses (late, duplicate, or retried elsewhere) are discarded as events and never fail the node's event loop.
+
 ### Lifecycle And Operations
 
 - Repair jobs are reconstructed from persisted committed intents plus durable receipts, so missing-replica work survives service restart without a separate volatile queue.

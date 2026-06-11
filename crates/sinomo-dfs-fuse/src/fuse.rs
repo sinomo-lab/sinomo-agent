@@ -9,7 +9,7 @@ use fuser::{
 use sinomo_runtime::core::{ClusterBootstrapState, ClusterEndpointRecord};
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsFrameTransport, DfsObjectKind, DfsPosixError,
+    self, DfsControlPlaneKvClient, DfsError, DfsFrameTransport, DfsObjectKind, DfsPosixError,
     DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsTransportIdentity, DfsWriteOptions,
     LocalContentStore, NetworkedDfsService,
 };
@@ -1770,6 +1770,9 @@ fn errno_for_posix_error(error: DfsPosixError) -> libc::c_int {
         DfsPosixError::PendingWrite { .. } => libc::EAGAIN,
         DfsPosixError::Conflict { .. } => libc::ESTALE,
         DfsPosixError::DirectoryNotEmpty { .. } => libc::ENOTEMPTY,
+        // In-flight cross-shard moves reject mutations transiently; tell the
+        // application to retry rather than reporting an I/O failure.
+        DfsPosixError::Dfs(DfsError::Busy { .. }) => libc::EAGAIN,
         DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) => libc::EIO,
     }
 }
@@ -1802,4 +1805,26 @@ fn slice_bytes(bytes: &[u8], start: usize, len: usize) -> Vec<u8> {
     }
     let end = start.saturating_add(len).min(bytes.len());
     bytes[start..end].to_vec()
+}
+
+#[cfg(test)]
+mod errno_tests {
+    use super::*;
+
+    #[test]
+    fn busy_cross_shard_moves_map_to_eagain() {
+        assert_eq!(
+            errno_for_posix_error(DfsPosixError::Dfs(DfsError::Busy {
+                path: "/users/moving.txt".to_string(),
+            })),
+            libc::EAGAIN
+        );
+        // Other internal errors still surface as I/O failures.
+        assert_eq!(
+            errno_for_posix_error(DfsPosixError::Dfs(DfsError::Distributed {
+                message: "boom".to_string(),
+            })),
+            libc::EIO
+        );
+    }
 }
