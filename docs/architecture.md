@@ -353,7 +353,7 @@ Initial crate ownership:
 | Group | Crates |
 |---|---|
 | R0 | `sinomo-core` |
-| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-module-api`, `sinomo-network`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision` |
+| R1 | `sinomo-api`, `sinomo-device`, `sinomo-dfs`, `sinomo-eval`, `sinomo-events`, `sinomo-kv`, `sinomo-local`, `sinomo-module`, `sinomo-module-api`, `sinomo-network`, `sinomo-network-module`, `sinomo-node`, `sinomo-policy`, `sinomo-registry`, `sinomo-rollout`, `sinomo-sandbox`, `sinomo-supervision` |
 | R0/R1 boundary | `sinomo-runtime` |
 | R2 | `sinomo-actions`, `sinomo-agent`, `sinomo-audio`, `sinomo-deliberation`, `sinomo-evolution`, `sinomo-fusion`, `sinomo-gateway`, `sinomo-lm`, `sinomo-memory`, `sinomo-video`, `sinomo-voice` |
 | Application/tooling | `sinomo`, `sinomo-app`, `sinomo-cli` |
@@ -565,6 +565,7 @@ sinomo-agent/
     sinomo-node/          # Node identity, local runtime metadata, capability model
     sinomo-device/        # Device registry, source/action target metadata
     sinomo-network/       # Peer discovery, transport, authentication, routing
+    sinomo-network-module/ # Module-surface adapter for network-owned inspection tools and skills
     sinomo-dfs/           # Local-first distributed workspace filesystem
     sinomo-policy/        # Trusted policy decision contracts and verifier
     sinomo-registry/      # Module artifact registry and provenance metadata

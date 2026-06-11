@@ -10068,6 +10068,61 @@ mod tests {
     }
 
     #[test]
+    fn module_tool_projection_exposes_network_cluster_health_tool() {
+        let registration = sinomo_runtime::network_module::network_module_registration();
+        let module_id = registration.manifest.module_id.clone();
+        let projection = AgentModuleToolProjection::new()
+            .with_registration(registration)
+            .with_loader_state(sinomo_runtime::core::ModuleLoaderState {
+                module_id,
+                active_artifact_id: TaskId::generate(),
+                previous_artifact_id: None,
+                shadow_artifact_id: None,
+                candidate_artifact_id: None,
+                hot_swap_state: sinomo_runtime::core::HotSwapState::Stable,
+            });
+        let plan = AgentToolPlanner::plan(
+            std::iter::empty::<AgentToolDescriptor>(),
+            &projection,
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["object_rpc"],
+            0,
+        );
+
+        let projected = plan
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.descriptor.spec.name == "module_rpc_cluster_health_cluster_health_read"
+            })
+            .expect("network cluster health module route descriptor");
+        assert_eq!(projected.source, crate::tools::AgentToolPlanSource::Module);
+        assert!(!projected.executable);
+        assert!(plan.is_model_visible("module_rpc_cluster_health_cluster_health_read"));
+        assert!(
+            projected
+                .descriptor
+                .spec
+                .description
+                .contains(sinomo_runtime::network::CLUSTER_HEALTH_ROUTE)
+        );
+        assert!(
+            projected
+                .descriptor
+                .toolsets
+                .contains(&sinomo_runtime::network::SINOMO_NETWORK_MODULE_OWNER.to_string())
+        );
+        assert!(
+            projected
+                .descriptor
+                .capabilities
+                .contains(&AgentToolCapability::CallModule)
+        );
+    }
+
+    #[test]
     fn render_tool_results_keeps_large_evidence_out_of_model_context() {
         let outcome = AgentToolOutcome {
             call_id: TaskId::generate(),

@@ -30,6 +30,7 @@ sinomo-kv = { path = "../sinomo-kv" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-network = { path = "../sinomo-network", features = ["iroh-transport"] }
+sinomo-network-module = { path = "../sinomo-network-module" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object" }
 sinomo-observe = { path = "../sinomo-observe" }

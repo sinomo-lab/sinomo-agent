@@ -50,6 +50,7 @@ pub const MODULE_USER_CORRECTION_EVENT_KIND: &str = "module.user.correction";
 pub const MODULE_CRASH_EVENT_KIND: &str = "module.crash";
 pub const MODULE_TIMEOUT_EVENT_KIND: &str = "module.timeout";
 pub const MODULE_POLICY_BLOCKED_EVENT_KIND: &str = "module.policy.blocked";
+pub const DECLARATIVE_MODULE_API_VERSION: &str = "sinomo.declarative.module.v1";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SinomoModuleV1Context {
@@ -167,6 +168,116 @@ pub struct NativeDylibModuleInstallResult {
     pub state: NativeDylibModuleLoaderState,
     pub cache_path: PathBuf,
     pub state_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DeclarativeModuleLoaderState {
+    pub module_id: ModuleId,
+    pub version: String,
+    pub content_hash: String,
+    pub payload_ref: String,
+    pub active: bool,
+    pub installed_at: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeclarativeModuleInstallRequest {
+    pub source: String,
+    pub activate: bool,
+}
+
+impl DeclarativeModuleInstallRequest {
+    pub fn new(source: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            activate: true,
+        }
+    }
+
+    pub fn inactive(mut self) -> Self {
+        self.activate = false;
+        self
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeclarativeModuleInstallResult {
+    pub registration: ModuleRegistration,
+    pub state: DeclarativeModuleLoaderState,
+    pub payload_path: PathBuf,
+    pub catalog_path: PathBuf,
+    pub state_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DeclarativeModulePackageManifest {
+    pub module_id: String,
+    pub version: String,
+    #[serde(default = "default_declarative_module_owner")]
+    pub owner: String,
+    #[serde(default = "default_declarative_module_api_version")]
+    pub api_version: String,
+    #[serde(default = "default_declarative_module_target_ring")]
+    pub target_ring: TrustRing,
+    #[serde(default, skip_serializing_if = "ModuleCapabilities::is_empty")]
+    pub capabilities: ModuleCapabilities,
+    #[serde(default, skip_serializing_if = "ModuleSurfaces::is_empty")]
+    pub surfaces: ModuleSurfaces,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ModuleDeclarativeResourceExport>,
+}
+
+impl DeclarativeModulePackageManifest {
+    pub fn into_registration(
+        mut self,
+        payload_ref: impl Into<String>,
+    ) -> Result<ModuleRegistration, DeclarativeModuleInstallError> {
+        let module_id = parse_declarative_module_id(&self.module_id)?;
+        let payload_ref = payload_ref.into();
+        if self.version.trim().is_empty() {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: "module version must be non-empty".to_string(),
+            });
+        }
+        if self.version != self.version.trim() {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: "module version must not have leading or trailing whitespace".to_string(),
+            });
+        }
+        validate_declarative_module_version(&self.version)?;
+        if self.owner.trim().is_empty() {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: "module owner must be non-empty".to_string(),
+            });
+        }
+        if self.api_version.trim().is_empty() {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: "module api_version must be non-empty".to_string(),
+            });
+        }
+        for resource in self.resources {
+            self.surfaces.declarative_resources.push(resource);
+        }
+        self.surfaces
+            .validate()
+            .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+                detail: source.to_string(),
+            })?;
+        let mut manifest = sinomo_core::ModuleManifest::declarative(
+            module_id,
+            self.version,
+            self.owner,
+            self.api_version,
+            self.target_ring,
+        );
+        manifest.capabilities = self.capabilities;
+        Ok(ModuleRegistration {
+            manifest,
+            backend: ModuleBackendRegistration::Declarative { payload_ref },
+            surfaces: self.surfaces,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -767,6 +878,8 @@ pub struct ModuleSurfaces {
     pub storage_owners: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_definitions: Vec<ModuleAgentDefinitionExport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarative_resources: Vec<ModuleDeclarativeResourceExport>,
     #[serde(default, skip_serializing_if = "ModuleCapabilities::is_empty")]
     pub capabilities: ModuleCapabilities,
 }
@@ -777,6 +890,7 @@ impl ModuleSurfaces {
             && self.event_kinds.is_empty()
             && self.storage_owners.is_empty()
             && self.agent_definitions.is_empty()
+            && self.declarative_resources.is_empty()
             && self.capabilities.is_empty()
     }
 
@@ -808,6 +922,19 @@ impl ModuleSurfaces {
     pub fn with_agent_definition(mut self, definition: ModuleAgentDefinitionExport) -> Self {
         self.agent_definitions.push(definition);
         self
+    }
+
+    pub fn with_declarative_resource(mut self, resource: ModuleDeclarativeResourceExport) -> Self {
+        self.declarative_resources.push(resource);
+        self
+    }
+
+    pub fn with_skill_resource(self, id: impl Into<String>, path: impl Into<String>) -> Self {
+        self.with_declarative_resource(ModuleDeclarativeResourceExport::skill(id, path))
+    }
+
+    pub fn with_prompt_resource(self, id: impl Into<String>, path: impl Into<String>) -> Self {
+        self.with_declarative_resource(ModuleDeclarativeResourceExport::prompt(id, path))
     }
 
     pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
@@ -888,6 +1015,16 @@ impl ModuleSurfaces {
             if !exports.insert(capability.as_str()) {
                 return Err(ModuleSurfaceError::DuplicateCapabilityExport {
                     capability: capability.as_str().to_string(),
+                });
+            }
+        }
+
+        let mut declarative_resource_ids = BTreeSet::new();
+        for resource in &self.declarative_resources {
+            resource.validate()?;
+            if !declarative_resource_ids.insert(resource.id.as_str()) {
+                return Err(ModuleSurfaceError::DuplicateDeclarativeResource {
+                    id: resource.id.clone(),
                 });
             }
         }
@@ -982,6 +1119,141 @@ impl ModuleAgentToolExport {
             description: description.into(),
             async_default,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModuleDeclarativeResourceKind {
+    Skill,
+    Prompt,
+    PromptPack,
+    EvalSuite,
+    Example,
+    Policy,
+    Config,
+}
+
+impl ModuleDeclarativeResourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Prompt => "prompt",
+            Self::PromptPack => "prompt-pack",
+            Self::EvalSuite => "eval-suite",
+            Self::Example => "example",
+            Self::Policy => "policy",
+            Self::Config => "config",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModuleDeclarativeResourceExport {
+    pub id: String,
+    pub kind: ModuleDeclarativeResourceKind,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<CapabilityName>,
+}
+
+impl ModuleDeclarativeResourceExport {
+    pub fn new(
+        id: impl Into<String>,
+        kind: ModuleDeclarativeResourceKind,
+        path: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            path: path.into(),
+            description: String::new(),
+            target_agents: Vec::new(),
+            model_families: Vec::new(),
+            activation_tags: Vec::new(),
+            required_capabilities: Vec::new(),
+        }
+    }
+
+    pub fn skill(id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::new(id, ModuleDeclarativeResourceKind::Skill, path)
+    }
+
+    pub fn prompt(id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::new(id, ModuleDeclarativeResourceKind::Prompt, path)
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn with_target_agent(mut self, target_agent: impl Into<String>) -> Self {
+        self.target_agents.push(target_agent.into());
+        self
+    }
+
+    pub fn with_model_family(mut self, model_family: impl Into<String>) -> Self {
+        self.model_families.push(model_family.into());
+        self
+    }
+
+    pub fn with_activation_tag(mut self, tag: impl Into<String>) -> Self {
+        self.activation_tags.push(tag.into());
+        self
+    }
+
+    pub fn with_required_capability(mut self, capability: CapabilityName) -> Self {
+        self.required_capabilities.push(capability);
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ModuleSurfaceError> {
+        validate_module_declarative_resource_token(&self.id, &self.id, "declarative resource id")?;
+        validate_module_declarative_resource_path(&self.id, &self.path)?;
+        if !self.description.is_empty() && self.description.chars().any(char::is_control) {
+            return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+                id: self.id.clone(),
+                detail: "description must not contain control characters".to_string(),
+            });
+        }
+        validate_module_declarative_resource_tokens(
+            &self.id,
+            &self.target_agents,
+            "declarative resource target agent",
+        )?;
+        validate_module_declarative_resource_tokens(
+            &self.id,
+            &self.model_families,
+            "declarative resource model family",
+        )?;
+        validate_module_declarative_resource_tokens(
+            &self.id,
+            &self.activation_tags,
+            "declarative resource activation tag",
+        )?;
+
+        let mut capabilities = BTreeSet::new();
+        for capability in &self.required_capabilities {
+            if !capabilities.insert(capability.as_str()) {
+                return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+                    id: self.id.clone(),
+                    detail: format!(
+                        "required capability `{}` is listed more than once",
+                        capability.as_str()
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1375,6 +1647,10 @@ pub enum ModuleSurfaceError {
     InvalidStorageOwner { owner: String, detail: String },
     #[error("duplicate module storage owner `{owner}`")]
     DuplicateStorageOwner { owner: String },
+    #[error("module declarative resource `{id}` is invalid: {detail}")]
+    InvalidDeclarativeResource { id: String, detail: String },
+    #[error("duplicate module declarative resource `{id}`")]
+    DuplicateDeclarativeResource { id: String },
     #[error("duplicate module capability import `{capability}`")]
     DuplicateCapabilityImport { capability: String },
     #[error("duplicate module capability export `{capability}`")]
@@ -1444,6 +1720,156 @@ fn validate_module_surface_text(value: &str, context: &str) -> Result<(), Module
         });
     }
     Ok(())
+}
+
+fn validate_module_declarative_resource_token(
+    resource_id: &str,
+    value: &str,
+    context: &str,
+) -> Result<(), ModuleSurfaceError> {
+    if value.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: format!("{context} must be non-empty"),
+        });
+    }
+    if value != value.trim() {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: format!("{context} must not have leading or trailing whitespace"),
+        });
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '/'))
+    {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: format!(
+                "{context} must contain only ASCII letters, digits, '.', '-', '_', ':', or '/'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_module_declarative_resource_tokens(
+    resource_id: &str,
+    values: &[String],
+    context: &str,
+) -> Result<(), ModuleSurfaceError> {
+    let mut seen = BTreeSet::new();
+    for value in values {
+        validate_module_declarative_resource_token(resource_id, value, context)?;
+        if !seen.insert(value.as_str()) {
+            return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+                id: resource_id.to_string(),
+                detail: format!("{context} `{value}` is listed more than once"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_module_declarative_resource_path(
+    resource_id: &str,
+    path: &str,
+) -> Result<(), ModuleSurfaceError> {
+    if path.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: "path must be non-empty".to_string(),
+        });
+    }
+    if path != path.trim() {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: "path must not have leading or trailing whitespace".to_string(),
+        });
+    }
+    if path.chars().any(char::is_control) {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: "path must not contain control characters".to_string(),
+        });
+    }
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+            id: resource_id.to_string(),
+            detail: "path must be relative to the module payload root".to_string(),
+        });
+    }
+    for component in candidate.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+                    id: resource_id.to_string(),
+                    detail: "path must stay inside the module payload root".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn default_declarative_module_owner() -> String {
+    "local".to_string()
+}
+
+fn default_declarative_module_api_version() -> String {
+    DECLARATIVE_MODULE_API_VERSION.to_string()
+}
+
+fn default_declarative_module_target_ring() -> TrustRing {
+    TrustRing::R3SandboxedModule
+}
+
+fn parse_declarative_module_id(value: &str) -> Result<ModuleId, DeclarativeModuleInstallError> {
+    ModuleId::new(value.to_string())
+        .or_else(|_| ModuleId::from_legacy_named(value))
+        .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+            detail: format!("invalid module id `{value}`: {source}"),
+        })
+}
+
+fn validate_declarative_module_version(value: &str) -> Result<(), DeclarativeModuleInstallError> {
+    if value.chars().any(char::is_control) {
+        return Err(DeclarativeModuleInstallError::Descriptor {
+            detail: "module version must not contain control characters".to_string(),
+        });
+    }
+    if value
+        .chars()
+        .any(|ch| matches!(ch, '/' | '\\') || ch.is_whitespace())
+    {
+        return Err(DeclarativeModuleInstallError::Descriptor {
+            detail: "module version must be a single path-safe token".to_string(),
+        });
+    }
+    if matches!(value, "." | "..") {
+        return Err(DeclarativeModuleInstallError::Descriptor {
+            detail: "module version must not be . or ..".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn module_content_hash_path_key(content_hash: &str) -> String {
+    content_hash
+        .strip_prefix("blake3:")
+        .unwrap_or(content_hash)
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1529,6 +1955,56 @@ pub fn module_local_command_registry_path(data_dir_root: &Path) -> PathBuf {
     data_dir_root
         .join("module")
         .join("local-command-artifacts.sobj")
+}
+
+pub fn declarative_module_catalog_dir(data_dir_root: &Path) -> PathBuf {
+    data_dir_root
+        .join("module")
+        .join("catalog")
+        .join("declarative")
+}
+
+pub fn declarative_module_catalog_path(data_dir_root: &Path, module_id: &ModuleId) -> PathBuf {
+    declarative_module_catalog_dir(data_dir_root).join(format!("{module_id}.sobj"))
+}
+
+pub fn declarative_module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
+    module_loader_state_dir(data_dir_root).join("declarative")
+}
+
+pub fn declarative_module_loader_state_path(data_dir_root: &Path, module_id: &ModuleId) -> PathBuf {
+    declarative_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
+}
+
+pub fn declarative_module_cache_dir(data_dir_root: &Path) -> PathBuf {
+    data_dir_root
+        .join("module")
+        .join("cache")
+        .join("declarative")
+}
+
+pub fn declarative_module_payload_cache_path(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+    version: &str,
+    content_hash: &str,
+) -> PathBuf {
+    declarative_module_cache_dir(data_dir_root)
+        .join(module_id.to_string())
+        .join(version)
+        .join(module_content_hash_path_key(content_hash))
+        .join("payload")
+}
+
+pub fn declarative_module_payload_ref(
+    module_id: &ModuleId,
+    version: &str,
+    content_hash: &str,
+) -> String {
+    format!(
+        "local://module/cache/declarative/{module_id}/{version}/{}/payload",
+        module_content_hash_path_key(content_hash)
+    )
 }
 
 pub fn read_module_loader_runtime_state(
@@ -1681,10 +2157,470 @@ pub fn write_module_local_command_registry(
     Ok(path)
 }
 
+pub fn read_declarative_module_registration(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> Result<Option<ModuleRegistration>, ModuleLoaderStoreError> {
+    let path = declarative_module_catalog_path(data_dir_root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_object(&path).map(Some)
+}
+
+pub fn write_declarative_module_registration(
+    data_dir_root: &Path,
+    registration: &ModuleRegistration,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let path = declarative_module_catalog_path(data_dir_root, registration.module_id());
+    write_object(&path, registration)?;
+    Ok(path)
+}
+
+pub fn read_declarative_module_loader_state(
+    data_dir_root: &Path,
+    module_id: &ModuleId,
+) -> Result<Option<DeclarativeModuleLoaderState>, ModuleLoaderStoreError> {
+    let path = declarative_module_loader_state_path(data_dir_root, module_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    read_object(&path).map(Some)
+}
+
+pub fn write_declarative_module_loader_state(
+    data_dir_root: &Path,
+    state: &DeclarativeModuleLoaderState,
+) -> Result<PathBuf, ModuleLoaderStoreError> {
+    let path = declarative_module_loader_state_path(data_dir_root, &state.module_id);
+    write_object(&path, state)?;
+    Ok(path)
+}
+
 pub fn module_loader_applied_at_now() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+pub fn install_declarative_module_package(
+    data_dir_root: &Path,
+    source_path: &Path,
+    request: DeclarativeModuleInstallRequest,
+) -> Result<DeclarativeModuleInstallResult, DeclarativeModuleInstallError> {
+    let package = collect_declarative_module_package(source_path)?;
+    validate_declarative_module_resource_paths(&package.files, &package.manifest)?;
+
+    let content_hash = declarative_module_content_hash(&package.files);
+    let package_manifest = package.manifest;
+    let module_id = parse_declarative_module_id(&package_manifest.module_id)?;
+    let version = package_manifest.version.clone();
+    let payload_ref = declarative_module_payload_ref(&module_id, &version, &content_hash);
+    let registration = package_manifest.into_registration(payload_ref.clone())?;
+    if registration.manifest.kind != ModuleKind::Declarative {
+        return Err(DeclarativeModuleInstallError::Descriptor {
+            detail: "declarative package manifest produced a non-declarative module".to_string(),
+        });
+    }
+    if registration.module_id() != &module_id {
+        return Err(DeclarativeModuleInstallError::Descriptor {
+            detail: format!(
+                "manifest module id `{}` did not round-trip to registration module id `{}`",
+                module_id,
+                registration.module_id()
+            ),
+        });
+    }
+
+    let payload_path =
+        declarative_module_payload_cache_path(data_dir_root, &module_id, &version, &content_hash);
+    copy_declarative_module_package_files(&payload_path, &package.files)?;
+    let catalog_path = write_declarative_module_registration(data_dir_root, &registration)?;
+    let state = DeclarativeModuleLoaderState {
+        module_id,
+        version,
+        content_hash,
+        payload_ref,
+        active: request.activate,
+        installed_at: module_loader_applied_at_now(),
+        source: request.source,
+    };
+    let state_path = if request.activate {
+        Some(write_declarative_module_loader_state(
+            data_dir_root,
+            &state,
+        )?)
+    } else {
+        None
+    };
+
+    Ok(DeclarativeModuleInstallResult {
+        registration,
+        state,
+        payload_path,
+        catalog_path,
+        state_path,
+    })
+}
+
+struct CollectedDeclarativeModulePackage {
+    manifest: DeclarativeModulePackageManifest,
+    files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn collect_declarative_module_package(
+    source_path: &Path,
+) -> Result<CollectedDeclarativeModulePackage, DeclarativeModuleInstallError> {
+    if source_path.is_dir() {
+        collect_declarative_module_directory_package(source_path)
+    } else if source_path.extension().and_then(|value| value.to_str()) == Some("zip") {
+        collect_declarative_module_zip_package(source_path)
+    } else {
+        Err(DeclarativeModuleInstallError::Descriptor {
+            detail: format!(
+                "declarative module package source must be a directory or .zip archive: {}",
+                source_path.display()
+            ),
+        })
+    }
+}
+
+fn collect_declarative_module_directory_package(
+    source_path: &Path,
+) -> Result<CollectedDeclarativeModulePackage, DeclarativeModuleInstallError> {
+    let manifest_path = declarative_module_package_manifest_path(source_path)?;
+    let manifest = read_declarative_module_package_manifest(&manifest_path)?;
+    let files = collect_declarative_module_package_files(source_path)?;
+    Ok(CollectedDeclarativeModulePackage { manifest, files })
+}
+
+fn collect_declarative_module_zip_package(
+    source_path: &Path,
+) -> Result<CollectedDeclarativeModulePackage, DeclarativeModuleInstallError> {
+    let file = fs::File::open(source_path).map_err(|source| DeclarativeModuleInstallError::Io {
+        path: source_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|source| DeclarativeModuleInstallError::Archive {
+            path: source_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    let mut files = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry =
+            archive
+                .by_index(index)
+                .map_err(|source| DeclarativeModuleInstallError::Archive {
+                    path: source_path.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(relative_path) = entry.enclosed_name() else {
+            return Err(DeclarativeModuleInstallError::Archive {
+                path: source_path.display().to_string(),
+                detail: format!("zip entry `{}` escapes the archive root", entry.name()),
+            });
+        };
+        validate_module_declarative_resource_path(
+            &relative_path.display().to_string(),
+            &relative_path.display().to_string(),
+        )
+        .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+            detail: source.to_string(),
+        })?;
+        let mut bytes = Vec::new();
+        entry
+            .read_to_end(&mut bytes)
+            .map_err(|source| DeclarativeModuleInstallError::Io {
+                path: format!("{}:{}", source_path.display(), relative_path.display()),
+                detail: source.to_string(),
+            })?;
+        files.push((relative_path, bytes));
+    }
+    normalize_declarative_zip_package_prefix(&mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    let manifest = read_declarative_module_package_manifest_from_files(source_path, &files)?;
+    Ok(CollectedDeclarativeModulePackage { manifest, files })
+}
+
+fn normalize_declarative_zip_package_prefix(
+    files: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result<(), DeclarativeModuleInstallError> {
+    if declarative_module_package_manifest_file_index(files).is_some() {
+        return Ok(());
+    }
+    let mut common_prefix = None::<std::ffi::OsString>;
+    for (relative_path, _) in files.iter() {
+        let Some(Component::Normal(component)) = relative_path.components().next() else {
+            return Ok(());
+        };
+        match common_prefix.as_ref() {
+            Some(prefix) if prefix == component => {}
+            Some(_) => return Ok(()),
+            None => common_prefix = Some(component.to_os_string()),
+        }
+    }
+    let Some(prefix) = common_prefix else {
+        return Ok(());
+    };
+    for (relative_path, _) in files.iter_mut() {
+        let stripped = relative_path
+            .strip_prefix(Path::new(&prefix))
+            .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+                detail: format!(
+                    "failed to strip zip package prefix `{}` from {}: {source}",
+                    prefix.to_string_lossy(),
+                    relative_path.display()
+                ),
+            })?
+            .to_path_buf();
+        if stripped.as_os_str().is_empty() {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: "zip package contains only a wrapper directory".to_string(),
+            });
+        }
+        *relative_path = stripped;
+    }
+    Ok(())
+}
+
+fn declarative_module_package_manifest_file_index(files: &[(PathBuf, Vec<u8>)]) -> Option<usize> {
+    files.iter().position(|(path, _)| {
+        path == Path::new("sinomo.module.json")
+            || path == Path::new("module.json")
+            || path == Path::new("sinomo.module.sobj")
+    })
+}
+
+fn read_declarative_module_package_manifest_from_files(
+    source_path: &Path,
+    files: &[(PathBuf, Vec<u8>)],
+) -> Result<DeclarativeModulePackageManifest, DeclarativeModuleInstallError> {
+    let index = declarative_module_package_manifest_file_index(files).ok_or_else(|| {
+        DeclarativeModuleInstallError::Descriptor {
+            detail: format!(
+                "declarative module package {} does not contain sinomo.module.json or sinomo.module.sobj",
+                source_path.display()
+            ),
+        }
+    })?;
+    let (path, bytes) = &files[index];
+    match path.extension().and_then(|value| value.to_str()) {
+        Some("sobj") => serde_ext::from_bytes(bytes).map_err(|source| {
+            DeclarativeModuleInstallError::Store(ModuleLoaderStoreError::Object {
+                path: format!("{}:{}", source_path.display(), path.display()),
+                detail: source.to_string(),
+            })
+        }),
+        Some("json") => {
+            serde_json::from_slice(bytes).map_err(|source| DeclarativeModuleInstallError::Json {
+                path: format!("{}:{}", source_path.display(), path.display()),
+                detail: source.to_string(),
+            })
+        }
+        _ => Err(DeclarativeModuleInstallError::Descriptor {
+            detail: format!(
+                "unsupported declarative module manifest format: {}",
+                path.display()
+            ),
+        }),
+    }
+}
+
+fn declarative_module_package_manifest_path(
+    source_path: &Path,
+) -> Result<PathBuf, DeclarativeModuleInstallError> {
+    for file_name in ["sinomo.module.sobj", "sinomo.module.json", "module.json"] {
+        let candidate = source_path.join(file_name);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(DeclarativeModuleInstallError::Descriptor {
+        detail: format!(
+            "declarative module package {} does not contain sinomo.module.json or sinomo.module.sobj",
+            source_path.display()
+        ),
+    })
+}
+
+fn read_declarative_module_package_manifest(
+    manifest_path: &Path,
+) -> Result<DeclarativeModulePackageManifest, DeclarativeModuleInstallError> {
+    let extension = manifest_path.extension().and_then(|value| value.to_str());
+    match extension {
+        Some("sobj") => read_object(manifest_path).map_err(DeclarativeModuleInstallError::Store),
+        Some("json") => {
+            let bytes =
+                fs::read(manifest_path).map_err(|source| DeclarativeModuleInstallError::Io {
+                    path: manifest_path.display().to_string(),
+                    detail: source.to_string(),
+                })?;
+            serde_json::from_slice(&bytes).map_err(|source| DeclarativeModuleInstallError::Json {
+                path: manifest_path.display().to_string(),
+                detail: source.to_string(),
+            })
+        }
+        _ => Err(DeclarativeModuleInstallError::Descriptor {
+            detail: format!(
+                "unsupported declarative module manifest format: {}",
+                manifest_path.display()
+            ),
+        }),
+    }
+}
+
+fn validate_declarative_module_resource_paths(
+    files: &[(PathBuf, Vec<u8>)],
+    manifest: &DeclarativeModulePackageManifest,
+) -> Result<(), DeclarativeModuleInstallError> {
+    manifest
+        .surfaces
+        .validate()
+        .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+            detail: source.to_string(),
+        })?;
+    for resource in manifest
+        .surfaces
+        .declarative_resources
+        .iter()
+        .chain(manifest.resources.iter())
+    {
+        resource
+            .validate()
+            .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+                detail: source.to_string(),
+            })?;
+        let resource_path = Path::new(&resource.path);
+        let exists_in_package = files
+            .iter()
+            .any(|(path, _)| path == resource_path || path.starts_with(resource_path));
+        if !exists_in_package {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: format!(
+                    "declarative resource `{}` points to missing payload path `{}`",
+                    resource.id, resource.path
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn collect_declarative_module_package_files(
+    source_path: &Path,
+) -> Result<Vec<(PathBuf, Vec<u8>)>, DeclarativeModuleInstallError> {
+    let mut relative_paths = Vec::new();
+    collect_declarative_module_package_file_paths(source_path, source_path, &mut relative_paths)?;
+    relative_paths.sort();
+    let mut files = Vec::new();
+    for relative_path in relative_paths {
+        let full_path = source_path.join(&relative_path);
+        let bytes = fs::read(&full_path).map_err(|source| DeclarativeModuleInstallError::Io {
+            path: full_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        files.push((relative_path, bytes));
+    }
+    if files.is_empty() {
+        return Err(DeclarativeModuleInstallError::Descriptor {
+            detail: "declarative module package contains no files".to_string(),
+        });
+    }
+    Ok(files)
+}
+
+fn collect_declarative_module_package_file_paths(
+    root: &Path,
+    current: &Path,
+    relative_paths: &mut Vec<PathBuf>,
+) -> Result<(), DeclarativeModuleInstallError> {
+    let entries = fs::read_dir(current).map_err(|source| DeclarativeModuleInstallError::Io {
+        path: current.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| DeclarativeModuleInstallError::Io {
+            path: current.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| DeclarativeModuleInstallError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if file_type.is_symlink() {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: format!(
+                    "declarative module package must not contain symlinks: {}",
+                    path.display()
+                ),
+            });
+        }
+        if file_type.is_dir() {
+            collect_declarative_module_package_file_paths(root, &path, relative_paths)?;
+        } else if file_type.is_file() {
+            let relative_path = path.strip_prefix(root).map_err(|source| {
+                DeclarativeModuleInstallError::Descriptor {
+                    detail: format!(
+                        "failed to derive package-relative path for {}: {source}",
+                        path.display()
+                    ),
+                }
+            })?;
+            validate_module_declarative_resource_path(
+                &relative_path.display().to_string(),
+                &relative_path.display().to_string(),
+            )
+            .map_err(|source| DeclarativeModuleInstallError::Descriptor {
+                detail: source.to_string(),
+            })?;
+            relative_paths.push(relative_path.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn declarative_module_content_hash(files: &[(PathBuf, Vec<u8>)]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for (relative_path, bytes) in files {
+        hasher.update(relative_path.to_string_lossy().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&[0]);
+        hasher.update(bytes);
+        hasher.update(&[0]);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn copy_declarative_module_package_files(
+    payload_path: &Path,
+    files: &[(PathBuf, Vec<u8>)],
+) -> Result<(), DeclarativeModuleInstallError> {
+    fs::create_dir_all(payload_path).map_err(|source| DeclarativeModuleInstallError::Io {
+        path: payload_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    for (relative_path, bytes) in files {
+        let destination = payload_path.join(relative_path);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|source| DeclarativeModuleInstallError::Io {
+                path: parent.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        }
+        fs::write(&destination, bytes).map_err(|source| DeclarativeModuleInstallError::Io {
+            path: destination.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 pub fn install_native_dylib_module_from_file(
@@ -2695,6 +3631,22 @@ pub enum NativeDylibModuleInstallError {
 }
 
 #[derive(Debug, Error)]
+pub enum DeclarativeModuleInstallError {
+    #[error("declarative module install I/O error at {path}: {detail}")]
+    Io { path: String, detail: String },
+    #[error("declarative module archive error at {path}: {detail}")]
+    Archive { path: String, detail: String },
+    #[error("declarative module manifest JSON error at {path}: {detail}")]
+    Json { path: String, detail: String },
+    #[error(transparent)]
+    Store(#[from] ModuleLoaderStoreError),
+    #[error("declarative module descriptor mismatch: {detail}")]
+    Descriptor { detail: String },
+    #[error("unsupported declarative module package: {detail}")]
+    UnsupportedPackage { detail: String },
+}
+
+#[derive(Debug, Error)]
 pub enum ModuleInvocationTelemetryError {
     #[error(transparent)]
     ModuleStore(#[from] ModuleLoaderStoreError),
@@ -2778,8 +3730,26 @@ pub fn register_storage_paths(
     layout.register_escape_path(
         "sinomo-module",
         StorageRing::R1,
+        "module/loader-state/declarative",
+        "node-local declarative module activation records keyed by module id",
+    )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
         "module/cache/native-dylib",
         "content-addressed native dynamic-library module cache",
+    )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/cache/declarative",
+        "content-addressed declarative module payload cache",
+    )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/catalog/declarative",
+        "node-local declarative module catalog registrations keyed by module id",
     )?;
     layout.register_escape_path(
         "sinomo-module",
@@ -2819,6 +3789,31 @@ pub fn register_storage_paths(
         .field("updated_at", "String")
         .field("source", "String")
         .field("reason", "String"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/loader-state/declarative/example.sobj",
+        sinomo_storage::ObjectSchema::new(
+            "DeclarativeModuleLoaderState",
+            STORAGE_CONTRACT_OBJECT_VERSION,
+        )
+        .field("module_id", "ModuleId")
+        .field("version", "String")
+        .field("content_hash", "String")
+        .field("payload_ref", "String")
+        .field("active", "bool")
+        .field("installed_at", "String")
+        .field("source", "String"),
+    )?;
+    layout.register_sinomo_object(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/catalog/declarative/example.sobj",
+        sinomo_storage::ObjectSchema::new("ModuleRegistration", STORAGE_CONTRACT_OBJECT_VERSION)
+            .field("manifest", "ModuleManifest")
+            .field("backend", "ModuleBackendRegistration")
+            .field("surfaces", "ModuleSurfaces"),
     )?;
     layout.register_sinomo_object(
         "sinomo-module",
@@ -3050,6 +4045,8 @@ mod tests {
                 ))
                 .with_event_kind_name("dfs.metadata.updated")
                 .with_storage_owner("sinomo-dfs")
+                .with_skill_resource("skill.dfs.operator", "skills/dfs/SKILL.md")
+                .with_prompt_resource("prompt.dfs.repair", "prompts/repair.md")
                 .with_capability_export(CapabilityName::new("dfs.status.read").expect("capability"))
                 .with_capability_export(
                     CapabilityName::new("dfs.metadata.replicate").expect("capability"),
@@ -3081,6 +4078,15 @@ mod tests {
             "dfs.metadata.updated"
         );
         assert_eq!(decoded.surfaces.storage_owners[0], "sinomo-dfs");
+        assert_eq!(decoded.surfaces.declarative_resources.len(), 2);
+        assert_eq!(
+            decoded.surfaces.declarative_resources[0].kind,
+            ModuleDeclarativeResourceKind::Skill
+        );
+        assert_eq!(
+            decoded.surfaces.declarative_resources[1].kind,
+            ModuleDeclarativeResourceKind::Prompt
+        );
         assert!(
             decoded
                 .surfaces
@@ -3116,6 +4122,133 @@ mod tests {
                 .expect("missing route descriptor lookup")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn declarative_module_package_install_imports_payload_catalog_and_state() {
+        let data_root = unique_temp("declarative-module-data");
+        let package_root = unique_temp("declarative-module-package");
+        std::fs::create_dir_all(package_root.join("skills/rust")).expect("skills dir");
+        std::fs::create_dir_all(package_root.join("prompts")).expect("prompts dir");
+        std::fs::write(
+            package_root.join("skills/rust/SKILL.md"),
+            "# Rust Debugging\n\nUse cargo diagnostics before editing.",
+        )
+        .expect("skill");
+        std::fs::write(
+            package_root.join("prompts/triage.md"),
+            "Classify the failure mode before selecting tools.",
+        )
+        .expect("prompt");
+        let package_manifest = DeclarativeModulePackageManifest {
+            module_id: "module.skills.rust_debugging".to_string(),
+            version: "0.1.0".to_string(),
+            owner: "agent".to_string(),
+            api_version: DECLARATIVE_MODULE_API_VERSION.to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            capabilities: ModuleCapabilities::default(),
+            surfaces: ModuleSurfaces::default(),
+            resources: vec![
+                ModuleDeclarativeResourceExport::skill(
+                    "skill.rust-debugging",
+                    "skills/rust/SKILL.md",
+                )
+                .with_description("Rust compiler and test failure workflow")
+                .with_model_family("gpt")
+                .with_activation_tag("rust"),
+                ModuleDeclarativeResourceExport::prompt("prompt.rust-triage", "prompts/triage.md")
+                    .with_target_agent("agent.coding"),
+            ],
+        };
+        std::fs::write(
+            package_root.join("sinomo.module.json"),
+            serde_json::to_vec_pretty(&package_manifest).expect("manifest json"),
+        )
+        .expect("manifest");
+
+        let result = install_declarative_module_package(
+            &data_root,
+            &package_root,
+            DeclarativeModuleInstallRequest::new("test-package"),
+        )
+        .expect("install package");
+
+        assert_eq!(result.registration.manifest.kind, ModuleKind::Declarative);
+        assert_eq!(result.registration.manifest.version, "0.1.0");
+        assert_eq!(result.registration.surfaces.declarative_resources.len(), 2);
+        assert!(result.state.active);
+        assert!(result.state.content_hash.starts_with("blake3:"));
+        assert!(result.payload_path.join("skills/rust/SKILL.md").exists());
+        assert!(result.payload_path.join("prompts/triage.md").exists());
+        assert!(result.catalog_path.exists());
+        assert!(result.state_path.as_ref().expect("state path").exists());
+
+        let read_registration =
+            read_declarative_module_registration(&data_root, result.registration.module_id())
+                .expect("read registration")
+                .expect("registration");
+        assert_eq!(read_registration, result.registration);
+        let read_state =
+            read_declarative_module_loader_state(&data_root, result.registration.module_id())
+                .expect("read state")
+                .expect("state");
+        assert_eq!(read_state, result.state);
+
+        let _ = std::fs::remove_dir_all(data_root);
+        let _ = std::fs::remove_dir_all(package_root);
+    }
+
+    #[test]
+    fn declarative_module_package_install_accepts_zip_transport() {
+        use std::io::Write as _;
+
+        let data_root = unique_temp("declarative-module-zip-data");
+        let zip_path = unique_temp("declarative-module-package").with_extension("zip");
+        let package_manifest = DeclarativeModulePackageManifest {
+            module_id: "module.prompts.system_management".to_string(),
+            version: "0.2.0".to_string(),
+            owner: "agent".to_string(),
+            api_version: DECLARATIVE_MODULE_API_VERSION.to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            capabilities: ModuleCapabilities::default(),
+            surfaces: ModuleSurfaces::default(),
+            resources: vec![ModuleDeclarativeResourceExport::prompt(
+                "prompt.system-management.repair",
+                "prompts/repair.md",
+            )],
+        };
+        let file = std::fs::File::create(&zip_path).expect("zip file");
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        archive
+            .start_file("package/sinomo.module.json", options)
+            .expect("manifest entry");
+        archive
+            .write_all(&serde_json::to_vec_pretty(&package_manifest).expect("manifest json"))
+            .expect("manifest bytes");
+        archive
+            .start_file("package/prompts/repair.md", options)
+            .expect("prompt entry");
+        archive
+            .write_all(b"Use system service tools only after checking health.")
+            .expect("prompt bytes");
+        archive.finish().expect("finish zip");
+
+        let result = install_declarative_module_package(
+            &data_root,
+            &zip_path,
+            DeclarativeModuleInstallRequest::new("test-zip"),
+        )
+        .expect("install zip package");
+
+        assert_eq!(result.registration.manifest.kind, ModuleKind::Declarative);
+        assert_eq!(result.registration.surfaces.declarative_resources.len(), 1);
+        assert!(result.payload_path.join("prompts/repair.md").exists());
+        assert!(result.state_path.as_ref().expect("state path").exists());
+
+        let _ = std::fs::remove_dir_all(data_root);
+        let _ = std::fs::remove_file(zip_path);
     }
 
     #[test]

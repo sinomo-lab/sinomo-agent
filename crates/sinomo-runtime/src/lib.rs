@@ -37,6 +37,7 @@ pub mod r1 {
     pub use sinomo_module as module;
     pub use sinomo_module_api as module_api;
     pub use sinomo_network as network;
+    pub use sinomo_network_module as network_module;
     pub use sinomo_node as node;
     pub use sinomo_observe as observe;
     pub use sinomo_policy as policy;
@@ -136,6 +137,11 @@ pub mod r1 {
                 register_storage_paths: Some(sinomo_rollout::register_storage_paths),
             },
             NativeRustModuleBinding {
+                registration_key: sinomo_network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
+                register_services: None,
+                register_storage_paths: None,
+            },
+            NativeRustModuleBinding {
                 registration_key: sinomo_observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
                 register_services: Some(sinomo_observe::register_services),
                 register_storage_paths: Some(sinomo_observe::register_storage_paths),
@@ -153,6 +159,7 @@ pub mod r1 {
         pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
             let registry = sinomo_module::ModuleRegistry::builder()
                 .register(sinomo_dfs::dfs_module_registration())?
+                .register(sinomo_network_module::network_module_registration())?
                 .register(sinomo_rollout::rollout_module_registration())?
                 .register(sinomo_observe::observe_module_registration())?
                 .try_build()?;
@@ -308,8 +315,8 @@ pub use r0::{core, object};
 pub use r1::sandbox_wasix_host;
 pub use r1::{
     cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
-    module, module_api, modules, network, node, observe, policy, registry, rollout, sandbox,
-    sandbox_wasix_api, service, storage, supervision, test,
+    module, module_api, modules, network, network_module, node, observe, policy, registry, rollout,
+    sandbox, sandbox_wasix_api, service, storage, supervision, test,
 };
 
 #[cfg(test)]
@@ -320,7 +327,7 @@ mod tests {
         module_registry_object_rpc_route_descriptors, native_rust_binding_for_registration,
     };
     use super::storage::{StorageCoverage, StoragePathOwner, sinomo_data_dir_layout};
-    use super::{core, daemon, dfs, module, network, observe, rollout, service};
+    use super::{core, daemon, dfs, module, network, network_module, observe, rollout, service};
 
     #[test]
     fn runtime_storage_layout_is_composed_from_owner_crates() {
@@ -464,6 +471,74 @@ mod tests {
     }
 
     #[test]
+    fn runtime_internal_module_registry_includes_network() {
+        let registry = internal_module_registry().expect("module registry");
+        let module_id = network_module::network_module_id();
+        let registration = registry
+            .get(&module_id)
+            .expect("network module registration");
+
+        assert_eq!(registration.manifest.kind, core::ModuleKind::NativeRust);
+        assert_eq!(
+            registration.manifest.target_ring,
+            core::TrustRing::R1TrustedRuntime
+        );
+        assert_eq!(registration.manifest.api_version, network::NETWORK_PROTOCOL);
+        assert!(
+            registration
+                .manifest
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == network::CLUSTER_HEALTH_READ_CAPABILITY)
+        );
+        assert_eq!(
+            registration.backend,
+            module::ModuleBackendRegistration::NativeRust {
+                registration: module::NativeRustBackendRegistration::new(
+                    network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
+                    network::SINOMO_NETWORK_MODULE_OWNER
+                )
+            }
+        );
+        assert_eq!(
+            registration.surfaces.storage_owners,
+            vec![network::SINOMO_NETWORK_MODULE_OWNER.to_string()]
+        );
+        assert_eq!(
+            registration.surfaces.object_rpc_routes.len(),
+            network::NETWORK_OBJECT_RPC_ROUTES.len()
+        );
+        assert!(
+            registration
+                .surfaces
+                .object_rpc_routes
+                .iter()
+                .any(|route| route.route == network::CLUSTER_HEALTH_ROUTE
+                    && route.category == network::CLUSTER_HEALTH_RPC_CATEGORY
+                    && route.auth == module::ModuleRouteAuth::LocalOrClusterMember)
+        );
+        assert!(
+            registration
+                .surfaces
+                .declarative_resources
+                .iter()
+                .any(
+                    |resource| resource.id == network::CLUSTER_NETWORK_INSPECTION_SKILL_ID
+                        && resource.kind == module::ModuleDeclarativeResourceKind::Skill
+                )
+        );
+        let binding =
+            native_rust_binding_for_registration(registration).expect("network native binding");
+        assert_eq!(
+            binding.registration_key,
+            network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY
+        );
+        assert!(binding.register_services.is_none());
+        assert!(binding.register_storage_paths.is_none());
+    }
+
+    #[test]
     fn runtime_internal_module_registry_includes_rollout() {
         let registry = internal_module_registry().expect("module registry");
         let module_id = rollout::rollout_module_id();
@@ -586,6 +661,15 @@ mod tests {
                     .any(|capability| capability == "dfs.status.read")
         }));
         assert!(descriptors.iter().any(|descriptor| {
+            descriptor.route == network::CLUSTER_HEALTH_ROUTE
+                && descriptor.category == network::CLUSTER_HEALTH_RPC_CATEGORY
+                && descriptor.auth_scope.as_deref() == Some("local-or-cluster-member")
+                && descriptor
+                    .required_capabilities
+                    .iter()
+                    .any(|capability| capability == network::CLUSTER_HEALTH_READ_CAPABILITY)
+        }));
+        assert!(descriptors.iter().any(|descriptor| {
             descriptor.route == rollout::ROLLOUT_BUILD_ROUTE
                 && descriptor.category == rollout::ROLLOUT_RPC_CATEGORY
                 && descriptor.auth_scope.as_deref() == Some("admin")
@@ -607,6 +691,12 @@ mod tests {
             .try_build()
             .expect("module descriptors should validate as a network route snapshot");
         assert!(snapshot.version() >= 1);
+        assert!(
+            snapshot
+                .catalog()
+                .routes
+                .contains_key(network::CLUSTER_HEALTH_ROUTE)
+        );
         assert!(
             snapshot
                 .catalog()
@@ -783,7 +873,7 @@ mod tests {
             binding.registration_key,
             dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY
         );
-        assert_eq!(table.native_rust_bindings.len(), 3);
+        assert_eq!(table.native_rust_bindings.len(), 4);
         assert!(binding.register_services.is_some());
         assert!(binding.register_storage_paths.is_some());
 

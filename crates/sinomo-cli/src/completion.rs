@@ -2169,6 +2169,8 @@ mod tests {
     fn slash_completion_lists_module_activation_commands() {
         let completions = slash_completions("/module ", "/module ".len()).expect("module");
 
+        assert!(completions.items.iter().any(|item| item.label == "install"));
+        assert!(completions.items.iter().any(|item| item.label == "inspect"));
         assert!(
             completions
                 .items

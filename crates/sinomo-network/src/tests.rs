@@ -80,6 +80,50 @@ fn cluster_network_rpc_route_metadata_matches_owned_routes() {
 }
 
 #[test]
+fn network_publishes_agent_cluster_inspection_specs() {
+    assert_eq!(NETWORK_OBJECT_RPC_ROUTES, &[CLUSTER_HEALTH_ROUTE]);
+    assert_eq!(
+        NETWORK_CAPABILITY_EXPORTS,
+        &[CLUSTER_HEALTH_READ_CAPABILITY]
+    );
+    assert!(NETWORK_CAPABILITY_IMPORTS.contains(&"cluster.kv.read"));
+
+    let tool = NETWORK_OBJECT_RPC_TOOL_SURFACES
+        .iter()
+        .find(|surface| surface.route == CLUSTER_HEALTH_ROUTE)
+        .expect("cluster health tool surface");
+    assert_eq!(tool.category, CLUSTER_HEALTH_RPC_CATEGORY);
+    assert_eq!(tool.operation, CLUSTER_HEALTH_READ_CAPABILITY);
+    assert_eq!(
+        tool.auth.as_scope(),
+        NetworkModuleRouteAuth::LocalOrClusterMember.as_scope()
+    );
+
+    let skill = NETWORK_DECLARATIVE_RESOURCE_SURFACES
+        .iter()
+        .find(|resource| resource.id == CLUSTER_NETWORK_INSPECTION_SKILL_ID)
+        .expect("cluster network inspection skill");
+    assert_eq!(skill.kind, NetworkDeclarativeResourceKind::Skill);
+    assert_eq!(skill.path, CLUSTER_NETWORK_INSPECTION_SKILL_PATH);
+    assert!(skill.model_families.contains(&"gpt"));
+    assert!(skill.activation_tags.contains(&"cluster"));
+    assert!(
+        skill
+            .required_capabilities
+            .contains(&CLUSTER_HEALTH_READ_CAPABILITY)
+    );
+    assert!(CLUSTER_NETWORK_INSPECTION_SKILL_MARKDOWN.contains(CLUSTER_HEALTH_READ_CAPABILITY));
+
+    let prompt = NETWORK_DECLARATIVE_RESOURCE_SURFACES
+        .iter()
+        .find(|resource| resource.id == CLUSTER_NETWORK_INSPECTION_PROMPT_ID)
+        .expect("cluster network inspection prompt");
+    assert_eq!(prompt.kind, NetworkDeclarativeResourceKind::Prompt);
+    assert_eq!(prompt.path, CLUSTER_NETWORK_INSPECTION_PROMPT_PATH);
+    assert!(CLUSTER_NETWORK_INSPECTION_PROMPT_MARKDOWN.contains("cluster network"));
+}
+
+#[test]
 fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
     struct NoopClusterStatusProbe;
 

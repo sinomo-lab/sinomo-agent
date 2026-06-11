@@ -37,6 +37,7 @@ default-members = [
     "crates/sinomo-module",
     "crates/sinomo-module-api",
     "crates/sinomo-network",
+    "crates/sinomo-network-module",
     "crates/sinomo-node",
     "crates/sinomo-object",
     "crates/sinomo-observe",

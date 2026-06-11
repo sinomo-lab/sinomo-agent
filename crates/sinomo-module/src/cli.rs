@@ -1,10 +1,12 @@
 use crate::{
-    ArtifactId, ModuleId, ModuleLoaderStoreError, ModuleUnloadRecord,
-    NativeDylibModuleInstallError, NativeDylibModuleInstallRequest, NativeModule,
-    install_native_dylib_module_from_file, module_loader_applied_at_now, native_module_cache_path,
-    remove_native_dylib_module_loader_state, set_native_rust_module_enabled,
-    validate_native_dylib_module_cache_key, validate_native_dylib_module_library_name,
-    write_module_unload_record,
+    ArtifactId, DeclarativeModuleInstallError, DeclarativeModuleInstallRequest,
+    ModuleBackendRegistration, ModuleDeclarativeResourceKind, ModuleId, ModuleLoaderStoreError,
+    ModuleUnloadRecord, NativeDylibModuleInstallError, NativeDylibModuleInstallRequest,
+    NativeModule, install_declarative_module_package, install_native_dylib_module_from_file,
+    module_loader_applied_at_now, native_module_cache_path, read_declarative_module_loader_state,
+    read_declarative_module_registration, remove_native_dylib_module_loader_state,
+    set_native_rust_module_enabled, validate_native_dylib_module_cache_key,
+    validate_native_dylib_module_library_name, write_module_unload_record,
 };
 use sinomo_cli_registry::{
     CliAutocompleteChoice, CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue,
@@ -83,6 +85,8 @@ pub struct ModuleWasixCliConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ModuleCliCommand {
     Help,
+    Install(ModuleInstallOptions),
+    Inspect(ModuleInspectOptions),
     NativeDylib(ModuleNativeDylibCliCommand),
     NativeRust(ModuleNativeRustCliCommand),
     Wasix(ModuleWasixCliCommand),
@@ -134,6 +138,18 @@ struct ModuleNativeDylibUnloadOptions {
 struct ModuleNativeRustToggleOptions {
     module_id: ModuleId,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ModuleInstallOptions {
+    source_path: PathBuf,
+    source: Option<String>,
+    activate: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ModuleInspectOptions {
+    module_id: ModuleId,
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +223,10 @@ fn module_cli_help(config: &ModuleCliCommandConfig) -> CliCommandHelp {
     let mut lines = vec![
         "  sinomo module".to_string(),
         "      Show module commands.".to_string(),
+        "  sinomo module install [--inactive] [--source <text>] <folder>".to_string(),
+        "      Import a declarative module package, cache its payload, register its catalog data, and activate it by default.".to_string(),
+        "  sinomo module inspect <module-id>".to_string(),
+        "      Show a locally registered declarative module package and activation state.".to_string(),
         "  sinomo module native-dylib activate [--module <module-id>] [--artifact <artifact-id>] [--interface <version>] [--cache-key <key>] [--library-name <file-name>] [--source <text>] <library>".to_string(),
         "      Install a native dynamic library module into the local data-dir module cache and activate its loader state.".to_string(),
         "  sinomo module native-dylib unload <module-id>".to_string(),
@@ -237,6 +257,22 @@ fn module_cli_autocomplete(config: &ModuleCliCommandConfig) -> CliAutocompleteSp
         || CliAutocompleteValue::new("module-id", "module id", module_choices.iter().cloned());
 
     let mut children = vec![
+        CliAutocompleteSpec::new("install", "install a declarative module package")
+            .with_options([
+                CliAutocompleteOption::flag("--inactive", "register without activating"),
+                CliAutocompleteOption::with_value(
+                    "--source",
+                    "source label",
+                    CliAutocompleteValue::new("text", "source label", []),
+                ),
+            ])
+            .with_values([CliAutocompleteValue::new(
+                "folder",
+                "declarative module package folder",
+                [],
+            )]),
+        CliAutocompleteSpec::new("inspect", "inspect a declarative module package")
+            .with_values([CliAutocompleteValue::new("module-id", "module id", [])]),
         CliAutocompleteSpec::new("native-dylib", "manage native dynamic library modules")
             .with_children([
                 CliAutocompleteSpec::new("activate", "activate a native library module")
@@ -349,6 +385,12 @@ fn parse_module_command(
         Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
             Ok(ModuleCliCommand::Help)
         }
+        Some((command, rest)) if command == "install" => Ok(ModuleCliCommand::Install(
+            parse_module_install_options(rest)?,
+        )),
+        Some((command, rest)) if command == "inspect" => Ok(ModuleCliCommand::Inspect(
+            parse_module_inspect_options(rest)?,
+        )),
         Some((command, rest)) if command == "native-dylib" => {
             parse_module_native_dylib_command(rest)
         }
@@ -391,6 +433,69 @@ fn parse_module_native_dylib_command(args: &[String]) -> Result<ModuleCliCommand
         )),
         _ => Err(CliParseError::Usage),
     }
+}
+
+fn parse_module_install_options(args: &[String]) -> Result<ModuleInstallOptions, CliParseError> {
+    let mut source_path = None;
+    let mut source = None;
+    let mut activate = true;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--inactive" => {
+                activate = false;
+            }
+            "--source" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                source = Some(non_empty_value(value, "source")?);
+            }
+            value if value.starts_with('-') => return Err(CliParseError::Usage),
+            value => {
+                if source_path.is_none() {
+                    source_path = Some(PathBuf::from(value));
+                } else {
+                    return Err(CliParseError::Usage);
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(ModuleInstallOptions {
+        source_path: source_path.ok_or(CliParseError::Usage)?,
+        source,
+        activate,
+    })
+}
+
+fn parse_module_inspect_options(args: &[String]) -> Result<ModuleInspectOptions, CliParseError> {
+    let mut module_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--module" | "--module-id" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliParseError::Usage);
+                };
+                module_id = Some(parse_cli_module_id(value)?);
+            }
+            value if value.starts_with('-') => return Err(CliParseError::Usage),
+            value => {
+                if module_id.is_none() {
+                    module_id = Some(parse_cli_module_id(value)?);
+                } else {
+                    return Err(CliParseError::Usage);
+                }
+            }
+        }
+        index += 1;
+    }
+    Ok(ModuleInspectOptions {
+        module_id: module_id.ok_or(CliParseError::Usage)?,
+    })
 }
 
 fn parse_module_wasix_command(args: &[String]) -> Result<ModuleCliCommand, CliParseError> {
@@ -597,6 +702,8 @@ fn run_module_cli_command(
 ) -> Result<(), CliCommandError> {
     match command {
         ModuleCliCommand::Help => module_cli_help(config).write(context),
+        ModuleCliCommand::Install(options) => install_declarative_module(context, options),
+        ModuleCliCommand::Inspect(options) => inspect_declarative_module(context, options),
         ModuleCliCommand::NativeDylib(ModuleNativeDylibCliCommand::Activate(options)) => {
             activate_native_dylib_module(context, options)
         }
@@ -616,6 +723,117 @@ fn run_module_cli_command(
             unload_wasix_native_module(context, config)
         }
     }
+}
+
+fn install_declarative_module(
+    context: &mut CliCommandContext<'_>,
+    options: ModuleInstallOptions,
+) -> Result<(), CliCommandError> {
+    let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
+    data_dir.ensure_root_layout().map_err(command_error)?;
+    let mut request = DeclarativeModuleInstallRequest::new(
+        options
+            .source
+            .unwrap_or_else(|| format!("local:{}", options.source_path.display())),
+    );
+    if !options.activate {
+        request = request.inactive();
+    }
+    let result =
+        install_declarative_module_package(&data_dir.root(), &options.source_path, request)
+            .map_err(declarative_module_install_error_to_command)?;
+
+    context.stdout_line(format_args!("module: {}", result.registration.module_id()))?;
+    context.stdout_line(format_args!(
+        "version: {}",
+        result.registration.manifest.version
+    ))?;
+    context.stdout_line(format_args!("backend: declarative"))?;
+    context.stdout_line(format_args!("hash: {}", result.state.content_hash))?;
+    context.stdout_line(format_args!("payload-ref: {}", result.state.payload_ref))?;
+    context.stdout_line(format_args!("payload: {}", result.payload_path.display()))?;
+    context.stdout_line(format_args!("catalog: {}", result.catalog_path.display()))?;
+    context.stdout_line(format_args!("active: {}", result.state.active))?;
+    if let Some(path) = result.state_path.as_ref() {
+        context.stdout_line(format_args!("state: {}", path.display()))?;
+    }
+    write_declarative_resource_summary(context, &result.registration.surfaces)?;
+    Ok(())
+}
+
+fn inspect_declarative_module(
+    context: &mut CliCommandContext<'_>,
+    options: ModuleInspectOptions,
+) -> Result<(), CliCommandError> {
+    let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
+    data_dir.ensure_root_layout().map_err(command_error)?;
+    let registration = read_declarative_module_registration(&data_dir.root(), &options.module_id)
+        .map_err(module_loader_store_error_to_command)?
+        .ok_or_else(|| {
+            CliCommandError::new(format!(
+                "declarative module `{}` is not registered locally",
+                options.module_id
+            ))
+        })?;
+    let state = read_declarative_module_loader_state(&data_dir.root(), &options.module_id)
+        .map_err(module_loader_store_error_to_command)?;
+
+    context.stdout_line(format_args!("module: {}", registration.module_id()))?;
+    context.stdout_line(format_args!("version: {}", registration.manifest.version))?;
+    context.stdout_line(format_args!("backend: declarative"))?;
+    if let ModuleBackendRegistration::Declarative { payload_ref } = &registration.backend {
+        context.stdout_line(format_args!("payload-ref: {payload_ref}"))?;
+    }
+    match state {
+        Some(state) => {
+            context.stdout_line(format_args!("active: {}", state.active))?;
+            context.stdout_line(format_args!("hash: {}", state.content_hash))?;
+            context.stdout_line(format_args!("installed-at: {}", state.installed_at))?;
+            context.stdout_line(format_args!("source: {}", state.source))?;
+        }
+        None => {
+            context.stdout_line(format_args!("active: false"))?;
+            context.stdout_line(format_args!("state: not-active"))?;
+        }
+    }
+    write_declarative_resource_summary(context, &registration.surfaces)?;
+    Ok(())
+}
+
+fn write_declarative_resource_summary(
+    context: &mut CliCommandContext<'_>,
+    surfaces: &crate::ModuleSurfaces,
+) -> Result<(), CliCommandError> {
+    let mut skills = 0usize;
+    let mut prompts = 0usize;
+    let mut prompt_packs = 0usize;
+    let mut eval_suites = 0usize;
+    let mut other = 0usize;
+    for resource in &surfaces.declarative_resources {
+        match resource.kind {
+            ModuleDeclarativeResourceKind::Skill => skills += 1,
+            ModuleDeclarativeResourceKind::Prompt => prompts += 1,
+            ModuleDeclarativeResourceKind::PromptPack => prompt_packs += 1,
+            ModuleDeclarativeResourceKind::EvalSuite => eval_suites += 1,
+            ModuleDeclarativeResourceKind::Example
+            | ModuleDeclarativeResourceKind::Policy
+            | ModuleDeclarativeResourceKind::Config => other += 1,
+        }
+    }
+    context.stdout_line(format_args!("skills: {skills}"))?;
+    context.stdout_line(format_args!("prompts: {prompts}"))?;
+    context.stdout_line(format_args!("prompt-packs: {prompt_packs}"))?;
+    context.stdout_line(format_args!("eval-suites: {eval_suites}"))?;
+    context.stdout_line(format_args!("other-resources: {other}"))?;
+    for resource in &surfaces.declarative_resources {
+        context.stdout_line(format_args!(
+            "resource: {} {} {}",
+            resource.kind.as_str(),
+            resource.id,
+            resource.path
+        ))?;
+    }
+    Ok(())
 }
 
 fn activate_wasix_native_module(
@@ -893,6 +1111,12 @@ fn native_dylib_module_install_error_to_command(
     command_error(error)
 }
 
+fn declarative_module_install_error_to_command(
+    error: DeclarativeModuleInstallError,
+) -> CliCommandError {
+    command_error(error)
+}
+
 fn native_dylib_module_install_error_to_parse(
     error: NativeDylibModuleInstallError,
 ) -> CliParseError {
@@ -947,11 +1171,28 @@ mod tests {
         assert!(
             help.lines
                 .iter()
+                .any(|line| line.contains("module install"))
+        );
+        assert!(
+            help.lines
+                .iter()
                 .any(|line| line.contains("native-rust enable"))
         );
 
         let autocomplete = handler.autocomplete();
         assert_eq!(autocomplete.word, "module");
+        assert!(
+            autocomplete
+                .children
+                .iter()
+                .any(|child| child.word == "install")
+        );
+        assert!(
+            autocomplete
+                .children
+                .iter()
+                .any(|child| child.word == "inspect")
+        );
         assert!(
             autocomplete
                 .children
@@ -964,5 +1205,42 @@ mod tests {
                 .iter()
                 .any(|child| child.word == "wasix")
         );
+    }
+
+    #[test]
+    fn module_handler_parses_declarative_install_and_inspect() {
+        let install = parse_module_command(
+            &[
+                "install".to_string(),
+                "--inactive".to_string(),
+                "--source".to_string(),
+                "test".to_string(),
+                "/tmp/pkg".to_string(),
+            ],
+            &test_config(),
+        )
+        .expect("install parse");
+        assert!(matches!(
+            install,
+            ModuleCliCommand::Install(ModuleInstallOptions {
+                ref source_path,
+                ref source,
+                activate: false,
+            }) if source_path == &PathBuf::from("/tmp/pkg")
+                && source.as_deref() == Some("test")
+        ));
+
+        let inspect = parse_module_command(
+            &[
+                "inspect".to_string(),
+                "module.skills.rust_debugging".to_string(),
+            ],
+            &test_config(),
+        )
+        .expect("inspect parse");
+        assert!(matches!(
+            inspect,
+            ModuleCliCommand::Inspect(ModuleInspectOptions { .. })
+        ));
     }
 }

@@ -32,16 +32,17 @@ use sinomo_kv::{
 };
 use sinomo_local::SinomoDataDir;
 use sinomo_network::{
-    AsyncDaemonControlStream, CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_ROUTE_METADATA,
-    CLUSTER_INVITE_PUBLISH_ROUTE, CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE,
-    CLUSTER_MEMBER_PUBLISH_ROUTE, CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-    CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_RELAY_ROUTE, CLUSTER_ROUTING_RPC_ROUTE_METADATA,
-    ClusterPaths, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
-    DaemonControlRequest, DaemonControlResponse, NetworkError, ObjectRouteDescriptor,
-    ObjectRpcAuthorizationLayer, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcRouteCatalog,
-    ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter, RelayEnvelope,
-    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, ServiceCatalog,
+    AsyncDaemonControlStream, CLUSTER_HEALTH_ROUTE, CLUSTER_INVITE_PUBLISH_ROUTE,
+    CLUSTER_JOIN_CHALLENGE_ROUTE, CLUSTER_JOIN_REGISTER_ROUTE, CLUSTER_MEMBER_PUBLISH_ROUTE,
+    CLUSTER_MEMBERSHIP_RPC_CATEGORY, CLUSTER_MEMBERSHIP_RPC_ROUTE_METADATA, CLUSTER_RELAY_ROUTE,
+    CLUSTER_ROUTING_RPC_ROUTE_METADATA, ClusterPaths, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE, DaemonControlRequest, DaemonControlResponse, NetworkError,
+    ObjectRouteDescriptor, ObjectRpcAuthorizationLayer, ObjectRpcRequest, ObjectRpcResponse,
+    ObjectRpcRouteCatalog, ObjectRpcRoutePolicyLayer, ObjectRpcRouteRegistry, ObjectRpcRouter,
+    RelayEnvelope, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+    ServiceCatalog,
 };
+use sinomo_network_module::network_module_surfaces;
 use sinomo_rollout::{
     ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
     ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
@@ -308,6 +309,22 @@ fn service_routes_from_metadata(
         .collect()
 }
 
+fn network_module_service_route(route: &'static str) -> ServiceRoute {
+    let descriptor = network_module_surfaces()
+        .object_rpc_route_descriptor(route)
+        .expect("network module surfaces should be valid")
+        .unwrap_or_else(|| panic!("unknown network service route {route}"));
+    ServiceRoute::from_route_metadata(
+        descriptor.route,
+        descriptor.category,
+        descriptor.auth_scope,
+        descriptor
+            .required_capabilities
+            .into_iter()
+            .map(|capability| capability.to_string()),
+    )
+}
+
 fn rollout_binary_service_route(route: &'static str) -> ServiceRoute {
     let descriptor = rollout_module_surfaces()
         .object_rpc_route_descriptor(route)
@@ -502,7 +519,7 @@ impl Service for ClusterHealthService {
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        service_routes_from_metadata(CLUSTER_HEALTH_RPC_ROUTE_METADATA)
+        vec![network_module_service_route(CLUSTER_HEALTH_ROUTE)]
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
@@ -1440,6 +1457,8 @@ fn daemon_internal_module_registry(
 ) -> Result<sinomo_module::ModuleRegistry, NetworkError> {
     let mut builder = sinomo_module::ModuleRegistry::builder()
         .register(sinomo_dfs::dfs_module_registration())
+        .map_err(module_error_to_network_error)?
+        .register(sinomo_network_module::network_module_registration())
         .map_err(module_error_to_network_error)?
         .register(sinomo_rollout::rollout_module_registration())
         .map_err(module_error_to_network_error)?;
@@ -2637,6 +2656,32 @@ mod tests {
             Some(sinomo_dfs::DFS_RPC_CATEGORY)
         );
         let route_metadata = registry.route_categories();
+        let health = route_metadata
+            .iter()
+            .find(|route| route.route == CLUSTER_HEALTH_ROUTE)
+            .expect("cluster health route metadata");
+        let network_module_routes = sinomo_network_module::network_module_surfaces()
+            .object_rpc_route_descriptors()
+            .expect("network module surfaces")
+            .into_iter()
+            .map(|descriptor| (descriptor.route.clone(), descriptor))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let health_module_route = network_module_routes
+            .get(CLUSTER_HEALTH_ROUTE)
+            .expect("cluster health module route");
+        assert_eq!(health.category, health_module_route.category);
+        assert_eq!(
+            health.auth_scope.as_deref(),
+            Some(health_module_route.auth_scope.as_str())
+        );
+        assert_eq!(
+            health.required_capabilities,
+            health_module_route
+                .required_capabilities
+                .iter()
+                .map(|capability| capability.as_str().to_string())
+                .collect::<Vec<_>>()
+        );
         let dfs_frame = route_metadata
             .iter()
             .find(|route| route.route == sinomo_dfs::DFS_PROTOCOL_FRAME_ROUTE)

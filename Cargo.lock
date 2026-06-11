@@ -1847,6 +1847,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -5842,6 +5843,7 @@ dependencies = [
  "sinomo-local",
  "sinomo-module",
  "sinomo-network",
+ "sinomo-network-module",
  "sinomo-node",
  "sinomo-object",
  "sinomo-observe",
@@ -6080,6 +6082,7 @@ dependencies = [
  "sinomo-storage",
  "thiserror 2.0.18",
  "time",
+ "zip",
 ]
 
 [[package]]
@@ -6117,6 +6120,15 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
+]
+
+[[package]]
+name = "sinomo-network-module"
+version = "0.1.0"
+dependencies = [
+ "sinomo-core",
+ "sinomo-module",
+ "sinomo-network",
 ]
 
 [[package]]
@@ -6242,6 +6254,7 @@ dependencies = [
  "sinomo-module",
  "sinomo-module-api",
  "sinomo-network",
+ "sinomo-network-module",
  "sinomo-node",
  "sinomo-object",
  "sinomo-observe",
@@ -9103,10 +9116,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
 dependencies = [
  "crc32fast",
+ "flate2",
  "indexmap",
  "memchr",
  "typed-path",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
 
 [[package]]
 name = "zmij"
