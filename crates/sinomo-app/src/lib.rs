@@ -1,7 +1,8 @@
 //! Sinomo's graphical client app, built on the SUI toolkit.
 //!
-//! Three tabs sit under a brand title bar: **Sinomo** (agent chat), **Files**
-//! (the SIFS distributed file browser) and **Settings** (app + cluster config).
+//! Four tabs sit under a brand title bar: **Sinomo** (agent chat), **Cluster**
+//! (network topology graph), **Files** (the SIFS distributed file browser) and
+//! **Settings** (app + cluster config).
 //! The app probes for a local daemon and, if none is found, runs as an embedded
 //! mobile node so it stays useful in local mode.
 

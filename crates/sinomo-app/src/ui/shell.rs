@@ -25,7 +25,7 @@ use sui::{
 
 use crate::state::{Shared, Tab};
 use crate::theme::Palette;
-use crate::ui::{chat, files, settings, widgets};
+use crate::ui::{chat, cluster, files, settings, widgets};
 
 pub const TOPBAR_HEIGHT: f32 = 44.0;
 const LOGO_SIZE: f32 = 24.0;
@@ -105,6 +105,7 @@ impl Shell {
     fn build_content(&mut self) {
         let content = SwitchView::new()
             .with_child(chat::view(self.shared.clone()))
+            .with_child(cluster::view(self.shared.clone()))
             .with_child(files::view(self.shared.clone()))
             .with_child(settings::view(self.shared.clone()))
             .selected_when({

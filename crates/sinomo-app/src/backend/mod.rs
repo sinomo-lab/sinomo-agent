@@ -7,6 +7,7 @@
 //! app is a pure frontend; it holds no config/runtime state of its own.
 
 pub mod chat_engine;
+pub mod cluster;
 pub mod config;
 pub mod sessions;
 pub mod sifs;
@@ -64,7 +65,7 @@ impl Connection {
     }
 
     /// The control address of the attached daemon, if any.
-    fn daemon_address(&self) -> Option<&str> {
+    pub(crate) fn daemon_address(&self) -> Option<&str> {
         match self {
             Connection::Daemon(status) | Connection::InProcessDaemon(status) => {
                 Some(status.address.as_str())
