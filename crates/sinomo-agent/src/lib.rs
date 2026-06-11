@@ -23,11 +23,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 mod agent;
+mod compaction;
 mod process;
 mod session_store;
 pub mod tools;
 
 pub use agent::*;
+pub use compaction::*;
 pub use process::*;
 pub use session_store::*;
 pub use tools::*;

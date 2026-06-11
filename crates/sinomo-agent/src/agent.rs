@@ -10,8 +10,9 @@ use crate::tools::{
     AgentToolStatus, is_tool_disclosure_bridge_name,
 };
 use crate::{
-    AgentCancellationToken, AgentDefinition, AgentError, AgentLoopDecision, AgentLoopInput,
-    AgentOutputFormat, AgentToolCall, AsyncTaskNextAction, InteractionModel, InteractionSession,
+    AgentCancellationToken, AgentCompactionEngine, AgentCompactionRequest, AgentDefinition,
+    AgentError, AgentLoopDecision, AgentLoopInput, AgentOutputFormat, AgentToolCall,
+    AsyncTaskNextAction, CodexStyleAgentCompactionEngine, InteractionModel, InteractionSession,
     TaskId, parse_agent_loop_response, render_agent_system_prompt_with_descriptors,
 };
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
 const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO: f32 = 0.80;
@@ -2023,7 +2024,15 @@ impl Default for AgentWorkingState {
 pub struct AgentCompactionSummary {
     pub compaction_id: TaskId,
     pub reason: String,
+    #[serde(default = "default_agent_compaction_summary_strategy_id")]
+    pub strategy_id: String,
+    #[serde(default)]
+    pub trigger: AgentCompactionTrigger,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<AgentCompactionModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_retained_item: Option<TaskId>,
     pub token_estimate_before: usize,
@@ -2038,6 +2047,48 @@ pub struct AgentCompactionSummary {
     pub open_risks: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_constraints: Vec<String>,
+}
+
+fn default_agent_compaction_summary_strategy_id() -> String {
+    crate::DEFAULT_AGENT_COMPACTION_STRATEGY_ID.to_string()
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCompactionTrigger {
+    #[default]
+    Manual,
+    PreSamplingBudget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct AgentCompactionModelRef {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentCompactionBuildOptions {
+    pub strategy_id: String,
+    pub trigger: AgentCompactionTrigger,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_override: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<AgentCompactionModelRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+impl Default for AgentCompactionBuildOptions {
+    fn default() -> Self {
+        Self {
+            strategy_id: crate::DEFAULT_AGENT_COMPACTION_STRATEGY_ID.to_string(),
+            trigger: AgentCompactionTrigger::Manual,
+            summary_override: None,
+            summary_model: None,
+            fallback_reason: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2097,6 +2148,30 @@ impl AgentCompactor {
         steering: &[AgentSteeringMessage],
         follow_ups: &[AgentFollowUpMessage],
     ) -> AgentCompactionSummary {
+        self.compact_retaining_tail_count_with_options(
+            transcript,
+            reason,
+            token_estimate_before,
+            retained_tail_count,
+            previous_projection,
+            steering,
+            follow_ups,
+            AgentCompactionBuildOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn compact_retaining_tail_count_with_options(
+        &self,
+        transcript: &AgentTranscript,
+        reason: impl Into<String>,
+        token_estimate_before: usize,
+        retained_tail_count: usize,
+        previous_projection: Option<&AgentSessionProjection>,
+        steering: &[AgentSteeringMessage],
+        follow_ups: &[AgentFollowUpMessage],
+        options: AgentCompactionBuildOptions,
+    ) -> AgentCompactionSummary {
         let reason = reason.into();
         let retained = transcript.retained_tail(retained_tail_count);
         let working_state = working_state_from_items(
@@ -2115,13 +2190,20 @@ impl AgentCompactor {
                 .or(working_state.active_objective.as_deref())
                 .unwrap_or("no active user request recorded")
         );
+        let summary = options
+            .summary_override
+            .as_ref()
+            .map(|summary| summary.trim())
+            .filter(|summary| !summary.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| projection_summary.clone());
         let projection = AgentSessionProjection {
             projection_id: TaskId::generate(),
             previous_projection_id: previous_projection
                 .map(|projection| projection.projection_id.clone()),
             created_at: time::OffsetDateTime::now_utc(),
             reason: reason.clone(),
-            summary: projection_summary,
+            summary,
             source_item_count: transcript.items.len(),
             source_item_ids: transcript.items.iter().map(agent_item_id).collect(),
             retained_item_ids: retained.iter().map(agent_item_id).collect(),
@@ -2130,7 +2212,11 @@ impl AgentCompactor {
         AgentCompactionSummary {
             compaction_id: TaskId::generate(),
             reason,
+            strategy_id: options.strategy_id,
+            trigger: options.trigger,
             summary: projection.summary.clone(),
+            summary_model: options.summary_model,
+            fallback_reason: options.fallback_reason,
             first_retained_item: retained.first().map(agent_item_id),
             token_estimate_before,
             retained_tail_count: retained.len(),
@@ -5414,6 +5500,7 @@ pub struct Agent<M> {
     tools: AgentToolRegistry,
     context_assembler: ContextAssembler,
     compactor: AgentCompactor,
+    compaction_engine: Arc<RwLock<Box<dyn AgentCompactionEngine<M>>>>,
     trace_store: Box<dyn AgentTraceStore>,
     session_store: Box<dyn AgentSessionStore>,
 }
@@ -5431,6 +5518,9 @@ impl<M: InteractionModel> Agent<M> {
             tools: AgentToolRegistry::new(),
             context_assembler: ContextAssembler,
             compactor: AgentCompactor::default(),
+            compaction_engine: Arc::new(RwLock::new(Box::new(
+                CodexStyleAgentCompactionEngine::default(),
+            ))),
             trace_store: Box::new(NoopAgentTraceStore),
             session_store: Box::new(NoopAgentSessionStore),
         }
@@ -5489,6 +5579,28 @@ impl<M: InteractionModel> Agent<M> {
     pub fn with_compactor(mut self, compactor: AgentCompactor) -> Self {
         self.compactor = compactor;
         self
+    }
+
+    pub fn with_compaction_engine<E>(mut self, engine: E) -> Self
+    where
+        E: AgentCompactionEngine<M> + 'static,
+    {
+        self.compaction_engine = Arc::new(RwLock::new(Box::new(engine)));
+        self
+    }
+
+    pub fn replace_compaction_engine<E>(&self, engine: E) -> Result<(), AgentError>
+    where
+        E: AgentCompactionEngine<M> + 'static,
+    {
+        let mut slot = self
+            .compaction_engine
+            .write()
+            .map_err(|_| AgentError::Runtime {
+                detail: "compaction engine lock poisoned".to_string(),
+            })?;
+        *slot = Box::new(engine);
+        Ok(())
     }
 
     pub fn with_trace_store<T: AgentTraceStore + 'static>(mut self, trace_store: T) -> Self {
@@ -5901,19 +6013,22 @@ impl<M: InteractionModel> Agent<M> {
         reason: impl Into<String>,
     ) -> Result<AgentCompactionSummary, AgentError> {
         let source_transcript = session.compaction_source_transcript();
-        let summary = self
+        let retained_tail_count = self
             .compactor
-            .compact_retaining_tail_count_with_session_state(
-                &source_transcript,
-                reason,
-                source_transcript.items.len(),
-                self.compactor
-                    .retained_tail_count
-                    .unwrap_or(source_transcript.items.len()),
-                session.projection.as_ref(),
-                &session.steering_queue,
-                &session.follow_up_queue,
-            );
+            .retained_tail_count
+            .unwrap_or(source_transcript.items.len());
+        let cancellation_token = AgentCancellationToken::new();
+        let summary = self.compact_source_transcript(
+            &source_transcript,
+            reason.into(),
+            source_transcript.items.len(),
+            retained_tail_count,
+            session.projection.as_ref(),
+            &session.steering_queue,
+            &session.follow_up_queue,
+            AgentCompactionTrigger::Manual,
+            &cancellation_token,
+        )?;
         let compaction_item = AgentItem::CompactionSummary {
             item_id: TaskId::generate(),
             summary: summary.clone(),
@@ -5936,6 +6051,43 @@ impl<M: InteractionModel> Agent<M> {
         )?;
         self.save_session(session)?;
         Ok(summary)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compact_source_transcript(
+        &self,
+        source_transcript: &AgentTranscript,
+        reason: String,
+        token_estimate_before: usize,
+        retained_tail_count: usize,
+        previous_projection: Option<&AgentSessionProjection>,
+        steering: &[AgentSteeringMessage],
+        follow_ups: &[AgentFollowUpMessage],
+        trigger: AgentCompactionTrigger,
+        cancellation_token: &AgentCancellationToken,
+    ) -> Result<AgentCompactionSummary, AgentError> {
+        let engine = self
+            .compaction_engine
+            .read()
+            .map_err(|_| AgentError::Runtime {
+                detail: "compaction engine lock poisoned".to_string(),
+            })?;
+        engine.compact(
+            &self.model,
+            AgentCompactionRequest {
+                config: &self.config,
+                projection_builder: &self.compactor,
+                source_transcript,
+                reason,
+                trigger,
+                token_estimate_before,
+                retained_tail_count,
+                previous_projection,
+                steering,
+                follow_ups,
+                cancellation_token,
+            },
+        )
     }
 
     pub fn abort(
@@ -6172,17 +6324,17 @@ impl<M: InteractionModel> Agent<M> {
                         .retained_tail_count
                         .unwrap_or(retained_transcript.len())
                         .min(typed_transcript.items.len());
-                    let compaction = self
-                        .compactor
-                        .compact_retaining_tail_count_with_session_state(
-                            &typed_transcript,
-                            "context budget threshold reached",
-                            turn_context.budget_estimate.total_bytes,
-                            retained_tail_count,
-                            session_projection.as_ref(),
-                            steering,
-                            follow_ups,
-                        );
+                    let compaction = self.compact_source_transcript(
+                        &typed_transcript,
+                        "context budget threshold reached".to_string(),
+                        turn_context.budget_estimate.total_bytes,
+                        retained_tail_count,
+                        session_projection.as_ref(),
+                        steering,
+                        follow_ups,
+                        AgentCompactionTrigger::PreSamplingBudget,
+                        &cancellation_token,
+                    )?;
                     let compaction_item = AgentItem::CompactionSummary {
                         item_id: TaskId::generate(),
                         summary: compaction.clone(),
@@ -9020,6 +9172,125 @@ mod tests {
     }
 
     #[test]
+    fn codex_style_compaction_uses_model_checkpoint_summary() {
+        let model = SequencedModel::new(["## Current Progress\n- Summary from compaction model."]);
+        let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
+            retained_tail_count: Some(1),
+        });
+        let session_id =
+            SessionId::from_legacy_named("sess_agent_model_compaction").expect("session");
+        let mut session = AgentSession::new(session_id, AgentRole::Deliberation);
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "old objective with critical id abc-123".to_string(),
+            event_id: None,
+        });
+        session.transcript.push(AgentItem::AssistantText {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "working notes".to_string(),
+        });
+
+        let summary = agent
+            .compact(&mut session, "checkpoint old context")
+            .expect("compact");
+
+        assert_eq!(
+            summary.summary,
+            "## Current Progress\n- Summary from compaction model."
+        );
+        assert_eq!(
+            summary.strategy_id,
+            crate::DEFAULT_AGENT_COMPACTION_STRATEGY_ID
+        );
+        assert_eq!(summary.trigger, AgentCompactionTrigger::Manual);
+        assert_eq!(
+            summary.summary_model,
+            Some(AgentCompactionModelRef {
+                provider: "fake".to_string(),
+                model: "fake".to_string(),
+            })
+        );
+        let requests = agent.model.requests.lock().expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].response_format,
+            LanguageModelResponseFormat::Text
+        );
+        assert_eq!(
+            requests[0]
+                .metadata
+                .get("loop")
+                .and_then(serde_json::Value::as_str),
+            Some("agent_compaction")
+        );
+        let request_text = requests[0]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_text.contains("CONTEXT CHECKPOINT COMPACTION"));
+        assert!(request_text.contains("abc-123"));
+    }
+
+    #[test]
+    fn compaction_engine_can_be_replaced_online() {
+        struct ReplacementEngine;
+
+        impl<M: InteractionModel> AgentCompactionEngine<M> for ReplacementEngine {
+            fn compact(
+                &self,
+                _model: &M,
+                request: AgentCompactionRequest<'_>,
+            ) -> Result<AgentCompactionSummary, AgentError> {
+                Ok(request
+                    .projection_builder
+                    .compact_retaining_tail_count_with_options(
+                        request.source_transcript,
+                        request.reason,
+                        request.token_estimate_before,
+                        request.retained_tail_count,
+                        request.previous_projection,
+                        request.steering,
+                        request.follow_ups,
+                        AgentCompactionBuildOptions {
+                            strategy_id: "test.replacement.compaction".to_string(),
+                            trigger: request.trigger,
+                            summary_override: Some("replacement engine summary".to_string()),
+                            summary_model: None,
+                            fallback_reason: None,
+                        },
+                    ))
+            }
+        }
+
+        let model = SequencedModel::new(Vec::<String>::new());
+        let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
+            retained_tail_count: Some(1),
+        });
+        agent
+            .replace_compaction_engine(ReplacementEngine)
+            .expect("replace engine");
+        let session_id =
+            SessionId::from_legacy_named("sess_agent_replace_compaction").expect("session");
+        let mut session = AgentSession::new(session_id, AgentRole::Deliberation);
+        session.transcript.push(AgentItem::UserMessage {
+            item_id: TaskId::generate(),
+            step_index: 0,
+            content: "replace this compaction implementation".to_string(),
+            event_id: None,
+        });
+
+        let summary = agent.compact(&mut session, "online swap").expect("compact");
+
+        assert_eq!(summary.strategy_id, "test.replacement.compaction");
+        assert_eq!(summary.summary, "replacement engine summary");
+        assert!(agent.model.requests.lock().expect("requests").is_empty());
+    }
+
+    #[test]
     fn compaction_carries_prior_projection_working_state_forward() {
         let compactor = AgentCompactor {
             retained_tail_count: Some(1),
@@ -11636,6 +11907,7 @@ old
     fn automatic_compaction_prunes_model_context_before_sampling() {
         let old_context = format!("OLD_CONTEXT_MARKER:{}", "x".repeat(8 * 1024));
         let model = SequencedModel::new([
+            "Checkpoint summary for old context.",
             r#"{
                 "response_mode": "answer",
                 "text": "First compacted answer.",
@@ -11643,6 +11915,7 @@ old
                 "background_handoff": null,
                 "next_state": "listening"
             }"#,
+            "Checkpoint summary for follow-up context.",
             r#"{
                 "response_mode": "answer",
                 "text": "Second compacted answer.",
@@ -11685,8 +11958,34 @@ old
         assert_eq!(first_run.compactions.len(), 1);
         assert_eq!(second_run.final_decision.text, "Second compacted answer.");
         let requests = agent.model.requests.lock().expect("requests");
-        assert_eq!(requests.len(), 2);
-        for request in requests.iter() {
+        assert_eq!(requests.len(), 4);
+        let compaction_requests = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .metadata
+                    .get("loop")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("agent_compaction")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(compaction_requests.len(), 2);
+        assert_eq!(
+            compaction_requests[0].response_format,
+            LanguageModelResponseFormat::Text
+        );
+        let agent_requests = requests
+            .iter()
+            .filter(|request| {
+                request
+                    .metadata
+                    .get("loop")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("agent")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(agent_requests.len(), 2);
+        for request in agent_requests {
             let request_text = request
                 .messages
                 .iter()
@@ -11701,13 +12000,16 @@ old
 
     #[test]
     fn session_projection_is_rendered_as_current_work_budget_lane() {
-        let model = SequencedModel::new([r#"{
+        let model = SequencedModel::new([
+            "Checkpoint summary for projection context.",
+            r#"{
             "response_mode": "answer",
             "text": "Projection-aware answer.",
             "tool_calls": [],
             "background_handoff": null,
             "next_state": "listening"
-        }"#]);
+        }"#,
+        ]);
         let agent = Agent::new(model, "fake", "fake").with_compactor(AgentCompactor {
             retained_tail_count: Some(1),
         });
@@ -11731,7 +12033,8 @@ old
 
         let run = agent.start_turn(&mut session, &input).expect("run");
 
-        let request_text = agent.model.requests.lock().expect("requests")[0]
+        let requests = agent.model.requests.lock().expect("requests");
+        let request_text = requests[1]
             .messages
             .iter()
             .map(|message| message.content.as_str())
