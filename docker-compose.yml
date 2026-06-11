@@ -48,6 +48,9 @@ services:
       # Production keeps iroh enabled (relay-assisted reachability for roaming
       # peers); the dev cluster disables it on purpose.
       SINOMO_DISABLE_IROH: "0"
+      # Bootstrap the default cluster-backed SIFS filesystem (metadata shards
+      # published to cluster KV) so DFS works across nodes out of the box.
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
       SINOMO_DAEMON_ADVERTISE_HOST: ${SINOMO_ADVERTISE_HOST:-}
     ports:
       - "21353:21353" # main daemon

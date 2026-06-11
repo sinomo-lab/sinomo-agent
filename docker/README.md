@@ -152,6 +152,38 @@ docker compose -f docker/docker-compose.dev.yml ps        # container state (all
 docker compose -f docker/docker-compose.dev.yml down -v   # tear down + wipe volumes
 ```
 
+## Automated DFS correctness suite
+
+`docker/test-cluster.sh` runs the cluster-wide POSIX/DFS correctness suite in a
+**dedicated compose project** (`sinomo-dfs-test` by default, so it never touches a
+manually started dev cluster): it builds the host binary if missing, brings up the
+6 nodes, waits for clean formation, then drives the in-binary `cluster-dfs` runtime
+test cases from different nodes:
+
+```bash
+docker/test-cluster.sh                       # up, test, down -v
+SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
+SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
+```
+
+Scenarios: per-node DFS invariants, read-your-write roundtrips (both segments),
+cross-segment write→read in both directions plus a routed delete, a
+/users→/services rename issued by a non-writer node, member restart durability,
+and a final invariant sweep. Failure evidence (probe JSON, compose ps, cluster
+health/doctor, per-node logs) lands in `target/cluster-test-artifacts/<run>/`.
+
+The scenarios are composed from runtime test cases registered in the binary
+itself (list them with `sinomo test list --tag cluster-dfs`), so any probe can
+also be run by hand on any live node:
+
+```bash
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  exec node5 sinomo test run cluster.dfs.read-your-write --require-cluster --json
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  exec node2 sinomo test run cluster.dfs.expect-file --require-cluster \
+  --param path=/services/x.txt --param payload=hello --param timeout-seconds=60
+```
+
 ## Validation gates
 
 The hardening harnesses are designed to fail with useful evidence instead of only printing
