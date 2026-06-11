@@ -10,8 +10,9 @@ use crate::namespace::{initial_version, metadata_path, next_version, object_id_f
 use crate::{
     DfsControlPlaneStore, DfsDirectoryPage, DfsDirectoryPageCursor, DfsError, DfsFileSystem,
     DfsFrameTransport, DfsNamespaceJobFrame, DfsNamespaceJobKind, DfsNamespaceJobRecord,
-    DfsNamespaceJobStatus, DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsReadData,
-    DfsReadRangeData, DfsReplicationPolicy, NetworkedDfsRangeReadOutcome,
+    DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespacePosixError, DfsNamespaceResult,
+    DfsNamespaceTransaction, DfsObjectKind, DfsObjectMetadata, DfsObjectVersionRecord, DfsReadData,
+    DfsReadRangeData, DfsReplicaReceiptRecord, DfsReplicationPolicy, NetworkedDfsRangeReadOutcome,
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome,
     NetworkedDfsService, NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
 };
@@ -227,9 +228,809 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// The metadata-shard primary to route a namespace mutation to, or `None`
+    /// when this node is itself the namespace authority for the path (or no
+    /// cluster shard configuration exists).
+    fn routed_namespace_primary_for_path(&mut self, path: &str) -> Result<Option<NodeId>> {
+        let Some(kv) = self.control_plane.as_mut() else {
+            return Ok(None);
+        };
+        let shard = DfsControlPlaneStore::new(kv.as_mut())
+            .select_metadata_shard_for_path(&sifs_file_system_id(), path)
+            .map_err(DfsError::from)?;
+        Ok(match shard {
+            Some(shard) if shard.primary_node_id != self.node_id => Some(shard.primary_node_id),
+            _ => None,
+        })
+    }
+
+    /// Routes a namespace mutation to the shard primary, blocks for the
+    /// response, and maps a structured rejection back to the same
+    /// `DfsPosixError` a local execution would have produced. On success the
+    /// response journal batches are already replayed locally.
+    fn route_namespace_operation(
+        &mut self,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<()> {
+        match self.route_namespace_operation_to_metadata_primary(
+            sifs_file_system_id(),
+            primary_node_id,
+            operation,
+        )? {
+            DfsNamespaceResult::Applied => Ok(()),
+            DfsNamespaceResult::Rejected {
+                reason,
+                posix_error,
+            } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+        }
+    }
+
+    /// Executes a routed namespace operation on the namespace authority.
+    /// Callers have already validated shard primaryship; dispatching to the
+    /// `_local` variants keeps execution from re-routing.
+    pub(crate) fn execute_namespace_operation_local(
+        &mut self,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<()> {
+        // Mutations must not interleave with an in-flight cross-shard move of
+        // the same path; the coordinator releases the lock when the move
+        // completes or aborts.
+        for path in operation.involved_paths() {
+            if let Some(normalized) = normalized_posix_path_key(path) {
+                self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &normalized)?;
+            }
+        }
+        match operation {
+            DfsNamespaceOperation::Mkdir { path } => self.posix_mkdir_local(path).map(drop),
+            DfsNamespaceOperation::MkdirAll { path } => self.posix_mkdir_all_local(path),
+            DfsNamespaceOperation::Rmdir { path } => self.posix_rmdir_local(path).map(drop),
+            DfsNamespaceOperation::Unlink { path } => self.posix_unlink_local(path).map(drop),
+            DfsNamespaceOperation::Rename { from, to } => {
+                self.posix_rename_local(from, to).map(drop)
+            }
+            DfsNamespaceOperation::Hardlink {
+                existing_path,
+                link_path,
+            } => self
+                .posix_hardlink_local(existing_path, link_path)
+                .map(drop),
+            DfsNamespaceOperation::SetMode { path, mode } => {
+                self.posix_set_mode_local(path, *mode).map(drop)
+            }
+            DfsNamespaceOperation::SetOwner { path, uid, gid } => {
+                self.posix_set_owner_local(path, *uid, *gid).map(drop)
+            }
+            DfsNamespaceOperation::SetTimes {
+                path,
+                accessed_at_unix_nanos,
+                modified_at_unix_nanos,
+                follow_symlink,
+            } => {
+                if *follow_symlink {
+                    self.posix_set_times_local(
+                        path,
+                        *accessed_at_unix_nanos,
+                        *modified_at_unix_nanos,
+                    )
+                    .map(drop)
+                } else {
+                    self.posix_set_symlink_times_local(
+                        path,
+                        *accessed_at_unix_nanos,
+                        *modified_at_unix_nanos,
+                    )
+                    .map(drop)
+                }
+            }
+            DfsNamespaceOperation::ClearDirRecursive { path } => {
+                self.posix_clear_dir_recursive_local(path)
+            }
+            DfsNamespaceOperation::SyncPath { .. } => Ok(()),
+            DfsNamespaceOperation::AdoptObjectAtPath {
+                object,
+                versions,
+                receipts,
+                intents,
+                conflicts,
+            } => self.adopt_object_at_path_local(object, versions, receipts, intents, conflicts),
+            DfsNamespaceOperation::AdoptHardlinkAlias { alias } => {
+                self.adopt_hardlink_alias_local(alias)
+            }
+        }
+    }
+
+    /// Local namespace mutations must not interleave with an in-flight
+    /// cross-shard move of the same resolved path (the move's saga may be
+    /// suspended awaiting recovery, with its lock still held).
+    fn ensure_resolved_path_not_in_cross_shard_flight(&self, path: &str) -> Result<()> {
+        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), path)?;
+        Ok(())
+    }
+
+    /// Replays a foreign primary's shard journal for a path this node just
+    /// mutated through a coordinated cross-shard operation, restoring
+    /// read-your-write for the foreign half.
+    fn sync_remote_namespace_path(&mut self, path: &str) -> Result<()> {
+        if let Some(primary) = self.routed_namespace_primary_for_path(path)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::SyncPath {
+                    path: path.to_string(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Touches the parent directory mtime when this node is the metadata
+    /// authority for the parent's shard; foreign-shard parents are journaled
+    /// by their own primaries.
+    fn touch_parent_directory_if_local_primary(&mut self, path: &str) -> Result<()> {
+        let Some(parent) = parent_posix_path(path) else {
+            return Ok(());
+        };
+        if self.routed_namespace_primary_for_path(&parent)?.is_some() {
+            return Ok(());
+        }
+        self.touch_directory_modified(&parent)
+    }
+
+    /// Coordinates a rename whose destination lives in a metadata shard owned
+    /// by another primary. The move is a durable two-step saga: the
+    /// destination primary atomically adopts the object record (with its
+    /// version and receipt history) at the new path, then this node — the
+    /// source-shard authority — atomically tombstones the old path and evicts
+    /// the moved record from the source shard. A persisted namespace job and
+    /// an in-flight path lock make the window crash-recoverable and serialize
+    /// concurrent mutations; after the adoption commits, recovery is forward
+    /// only, so the move either fully applies or cleanly rejects.
+    pub(crate) fn coordinate_cross_shard_rename(
+        &mut self,
+        from: &str,
+        to: &str,
+        destination_primary: NodeId,
+    ) -> Result<()> {
+        let (from, from_requires_directory) = normalize_posix_path_with_trailing_directory(from)?;
+        let (to, to_requires_directory) = normalize_posix_path_with_trailing_directory(to)?;
+        let from = self.resolve_posix_path_distributed(&from, false)?;
+        if from_requires_directory {
+            self.ensure_resolved_path_is_directory_no_follow(&from)?;
+        }
+        let to = self.resolve_posix_path_distributed(&to, false)?;
+        if from == "/" || to == "/" {
+            return Err(DfsPosixError::InvalidPath {
+                path: format!("{from} -> {to}"),
+            });
+        }
+        if from == to {
+            return Ok(());
+        }
+        let file_system_id = sifs_file_system_id();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
+        let source = self
+            .lookup_sifs_path(&from)?
+            .ok_or_else(|| DfsPosixError::NotFound { path: from.clone() })?;
+        if source.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound { path: from });
+        }
+        if source.kind == DfsObjectKind::Directory {
+            // Directory renames across shard primaries would migrate a whole
+            // subtree between authorities; reject like a cross-device rename.
+            return Err(DfsPosixError::InvalidPath {
+                path: format!("{from} -> {to} renames a directory across metadata shard primaries"),
+            });
+        }
+        if to_requires_directory {
+            return Err(DfsPosixError::NotDirectory { path: to });
+        }
+
+        let mut moved = source.clone();
+        moved.path = to.clone();
+        moved.changed_at_unix_nanos = now_unix_nanos();
+        moved.version = next_version(&source.version);
+        let job_id = namespace_job_id(
+            "rename-cross-shard",
+            &source.file_system_id,
+            &format!("{from}->{to}"),
+            &source.object_id,
+            &source.version,
+        );
+        let job = match self.namespace_job(&job_id)? {
+            Some(job) => job,
+            None => {
+                let now = time::OffsetDateTime::now_utc();
+                DfsNamespaceJobRecord {
+                    job_id,
+                    file_system_id: source.file_system_id.clone(),
+                    kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                    status: DfsNamespaceJobStatus::Running,
+                    root_path: from.clone(),
+                    target_path: Some(to.clone()),
+                    pending_frames: vec![
+                        DfsNamespaceJobFrame::CrossShardComplete {
+                            moved_object: moved.clone(),
+                            old_path: from.clone(),
+                        },
+                        DfsNamespaceJobFrame::CrossShardAdopt {
+                            moved_object: moved,
+                            old_path: from.clone(),
+                            destination_primary_node_id: destination_primary,
+                        },
+                    ],
+                    processed_object_count: 0,
+                    created_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                    failure_reason: None,
+                }
+            }
+        };
+        self.persist_namespace_job(&job)?;
+        self.run_cross_shard_namespace_job(job).map(drop)
+    }
+
+    /// Coordinates a hardlink whose alias path lives in a metadata shard
+    /// owned by another primary: the link-path primary atomically adopts the
+    /// alias record, then this node — the target's shard authority — records
+    /// the link-count change on the target.
+    pub(crate) fn coordinate_cross_shard_hardlink(
+        &mut self,
+        existing_path: &str,
+        link_path: &str,
+        destination_primary: NodeId,
+    ) -> Result<()> {
+        let (existing_path, existing_requires_directory) =
+            normalize_posix_path_with_trailing_directory(existing_path)?;
+        let existing_path = self.resolve_posix_path_distributed(&existing_path, false)?;
+        if existing_requires_directory {
+            self.ensure_resolved_path_is_directory_no_follow(&existing_path)?;
+        }
+        let (link_path, link_requires_directory) =
+            normalize_posix_path_with_trailing_directory(link_path)?;
+        let link_path = self.resolve_posix_path_distributed(&link_path, false)?;
+        if link_requires_directory {
+            self.ensure_resolved_path_is_directory_no_follow(&link_path)?;
+            return Err(DfsPosixError::AlreadyExists { path: link_path });
+        }
+        if link_path == "/" {
+            return Err(DfsPosixError::InvalidPath { path: link_path });
+        }
+        let file_system_id = sifs_file_system_id();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &existing_path)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &link_path)?;
+        let existing =
+            self.lookup_sifs_path(&existing_path)?
+                .ok_or_else(|| DfsPosixError::NotFound {
+                    path: existing_path.clone(),
+                })?;
+        if existing.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound {
+                path: existing_path,
+            });
+        }
+        let target = self.resolve_hardlink_target(&existing)?;
+        match target.kind {
+            DfsObjectKind::Directory => {
+                return Err(DfsPosixError::IsDirectory {
+                    path: existing_path,
+                });
+            }
+            DfsObjectKind::Tombstone => {
+                return Err(DfsPosixError::NotFound {
+                    path: existing_path,
+                });
+            }
+            _ => {}
+        }
+        let alias_object_id = {
+            let candidate = object_id_for_path(&link_path);
+            if candidate == target.object_id {
+                DfsObjectId::generate()
+            } else {
+                candidate
+            }
+        };
+        let alias = DfsObjectMetadata {
+            object_id: alias_object_id,
+            file_system_id: target.file_system_id.clone(),
+            path: link_path.clone(),
+            kind: DfsObjectKind::Hardlink,
+            owner_node_id: self.node_id.clone(),
+            current_locations: target.current_locations.clone(),
+            content_hash: target.content_hash.clone(),
+            content_size_bytes: target.content_size_bytes,
+            link_target_object_id: Some(target.object_id.clone()),
+            mode: target.mode,
+            uid: target.uid,
+            gid: target.gid,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: initial_version(),
+            policy: target.policy.clone(),
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+        let job_id = namespace_job_id(
+            "hardlink-cross-shard",
+            &target.file_system_id,
+            &format!("{existing_path}->{link_path}"),
+            &target.object_id,
+            &target.version,
+        );
+        let job = match self.namespace_job(&job_id)? {
+            Some(job) => job,
+            None => {
+                let now = time::OffsetDateTime::now_utc();
+                DfsNamespaceJobRecord {
+                    job_id,
+                    file_system_id: target.file_system_id.clone(),
+                    kind: DfsNamespaceJobKind::HardlinkAcrossShardPrimaries,
+                    status: DfsNamespaceJobStatus::Running,
+                    root_path: existing_path.clone(),
+                    target_path: Some(link_path.clone()),
+                    pending_frames: vec![
+                        DfsNamespaceJobFrame::CrossShardHardlinkComplete {
+                            target_object_id: target.object_id.clone(),
+                        },
+                        DfsNamespaceJobFrame::CrossShardHardlinkAdopt {
+                            alias,
+                            target_object_id: target.object_id.clone(),
+                            destination_primary_node_id: destination_primary,
+                        },
+                    ],
+                    processed_object_count: 0,
+                    created_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                    failure_reason: None,
+                }
+            }
+        };
+        self.persist_namespace_job(&job)?;
+        self.run_cross_shard_namespace_job(job).map(drop)
+    }
+
+    /// Drives a cross-shard saga job to completion: the foreign adoption is
+    /// idempotent and may be re-sent after restarts or timeouts; the local
+    /// completion is idempotent against current state. Structured rejections
+    /// from the destination abort the job before anything mutated locally;
+    /// transport failures leave the job running for maintenance to resume.
+    pub(crate) fn run_cross_shard_namespace_job(
+        &mut self,
+        mut job: DfsNamespaceJobRecord,
+    ) -> Result<DfsNamespaceJobRecord> {
+        if job.status != DfsNamespaceJobStatus::Running {
+            return Ok(job);
+        }
+        let file_system_id = job.file_system_id.clone();
+        // Snapshot-copied or stale jobs must not run on a node that is no
+        // longer the source-side authority.
+        let source_shards = self.namespace_shards_for_path(&file_system_id, &job.root_path)?;
+        if let Some(shard) = source_shards
+            .iter()
+            .find(|shard| shard.primary_node_id != self.node_id)
+        {
+            let reason = format!(
+                "node {} is not the source metadata primary for shard {}",
+                self.node_id, shard.shard_id
+            );
+            self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
+            return self.fail_namespace_job(job, reason);
+        }
+        self.lock_cross_shard_namespace_path(&file_system_id, &job.root_path);
+        while let Some(frame) = job.pending_frames.pop() {
+            let outcome = match frame.clone() {
+                DfsNamespaceJobFrame::CrossShardAdopt {
+                    moved_object,
+                    old_path,
+                    destination_primary_node_id,
+                } => {
+                    let _ = old_path;
+                    let (versions, receipts, intents, conflicts) =
+                        self.cross_shard_move_bundle(&moved_object.object_id)?;
+                    // The destination primary may have moved since the job
+                    // was created (shard transfer); follow the control
+                    // plane's current answer, falling back to the recorded
+                    // primary without one.
+                    match self.routed_namespace_primary_for_path(&moved_object.path)? {
+                        Some(primary) => self.route_namespace_operation(
+                            primary,
+                            DfsNamespaceOperation::AdoptObjectAtPath {
+                                object: moved_object,
+                                versions,
+                                receipts,
+                                intents,
+                                conflicts,
+                            },
+                        ),
+                        None if self.control_plane.is_some() => {
+                            // A transfer made this node the destination
+                            // primary; adopt locally.
+                            self.adopt_object_at_path_local(
+                                &moved_object,
+                                &versions,
+                                &receipts,
+                                &intents,
+                                &conflicts,
+                            )
+                        }
+                        None => self.route_namespace_operation(
+                            destination_primary_node_id,
+                            DfsNamespaceOperation::AdoptObjectAtPath {
+                                object: moved_object,
+                                versions,
+                                receipts,
+                                intents,
+                                conflicts,
+                            },
+                        ),
+                    }
+                }
+                DfsNamespaceJobFrame::CrossShardComplete {
+                    moved_object,
+                    old_path,
+                } => self.complete_cross_shard_move_locally(&moved_object, &old_path),
+                DfsNamespaceJobFrame::CrossShardHardlinkAdopt {
+                    alias,
+                    target_object_id,
+                    destination_primary_node_id,
+                } => {
+                    let _ = target_object_id;
+                    match self.routed_namespace_primary_for_path(&alias.path)? {
+                        Some(primary) => self.route_namespace_operation(
+                            primary,
+                            DfsNamespaceOperation::AdoptHardlinkAlias { alias },
+                        ),
+                        None if self.control_plane.is_some() => {
+                            self.adopt_hardlink_alias_local(&alias)
+                        }
+                        None => self.route_namespace_operation(
+                            destination_primary_node_id,
+                            DfsNamespaceOperation::AdoptHardlinkAlias { alias },
+                        ),
+                    }
+                }
+                DfsNamespaceJobFrame::CrossShardHardlinkComplete { target_object_id } => {
+                    self.complete_cross_shard_hardlink_locally(&target_object_id)
+                }
+                other => Err(DfsPosixError::InvalidPath {
+                    path: format!("{}: unexpected frame {other:?}", job.job_id),
+                }),
+            };
+            match outcome {
+                Ok(()) => {
+                    job.processed_object_count = job.processed_object_count.saturating_add(1);
+                    job.updated_at = time::OffsetDateTime::now_utc();
+                    self.persist_namespace_job(&job)?;
+                }
+                Err(error @ (DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_))) => {
+                    // Transport or internal failure: the saga stays running
+                    // (and the path stays locked) so maintenance resumes it.
+                    job.pending_frames.push(frame);
+                    job.updated_at = time::OffsetDateTime::now_utc();
+                    self.persist_namespace_job(&job)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    // Structured POSIX rejection from validation: abort before
+                    // any local mutation happened.
+                    self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
+                    self.fail_namespace_job(job, error.to_string())?;
+                    return Err(error);
+                }
+            }
+        }
+        let now = time::OffsetDateTime::now_utc();
+        job.status = DfsNamespaceJobStatus::Completed;
+        job.updated_at = now;
+        job.completed_at = Some(now);
+        self.persist_namespace_job(&job)?;
+        self.unlock_cross_shard_namespace_path(&file_system_id, &job.root_path);
+        Ok(job)
+    }
+
+    /// The moved object's version, receipt, intent, and conflict history,
+    /// shipped with the adoption so the destination shard owns the complete
+    /// record set for the object (mirroring same-node shard migration): its
+    /// replicas can serve and repair the content at the new home, and
+    /// historical intents stay resolvable for journal-replay tolerance.
+    #[allow(clippy::type_complexity)]
+    fn cross_shard_move_bundle(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> Result<(
+        Vec<DfsObjectVersionRecord>,
+        Vec<DfsReplicaReceiptRecord>,
+        Vec<crate::DfsWriteIntentRecord>,
+        Vec<crate::DfsConflictRecord>,
+    )> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        };
+        let mut versions = Vec::new();
+        let mut version_cursor = None;
+        loop {
+            let page = backend.versions_for_object_page(
+                object_id,
+                version_cursor.as_ref(),
+                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+            )?;
+            versions.extend(page.versions);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            version_cursor = Some(next_cursor);
+        }
+        let mut receipts = Vec::new();
+        for version in &versions {
+            let mut receipt_cursor = None;
+            loop {
+                let page = backend.receipts_for_version_page(
+                    object_id,
+                    &version.version,
+                    receipt_cursor.as_ref(),
+                    POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+                )?;
+                receipts.extend(page.receipts);
+                let Some(next_cursor) = page.next_cursor else {
+                    break;
+                };
+                receipt_cursor = Some(next_cursor);
+            }
+        }
+        let mut intents = Vec::new();
+        let mut intent_cursor = None;
+        loop {
+            let page = backend.intents_for_object_page(
+                object_id,
+                intent_cursor.as_ref(),
+                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+            )?;
+            intents.extend(page.intents);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            intent_cursor = Some(next_cursor);
+        }
+        let mut conflicts = Vec::new();
+        let mut conflict_cursor = None;
+        loop {
+            let page = backend.conflicts_for_object_page(
+                object_id,
+                conflict_cursor.as_ref(),
+                POSIX_LIST_DIR_COLLECT_PAGE_SIZE,
+            )?;
+            conflicts.extend(page.conflicts);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            conflict_cursor = Some(next_cursor);
+        }
+        Ok((versions, receipts, intents, conflicts))
+    }
+
+    /// The source-side half of a cross-shard move, applied after the
+    /// destination primary adopted the record: tombstone the old path, evict
+    /// the moved record from the source shard, and touch the source parent.
+    /// Idempotent so crash recovery can re-run it.
+    fn complete_cross_shard_move_locally(
+        &mut self,
+        moved_object: &DfsObjectMetadata,
+        old_path: &str,
+    ) -> Result<()> {
+        let old_path = normalize_posix_path(old_path)?;
+        let needs_tombstone = !matches!(
+            self.lookup_metadata_path_raw(&moved_object.file_system_id, &old_path)?,
+            Some(existing) if existing.kind == DfsObjectKind::Tombstone
+        );
+        if needs_tombstone {
+            let mut old_path_tombstone = moved_object.clone();
+            old_path_tombstone.object_id = DfsObjectId::generate();
+            old_path_tombstone.path = old_path.clone();
+            old_path_tombstone.kind = DfsObjectKind::Tombstone;
+            old_path_tombstone.version = next_version(&moved_object.version);
+            old_path_tombstone.content_hash = None;
+            old_path_tombstone.content_size_bytes = None;
+            old_path_tombstone.link_target_object_id = None;
+            old_path_tombstone.current_locations = vec![self.node_id.clone()];
+            self.apply_namespace_transaction(DfsNamespaceTransaction {
+                transaction_id: namespace_transaction_id(
+                    "rename-cross-shard",
+                    &moved_object.object_id,
+                    &old_path,
+                ),
+                file_system_id: moved_object.file_system_id.clone(),
+                objects: vec![old_path_tombstone],
+                versions: Vec::new(),
+                created_at: time::OffsetDateTime::now_utc(),
+            })?;
+        }
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            backend.evict_object_record_for_foreign_shard_move(moved_object)?;
+        }
+        self.touch_parent_directory_if_local_primary(&old_path)?;
+        Ok(())
+    }
+
+    /// The target-side half of a cross-shard hardlink: record the link-count
+    /// change as a ctime bump on the target object.
+    fn complete_cross_shard_hardlink_locally(
+        &mut self,
+        target_object_id: &DfsObjectId,
+    ) -> Result<()> {
+        let Some(mut target) = self.object_by_id(target_object_id)? else {
+            return Ok(());
+        };
+        if target.kind == DfsObjectKind::Tombstone {
+            return Ok(());
+        }
+        target.changed_at_unix_nanos = now_unix_nanos();
+        target.version = next_version(&target.version);
+        self.add_object_metadata(target)?;
+        Ok(())
+    }
+
+    /// Atomically installs an object record moved here from another primary's
+    /// shard, validating destination preconditions in the same step.
+    /// Idempotent against re-sent adoptions.
+    pub(crate) fn adopt_object_at_path_local(
+        &mut self,
+        object: &DfsObjectMetadata,
+        versions: &[DfsObjectVersionRecord],
+        receipts: &[DfsReplicaReceiptRecord],
+        intents: &[crate::DfsWriteIntentRecord],
+        conflicts: &[crate::DfsConflictRecord],
+    ) -> Result<()> {
+        let path = normalize_posix_path(&object.path)?;
+        let mut transaction_objects = Vec::new();
+        if let Some(mut destination) = self.lookup_sifs_path(&path)? {
+            if destination.object_id == object.object_id
+                && destination.version == object.version
+                && destination.kind == object.kind
+            {
+                return Ok(());
+            }
+            if destination.kind != DfsObjectKind::Tombstone {
+                match destination.kind {
+                    DfsObjectKind::Directory => {
+                        return Err(DfsPosixError::IsDirectory { path });
+                    }
+                    DfsObjectKind::Hardlink
+                        if destination.link_target_object_id.as_ref()
+                            == Some(&object.object_id) =>
+                    {
+                        // Hardlink promotion: the moved object replaces its
+                        // own alias at this path.
+                    }
+                    DfsObjectKind::Hardlink => {
+                        return Err(DfsPosixError::InvalidPath {
+                            path: format!(
+                                "{path} is a hardlink to another object; cross-shard replace is not supported"
+                            ),
+                        });
+                    }
+                    _ => {
+                        if self.hardlink_count_to_object(&destination.object_id)? > 0 {
+                            return Err(DfsPosixError::InvalidPath {
+                                path: format!(
+                                    "{path} has hardlink aliases; cross-shard replace is not supported"
+                                ),
+                            });
+                        }
+                    }
+                }
+                destination.kind = DfsObjectKind::Tombstone;
+                destination.version = next_version(&destination.version);
+                destination.content_hash = None;
+                destination.content_size_bytes = None;
+                destination.link_target_object_id = None;
+                destination.current_locations = vec![self.node_id.clone()];
+                transaction_objects.push(destination);
+            }
+        }
+        self.ensure_parent_directory(&path)?;
+        transaction_objects.push(object.clone());
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id("adopt-cross-shard", &object.object_id, &path),
+            file_system_id: object.file_system_id.clone(),
+            objects: transaction_objects,
+            versions: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        })?;
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            for version in versions {
+                if backend
+                    .get_version(&version.object_id, &version.version)?
+                    .is_none()
+                {
+                    backend.put_version(version)?;
+                }
+            }
+        }
+        for receipt in receipts {
+            let exists = self
+                .backend_receipt_for_replica(
+                    &receipt.receipt.object_id,
+                    &receipt.receipt.committed_version,
+                    &receipt.replica_node_id,
+                )?
+                .is_some();
+            if !exists && let Some(backend) = self.metadata_backend.as_mut() {
+                backend.put_receipt(receipt)?;
+            }
+        }
+        if let Some(backend) = self.metadata_backend.as_mut() {
+            for intent in intents {
+                if backend
+                    .get_intent(&intent.object_id, &intent.intent_id)?
+                    .is_none()
+                {
+                    backend.put_intent(intent)?;
+                }
+            }
+            for conflict in conflicts {
+                if backend
+                    .get_conflict(&conflict.object_id, &conflict.conflict_id)?
+                    .is_none()
+                {
+                    backend.put_conflict(conflict)?;
+                }
+            }
+        }
+        self.touch_parent_directory_if_local_primary(&path)?;
+        Ok(())
+    }
+
+    /// Atomically installs a hardlink alias created by another primary's
+    /// coordinator. Idempotent against re-sent adoptions.
+    pub(crate) fn adopt_hardlink_alias_local(&mut self, alias: &DfsObjectMetadata) -> Result<()> {
+        let path = normalize_posix_path(&alias.path)?;
+        if let Some(existing) = self.lookup_sifs_path(&path)? {
+            if existing.object_id == alias.object_id && existing.kind == DfsObjectKind::Hardlink {
+                return Ok(());
+            }
+            if existing.kind != DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::AlreadyExists { path });
+            }
+        }
+        self.ensure_parent_directory(&path)?;
+        self.apply_namespace_transaction(DfsNamespaceTransaction {
+            transaction_id: namespace_transaction_id(
+                "adopt-hardlink-cross-shard",
+                &alias.object_id,
+                &path,
+            ),
+            file_system_id: alias.file_system_id.clone(),
+            objects: vec![alias.clone()],
+            versions: Vec::new(),
+            created_at: time::OffsetDateTime::now_utc(),
+        })?;
+        self.touch_parent_directory_if_local_primary(&path)?;
+        Ok(())
+    }
+
     pub fn posix_mkdir(&mut self, path: &str) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::Mkdir {
+                    path: path.to_string(),
+                },
+            )?;
+            return self.posix_lstat(&normalized);
+        }
+        self.posix_mkdir_local(path)
+    }
+
+    pub(crate) fn posix_mkdir_local(&mut self, path: &str) -> Result<DfsStat> {
         let path = normalize_posix_path(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         if let Some(mut object) = self.lookup_sifs_path(&path)? {
             if object.kind != DfsObjectKind::Tombstone {
                 return Err(DfsPosixError::AlreadyExists { path });
@@ -253,6 +1054,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir_all(&mut self, path: &str) -> Result<()> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            return self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::MkdirAll {
+                    path: path.to_string(),
+                },
+            );
+        }
+        self.posix_mkdir_all_local(path)
+    }
+
+    pub(crate) fn posix_mkdir_all_local(&mut self, path: &str) -> Result<()> {
         let path = normalize_posix_path(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         if path == "/" {
@@ -278,7 +1092,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
                 Some(_) => return Err(DfsPosixError::NotDirectory { path: current }),
                 None => {
-                    self.posix_mkdir(&current)?;
+                    self.posix_mkdir_local(&current)?;
                 }
             }
         }
@@ -398,7 +1212,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 committed_object.changed_at_unix_nanos = now;
                 committed_object.last_modified_by_event_id = Some(EventId::generate());
                 self.add_transient_object_metadata(committed_object.clone())?;
-                if transient_create {
+                // A routed create's parent-mtime update is journaled by the
+                // metadata shard primary and arrives here through journal
+                // replay; appending it locally as well would fork this
+                // replica's journal sequence space from the primary's stream.
+                if transient_create && self.is_local_metadata_primary_for_object(&object)? {
                     self.touch_parent_directory_modified(&path)?;
                 }
                 let object = self.stat_target_for_path(&path)?;
@@ -1028,6 +1846,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 if object.kind == DfsObjectKind::Directory {
                     return Err(DfsPosixError::IsDirectory { path });
                 }
+                // Only the metadata authority may journal the atime update;
+                // appending it on a replica would fork the replica's journal
+                // from the shard primary's stream (noatime-style degradation
+                // on non-primary nodes).
+                if !self.is_local_metadata_primary_for_object(&object)? {
+                    return Ok(bytes);
+                }
                 object.accessed_at_unix_nanos = now_unix_nanos();
                 object.version = next_version(&object.version);
                 self.add_object_metadata(object)?;
@@ -1215,7 +2040,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         };
         match outcome {
             NetworkedDfsWriteOutcome::Committed { .. } => {
-                self.touch_parent_directory_modified(&link_path)?;
+                // Same as posix_write_file: the shard primary journals the
+                // parent-mtime update for routed symlink creates.
+                if self.is_local_metadata_primary_for_object(&object)? {
+                    self.touch_parent_directory_modified(&link_path)?;
+                }
                 let object =
                     self.lookup_sifs_path(&link_path)?
                         .ok_or_else(|| DfsPosixError::NotFound {
@@ -1258,15 +2087,56 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_hardlink(&mut self, existing_path: &str, link_path: &str) -> Result<DfsStat> {
+        let normalized_existing = normalize_posix_path(existing_path)?;
+        let normalized_link = normalize_posix_path(link_path)?;
+        let existing_primary = self.routed_namespace_primary_for_path(&normalized_existing)?;
+        let link_primary = self.routed_namespace_primary_for_path(&normalized_link)?;
+        match (existing_primary, link_primary) {
+            (None, None) => self.posix_hardlink_local(existing_path, link_path),
+            (None, Some(_)) => {
+                // This node owns the target's shard and coordinates the
+                // cross-shard alias adoption itself.
+                self.namespace_coordinator_dispatch_hardlink(
+                    &sifs_file_system_id(),
+                    existing_path,
+                    link_path,
+                )?;
+                self.posix_lstat(&normalized_link)
+            }
+            (Some(target_primary), link_primary) => {
+                // The link target's shard primary coordinates; it adopts the
+                // alias into the link path's shard when that lives elsewhere.
+                self.route_namespace_operation(
+                    target_primary.clone(),
+                    DfsNamespaceOperation::Hardlink {
+                        existing_path: existing_path.to_string(),
+                        link_path: link_path.to_string(),
+                    },
+                )?;
+                if link_primary.is_some_and(|link_primary| link_primary != target_primary) {
+                    self.sync_remote_namespace_path(&normalized_link)?;
+                }
+                self.posix_lstat(&normalized_link)
+            }
+        }
+    }
+
+    pub(crate) fn posix_hardlink_local(
+        &mut self,
+        existing_path: &str,
+        link_path: &str,
+    ) -> Result<DfsStat> {
         let (existing_path, existing_requires_directory) =
             normalize_posix_path_with_trailing_directory(existing_path)?;
         let existing_path = self.resolve_posix_path_distributed(&existing_path, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&existing_path)?;
         if existing_requires_directory {
             self.ensure_resolved_path_is_directory_no_follow(&existing_path)?;
         }
         let (link_path, link_requires_directory) =
             normalize_posix_path_with_trailing_directory(link_path)?;
         let link_path = self.resolve_posix_path_distributed(&link_path, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&link_path)?;
         if link_requires_directory {
             self.ensure_resolved_path_is_directory_no_follow(&link_path)?;
             return Err(DfsPosixError::AlreadyExists { path: link_path });
@@ -1345,7 +2215,23 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_set_mode(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::SetMode {
+                    path: path.to_string(),
+                    mode,
+                },
+            )?;
+            return self.posix_stat(&normalized);
+        }
+        self.posix_set_mode_local(path, mode)
+    }
+
+    pub(crate) fn posix_set_mode_local(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         let object = self
             .lookup_sifs_path(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
@@ -1364,7 +2250,29 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::SetOwner {
+                    path: path.to_string(),
+                    uid,
+                    gid,
+                },
+            )?;
+            return self.posix_stat(&normalized);
+        }
+        self.posix_set_owner_local(path, uid, gid)
+    }
+
+    pub(crate) fn posix_set_owner_local(
+        &mut self,
+        path: &str,
+        uid: u32,
+        gid: u32,
+    ) -> Result<DfsStat> {
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         let object = self
             .lookup_sifs_path(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
@@ -1389,11 +2297,55 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::SetTimes {
+                    path: path.to_string(),
+                    accessed_at_unix_nanos,
+                    modified_at_unix_nanos,
+                    follow_symlink: true,
+                },
+            )?;
+            return self.posix_stat(&normalized);
+        }
+        self.posix_set_times_local(path, accessed_at_unix_nanos, modified_at_unix_nanos)
+    }
+
+    pub(crate) fn posix_set_times_local(
+        &mut self,
+        path: &str,
+        accessed_at_unix_nanos: Option<u64>,
+        modified_at_unix_nanos: Option<u64>,
+    ) -> Result<DfsStat> {
         let path = self.resolve_existing_posix_path_distributed(path, true)?;
         self.posix_set_times_at_path(&path, accessed_at_unix_nanos, modified_at_unix_nanos)
     }
 
     pub fn posix_set_symlink_times(
+        &mut self,
+        path: &str,
+        accessed_at_unix_nanos: Option<u64>,
+        modified_at_unix_nanos: Option<u64>,
+    ) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::SetTimes {
+                    path: path.to_string(),
+                    accessed_at_unix_nanos,
+                    modified_at_unix_nanos,
+                    follow_symlink: false,
+                },
+            )?;
+            return self.posix_lstat(&normalized);
+        }
+        self.posix_set_symlink_times_local(path, accessed_at_unix_nanos, modified_at_unix_nanos)
+    }
+
+    pub(crate) fn posix_set_symlink_times_local(
         &mut self,
         path: &str,
         accessed_at_unix_nanos: Option<u64>,
@@ -1409,6 +2361,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
+        self.ensure_resolved_path_not_in_cross_shard_flight(path)?;
         let object = self
             .lookup_sifs_path(&path)?
             .ok_or_else(|| DfsPosixError::NotFound {
@@ -1506,6 +2459,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 path: resolved_path,
             });
         }
+        if !self.is_local_metadata_primary_for_object(&object)? {
+            return Ok(target);
+        }
         object.accessed_at_unix_nanos = now_unix_nanos();
         object.version = next_version(&object.version);
         self.add_object_metadata(object)?;
@@ -1513,7 +2469,22 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::Unlink {
+                    path: path.to_string(),
+                },
+            )?;
+            return self.stat_replayed_tombstone(&normalized);
+        }
+        self.posix_unlink_local(path)
+    }
+
+    pub(crate) fn posix_unlink_local(&mut self, path: &str) -> Result<DfsStat> {
         let path = self.resolve_existing_posix_path_distributed(path, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         let mut object = self
             .lookup_sifs_path(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
@@ -1542,6 +2513,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return self.stat_object(&object);
         }
         if self.link_count_for_object(&object)? > 1 {
+            // Unlinking a canonical record promotes one of its hardlink
+            // aliases. When the chosen alias lives in a shard owned by
+            // another primary, the promotion is a cross-shard move of the
+            // canonical record onto the alias path.
+            if let Some(alias) = self.first_hardlink_to_object(&object.object_id)? {
+                let alias_path = normalize_posix_path(&alias.path)?;
+                if let Some(destination_primary) =
+                    self.routed_namespace_primary_for_path(&alias_path)?
+                {
+                    self.coordinate_cross_shard_rename(&path, &alias_path, destination_primary)?;
+                    return self.stat_replayed_tombstone(&path);
+                }
+            }
             return self.unlink_canonical_with_hardlinks(object, &path);
         }
         object.kind = DfsObjectKind::Tombstone;
@@ -1556,8 +2540,23 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_rmdir(&mut self, path: &str) -> Result<DfsStat> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::Rmdir {
+                    path: path.to_string(),
+                },
+            )?;
+            return self.stat_replayed_tombstone(&normalized);
+        }
+        self.posix_rmdir_local(path)
+    }
+
+    pub(crate) fn posix_rmdir_local(&mut self, path: &str) -> Result<DfsStat> {
         let path = normalize_posix_path(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         if path == "/" {
             return Err(DfsPosixError::InvalidPath { path });
         }
@@ -1582,6 +2581,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_clear_dir_recursive(&mut self, path: &str) -> Result<()> {
+        let normalized = normalize_posix_path(path)?;
+        if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
+            return self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::ClearDirRecursive {
+                    path: path.to_string(),
+                },
+            );
+        }
+        self.posix_clear_dir_recursive_local(path)
+    }
+
+    pub(crate) fn posix_clear_dir_recursive_local(&mut self, path: &str) -> Result<()> {
         let mut job =
             self.posix_clear_dir_recursive_bounded(path, POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS)?;
         while job.status != DfsNamespaceJobStatus::Completed {
@@ -1624,6 +2636,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             }
             DfsNamespaceJobKind::RenameDirectory => {
                 self.run_rename_directory_job_batch(job, max_steps)
+            }
+            DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries => {
+                self.run_cross_shard_namespace_job(job)
             }
         }
     }
@@ -1733,13 +2749,47 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_rename(&mut self, from: &str, to: &str) -> Result<DfsStat> {
+        let normalized_from = normalize_posix_path(from)?;
+        let normalized_to = normalize_posix_path(to)?;
+        let from_primary = self.routed_namespace_primary_for_path(&normalized_from)?;
+        let to_primary = self.routed_namespace_primary_for_path(&normalized_to)?;
+        match (from_primary, to_primary) {
+            (None, None) => self.posix_rename_local(from, to),
+            (None, Some(_)) => {
+                // This node owns the source side and coordinates the
+                // cross-shard move itself.
+                self.namespace_coordinator_dispatch_rename(&sifs_file_system_id(), from, to)?;
+                self.posix_stat(&normalized_to)
+            }
+            (Some(source_primary), to_primary) => {
+                // The source-side shard primary coordinates; it adopts the
+                // record into the destination shard when that lives
+                // elsewhere.
+                self.route_namespace_operation(
+                    source_primary.clone(),
+                    DfsNamespaceOperation::Rename {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                    },
+                )?;
+                if to_primary.is_some_and(|to_primary| to_primary != source_primary) {
+                    self.sync_remote_namespace_path(&normalized_to)?;
+                }
+                self.posix_stat(&normalized_to)
+            }
+        }
+    }
+
+    pub(crate) fn posix_rename_local(&mut self, from: &str, to: &str) -> Result<DfsStat> {
         let (from, from_requires_directory) = normalize_posix_path_with_trailing_directory(from)?;
         let (to, to_requires_directory) = normalize_posix_path_with_trailing_directory(to)?;
         let from = self.resolve_posix_path_distributed(&from, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&from)?;
         if from_requires_directory {
             self.ensure_resolved_path_is_directory_no_follow(&from)?;
         }
         let to = self.resolve_posix_path_distributed(&to, false)?;
+        self.ensure_resolved_path_not_in_cross_shard_flight(&to)?;
         if from == "/" || to == "/" {
             return Err(DfsPosixError::InvalidPath {
                 path: format!("{from} -> {to}"),
@@ -1814,6 +2864,20 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     let alias = self
                         .first_hardlink_to_object(&destination.object_id)?
                         .ok_or_else(|| DfsPosixError::NotFound { path: to.clone() })?;
+                    // Demoting the replaced destination onto its alias would
+                    // write into the alias's shard; that shard's primary must
+                    // be this node, or the promotion would fork its journal.
+                    let alias_path = normalize_posix_path(&alias.path)?;
+                    if self
+                        .routed_namespace_primary_for_path(&alias_path)?
+                        .is_some()
+                    {
+                        return Err(DfsPosixError::InvalidPath {
+                            path: format!(
+                                "{to} has a hardlink alias at {alias_path} owned by another metadata shard primary"
+                            ),
+                        });
+                    }
                     let mut alias_tombstone = alias.clone();
                     alias_tombstone.path = hidden_alias_tombstone_path(&alias.object_id);
                     alias_tombstone.kind = DfsObjectKind::Tombstone;
@@ -2044,6 +3108,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotDirectory {
                 path: resolved_path,
             });
+        }
+        if !self.is_local_metadata_primary_for_object(&object)? {
+            return Ok(entries);
         }
         object.accessed_at_unix_nanos = now_unix_nanos();
         object.version = next_version(&object.version);
@@ -2625,7 +3692,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 }
                 DfsNamespaceJobFrame::RenameDirectoryStart { .. }
                 | DfsNamespaceJobFrame::RenameDirectoryScan { .. }
-                | DfsNamespaceJobFrame::RenameDirectoryComplete { .. } => {
+                | DfsNamespaceJobFrame::RenameDirectoryComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardAdopt { .. }
+                | DfsNamespaceJobFrame::CrossShardComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkAdopt { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. } => {
                     return Err(DfsPosixError::InvalidPath {
                         path: job.job_id.clone(),
                     });
@@ -2655,6 +3726,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             ) && self.link_count_for_object(&object)? > 1
                 && let Some(alias) = self.first_hardlink_alias_outside_prefix(&object, prefix)?
             {
+                // Promoting onto an alias in another primary's shard runs the
+                // cross-shard move saga instead of a local transaction.
+                let alias_path = normalize_posix_path(&alias.path)?;
+                if let Some(destination_primary) =
+                    self.routed_namespace_primary_for_path(&alias_path)?
+                {
+                    self.coordinate_cross_shard_rename(
+                        object_path,
+                        &alias_path,
+                        destination_primary,
+                    )?;
+                    return Ok(true);
+                }
                 let mut alias_tombstone = alias.clone();
                 alias_tombstone.path = hidden_alias_tombstone_path(&alias.object_id);
                 alias_tombstone.kind = DfsObjectKind::Tombstone;
@@ -2950,7 +4034,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     }
                 }
                 DfsNamespaceJobFrame::ScanDirectory { .. }
-                | DfsNamespaceJobFrame::CompleteDirectory { .. } => {
+                | DfsNamespaceJobFrame::CompleteDirectory { .. }
+                | DfsNamespaceJobFrame::CrossShardAdopt { .. }
+                | DfsNamespaceJobFrame::CrossShardComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkAdopt { .. }
+                | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. } => {
                     return Err(DfsPosixError::InvalidPath {
                         path: job.job_id.clone(),
                     });
@@ -3112,6 +4200,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         })
     }
 
+    /// Stat for a path that a routed unlink/rmdir just tombstoned; the
+    /// response journal batches were replayed before this runs, so the local
+    /// lookup observes the authoritative tombstone like a local removal does.
+    fn stat_replayed_tombstone(&self, path: &str) -> Result<DfsStat> {
+        let resolved = self.resolve_posix_path(path, false)?;
+        let object = self
+            .lookup_sifs_path(&resolved)?
+            .ok_or_else(|| DfsPosixError::NotFound {
+                path: resolved.clone(),
+            })?;
+        self.stat_object(&object)
+    }
+
     fn stat_target_for_path(&self, path: &str) -> Result<DfsObjectMetadata> {
         let object = self
             .lookup_sifs_path(path)?
@@ -3189,7 +4290,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
     }
 
-    fn touch_parent_directory_modified(&mut self, path: &str) -> Result<()> {
+    pub(crate) fn touch_parent_directory_modified(&mut self, path: &str) -> Result<()> {
         let Some(parent) = parent_posix_path(path) else {
             return Ok(());
         };
@@ -3396,6 +4497,71 @@ fn default_mode_for_kind(kind: &DfsObjectKind) -> u32 {
     }
 }
 
+/// Wire form of a namespace `DfsPosixError` so routed operations surface the
+/// same errno semantics as local ones. Transport/internal errors map to
+/// `None` and travel as plain rejection reasons.
+pub(crate) fn namespace_posix_error_for(error: &DfsPosixError) -> Option<DfsNamespacePosixError> {
+    match error {
+        DfsPosixError::NotFound { path } => {
+            Some(DfsNamespacePosixError::NotFound { path: path.clone() })
+        }
+        DfsPosixError::AlreadyExists { path } => {
+            Some(DfsNamespacePosixError::AlreadyExists { path: path.clone() })
+        }
+        DfsPosixError::NotDirectory { path } => {
+            Some(DfsNamespacePosixError::NotDirectory { path: path.clone() })
+        }
+        DfsPosixError::IsDirectory { path } => {
+            Some(DfsNamespacePosixError::IsDirectory { path: path.clone() })
+        }
+        DfsPosixError::NotSymlink { path } => {
+            Some(DfsNamespacePosixError::NotSymlink { path: path.clone() })
+        }
+        DfsPosixError::MissingParent { path } => {
+            Some(DfsNamespacePosixError::MissingParent { path: path.clone() })
+        }
+        DfsPosixError::InvalidPath { path } => {
+            Some(DfsNamespacePosixError::InvalidPath { path: path.clone() })
+        }
+        DfsPosixError::DirectoryNotEmpty { path } => {
+            Some(DfsNamespacePosixError::DirectoryNotEmpty { path: path.clone() })
+        }
+        DfsPosixError::Conflict { path, reason } => Some(DfsNamespacePosixError::Conflict {
+            path: path.clone(),
+            reason: reason.clone(),
+        }),
+        DfsPosixError::Dfs(_) | DfsPosixError::Metadata(_) | DfsPosixError::PendingWrite { .. } => {
+            None
+        }
+    }
+}
+
+fn posix_error_for_namespace_rejection(
+    reason: String,
+    posix_error: Option<DfsNamespacePosixError>,
+) -> DfsPosixError {
+    match posix_error {
+        Some(DfsNamespacePosixError::NotFound { path }) => DfsPosixError::NotFound { path },
+        Some(DfsNamespacePosixError::AlreadyExists { path }) => {
+            DfsPosixError::AlreadyExists { path }
+        }
+        Some(DfsNamespacePosixError::NotDirectory { path }) => DfsPosixError::NotDirectory { path },
+        Some(DfsNamespacePosixError::IsDirectory { path }) => DfsPosixError::IsDirectory { path },
+        Some(DfsNamespacePosixError::NotSymlink { path }) => DfsPosixError::NotSymlink { path },
+        Some(DfsNamespacePosixError::MissingParent { path }) => {
+            DfsPosixError::MissingParent { path }
+        }
+        Some(DfsNamespacePosixError::InvalidPath { path }) => DfsPosixError::InvalidPath { path },
+        Some(DfsNamespacePosixError::DirectoryNotEmpty { path }) => {
+            DfsPosixError::DirectoryNotEmpty { path }
+        }
+        Some(DfsNamespacePosixError::Conflict { path, reason }) => {
+            DfsPosixError::Conflict { path, reason }
+        }
+        None => DfsPosixError::Dfs(DfsError::Distributed { message: reason }),
+    }
+}
+
 fn read_conflict_error(path: String, conflicts: Vec<crate::DfsConflictReadView>) -> DfsPosixError {
     let reason = conflicts
         .into_iter()
@@ -3405,7 +4571,7 @@ fn read_conflict_error(path: String, conflicts: Vec<crate::DfsConflictReadView>)
     DfsPosixError::Conflict { path, reason }
 }
 
-fn parent_posix_path(path: &str) -> Option<String> {
+pub(crate) fn parent_posix_path(path: &str) -> Option<String> {
     if path == "/" {
         return None;
     }

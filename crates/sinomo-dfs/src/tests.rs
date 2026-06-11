@@ -16486,3 +16486,2460 @@ fn explicit_dfs_roots_are_preserved() {
         root.join("pins")
     );
 }
+
+// ---------------------------------------------------------------------------
+// SIFS POSIX cluster correctness tests
+//
+// These tests run a real in-process SIFS cluster: one metadata-shard primary
+// plus two replica nodes sharing one `InProcessNetwork` and one Raft-backed
+// control plane. They verify that the POSIX facade keeps its contract when
+// operations route across nodes: read-your-write after routed writes,
+// primary visibility, replica catch-up through journal publication, write
+// serialization with explicit conflicts, sparse write-at/truncate semantics,
+// namespace replication (rename/unlink tombstones), restart durability, and
+// errno-style error mapping.
+// ---------------------------------------------------------------------------
+
+const SIFS_CLUSTER_PUMP_DEADLINE: Duration = Duration::from_secs(10);
+const SIFS_CLUSTER_PUMP_IDLE_SLEEP: Duration = Duration::from_millis(2);
+
+struct SifsPosixCluster {
+    root: PathBuf,
+    primary_node: NodeId,
+    writer_node: NodeId,
+    observer_node: NodeId,
+    primary: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    writer: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    observer: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    rejections: Vec<String>,
+}
+
+fn sifs_posix_cluster_node(
+    network: &InProcessNetwork,
+    shared_kv: &SharedDfsControlPlaneKvClient<InProcessRaftKvCluster>,
+    root: &Path,
+    name: &str,
+    node_id: NodeId,
+) -> NetworkedDfsService<sinomo_network::InProcessTransport> {
+    let node_root = root.join(name);
+    NetworkedDfsService::new(
+        network.add_node(node_id),
+        LocalContentStore::new(node_root.join("content")).expect("cluster node content store"),
+    )
+    .with_control_plane(shared_kv.clone())
+    .with_metadata_backend(
+        open_root_local_metadata_backend(node_root.join("metadata"))
+            .expect("cluster node metadata backend"),
+    )
+    .expect("cluster node metadata backend attach")
+}
+
+fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
+    let root = temp_root(name);
+    let node_prefix = name.replace('-', "_");
+    let primary_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_primary")).expect("primary node");
+    let writer_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_writer")).expect("writer node");
+    let observer_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_observer")).expect("observer node");
+
+    let network = InProcessNetwork::new();
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary_node.clone()]).expect("control plane kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary_node.clone(),
+            )))
+            .expect("sifs filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: primary_node.clone(),
+                replica_node_ids: vec![writer_node.clone(), observer_node.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("sifs root metadata shard config");
+    });
+
+    let mut primary =
+        sifs_posix_cluster_node(&network, &shared_kv, &root, "primary", primary_node.clone());
+    let writer =
+        sifs_posix_cluster_node(&network, &shared_kv, &root, "writer", writer_node.clone());
+    let observer = sifs_posix_cluster_node(
+        &network,
+        &shared_kv,
+        &root,
+        "observer",
+        observer_node.clone(),
+    );
+
+    // The shard primary is the namespace authority and bootstraps SIFS
+    // locally; replicas join as followers of the primary's metadata journal
+    // stream and learn the bootstrap namespace through replication.
+    primary
+        .bootstrap_distributed_sifs()
+        .expect("primary SIFS bootstrap");
+
+    let mut cluster = SifsPosixCluster {
+        root,
+        primary_node,
+        writer_node,
+        observer_node,
+        primary,
+        writer,
+        observer,
+        rejections: Vec::new(),
+    };
+    sifs_cluster_publish_metadata_until(&mut cluster, "initial follower catch-up", |cluster| {
+        cluster.writer.posix_stat(SIFS_USERS_PATH).is_ok()
+            && cluster.observer.posix_stat(SIFS_USERS_PATH).is_ok()
+    });
+    // Follower-side bootstrap after catch-up must be a no-op: every namespace
+    // anchor already exists from journal replay, so it must not append local
+    // journal entries that would fork the follower from the primary's stream.
+    cluster
+        .writer
+        .bootstrap_distributed_sifs()
+        .expect("writer follower bootstrap");
+    cluster
+        .observer
+        .bootstrap_distributed_sifs()
+        .expect("observer follower bootstrap");
+    assert!(
+        cluster.rejections.is_empty(),
+        "initial follower catch-up must not reject journal batches: {:?}",
+        cluster.rejections
+    );
+    cluster
+}
+
+fn sifs_posix_cluster_pump_round(cluster: &mut SifsPosixCluster) -> usize {
+    let mut activity = 0;
+    for (label, service) in [
+        ("primary", &mut cluster.primary),
+        ("writer", &mut cluster.writer),
+        ("observer", &mut cluster.observer),
+    ] {
+        let events = service
+            .process_incoming()
+            .expect("cluster process_incoming");
+        activity += events.len();
+        for event in events {
+            if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected { reason, .. } = event {
+                cluster.rejections.push(format!("{label}: {reason}"));
+            }
+        }
+    }
+    activity
+}
+
+fn sifs_posix_cluster_pump_until(
+    cluster: &mut SifsPosixCluster,
+    what: &str,
+    mut done: impl FnMut(&mut SifsPosixCluster) -> bool,
+) {
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        if done(cluster) {
+            return;
+        }
+        let activity = sifs_posix_cluster_pump_round(cluster);
+        if Instant::now() >= deadline {
+            panic!(
+                "SIFS cluster did not converge within deadline: {what}; journal rejections: {:?}",
+                cluster.rejections
+            );
+        }
+        if activity == 0 {
+            std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+        }
+    }
+}
+
+fn sifs_cluster_write_options(node_id: &NodeId) -> DfsWriteOptions {
+    DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 1).expect("cluster write policy"),
+        replica_candidates: vec![node_id.clone()],
+        wait_for_commit: false,
+    }
+}
+
+/// Issues a POSIX write on the cluster's writer node (which is not the
+/// metadata-shard primary, so the write routes over the network) and pumps the
+/// cluster until the writer observes the committed content at the path.
+fn sifs_cluster_routed_posix_write(cluster: &mut SifsPosixCluster, path: &str, bytes: &[u8]) {
+    let expected_hash = content_hash(bytes);
+    let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    match cluster.writer.posix_write_file(path, bytes, options) {
+        Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("routed POSIX write to {path} failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(cluster, path, |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+}
+
+/// Writes on the primary node, which commits immediately through the local
+/// fast path because the primary coordinates its own shard.
+fn sifs_cluster_primary_posix_write(cluster: &mut SifsPosixCluster, path: &str, bytes: &[u8]) {
+    let options = sifs_cluster_write_options(&cluster.primary_node.clone());
+    let stat = cluster
+        .primary
+        .posix_write_file(path, bytes, options)
+        .expect("primary POSIX write");
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(content_hash(bytes).as_str()),
+        "primary POSIX write to {path} must commit synchronously"
+    );
+}
+
+/// Publishes the primary's metadata journal to the configured replicas and
+/// pumps the cluster until `done` observes the replicated state.
+fn sifs_cluster_publish_metadata_until(
+    cluster: &mut SifsPosixCluster,
+    what: &str,
+    mut done: impl FnMut(&mut SifsPosixCluster) -> bool,
+) {
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        if done(cluster) {
+            return;
+        }
+        let outcomes = cluster
+            .primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("primary metadata journal publish");
+        sifs_posix_cluster_pump_round(cluster);
+        if Instant::now() >= deadline {
+            panic!(
+                "SIFS cluster metadata publication did not converge: {what}; \
+                 last outcomes: {outcomes:?}; journal rejections: {:?}",
+                cluster.rejections
+            );
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+}
+
+/// Makes remote content locally readable on a node by requesting a remote
+/// read and pumping the cluster until the local read succeeds.
+fn sifs_cluster_fetch_for_local_read(
+    cluster: &mut SifsPosixCluster,
+    node: fn(&mut SifsPosixCluster) -> &mut NetworkedDfsService<sinomo_network::InProcessTransport>,
+    path: &str,
+) -> Vec<u8> {
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        match node(cluster).posix_read_file(path) {
+            Ok(bytes) => return bytes,
+            Err(DfsPosixError::NotFound { .. }) => {}
+            Err(error) => panic!("cluster read of {path} failed: {error}"),
+        }
+        node(cluster)
+            .posix_request_remote_read(path)
+            .expect("request remote read");
+        sifs_posix_cluster_pump_round(cluster);
+        if Instant::now() >= deadline {
+            panic!("cluster read of {path} did not become locally readable");
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+}
+
+#[test]
+fn sifs_cluster_posix_routed_create_is_read_your_write_on_writer() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-ryw");
+    let path = "/users/read-your-write.txt";
+    let bytes = b"hello from the writer node";
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
+
+    // Read-your-write through the strictly local read path: after the routed
+    // write commits, the writer must see its own bytes without any further
+    // network round trip.
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("writer read"),
+        bytes.to_vec()
+    );
+    let stat = cluster.writer.posix_stat(path).expect("writer stat");
+    assert_eq!(stat.kind, DfsObjectKind::File);
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(content_hash(bytes).as_str())
+    );
+
+    // The new entry must be listed in the parent directory on the writer.
+    let entries = cluster
+        .writer
+        .posix_list_dir("/users")
+        .expect("writer list /users");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry.path == path && entry.kind == DfsObjectKind::File),
+        "writer directory listing must contain the routed write: {entries:?}"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_routed_write_is_visible_on_primary() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-primary-vis");
+    let path = "/users/primary-visibility.txt";
+    let bytes = b"routed bytes visible on the primary";
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
+
+    // The shard primary serialized the write, so its metadata must already be
+    // authoritative: correct kind, size, and content hash.
+    let stat = cluster.primary.posix_stat(path).expect("primary stat");
+    assert_eq!(stat.kind, DfsObjectKind::File);
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(content_hash(bytes).as_str())
+    );
+
+    let entries = cluster
+        .primary
+        .posix_list_dir("/users")
+        .expect("primary list /users");
+    assert!(
+        entries.iter().any(|entry| entry.path == path),
+        "primary directory listing must contain the routed write: {entries:?}"
+    );
+
+    // The content was staged on the writer; the primary must be able to make
+    // it locally readable through the remote-read path.
+    let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    assert_eq!(read, bytes.to_vec());
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_routed_overwrite_advances_version_monotonically() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-overwrite");
+    let path = "/users/overwrite.txt";
+    let first = b"first version".to_vec();
+    let second = b"the second, longer version of the content".to_vec();
+    let third = b"3rd".to_vec();
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &first);
+    let first_stat = cluster.writer.posix_stat(path).expect("first stat");
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &second);
+    let second_stat = cluster.writer.posix_stat(path).expect("second stat");
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("second read"),
+        second
+    );
+    assert_eq!(second_stat.size_bytes, Some(second.len() as u64));
+    assert!(
+        second_stat.version > first_stat.version,
+        "overwrite must advance the visible version: {:?} -> {:?}",
+        first_stat.version,
+        second_stat.version
+    );
+    assert!(
+        second_stat.modified_at_unix_nanos >= first_stat.modified_at_unix_nanos,
+        "overwrite must not move mtime backwards"
+    );
+
+    // Shrinking overwrite: size must follow the latest committed content.
+    sifs_cluster_routed_posix_write(&mut cluster, path, &third);
+    let third_stat = cluster.writer.posix_stat(path).expect("third stat");
+    assert_eq!(third_stat.size_bytes, Some(third.len() as u64));
+    assert!(third_stat.version > second_stat.version);
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("third read"),
+        third
+    );
+
+    // The primary observes the same latest version.
+    let primary_stat = cluster.primary.posix_stat(path).expect("primary stat");
+    assert_eq!(
+        primary_stat.content_hash.as_deref(),
+        Some(content_hash(&third).as_str())
+    );
+    assert_eq!(primary_stat.size_bytes, Some(third.len() as u64));
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_replica_catches_up_after_journal_publish() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-catchup");
+    let path = "/users/replicated.txt";
+    let bytes = b"observer should converge to this content";
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
+
+    // The observer never participated in the write; it learns the namespace
+    // through the primary's metadata journal publication.
+    assert!(
+        matches!(
+            cluster.observer.posix_stat(path),
+            Err(DfsPosixError::NotFound { .. })
+        ),
+        "observer must not see the path before metadata publication"
+    );
+
+    let expected_hash = content_hash(bytes);
+    sifs_cluster_publish_metadata_until(&mut cluster, path, |cluster| {
+        cluster
+            .observer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+
+    let stat = cluster.observer.posix_stat(path).expect("observer stat");
+    assert_eq!(stat.kind, DfsObjectKind::File);
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    let entries = cluster
+        .observer
+        .posix_list_dir("/users")
+        .expect("observer list /users");
+    assert!(
+        entries.iter().any(|entry| entry.path == path),
+        "observer directory listing must contain the replicated path: {entries:?}"
+    );
+
+    // Content follows metadata on demand.
+    let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, path);
+    assert_eq!(read, bytes.to_vec());
+
+    // Publication is idempotent: republishing must not error or regress state.
+    cluster
+        .primary
+        .replicate_configured_metadata_shards(&sifs_file_system_id())
+        .expect("idempotent metadata journal publish");
+    sifs_posix_cluster_pump_round(&mut cluster);
+    let stat = cluster
+        .observer
+        .posix_stat(path)
+        .expect("observer stat after republish");
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(expected_hash.as_str()),
+        "republishing the journal must not regress replicated metadata"
+    );
+
+    // The writer (also a configured replica) already replayed these journal
+    // entries from the routed-write response; the publish stream must remain
+    // consistent for it as well.
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("writer read"),
+        bytes.to_vec()
+    );
+
+    assert!(
+        cluster.rejections.is_empty(),
+        "no journal batch may be rejected during routed writes and catch-up: {:?}",
+        cluster.rejections
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_routed_create_updates_parent_directory_mtime_cluster_wide() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-parent-mtime");
+    let parent = "/users";
+    let path = "/users/parent-mtime.txt";
+    let bytes = b"parent mtime must advance everywhere";
+
+    let writer_parent_before = cluster
+        .writer
+        .posix_stat(parent)
+        .expect("writer parent stat before");
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
+
+    // POSIX: creating an entry updates the parent directory mtime. The shard
+    // primary journals that update, so the writer must observe it through the
+    // routed-write response replay without appending to its own journal.
+    let primary_parent = cluster
+        .primary
+        .posix_stat(parent)
+        .expect("primary parent stat");
+    sifs_posix_cluster_pump_until(&mut cluster, "writer parent mtime replay", |cluster| {
+        cluster
+            .writer
+            .posix_stat(parent)
+            .is_ok_and(|stat| stat.modified_at_unix_nanos == primary_parent.modified_at_unix_nanos)
+    });
+    let writer_parent = cluster
+        .writer
+        .posix_stat(parent)
+        .expect("writer parent stat after");
+    assert!(
+        writer_parent.modified_at_unix_nanos > writer_parent_before.modified_at_unix_nanos,
+        "routed create must advance the parent directory mtime on the writer"
+    );
+    assert_eq!(
+        writer_parent.version, primary_parent.version,
+        "writer must replay the primary's parent directory record, not invent its own"
+    );
+
+    // The observer converges to the identical parent record after publication.
+    sifs_cluster_publish_metadata_until(&mut cluster, "observer parent mtime", |cluster| {
+        cluster.observer.posix_stat(parent).is_ok_and(|stat| {
+            stat.modified_at_unix_nanos == primary_parent.modified_at_unix_nanos
+                && stat.version == primary_parent.version
+        })
+    });
+
+    assert!(
+        cluster.rejections.is_empty(),
+        "parent mtime propagation must not fork any replica journal: {:?}",
+        cluster.rejections
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_concurrent_creates_serialize_with_explicit_conflict() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-race");
+    let path = "/users/raced.txt";
+    let writer_bytes = b"writer candidate content".to_vec();
+    let observer_bytes = b"observer candidate bytes!".to_vec();
+    assert_ne!(content_hash(&writer_bytes), content_hash(&observer_bytes));
+
+    // Both replicas race to create the same path before any frames are pumped.
+    let writer_options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    let writer_request = match cluster
+        .writer
+        .posix_write_file(path, &writer_bytes, writer_options)
+    {
+        Err(DfsPosixError::PendingWrite { intent_id, .. }) => intent_id,
+        other => panic!("expected pending routed write from writer, got {other:?}"),
+    };
+    let observer_options = sifs_cluster_write_options(&cluster.observer_node.clone());
+    let observer_request =
+        match cluster
+            .observer
+            .posix_write_file(path, &observer_bytes, observer_options)
+        {
+            Err(DfsPosixError::PendingWrite { intent_id, .. }) => intent_id,
+            other => panic!("expected pending routed write from observer, got {other:?}"),
+        };
+
+    sifs_posix_cluster_pump_until(&mut cluster, "racing writes settle", |cluster| {
+        let writer_settled = !matches!(
+            cluster.writer.write_outcome(&writer_request),
+            Ok(NetworkedDfsWriteOutcome::Pending { .. })
+        );
+        let observer_settled = !matches!(
+            cluster.observer.write_outcome(&observer_request),
+            Ok(NetworkedDfsWriteOutcome::Pending { .. })
+        );
+        writer_settled && observer_settled
+    });
+
+    let writer_outcome = cluster.writer.write_outcome(&writer_request);
+    let observer_outcome = cluster.observer.write_outcome(&observer_request);
+    let mut committed_hashes = Vec::new();
+    let mut surfaced_failures = 0usize;
+    for outcome in [&writer_outcome, &observer_outcome] {
+        match outcome {
+            Ok(NetworkedDfsWriteOutcome::Committed { content_hash, .. }) => {
+                committed_hashes.push(content_hash.clone());
+            }
+            Ok(NetworkedDfsWriteOutcome::Conflict { .. }) | Err(_) => {
+                surfaced_failures += 1;
+            }
+            Ok(NetworkedDfsWriteOutcome::Pending { .. }) => {
+                panic!("racing write left pending after settle")
+            }
+        }
+    }
+    assert_eq!(
+        (committed_hashes.len(), surfaced_failures),
+        (1, 1),
+        "exactly one racing create must commit and the other must surface an explicit \
+         conflict; writer: {writer_outcome:?}, observer: {observer_outcome:?}"
+    );
+    let winner_hash = committed_hashes.remove(0);
+    assert!(
+        winner_hash == content_hash(&writer_bytes) || winner_hash == content_hash(&observer_bytes),
+        "winning content must be exactly one candidate, never interleaved"
+    );
+
+    // The primary's visible metadata must reference the winner's bytes.
+    let primary_stat = cluster.primary.posix_stat(path).expect("primary stat");
+    assert_eq!(
+        primary_stat.content_hash.as_deref(),
+        Some(winner_hash.as_str())
+    );
+    let winner_len = if winner_hash == content_hash(&writer_bytes) {
+        writer_bytes.len()
+    } else {
+        observer_bytes.len()
+    };
+    assert_eq!(primary_stat.size_bytes, Some(winner_len as u64));
+
+    // Reads of a conflicted object either return the winning bytes or surface
+    // the conflict explicitly; they must never return the losing candidate.
+    match cluster.primary.posix_read_file_distributed(path) {
+        Ok(bytes) => {
+            let read_hash = content_hash(&bytes);
+            assert_eq!(
+                read_hash, winner_hash,
+                "read after race must observe the winning content only"
+            );
+        }
+        Err(DfsPosixError::Conflict { .. }) => {}
+        Err(DfsPosixError::NotFound { .. }) => {
+            // Content may still live only on the winning replica; metadata
+            // remains authoritative for the assertion above.
+        }
+        Err(error) => panic!("unexpected read failure after race: {error}"),
+    }
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-hole");
+    let path = "/users/sparse.bin";
+    let base = b"0123456789".to_vec();
+    let patch = b"PATCH".to_vec();
+    let hole_offset = 16u64;
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &base);
+
+    let mut expected = base.clone();
+    expected.resize(hole_offset as usize, 0);
+    expected.extend_from_slice(&patch);
+    let expected_hash = content_hash(&expected);
+
+    let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    match cluster
+        .writer
+        .posix_write_file_at(path, hole_offset, &patch, options)
+    {
+        Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("routed write_at failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(&mut cluster, "write_at hole commit", |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+
+    // POSIX hole semantics: bytes between the old EOF and the write offset
+    // must read back as zeros.
+    let read = cluster.writer.posix_read_file(path).expect("writer read");
+    assert_eq!(read, expected);
+    let stat = cluster.writer.posix_stat(path).expect("writer stat");
+    assert_eq!(stat.size_bytes, Some(expected.len() as u64));
+
+    // Range reads observe the same bytes (hole inclusive).
+    let range = cluster
+        .writer
+        .posix_read_file_range(path, base.len() as u64, expected.len())
+        .expect("writer range read");
+    assert_eq!(range, expected[base.len()..].to_vec());
+
+    // The primary agrees on the patched content.
+    let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    assert_eq!(read, expected);
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_truncate_shrinks_and_extends_with_zeros() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-truncate");
+    let path = "/users/truncate.bin";
+    let base = b"truncate source content".to_vec();
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &base);
+
+    // Shrink.
+    let shrunk = base[..8].to_vec();
+    let shrunk_hash = content_hash(&shrunk);
+    let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    match cluster.writer.posix_truncate_file(path, 8, options) {
+        Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("routed truncate failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(&mut cluster, "truncate shrink commit", |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(shrunk_hash.as_str()))
+    });
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("shrunk read"),
+        shrunk
+    );
+    assert_eq!(
+        cluster
+            .writer
+            .posix_stat(path)
+            .expect("shrunk stat")
+            .size_bytes,
+        Some(8)
+    );
+
+    // Extend: the new tail must be zero filled.
+    let mut extended = shrunk.clone();
+    extended.resize(12, 0);
+    let extended_hash = content_hash(&extended);
+    let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    match cluster.writer.posix_truncate_file(path, 12, options) {
+        Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("routed truncate extension failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(&mut cluster, "truncate extend commit", |cluster| {
+        cluster
+            .writer
+            .posix_stat(path)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(extended_hash.as_str()))
+    });
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("extended read"),
+        extended
+    );
+
+    // Primary sees the final truncated content.
+    let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    assert_eq!(read, extended);
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_rename_replicates_atomically_to_observers() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-rename");
+    let source = "/users/rename-source.txt";
+    let destination = "/users/rename-destination.txt";
+    let source_bytes = b"bytes that travel with the rename".to_vec();
+    let destination_bytes = b"bytes that are replaced".to_vec();
+    let source_hash = content_hash(&source_bytes);
+
+    // Namespace mutations are authoritative on the shard primary.
+    sifs_cluster_primary_posix_write(&mut cluster, source, &source_bytes);
+    sifs_cluster_primary_posix_write(&mut cluster, destination, &destination_bytes);
+
+    // Ship the pre-rename namespace to the observer first so the rename
+    // replay has to move/replace existing replica records rather than start
+    // from an empty namespace.
+    sifs_cluster_publish_metadata_until(&mut cluster, "pre-rename catch-up", |cluster| {
+        cluster.observer.posix_stat(source).is_ok()
+            && cluster.observer.posix_stat(destination).is_ok()
+    });
+
+    let renamed_stat = cluster
+        .primary
+        .posix_rename(source, destination)
+        .expect("primary rename over existing destination");
+    assert_eq!(
+        renamed_stat.content_hash.as_deref(),
+        Some(source_hash.as_str())
+    );
+
+    // Rename must be atomic on the primary: destination has the source
+    // content, the source path is gone.
+    assert_eq!(
+        cluster
+            .primary
+            .posix_stat(destination)
+            .expect("primary destination stat")
+            .content_hash
+            .as_deref(),
+        Some(source_hash.as_str())
+    );
+    assert!(matches!(
+        cluster.primary.posix_stat(source),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    // Replicas converge to the same post-rename namespace.
+    sifs_cluster_publish_metadata_until(&mut cluster, "post-rename catch-up", |cluster| {
+        let destination_current = cluster
+            .observer
+            .posix_stat(destination)
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(source_hash.as_str()));
+        let source_gone = matches!(
+            cluster.observer.posix_stat(source),
+            Err(DfsPosixError::NotFound { .. })
+        );
+        destination_current && source_gone
+    });
+    let entries = cluster
+        .observer
+        .posix_list_dir("/users")
+        .expect("observer list after rename");
+    assert!(
+        entries.iter().any(|entry| entry.path == destination),
+        "observer must list the rename destination: {entries:?}"
+    );
+    assert!(
+        !entries.iter().any(|entry| entry.path == source),
+        "observer must not list the rename source after replay: {entries:?}"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_directory_rename_moves_children_on_observers() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-dir-rename");
+    let child_bytes = b"child file inside renamed directory".to_vec();
+    let child_hash = content_hash(&child_bytes);
+
+    cluster
+        .primary
+        .posix_mkdir("/users/project-a")
+        .expect("primary mkdir");
+    sifs_cluster_primary_posix_write(&mut cluster, "/users/project-a/notes.txt", &child_bytes);
+
+    sifs_cluster_publish_metadata_until(&mut cluster, "pre-dir-rename catch-up", |cluster| {
+        cluster
+            .observer
+            .posix_stat("/users/project-a/notes.txt")
+            .is_ok()
+    });
+
+    cluster
+        .primary
+        .posix_rename("/users/project-a", "/users/project-b")
+        .expect("primary directory rename");
+    assert_eq!(
+        cluster
+            .primary
+            .posix_stat("/users/project-b/notes.txt")
+            .expect("primary child stat")
+            .content_hash
+            .as_deref(),
+        Some(child_hash.as_str())
+    );
+    assert!(matches!(
+        cluster.primary.posix_stat("/users/project-a"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    sifs_cluster_publish_metadata_until(&mut cluster, "post-dir-rename catch-up", |cluster| {
+        let child_moved = cluster
+            .observer
+            .posix_stat("/users/project-b/notes.txt")
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(child_hash.as_str()));
+        let old_dir_gone = matches!(
+            cluster.observer.posix_stat("/users/project-a"),
+            Err(DfsPosixError::NotFound { .. })
+        );
+        child_moved && old_dir_gone
+    });
+    assert!(matches!(
+        cluster.observer.posix_stat("/users/project-a/notes.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let stat = cluster
+        .observer
+        .posix_stat("/users/project-b")
+        .expect("observer renamed dir stat");
+    assert_eq!(stat.kind, DfsObjectKind::Directory);
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_unlink_replicates_tombstone_to_observers() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-unlink");
+    let path = "/users/unlink-me.txt";
+    let bytes = b"bytes to be unlinked".to_vec();
+
+    sifs_cluster_primary_posix_write(&mut cluster, path, &bytes);
+    sifs_cluster_publish_metadata_until(&mut cluster, "pre-unlink catch-up", |cluster| {
+        cluster.observer.posix_stat(path).is_ok()
+    });
+
+    cluster.primary.posix_unlink(path).expect("primary unlink");
+    assert!(matches!(
+        cluster.primary.posix_stat(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    sifs_cluster_publish_metadata_until(&mut cluster, "post-unlink catch-up", |cluster| {
+        matches!(
+            cluster.observer.posix_stat(path),
+            Err(DfsPosixError::NotFound { .. })
+        )
+    });
+    assert!(matches!(
+        cluster.observer.posix_read_file(path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    let entries = cluster
+        .observer
+        .posix_list_dir("/users")
+        .expect("observer list after unlink");
+    assert!(
+        !entries.iter().any(|entry| entry.path == path),
+        "observer must not list an unlinked path: {entries:?}"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_namespace_and_stats_agree_across_nodes() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-agree");
+    let dir = "/users/team";
+    let file_a = "/users/team/a.txt";
+    let file_b = "/users/team/b.txt";
+    let link = "/users/team/link";
+    let a_bytes = b"alpha file content".to_vec();
+    let b_bytes = b"bravo".to_vec();
+
+    cluster.primary.posix_mkdir(dir).expect("primary mkdir");
+    sifs_cluster_primary_posix_write(&mut cluster, file_a, &a_bytes);
+    sifs_cluster_primary_posix_write(&mut cluster, file_b, &b_bytes);
+    cluster
+        .primary
+        .posix_symlink(
+            "a.txt",
+            link,
+            sifs_cluster_write_options(&cluster.primary_node.clone()),
+        )
+        .expect("primary symlink");
+
+    sifs_cluster_publish_metadata_until(&mut cluster, "namespace agreement", |cluster| {
+        cluster.observer.posix_lstat(link).is_ok()
+            && cluster.writer.posix_lstat(link).is_ok()
+            && cluster.observer.posix_stat(file_b).is_ok()
+            && cluster.writer.posix_stat(file_b).is_ok()
+    });
+
+    let primary_entries = cluster.primary.posix_list_dir(dir).expect("primary list");
+    let writer_entries = cluster.writer.posix_list_dir(dir).expect("writer list");
+    let observer_entries = cluster.observer.posix_list_dir(dir).expect("observer list");
+    let names = |entries: &[DfsDirEntry]| {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    entry.kind.clone(),
+                    entry.object_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&primary_entries), names(&writer_entries));
+    assert_eq!(names(&primary_entries), names(&observer_entries));
+
+    for path in [file_a, file_b] {
+        let primary_stat = cluster.primary.posix_stat(path).expect("primary stat");
+        for (label, stat) in [
+            (
+                "writer",
+                cluster.writer.posix_stat(path).expect("writer stat"),
+            ),
+            (
+                "observer",
+                cluster.observer.posix_stat(path).expect("observer stat"),
+            ),
+        ] {
+            assert_eq!(stat.object_id, primary_stat.object_id, "{label} {path}");
+            assert_eq!(stat.kind, primary_stat.kind, "{label} {path}");
+            assert_eq!(stat.size_bytes, primary_stat.size_bytes, "{label} {path}");
+            assert_eq!(
+                stat.content_hash, primary_stat.content_hash,
+                "{label} {path}"
+            );
+            assert_eq!(stat.version, primary_stat.version, "{label} {path}");
+        }
+    }
+
+    // lstat reports the symlink itself without needing its content.
+    let observer_lstat = cluster.observer.posix_lstat(link).expect("observer lstat");
+    assert_eq!(observer_lstat.kind, DfsObjectKind::Symlink);
+
+    // Following the symlink requires its content (the target string); fetch
+    // it to the observer before follow-the-link assertions.
+    cluster
+        .observer
+        .posix_request_remote_read_no_follow(link)
+        .expect("observer symlink remote read");
+    sifs_posix_cluster_pump_until(&mut cluster, "symlink content fetch", |cluster| {
+        cluster.observer.posix_readlink(link).is_ok()
+    });
+    assert_eq!(
+        cluster.observer.posix_readlink(link).expect("readlink"),
+        "a.txt"
+    );
+
+    // With the link content local, stat follows it to the target file.
+    let observer_stat = cluster.observer.posix_stat(link).expect("observer stat");
+    assert_eq!(observer_stat.kind, DfsObjectKind::File);
+    assert_eq!(observer_stat.size_bytes, Some(a_bytes.len() as u64));
+
+    // Following the symlink resolves to the same bytes on every node.
+    let through_link = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.observer, link);
+    assert_eq!(through_link, a_bytes);
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_routed_write_survives_writer_restart() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-restart");
+    let path = "/users/restart-durable.txt";
+    let bytes = b"these bytes must survive a writer restart";
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, bytes);
+    assert_eq!(
+        cluster
+            .writer
+            .posix_read_file(path)
+            .expect("pre-restart read"),
+        bytes.to_vec()
+    );
+
+    // Simulate a writer crash/restart: drop the service and rebuild it from
+    // the same durable content store and metadata backend.
+    let writer_node = cluster.writer_node.clone();
+    let writer_root = cluster.root.join("writer");
+    let placeholder = NetworkedDfsService::new(
+        sinomo_network::InProcessNetwork::new().add_node(writer_node.clone()),
+        LocalContentStore::new(cluster.root.join("unused-content"))
+            .expect("placeholder content store"),
+    );
+    let writer = std::mem::replace(&mut cluster.writer, placeholder);
+    drop(writer);
+
+    let mut restarted = NetworkedDfsService::new(
+        ReceiveOnlyTransport::new(writer_node),
+        LocalContentStore::new(writer_root.join("content")).expect("reopened content store"),
+    )
+    .with_metadata_backend(
+        open_root_local_metadata_backend(writer_root.join("metadata"))
+            .expect("reopened metadata backend"),
+    )
+    .expect("restarted writer service");
+    restarted
+        .bootstrap_distributed_sifs()
+        .expect("restarted SIFS bootstrap");
+
+    // Committed state must be durable: same bytes, same stat identity.
+    assert_eq!(
+        restarted.posix_read_file(path).expect("post-restart read"),
+        bytes.to_vec()
+    );
+    let stat = restarted.posix_stat(path).expect("post-restart stat");
+    assert_eq!(stat.kind, DfsObjectKind::File);
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(content_hash(bytes).as_str())
+    );
+    let entries = restarted
+        .posix_list_dir("/users")
+        .expect("post-restart list");
+    assert!(
+        entries.iter().any(|entry| entry.path == path),
+        "restarted writer must still list the committed path: {entries:?}"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_error_mapping_matches_posix_contract() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-errno");
+
+    // EEXIST: mkdir over an existing directory.
+    cluster
+        .primary
+        .posix_mkdir("/users/errno-dir")
+        .expect("primary mkdir");
+    assert!(matches!(
+        cluster.primary.posix_mkdir("/users/errno-dir"),
+        Err(DfsPosixError::AlreadyExists { .. })
+    ));
+
+    // EISDIR: writing file bytes over a directory, unlinking a directory.
+    assert!(matches!(
+        cluster.primary.posix_write_file(
+            "/users/errno-dir",
+            b"nope",
+            sifs_cluster_write_options(&cluster.primary_node.clone()),
+        ),
+        Err(DfsPosixError::IsDirectory { .. })
+    ));
+    assert!(matches!(
+        cluster.primary.posix_unlink("/users/errno-dir"),
+        Err(DfsPosixError::IsDirectory { .. })
+    ));
+
+    // ENOTDIR: rmdir on a file; trailing slash on a file path.
+    sifs_cluster_primary_posix_write(&mut cluster, "/users/errno-file.txt", b"errno bytes");
+    assert!(matches!(
+        cluster.primary.posix_rmdir("/users/errno-file.txt"),
+        Err(DfsPosixError::NotDirectory { .. })
+    ));
+    assert!(matches!(
+        cluster.primary.posix_stat("/users/errno-file.txt/"),
+        Err(DfsPosixError::NotDirectory { .. })
+    ));
+
+    // ENOTEMPTY: rmdir on a non-empty directory.
+    sifs_cluster_primary_posix_write(&mut cluster, "/users/errno-dir/child.txt", b"child");
+    assert!(matches!(
+        cluster.primary.posix_rmdir("/users/errno-dir"),
+        Err(DfsPosixError::DirectoryNotEmpty { .. })
+    ));
+
+    // ENOENT: reading/statting a missing path; writing under a missing parent.
+    assert!(matches!(
+        cluster.primary.posix_read_file("/users/errno-missing.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(matches!(
+        cluster.primary.posix_write_file(
+            "/users/errno-no-parent/file.txt",
+            b"nope",
+            sifs_cluster_write_options(&cluster.primary_node.clone()),
+        ),
+        Err(DfsPosixError::MissingParent { .. })
+    ));
+
+    // EINVAL: renaming a directory into its own subtree; relative paths.
+    assert!(matches!(
+        cluster
+            .primary
+            .posix_rename("/users/errno-dir", "/users/errno-dir/inner"),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+    assert!(matches!(
+        cluster.primary.posix_stat("relative/path.txt"),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+
+    // The same contract holds on a non-primary node: failed validation must
+    // not leave routed-write state behind.
+    assert!(matches!(
+        cluster.writer.posix_write_file(
+            "/users/errno-no-parent/file.txt",
+            b"nope",
+            sifs_cluster_write_options(&cluster.writer_node.clone()),
+        ),
+        Err(DfsPosixError::MissingParent { .. })
+    ));
+    assert!(
+        cluster.writer.pending_routed_writes.is_empty(),
+        "failed POSIX validation on a replica must not leak routed-write state"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_blocking_write_and_read_with_live_peers() {
+    // End-to-end through the blocking POSIX surface that the FUSE adapter and
+    // CLI use: `wait_for_commit: true` writes on a non-primary node and
+    // blocking distributed reads, with peer nodes pumping their own event
+    // loops on threads like live daemons.
+    let cluster = sifs_posix_cluster("sifs-cluster-blocking");
+    let path = "/users/blocking.txt";
+    let bytes = b"blocking write through live peers".to_vec();
+    let SifsPosixCluster {
+        root,
+        primary_node: _,
+        writer_node,
+        observer_node: _,
+        primary,
+        mut writer,
+        mut observer,
+        rejections: _,
+    } = cluster;
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    // The production write path: blocks until the routed write commits.
+    let stat = writer
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("blocking routed write");
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+
+    // Read-your-write immediately after the blocking write returns.
+    assert_eq!(
+        writer.posix_read_file(path).expect("read your write"),
+        bytes
+    );
+
+    // Stop the primary thread and publish its journal so the observer learns
+    // the namespace.
+    stop_primary.store(true, Ordering::SeqCst);
+    let mut primary = primary_thread.join().expect("primary thread");
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("primary journal publish");
+        primary.process_incoming().expect("primary pump");
+        writer.process_incoming().expect("writer pump");
+        observer.process_incoming().expect("observer pump");
+        if observer.posix_stat(path).is_ok() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("observer did not learn the namespace from journal publication");
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+
+    // The blocking distributed read fetches content from the writer replica,
+    // which keeps serving frames on its own thread.
+    let stop_writer = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop_writer);
+    let writer_thread = std::thread::spawn(move || {
+        let mut writer = writer;
+        while !writer_stop.load(Ordering::SeqCst) {
+            writer.process_incoming().expect("writer pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        writer
+    });
+    let read = observer
+        .posix_read_file_distributed(path)
+        .expect("blocking distributed read");
+    assert_eq!(read, bytes);
+    stop_writer.store(true, Ordering::SeqCst);
+    writer_thread.join().expect("writer thread");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+fn pump_dfs_services_collect_rejections(
+    services: &mut [(
+        &str,
+        &mut NetworkedDfsService<sinomo_network::InProcessTransport>,
+    )],
+    rejections: &mut Vec<String>,
+) -> usize {
+    let mut activity = 0;
+    for (label, service) in services.iter_mut() {
+        let events = service
+            .process_incoming()
+            .expect("cluster process_incoming");
+        activity += events.len();
+        for event in events {
+            if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected { reason, .. } = event {
+                rejections.push(format!("{label}: {reason}"));
+            }
+        }
+    }
+    activity
+}
+
+#[test]
+fn sifs_cluster_posix_routed_namespace_ops_have_read_your_write_semantics() {
+    // Namespace mutations from a non-primary node route to the metadata shard
+    // primary and replay the primary's journal before returning, so every
+    // blocking POSIX call observes its own effect locally.
+    let cluster = sifs_posix_cluster("sifs-cluster-ns-ryw");
+    let SifsPosixCluster {
+        root,
+        primary_node: _,
+        writer_node,
+        observer_node: _,
+        primary,
+        mut writer,
+        mut observer,
+        rejections: _,
+    } = cluster;
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    // mkdir routes and is immediately visible locally.
+    let dir_stat = writer
+        .posix_mkdir("/users/routed-dir")
+        .expect("routed mkdir");
+    assert_eq!(dir_stat.kind, DfsObjectKind::Directory);
+    assert!(
+        writer
+            .posix_list_dir("/users")
+            .expect("writer list /users")
+            .iter()
+            .any(|entry| entry.path == "/users/routed-dir"),
+        "routed mkdir must be locally listed after it returns"
+    );
+
+    // mkdir_all creates the whole chain through the primary.
+    writer
+        .posix_mkdir_all("/users/routed-dir/a/b")
+        .expect("routed mkdir_all");
+    assert_eq!(
+        writer
+            .posix_stat("/users/routed-dir/a/b")
+            .expect("nested dir stat")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    // Content write into the routed directory (already-routed write path).
+    let bytes = b"namespace routed file content".to_vec();
+    let file_stat = writer
+        .posix_write_file(
+            "/users/routed-dir/file.txt",
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("routed content write");
+    assert_eq!(
+        file_stat.content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+
+    // chmod / utimens route and read back their own effect.
+    let mode_stat = writer
+        .posix_set_mode("/users/routed-dir/file.txt", 0o600)
+        .expect("routed set_mode");
+    assert_eq!(mode_stat.mode, 0o600);
+    assert_eq!(
+        writer
+            .posix_stat("/users/routed-dir/file.txt")
+            .expect("stat after chmod")
+            .mode,
+        0o600
+    );
+    let times_stat = writer
+        .posix_set_times(
+            "/users/routed-dir/file.txt",
+            Some(123_000_000_000),
+            Some(456_000_000_000),
+        )
+        .expect("routed set_times");
+    assert_eq!(times_stat.accessed_at_unix_nanos, 123_000_000_000);
+    assert_eq!(times_stat.modified_at_unix_nanos, 456_000_000_000);
+
+    // rename routes; the destination is readable locally right away because
+    // the content was staged here and the metadata replayed.
+    let renamed_stat = writer
+        .posix_rename(
+            "/users/routed-dir/file.txt",
+            "/users/routed-dir/renamed.txt",
+        )
+        .expect("routed rename");
+    assert_eq!(
+        renamed_stat.content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    assert_eq!(
+        writer
+            .posix_read_file("/users/routed-dir/renamed.txt")
+            .expect("read renamed"),
+        bytes
+    );
+    assert!(matches!(
+        writer.posix_stat("/users/routed-dir/file.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    // hardlink routes and updates the link count everywhere it is observed.
+    let link_stat = writer
+        .posix_hardlink("/users/routed-dir/renamed.txt", "/users/routed-dir/link")
+        .expect("routed hardlink");
+    assert_eq!(link_stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(link_stat.link_count, 2);
+    assert_eq!(
+        writer
+            .posix_stat("/users/routed-dir/renamed.txt")
+            .expect("stat canonical after hardlink")
+            .link_count,
+        2
+    );
+
+    // unlink routes; the alias disappears and the link count drops.
+    let unlinked = writer
+        .posix_unlink("/users/routed-dir/link")
+        .expect("routed unlink");
+    assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
+    assert!(matches!(
+        writer.posix_stat("/users/routed-dir/link"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        writer
+            .posix_stat("/users/routed-dir/renamed.txt")
+            .expect("stat after alias unlink")
+            .link_count,
+        1
+    );
+
+    // POSIX error mapping survives the wire round trip.
+    assert!(matches!(
+        writer.posix_mkdir("/users/routed-dir"),
+        Err(DfsPosixError::AlreadyExists { .. })
+    ));
+    assert!(matches!(
+        writer.posix_rmdir("/users/routed-dir"),
+        Err(DfsPosixError::DirectoryNotEmpty { .. })
+    ));
+    assert!(matches!(
+        writer.posix_unlink("/users/routed-dir"),
+        Err(DfsPosixError::IsDirectory { .. })
+    ));
+    assert!(matches!(
+        writer.posix_unlink("/users/routed-missing.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(matches!(
+        writer.posix_rename("/users/routed-dir", "/users/routed-dir/inside"),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+
+    // Recursive clear routes, then the emptied directory can be removed.
+    writer
+        .posix_clear_dir_recursive("/users/routed-dir")
+        .expect("routed recursive clear");
+    assert!(
+        writer
+            .posix_list_dir("/users/routed-dir")
+            .expect("list cleared dir")
+            .is_empty(),
+        "recursive clear must empty the directory on the requester"
+    );
+    writer
+        .posix_rmdir("/users/routed-dir")
+        .expect("routed rmdir after clear");
+    assert!(matches!(
+        writer.posix_stat("/users/routed-dir"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    assert!(
+        writer.pending_routed_namespace_ops.is_empty(),
+        "settled routed namespace ops must not leak pending state"
+    );
+
+    // The primary holds the same authoritative view.
+    stop_primary.store(true, Ordering::SeqCst);
+    let mut primary = primary_thread.join().expect("primary thread");
+    assert!(matches!(
+        primary.posix_stat("/users/routed-dir"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    // Journals stayed aligned: publication to both replicas applies cleanly.
+    let mut rejections = Vec::new();
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("publish after routed namespace ops");
+        pump_dfs_services_collect_rejections(
+            &mut [
+                ("primary", &mut primary),
+                ("writer", &mut writer),
+                ("observer", &mut observer),
+            ],
+            &mut rejections,
+        );
+        if matches!(
+            observer.posix_stat("/users/routed-dir"),
+            Err(DfsPosixError::NotFound { .. })
+        ) && observer
+            .posix_stat("/users/routed-dir/renamed.txt")
+            .is_err()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "observer did not converge after routed namespace ops; rejections: {rejections:?}"
+            );
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+    assert!(
+        rejections.is_empty(),
+        "routed namespace ops must keep replica journals aligned: {rejections:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
+    // Namespace mutations issued from different replicas serialize through
+    // the shard primary, and every node converges to one identical namespace.
+    let cluster = sifs_posix_cluster("sifs-cluster-ns-converge");
+    let SifsPosixCluster {
+        root,
+        primary_node: _,
+        writer_node,
+        observer_node: _,
+        primary,
+        mut writer,
+        mut observer,
+        rejections: _,
+    } = cluster;
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    // The writer builds a subtree and a file.
+    writer
+        .posix_mkdir("/users/shared")
+        .expect("writer routed mkdir");
+    let bytes = b"replica-converged bytes".to_vec();
+    writer
+        .posix_write_file(
+            "/users/shared/from-writer.txt",
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![writer_node.clone()]),
+        )
+        .expect("writer routed write");
+
+    // The observer mutates the same subtree it has never replayed: the
+    // primary resolves authoritatively, so the routed ops still apply.
+    observer
+        .posix_mkdir("/users/shared/from-observer")
+        .expect("observer routed mkdir into unseen subtree");
+    observer
+        .posix_rename(
+            "/users/shared/from-writer.txt",
+            "/users/shared/renamed-by-observer.txt",
+        )
+        .expect("observer routed rename of writer file");
+    assert!(matches!(
+        observer.posix_stat("/users/shared/from-writer.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        observer
+            .posix_stat("/users/shared/renamed-by-observer.txt")
+            .expect("observer stat renamed")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+
+    // The writer learns the observer's mutations through publication.
+    stop_primary.store(true, Ordering::SeqCst);
+    let mut primary = primary_thread.join().expect("primary thread");
+    let mut rejections = Vec::new();
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("publish after replica namespace ops");
+        pump_dfs_services_collect_rejections(
+            &mut [
+                ("primary", &mut primary),
+                ("writer", &mut writer),
+                ("observer", &mut observer),
+            ],
+            &mut rejections,
+        );
+        let writer_sees_rename = writer
+            .posix_stat("/users/shared/renamed-by-observer.txt")
+            .is_ok()
+            && matches!(
+                writer.posix_stat("/users/shared/from-writer.txt"),
+                Err(DfsPosixError::NotFound { .. })
+            );
+        let writer_sees_observer_dir = writer.posix_stat("/users/shared/from-observer").is_ok();
+        if writer_sees_rename && writer_sees_observer_dir {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("writer did not converge to observer mutations; rejections: {rejections:?}");
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+    assert!(
+        rejections.is_empty(),
+        "cross-replica namespace ops must keep journals aligned: {rejections:?}"
+    );
+
+    // All three nodes list the same namespace identity.
+    let names = |entries: &[DfsDirEntry]| {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    entry.kind.clone(),
+                    entry.object_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let primary_entries = primary
+        .posix_list_dir("/users/shared")
+        .expect("primary list shared");
+    assert_eq!(
+        names(&primary_entries),
+        names(&writer.posix_list_dir("/users/shared").expect("writer list"))
+    );
+    assert_eq!(
+        names(&primary_entries),
+        names(
+            &observer
+                .posix_list_dir("/users/shared")
+                .expect("observer list")
+        )
+    );
+
+    // The renamed content reads identically from its staging replica.
+    assert_eq!(
+        writer
+            .posix_read_file("/users/shared/renamed-by-observer.txt")
+            .expect("writer read renamed"),
+        bytes
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------------------------
+// SIFS cross-shard-primary POSIX transaction tests
+//
+// Two-primary topology mirroring the production shard-transfer lifecycle: one
+// node bootstraps SIFS as primary of every shard, replicas catch up through
+// journal publication, and the `/services` shard is then transferred to a
+// second primary. Renames and hardlinks across the two primaries must apply
+// transactionally: the destination primary adopts atomically, the source
+// primary completes its half through a durable recoverable saga, and no
+// replica journal ever forks.
+// ---------------------------------------------------------------------------
+
+struct SifsTwoPrimaryCluster {
+    root: PathBuf,
+    users_primary_node: NodeId,
+    services_primary_node: NodeId,
+    replica_node: NodeId,
+    shared_kv: SharedDfsControlPlaneKvClient<InProcessRaftKvCluster>,
+    users_primary: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    services_primary: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    replica: NetworkedDfsService<sinomo_network::InProcessTransport>,
+    rejections: Vec<String>,
+}
+
+fn sifs_two_primary_shard_configs(
+    users_primary: &NodeId,
+    services_primary: &NodeId,
+    services_epoch: u64,
+    others_for_users: Vec<NodeId>,
+    others_for_services: Vec<NodeId>,
+) -> Vec<DfsMetadataShardConfig> {
+    vec![
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: users_primary.clone(),
+            replica_node_ids: others_for_users.clone(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "users".to_string(),
+            primary_node_id: users_primary.clone(),
+            replica_node_ids: others_for_users,
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/users".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+        DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "services".to_string(),
+            primary_node_id: services_primary.clone(),
+            replica_node_ids: others_for_services,
+            epoch: services_epoch,
+            assignment: DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/services".to_string(),
+            },
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        },
+    ]
+}
+
+fn sifs_two_primary_pump_round(cluster: &mut SifsTwoPrimaryCluster) -> usize {
+    let mut activity = 0;
+    for (label, service) in [
+        ("users-primary", &mut cluster.users_primary),
+        ("services-primary", &mut cluster.services_primary),
+        ("replica", &mut cluster.replica),
+    ] {
+        let events = service
+            .process_incoming()
+            .expect("cluster process_incoming");
+        activity += events.len();
+        for event in events {
+            if let NetworkedDfsServiceEvent::MetadataJournalBatchRejected { reason, .. } = event {
+                cluster.rejections.push(format!("{label}: {reason}"));
+            }
+        }
+    }
+    activity
+}
+
+fn sifs_two_primary_publish_until(
+    cluster: &mut SifsTwoPrimaryCluster,
+    what: &str,
+    mut done: impl FnMut(&mut SifsTwoPrimaryCluster) -> bool,
+) {
+    let deadline = Instant::now() + SIFS_CLUSTER_PUMP_DEADLINE;
+    loop {
+        if done(cluster) {
+            return;
+        }
+        cluster
+            .users_primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("users primary publish");
+        cluster
+            .services_primary
+            .replicate_configured_metadata_shards(&sifs_file_system_id())
+            .expect("services primary publish");
+        sifs_two_primary_pump_round(cluster);
+        if Instant::now() >= deadline {
+            panic!(
+                "two-primary cluster did not converge: {what}; rejections: {:?}",
+                cluster.rejections
+            );
+        }
+        std::thread::sleep(SIFS_CLUSTER_PUMP_IDLE_SLEEP);
+    }
+}
+
+fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
+    let root = temp_root(name);
+    let node_prefix = name.replace('-', "_");
+    let users_primary_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_users")).expect("users primary");
+    let services_primary_node = NodeId::from_legacy_named(&format!("node_{node_prefix}_services"))
+        .expect("services primary");
+    let replica_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_replica")).expect("replica");
+
+    let network = InProcessNetwork::new();
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![users_primary_node.clone()]).expect("control plane kv"),
+    );
+    // Genesis: one node is primary of every shard and materializes SIFS.
+    let genesis_shards = sifs_two_primary_shard_configs(
+        &users_primary_node,
+        &users_primary_node,
+        1,
+        vec![services_primary_node.clone(), replica_node.clone()],
+        vec![services_primary_node.clone(), replica_node.clone()],
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                users_primary_node.clone(),
+            )))
+            .expect("sifs filesystem config");
+        for shard in &genesis_shards {
+            control.put_metadata_shard(shard).expect("genesis shard");
+        }
+    });
+
+    let node = |node_id: &NodeId, dir: &str| {
+        let node_root = root.join(dir);
+        NetworkedDfsService::new(
+            network.add_node(node_id.clone()),
+            LocalContentStore::new(node_root.join("content")).expect("node content"),
+        )
+        .with_control_plane(shared_kv.clone())
+        .with_metadata_backend(
+            open_local_sharded_metadata_backend(node_root.join("metadata"), genesis_shards.clone())
+                .expect("node sharded metadata"),
+        )
+        .expect("node backend attach")
+    };
+    let mut users_primary = node(&users_primary_node, "users-primary");
+    let services_primary = node(&services_primary_node, "services-primary");
+    let replica = node(&replica_node, "replica");
+
+    users_primary
+        .bootstrap_distributed_sifs()
+        .expect("genesis SIFS bootstrap");
+
+    let mut cluster = SifsTwoPrimaryCluster {
+        root,
+        users_primary_node: users_primary_node.clone(),
+        services_primary_node: services_primary_node.clone(),
+        replica_node,
+        shared_kv,
+        users_primary,
+        services_primary,
+        replica,
+        rejections: Vec::new(),
+    };
+    sifs_two_primary_publish_until(&mut cluster, "genesis follower catch-up", |cluster| {
+        cluster
+            .services_primary
+            .posix_stat(SIFS_SERVICES_PATH)
+            .is_ok()
+            && cluster.services_primary.posix_stat(SIFS_USERS_PATH).is_ok()
+            && cluster.replica.posix_stat(SIFS_SERVICES_PATH).is_ok()
+            && cluster.replica.posix_stat(SIFS_USERS_PATH).is_ok()
+    });
+    cluster
+        .services_primary
+        .bootstrap_distributed_sifs()
+        .expect("services follower bootstrap");
+    cluster
+        .replica
+        .bootstrap_distributed_sifs()
+        .expect("replica follower bootstrap");
+
+    // Shard transfer: the services shard moves to its own primary, exactly
+    // like a production primary transfer after the candidate replayed the
+    // journal.
+    let transferred = sifs_two_primary_shard_configs(
+        &users_primary_node,
+        &services_primary_node,
+        2,
+        vec![services_primary_node.clone(), cluster.replica_node.clone()],
+        vec![users_primary_node.clone(), cluster.replica_node.clone()],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &transferred {
+            control.put_metadata_shard(shard).expect("transfer shard");
+        }
+    });
+    assert!(
+        cluster.rejections.is_empty(),
+        "two-primary genesis must not reject journal batches: {:?}",
+        cluster.rejections
+    );
+    cluster
+}
+
+#[test]
+fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-rename");
+    let SifsTwoPrimaryCluster {
+        root,
+        users_primary_node: _,
+        services_primary_node: _,
+        replica_node,
+        shared_kv: _,
+        users_primary,
+        services_primary,
+        mut replica,
+        rejections: _,
+    } = cluster;
+    let bytes = b"bytes that move between shard primaries".to_vec();
+    let moved_bytes = b"rewritten at the new shard authority".to_vec();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread = std::thread::spawn(move || {
+        let mut users_primary = users_primary;
+        while !users_stop.load(Ordering::SeqCst) {
+            users_primary
+                .process_incoming()
+                .expect("users primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        users_primary
+    });
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    // Create under /users (routed to the users primary).
+    replica
+        .posix_write_file(
+            "/users/move-me.txt",
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("replica routed create");
+    assert_eq!(
+        replica.posix_read_file("/users/move-me.txt").expect("read"),
+        bytes
+    );
+
+    // Rename across shard primaries; the source primary coordinates the
+    // adoption on the services primary.
+    let stat = replica
+        .posix_rename("/users/move-me.txt", "/services/moved.txt")
+        .expect("cross-primary rename");
+    assert_eq!(
+        stat.content_hash.as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    assert_eq!(stat.path, "/services/moved.txt");
+
+    // Read-your-write on the requester for both halves.
+    assert!(matches!(
+        replica.posix_stat("/users/move-me.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        replica
+            .posix_read_file("/services/moved.txt")
+            .expect("read moved"),
+        bytes
+    );
+
+    // The object's write authority moved with it: a write to the new path
+    // routes to the services primary and commits there.
+    replica
+        .posix_write_file(
+            "/services/moved.txt",
+            &moved_bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("write at new shard authority");
+    assert_eq!(
+        replica
+            .posix_read_file("/services/moved.txt")
+            .expect("read rewritten"),
+        moved_bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let users_primary = users_thread.join().expect("users thread");
+    let services_primary = services_thread.join().expect("services thread");
+    assert!(matches!(
+        users_primary.posix_stat("/users/move-me.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(users_primary.posix_stat("/services/moved.txt").is_ok());
+    assert_eq!(
+        services_primary
+            .posix_stat("/services/moved.txt")
+            .expect("services primary stat")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(&moved_bytes).as_str())
+    );
+
+    // Convergence: both primaries publish and every node agrees, with no
+    // journal rejections anywhere.
+    let mut cluster = SifsTwoPrimaryCluster {
+        root,
+        users_primary_node: NodeId::from_legacy_named("node_unused_users").expect("node"),
+        services_primary_node: NodeId::from_legacy_named("node_unused_services").expect("node"),
+        replica_node,
+        shared_kv: SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![
+                NodeId::from_legacy_named("node_unused_kv").expect("node"),
+            ])
+            .expect("kv"),
+        ),
+        users_primary,
+        services_primary,
+        replica,
+        rejections: Vec::new(),
+    };
+    let expected_hash = content_hash(&moved_bytes);
+    sifs_two_primary_publish_until(&mut cluster, "post-rename convergence", |cluster| {
+        let services_sees_users_half = matches!(
+            cluster.services_primary.posix_stat("/users/move-me.txt"),
+            Err(DfsPosixError::NotFound { .. })
+        );
+        let replica_current = cluster
+            .replica
+            .posix_stat("/services/moved.txt")
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()));
+        services_sees_users_half && replica_current
+    });
+    assert!(
+        cluster.rejections.is_empty(),
+        "cross-primary rename must keep every replica journal aligned: {:?}",
+        cluster.rejections
+    );
+    let users_entries = cluster
+        .users_primary
+        .posix_list_dir("/users")
+        .expect("users list");
+    assert!(
+        !users_entries
+            .iter()
+            .any(|entry| entry.path == "/users/move-me.txt"),
+        "old path must not be listed after the move: {users_entries:?}"
+    );
+    let services_entries = cluster
+        .replica
+        .posix_list_dir("/services")
+        .expect("replica services list");
+    assert!(
+        services_entries
+            .iter()
+            .any(|entry| entry.path == "/services/moved.txt"),
+        "new path must be listed on replicas: {services_entries:?}"
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-errno");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread = std::thread::spawn(move || {
+        let mut users_primary = users_primary;
+        while !users_stop.load(Ordering::SeqCst) {
+            users_primary
+                .process_incoming()
+                .expect("users primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        users_primary
+    });
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    let bytes = b"survives every failed rename".to_vec();
+    replica
+        .posix_write_file(
+            "/users/keep-me.txt",
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("replica create");
+
+    // Source missing: validated by the source primary.
+    assert!(matches!(
+        replica.posix_rename("/users/absent.txt", "/services/x.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    // Directory source: EXDEV-style rejection.
+    replica.posix_mkdir("/users/srcdir").expect("mkdir srcdir");
+    assert!(matches!(
+        replica.posix_rename("/users/srcdir", "/services/srcdir"),
+        Err(DfsPosixError::InvalidPath { .. })
+    ));
+    // Missing destination parent: validated by the destination primary and
+    // round-tripped through two hops.
+    assert!(matches!(
+        replica.posix_rename("/users/keep-me.txt", "/services/no-parent/keep.txt"),
+        Err(DfsPosixError::MissingParent { .. })
+    ));
+    // Directory destination: also a destination-primary validation.
+    replica
+        .posix_mkdir("/services/destdir")
+        .expect("mkdir destdir");
+    assert!(matches!(
+        replica.posix_rename("/users/keep-me.txt", "/services/destdir"),
+        Err(DfsPosixError::IsDirectory { .. })
+    ));
+
+    // Aborted sagas must release their locks and leave the source intact:
+    // the source is still readable and writable.
+    assert_eq!(
+        replica.posix_read_file("/users/keep-me.txt").expect("read"),
+        bytes
+    );
+    let updated = b"still writable after aborted moves".to_vec();
+    replica
+        .posix_write_file(
+            "/users/keep-me.txt",
+            &updated,
+            DfsWriteOptions::replicated_eventual(vec![replica_node]),
+        )
+        .expect("source writable after aborts");
+    assert_eq!(
+        replica
+            .posix_read_file("/users/keep-me.txt")
+            .expect("read updated"),
+        updated
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let mut users_primary = users_thread.join().expect("users thread");
+    services_thread.join().expect("services thread");
+
+    // No saga may be left running on the coordinator.
+    let report = users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance resume");
+    assert_eq!(
+        report.remaining_running_job_count, 0,
+        "aborted cross-shard renames must not leave running jobs: {report:?}"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-hardlink");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+    let bytes = b"content shared across shard primaries".to_vec();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread = std::thread::spawn(move || {
+        let mut users_primary = users_primary;
+        while !users_stop.load(Ordering::SeqCst) {
+            users_primary
+                .process_incoming()
+                .expect("users primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        users_primary
+    });
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    replica
+        .posix_write_file(
+            "/users/canonical.txt",
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("replica create canonical");
+
+    // Hardlink across primaries: the target's primary coordinates the alias
+    // adoption on the services primary.
+    let link_stat = replica
+        .posix_hardlink("/users/canonical.txt", "/services/alias")
+        .expect("cross-primary hardlink");
+    assert_eq!(link_stat.size_bytes, Some(bytes.len() as u64));
+    assert_eq!(link_stat.link_count, 2);
+    assert_eq!(
+        replica
+            .posix_read_file("/services/alias")
+            .expect("read through alias"),
+        bytes
+    );
+    assert_eq!(
+        replica
+            .posix_stat("/users/canonical.txt")
+            .expect("canonical stat")
+            .link_count,
+        2
+    );
+
+    // Unlinking the canonical promotes the foreign alias through the
+    // cross-shard move saga.
+    let unlinked = replica
+        .posix_unlink("/users/canonical.txt")
+        .expect("unlink canonical with foreign alias");
+    assert_eq!(unlinked.kind, DfsObjectKind::Tombstone);
+    assert!(matches!(
+        replica.posix_stat("/users/canonical.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    stop.store(true, Ordering::SeqCst);
+    let users_primary = users_thread.join().expect("users thread");
+    let services_primary = services_thread.join().expect("services thread");
+
+    // Convergence: the alias becomes the canonical record everywhere with
+    // the content intact and a link count of one.
+    let mut cluster = SifsTwoPrimaryCluster {
+        root,
+        users_primary_node: NodeId::from_legacy_named("node_unused_users2").expect("node"),
+        services_primary_node: NodeId::from_legacy_named("node_unused_services2").expect("node"),
+        replica_node,
+        shared_kv: SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![
+                NodeId::from_legacy_named("node_unused_kv2").expect("node"),
+            ])
+            .expect("kv"),
+        ),
+        users_primary,
+        services_primary,
+        replica,
+        rejections: Vec::new(),
+    };
+    let expected_hash = content_hash(&bytes);
+    sifs_two_primary_publish_until(&mut cluster, "post-promotion convergence", |cluster| {
+        let replica_alias = cluster
+            .replica
+            .posix_stat("/services/alias")
+            .is_ok_and(|stat| {
+                stat.content_hash.as_deref() == Some(expected_hash.as_str())
+                    && stat.kind == DfsObjectKind::File
+                    && stat.link_count == 1
+            });
+        let canonical_gone = matches!(
+            cluster.replica.posix_stat("/users/canonical.txt"),
+            Err(DfsPosixError::NotFound { .. })
+        );
+        replica_alias && canonical_gone
+    });
+    assert_eq!(
+        cluster
+            .replica
+            .posix_read_file("/services/alias")
+            .expect("read promoted alias"),
+        bytes
+    );
+    assert!(
+        cluster.rejections.is_empty(),
+        "cross-primary hardlink and promotion must keep journals aligned: {:?}",
+        cluster.rejections
+    );
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
+    let mut cluster = sifs_two_primary_cluster("sifs-xshard-recovery");
+    let ghost = NodeId::from_legacy_named("node_sifs_xshard_recovery_ghost").expect("ghost node");
+
+    // Create the source file directly on the users primary (local commit).
+    let bytes = b"survives a destination outage".to_vec();
+    cluster
+        .users_primary
+        .posix_write_file(
+            "/users/stuck.txt",
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+            },
+        )
+        .expect("primary local create");
+
+    // Point the services shard at an unreachable primary: the adoption
+    // cannot be sent, so the saga parks as a running recoverable job.
+    let to_ghost = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &ghost,
+        3,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &to_ghost {
+            control.put_metadata_shard(shard).expect("ghost shard");
+        }
+    });
+    let error = cluster
+        .users_primary
+        .posix_rename("/users/stuck.txt", "/services/stuck-moved.txt")
+        .expect_err("rename to unreachable destination primary must not block forever");
+    assert!(
+        matches!(error, DfsPosixError::Dfs(DfsError::Network { .. })),
+        "expected a transport error, got {error:?}"
+    );
+
+    // The in-flight lock protects the half-moved object from concurrent
+    // mutation while the saga awaits recovery.
+    let write_error = cluster
+        .users_primary
+        .posix_write_file(
+            "/users/stuck.txt",
+            b"concurrent write",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+            },
+        )
+        .expect_err("writes to an in-flight cross-shard path must be rejected");
+    assert!(
+        write_error
+            .to_string()
+            .contains("moving between metadata shards"),
+        "unexpected lock error: {write_error}"
+    );
+    let chmod_error = cluster
+        .users_primary
+        .posix_set_mode("/users/stuck.txt", 0o600)
+        .expect_err("namespace mutations on an in-flight path must be rejected");
+    assert!(
+        chmod_error
+            .to_string()
+            .contains("moving between metadata shards"),
+        "unexpected namespace lock error: {chmod_error}"
+    );
+
+    // Heal the topology: transfer the services shard to its real primary and
+    // resume the parked saga through the maintenance path.
+    let healed = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &cluster.services_primary_node,
+        4,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &healed {
+            control.put_metadata_shard(shard).expect("healed shard");
+        }
+    });
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_pump").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+    let report = cluster
+        .users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance resume");
+    assert_eq!(
+        (report.resumed_job_count, report.completed_job_count),
+        (1, 1),
+        "the parked cross-shard rename must resume and complete: {report:?}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    cluster.services_primary = services_thread.join().expect("services thread");
+
+    // The move completed: old path gone, new path adopted, lock released.
+    assert!(matches!(
+        cluster.users_primary.posix_stat("/users/stuck.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster
+            .users_primary
+            .posix_stat("/services/stuck-moved.txt")
+            .expect("moved stat")
+            .content_hash
+            .as_deref(),
+        Some(content_hash(&bytes).as_str())
+    );
+    cluster
+        .users_primary
+        .posix_write_file(
+            "/users/stuck.txt",
+            b"fresh file at the freed path",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+            },
+        )
+        .expect("the freed source path accepts new files after recovery");
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}

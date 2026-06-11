@@ -672,6 +672,8 @@ pub struct DfsNamespaceJobRecord {
 pub enum DfsNamespaceJobKind {
     ClearDirectoryRecursive,
     RenameDirectory,
+    RenameObjectAcrossShardPrimaries,
+    HardlinkAcrossShardPrimaries,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -707,6 +709,31 @@ pub enum DfsNamespaceJobFrame {
         source_object_id: DfsObjectId,
         source_path: String,
         target_path: String,
+    },
+    /// Cross-shard-primary move: ask the destination-shard primary to adopt
+    /// the moved object record at its new path.
+    CrossShardAdopt {
+        moved_object: DfsObjectMetadata,
+        old_path: String,
+        destination_primary_node_id: NodeId,
+    },
+    /// Cross-shard-primary move: locally tombstone the old path, evict the
+    /// moved record from the source shard, and touch the source parent.
+    CrossShardComplete {
+        moved_object: DfsObjectMetadata,
+        old_path: String,
+    },
+    /// Cross-shard-primary hardlink: ask the link-path shard primary to adopt
+    /// the alias record.
+    CrossShardHardlinkAdopt {
+        alias: DfsObjectMetadata,
+        target_object_id: DfsObjectId,
+        destination_primary_node_id: NodeId,
+    },
+    /// Cross-shard-primary hardlink: locally record the target's link-count
+    /// change (ctime bump).
+    CrossShardHardlinkComplete {
+        target_object_id: DfsObjectId,
     },
 }
 
@@ -1770,6 +1797,18 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
     ) -> Result<DfsTombstoneCompactionReport> {
         let _ = options;
         Ok(DfsTombstoneCompactionReport::default())
+    }
+    /// Records that an object moved to a metadata shard owned by another
+    /// node: journals a same-object-id tombstone in the shard that held the
+    /// record (so that shard's replicas observe the departure) and repoints
+    /// the local object→shard index at the destination shard. Single-shard
+    /// backends never split authority, so the default is a no-op.
+    fn evict_object_record_for_foreign_shard_move(
+        &mut self,
+        moved_object: &DfsObjectMetadata,
+    ) -> Result<()> {
+        let _ = moved_object;
+        Ok(())
     }
     fn put_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {
         let _ = job;
@@ -4430,6 +4469,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
                 transaction.transaction_id
             ))
         })
+    }
+
+    fn evict_object_record_for_foreign_shard_move(
+        &mut self,
+        moved_object: &DfsObjectMetadata,
+    ) -> Result<()> {
+        let target_shard_id =
+            self.select_shard_id_for_path(&moved_object.file_system_id, &moved_object.path)?;
+        if let Some(source_shard_id) = self.shard_id_for_object(&moved_object.object_id)?
+            && source_shard_id != target_shard_id
+        {
+            self.put_cross_shard_tombstone(moved_object, &source_shard_id, &target_shard_id)?;
+        }
+        self.write_object_shard_index(moved_object, &target_shard_id)?;
+        Ok(())
     }
 
     fn compact_tombstones(
