@@ -353,6 +353,16 @@ impl DistributedEventualCoordinator {
         })
     }
 
+    /// Whether any write intent for the object is still awaiting receipts.
+    /// Cross-shard moves fence on this: a half-finished write must settle
+    /// before its object may change shard authority.
+    pub fn has_open_intent_for_object(&self, object_id: &DfsObjectId) -> bool {
+        self.intents.values().any(|intent| {
+            intent.object_id == *object_id
+                && matches!(intent.state, DfsWriteIntentState::AwaitingReceipts)
+        })
+    }
+
     pub fn restore_intent(
         &mut self,
         intent: DistributedWriteIntent,

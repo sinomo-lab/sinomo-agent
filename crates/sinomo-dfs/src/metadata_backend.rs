@@ -1913,6 +1913,16 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
             .unwrap_or(0))
     }
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot>;
+    /// Snapshot of one shard's tables, for replica snapshot repair. Backends
+    /// that cannot scope an export to a single shard return `None` and the
+    /// repair is skipped.
+    fn export_shard_table_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataTableSnapshot>> {
+        let _ = shard_id;
+        Ok(None)
+    }
     fn journal_since_limited(
         &self,
         after_sequence: u64,
@@ -2864,12 +2874,24 @@ impl LocalShardedMetadataBackend {
                 return Ok(Some(index.shard_id));
             }
         }
+        // Without an index record (replicas never write one), the same object
+        // id can appear in several shards after a cross-shard move: the live
+        // record in the destination shard and the eviction tombstone left in
+        // the source shard. The live record must win regardless of shard
+        // iteration order; tombstone-only matches are returned as a fallback
+        // so deleted objects still resolve.
+        let mut tombstone_shard = None;
         for (shard_id, backend) in &self.shards {
-            if backend.get_object(object_id)?.is_some() {
-                return Ok(Some(shard_id.clone()));
+            if let Some(object) = backend.get_object(object_id)? {
+                if object.kind != DfsObjectKind::Tombstone {
+                    return Ok(Some(shard_id.clone()));
+                }
+                if tombstone_shard.is_none() {
+                    tombstone_shard = Some(shard_id.clone());
+                }
             }
         }
-        Ok(None)
+        Ok(tombstone_shard)
     }
 
     fn object_is_visible_from_shard(
@@ -4802,6 +4824,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
             max_entries,
             max_encoded_bytes,
         )
+    }
+
+    fn export_shard_table_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataTableSnapshot>> {
+        Ok(Some(LocalSobjMetadataBackend::export_table_snapshot(
+            self.shard_backend(shard_id)?,
+        )))
     }
 
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
@@ -7696,6 +7727,16 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
 
     fn export_table_snapshot(&self) -> Result<DfsMetadataTableSnapshot> {
         Ok(LocalSobjMetadataBackend::export_table_snapshot(self))
+    }
+
+    fn export_shard_table_snapshot(
+        &self,
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<Option<DfsMetadataTableSnapshot>> {
+        if shard_id == &self.shard_id {
+            return Ok(Some(LocalSobjMetadataBackend::export_table_snapshot(self)));
+        }
+        Ok(None)
     }
 
     fn metadata_replication_cursor(

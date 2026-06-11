@@ -134,8 +134,11 @@ pub struct DfsDistributedWriteResponse {
     pub request_id: String,
     pub object_id: DfsObjectId,
     pub result: DfsDistributedWriteResult,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metadata_journal_batch: Option<DfsMetadataJournalBatch>,
+    /// Journal catch-up batches (oldest first) from the requester's reported
+    /// cursor through the committed write, so the requester reads its own
+    /// write. Bounded by the primary's per-response batch cap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_journal_batches: Vec<DfsMetadataJournalBatch>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -221,9 +224,12 @@ pub enum DfsNamespaceOperation {
     /// the destination and install the moved object record at its new path,
     /// together with its version, receipt, intent, and conflict history so
     /// the destination shard owns the complete record set (mirroring
-    /// same-node shard migration).
+    /// same-node shard migration). `source_path` is the record's previous
+    /// path; the receiver verifies the sender is that path's shard primary
+    /// before accepting the adoption.
     AdoptObjectAtPath {
         object: DfsObjectMetadata,
+        source_path: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         versions: Vec<DfsObjectVersionRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -235,9 +241,12 @@ pub enum DfsNamespaceOperation {
     },
     /// Cross-shard-primary hardlink, sent by the link-target's shard primary
     /// (coordinator) to the link-path's shard primary: atomically validate
-    /// the link path and install the hardlink alias record.
+    /// the link path and install the hardlink alias record. `source_path` is
+    /// the link target's path; the receiver verifies the sender is that
+    /// path's shard primary.
     AdoptHardlinkAlias {
         alias: DfsObjectMetadata,
+        source_path: String,
     },
 }
 
@@ -263,7 +272,7 @@ impl DfsNamespaceOperation {
                 link_path,
             } => vec![existing_path, link_path],
             DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => vec![object.path.as_str()],
-            DfsNamespaceOperation::AdoptHardlinkAlias { alias } => vec![alias.path.as_str()],
+            DfsNamespaceOperation::AdoptHardlinkAlias { alias, .. } => vec![alias.path.as_str()],
         }
     }
 }
@@ -297,15 +306,38 @@ pub enum DfsNamespaceResult {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespacePosixError {
-    NotFound { path: String },
-    AlreadyExists { path: String },
-    NotDirectory { path: String },
-    IsDirectory { path: String },
-    NotSymlink { path: String },
-    MissingParent { path: String },
-    InvalidPath { path: String },
-    DirectoryNotEmpty { path: String },
-    Conflict { path: String, reason: String },
+    NotFound {
+        path: String,
+    },
+    AlreadyExists {
+        path: String,
+    },
+    NotDirectory {
+        path: String,
+    },
+    IsDirectory {
+        path: String,
+    },
+    NotSymlink {
+        path: String,
+    },
+    MissingParent {
+        path: String,
+    },
+    InvalidPath {
+        path: String,
+    },
+    DirectoryNotEmpty {
+        path: String,
+    },
+    Conflict {
+        path: String,
+        reason: String,
+    },
+    /// Retriable: the path is part of an in-flight cross-shard move.
+    Busy {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
