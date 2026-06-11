@@ -433,6 +433,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "config_search".to_string(),
                 input: serde_json::json!({ "query": "enabled" }),
                 r#async: false,
@@ -447,6 +448,7 @@ mod tests {
             0,
             1,
             &AgentToolCall {
+                call_id: None,
                 tool: "config_set".to_string(),
                 input: serde_json::json!({
                     "key": "test.enabled",
@@ -465,6 +467,7 @@ mod tests {
             0,
             2,
             &AgentToolCall {
+                call_id: None,
                 tool: "config_get".to_string(),
                 input: serde_json::json!({ "key": "test.enabled" }),
                 r#async: false,
@@ -492,6 +495,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "config_set".to_string(),
                 input: serde_json::json!({
                     "key": "test.enabled",

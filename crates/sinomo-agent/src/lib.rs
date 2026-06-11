@@ -1264,6 +1264,8 @@ pub enum AgentInteractionState {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentToolCall {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     pub tool: String,
     #[serde(default)]
     pub input: serde_json::Value,

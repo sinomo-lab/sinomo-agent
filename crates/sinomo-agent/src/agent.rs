@@ -623,6 +623,10 @@ pub enum AgentItem {
         step_index: usize,
         call_index: usize,
         call_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        native_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_name: Option<String>,
         status: AgentToolStatus,
         summary: String,
         #[serde(default)]
@@ -1641,6 +1645,7 @@ impl AgentModelEvent {
                 call_index: None,
                 call_id: call_id.clone(),
                 call: AgentToolCall {
+                    call_id: call_id.clone(),
                     tool: name.clone(),
                     input: input.clone(),
                     r#async: false,
@@ -1729,6 +1734,7 @@ impl AgentModelEvent {
                 } => {
                     saw_tool_completed = true;
                     let call = AgentToolCall {
+                        call_id: call_id.clone(),
                         tool: name.clone(),
                         input,
                         r#async: false,
@@ -1885,8 +1891,9 @@ impl AgentModelEvent {
                     events.push(AgentModelEvent::ToolCallCompleted {
                         step_index,
                         call_index: None,
-                        call_id,
+                        call_id: call_id.clone(),
                         call: AgentToolCall {
+                            call_id,
                             tool: name,
                             input,
                             r#async: false,
@@ -4558,13 +4565,15 @@ pub struct AgentModelTurn {
     pub events: Vec<AgentModelEvent>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentTranscriptItem {
     pub step_index: usize,
     pub role: AgentTranscriptRole,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub native_items: Vec<LanguageModelRequestItem>,
 }
 
 impl AgentTranscriptItem {
@@ -4574,6 +4583,7 @@ impl AgentTranscriptItem {
             role: AgentTranscriptRole::User,
             content: content.into(),
             tool_call_id: None,
+            native_items: Vec::new(),
         }
     }
 
@@ -4583,6 +4593,7 @@ impl AgentTranscriptItem {
             role: AgentTranscriptRole::Assistant,
             content: content.into(),
             tool_call_id: None,
+            native_items: Vec::new(),
         }
     }
 
@@ -4592,7 +4603,23 @@ impl AgentTranscriptItem {
             role: AgentTranscriptRole::Tool,
             content: content.into(),
             tool_call_id: Some(tool_call_id),
+            native_items: Vec::new(),
         }
+    }
+
+    pub fn tool_call(step_index: usize, content: impl Into<String>) -> Self {
+        Self {
+            step_index,
+            role: AgentTranscriptRole::ToolCall,
+            content: content.into(),
+            tool_call_id: None,
+            native_items: Vec::new(),
+        }
+    }
+
+    pub fn with_native_items(mut self, native_items: Vec<LanguageModelRequestItem>) -> Self {
+        self.native_items = native_items;
+        self
     }
 }
 
@@ -4601,6 +4628,7 @@ impl AgentTranscriptItem {
 pub enum AgentTranscriptRole {
     User,
     Assistant,
+    ToolCall,
     Tool,
 }
 
@@ -5276,6 +5304,7 @@ impl<'a> AgentToolOrchestrator<'a> {
             );
         }
         let target_call = AgentToolCall {
+            call_id: None,
             tool: target_tool.clone(),
             input: target_input,
             r#async: json_input_bool(call, "async").unwrap_or(false),
@@ -6546,10 +6575,10 @@ impl<M: InteractionModel> Agent<M> {
                 model_events.push(event);
                 break;
             }
-            transcript.push(AgentTranscriptItem::assistant(
-                step_index,
-                response.content.clone(),
-            ));
+            transcript.push(
+                AgentTranscriptItem::assistant(step_index, response.content.clone())
+                    .with_native_items(native_tool_call_items_from_decision(&decision)),
+            );
             for event in &step_model_events {
                 self.trace(
                     &input.session.session_id,
@@ -6685,6 +6714,8 @@ impl<M: InteractionModel> Agent<M> {
                     step_index: outcome.step_index,
                     call_index: outcome.call_index,
                     call_id: outcome.call_id.clone(),
+                    native_call_id: outcome.call.call_id.clone(),
+                    tool_name: Some(outcome.call.tool.clone()),
                     status: outcome.status.clone(),
                     summary: outcome.summary.clone(),
                     output: outcome.output.clone(),
@@ -6725,11 +6756,14 @@ impl<M: InteractionModel> Agent<M> {
                 .first()
                 .map(|result| result.call_id.clone())
                 .unwrap_or_else(TaskId::generate);
-            transcript.push(AgentTranscriptItem::tool(
-                step_index,
-                tool_message_id,
-                render_tool_results(step_index, &step_results)?,
-            ));
+            transcript.push(
+                AgentTranscriptItem::tool(
+                    step_index,
+                    tool_message_id,
+                    render_tool_results(step_index, &step_results)?,
+                )
+                .with_native_items(native_tool_output_items_from_outcomes(&step_results)),
+            );
             let coding_state = coding_state_from_items(&items);
             if !coding_state.is_empty() {
                 let coding_state_item = AgentItem::CodingRunState {
@@ -6901,35 +6935,33 @@ impl<M: InteractionModel> Agent<M> {
         turn_context: &TurnContext,
         step_index: usize,
     ) -> Result<LanguageModelRequest, AgentError> {
+        let turn_context_message = render_turn_context_message(input, turn_context)?;
         let mut messages = vec![LanguageModelMessage {
             role: LanguageModelRole::System,
-            content: turn_context.system_instructions.clone(),
+            content: model_protocol_system_instructions(
+                &turn_context.provider,
+                &turn_context.model,
+                &turn_context.system_instructions,
+            ),
         }];
         messages.push(LanguageModelMessage {
             role: LanguageModelRole::User,
-            content: render_turn_context_message(input, turn_context)?,
+            content: turn_context_message.clone(),
         });
         messages.extend(
             turn_context
                 .transcript_view
                 .iter()
-                .map(|item| LanguageModelMessage {
-                    role: match item.role {
-                        AgentTranscriptRole::Assistant => LanguageModelRole::Assistant,
-                        AgentTranscriptRole::User | AgentTranscriptRole::Tool => {
-                            LanguageModelRole::User
-                        }
-                    },
-                    content: item.content.clone(),
-                }),
+                .filter_map(language_model_message_from_transcript_item),
         );
 
-        let items = messages
-            .iter()
-            .map(|message| {
-                LanguageModelRequestItem::message(message.role.clone(), message.content.clone())
-            })
-            .collect();
+        let mut items = vec![LanguageModelRequestItem::message(
+            LanguageModelRole::User,
+            turn_context_message,
+        )];
+        for item in &turn_context.transcript_view {
+            items.extend(language_model_request_items_from_transcript_item(item));
+        }
         let tools: Vec<LanguageModelToolSpec> = turn_context
             .available_tool_specs
             .iter()
@@ -6989,6 +7021,63 @@ impl<M: InteractionModel> Agent<M> {
             self.tools.generation(),
         )
     }
+}
+
+fn model_protocol_system_instructions(provider: &str, model: &str, base: &str) -> String {
+    if !prefers_openai_responses_native_protocol(provider, model) {
+        return base.to_string();
+    }
+    format!(
+        "{base}\n\nModel protocol hint: native tool calls are available for this provider/model. Prefer the provider-native tool protocol for tool use; use JSON `tool_calls` only as a fallback. After native tool results are returned, continue with the required final response format."
+    )
+}
+
+fn prefers_openai_responses_native_protocol(provider: &str, model: &str) -> bool {
+    let provider = provider.to_ascii_lowercase();
+    let model = model.to_ascii_lowercase();
+    matches!(provider.as_str(), "openai" | "openai-api")
+        && (model.contains("gpt") || model.starts_with('o'))
+}
+
+fn language_model_message_from_transcript_item(
+    item: &AgentTranscriptItem,
+) -> Option<LanguageModelMessage> {
+    let role = match item.role {
+        AgentTranscriptRole::User | AgentTranscriptRole::Tool => LanguageModelRole::User,
+        AgentTranscriptRole::Assistant => LanguageModelRole::Assistant,
+        AgentTranscriptRole::ToolCall => return None,
+    };
+    Some(LanguageModelMessage {
+        role,
+        content: item.content.clone(),
+    })
+}
+
+fn language_model_request_items_from_transcript_item(
+    item: &AgentTranscriptItem,
+) -> Vec<LanguageModelRequestItem> {
+    let mut items = Vec::new();
+    match item.role {
+        AgentTranscriptRole::ToolCall => {}
+        AgentTranscriptRole::Tool if !item.native_items.is_empty() => {}
+        AgentTranscriptRole::User | AgentTranscriptRole::Assistant | AgentTranscriptRole::Tool => {
+            if !item.content.trim().is_empty() {
+                let role = match item.role {
+                    AgentTranscriptRole::Assistant => LanguageModelRole::Assistant,
+                    AgentTranscriptRole::User | AgentTranscriptRole::Tool => {
+                        LanguageModelRole::User
+                    }
+                    AgentTranscriptRole::ToolCall => unreachable!(),
+                };
+                items.push(LanguageModelRequestItem::message(
+                    role,
+                    item.content.clone(),
+                ));
+            }
+        }
+    }
+    items.extend(item.native_items.clone());
+    items
 }
 
 fn language_model_tool_spec_from_agent_tool(
@@ -7237,6 +7326,8 @@ fn project_agent_item_to_transcript_item(
             item_id: _,
             step_index,
             call_id,
+            native_call_id,
+            tool_name,
             status,
             summary,
             output,
@@ -7245,12 +7336,48 @@ fn project_agent_item_to_transcript_item(
         } => Some(
             serde_json::to_string_pretty(&serde_json::json!({
                 "kind": "prior_tool_result",
-                "status": status,
-                "summary": summary,
+                "status": &status,
+                "summary": &summary,
                 "output": model_visible_tool_output(None, &output),
                 "evidence": model_visible_tool_evidence(&evidence),
             }))
-            .map(|content| AgentTranscriptItem::tool(step_index, call_id, content))
+            .map(|content| {
+                let native_items = native_call_id
+                    .zip(tool_name)
+                    .map(|(native_call_id, tool_name)| {
+                        vec![LanguageModelRequestItem::tool_call_output(
+                            native_call_id,
+                            tool_name,
+                            serde_json::json!({
+                                "status": &status,
+                                "summary": &summary,
+                                "output": model_visible_tool_output(None, &output),
+                                "evidence": model_visible_tool_evidence(&evidence),
+                            }),
+                        )]
+                    })
+                    .unwrap_or_default();
+                AgentTranscriptItem::tool(step_index, call_id, content)
+                    .with_native_items(native_items)
+            })
+            .map_err(|source| AgentError::ModelRequest {
+                detail: source.to_string(),
+            }),
+        ),
+        AgentItem::ToolCall {
+            step_index, call, ..
+        } => Some(
+            serde_json::to_string_pretty(&serde_json::json!({
+                "kind": "prior_tool_call",
+                "tool": &call.tool,
+                "input": &call.input,
+                "summary": &call.summary,
+                "call_id": &call.call_id,
+            }))
+            .map(|content| {
+                AgentTranscriptItem::tool_call(step_index, content)
+                    .with_native_items(native_tool_call_item_from_call(&call).into_iter().collect())
+            })
             .map_err(|source| AgentError::ModelRequest {
                 detail: source.to_string(),
             }),
@@ -7330,7 +7457,6 @@ fn project_agent_item_to_transcript_item(
             }),
         ),
         AgentItem::AssistantReasoningSummary { .. }
-        | AgentItem::ToolCall { .. }
         | AgentItem::AsyncTaskUpdate { .. }
         | AgentItem::ContextInjection { .. }
         | AgentItem::ModelUsage { .. } => None,
@@ -7382,12 +7508,13 @@ fn render_tool_results(
 
 fn model_visible_tool_outcome(outcome: &AgentToolOutcome) -> serde_json::Value {
     let mut value = serde_json::json!({
-        "call_id": outcome.call_id,
+        "call_id": &outcome.call_id,
+        "native_call_id": &outcome.call.call_id,
         "step_index": outcome.step_index,
         "call_index": outcome.call_index,
-        "call": outcome.call,
-        "status": outcome.status,
-        "summary": outcome.summary,
+        "call": &outcome.call,
+        "status": &outcome.status,
+        "summary": &outcome.summary,
         "output": model_visible_tool_output(Some(outcome.call.tool.as_str()), &outcome.output),
         "evidence": model_visible_tool_evidence(&outcome.evidence),
     });
@@ -7397,6 +7524,43 @@ fn model_visible_tool_outcome(outcome: &AgentToolOutcome) -> serde_json::Value {
         object.insert("event_id".to_string(), serde_json::json!(event_id));
     }
     value
+}
+
+fn native_tool_call_items_from_decision(
+    decision: &AgentLoopDecision,
+) -> Vec<LanguageModelRequestItem> {
+    decision
+        .tool_calls
+        .iter()
+        .filter_map(native_tool_call_item_from_call)
+        .collect()
+}
+
+fn native_tool_call_item_from_call(call: &AgentToolCall) -> Option<LanguageModelRequestItem> {
+    Some(LanguageModelRequestItem::tool_call(
+        call.call_id.as_ref()?.clone(),
+        call.tool.clone(),
+        call.input.clone(),
+    ))
+}
+
+fn native_tool_output_items_from_outcomes(
+    outcomes: &[AgentToolOutcome],
+) -> Vec<LanguageModelRequestItem> {
+    outcomes
+        .iter()
+        .filter_map(native_tool_output_item_from_outcome)
+        .collect()
+}
+
+fn native_tool_output_item_from_outcome(
+    outcome: &AgentToolOutcome,
+) -> Option<LanguageModelRequestItem> {
+    Some(LanguageModelRequestItem::tool_call_output(
+        outcome.call.call_id.as_ref()?.clone(),
+        outcome.call.tool.clone(),
+        model_visible_tool_outcome(outcome),
+    ))
 }
 
 fn model_visible_tool_output(
@@ -7630,6 +7794,7 @@ fn agent_tool_calls_from_language_model(calls: &[LanguageModelToolCall]) -> Vec<
     calls
         .iter()
         .map(|call| AgentToolCall {
+            call_id: call.call_id.clone(),
             tool: call.name.clone(),
             input: call.input.clone(),
             r#async: false,
@@ -8078,6 +8243,7 @@ mod tests {
 
     struct EventfulModel {
         turns: Mutex<VecDeque<(String, Vec<LanguageModelStreamEvent>)>>,
+        requests: Mutex<Vec<LanguageModelRequest>>,
     }
 
     impl EventfulModel {
@@ -8091,6 +8257,7 @@ mod tests {
                         .map(|(response, events)| (response.into(), events))
                         .collect(),
                 ),
+                requests: Mutex::new(Vec::new()),
             }
         }
     }
@@ -8105,9 +8272,13 @@ mod tests {
 
         fn complete_streaming_events(
             &self,
-            _request: &LanguageModelRequest,
+            request: &LanguageModelRequest,
             on_event: &mut dyn FnMut(LanguageModelStreamEvent),
         ) -> Result<LanguageModelResponse, LanguageModelError> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(request.clone());
             let (response, events) =
                 self.turns
                     .lock()
@@ -8790,6 +8961,31 @@ mod tests {
                     finish_reason: Some(reason),
                     ..
                 } if reason == "tool_calls"
+            )
+        }));
+        let requests = agent.model.requests.lock().expect("requests");
+        let second_items = &requests[1].items;
+        assert!(second_items.iter().any(|item| {
+            matches!(
+                item,
+                LanguageModelRequestItem::ToolCall {
+                    call_id,
+                    name,
+                    input,
+                } if call_id == "call_1" && name == "read_file" && input["path"] == "Cargo.toml"
+            )
+        }));
+        assert!(second_items.iter().any(|item| {
+            matches!(
+                item,
+                LanguageModelRequestItem::ToolCallOutput {
+                    call_id,
+                    name,
+                    output,
+                } if call_id == "call_1"
+                    && name == "read_file"
+                    && output["native_call_id"] == "call_1"
+                    && output["status"] == serde_json::json!(AgentToolStatus::Succeeded)
             )
         }));
     }
@@ -9558,6 +9754,7 @@ mod tests {
         let registry = AgentToolRegistry::descriptor_only(default_agent_tool_descriptors());
         let input = agent_input("read");
         let call = AgentToolCall {
+            call_id: None,
             tool: "read_file".to_string(),
             input: serde_json::json!({"path": "Cargo.toml"}),
             r#async: false,
@@ -9578,6 +9775,7 @@ mod tests {
         let registry = AgentToolRegistry::new();
         let input = agent_input("read");
         let call = AgentToolCall {
+            call_id: None,
             tool: "read_file".to_string(),
             input: serde_json::json!({"path": "Cargo.toml"}),
             r#async: false,
@@ -9696,6 +9894,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "tool_search".to_string(),
                 input: serde_json::json!({ "query": "read" }),
                 r#async: false,
@@ -9727,6 +9926,7 @@ mod tests {
             0,
             1,
             &AgentToolCall {
+                call_id: None,
                 tool: "tool_describe".to_string(),
                 input: serde_json::json!({ "tool": "read_file" }),
                 r#async: false,
@@ -9749,6 +9949,7 @@ mod tests {
             0,
             2,
             &AgentToolCall {
+                call_id: None,
                 tool: "tool_call".to_string(),
                 input: serde_json::json!({
                     "tool": "read_file",
@@ -9840,6 +10041,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "tool_search".to_string(),
                 input: serde_json::json!({ "query": "status" }),
                 r#async: false,
@@ -9868,6 +10070,7 @@ mod tests {
             step_index: 3,
             call_index: 0,
             call: AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": "*** Begin Patch\n*** End Patch" }),
                 r#async: false,
@@ -9947,6 +10150,7 @@ mod tests {
             step_index: 4,
             call_index: 0,
             call: AgentToolCall {
+                call_id: None,
                 tool: "run_command".to_string(),
                 input: serde_json::json!({ "command": "make check" }),
                 r#async: false,
@@ -10476,6 +10680,7 @@ mod tests {
             AgentToolRegistry::local_workspace(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
         let input = agent_input("read");
         let call = AgentToolCall {
+            call_id: None,
             tool: "read_file".to_string(),
             input: serde_json::json!({
                 "path": "Cargo.toml",
@@ -10514,6 +10719,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "list_files".to_string(),
                 input: serde_json::json!({ "path": "." }),
                 r#async: false,
@@ -10549,6 +10755,7 @@ mod tests {
             0,
             1,
             &AgentToolCall {
+                call_id: None,
                 tool: "list_files".to_string(),
                 input: serde_json::json!({
                     "path": ".",
@@ -10588,6 +10795,7 @@ mod tests {
         let registry = AgentToolRegistry::local_workspace(&root);
         let input = agent_input("read range");
         let call = AgentToolCall {
+            call_id: None,
             tool: "read_file".to_string(),
             input: serde_json::json!({
                 "path": "sample.txt",
@@ -10642,6 +10850,7 @@ mod tests {
         config.max_read_bytes = 16;
         let registry = AgentToolRegistry::local_workspace_with_config(config);
         let call = AgentToolCall {
+            call_id: None,
             tool: "read_file".to_string(),
             input: serde_json::json!({
                 "path": "Cargo.toml",
@@ -10687,6 +10896,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "read_file".to_string(),
                 input: serde_json::json!({
                     "path": "large.txt",
@@ -10731,6 +10941,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "search".to_string(),
                 input: serde_json::json!({
                     "query": "needle",
@@ -10771,6 +10982,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "changed_files".to_string(),
                 input: serde_json::json!({}),
                 r#async: false,
@@ -10791,6 +11003,7 @@ mod tests {
             0,
             1,
             &AgentToolCall {
+                call_id: None,
                 tool: "git_diff".to_string(),
                 input: serde_json::json!({ "max_bytes": 4096 }),
                 r#async: false,
@@ -10827,6 +11040,7 @@ mod tests {
             AgentToolRegistry::local_workspace(std::env::current_dir().expect("current dir"));
         let input = agent_input("command");
         let call = AgentToolCall {
+            call_id: None,
             tool: "run_command".to_string(),
             input: serde_json::json!({ "command": "echo hi" }),
             r#async: false,
@@ -10861,6 +11075,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "run_command".to_string(),
                 input: serde_json::json!({
                     "command": "pwd; sleep 1",
@@ -10911,6 +11126,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "run_command".to_string(),
                 input: serde_json::json!({ "command": "false | true" }),
                 r#async: false,
@@ -10958,6 +11174,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "run_command".to_string(),
                 input: serde_json::json!({
                     "command": "printf abcdef; printf uvwxyz >&2; exit 2"
@@ -11051,6 +11268,7 @@ mod tests {
             AgentToolRegistry::local_workspace(std::env::current_dir().expect("current dir"));
         let input = agent_input("patch");
         let call = AgentToolCall {
+            call_id: None,
             tool: "apply_patch".to_string(),
             input: serde_json::json!({ "patch": "--- a/file\n+++ b/file\n" }),
             r#async: false,
@@ -11077,6 +11295,7 @@ mod tests {
         let input = agent_input("patch");
         let patch = "--- a/hello.txt\n+++ b/hello.txt\n@@ -1 +1 @@\n-old\n+new\n";
         let call = AgentToolCall {
+            call_id: None,
             tool: "apply_patch".to_string(),
             input: serde_json::json!({ "patch": patch }),
             r#async: false,
@@ -11141,6 +11360,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11221,6 +11441,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::Value::String(patch.to_string()),
                 r#async: false,
@@ -11256,6 +11477,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11309,6 +11531,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11358,6 +11581,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11396,6 +11620,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({
                     "changes": [{
@@ -11442,6 +11667,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11486,6 +11712,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11522,6 +11749,7 @@ mod tests {
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11557,6 +11785,7 @@ old
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({ "patch": patch }),
                 r#async: false,
@@ -11597,6 +11826,7 @@ old
             0,
             0,
             &AgentToolCall {
+                call_id: None,
                 tool: "apply_patch".to_string(),
                 input: serde_json::json!({
                     "changes": [

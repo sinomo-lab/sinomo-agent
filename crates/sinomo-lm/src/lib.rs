@@ -90,6 +90,12 @@ pub enum LanguageModelRequestItem {
         role: LanguageModelRole,
         content: String,
     },
+    ToolCall {
+        call_id: String,
+        name: String,
+        #[serde(default)]
+        input: serde_json::Value,
+    },
     ToolCallOutput {
         call_id: String,
         name: String,
@@ -107,6 +113,30 @@ impl LanguageModelRequestItem {
         Self::Message {
             role,
             content: content.into(),
+        }
+    }
+
+    pub fn tool_call(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        input: serde_json::Value,
+    ) -> Self {
+        Self::ToolCall {
+            call_id: call_id.into(),
+            name: name.into(),
+            input,
+        }
+    }
+
+    pub fn tool_call_output(
+        call_id: impl Into<String>,
+        name: impl Into<String>,
+        output: serde_json::Value,
+    ) -> Self {
+        Self::ToolCallOutput {
+            call_id: call_id.into(),
+            name: name.into(),
+            output,
         }
     }
 }

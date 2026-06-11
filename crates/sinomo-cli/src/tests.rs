@@ -14502,6 +14502,7 @@ fn main_agent_config_tool_registry_exposes_host_config_catalog() {
         0,
         0,
         &sinomo_agent::AgentToolCall {
+            call_id: None,
             tool: "config_search".to_string(),
             input: serde_json::json!({ "query": "" }),
             r#async: false,

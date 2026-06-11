@@ -3,10 +3,11 @@ use crate::{
     LanguageModelCustomToolFormat, LanguageModelCustomToolSpec, LanguageModelError,
     LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelProviderToolSpec,
-    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat,
-    LanguageModelResponseItem, LanguageModelRole, LanguageModelToolCall, LanguageModelToolChoice,
-    LanguageModelToolSpec, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
-    apply_provider_vendor_options_to_payload, render_plain_prompt, selected_model,
+    LanguageModelRequest, LanguageModelRequestItem, LanguageModelResponse,
+    LanguageModelResponseFormat, LanguageModelResponseItem, LanguageModelRole,
+    LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec, LanguageModelUsage,
+    PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload, render_plain_prompt,
+    selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -232,7 +233,7 @@ fn openai_responses_payload(
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let input = render_openai_input_prompt(request);
+    let input = openai_responses_input(request);
     let mut payload = serde_json::json!({
         "model": model,
         "input": input,
@@ -304,6 +305,119 @@ fn openai_responses_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value
     })
 }
 
+fn openai_responses_input(request: &LanguageModelRequest) -> serde_json::Value {
+    let items = request
+        .items
+        .iter()
+        .filter_map(|item| openai_responses_input_item(item, &request.tools))
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        serde_json::json!(render_openai_input_prompt(request))
+    } else {
+        serde_json::Value::Array(items)
+    }
+}
+
+fn openai_responses_input_item(
+    item: &LanguageModelRequestItem,
+    tools: &[LanguageModelToolSpec],
+) -> Option<serde_json::Value> {
+    match item {
+        LanguageModelRequestItem::Message { role, content } => {
+            if *role == LanguageModelRole::System || content.trim().is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "message",
+                "role": openai_message_role(role),
+                "content": [{
+                    "type": match role {
+                        LanguageModelRole::Assistant => "output_text",
+                        LanguageModelRole::System | LanguageModelRole::User => "input_text",
+                    },
+                    "text": content,
+                }],
+            }))
+        }
+        LanguageModelRequestItem::ToolCall {
+            call_id,
+            name,
+            input,
+        } => {
+            if openai_custom_tool_spec_by_name(name, tools).is_some() {
+                Some(serde_json::json!({
+                    "type": "custom_tool_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "input": openai_tool_input_text(input),
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "type": "function_call",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": openai_tool_input_text(input),
+                }))
+            }
+        }
+        LanguageModelRequestItem::ToolCallOutput {
+            call_id,
+            name,
+            output,
+        } => {
+            if openai_custom_tool_spec_by_name(name, tools).is_some() {
+                Some(serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "name": name,
+                    "output": openai_tool_output_text(output),
+                }))
+            } else {
+                Some(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": openai_tool_output_text(output),
+                }))
+            }
+        }
+        LanguageModelRequestItem::Context { label, content } => {
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": format!("{label}:\n{content}"),
+                }],
+            }))
+        }
+    }
+}
+
+fn openai_message_role(role: &LanguageModelRole) -> &'static str {
+    match role {
+        LanguageModelRole::System => "system",
+        LanguageModelRole::User => "user",
+        LanguageModelRole::Assistant => "assistant",
+    }
+}
+
+fn openai_tool_input_text(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(value) => value.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+fn openai_tool_output_text(output: &serde_json::Value) -> String {
+    match output {
+        serde_json::Value::String(value) => value.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
 fn openai_responses_tool_choice(
     tool_choice: &LanguageModelToolChoice,
     tools: &[LanguageModelToolSpec],
@@ -325,6 +439,16 @@ fn openai_responses_tool_choice(
 
 fn openai_custom_tool_spec(tool: &LanguageModelToolSpec) -> Option<&LanguageModelCustomToolSpec> {
     provider_tool_spec(tool, OpenAiProvider::PROVIDER_ID).and_then(|spec| spec.custom.as_ref())
+}
+
+fn openai_custom_tool_spec_by_name<'a>(
+    name: &str,
+    tools: &'a [LanguageModelToolSpec],
+) -> Option<&'a LanguageModelCustomToolSpec> {
+    tools
+        .iter()
+        .find(|tool| tool.name == name)
+        .and_then(openai_custom_tool_spec)
 }
 
 fn provider_tool_spec<'a>(
@@ -582,6 +706,104 @@ mod tests {
         assert!(payload["tools"][0].get("parameters").is_none());
         assert_eq!(payload["tool_choice"]["type"], "custom");
         assert_eq!(payload["tool_choice"]["name"], "apply_patch");
+    }
+
+    #[test]
+    fn payload_prefers_typed_responses_input_items() {
+        let mut request = request();
+        request.items = vec![
+            LanguageModelRequestItem::message(LanguageModelRole::User, "Inspect Cargo.toml."),
+            LanguageModelRequestItem::tool_call(
+                "call_read",
+                "read_file",
+                serde_json::json!({ "path": "Cargo.toml" }),
+            ),
+            LanguageModelRequestItem::tool_call_output(
+                "call_read",
+                "read_file",
+                serde_json::json!({ "ok": true, "content": "[package]" }),
+            ),
+        ];
+        request.tools = vec![LanguageModelToolSpec {
+            name: "read_file".to_string(),
+            description: "Read a file.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        }];
+
+        let payload = openai_responses_payload(
+            &request,
+            "gpt-5.2-codex",
+            &LanguageModelProviderOptions::default(),
+        );
+        let input = payload["input"].as_array().expect("typed input array");
+
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_read");
+        assert_eq!(input[1]["name"], "read_file");
+        assert_eq!(input[1]["arguments"], r#"{"path":"Cargo.toml"}"#);
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_read");
+        assert_eq!(input[2]["output"], r#"{"content":"[package]","ok":true}"#);
+    }
+
+    #[test]
+    fn payload_renders_custom_tool_transcript_items() {
+        let mut request = request();
+        request.items = vec![
+            LanguageModelRequestItem::tool_call(
+                "call_patch",
+                "apply_patch",
+                serde_json::json!("*** Begin Patch\n*** End Patch\n"),
+            ),
+            LanguageModelRequestItem::tool_call_output(
+                "call_patch",
+                "apply_patch",
+                serde_json::json!("patch applied"),
+            ),
+        ];
+        request.tools = vec![LanguageModelToolSpec {
+            name: "apply_patch".to_string(),
+            description: "Apply a patch.".to_string(),
+            input_schema: serde_json::Value::Null,
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: vec![LanguageModelProviderToolSpec {
+                provider: OpenAiProvider::PROVIDER_ID.to_string(),
+                custom: Some(LanguageModelCustomToolSpec {
+                    format: LanguageModelCustomToolFormat::Grammar {
+                        syntax: "lark".to_string(),
+                        definition: "start: /.+/".to_string(),
+                    },
+                    raw_input_argument: Some("patch".to_string()),
+                }),
+            }],
+        }];
+
+        let payload = openai_responses_payload(
+            &request,
+            "gpt-5.2-codex",
+            &LanguageModelProviderOptions::default(),
+        );
+        let input = payload["input"].as_array().expect("typed input array");
+
+        assert_eq!(input[0]["type"], "custom_tool_call");
+        assert_eq!(input[0]["call_id"], "call_patch");
+        assert_eq!(input[0]["name"], "apply_patch");
+        assert_eq!(input[0]["input"], "*** Begin Patch\n*** End Patch\n");
+        assert_eq!(input[1]["type"], "custom_tool_call_output");
+        assert_eq!(input[1]["call_id"], "call_patch");
+        assert_eq!(input[1]["name"], "apply_patch");
+        assert_eq!(input[1]["output"], "patch applied");
     }
 
     #[test]
