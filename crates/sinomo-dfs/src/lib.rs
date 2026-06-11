@@ -8999,6 +8999,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         job.kind,
                         DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
                             | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
                     )
                 {
                     locks.push((job.file_system_id.clone(), job.root_path.clone()));
@@ -13477,14 +13478,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     /// Marks a path as participating in an in-flight cross-shard move so
-    /// concurrent mutations cannot fork the object between shards.
+    /// concurrent mutations cannot fork the object between shards. Directory
+    /// moves lock their whole subtree: the check matches descendants and
+    /// ancestors of the locked path, not just the path itself.
     pub(crate) fn lock_cross_shard_namespace_path(
         &mut self,
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) {
+        let Some(normalized) = crate::posix::normalized_posix_path_key(path) else {
+            return;
+        };
         self.cross_shard_namespace_locks
-            .insert((file_system_id.clone(), metadata_path(path)));
+            .insert((file_system_id.clone(), normalized));
     }
 
     pub(crate) fn unlock_cross_shard_namespace_path(
@@ -13492,8 +13498,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) {
+        let Some(normalized) = crate::posix::normalized_posix_path_key(path) else {
+            return;
+        };
         self.cross_shard_namespace_locks
-            .remove(&(file_system_id.clone(), metadata_path(path)));
+            .remove(&(file_system_id.clone(), normalized));
     }
 
     pub(crate) fn ensure_path_not_in_cross_shard_flight(
@@ -13501,10 +13510,26 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         path: &str,
     ) -> Result<(), DfsError> {
-        if self
-            .cross_shard_namespace_locks
-            .contains(&(file_system_id.clone(), metadata_path(path)))
-        {
+        if self.cross_shard_namespace_locks.is_empty() {
+            return Ok(());
+        }
+        let Some(normalized) = crate::posix::normalized_posix_path_key(path) else {
+            return Ok(());
+        };
+        let blocked =
+            self.cross_shard_namespace_locks
+                .iter()
+                .any(|(locked_file_system_id, locked_path)| {
+                    locked_file_system_id == file_system_id
+                        && (crate::posix::posix_path_is_at_or_under_prefix(
+                            &normalized,
+                            locked_path,
+                        ) || crate::posix::posix_path_is_at_or_under_prefix(
+                            locked_path,
+                            &normalized,
+                        ))
+                });
+        if blocked {
             return Err(DfsError::Distributed {
                 message: format!(
                     "path {path} is moving between metadata shards; retry the operation"

@@ -18591,10 +18591,15 @@ fn sifs_cluster_posix_rename_across_shard_primaries_rejects_invalid_destinations
         replica.posix_rename("/users/absent.txt", "/services/x.txt"),
         Err(DfsPosixError::NotFound { .. })
     ));
-    // Directory source: EXDEV-style rejection.
+    // Directory sources move through the cross-shard subtree saga; renaming
+    // a directory into its own subtree stays rejected.
     replica.posix_mkdir("/users/srcdir").expect("mkdir srcdir");
+    let dir_stat = replica
+        .posix_rename("/users/srcdir", "/services/srcdir")
+        .expect("cross-primary directory rename");
+    assert_eq!(dir_stat.kind, DfsObjectKind::Directory);
     assert!(matches!(
-        replica.posix_rename("/users/srcdir", "/services/srcdir"),
+        replica.posix_rename("/services/srcdir", "/services/srcdir/inner"),
         Err(DfsPosixError::InvalidPath { .. })
     ));
     // Missing destination parent: validated by the destination primary and
@@ -18940,6 +18945,328 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
             },
         )
         .expect("the freed source path accepts new files after recovery");
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_directory_rename_across_shard_primaries_moves_subtree() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-dir-rename");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+    let bytes_a = b"alpha child crossing shard authorities".to_vec();
+    let bytes_b = b"nested child content".to_vec();
+    let bytes_a2 = b"rewritten under the new shard authority".to_vec();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread = std::thread::spawn(move || {
+        let mut users_primary = users_primary;
+        while !users_stop.load(Ordering::SeqCst) {
+            users_primary
+                .process_incoming()
+                .expect("users primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        users_primary
+    });
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    // Build a small subtree under /users from the replica.
+    replica.posix_mkdir("/users/proj").expect("mkdir proj");
+    replica
+        .posix_write_file(
+            "/users/proj/a.txt",
+            &bytes_a,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("create a.txt");
+    replica.posix_mkdir("/users/proj/sub").expect("mkdir sub");
+    replica
+        .posix_write_file(
+            "/users/proj/sub/b.txt",
+            &bytes_b,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("create b.txt");
+
+    // The whole subtree moves between shard primaries.
+    let stat = replica
+        .posix_rename("/users/proj", "/services/proj")
+        .expect("cross-primary directory rename");
+    assert_eq!(stat.kind, DfsObjectKind::Directory);
+
+    // Read-your-write on the requester for the full subtree, both halves.
+    assert!(matches!(
+        replica.posix_stat("/users/proj"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert!(matches!(
+        replica.posix_stat("/users/proj/a.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        replica
+            .posix_read_file("/services/proj/a.txt")
+            .expect("read a"),
+        bytes_a
+    );
+    assert_eq!(
+        replica
+            .posix_read_file("/services/proj/sub/b.txt")
+            .expect("read b"),
+        bytes_b
+    );
+    let names: Vec<String> = replica
+        .posix_list_dir("/services/proj")
+        .expect("list moved dir")
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(names, vec!["a.txt".to_string(), "sub".to_string()]);
+
+    // Write authority moved with every child: a write through the new path
+    // commits at the services primary.
+    replica
+        .posix_write_file(
+            "/services/proj/a.txt",
+            &bytes_a2,
+            DfsWriteOptions::replicated_eventual(vec![replica_node.clone()]),
+        )
+        .expect("write at new authority");
+    assert_eq!(
+        replica
+            .posix_read_file("/services/proj/a.txt")
+            .expect("read rewritten"),
+        bytes_a2
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    let mut users_primary = users_thread.join().expect("users thread");
+    let services_primary = services_thread.join().expect("services thread");
+
+    // No saga may be left running on the coordinator.
+    let report = users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance resume");
+    assert_eq!(
+        (report.remaining_running_job_count, report.failed_job_count),
+        (0, 0),
+        "directory move must leave no running or failed jobs: {report:?}"
+    );
+
+    // Convergence: both primaries publish; every node agrees on the moved
+    // subtree with no journal rejections.
+    let mut cluster = SifsTwoPrimaryCluster {
+        root,
+        users_primary_node: NodeId::from_legacy_named("node_unused_users3").expect("node"),
+        services_primary_node: NodeId::from_legacy_named("node_unused_services3").expect("node"),
+        replica_node,
+        shared_kv: SharedDfsControlPlaneKvClient::new(
+            InProcessRaftKvCluster::new(vec![
+                NodeId::from_legacy_named("node_unused_kv3").expect("node"),
+            ])
+            .expect("kv"),
+        ),
+        users_primary,
+        services_primary,
+        replica,
+        rejections: Vec::new(),
+    };
+    let expected_b = content_hash(&bytes_b);
+    sifs_two_primary_publish_until(&mut cluster, "post-dir-move convergence", |cluster| {
+        let services_sees_old_gone = matches!(
+            cluster.services_primary.posix_stat("/users/proj"),
+            Err(DfsPosixError::NotFound { .. })
+        );
+        let users_sees_nested = cluster
+            .users_primary
+            .posix_stat("/services/proj/sub/b.txt")
+            .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_b.as_str()));
+        services_sees_old_gone && users_sees_nested
+    });
+    assert!(
+        cluster.rejections.is_empty(),
+        "cross-primary directory rename must keep journals aligned: {:?}",
+        cluster.rejections
+    );
+    let listing = |service: &NetworkedDfsService<sinomo_network::InProcessTransport>| {
+        service
+            .posix_list_dir("/services/proj")
+            .expect("list")
+            .into_iter()
+            .map(|entry| (entry.name, entry.kind, entry.object_id))
+            .collect::<Vec<_>>()
+    };
+    let users_view = listing(&cluster.users_primary);
+    assert_eq!(users_view, listing(&cluster.services_primary));
+    assert_eq!(users_view, listing(&cluster.replica));
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_directory_rename_across_shard_primaries_recovers_with_subtree_lock() {
+    let mut cluster = sifs_two_primary_cluster("sifs-xshard-dir-recovery");
+    let ghost =
+        NodeId::from_legacy_named("node_sifs_xshard_dir_recovery_ghost").expect("ghost node");
+    let bytes = b"child frozen during the parked subtree move".to_vec();
+    let local_write_options = DfsWriteOptions {
+        policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+        replica_candidates: vec![cluster.users_primary_node.clone()],
+        wait_for_commit: true,
+    };
+
+    cluster
+        .users_primary
+        .posix_mkdir("/users/proj2")
+        .expect("mkdir proj2");
+    cluster
+        .users_primary
+        .posix_write_file("/users/proj2/file.txt", &bytes, local_write_options.clone())
+        .expect("create child");
+
+    // Park the saga: the services shard points at an unreachable primary.
+    let to_ghost = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &ghost,
+        3,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &to_ghost {
+            control.put_metadata_shard(shard).expect("ghost shard");
+        }
+    });
+    let error = cluster
+        .users_primary
+        .posix_rename("/users/proj2", "/services/proj2")
+        .expect_err("directory rename to unreachable primary must park, not block");
+    assert!(
+        matches!(error, DfsPosixError::Dfs(DfsError::Network { .. })),
+        "expected a transport error, got {error:?}"
+    );
+
+    // The subtree is frozen, not just the root: child writes and child
+    // namespace mutations are rejected while the saga awaits recovery.
+    let child_write = cluster
+        .users_primary
+        .posix_write_file(
+            "/users/proj2/file.txt",
+            b"concurrent",
+            local_write_options.clone(),
+        )
+        .expect_err("child writes must be frozen during the subtree move");
+    assert!(
+        child_write
+            .to_string()
+            .contains("moving between metadata shards"),
+        "unexpected child write error: {child_write}"
+    );
+    let child_mkdir = cluster
+        .users_primary
+        .posix_mkdir("/users/proj2/newdir")
+        .expect_err("child namespace mutations must be frozen during the subtree move");
+    assert!(
+        child_mkdir
+            .to_string()
+            .contains("moving between metadata shards"),
+        "unexpected child mkdir error: {child_mkdir}"
+    );
+
+    // Heal the topology and resume through maintenance: the whole subtree
+    // completes its move.
+    let healed = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &cluster.services_primary_node,
+        4,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &healed {
+            control.put_metadata_shard(shard).expect("healed shard");
+        }
+    });
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_pump2").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+    let report = cluster
+        .users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance resume");
+    assert_eq!(
+        (report.resumed_job_count, report.completed_job_count),
+        (1, 1),
+        "the parked directory move must resume and complete: {report:?}"
+    );
+    stop.store(true, Ordering::SeqCst);
+    cluster.services_primary = services_thread.join().expect("services thread");
+
+    // The whole subtree moved and the lock is gone.
+    assert!(matches!(
+        cluster.users_primary.posix_stat("/users/proj2"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster
+            .users_primary
+            .posix_read_file("/services/proj2/file.txt")
+            .expect("read moved child"),
+        bytes
+    );
+    cluster
+        .users_primary
+        .posix_mkdir("/users/proj2")
+        .expect("the freed source path accepts a fresh directory after recovery");
 
     std::fs::remove_dir_all(&cluster.root).ok();
 }
