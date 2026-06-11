@@ -10123,6 +10123,125 @@ mod tests {
     }
 
     #[test]
+    fn module_tool_projection_exposes_native_dylib_declared_tools() {
+        let module_id =
+            sinomo_runtime::module::ModuleId::from_legacy_named("module.dynamic-native")
+                .expect("module id");
+        let state = sinomo_runtime::module::NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: Some(
+                sinomo_runtime::module::ArtifactId::from_legacy_named(
+                    "artifact.dynamic-native.test",
+                )
+                .expect("artifact id"),
+            ),
+            content_hash: "blake3:abc".to_string(),
+            cache_key: "module/dynamic-native".to_string(),
+            library_name: "libdynamic_native_module.so".to_string(),
+            platform_triple: "x86_64-linux-unix".to_string(),
+            native_abi_version: sinomo_runtime::module_api::SINOMO_NATIVE_MODULE_ABI_VERSION,
+            interface_version: "sinomo.dynamic-native.v1".to_string(),
+            activated_at: "2026-06-11T00:00:00Z".to_string(),
+            source: "test".to_string(),
+        };
+        let descriptor = sinomo_runtime::module_api::NativeModuleDescriptor {
+            module_id: module_id.as_str().to_string(),
+            module_version: "0.1.0".to_string(),
+            owner: "dynamic-native".to_string(),
+            native_abi_version: sinomo_runtime::module_api::SINOMO_NATIVE_MODULE_ABI_VERSION,
+            backend: sinomo_runtime::module_api::NativeModuleBackend::NativeDylib,
+            interface_version: "sinomo.dynamic-native.v1".to_string(),
+            platform_triple: "x86_64-linux-unix".to_string(),
+            supported_operations: vec![
+                "dynamic.native.inspect".to_string(),
+                "dynamic.native.apply".to_string(),
+            ],
+            capabilities: vec![
+                "dynamic.native.inspect".to_string(),
+                "dynamic.native.apply".to_string(),
+            ],
+            surfaces: sinomo_runtime::module_api::NativeModuleSurfaces {
+                object_rpc_routes: vec![
+                    sinomo_runtime::module_api::NativeModuleObjectRpcRoute {
+                        route: "/dynamic-native/inspect".to_string(),
+                        category: "dynamic.native".to_string(),
+                        operation: "dynamic.native.inspect".to_string(),
+                        auth: "admin".to_string(),
+                    },
+                    sinomo_runtime::module_api::NativeModuleObjectRpcRoute {
+                        route: "/dynamic-native/apply".to_string(),
+                        category: "dynamic.native".to_string(),
+                        operation: "dynamic.native.apply".to_string(),
+                        auth: "admin".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+        };
+        let registration =
+            sinomo_runtime::module::native_dylib_module_registration_from_state_and_descriptor(
+                &state,
+                &descriptor,
+            )
+            .expect("native dylib registration");
+        let module_id = registration.manifest.module_id.clone();
+        let projection = AgentModuleToolProjection::new()
+            .with_registration(registration)
+            .with_loader_state(sinomo_runtime::core::ModuleLoaderState {
+                module_id,
+                active_artifact_id: TaskId::generate(),
+                previous_artifact_id: None,
+                shadow_artifact_id: None,
+                candidate_artifact_id: None,
+                hot_swap_state: sinomo_runtime::core::HotSwapState::Stable,
+            });
+        let plan = AgentToolPlanner::plan(
+            std::iter::empty::<AgentToolDescriptor>(),
+            &projection,
+            std::iter::empty::<AgentToolSpec>(),
+            std::iter::empty::<AgentToolSpec>(),
+            false,
+            ["object_rpc"],
+            0,
+        );
+
+        let system_info = plan
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.descriptor.spec.name == "module_rpc_dynamic_native_dynamic_native_inspect"
+            })
+            .expect("native dylib inspect tool");
+        let shell_run = plan
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.descriptor.spec.name == "module_rpc_dynamic_native_dynamic_native_apply"
+            })
+            .expect("native dylib apply tool");
+
+        assert_eq!(
+            system_info.source,
+            crate::tools::AgentToolPlanSource::Module
+        );
+        assert!(plan.is_model_visible(&system_info.descriptor.spec.name));
+        assert!(plan.is_model_visible(&shell_run.descriptor.spec.name));
+        assert!(
+            system_info
+                .descriptor
+                .spec
+                .description
+                .contains("/dynamic-native/inspect")
+        );
+        assert!(
+            system_info
+                .descriptor
+                .toolsets
+                .contains(&"dynamic-native".to_string())
+        );
+    }
+
+    #[test]
     fn render_tool_results_keeps_large_evidence_out_of_model_context() {
         let outcome = AgentToolOutcome {
             call_id: TaskId::generate(),

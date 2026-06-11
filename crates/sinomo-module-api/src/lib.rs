@@ -141,6 +141,8 @@ pub type SinomoModuleFreeBufferFn = unsafe extern "C" fn(buffer: SinomoModuleByt
 pub struct NativeModuleDescriptor {
     pub module_id: String,
     pub module_version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
     pub native_abi_version: u32,
     pub backend: NativeModuleBackend,
     pub interface_version: String,
@@ -149,12 +151,65 @@ pub struct NativeModuleDescriptor {
     pub supported_operations: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "NativeModuleSurfaces::is_empty")]
+    pub surfaces: NativeModuleSurfaces,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NativeModuleBackend {
     NativeDylib,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeModuleSurfaces {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_rpc_routes: Vec<NativeModuleObjectRpcRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declarative_resources: Vec<NativeModuleDeclarativeResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_owners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_imports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capability_exports: Vec<String>,
+}
+
+impl NativeModuleSurfaces {
+    pub fn is_empty(&self) -> bool {
+        self.object_rpc_routes.is_empty()
+            && self.declarative_resources.is_empty()
+            && self.storage_owners.is_empty()
+            && self.capability_imports.is_empty()
+            && self.capability_exports.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeModuleObjectRpcRoute {
+    pub route: String,
+    pub category: String,
+    pub operation: String,
+    pub auth: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeModuleDeclarativeResource {
+    pub id: String,
+    pub kind: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_agents: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activation_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

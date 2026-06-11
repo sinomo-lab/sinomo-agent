@@ -133,16 +133,10 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
         "the lightweight WASIX host loader should remain in default builds"
     );
     assert!(
-        !default_members.contains(&"modules/sandbox/wasix".to_string()),
-        "the heavy WASIX native-dylib module must be built explicitly, not by default"
-    );
-    assert!(
-        !default_members.contains(&"modules/benchmark/sinomo-benchmarks".to_string()),
-        "the benchmark native-dylib module must be built explicitly, not by default"
-    );
-    assert!(
-        !default_members.contains(&"modules/dfs/cloud-files".to_string()),
-        "the Cloud Files native-dylib module must be built explicitly, not by default"
+        default_members
+            .iter()
+            .all(|member| !member.starts_with("modules/")),
+        "native-dylib modules under modules/ must be built explicitly, not by default"
     );
     assert!(
         !default_members.contains(&"crates/sinomo-benchmarks".to_string()),

@@ -123,9 +123,10 @@ leak resources, deadlock, or crash the daemon. Therefore this backend must be
 limited to trusted code and gated like other host-process code.
 
 The dynamic boundary should stay small and stable: a versioned C-compatible
-loader ABI, byte buffers, status codes, host callback tables, and SOBJ request
-and response envelopes. Backend-specific protocols ride inside that generic
-envelope as typed payloads.
+loader ABI, byte buffers, status codes, host callback tables, descriptors, and
+SOBJ request and response envelopes. Native descriptors may declare object-RPC
+routes and embedded declarative resources so the host can expose a module at
+runtime without linking module-specific crates into the main binary.
 
 Unloading native dynamic libraries is best effort. The lifecycle transition can
 remove the module from active routing and ask the module to shut down, but the
@@ -446,7 +447,9 @@ The crate boundary follows the trust-ring architecture:
   module telemetry contracts, and serializable module surface declarations. It
   must not own policy decisions, rollout admission, rollout transition state,
   or self-evolution scoring.
-- `sinomo-module-api` owns the stable native dynamic-library ABI surface.
+- `sinomo-module-api` owns the stable native dynamic-library ABI surface,
+  including generic descriptor fields for self-described object-RPC routes and
+  embedded declarative resources.
 - `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
 - `sinomo-registry` owns immutable artifact, capsule, provenance, evidence, and
   signer records.

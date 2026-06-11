@@ -19,6 +19,9 @@ use sinomo_core::{
     RoutingScope, Salience, Source, TrustRing,
 };
 use sinomo_events::{EventId, EventStore, EventStoreError, StoredEvent};
+use sinomo_module_api::{
+    NativeModuleDeclarativeResource, NativeModuleDescriptor, NativeModuleObjectRpcRoute,
+};
 use sinomo_node::{NodeId, NodeIdentity};
 use sinomo_object::{LengthMode, serde_ext};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1163,6 +1166,8 @@ pub struct ModuleDeclarativeResourceExport {
     pub activation_tags: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_capabilities: Vec<CapabilityName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedded_text: Option<String>,
 }
 
 impl ModuleDeclarativeResourceExport {
@@ -1180,6 +1185,7 @@ impl ModuleDeclarativeResourceExport {
             model_families: Vec::new(),
             activation_tags: Vec::new(),
             required_capabilities: Vec::new(),
+            embedded_text: None,
         }
     }
 
@@ -1213,6 +1219,11 @@ impl ModuleDeclarativeResourceExport {
 
     pub fn with_required_capability(mut self, capability: CapabilityName) -> Self {
         self.required_capabilities.push(capability);
+        self
+    }
+
+    pub fn with_embedded_text(mut self, text: impl Into<String>) -> Self {
+        self.embedded_text = Some(text.into());
         self
     }
 
@@ -1252,6 +1263,16 @@ impl ModuleDeclarativeResourceExport {
                     ),
                 });
             }
+        }
+        if self
+            .embedded_text
+            .as_deref()
+            .is_some_and(|text| text.chars().any(|ch| ch == '\0'))
+        {
+            return Err(ModuleSurfaceError::InvalidDeclarativeResource {
+                id: self.id.clone(),
+                detail: "embedded text must not contain NUL bytes".to_string(),
+            });
         }
         Ok(())
     }
@@ -2038,6 +2059,38 @@ pub fn read_native_dylib_module_loader_state(
     read_object(&path).map(Some)
 }
 
+pub fn read_native_dylib_module_loader_states(
+    data_dir_root: &Path,
+) -> Result<Vec<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
+    let dir = native_dylib_module_loader_state_dir(data_dir_root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&dir)
+        .map_err(|source| ModuleLoaderStoreError::Io {
+            path: dir.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|source| ModuleLoaderStoreError::Io {
+                    path: dir.display().to_string(),
+                    detail: source.to_string(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    let mut states = Vec::new();
+    for path in paths {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("sobj") {
+            continue;
+        }
+        states.push(read_object(&path)?);
+    }
+    Ok(states)
+}
+
 pub fn write_native_dylib_module_loader_state(
     data_dir_root: &Path,
     state: &NativeDylibModuleLoaderState,
@@ -2045,6 +2098,236 @@ pub fn write_native_dylib_module_loader_state(
     let path = native_dylib_module_loader_state_path(data_dir_root, &state.module_id);
     write_object(&path, state)?;
     Ok(path)
+}
+
+pub fn native_dylib_module_registration_from_loader_state(
+    data_dir_root: &Path,
+    state: &NativeDylibModuleLoaderState,
+) -> Result<ModuleRegistration, NativeDylibModuleInstallError> {
+    let library_path = native_module_cache_path(
+        data_dir_root,
+        &state.cache_key,
+        &state.content_hash,
+        &state.library_name,
+    );
+    let module = unsafe {
+        NativeModule::load_from_content_addressed_path(&library_path, &state.content_hash)
+    }?;
+    native_dylib_module_registration_from_state_and_descriptor(state, module.descriptor())
+}
+
+pub fn active_native_dylib_module_registrations(
+    data_dir_root: &Path,
+) -> Result<Vec<ModuleRegistration>, NativeDylibModuleInstallError> {
+    let states = read_native_dylib_module_loader_states(data_dir_root)?;
+    states
+        .iter()
+        .map(|state| native_dylib_module_registration_from_loader_state(data_dir_root, state))
+        .collect()
+}
+
+pub fn native_dylib_module_registration_from_state_and_descriptor(
+    state: &NativeDylibModuleLoaderState,
+    descriptor: &NativeModuleDescriptor,
+) -> Result<ModuleRegistration, NativeDylibModuleInstallError> {
+    validate_native_dylib_descriptor_matches_state(state, descriptor)?;
+    let module_id = parse_native_dylib_module_id(&descriptor.module_id)?;
+    let owner = if descriptor.owner.trim().is_empty() {
+        descriptor.module_id.clone()
+    } else {
+        descriptor.owner.clone()
+    };
+    let mut registration = ModuleRegistration {
+        manifest: sinomo_core::ModuleManifest::native_dylib(
+            module_id,
+            descriptor.module_version.clone(),
+            owner,
+            descriptor.interface_version.clone(),
+            TrustRing::R1TrustedRuntime,
+        ),
+        backend: ModuleBackendRegistration::NativeDylib {
+            artifact_id: state
+                .artifact_id
+                .clone()
+                .unwrap_or_else(|| native_dylib_fallback_artifact_id(&descriptor.module_id)),
+            content_hash: state.content_hash.clone(),
+            library_name: state.library_name.clone(),
+            platform_triple: state.platform_triple.clone(),
+            interface_version: state.interface_version.clone(),
+        },
+        surfaces: native_descriptor_surfaces_to_module_surfaces(descriptor)?,
+    };
+    registration.manifest.capabilities = registration.surfaces.capabilities.clone();
+    Ok(registration)
+}
+
+fn native_dylib_fallback_artifact_id(module_id: &str) -> ArtifactId {
+    ArtifactId::from_legacy_named(format!("artifact.{module_id}"))
+        .expect("module id-derived artifact id should be valid")
+}
+
+fn validate_native_dylib_descriptor_matches_state(
+    state: &NativeDylibModuleLoaderState,
+    descriptor: &NativeModuleDescriptor,
+) -> Result<(), NativeDylibModuleInstallError> {
+    let descriptor_module_id = parse_native_dylib_module_id(&descriptor.module_id)?;
+    if descriptor_module_id != state.module_id.clone() {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native dylib descriptor module_id `{}` does not match loader state `{}`",
+                descriptor.module_id, state.module_id
+            ),
+        });
+    }
+    if descriptor.native_abi_version != state.native_abi_version {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native dylib descriptor ABI {} does not match loader state {}",
+                descriptor.native_abi_version, state.native_abi_version
+            ),
+        });
+    }
+    if descriptor.interface_version != state.interface_version {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native dylib descriptor interface `{}` does not match loader state `{}`",
+                descriptor.interface_version, state.interface_version
+            ),
+        });
+    }
+    if descriptor.platform_triple != state.platform_triple {
+        return Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native dylib descriptor platform `{}` does not match loader state `{}`",
+                descriptor.platform_triple, state.platform_triple
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn native_descriptor_surfaces_to_module_surfaces(
+    descriptor: &NativeModuleDescriptor,
+) -> Result<ModuleSurfaces, NativeDylibModuleInstallError> {
+    let mut surfaces = ModuleSurfaces::default();
+    for owner in &descriptor.surfaces.storage_owners {
+        surfaces = surfaces.with_storage_owner(owner.clone());
+    }
+    for route in &descriptor.surfaces.object_rpc_routes {
+        surfaces = surfaces.with_object_rpc_route(native_descriptor_route_to_module_route(route)?);
+    }
+    for resource in &descriptor.surfaces.declarative_resources {
+        surfaces = surfaces
+            .with_declarative_resource(native_descriptor_resource_to_module_resource(resource)?);
+    }
+    let capability_exports = if descriptor.surfaces.capability_exports.is_empty() {
+        &descriptor.capabilities
+    } else {
+        &descriptor.surfaces.capability_exports
+    };
+    surfaces.capabilities = ModuleCapabilities {
+        imports: descriptor
+            .surfaces
+            .capability_imports
+            .iter()
+            .map(|capability| native_descriptor_capability(capability))
+            .collect::<Result<Vec<_>, _>>()?,
+        exports: capability_exports
+            .iter()
+            .map(|capability| native_descriptor_capability(capability))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    surfaces
+        .validate()
+        .map_err(|source| NativeDylibModuleInstallError::Descriptor {
+            detail: source.to_string(),
+        })?;
+    Ok(surfaces)
+}
+
+fn native_descriptor_route_to_module_route(
+    route: &NativeModuleObjectRpcRoute,
+) -> Result<ModuleObjectRpcRoute, NativeDylibModuleInstallError> {
+    Ok(ModuleObjectRpcRoute::new(
+        route.route.clone(),
+        route.category.clone(),
+        route.operation.clone(),
+        native_descriptor_route_auth(&route.auth, &route.route)?,
+    ))
+}
+
+fn native_descriptor_route_auth(
+    auth: &str,
+    route: &str,
+) -> Result<ModuleRouteAuth, NativeDylibModuleInstallError> {
+    match auth {
+        "local-command" => Ok(ModuleRouteAuth::LocalCommand),
+        "local-or-cluster-member" => Ok(ModuleRouteAuth::LocalOrClusterMember),
+        "cluster-member" => Ok(ModuleRouteAuth::ClusterMember),
+        "admin" => Ok(ModuleRouteAuth::Admin),
+        other => Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!("native dylib route `{route}` has unsupported auth `{other}`"),
+        }),
+    }
+}
+
+fn native_descriptor_resource_to_module_resource(
+    resource: &NativeModuleDeclarativeResource,
+) -> Result<ModuleDeclarativeResourceExport, NativeDylibModuleInstallError> {
+    let mut export = ModuleDeclarativeResourceExport::new(
+        resource.id.clone(),
+        native_descriptor_resource_kind(&resource.kind, &resource.id)?,
+        resource.path.clone(),
+    )
+    .with_description(resource.description.clone());
+    for target_agent in &resource.target_agents {
+        export = export.with_target_agent(target_agent.clone());
+    }
+    for model_family in &resource.model_families {
+        export = export.with_model_family(model_family.clone());
+    }
+    for activation_tag in &resource.activation_tags {
+        export = export.with_activation_tag(activation_tag.clone());
+    }
+    for capability in &resource.required_capabilities {
+        export = export.with_required_capability(native_descriptor_capability(capability)?);
+    }
+    if let Some(text) = resource.embedded_text.clone() {
+        export = export.with_embedded_text(text);
+    }
+    Ok(export)
+}
+
+fn native_descriptor_resource_kind(
+    kind: &str,
+    id: &str,
+) -> Result<ModuleDeclarativeResourceKind, NativeDylibModuleInstallError> {
+    match kind {
+        "skill" => Ok(ModuleDeclarativeResourceKind::Skill),
+        "prompt" => Ok(ModuleDeclarativeResourceKind::Prompt),
+        "prompt-pack" => Ok(ModuleDeclarativeResourceKind::PromptPack),
+        "eval-suite" => Ok(ModuleDeclarativeResourceKind::EvalSuite),
+        "example" => Ok(ModuleDeclarativeResourceKind::Example),
+        "policy" => Ok(ModuleDeclarativeResourceKind::Policy),
+        "config" => Ok(ModuleDeclarativeResourceKind::Config),
+        other => Err(NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native dylib declarative resource `{id}` has unsupported kind `{other}`"
+            ),
+        }),
+    }
+}
+
+fn native_descriptor_capability(
+    capability: &str,
+) -> Result<CapabilityName, NativeDylibModuleInstallError> {
+    CapabilityName::new(capability.to_string()).map_err(|source| {
+        NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native dylib descriptor capability `{capability}` is invalid: {source}"
+            ),
+        }
+    })
 }
 
 pub fn remove_native_dylib_module_loader_state(
@@ -2793,7 +3076,9 @@ fn non_empty_native_dylib_value(
     Ok(trimmed)
 }
 
-fn parse_native_dylib_module_id(value: &str) -> Result<ModuleId, NativeDylibModuleInstallError> {
+pub fn parse_native_dylib_module_id(
+    value: &str,
+) -> Result<ModuleId, NativeDylibModuleInstallError> {
     ModuleId::new(value.to_string())
         .or_else(|_| ModuleId::from_legacy_named(value))
         .map_err(|source| NativeDylibModuleInstallError::Descriptor {
@@ -4121,6 +4406,95 @@ mod tests {
                 .object_rpc_route_descriptor("/dfs/missing")
                 .expect("missing route descriptor lookup")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn native_dylib_descriptor_surfaces_convert_to_registration() {
+        let module_id = ModuleId::from_legacy_named("module.dynamic-native").expect("module");
+        let state = NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: "blake3:abc".to_string(),
+            cache_key: "module/dynamic-native".to_string(),
+            library_name: "libdynamic_native_module.so".to_string(),
+            platform_triple: "x86_64-linux-unix".to_string(),
+            native_abi_version: sinomo_module_api::SINOMO_NATIVE_MODULE_ABI_VERSION,
+            interface_version: "sinomo.dynamic-native.v1".to_string(),
+            activated_at: "2026-06-11T00:00:00Z".to_string(),
+            source: "test".to_string(),
+        };
+        let descriptor = NativeModuleDescriptor {
+            module_id: "module.dynamic-native".to_string(),
+            module_version: "0.1.0".to_string(),
+            owner: "dynamic-native".to_string(),
+            native_abi_version: sinomo_module_api::SINOMO_NATIVE_MODULE_ABI_VERSION,
+            backend: sinomo_module_api::NativeModuleBackend::NativeDylib,
+            interface_version: "sinomo.dynamic-native.v1".to_string(),
+            platform_triple: "x86_64-linux-unix".to_string(),
+            supported_operations: vec!["dynamic.native.inspect".to_string()],
+            capabilities: vec!["dynamic.native.inspect".to_string()],
+            surfaces: sinomo_module_api::NativeModuleSurfaces {
+                object_rpc_routes: vec![NativeModuleObjectRpcRoute {
+                    route: "/dynamic-native/inspect".to_string(),
+                    category: "dynamic.native".to_string(),
+                    operation: "dynamic.native.inspect".to_string(),
+                    auth: "admin".to_string(),
+                }],
+                declarative_resources: vec![NativeModuleDeclarativeResource {
+                    id: "skill.dynamic-native".to_string(),
+                    kind: "skill".to_string(),
+                    path: "skills/dynamic-native/SKILL.md".to_string(),
+                    description: "Dynamic native module skill".to_string(),
+                    target_agents: vec!["agent.coding".to_string()],
+                    model_families: vec!["gpt".to_string()],
+                    activation_tags: vec!["dynamic-native".to_string()],
+                    required_capabilities: vec!["dynamic.native.inspect".to_string()],
+                    embedded_text: Some(
+                        "# Dynamic Native\n\nInspect the dynamic module.".to_string(),
+                    ),
+                }],
+                storage_owners: vec!["dynamic-native".to_string()],
+                capability_imports: vec!["filesystem.read".to_string()],
+                capability_exports: vec!["dynamic.native.inspect".to_string()],
+            },
+        };
+
+        let registration =
+            native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
+                .expect("native dylib descriptor registration");
+
+        assert_eq!(registration.module_id(), &module_id);
+        assert_eq!(registration.manifest.owner, "dynamic-native");
+        assert_eq!(registration.manifest.kind, ModuleKind::NativeDylib);
+        assert_eq!(registration.surfaces.object_rpc_routes.len(), 1);
+        assert_eq!(
+            registration.surfaces.object_rpc_routes[0].auth,
+            ModuleRouteAuth::Admin
+        );
+        assert_eq!(registration.surfaces.declarative_resources.len(), 1);
+        assert_eq!(
+            registration.surfaces.declarative_resources[0]
+                .embedded_text
+                .as_deref(),
+            Some("# Dynamic Native\n\nInspect the dynamic module.")
+        );
+        assert_eq!(registration.surfaces.storage_owners, vec!["dynamic-native"]);
+        assert!(
+            registration
+                .surfaces
+                .capabilities
+                .exports
+                .iter()
+                .any(|capability| capability.as_str() == "dynamic.native.inspect")
+        );
+        assert!(
+            registration
+                .surfaces
+                .capabilities
+                .imports
+                .iter()
+                .any(|capability| capability.as_str() == "filesystem.read")
         );
     }
 

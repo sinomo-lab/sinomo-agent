@@ -587,6 +587,8 @@ sinomo-agent/
     sinomo-voice/         # TTS orchestration and duplex audio output control
     sinomo-api/           # Operator/debug/admin HTTP and WebSocket API
     sinomo-app/           # Local deployment binary that wires services together
+  modules/
+    remote/management/    # Self-contained trusted native-dylib shell, filesystem, and system-info module
 ```
 
 The current `crates/sinomo` binary can either be renamed to `sinomo-app` or kept temporarily as the bootstrap binary while the crate layout is introduced.
@@ -736,7 +738,10 @@ Stable native dynamic-library module ABI.
 Responsibilities:
 
 - Define C-compatible byte buffer, status, descriptor, host callback, and
-  invocation entrypoint types.
+  invocation envelope types for trusted native dynamic-library modules.
+- Carry optional self-described module surfaces, including object-RPC routes and
+  embedded declarative resources, so the host can expose a dylib without
+  module-specific code in the main binary.
 - Define generic SOBJ request and response envelopes for native module
   invocation.
 - Stay independent of dynamic loading, sandbox execution, Wasm runtimes, and

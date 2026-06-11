@@ -102,6 +102,7 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
     NativeModuleDescriptor {
         module_id: SINOMO_DFS_CLOUD_FILES_MODULE_ID.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
+        owner: "sinomo-dfs-cloud-files".to_string(),
         native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
         backend: NativeModuleBackend::NativeDylib,
         interface_version: SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string(),
@@ -112,6 +113,7 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
             "dfs.sifs.cloud-files.placeholder-hydrate".to_string(),
             "dfs.sifs.read".to_string(),
         ],
+        surfaces: Default::default(),
     }
 }
 

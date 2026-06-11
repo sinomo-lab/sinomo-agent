@@ -33,6 +33,7 @@ sinomo-events = { path = "../sinomo-events" }
 sinomo-kv = { path = "../sinomo-kv" }
 sinomo-local = { path = "../sinomo-local" }
 sinomo-module = { path = "../sinomo-module" }
+sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-network = { path = "../sinomo-network" }
 sinomo-network-module = { path = "../sinomo-network-module" }
 sinomo-node = { path = "../sinomo-node" }

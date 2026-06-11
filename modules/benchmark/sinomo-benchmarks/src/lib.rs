@@ -130,6 +130,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
     NativeModuleDescriptor {
         module_id: SINOMO_BENCHMARKS_MODULE_ID.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
+        owner: "sinomo-benchmarks".to_string(),
         native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
         backend: NativeModuleBackend::NativeDylib,
         interface_version: SINOMO_BENCHMARKS_INTERFACE_VERSION.to_string(),
@@ -141,6 +142,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             "benchmark.minestudio.plan".to_string(),
             "benchmark.terminalbench.plan".to_string(),
         ],
+        surfaces: Default::default(),
     }
 }
 

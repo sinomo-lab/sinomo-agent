@@ -5842,6 +5842,7 @@ dependencies = [
  "sinomo-kv",
  "sinomo-local",
  "sinomo-module",
+ "sinomo-module-api",
  "sinomo-network",
  "sinomo-network-module",
  "sinomo-node",
@@ -6208,6 +6209,15 @@ dependencies = [
  "sinomo-storage",
  "thiserror 2.0.18",
  "time",
+]
+
+[[package]]
+name = "sinomo-remote-management-module"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_bytes",
+ "sinomo-module-api",
 ]
 
 [[package]]

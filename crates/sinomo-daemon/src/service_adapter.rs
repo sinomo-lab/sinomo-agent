@@ -1213,6 +1213,7 @@ pub(crate) struct DaemonServiceRegistryHost {
 }
 
 impl DaemonServiceRegistryHost {
+    #[cfg_attr(not(test), allow(dead_code))]
     fn from_registry_for_paths(
         registry: ServiceRegistry,
         paths: &DaemonPaths,
@@ -1245,11 +1246,17 @@ impl DaemonServiceRegistryHost {
         register_observe_module: bool,
     ) -> Result<Self, DaemonError> {
         let service_snapshot = service_registry_snapshot(registry);
-        let module_snapshots = build_daemon_internal_module_snapshot_store(register_observe_module)
-            .map_err(|source| DaemonError::Network {
+        let data_dir_root =
+            daemon_data_dir_path(&paths).map_err(|source| DaemonError::Network {
                 address: "daemon module registry".to_string(),
                 detail: source.to_string(),
             })?;
+        let module_snapshots =
+            build_daemon_internal_module_snapshot_store(&data_dir_root, register_observe_module)
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon module registry".to_string(),
+                    detail: source.to_string(),
+                })?;
         let route_registry = daemon_service_object_rpc_route_registry(
             service_snapshot,
             &module_snapshots,
@@ -1293,6 +1300,7 @@ impl DaemonServiceRegistryHost {
         self.router.clone()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn active_route_snapshot(&self) -> Arc<ObjectRpcRouteRegistry> {
         self.router.route_registry_snapshot()
     }
@@ -1450,9 +1458,17 @@ fn module_error_to_network_error(error: impl std::fmt::Display) -> NetworkError 
 struct DaemonInternalModuleSnapshot {
     snapshot: Arc<sinomo_module::ModuleRegistrySnapshot>,
     routes: Vec<ObjectRouteDescriptor>,
+    native_dylib_routes: BTreeMap<String, DaemonNativeDylibRouteTarget>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonNativeDylibRouteTarget {
+    module_id: sinomo_module::ModuleId,
+    operation: String,
 }
 
 fn daemon_internal_module_registry(
+    data_dir_root: &std::path::Path,
     register_observe_module: bool,
 ) -> Result<sinomo_module::ModuleRegistry, NetworkError> {
     let mut builder = sinomo_module::ModuleRegistry::builder()
@@ -1467,13 +1483,22 @@ fn daemon_internal_module_registry(
             .register(sinomo_observe::observe_module_registration())
             .map_err(module_error_to_network_error)?;
     }
+    for registration in sinomo_module::active_native_dylib_module_registrations(data_dir_root)
+        .map_err(module_error_to_network_error)?
+    {
+        builder = builder
+            .register(registration)
+            .map_err(module_error_to_network_error)?;
+    }
     builder.try_build().map_err(module_error_to_network_error)
 }
 
 fn build_daemon_internal_module_snapshot_store(
+    data_dir_root: &std::path::Path,
     register_observe_module: bool,
 ) -> Result<sinomo_module::ModuleRegistrySnapshotStore, NetworkError> {
     sinomo_module::ModuleRegistrySnapshotStore::new(daemon_internal_module_registry(
+        data_dir_root,
         register_observe_module,
     )?)
     .map_err(module_error_to_network_error)
@@ -1491,8 +1516,12 @@ fn daemon_internal_module_snapshot(
 fn daemon_internal_module_snapshot_from_snapshot(
     snapshot: Arc<sinomo_module::ModuleRegistrySnapshot>,
 ) -> Result<DaemonInternalModuleSnapshot, NetworkError> {
-    let routes = daemon_module_snapshot_route_descriptors(&snapshot)?;
-    Ok(DaemonInternalModuleSnapshot { snapshot, routes })
+    let (routes, native_dylib_routes) = daemon_module_snapshot_route_descriptors(&snapshot)?;
+    Ok(DaemonInternalModuleSnapshot {
+        snapshot,
+        routes,
+        native_dylib_routes,
+    })
 }
 
 fn module_object_rpc_route_descriptor_to_daemon_route(
@@ -1520,25 +1549,45 @@ fn module_object_rpc_route_descriptor_to_daemon_route(
 
 fn daemon_module_snapshot_route_descriptors(
     snapshot: &sinomo_module::ModuleRegistrySnapshot,
-) -> Result<Vec<ObjectRouteDescriptor>, NetworkError> {
+) -> Result<
+    (
+        Vec<ObjectRouteDescriptor>,
+        BTreeMap<String, DaemonNativeDylibRouteTarget>,
+    ),
+    NetworkError,
+> {
     let mut seen_routes = BTreeSet::new();
     let mut descriptors = Vec::new();
+    let mut native_dylib_routes = BTreeMap::new();
     for registration in snapshot.registry().registrations() {
         for descriptor in registration
             .surfaces
             .object_rpc_route_descriptors()
             .map_err(module_error_to_network_error)?
         {
+            let operation = descriptor.operation.as_str().to_string();
             let descriptor = module_object_rpc_route_descriptor_to_daemon_route(&descriptor);
             if !seen_routes.insert(descriptor.route.clone()) {
                 return Err(NetworkError::Serialization {
                     detail: format!("duplicate module object rpc route {}", descriptor.route),
                 });
             }
+            if matches!(
+                &registration.backend,
+                sinomo_module::ModuleBackendRegistration::NativeDylib { .. }
+            ) {
+                native_dylib_routes.insert(
+                    descriptor.route.clone(),
+                    DaemonNativeDylibRouteTarget {
+                        module_id: registration.manifest.module_id.clone(),
+                        operation: operation.clone(),
+                    },
+                );
+            }
             descriptors.push(descriptor);
         }
     }
-    Ok(descriptors)
+    Ok((descriptors, native_dylib_routes))
 }
 
 fn service_route_descriptor(route: &ServiceRoute) -> ObjectRouteDescriptor {
@@ -1661,6 +1710,108 @@ async fn dispatch_service_registry_request(
     }
 }
 
+async fn dispatch_native_dylib_module_request(
+    paths: DaemonPaths,
+    target: DaemonNativeDylibRouteTarget,
+    request: ObjectRpcRequest,
+) -> Result<ObjectRpcResponse, NetworkError> {
+    let route_for_error = request.route.clone();
+    tokio::task::spawn_blocking(move || {
+        let data_dir_root = daemon_data_dir_path(&paths).map_err(daemon_error_to_network_error)?;
+        let state =
+            sinomo_module::read_native_dylib_module_loader_state(&data_dir_root, &target.module_id)
+                .map_err(module_error_to_network_error)?
+                .ok_or_else(|| NetworkError::Serialization {
+                    detail: format!(
+                        "native dylib module {} is not active for route {}",
+                        target.module_id, request.route
+                    ),
+                })?;
+        let library_path = sinomo_module::native_module_cache_path(
+            &data_dir_root,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        let module = unsafe {
+            sinomo_module::NativeModule::load_from_content_addressed_path(
+                &library_path,
+                &state.content_hash,
+            )
+        }
+        .map_err(module_error_to_network_error)?;
+        let descriptor = module.descriptor();
+        let descriptor_module_id =
+            sinomo_module::parse_native_dylib_module_id(&descriptor.module_id)
+                .map_err(module_error_to_network_error)?;
+        if descriptor_module_id != target.module_id.clone() {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "native dylib route {} resolved module {}, but descriptor reports {}",
+                    request.route, target.module_id, descriptor.module_id
+                ),
+            });
+        }
+        if !descriptor
+            .supported_operations
+            .iter()
+            .any(|operation| operation == &target.operation)
+        {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "native dylib module {} does not support operation {}",
+                    target.module_id, target.operation
+                ),
+            });
+        }
+        let native_response = module
+            .invoke(&sinomo_module_api::NativeModuleRequest::Invoke(
+                sinomo_module_api::NativeModuleInvocationRequest {
+                    operation: target.operation.clone(),
+                    payload_sobj: request.body,
+                },
+            ))
+            .map_err(module_error_to_network_error)?;
+        match native_response {
+            sinomo_module_api::NativeModuleResponse::Invocation(response) => {
+                if response.operation != target.operation {
+                    return Err(NetworkError::Serialization {
+                        detail: format!(
+                            "native dylib route {} expected operation {}, got {}",
+                            request.route, target.operation, response.operation
+                        ),
+                    });
+                }
+                Ok(ObjectRpcResponse::from_encoded_body(
+                    request.route,
+                    response.payload_sobj,
+                ))
+            }
+            sinomo_module_api::NativeModuleResponse::Error(error) => {
+                Err(NetworkError::Serialization {
+                    detail: format!(
+                        "native dylib module {} returned error {}: {}",
+                        target.module_id, error.code, error.detail
+                    ),
+                })
+            }
+            sinomo_module_api::NativeModuleResponse::Capabilities(_) => {
+                Err(NetworkError::Serialization {
+                    detail: format!(
+                        "native dylib module {} returned capabilities for route invocation",
+                        target.module_id
+                    ),
+                })
+            }
+        }
+    })
+    .await
+    .map_err(|source| NetworkError::Io {
+        operation: format!("dispatch native dylib module route {route_for_error}"),
+        detail: format!("native dylib module route task failed: {source}"),
+    })?
+}
+
 fn insert_daemon_route_descriptor(
     catalog: &mut ServiceCatalog,
     descriptor: ObjectRouteDescriptor,
@@ -1682,12 +1833,27 @@ fn append_daemon_module_snapshot_routes(
 ) -> Result<BTreeSet<String>, NetworkError> {
     let mut installed_routes = BTreeSet::new();
     for descriptor in module_snapshot.routes.iter().cloned() {
-        let Some(service_route) = service_routes.get(&descriptor.route) else {
+        let is_native_dylib_route = module_snapshot
+            .native_dylib_routes
+            .contains_key(&descriptor.route);
+        let service_route = service_routes.get(&descriptor.route);
+        if is_native_dylib_route && service_route.is_some() {
+            return Err(NetworkError::Serialization {
+                detail: format!(
+                    "native dylib module route {} collides with a daemon service route",
+                    descriptor.route
+                ),
+            });
+        }
+        let route = descriptor.route.clone();
+        let descriptor = if let Some(service_route) = service_route {
+            validate_module_service_route_contract(&descriptor, service_route)?;
+            apply_service_route_execution_policy(descriptor, service_route)
+        } else if is_native_dylib_route {
+            apply_native_dylib_route_execution_policy(descriptor)
+        } else {
             continue;
         };
-        validate_module_service_route_contract(&descriptor, service_route)?;
-        let route = descriptor.route.clone();
-        let descriptor = apply_service_route_execution_policy(descriptor, service_route);
         let descriptor = mark_service_snapshot_route(
             descriptor.observable(
                 "module.registry.snapshot_version",
@@ -1699,6 +1865,14 @@ fn append_daemon_module_snapshot_routes(
         installed_routes.insert(route);
     }
     Ok(installed_routes)
+}
+
+fn apply_native_dylib_route_execution_policy(
+    mut descriptor: ObjectRouteDescriptor,
+) -> ObjectRouteDescriptor {
+    descriptor.concurrency_limit = Some(4);
+    descriptor.timeout_ms = Some(310_000);
+    descriptor.observable("daemon.native_dylib_module_route", "true")
 }
 
 const DAEMON_SERVICE_SIGNER_AUTHORITY_METADATA_KEY: &str = "daemon.service.signer.authority";
@@ -1758,6 +1932,7 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
     service_runtime: Option<tokio::runtime::Handle>,
 ) -> Result<Arc<ObjectRpcRouteRegistry>, NetworkError> {
     let service_registry = service_snapshot.registry_arc();
+    let native_dylib_routes = Arc::new(module_snapshot.native_dylib_routes.clone());
     let descriptors = daemon_service_object_rpc_route_descriptors_from_module_snapshot(
         service_snapshot,
         module_snapshot,
@@ -1765,13 +1940,19 @@ fn daemon_service_object_rpc_route_registry_from_module_snapshot(
     let mut builder = ObjectRpcRouteRegistry::builder();
     for descriptor in descriptors {
         let registry = Arc::clone(&service_registry);
+        let native_target = native_dylib_routes.get(&descriptor.route).cloned();
         let handler_paths = paths.clone();
         let handler_runtime = service_runtime.clone();
         builder = builder.try_register_route(descriptor, move |request| {
             let registry = Arc::clone(&registry);
             let paths = handler_paths.clone();
             let runtime = handler_runtime.clone();
+            let native_target = native_target.clone();
             async move {
+                if let Some(native_target) = native_target {
+                    return dispatch_native_dylib_module_request(paths, native_target, request)
+                        .await;
+                }
                 let signer = daemon_service_signer_from_request_metadata(&request)?;
                 let (data_dir, cluster) = tokio::task::spawn_blocking(move || {
                     let data_dir = Arc::new(SinomoDataDir::new(
@@ -2566,6 +2747,96 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn daemon_service_registry_host_installs_active_native_dylib_routes_from_descriptor() {
+        let Ok(library_path) = std::env::var("SINOMO_DAEMON_TEST_NATIVE_DYLIB") else {
+            return;
+        };
+        let library_path = resolve_test_dylib_path(std::path::PathBuf::from(library_path));
+        let module = unsafe { sinomo_module::NativeModule::load_verified(&library_path) }
+            .expect("load test native dylib");
+        let descriptor = module.descriptor().clone();
+        let route = descriptor
+            .surfaces
+            .object_rpc_routes
+            .first()
+            .expect("test native dylib route")
+            .clone();
+        drop(module);
+
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-daemon-active-native-dylib-routes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test data dir");
+        let library_name = library_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("test dylib file name")
+            .to_string();
+        sinomo_module::install_native_dylib_module_from_file(
+            &root,
+            &library_path,
+            sinomo_module::NativeDylibModuleInstallRequest {
+                expected_module_id: None,
+                artifact_id: None,
+                expected_interface_version: None,
+                cache_key: Some(format!("test/{}", descriptor.module_id)),
+                library_name: Some(library_name),
+                source: "test".to_string(),
+            },
+        )
+        .expect("install test native dylib");
+
+        let host = test_service_host(&root, ServiceRegistry::builder().build());
+        let catalog = host.active_route_snapshot().catalog().clone();
+        let route_descriptor = catalog
+            .routes
+            .get(&route.route)
+            .expect("native dylib route descriptor");
+        assert_eq!(route_descriptor.category, route.category);
+        assert_eq!(
+            route_descriptor
+                .observability
+                .get("daemon.native_dylib_module_route")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut router = host.route_policy_layer().layer(host.active_router());
+        let response = runtime
+            .block_on(sinomo_network::call_object_rpc_service_async(
+                &mut router,
+                ObjectRpcRequest::encode_body(&route.route, &route.category, &()).expect("request"),
+            ))
+            .expect("native dylib route response");
+        assert_eq!(response.route, route.route);
+        assert!(!response.body.is_empty());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn resolve_test_dylib_path(path: std::path::PathBuf) -> std::path::PathBuf {
+        if path.is_absolute() {
+            return path;
+        }
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        workspace_root.join(path)
     }
 
     #[test]
