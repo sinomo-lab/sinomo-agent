@@ -1594,6 +1594,7 @@ pub(crate) fn publish_local_members_via_voter_on_runtime(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
+            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -1603,6 +1604,7 @@ pub(crate) fn publish_local_members_via_voter_on_runtime(
 pub(crate) async fn publish_local_members_via_voter_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
+    force_kv_snapshot_sync: bool,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
     let mut host = DaemonClusterControlPlaneTransport {
@@ -1614,6 +1616,7 @@ pub(crate) async fn publish_local_members_via_voter_async(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
+            force_kv_snapshot_sync,
         },
         &mut host,
     )
@@ -1635,6 +1638,7 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
+            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -2215,7 +2219,12 @@ impl ClusterNetworkMaintenance {
                 .map(|_| ())
             }
             ClusterMemberPublishPendingMode::ViaVoter => {
-                publish_local_members_via_voter_async(&pending.paths, &pending.state, runtime).await
+                // Learners force the publish each round so the voter can hand
+                // back a newer KV snapshot (tiny response when already
+                // current); this is the only push-free path by which a
+                // learner's local KV snapshot converges.
+                publish_local_members_via_voter_async(&pending.paths, &pending.state, true, runtime)
+                    .await
             }
         };
         if let Err(error) = result {
@@ -6628,6 +6637,7 @@ mod tests {
             sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
             &ClusterMemberPublishRequest {
                 members: vec![state.members[0].clone()],
+                local_kv_revision: None,
             },
         )
         .expect("member publish rpc request");

@@ -15640,6 +15640,7 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
         &paths,
         ClusterMemberPublishRequest {
             members: vec![published],
+            local_kv_revision: None,
         },
         local.as_str(),
         &mut host,
@@ -15680,6 +15681,7 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
             &paths,
             ClusterMemberPublishRequest {
                 members: vec![async_published],
+                local_kv_revision: None,
             },
             local.as_str(),
             &mut async_host,
@@ -15711,6 +15713,7 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
         &paths,
         ClusterMemberPublishRequest {
             members: vec![state.members[0].clone()],
+            local_kv_revision: None,
         },
         "node_member_publish_request_host_other",
         &mut unauthorized_host,
@@ -15762,6 +15765,7 @@ fn cluster_membership_rpc_dispatch_decodes_and_encodes_member_publish() {
         CLUSTER_MEMBERSHIP_RPC_CATEGORY,
         &ClusterMemberPublishRequest {
             members: vec![published],
+            local_kv_revision: None,
         },
     )
     .expect("member publish rpc");
@@ -15834,6 +15838,7 @@ fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
         &state,
         ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
+            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -15893,6 +15898,7 @@ fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
             &state,
             ClusterLocalMemberPublishOptions {
                 member_publish_timeout: Duration::from_secs(1),
+                force_kv_snapshot_sync: false,
             },
             &mut host,
         ))
@@ -15973,6 +15979,7 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
         &state,
         ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(7),
+            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -16066,6 +16073,7 @@ fn local_member_publish_async_with_host_forwards_when_local_commit_is_unavailabl
             &state,
             ClusterLocalMemberPublishOptions {
                 member_publish_timeout: Duration::from_secs(7),
+                force_kv_snapshot_sync: false,
             },
             &mut host,
         ))
@@ -29698,4 +29706,371 @@ fn write_object_file_cleans_temp_file_after_replace_failure() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-member-publish-stale-snapshot-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_member_publish_stale_snapshot").expect("cluster");
+    let local = NodeId::from_legacy_named("node_member_publish_stale_snapshot").expect("local");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "member publish stale snapshot",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state to kv");
+
+    let mut published = state.members[0].clone();
+    published.endpoints = vec![daemon_lan_endpoint(
+        &local,
+        "10.49.0.7:21353".to_string(),
+        10,
+    )];
+
+    // First publish commits the endpoint records.
+    let mut host = RecordingClusterMemberPublishHost::default();
+    let committed = handle_cluster_member_publish_request_with_host(
+        &paths,
+        ClusterMemberPublishRequest {
+            members: vec![published.clone()],
+            local_kv_revision: None,
+        },
+        local.as_str(),
+        &mut host,
+    )
+    .expect("first member publish");
+    assert!(committed.accepted);
+    assert_eq!(host.commits, 1);
+    let current_revision = read_cluster_kv_current_snapshot(&paths)
+        .expect("snapshot after commit")
+        .revision;
+
+    // Re-publishing identical records is a no-op commit-wise, but the response
+    // must hand the current snapshot back to publishers that are behind (or
+    // report no revision at all) — this is how learner KV snapshots converge.
+    for (publisher_revision, expects_snapshot) in [
+        (Some(current_revision), false),
+        (Some(KvRevision(0)), true),
+        (None, true),
+    ] {
+        let mut repeat_host = RecordingClusterMemberPublishHost::default();
+        let response = handle_cluster_member_publish_request_with_host(
+            &paths,
+            ClusterMemberPublishRequest {
+                members: vec![published.clone()],
+                local_kv_revision: publisher_revision,
+            },
+            local.as_str(),
+            &mut repeat_host,
+        )
+        .expect("repeat member publish");
+        assert!(response.accepted);
+        assert_eq!(response.detail, "member endpoints already current");
+        assert_eq!(repeat_host.commits, 0, "no-op publish must not commit");
+        assert_eq!(
+            response.kv_snapshot.is_some(),
+            expects_snapshot,
+            "publisher revision {publisher_revision:?} should{} receive a snapshot",
+            if expects_snapshot { "" } else { " not" }
+        );
+        if let Some(snapshot) = response.kv_snapshot {
+            assert_eq!(snapshot.revision, current_revision);
+        }
+    }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn local_member_publish_forced_sync_publishes_even_when_records_current() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-local-member-publish-forced-sync-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_local_member_publish_forced_sync").expect("cluster");
+    let local = NodeId::from_legacy_named("node_local_member_publish_forced_sync").expect("local");
+    let voter =
+        NodeId::from_legacy_named("node_local_member_publish_forced_sync_voter").expect("voter");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "local member publish forced sync",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        voter.clone(),
+        "remote voter",
+        "pk-voter",
+        now,
+    );
+    remote.capabilities = sinomo_node::main_daemon_capabilities(&remote.role);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &voter,
+        "10.49.1.7:21353".to_string(),
+        10,
+    )];
+    state.members.push(remote);
+    write_cluster_state(&paths, &state).expect("write state");
+
+    // Seed the local snapshot so the local member records already match —
+    // the historical short-circuit that froze learner snapshots forever.
+    let mut seeded = InProcessKvStore::new();
+    for member in cluster_local_process_members(&state) {
+        let txn = KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                KvOp::put_serde(cluster_member_key(&member.node_id), &member, None)
+                    .expect("member op"),
+            ],
+            failure: Vec::new(),
+        };
+        seeded.txn(txn).expect("seed member");
+    }
+    write_cluster_kv_snapshot(&paths, &seeded.snapshot()).expect("seed snapshot");
+    assert!(
+        cluster_member_publish_matches_kv(&paths, &cluster_local_process_members(&state))
+            .expect("matches kv"),
+        "fixture must reproduce the already-published state"
+    );
+
+    let mut imported_store = seeded;
+    imported_store
+        .put("/kv/forced-sync/imported", b"ok".to_vec(), None)
+        .expect("imported marker");
+
+    // Without the force flag the publish short-circuits: no RPC, no import.
+    let mut idle_host = RecordingClusterLocalMemberPublishHost {
+        has_quorum: false,
+        response: Some(ClusterMemberPublishResponse {
+            accepted: true,
+            detail: "published".to_string(),
+            state: state.clone(),
+            kv_snapshot: Some(imported_store.snapshot()),
+        }),
+        ..Default::default()
+    };
+    publish_local_members_via_voter_with_host(
+        &paths,
+        &state,
+        ClusterLocalMemberPublishOptions {
+            member_publish_timeout: Duration::from_secs(5),
+            force_kv_snapshot_sync: false,
+        },
+        &mut idle_host,
+    )
+    .expect("non-forced publish");
+    assert!(idle_host.sends.is_empty());
+
+    // With the force flag the learner publishes anyway, reports its local
+    // revision, and imports the newer snapshot the voter hands back.
+    let mut forced_host = RecordingClusterLocalMemberPublishHost {
+        has_quorum: false,
+        response: Some(ClusterMemberPublishResponse {
+            accepted: true,
+            detail: "published".to_string(),
+            state: state.clone(),
+            kv_snapshot: Some(imported_store.snapshot()),
+        }),
+        ..Default::default()
+    };
+    publish_local_members_via_voter_with_host(
+        &paths,
+        &state,
+        ClusterLocalMemberPublishOptions {
+            member_publish_timeout: Duration::from_secs(5),
+            force_kv_snapshot_sync: true,
+        },
+        &mut forced_host,
+    )
+    .expect("forced publish");
+    assert_eq!(forced_host.sends.len(), 1);
+    assert!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("snapshot after forced sync")
+            .get("/kv/forced-sync/imported")
+            .is_some(),
+        "forced sync must import the voter's newer snapshot"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[derive(Default)]
+struct RelayOnlySnapshotRefreshHost {
+    relay_peer: Option<ClusterEndpointRecord>,
+    relay_snapshot: Option<KvSnapshot>,
+    direct_fetches: usize,
+    relay_calls: usize,
+}
+
+impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
+    fn known_raft_leader_id(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Result<Option<NodeId>, NetworkError> {
+        Ok(None)
+    }
+
+    fn fetch_cluster_kv_snapshot(
+        &mut self,
+        endpoint: &ClusterEndpointRecord,
+        _timeout: Duration,
+    ) -> Result<KvSnapshot, NetworkError> {
+        self.direct_fetches += 1;
+        Err(NetworkError::Io {
+            operation: "test direct snapshot fetch".to_string(),
+            detail: format!("{} is unreachable in this test", endpoint.address),
+        })
+    }
+
+    fn restore_cluster_raft_from_snapshot_if_newer(
+        &mut self,
+        _paths: &ClusterPaths,
+        _local_node_id: &NodeId,
+        _snapshot: KvSnapshot,
+    ) -> Result<bool, NetworkError> {
+        Ok(false)
+    }
+
+    fn relay_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Vec<ClusterEndpointRecord> {
+        self.relay_peer.iter().cloned().collect()
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.relay_calls += 1;
+        assert_eq!(request.route, sinomo_kv::CLUSTER_KV_SNAPSHOT_ROUTE);
+        let payload = sinomo_kv::cluster_kv_snapshot_response_rpc_payload(
+            self.relay_snapshot.as_ref().expect("relay snapshot"),
+        )?;
+        Ok(ObjectRpcResponse::from_encoded_body(
+            payload.route,
+            payload.body,
+        ))
+    }
+}
+
+#[test]
+fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-refresh-relay-fallback-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_refresh_relay_fallback").expect("cluster");
+    let local = NodeId::from_legacy_named("node_refresh_relay_fallback").expect("local");
+    let voter = NodeId::from_legacy_named("node_refresh_relay_fallback_voter").expect("voter");
+    let bridge = NodeId::from_legacy_named("node_refresh_relay_fallback_bridge").expect("bridge");
+    let mut state = ClusterBootstrapState::initialized_locally(
+        cluster_id.clone(),
+        "refresh relay fallback",
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
+    state.members[0].capabilities = sinomo_node::main_daemon_capabilities(&state.members[0].role);
+    state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
+    let mut remote = ClusterMemberRecord::local_voter(
+        cluster_id,
+        voter.clone(),
+        "remote voter",
+        "pk-voter",
+        now,
+    );
+    remote.capabilities = sinomo_node::main_daemon_capabilities(&remote.role);
+    remote.allowed_capabilities = remote.capabilities.clone();
+    remote.endpoints = vec![daemon_lan_endpoint(
+        &voter,
+        "10.49.2.7:21353".to_string(),
+        10,
+    )];
+    state.members.push(remote);
+    write_cluster_state(&paths, &state).expect("write state");
+    write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot()).expect("empty snapshot");
+
+    let mut relayed_store = InProcessKvStore::new();
+    relayed_store
+        .put("/kv/relay/imported", b"ok".to_vec(), None)
+        .expect("relayed marker");
+    let mut host = RelayOnlySnapshotRefreshHost {
+        relay_peer: Some(daemon_lan_endpoint(
+            &bridge,
+            "10.49.2.8:21353".to_string(),
+            10,
+        )),
+        relay_snapshot: Some(relayed_store.snapshot()),
+        ..Default::default()
+    };
+
+    let store = refresh_current_cluster_kv_store_with_host(
+        &paths,
+        &state,
+        ClusterControlPlaneTimeouts::default_daemon_transport().kv_snapshot_refresh_options(),
+        &mut host,
+    )
+    .expect("refresh with relay fallback");
+
+    assert!(host.direct_fetches > 0, "direct fetch must be attempted");
+    assert_eq!(host.relay_calls, 1, "relay fallback must run exactly once");
+    assert!(store.snapshot().get("/kv/relay/imported").is_some());
+    assert!(
+        read_cluster_kv_current_snapshot(&paths)
+            .expect("imported snapshot")
+            .get("/kv/relay/imported")
+            .is_some(),
+        "relayed snapshot must be written locally"
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }
