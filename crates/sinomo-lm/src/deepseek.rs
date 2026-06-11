@@ -302,7 +302,21 @@ fn deepseek_chat_completion_payload(
     if let Some(parallel_tool_calls) = request.parallel_tool_calls {
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
     }
+    if deepseek_request_uses_tools_or_tool_transcript(request) {
+        payload["thinking"] = serde_json::json!({ "type": "disabled" });
+    }
     payload
+}
+
+fn deepseek_request_uses_tools_or_tool_transcript(request: &LanguageModelRequest) -> bool {
+    !request.tools.is_empty()
+        || request.items.iter().any(|item| {
+            matches!(
+                item,
+                LanguageModelRequestItem::ToolCall { .. }
+                    | LanguageModelRequestItem::ToolCallOutput { .. }
+            )
+        })
 }
 
 fn deepseek_chat_messages(request: &LanguageModelRequest) -> Vec<serde_json::Value> {
@@ -615,6 +629,7 @@ mod tests {
         );
         assert_eq!(payload["tool_choice"]["function"]["name"], "read_file");
         assert_eq!(payload["parallel_tool_calls"], false);
+        assert_eq!(payload["thinking"]["type"], "disabled");
     }
 
     #[test]
@@ -672,12 +687,20 @@ mod tests {
         assert_eq!(arguments["path"], "Cargo.toml");
         assert_eq!(messages[3]["role"], "tool");
         assert_eq!(messages[3]["tool_call_id"], "call_read");
+        assert_eq!(payload["thinking"]["type"], "disabled");
         let output = serde_json::from_str::<serde_json::Value>(
             messages[3]["content"].as_str().expect("tool output string"),
         )
         .expect("json tool output");
         assert_eq!(output["ok"], true);
         assert_eq!(output["content"], "[package]");
+    }
+
+    #[test]
+    fn deepseek_payload_does_not_disable_thinking_without_tools() {
+        let payload = deepseek_chat_completion_payload(&request(), DEEPSEEK_V4_PRO_MODEL);
+
+        assert!(payload.get("thinking").is_none());
     }
 
     #[test]
