@@ -7,7 +7,7 @@
 # the bridge nodes. Every node joins best-effort (a failed/timed-out join is logged, not
 # fatal) and always ends up running its daemon, so route convergence stays observable.
 #
-# Per-node env (set in docker-compose.yml):
+# Per-node env (set in docker-compose.yml / docker/docker-compose.dev.yml):
 #   ROLE                seed | joiner
 #   NODE_NAME           cluster node name
 #   CLUSTER_NAME        cluster name (seed only)
@@ -130,7 +130,9 @@ join_in_background() {
 
 # 1. Managed rollout source repo: symlink to the image's pre-built source tree (/sinomo-src)
 #    so any in-container rollout build reuses its warm target/ (incremental, not cold).
-if [ ! -e "$DATA/source/sinomo" ]; then
+#    The thin dev image (docker/Dockerfile.dev) ships no source/toolchain; rollout
+#    builds are unavailable there and the link is skipped.
+if [ ! -e "$DATA/source/sinomo" ] && [ -d "$SRC" ]; then
   log "linking managed rollout source repo -> $SRC (shared warm build cache)"
   mkdir -p "$DATA/source"
   ln -s "$SRC" "$DATA/source/sinomo"

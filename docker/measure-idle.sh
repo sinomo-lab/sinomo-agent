@@ -4,6 +4,12 @@
 # <10 KB/s disk read, <10 KB/s network during idle.
 #
 #   docker/measure-idle.sh [window_seconds]   (default 60)
+
+# These helpers target the dev cluster compose file regardless of the caller's
+# working directory (the root docker-compose.yml is the production node).
+SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+
 set -uo pipefail
 cd "$(dirname "$0")/.."
 WINDOW="${1:-60}"

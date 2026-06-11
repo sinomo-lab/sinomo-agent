@@ -1,0 +1,30 @@
+# Thin runtime image for the Sinomo DEV cluster (docker/docker-compose.dev.yml).
+#
+# The sinomo binary is NOT built here: the dev compose bind-mounts the
+# host-built `target/debug/sinomo` into every node, so iterating costs one
+# `cargo build -p sinomo` plus a container restart instead of an image build.
+#
+# Consequences vs the full image (docker/Dockerfile):
+# - no Rust toolchain and no /sinomo-src: in-container self-rollout builds
+#   (`rollout apply` building from the managed source repo) are unavailable;
+#   the entrypoint skips the managed-source link when /sinomo-src is absent.
+# - the host binary must be ABI-compatible with this base. debian:trixie ships
+#   glibc 2.41; a binary built on any current mainstream distro (glibc <= 2.41)
+#   runs as is. If your host glibc is newer than the base, bump the base image
+#   rather than rebuilding in Docker.
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        iproute2 \
+        procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Baked-in copy of the entrypoint; the dev compose additionally bind-mounts the
+# working-tree script over it so edits apply on container restart.
+COPY entrypoint.sh /usr/local/bin/sinomo-node-entrypoint
+RUN chmod +x /usr/local/bin/sinomo-node-entrypoint
+
+ENV SINOMO_DATA_DIR=/data
+ENTRYPOINT ["/usr/local/bin/sinomo-node-entrypoint"]

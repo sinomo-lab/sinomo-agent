@@ -1,13 +1,13 @@
 # Single-node Sinomo cluster for DFS and self-evolution smoke testing.
 #
-#   docker compose -f docker-compose.single-node.yml up --build -d sinomo-single
-#   docker compose -f docker-compose.single-node.yml run --rm sinomo-single-smoke
-#   docker compose -f docker-compose.single-node.yml down -v
+#   docker compose -f docker/docker-compose.single-node.yml up --build -d sinomo-single
+#   docker compose -f docker/docker-compose.single-node.yml run --rm sinomo-single-smoke
+#   docker compose -f docker/docker-compose.single-node.yml down -v
 
 x-single-node: &single-node
   image: sinomo-dev-single-node
   build:
-    context: .
+    context: ..
     dockerfile: docker/Dockerfile
     args:
       SINOMO_BENCH_DEPS: "1"
