@@ -18,6 +18,7 @@ pub fn print_usage() {
     println!("  sinomo models");
     println!("  sinomo usage");
     println!("  sinomo providers");
+    println!("  sinomo test");
     println!();
     println!("Global flags:");
     println!(
@@ -295,4 +296,20 @@ pub(super) fn print_providers_help() {
     println!("  deepseek");
     println!("  gemini");
     println!("  nvidia");
+}
+
+pub(super) fn print_test_help() {
+    println!("Tests:");
+    println!("  sinomo test");
+    println!("      Show test commands.");
+    println!("  sinomo test list [--tag <tag>] [--json]");
+    println!("      List registered runtime tests.");
+    println!(
+        "  sinomo test run <test-id> [--provider <provider>] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json]"
+    );
+    println!("      Run one registered runtime test.");
+    println!(
+        "  sinomo test smoke [--provider deepseek|openai] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json]"
+    );
+    println!("      Run the provider native-tool live smoke test.");
 }

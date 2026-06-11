@@ -8,6 +8,7 @@ mod install;
 mod models;
 mod rollout;
 mod support;
+mod test;
 
 pub(crate) use cluster::*;
 pub(crate) use daemon::*;
@@ -17,3 +18,4 @@ pub(crate) use install::*;
 pub(crate) use models::*;
 pub(crate) use rollout::*;
 pub(crate) use support::*;
+pub(crate) use test::*;

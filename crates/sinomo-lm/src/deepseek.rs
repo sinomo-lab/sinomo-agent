@@ -1,10 +1,10 @@
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
-    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
-    LanguageModelResponseFormat, LanguageModelResponseItem, LanguageModelRole,
-    LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec, LanguageModelUsage,
-    PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
+    LanguageModelProviderInfo, LanguageModelRequest, LanguageModelRequestItem,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
+    LanguageModelRole, LanguageModelToolCall, LanguageModelToolChoice, LanguageModelToolSpec,
+    LanguageModelUsage, PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{
@@ -265,20 +265,7 @@ fn deepseek_chat_completion_payload(
     request: &LanguageModelRequest,
     model: &str,
 ) -> serde_json::Value {
-    let mut messages = request
-        .messages
-        .iter()
-        .map(|message| {
-            serde_json::json!({
-                "role": match message.role {
-                    LanguageModelRole::System => "system",
-                    LanguageModelRole::User => "user",
-                    LanguageModelRole::Assistant => "assistant",
-                },
-                "content": message.content,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut messages = deepseek_chat_messages(request);
     if messages.is_empty() {
         messages.push(serde_json::json!({
             "role": "user",
@@ -316,6 +303,153 @@ fn deepseek_chat_completion_payload(
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
     }
     payload
+}
+
+fn deepseek_chat_messages(request: &LanguageModelRequest) -> Vec<serde_json::Value> {
+    let item_messages = deepseek_chat_messages_from_items(&request.items);
+    if !item_messages.is_empty() {
+        let mut messages = request
+            .messages
+            .iter()
+            .filter(|message| message.role == LanguageModelRole::System)
+            .map(deepseek_chat_message)
+            .collect::<Vec<_>>();
+        messages.extend(item_messages);
+        return messages;
+    }
+    request.messages.iter().map(deepseek_chat_message).collect()
+}
+
+fn deepseek_chat_message(message: &LanguageModelMessage) -> serde_json::Value {
+    serde_json::json!({
+        "role": deepseek_chat_role(&message.role),
+        "content": message.content,
+    })
+}
+
+fn deepseek_chat_messages_from_items(items: &[LanguageModelRequestItem]) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    let mut pending_assistant_content: Option<String> = None;
+    let mut pending_assistant_tool_calls = Vec::new();
+
+    for item in items {
+        match item {
+            LanguageModelRequestItem::Message {
+                role: LanguageModelRole::Assistant,
+                content,
+            } => {
+                flush_deepseek_pending_assistant(
+                    &mut messages,
+                    &mut pending_assistant_content,
+                    &mut pending_assistant_tool_calls,
+                );
+                if !content.trim().is_empty() {
+                    pending_assistant_content = Some(content.clone());
+                }
+            }
+            LanguageModelRequestItem::ToolCall {
+                call_id,
+                name,
+                input,
+            } => {
+                pending_assistant_tool_calls.push(serde_json::json!({
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": deepseek_tool_argument_text(input),
+                    },
+                }));
+            }
+            LanguageModelRequestItem::Message { role, content } => {
+                flush_deepseek_pending_assistant(
+                    &mut messages,
+                    &mut pending_assistant_content,
+                    &mut pending_assistant_tool_calls,
+                );
+                if !content.trim().is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": deepseek_chat_role(role),
+                        "content": content,
+                    }));
+                }
+            }
+            LanguageModelRequestItem::ToolCallOutput {
+                call_id, output, ..
+            } => {
+                flush_deepseek_pending_assistant(
+                    &mut messages,
+                    &mut pending_assistant_content,
+                    &mut pending_assistant_tool_calls,
+                );
+                messages.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": deepseek_tool_output_text(output),
+                }));
+            }
+            LanguageModelRequestItem::Context { label, content } => {
+                flush_deepseek_pending_assistant(
+                    &mut messages,
+                    &mut pending_assistant_content,
+                    &mut pending_assistant_tool_calls,
+                );
+                if !content.trim().is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("{label}:\n{content}"),
+                    }));
+                }
+            }
+        }
+    }
+
+    flush_deepseek_pending_assistant(
+        &mut messages,
+        &mut pending_assistant_content,
+        &mut pending_assistant_tool_calls,
+    );
+    messages
+}
+
+fn flush_deepseek_pending_assistant(
+    messages: &mut Vec<serde_json::Value>,
+    pending_content: &mut Option<String>,
+    pending_tool_calls: &mut Vec<serde_json::Value>,
+) {
+    if pending_content.is_none() && pending_tool_calls.is_empty() {
+        return;
+    }
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": pending_content.take(),
+    });
+    if !pending_tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(std::mem::take(pending_tool_calls));
+    }
+    messages.push(message);
+}
+
+fn deepseek_chat_role(role: &LanguageModelRole) -> &'static str {
+    match role {
+        LanguageModelRole::System => "system",
+        LanguageModelRole::User => "user",
+        LanguageModelRole::Assistant => "assistant",
+    }
+}
+
+fn deepseek_tool_argument_text(input: &serde_json::Value) -> String {
+    match input {
+        serde_json::Value::String(value) => value.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+    }
+}
+
+fn deepseek_tool_output_text(output: &serde_json::Value) -> String {
+    match output {
+        serde_json::Value::String(value) => value.clone(),
+        value => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+    }
 }
 
 fn deepseek_chat_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value {
@@ -481,6 +615,69 @@ mod tests {
         );
         assert_eq!(payload["tool_choice"]["function"]["name"], "read_file");
         assert_eq!(payload["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn deepseek_payload_prefers_native_tool_transcript_items() {
+        let mut request = request();
+        request.items = vec![
+            LanguageModelRequestItem::message(LanguageModelRole::User, "Inspect Cargo.toml."),
+            LanguageModelRequestItem::message(LanguageModelRole::Assistant, "I'll read it."),
+            LanguageModelRequestItem::tool_call(
+                "call_read",
+                "read_file",
+                serde_json::json!({ "path": "Cargo.toml" }),
+            ),
+            LanguageModelRequestItem::tool_call_output(
+                "call_read",
+                "read_file",
+                serde_json::json!({ "ok": true, "content": "[package]" }),
+            ),
+        ];
+        request.tools = vec![LanguageModelToolSpec {
+            name: "read_file".to_string(),
+            description: "Read a file.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+            output_schema: serde_json::Value::Null,
+            supports_parallel: false,
+            provider_specs: Vec::new(),
+        }];
+
+        let payload = deepseek_chat_completion_payload(&request, DEEPSEEK_V4_PRO_MODEL);
+        let messages = payload["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "Return JSON only.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Inspect Cargo.toml.");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "I'll read it.");
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_read");
+        assert_eq!(messages[2]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            messages[2]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        let arguments = serde_json::from_str::<serde_json::Value>(
+            messages[2]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .expect("arguments string"),
+        )
+        .expect("json arguments");
+        assert_eq!(arguments["path"], "Cargo.toml");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_read");
+        let output = serde_json::from_str::<serde_json::Value>(
+            messages[3]["content"].as_str().expect("tool output string"),
+        )
+        .expect("json tool output");
+        assert_eq!(output["ok"], true);
+        assert_eq!(output["content"], "[package]");
     }
 
     #[test]

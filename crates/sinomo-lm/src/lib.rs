@@ -10,6 +10,7 @@ mod gemini;
 mod github_copilot;
 mod nvidia;
 mod openai;
+mod test_cases;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
 pub use claude_code::{
@@ -41,6 +42,7 @@ pub use github_copilot::{
 };
 pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_nvidia_model_id};
 pub use openai::{OpenAiConfig, OpenAiProvider};
+pub use test_cases::register_lm_test_cases;
 
 use serde::{Deserialize, Serialize};
 use sinomo_runtime::kv::{KvEntry, KvSnapshot, KvTxn, decode_kv_value};

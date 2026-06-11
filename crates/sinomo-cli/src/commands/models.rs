@@ -903,7 +903,7 @@ pub(crate) fn load_model_config_for_node(
     ))
 }
 
-fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
+pub(crate) fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, CliError> {
     let _ = paths;
     if let Some(status) = default_main_daemon_status()?
         && let Ok(snapshot) =

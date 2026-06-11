@@ -941,6 +941,7 @@ fn join_stdio_capture_reader(
 pub(crate) fn cli_command_requires_cluster_state(command: &CliCommand) -> bool {
     match command {
         CliCommand::Dfs(command) => dfs_command_requires_cluster_state(command),
+        CliCommand::Test(command) => test_command_requires_cluster_state(command),
         CliCommand::Registered(command) => command.policy().requires_cluster_state,
         _ => false,
     }
@@ -952,6 +953,7 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
         | CliCommand::Models(_)
         | CliCommand::Providers(_)
         | CliCommand::Agent(_) => true,
+        CliCommand::Test(command) => !test_command_requires_cluster_state(command),
         CliCommand::Dfs(command) => !dfs_command_requires_cluster_state(command),
         CliCommand::Registered(command) => command.policy().supports_degraded_local_mode,
         _ => false,
@@ -1055,6 +1057,7 @@ pub(crate) enum CliCommand {
     Dfs(DfsCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
+    Test(TestCliCommand),
     Agent(AgentCliCommand),
     Registered(RegisteredCliCommand),
     Usage(UsageOptions),
@@ -1135,6 +1138,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         }
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
+        }
+        Some((command, rest)) if command == "test" => {
+            Ok(CliCommand::Test(parse_test_command(rest)?))
         }
         Some((command, rest)) if command == "agent" => {
             Ok(CliCommand::Agent(parse_agent_command(rest)?))
@@ -1644,6 +1650,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
+        CliCommand::Test(command) => run_test_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
         CliCommand::Registered(command) => {
             let command_name = command.name().to_string();

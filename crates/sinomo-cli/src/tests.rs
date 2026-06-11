@@ -12,8 +12,8 @@ use super::{
     ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
     RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
     RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
-    SelfRolloutPaths, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
-    apply_cluster_raft_role, authenticate_daemon_control_request,
+    SelfRolloutPaths, TestCliCommand, UninstallOptions, advertised_peer_route_targets,
+    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
     cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
     cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
@@ -35,8 +35,8 @@ use super::{
     parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
     parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
-    parse_provider_command, parse_rollout_command, parse_slash_command, parse_uninstall_options,
-    parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
+    parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
+    parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
     rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
@@ -46,9 +46,10 @@ use super::{
     rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
     send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
     sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, tui_default_daemon_status,
-    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
-    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
+    stage_rollout_main_activation, sync_cluster_state_to_kv, test_command_requires_cluster_state,
+    tui_default_daemon_status, uninstall_with_layout, with_cli_force_local_mode,
+    write_daemon_status, write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node,
+    write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -564,6 +565,10 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Models(ModelsCliCommand::List(_))
     ));
     assert!(matches!(
+        parse_cli_command(&["test".to_string(), "list".to_string()]).expect("test list"),
+        CliCommand::Test(TestCliCommand::List(_))
+    ));
+    assert!(matches!(
         parse_cli_command(&["models".to_string()]).expect("models help"),
         CliCommand::Models(ModelsCliCommand::Help)
     ));
@@ -638,6 +643,36 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Agent(AgentCliCommand::Run(_))
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn test_parser_accepts_live_cluster_smoke_options() {
+    let command = parse_test_command(&[
+        "smoke".to_string(),
+        "--provider".to_string(),
+        "deepseek".to_string(),
+        "--account".to_string(),
+        "work".to_string(),
+        "--model".to_string(),
+        "deepseek-v4-pro".to_string(),
+        "--live".to_string(),
+        "--require-cluster".to_string(),
+        "--json".to_string(),
+    ])
+    .expect("test smoke");
+
+    let TestCliCommand::Smoke(options) = command else {
+        panic!("expected smoke command");
+    };
+    assert_eq!(options.provider, "deepseek");
+    assert_eq!(options.account, "work");
+    assert_eq!(options.model.as_deref(), Some("deepseek-v4-pro"));
+    assert!(options.live);
+    assert!(options.require_cluster);
+    assert!(options.json);
+    assert!(test_command_requires_cluster_state(&TestCliCommand::Smoke(
+        options
+    )));
 }
 
 #[test]

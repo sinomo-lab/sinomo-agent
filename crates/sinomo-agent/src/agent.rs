@@ -7024,7 +7024,7 @@ impl<M: InteractionModel> Agent<M> {
 }
 
 fn model_protocol_system_instructions(provider: &str, model: &str, base: &str) -> String {
-    if !prefers_openai_responses_native_protocol(provider, model) {
+    if !prefers_native_tool_protocol(provider, model) {
         return base.to_string();
     }
     format!(
@@ -7032,11 +7032,14 @@ fn model_protocol_system_instructions(provider: &str, model: &str, base: &str) -
     )
 }
 
-fn prefers_openai_responses_native_protocol(provider: &str, model: &str) -> bool {
+fn prefers_native_tool_protocol(provider: &str, model: &str) -> bool {
     let provider = provider.to_ascii_lowercase();
     let model = model.to_ascii_lowercase();
-    matches!(provider.as_str(), "openai" | "openai-api")
-        && (model.contains("gpt") || model.starts_with('o'))
+    match provider.as_str() {
+        "openai" | "openai-api" => model.contains("gpt") || model.starts_with('o'),
+        "deepseek" | "deepseek-api" => model.contains("deepseek"),
+        _ => false,
+    }
 }
 
 fn language_model_message_from_transcript_item(

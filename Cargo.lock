@@ -6254,6 +6254,7 @@ dependencies = [
  "sinomo-service",
  "sinomo-storage",
  "sinomo-supervision",
+ "sinomo-test",
 ]
 
 [[package]]
@@ -6383,6 +6384,16 @@ dependencies = [
  "sinomo-events",
  "sinomo-node",
  "time",
+]
+
+[[package]]
+name = "sinomo-test"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-kv",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

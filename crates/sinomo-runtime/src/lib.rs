@@ -51,6 +51,7 @@ pub mod r1 {
     pub use sinomo_sandbox_wasix_host as sandbox_wasix_host;
     pub use sinomo_service as service;
     pub use sinomo_supervision as supervision;
+    pub use sinomo_test as test;
 
     pub mod storage {
         pub use sinomo_storage::*;
@@ -308,7 +309,7 @@ pub use r1::sandbox_wasix_host;
 pub use r1::{
     cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv, local,
     module, module_api, modules, network, node, observe, policy, registry, rollout, sandbox,
-    sandbox_wasix_api, service, storage, supervision,
+    sandbox_wasix_api, service, storage, supervision, test,
 };
 
 #[cfg(test)]
