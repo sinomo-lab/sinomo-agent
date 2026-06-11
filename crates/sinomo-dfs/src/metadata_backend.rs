@@ -674,6 +674,7 @@ pub enum DfsNamespaceJobKind {
     RenameDirectory,
     RenameObjectAcrossShardPrimaries,
     HardlinkAcrossShardPrimaries,
+    RenameDirectoryAcrossShardPrimaries,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -734,6 +735,28 @@ pub enum DfsNamespaceJobFrame {
     /// change (ctime bump).
     CrossShardHardlinkComplete {
         target_object_id: DfsObjectId,
+    },
+    /// Cross-shard-primary directory rename: move the root directory record
+    /// (destination primary adopts it, source primary tombstones the old
+    /// path and evicts the record).
+    CrossShardDirStart {
+        source_object_id: DfsObjectId,
+        source_root: String,
+        target_root: String,
+    },
+    /// Cross-shard-primary directory rename: page the children of one moved
+    /// directory, adopting each at its target path and evicting the source
+    /// record; subdirectories push their own scan frames (depth first).
+    CrossShardDirScan {
+        source_path: String,
+        target_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<DfsDirectoryPageCursor>,
+    },
+    /// Cross-shard-primary directory rename: record the source parent's
+    /// mtime change once the whole subtree has moved.
+    CrossShardDirFinish {
+        source_root: String,
     },
 }
 

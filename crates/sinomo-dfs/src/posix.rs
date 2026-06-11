@@ -416,11 +416,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::NotFound { path: from });
         }
         if source.kind == DfsObjectKind::Directory {
-            // Directory renames across shard primaries would migrate a whole
-            // subtree between authorities; reject like a cross-device rename.
-            return Err(DfsPosixError::InvalidPath {
-                path: format!("{from} -> {to} renames a directory across metadata shard primaries"),
-            });
+            // Directory renames migrate the whole subtree between shard
+            // authorities through a paged, resumable saga.
+            let child_prefix = subtree_prefix(&from);
+            if to.starts_with(&child_prefix) {
+                return Err(DfsPosixError::InvalidPath {
+                    path: format!("{from} -> {to}"),
+                });
+            }
+            return self.coordinate_cross_shard_directory_rename(&from, &to, source);
         }
         if to_requires_directory {
             return Err(DfsPosixError::NotDirectory { path: to });
@@ -469,6 +473,210 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         };
         self.persist_namespace_job(&job)?;
         self.run_cross_shard_namespace_job(job).map(drop)
+    }
+
+    /// Coordinates a directory rename whose destination lives in a metadata
+    /// shard owned by another primary: the root record moves first (the
+    /// destination primary validates and adopts it atomically, like a local
+    /// rename over an empty destination), then the subtree is walked in
+    /// paged, resumable frames, adopting every child at its target path and
+    /// evicting the source record. The source root path is subtree-locked
+    /// for the whole saga, so no write can fork a half-moved object.
+    fn coordinate_cross_shard_directory_rename(
+        &mut self,
+        from: &str,
+        to: &str,
+        source: DfsObjectMetadata,
+    ) -> Result<()> {
+        let job_id = namespace_job_id(
+            "rename-dir-cross-shard",
+            &source.file_system_id,
+            &format!("{from}->{to}"),
+            &source.object_id,
+            &source.version,
+        );
+        let job = match self.namespace_job(&job_id)? {
+            Some(job) => job,
+            None => {
+                let now = time::OffsetDateTime::now_utc();
+                DfsNamespaceJobRecord {
+                    job_id,
+                    file_system_id: source.file_system_id.clone(),
+                    kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                    status: DfsNamespaceJobStatus::Running,
+                    root_path: from.to_string(),
+                    target_path: Some(to.to_string()),
+                    pending_frames: vec![
+                        DfsNamespaceJobFrame::CrossShardDirFinish {
+                            source_root: from.to_string(),
+                        },
+                        DfsNamespaceJobFrame::CrossShardDirScan {
+                            source_path: from.to_string(),
+                            target_path: to.to_string(),
+                            cursor: None,
+                        },
+                        DfsNamespaceJobFrame::CrossShardDirStart {
+                            source_object_id: source.object_id.clone(),
+                            source_root: from.to_string(),
+                            target_root: to.to_string(),
+                        },
+                    ],
+                    processed_object_count: 0,
+                    created_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                    failure_reason: None,
+                }
+            }
+        };
+        self.persist_namespace_job(&job)?;
+        self.run_cross_shard_namespace_job(job).map(drop)
+    }
+
+    /// Moves the directory-rename root record across primaries: the
+    /// destination primary adopts it, then the old root path is tombstoned
+    /// (hiding the not-yet-moved children under it) and the record evicted
+    /// from the source shard. Idempotent against resumes.
+    fn run_cross_shard_dir_start(
+        &mut self,
+        source_object_id: &DfsObjectId,
+        source_root: &str,
+        target_root: &str,
+    ) -> Result<()> {
+        let Some(current) = self.object_by_id(source_object_id)? else {
+            return Err(DfsPosixError::NotFound {
+                path: source_root.to_string(),
+            });
+        };
+        if current.kind == DfsObjectKind::Tombstone {
+            return Err(DfsPosixError::NotFound {
+                path: source_root.to_string(),
+            });
+        }
+        if current.kind != DfsObjectKind::Directory {
+            return Err(DfsPosixError::NotDirectory {
+                path: source_root.to_string(),
+            });
+        }
+        let current_path = normalize_posix_path(&current.path)?;
+        let mut moved = current.clone();
+        if current_path == target_root {
+            // The adoption already applied; only the source half remains.
+            return self.complete_cross_shard_move_locally(&moved, source_root, false);
+        }
+        if current_path != source_root {
+            return Err(DfsPosixError::InvalidPath {
+                path: format!("{current_path} -> {target_root}"),
+            });
+        }
+        moved.path = target_root.to_string();
+        moved.changed_at_unix_nanos = now_unix_nanos();
+        moved.version = next_version(&current.version);
+        self.adopt_moved_object_on_destination_primary(&moved)?;
+        self.complete_cross_shard_move_locally(&moved, source_root, false)
+    }
+
+    /// Pages one directory of a cross-primary subtree move: every child file
+    /// is adopted at its target path and evicted from the source shard;
+    /// child directories are adopted, evicted, and pushed as their own scan
+    /// frames (depth first). Already-moved children are skipped, so resumes
+    /// and re-sent adoptions stay idempotent.
+    fn run_cross_shard_dir_scan(
+        &mut self,
+        job: &mut DfsNamespaceJobRecord,
+        source_path: &str,
+        target_path: &str,
+        cursor: Option<&DfsDirectoryPageCursor>,
+    ) -> Result<()> {
+        let source_prefix = subtree_prefix(source_path);
+        let target_prefix = subtree_prefix(target_path);
+        let page = self.child_objects_for_sifs_dir_page(
+            source_path,
+            cursor,
+            POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE,
+        )?;
+        let mut child_dirs = Vec::new();
+        for object in page.objects {
+            let object_path = normalize_posix_path(&object.path)?;
+            if !object_path.starts_with(&source_prefix) {
+                continue;
+            }
+            let suffix = object_path.trim_start_matches(&source_prefix);
+            let target_child_path = format!("{target_prefix}{suffix}");
+            let Some(current) = self.object_by_id(&object.object_id)? else {
+                continue;
+            };
+            if current.kind == DfsObjectKind::Tombstone {
+                continue;
+            }
+            let current_path = normalize_posix_path(&current.path)?;
+            if current_path == target_child_path {
+                // Already adopted; ensure the source half is evicted.
+                if let Some(backend) = self.metadata_backend.as_mut() {
+                    backend.evict_object_record_for_foreign_shard_move(&current)?;
+                }
+                if current.kind == DfsObjectKind::Directory {
+                    child_dirs.push((object_path, target_child_path));
+                }
+                continue;
+            }
+            if current_path != object_path {
+                continue;
+            }
+            let mut moved = current.clone();
+            moved.path = target_child_path.clone();
+            self.adopt_moved_object_on_destination_primary(&moved)?;
+            if let Some(backend) = self.metadata_backend.as_mut() {
+                backend.evict_object_record_for_foreign_shard_move(&moved)?;
+            }
+            job.processed_object_count = job.processed_object_count.saturating_add(1);
+            if moved.kind == DfsObjectKind::Directory {
+                child_dirs.push((object_path, target_child_path));
+            }
+        }
+        if let Some(next_cursor) = page.next_cursor {
+            job.pending_frames
+                .push(DfsNamespaceJobFrame::CrossShardDirScan {
+                    source_path: source_path.to_string(),
+                    target_path: target_path.to_string(),
+                    cursor: Some(next_cursor),
+                });
+        }
+        for (child_source_path, child_target_path) in child_dirs.into_iter().rev() {
+            job.pending_frames
+                .push(DfsNamespaceJobFrame::CrossShardDirScan {
+                    source_path: child_source_path,
+                    target_path: child_target_path,
+                    cursor: None,
+                });
+        }
+        Ok(())
+    }
+
+    /// Routes the adoption of a moved record to the destination path's
+    /// current primary (re-resolved from the control plane on every attempt),
+    /// or adopts locally when a shard transfer made this node the authority.
+    fn adopt_moved_object_on_destination_primary(
+        &mut self,
+        moved: &DfsObjectMetadata,
+    ) -> Result<()> {
+        let (versions, receipts, intents, conflicts) =
+            self.cross_shard_move_bundle(&moved.object_id)?;
+        match self.routed_namespace_primary_for_path(&moved.path)? {
+            Some(primary) => self.route_namespace_operation(
+                primary,
+                DfsNamespaceOperation::AdoptObjectAtPath {
+                    object: moved.clone(),
+                    versions,
+                    receipts,
+                    intents,
+                    conflicts,
+                },
+            ),
+            None => {
+                self.adopt_object_at_path_local(moved, &versions, &receipts, &intents, &conflicts)
+            }
+        }
     }
 
     /// Coordinates a hardlink whose alias path lives in a metadata shard
@@ -629,51 +837,31 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     old_path,
                     destination_primary_node_id,
                 } => {
-                    let _ = old_path;
-                    let (versions, receipts, intents, conflicts) =
-                        self.cross_shard_move_bundle(&moved_object.object_id)?;
-                    // The destination primary may have moved since the job
-                    // was created (shard transfer); follow the control
-                    // plane's current answer, falling back to the recorded
-                    // primary without one.
-                    match self.routed_namespace_primary_for_path(&moved_object.path)? {
-                        Some(primary) => self.route_namespace_operation(
-                            primary,
-                            DfsNamespaceOperation::AdoptObjectAtPath {
-                                object: moved_object,
-                                versions,
-                                receipts,
-                                intents,
-                                conflicts,
-                            },
-                        ),
-                        None if self.control_plane.is_some() => {
-                            // A transfer made this node the destination
-                            // primary; adopt locally.
-                            self.adopt_object_at_path_local(
-                                &moved_object,
-                                &versions,
-                                &receipts,
-                                &intents,
-                                &conflicts,
-                            )
-                        }
-                        None => self.route_namespace_operation(
-                            destination_primary_node_id,
-                            DfsNamespaceOperation::AdoptObjectAtPath {
-                                object: moved_object,
-                                versions,
-                                receipts,
-                                intents,
-                                conflicts,
-                            },
-                        ),
-                    }
+                    let _ = (old_path, destination_primary_node_id);
+                    self.adopt_moved_object_on_destination_primary(&moved_object)
                 }
                 DfsNamespaceJobFrame::CrossShardComplete {
                     moved_object,
                     old_path,
-                } => self.complete_cross_shard_move_locally(&moved_object, &old_path),
+                } => self.complete_cross_shard_move_locally(&moved_object, &old_path, true),
+                DfsNamespaceJobFrame::CrossShardDirStart {
+                    source_object_id,
+                    source_root,
+                    target_root,
+                } => self.run_cross_shard_dir_start(&source_object_id, &source_root, &target_root),
+                DfsNamespaceJobFrame::CrossShardDirScan {
+                    source_path,
+                    target_path,
+                    cursor,
+                } => self.run_cross_shard_dir_scan(
+                    &mut job,
+                    &source_path,
+                    &target_path,
+                    cursor.as_ref(),
+                ),
+                DfsNamespaceJobFrame::CrossShardDirFinish { source_root } => {
+                    self.touch_parent_directory_if_local_primary(&source_root)
+                }
                 DfsNamespaceJobFrame::CrossShardHardlinkAdopt {
                     alias,
                     target_object_id,
@@ -815,12 +1003,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
     /// The source-side half of a cross-shard move, applied after the
     /// destination primary adopted the record: tombstone the old path, evict
-    /// the moved record from the source shard, and touch the source parent.
-    /// Idempotent so crash recovery can re-run it.
+    /// the moved record from the source shard, and (for top-level moves)
+    /// touch the source parent. Idempotent so crash recovery can re-run it.
     fn complete_cross_shard_move_locally(
         &mut self,
         moved_object: &DfsObjectMetadata,
         old_path: &str,
+        touch_parent: bool,
     ) -> Result<()> {
         let old_path = normalize_posix_path(old_path)?;
         let needs_tombstone = !matches!(
@@ -852,7 +1041,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if let Some(backend) = self.metadata_backend.as_mut() {
             backend.evict_object_record_for_foreign_shard_move(moved_object)?;
         }
-        self.touch_parent_directory_if_local_primary(&old_path)?;
+        if touch_parent {
+            self.touch_parent_directory_if_local_primary(&old_path)?;
+        }
         Ok(())
     }
 
@@ -895,18 +1086,30 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 return Ok(());
             }
             if destination.kind != DfsObjectKind::Tombstone {
-                match destination.kind {
-                    DfsObjectKind::Directory => {
+                match (&object.kind, &destination.kind) {
+                    // A moved directory may replace an empty directory, like
+                    // a local rename over an empty destination directory.
+                    (DfsObjectKind::Directory, DfsObjectKind::Directory) => {
+                        if destination.object_id != object.object_id
+                            && self.sifs_dir_has_children(&path)?
+                        {
+                            return Err(DfsPosixError::DirectoryNotEmpty { path });
+                        }
+                    }
+                    (DfsObjectKind::Directory, _) => {
+                        return Err(DfsPosixError::NotDirectory { path });
+                    }
+                    (_, DfsObjectKind::Directory) => {
                         return Err(DfsPosixError::IsDirectory { path });
                     }
-                    DfsObjectKind::Hardlink
+                    (_, DfsObjectKind::Hardlink)
                         if destination.link_target_object_id.as_ref()
                             == Some(&object.object_id) =>
                     {
                         // Hardlink promotion: the moved object replaces its
                         // own alias at this path.
                     }
-                    DfsObjectKind::Hardlink => {
+                    (_, DfsObjectKind::Hardlink) => {
                         return Err(DfsPosixError::InvalidPath {
                             path: format!(
                                 "{path} is a hardlink to another object; cross-shard replace is not supported"
@@ -2638,7 +2841,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 self.run_rename_directory_job_batch(job, max_steps)
             }
             DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
-            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries => {
+            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries => {
                 self.run_cross_shard_namespace_job(job)
             }
         }
@@ -2724,6 +2928,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if from == "/" || to == "/" {
             return Err(DfsPosixError::InvalidPath {
                 path: format!("{from} -> {to}"),
+            });
+        }
+        // This bounded maintenance API runs the local rename job only; a
+        // destination owned by another metadata primary must go through the
+        // routed `posix_rename`, whose coordinator journals each half on its
+        // own authority.
+        if self.routed_namespace_primary_for_path(&from)?.is_some()
+            || self.routed_namespace_primary_for_path(&to)?.is_some()
+        {
+            return Err(DfsPosixError::InvalidPath {
+                path: format!("{from} -> {to} crosses metadata shard primaries; use posix_rename"),
             });
         }
         if from == to {
@@ -3696,7 +3911,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardAdopt { .. }
                 | DfsNamespaceJobFrame::CrossShardComplete { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkAdopt { .. }
-                | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. } => {
+                | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardDirStart { .. }
+                | DfsNamespaceJobFrame::CrossShardDirScan { .. }
+                | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {
                     return Err(DfsPosixError::InvalidPath {
                         path: job.job_id.clone(),
                     });
@@ -4038,7 +4256,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 | DfsNamespaceJobFrame::CrossShardAdopt { .. }
                 | DfsNamespaceJobFrame::CrossShardComplete { .. }
                 | DfsNamespaceJobFrame::CrossShardHardlinkAdopt { .. }
-                | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. } => {
+                | DfsNamespaceJobFrame::CrossShardHardlinkComplete { .. }
+                | DfsNamespaceJobFrame::CrossShardDirStart { .. }
+                | DfsNamespaceJobFrame::CrossShardDirScan { .. }
+                | DfsNamespaceJobFrame::CrossShardDirFinish { .. } => {
                     return Err(DfsPosixError::InvalidPath {
                         path: job.job_id.clone(),
                     });
@@ -4704,7 +4925,7 @@ fn subtree_prefix(path: &str) -> String {
     }
 }
 
-fn posix_path_is_at_or_under_prefix(path: &str, prefix: &str) -> bool {
+pub(crate) fn posix_path_is_at_or_under_prefix(path: &str, prefix: &str) -> bool {
     prefix == "/"
         || path == prefix
         || path
