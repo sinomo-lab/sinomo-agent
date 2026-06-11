@@ -267,7 +267,7 @@ impl DistributedEventualCoordinator {
             &policy,
         )?;
 
-        let intent_id = self.next_intent_id(&requesting_node_id, &object_id);
+        let intent_id = self.next_intent_id(&requesting_node_id, &object_id, &target_version);
         let intent = DistributedWriteIntent {
             intent_id: intent_id.clone(),
             file_system_id,
@@ -660,8 +660,21 @@ impl DistributedEventualCoordinator {
             .collect()
     }
 
-    fn next_intent_id(&mut self, requesting_node_id: &NodeId, object_id: &DfsObjectId) -> String {
-        let object_hash = blake3::hash(object_id.as_str().as_bytes()).to_hex();
+    fn next_intent_id(
+        &mut self,
+        requesting_node_id: &NodeId,
+        object_id: &DfsObjectId,
+        target_version: &DfsVersion,
+    ) -> String {
+        // The hash covers the target version as well as the object: after a
+        // cross-shard move a different coordinator mints intents for the same
+        // object, and its counter may coincide with the previous
+        // coordinator's. Distinct targets must never share an intent id;
+        // a collision then only remains possible for genuinely competing
+        // writes to one target, which duplicate-intent detection must see.
+        let object_hash =
+            blake3::hash(format!("{}\0{}", object_id.as_str(), target_version.as_str()).as_bytes())
+                .to_hex();
         let object_hash = &object_hash[..16];
         let intent_id = format!(
             "dfs_intent_{}_{}_{}",

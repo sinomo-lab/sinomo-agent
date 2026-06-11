@@ -81,12 +81,13 @@ pub use protocol::{
     DfsFetchBlobCommand, DfsFetchBlobResponse, DfsFetchBlobResponseChunk, DfsFetchBlobResult,
     DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse, DfsMetadataJournalBatchResult,
     DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-    DfsMetadataSnapshotInstallResult, DfsNetworkMessage, DfsProtocolFrameCommand,
-    DfsProtocolFrameResponse, DfsReadData, DfsReadRangeData, DfsReadRequest, DfsReadResponse,
-    DfsReadResponseChunk, DfsReadResult, DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand,
-    DfsRepairReplicaResponse, DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse,
-    DfsStagePatchChunkCommand, DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse,
-    DfsWriteResult,
+    DfsMetadataSnapshotInstallResult, DfsNamespaceCommand, DfsNamespaceOperation,
+    DfsNamespacePosixError, DfsNamespaceResponse, DfsNamespaceResult, DfsNamespaceShardCursor,
+    DfsNetworkMessage, DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsReadData,
+    DfsReadRangeData, DfsReadRequest, DfsReadResponse, DfsReadResponseChunk, DfsReadResult,
+    DfsRepairReplicaChunkCommand, DfsRepairReplicaCommand, DfsRepairReplicaResponse,
+    DfsStageBlobChunkCommand, DfsStageBlobCommand, DfsStageBlobResponse, DfsStagePatchChunkCommand,
+    DfsStagePatchCommand, DfsWriteCommand, DfsWriteResponse, DfsWriteResult,
 };
 
 pub type DfsFileSystemId = sinomo_core::Id;
@@ -3989,6 +3990,8 @@ impl<T: DfsFrameTransport> LocalOwnedDfsService<T> {
                 | DfsNetworkMessage::FetchBlobResponseChunk(_)
                 | DfsNetworkMessage::DistributedWriteRequest(_)
                 | DfsNetworkMessage::DistributedWriteResponse(_)
+                | DfsNetworkMessage::NamespaceRequest(_)
+                | DfsNetworkMessage::NamespaceResponse(_)
                 | DfsNetworkMessage::MetadataJournalBatch(_)
                 | DfsNetworkMessage::MetadataJournalBatchResponse(_)
                 | DfsNetworkMessage::MetadataSnapshotInstall(_)
@@ -4407,6 +4410,13 @@ struct PendingRemoteWriteResponse {
     request_id: String,
     object_id: DfsObjectId,
     metadata_journal_after_sequence: Option<u64>,
+    created_object_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRoutedNamespaceOp {
+    primary_node_id: NodeId,
+    result: Option<DfsNamespaceResult>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -4488,6 +4498,16 @@ pub enum NetworkedDfsServiceEvent {
         primary_node_id: NodeId,
         result: DfsDistributedWriteResult,
     },
+    RemoteNamespaceServed {
+        request_id: String,
+        requester_node_id: NodeId,
+        result: DfsNamespaceResult,
+    },
+    RemoteNamespaceCompleted {
+        request_id: String,
+        primary_node_id: NodeId,
+        result: DfsNamespaceResult,
+    },
     RepairRejected {
         intent_id: String,
         object_id: DfsObjectId,
@@ -4548,6 +4568,8 @@ pub struct NetworkedDfsService<T> {
     pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
     pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
+    pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
+    cross_shard_namespace_locks: BTreeSet<(DfsFileSystemId, String)>,
     last_events: Vec<NetworkedDfsServiceEvent>,
     transport: T,
     repair_retry_tick: u64,
@@ -4565,6 +4587,8 @@ pub struct DfsProtocolFrameProcessResult {
 pub const DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
+pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(5);
+const DFS_ROUTED_NAMESPACE_IDLE_WAIT: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsMetadataReplicaShardContext {
@@ -4725,6 +4749,12 @@ pub fn dfs_events_should_publish_metadata(events: &[NetworkedDfsServiceEvent]) -
         | NetworkedDfsServiceEvent::RemoteWriteCompleted { result, .. } => {
             matches!(result, DfsDistributedWriteResult::Outcome { .. })
         }
+        // The primary journals routed namespace mutations and must publish
+        // them to replicas; the requester-side completion only replays.
+        NetworkedDfsServiceEvent::RemoteNamespaceServed { result, .. } => {
+            matches!(result, DfsNamespaceResult::Applied)
+        }
+        NetworkedDfsServiceEvent::RemoteNamespaceCompleted { .. } => false,
         NetworkedDfsServiceEvent::BlobStageRejected { .. }
         | NetworkedDfsServiceEvent::BlobFetched { .. }
         | NetworkedDfsServiceEvent::BlobFetchRejected { .. }
@@ -7602,6 +7632,8 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             pending_metadata_replications: BTreeMap::new(),
             pending_routed_writes: BTreeMap::new(),
             pending_remote_write_responses: BTreeMap::new(),
+            pending_routed_namespace_ops: BTreeMap::new(),
+            cross_shard_namespace_locks: BTreeSet::new(),
             last_events: Vec::new(),
             transport,
             repair_retry_tick: 0,
@@ -8948,6 +8980,41 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(outcomes)
     }
 
+    /// Re-locks the source paths of running cross-shard move jobs so that no
+    /// write can fork a half-moved object between a restart and the first
+    /// maintenance resume.
+    fn rebuild_cross_shard_namespace_locks(&mut self) -> Result<(), DfsError> {
+        self.cross_shard_namespace_locks.clear();
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(());
+        };
+        let mut locks = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = backend
+                .list_namespace_jobs_page(cursor.as_ref(), DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE)?;
+            for job in page.jobs {
+                if job.status == DfsNamespaceJobStatus::Running
+                    && matches!(
+                        job.kind,
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+                            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+                    )
+                {
+                    locks.push((job.file_system_id.clone(), job.root_path.clone()));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
+        }
+        for (file_system_id, path) in locks {
+            self.lock_cross_shard_namespace_path(&file_system_id, &path);
+        }
+        Ok(())
+    }
+
     pub fn hydrate_from_metadata_backend(&mut self) -> Result<(), DfsError> {
         if self.metadata_backend.is_none() {
             return Ok(());
@@ -8968,6 +9035,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         self.incoming_fetch_transfers.clear();
         self.incoming_blob_transfers.clear();
         self.incoming_patch_transfers.clear();
+        self.rebuild_cross_shard_namespace_locks()?;
 
         for file_system in &file_systems {
             self.metadata.add_file_system(file_system.clone());
@@ -9248,6 +9316,30 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             backend.put_intent(intent_record)?;
         }
         Ok(())
+    }
+
+    /// Whether the backend's current record for the intent is in a terminal
+    /// state (the write finished one way or another), making a replayed
+    /// snapshot of that intent historical rather than actionable.
+    fn backend_intent_record_is_terminal(
+        &self,
+        object_id: &DfsObjectId,
+        intent_id: &str,
+    ) -> Result<bool, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(false);
+        };
+        Ok(backend
+            .get_intent(object_id, intent_id)?
+            .is_some_and(|record| {
+                matches!(
+                    record.status,
+                    DfsWriteIntentStatus::Committed
+                        | DfsWriteIntentStatus::Rejected
+                        | DfsWriteIntentStatus::Conflict
+                        | DfsWriteIntentStatus::Aborted
+                )
+            }))
     }
 
     fn restore_visible_committed_object_location_receipts(
@@ -9778,6 +9870,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     }
                     return Ok(());
                 }
+                // Journal replay can revisit an intent that later history in
+                // the same stream already superseded — either because the
+                // backend applied the whole batch before service-state replay
+                // or because a republished batch duplicates entries this node
+                // replayed earlier. The backend's current intent record is
+                // authoritative: a terminal record makes the replayed entry
+                // historical rather than inconsistent.
+                if self.backend_intent_record_is_terminal(
+                    &intent_record.object_id,
+                    &intent_record.intent_id,
+                )? {
+                    return Ok(());
+                }
                 return Err(error.into());
             }
             Err(error) => return Err(error.into()),
@@ -9926,7 +10031,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 store.put_file_system_config(&file_system_config)?;
             }
         }
-        if let Some(backend) = self.metadata_backend.as_mut() {
+        if let Some(backend) = self.metadata_backend.as_mut()
+            && backend
+                .get_file_system(&file_system.file_system_id)?
+                .as_ref()
+                != Some(&file_system)
+        {
             backend.put_file_system(&file_system)?;
         }
         self.metadata.add_file_system(file_system);
@@ -12729,6 +12839,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 DfsNetworkMessage::DistributedWriteResponse(response) => {
                     events.push(self.handle_distributed_write_response(source_node_id, response)?);
                 }
+                DfsNetworkMessage::NamespaceRequest(command) => {
+                    events.push(self.handle_namespace_request(source_node_id, command)?);
+                }
+                DfsNetworkMessage::NamespaceResponse(response) => {
+                    events.push(self.handle_namespace_response(source_node_id, response)?);
+                }
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
                     events.push(self.handle_metadata_journal_batch(source_node_id, command)?);
                 }
@@ -12783,6 +12899,11 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let request_id = command.request_id.clone();
         let object_id = command.request.object_id.clone();
         let metadata_journal_after_sequence = command.metadata_journal_after_sequence;
+        let routed_object_path = command
+            .object_metadata
+            .as_ref()
+            .map(|object| object.path.clone());
+        let mut created_object_path = None;
         let result = if requester_node_id != command.request.requesting_node_id {
             DfsDistributedWriteResult::Rejected {
                 reason: format!(
@@ -12796,7 +12917,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &command.request,
                     command.object_metadata.as_ref(),
                 )
-                .and_then(|()| {
+                .and_then(|created| {
+                    if created {
+                        created_object_path = routed_object_path;
+                    }
                     if let Some(content_hash) = command.content_hash {
                         let content_size_bytes =
                             command.content_size_bytes.ok_or_else(|| DfsError::Distributed {
@@ -12832,16 +12956,25 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     }
                 }) {
                 Ok(outcome) => {
-                    if let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &outcome {
-                        self.pending_remote_write_responses.insert(
-                            intent_id.clone(),
-                            PendingRemoteWriteResponse {
-                                requester_node_id: requester_node_id.clone(),
-                                request_id: request_id.clone(),
-                                object_id: object_id.clone(),
-                                metadata_journal_after_sequence,
-                            },
-                        );
+                    match &outcome {
+                        NetworkedDfsWriteOutcome::Pending { intent_id, .. } => {
+                            self.pending_remote_write_responses.insert(
+                                intent_id.clone(),
+                                PendingRemoteWriteResponse {
+                                    requester_node_id: requester_node_id.clone(),
+                                    request_id: request_id.clone(),
+                                    object_id: object_id.clone(),
+                                    metadata_journal_after_sequence,
+                                    created_object_path: created_object_path.clone(),
+                                },
+                            );
+                        }
+                        NetworkedDfsWriteOutcome::Committed { .. } => {
+                            if let Some(path) = created_object_path.as_deref() {
+                                self.touch_routed_create_parent_directory(path);
+                            }
+                        }
+                        NetworkedDfsWriteOutcome::Conflict { .. } => {}
                     }
                     DfsDistributedWriteResult::Outcome { outcome }
                 }
@@ -13018,6 +13151,15 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             let Some(pending) = self.pending_remote_write_responses.remove(&intent_id) else {
                 continue;
             };
+            if matches!(
+                &result,
+                DfsDistributedWriteResult::Outcome {
+                    outcome: NetworkedDfsWriteOutcome::Committed { .. }
+                }
+            ) && let Some(path) = pending.created_object_path.as_deref()
+            {
+                self.touch_routed_create_parent_directory(path);
+            }
             let metadata_journal_batch = self.routed_write_response_metadata_journal_batch(
                 &pending.object_id,
                 &result,
@@ -13075,13 +13217,458 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    /// Serves a namespace mutation routed from a replica. The local node must
+    /// be the metadata-shard primary for every shard the operation touches;
+    /// it executes the operation authoritatively and answers with journal
+    /// catch-up batches so the requester reads its own namespace write.
+    fn handle_namespace_request(
+        &mut self,
+        requester_node_id: NodeId,
+        command: DfsNamespaceCommand,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        let request_id = command.request_id.clone();
+        let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
+        let result = if requester_node_id != command.requesting_node_id {
+            DfsNamespaceResult::Rejected {
+                reason: format!(
+                    "namespace request requester mismatch: frame source {}, payload requester {}",
+                    requester_node_id, command.requesting_node_id
+                ),
+                posix_error: None,
+            }
+        } else {
+            match self.affected_namespace_shards(&command.file_system_id, &command.operation) {
+                Err(error) => DfsNamespaceResult::Rejected {
+                    reason: error.to_string(),
+                    posix_error: None,
+                },
+                Ok(shards) => {
+                    // Response batches may only carry shards this node is
+                    // primary for; foreign halves of coordinated operations
+                    // are synced from their own primaries.
+                    affected_shard_ids = shards
+                        .iter()
+                        .filter(|shard| shard.primary_node_id == self.node_id)
+                        .map(|shard| DfsMetadataShardId::new(shard.shard_id.clone()))
+                        .collect();
+                    let foreign_shard = shards
+                        .iter()
+                        .find(|shard| shard.primary_node_id != self.node_id)
+                        .cloned();
+                    let outcome = match (&foreign_shard, &command.operation) {
+                        (None, _) => self.execute_namespace_operation_local(&command.operation),
+                        // Operations spanning another primary's shard run
+                        // through the cross-shard coordinator when this node
+                        // owns the source side.
+                        (Some(_), DfsNamespaceOperation::Rename { from, to }) => {
+                            let from = from.clone();
+                            let to = to.clone();
+                            self.namespace_coordinator_dispatch_rename(
+                                &command.file_system_id,
+                                &from,
+                                &to,
+                            )
+                        }
+                        (
+                            Some(_),
+                            DfsNamespaceOperation::Hardlink {
+                                existing_path,
+                                link_path,
+                            },
+                        ) => {
+                            let existing_path = existing_path.clone();
+                            let link_path = link_path.clone();
+                            self.namespace_coordinator_dispatch_hardlink(
+                                &command.file_system_id,
+                                &existing_path,
+                                &link_path,
+                            )
+                        }
+                        (Some(shard), _) => {
+                            Err(crate::posix::DfsPosixError::Dfs(DfsError::Distributed {
+                                message: format!(
+                                    "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
+                                    self.node_id,
+                                    shard.shard_id,
+                                    shard.primary_node_id,
+                                    shard.epoch
+                                ),
+                            }))
+                        }
+                    };
+                    match outcome {
+                        Ok(()) => DfsNamespaceResult::Applied,
+                        Err(error) => DfsNamespaceResult::Rejected {
+                            posix_error: crate::posix::namespace_posix_error_for(&error),
+                            reason: error.to_string(),
+                        },
+                    }
+                }
+            }
+        };
+        let metadata_journal_batches = if matches!(result, DfsNamespaceResult::Applied) {
+            let mut batches = Vec::new();
+            for shard_id in &affected_shard_ids {
+                let after_sequence = command
+                    .metadata_journal_after_sequences
+                    .iter()
+                    .find(|cursor| &cursor.shard_id == shard_id)
+                    .map(|cursor| cursor.after_sequence)
+                    .unwrap_or(0);
+                if let Some(batch) =
+                    self.metadata_journal_batch_for_shard_since(shard_id, after_sequence)?
+                {
+                    batches.push(batch);
+                }
+            }
+            batches
+        } else {
+            Vec::new()
+        };
+        self.send_dfs_message_if_routable(
+            &requester_node_id,
+            DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+                request_id: request_id.clone(),
+                result: result.clone(),
+                metadata_journal_batches,
+            }),
+        )?;
+        Ok(NetworkedDfsServiceEvent::RemoteNamespaceServed {
+            request_id,
+            requester_node_id,
+            result,
+        })
+    }
+
+    /// The metadata shards a namespace operation can mutate: the shards of
+    /// every involved path plus their parents (parent records share the
+    /// child's prefix shard except at shard-boundary anchors).
+    fn affected_namespace_shards(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        operation: &DfsNamespaceOperation,
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
+        for path in operation.involved_paths() {
+            for shard in self.namespace_shards_for_path(file_system_id, path)? {
+                if !shards
+                    .iter()
+                    .any(|existing| existing.shard_id == shard.shard_id)
+                {
+                    shards.push(shard);
+                }
+            }
+        }
+        Ok(shards)
+    }
+
+    /// The metadata shards covering a path and its parent directory.
+    pub(crate) fn namespace_shards_for_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
+        if self.control_plane.is_none() {
+            return Ok(Vec::new());
+        }
+        let normalized =
+            crate::posix::normalized_posix_path_key(path).ok_or_else(|| DfsError::Distributed {
+                message: format!("invalid namespace operation path: {path}"),
+            })?;
+        let mut candidates = vec![normalized.clone()];
+        if let Some(parent) = crate::posix::parent_posix_path(&normalized) {
+            candidates.push(parent);
+        }
+        let mut shards: Vec<DfsMetadataShardConfig> = Vec::new();
+        for candidate in candidates {
+            let kv = self
+                .control_plane
+                .as_mut()
+                .expect("control plane checked above");
+            let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
+                .select_metadata_shard_for_path(file_system_id, &candidate)
+                .map_err(DfsError::from)?
+            else {
+                continue;
+            };
+            if !shards
+                .iter()
+                .any(|existing| existing.shard_id == shard.shard_id)
+            {
+                shards.push(shard);
+            }
+        }
+        Ok(shards)
+    }
+
+    /// Validates the source side of a coordinated rename and resolves the
+    /// single foreign destination primary before handing off to the
+    /// cross-shard coordinator.
+    fn namespace_coordinator_dispatch_rename(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        from: &str,
+        to: &str,
+    ) -> crate::posix::Result<()> {
+        let destination_primary =
+            self.namespace_coordinator_foreign_primary(file_system_id, from, to)?;
+        let Some(destination_primary) = destination_primary else {
+            return self.posix_rename_local(from, to).map(drop);
+        };
+        self.coordinate_cross_shard_rename(from, to, destination_primary)
+    }
+
+    fn namespace_coordinator_dispatch_hardlink(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        existing_path: &str,
+        link_path: &str,
+    ) -> crate::posix::Result<()> {
+        let destination_primary =
+            self.namespace_coordinator_foreign_primary(file_system_id, existing_path, link_path)?;
+        let Some(destination_primary) = destination_primary else {
+            return self
+                .posix_hardlink_local(existing_path, link_path)
+                .map(drop);
+        };
+        self.coordinate_cross_shard_hardlink(existing_path, link_path, destination_primary)
+    }
+
+    /// For a two-path coordinated operation: every shard on the source side
+    /// must be owned by this node, and the destination side must resolve to
+    /// at most one foreign primary.
+    fn namespace_coordinator_foreign_primary(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        source_path: &str,
+        destination_path: &str,
+    ) -> crate::posix::Result<Option<NodeId>> {
+        let source_shards = self.namespace_shards_for_path(file_system_id, source_path)?;
+        if let Some(shard) = source_shards
+            .iter()
+            .find(|shard| shard.primary_node_id != self.node_id)
+        {
+            return Err(crate::posix::DfsPosixError::Dfs(DfsError::Distributed {
+                message: format!(
+                    "node {} is not the metadata primary for source shard {} (primary {}, epoch {})",
+                    self.node_id, shard.shard_id, shard.primary_node_id, shard.epoch
+                ),
+            }));
+        }
+        let destination_shards =
+            self.namespace_shards_for_path(file_system_id, destination_path)?;
+        let mut foreign_primary: Option<NodeId> = None;
+        for shard in destination_shards {
+            if shard.primary_node_id == self.node_id {
+                continue;
+            }
+            match &foreign_primary {
+                Some(existing) if existing != &shard.primary_node_id => {
+                    return Err(crate::posix::DfsPosixError::InvalidPath {
+                        path: format!(
+                            "{destination_path} spans metadata shards with different primaries"
+                        ),
+                    });
+                }
+                _ => foreign_primary = Some(shard.primary_node_id),
+            }
+        }
+        Ok(foreign_primary)
+    }
+
+    /// Marks a path as participating in an in-flight cross-shard move so
+    /// concurrent mutations cannot fork the object between shards.
+    pub(crate) fn lock_cross_shard_namespace_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) {
+        self.cross_shard_namespace_locks
+            .insert((file_system_id.clone(), metadata_path(path)));
+    }
+
+    pub(crate) fn unlock_cross_shard_namespace_path(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) {
+        self.cross_shard_namespace_locks
+            .remove(&(file_system_id.clone(), metadata_path(path)));
+    }
+
+    pub(crate) fn ensure_path_not_in_cross_shard_flight(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        path: &str,
+    ) -> Result<(), DfsError> {
+        if self
+            .cross_shard_namespace_locks
+            .contains(&(file_system_id.clone(), metadata_path(path)))
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "path {path} is moving between metadata shards; retry the operation"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_object_not_in_cross_shard_flight(
+        &self,
+        object: &DfsObjectMetadata,
+    ) -> Result<(), DfsError> {
+        self.ensure_path_not_in_cross_shard_flight(&object.file_system_id, &object.path)
+    }
+
+    fn handle_namespace_response(
+        &mut self,
+        primary_node_id: NodeId,
+        response: DfsNamespaceResponse,
+    ) -> Result<NetworkedDfsServiceEvent, DfsError> {
+        {
+            let pending = self
+                .pending_routed_namespace_ops
+                .get(&response.request_id)
+                .ok_or_else(|| DfsError::Distributed {
+                    message: format!(
+                        "received namespace response for unknown request {}",
+                        response.request_id
+                    ),
+                })?;
+            if pending.primary_node_id != primary_node_id {
+                return Err(DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: primary_node_id,
+                    reason: format!(
+                        "namespace response for {} did not come from primary {}",
+                        response.request_id, pending.primary_node_id
+                    ),
+                });
+            }
+        }
+        for batch in &response.metadata_journal_batches {
+            self.apply_routed_write_metadata_journal_batch(&primary_node_id, batch)?;
+        }
+        let pending = self
+            .pending_routed_namespace_ops
+            .get_mut(&response.request_id)
+            .expect("pending routed namespace op was validated before metadata replay");
+        pending.result = Some(response.result.clone());
+        Ok(NetworkedDfsServiceEvent::RemoteNamespaceCompleted {
+            request_id: response.request_id,
+            primary_node_id,
+            result: response.result,
+        })
+    }
+
+    /// The requester's last applied journal sequence per locally known shard,
+    /// reported with routed namespace operations so the primary's response
+    /// batches replay exactly the missing entries.
+    fn local_metadata_shard_cursors(&self) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(Vec::new());
+        };
+        Ok(backend
+            .metadata_shard_statuses()?
+            .into_iter()
+            .map(|status| DfsNamespaceShardCursor {
+                shard_id: status.shard_id,
+                after_sequence: status.journal_last_sequence,
+            })
+            .collect())
+    }
+
+    /// Routes a namespace mutation to the metadata-shard primary and blocks
+    /// until the primary answers (or the timeout elapses). On `Applied`, the
+    /// response journal batches have already been replayed locally, so the
+    /// caller immediately reads its own namespace write.
+    pub(crate) fn route_namespace_operation_to_metadata_primary(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<DfsNamespaceResult, DfsError> {
+        let request_id = self.next_request_id();
+        let sent = self.send_dfs_message_if_routable(
+            &primary_node_id,
+            DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: request_id.clone(),
+                file_system_id,
+                requesting_node_id: self.node_id.clone(),
+                metadata_journal_after_sequences: self.local_metadata_shard_cursors()?,
+                operation,
+            }),
+        )?;
+        if !sent {
+            return Err(DfsError::Network {
+                message: format!(
+                    "metadata primary {primary_node_id} is not routable for namespace operation"
+                ),
+            });
+        }
+        self.pending_routed_namespace_ops.insert(
+            request_id.clone(),
+            PendingRoutedNamespaceOp {
+                primary_node_id,
+                result: None,
+            },
+        );
+        self.settle_routed_namespace_op(&request_id)
+    }
+
+    fn settle_routed_namespace_op(
+        &mut self,
+        request_id: &str,
+    ) -> Result<DfsNamespaceResult, DfsError> {
+        let started_at = Instant::now();
+        loop {
+            let events = match self.process_incoming() {
+                Ok(events) => events,
+                Err(error) => {
+                    self.pending_routed_namespace_ops.remove(request_id);
+                    return Err(error);
+                }
+            };
+            if self
+                .pending_routed_namespace_ops
+                .get(request_id)
+                .is_some_and(|pending| pending.result.is_some())
+            {
+                let pending = self
+                    .pending_routed_namespace_ops
+                    .remove(request_id)
+                    .expect("pending routed namespace op checked above");
+                return Ok(pending.result.expect("settled result checked above"));
+            }
+            let elapsed = started_at.elapsed();
+            if elapsed >= DFS_ROUTED_NAMESPACE_OP_TIMEOUT {
+                self.pending_routed_namespace_ops.remove(request_id);
+                return Err(DfsError::Network {
+                    message: format!(
+                        "routed namespace operation {request_id} timed out waiting for the metadata primary"
+                    ),
+                });
+            }
+            if events.is_empty() {
+                let wait = DFS_ROUTED_NAMESPACE_IDLE_WAIT
+                    .min(DFS_ROUTED_NAMESPACE_OP_TIMEOUT.saturating_sub(elapsed));
+                self.transport
+                    .wait_for_incoming(wait)
+                    .map_err(DfsError::from_network)?;
+            }
+        }
+    }
+
+    /// Ensures the routed write's object metadata is known locally. Returns
+    /// `true` when the object was unknown and the requester-provided metadata
+    /// was injected, i.e. the routed write creates the object at its path.
     fn ensure_routed_write_object_metadata(
         &mut self,
         request: &DfsWriteRequest,
         object_metadata: Option<&DfsObjectMetadata>,
-    ) -> Result<(), DfsError> {
+    ) -> Result<bool, DfsError> {
         match self.current_object_for_write(&request.object_id) {
-            Ok(_) => return Ok(()),
+            Ok(_) => return Ok(false),
             Err(DfsError::UnknownObject { .. }) => {}
             Err(error) => return Err(error),
         }
@@ -13115,7 +13702,31 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 epoch: shard.epoch,
             });
         }
-        self.add_transient_object_metadata(object.clone())
+        self.add_transient_object_metadata(object.clone())?;
+        Ok(true)
+    }
+
+    /// Records the parent-directory mtime update for an object that a routed
+    /// write created. The metadata shard primary is the namespace authority,
+    /// so the update must be journaled here and reach every replica (including
+    /// the requester) through journal replay. Best effort: a primary that does
+    /// not hold the parent directory record must still answer the committed
+    /// write.
+    fn touch_routed_create_parent_directory(&mut self, path: &str) {
+        let _ = self.touch_parent_directory_modified(path);
+    }
+
+    /// Whether this node is the metadata write authority for the object's
+    /// path: the configured metadata-shard primary, or the local service
+    /// itself when no cluster shard configuration exists.
+    pub(crate) fn is_local_metadata_primary_for_object(
+        &mut self,
+        object: &DfsObjectMetadata,
+    ) -> Result<bool, DfsError> {
+        Ok(match self.select_metadata_shard_for_object(object)? {
+            Some(shard) => shard.primary_node_id == self.node_id,
+            None => true,
+        })
     }
 
     fn handle_metadata_journal_batch_response(
@@ -13578,9 +14189,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
     ) -> Result<DfsObjectMetadata, DfsError> {
         let memory_object = self.metadata.object(object_id).cloned();
+        if let Some(memory_object) = memory_object.as_ref() {
+            // Writes must not race an in-flight cross-shard move of the
+            // object's path; the move would fork the object between the
+            // source and destination shards.
+            self.ensure_object_not_in_cross_shard_flight(memory_object)?;
+        }
         if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(backend_object) = backend.get_object(object_id)?
         {
+            self.ensure_object_not_in_cross_shard_flight(&backend_object)?;
             if let Some(memory_object) = memory_object.as_ref()
                 && self.local_write_view_overrides_backend(
                     object_id,

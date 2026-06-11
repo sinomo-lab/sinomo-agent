@@ -817,6 +817,26 @@ These events carry node, filesystem, object, version, policy, content hash, and 
 - Directory listing is page-first through directory fragments. Non-paged helpers are convenience wrappers over paged scans.
 - Recursive clear and directory rename are durable bounded namespace jobs. Jobs persist in the metadata backend, resume after reopen, and daemon maintenance can resume pending jobs in bounded batches.
 
+### Namespace Operation Routing
+
+POSIX namespace mutations (`mkdir`, `mkdir_all`, `rmdir`, `unlink`, `rename`, `hardlink`, `set_mode`, `set_owner`, `set_times`, recursive clear) route to the metadata-shard primary when the local node is not the namespace authority for the path, mirroring routed content writes:
+
+- the request carries the requester's per-shard journal cursors,
+- the primary validates authority over every involved path (and its parent), executes the operation, and journals it,
+- the response carries journal catch-up batches per affected shard plus a structured POSIX error kind, so errno semantics and read-your-write both survive routing.
+
+The load-bearing invariant behind this design: a shard replica's backend journal must stay sequence-aligned with the primary's stream, so replicas never append local entries for replicated shards. Implicit atime updates on non-primary nodes are skipped (`noatime`-style) for the same reason, and parent-directory mtime updates for routed creates are journaled by the primary, not the requester.
+
+### Cross-Shard-Primary Renames And Hardlinks
+
+File and symlink renames (and hardlinks) whose source and destination live in metadata shards owned by *different* primaries run as a durable two-step saga coordinated by the source-side primary:
+
+1. the coordinator validates the source, persists a `RenameObjectAcrossShardPrimaries` (or `HardlinkAcrossShardPrimaries`) namespace job, and locks the in-flight path against concurrent content writes and namespace mutations,
+2. the destination primary atomically validates the destination and adopts the moved record together with its version, receipt, intent, and conflict history (`AdoptObjectAtPath` / `AdoptHardlinkAlias`, mirroring same-node shard migration), journaled in the destination shard,
+3. the coordinator then atomically tombstones the old path, evicts the moved record from the source shard (same-object-id tombstone plus shard-index repoint, exactly the journal shape of a same-node cross-shard move), and touches the source parent.
+
+Structured destination rejections abort the saga before anything mutated; transport failures park the job (lock held) for daemon maintenance to resume, re-resolving the destination primary from the control plane so shard transfers mid-saga are followed. After adoption commits, recovery is forward only — the move either fully applies everywhere or cleanly rejects. Unlinking a canonical record whose surviving hardlink alias lives under another primary promotes it through the same saga. Requesters regain read-your-write for the foreign half via a `SyncPath` round to the destination primary. Intent ids cover the target version so a new shard authority can never mint an id that collides with the previous coordinator's history. Directory renames across shard primaries remain rejected (`EXDEV`-like): they would migrate an entire subtree between authorities.
+
 ### Lifecycle And Operations
 
 - Repair jobs are reconstructed from persisted committed intents plus durable receipts, so missing-replica work survives service restart without a separate volatile queue.

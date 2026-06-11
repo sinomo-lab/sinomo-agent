@@ -1,6 +1,8 @@
 use crate::{
-    DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId, DfsMetadataTableSnapshot,
-    DfsObjectId, DfsObjectMetadata, DfsReplicationPolicy, DfsVersion, NetworkedDfsWriteOutcome,
+    DfsConflictRecord, DfsFileSystemId, DfsMetadataJournalBatch, DfsMetadataShardId,
+    DfsMetadataTableSnapshot, DfsObjectId, DfsObjectMetadata, DfsObjectVersionRecord,
+    DfsReplicaReceiptRecord, DfsReplicationPolicy, DfsVersion, DfsWriteIntentRecord,
+    NetworkedDfsWriteOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::{DfsWriteReceipt, DfsWriteRequest};
@@ -141,6 +143,169 @@ pub struct DfsDistributedWriteResponse {
 pub enum DfsDistributedWriteResult {
     Outcome { outcome: NetworkedDfsWriteOutcome },
     Rejected { reason: String },
+}
+
+/// POSIX namespace mutation routed to the metadata shard primary. The primary
+/// is the namespace write authority; it executes the operation, journals the
+/// metadata, and replies with catch-up journal batches so the requester reads
+/// its own namespace write.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceCommand {
+    pub request_id: String,
+    pub file_system_id: DfsFileSystemId,
+    pub requesting_node_id: NodeId,
+    /// The requester's last applied journal sequence per locally known shard,
+    /// so the response batches replay exactly the missing entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_journal_after_sequences: Vec<DfsNamespaceShardCursor>,
+    pub operation: DfsNamespaceOperation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceShardCursor {
+    pub shard_id: DfsMetadataShardId,
+    pub after_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespaceOperation {
+    Mkdir {
+        path: String,
+    },
+    MkdirAll {
+        path: String,
+    },
+    Rmdir {
+        path: String,
+    },
+    Unlink {
+        path: String,
+    },
+    Rename {
+        from: String,
+        to: String,
+    },
+    Hardlink {
+        existing_path: String,
+        link_path: String,
+    },
+    SetMode {
+        path: String,
+        mode: u32,
+    },
+    SetOwner {
+        path: String,
+        uid: u32,
+        gid: u32,
+    },
+    SetTimes {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accessed_at_unix_nanos: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modified_at_unix_nanos: Option<u64>,
+        follow_symlink: bool,
+    },
+    ClearDirRecursive {
+        path: String,
+    },
+    /// No-op operation whose response carries journal catch-up batches for
+    /// the path's shard. Requesters use it to read their own writes after an
+    /// operation that mutated a shard owned by a different primary.
+    SyncPath {
+        path: String,
+    },
+    /// Cross-shard-primary move, sent by the source-shard primary
+    /// (coordinator) to the destination-shard primary: atomically validate
+    /// the destination and install the moved object record at its new path,
+    /// together with its version, receipt, intent, and conflict history so
+    /// the destination shard owns the complete record set (mirroring
+    /// same-node shard migration).
+    AdoptObjectAtPath {
+        object: DfsObjectMetadata,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        versions: Vec<DfsObjectVersionRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        receipts: Vec<DfsReplicaReceiptRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        intents: Vec<DfsWriteIntentRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        conflicts: Vec<DfsConflictRecord>,
+    },
+    /// Cross-shard-primary hardlink, sent by the link-target's shard primary
+    /// (coordinator) to the link-path's shard primary: atomically validate
+    /// the link path and install the hardlink alias record.
+    AdoptHardlinkAlias {
+        alias: DfsObjectMetadata,
+    },
+}
+
+impl DfsNamespaceOperation {
+    /// The normalized paths whose metadata shards this operation may mutate
+    /// (the targets themselves; parents share a prefix shard with their
+    /// children except at shard-boundary anchors, which the handler also
+    /// derives from these paths).
+    pub fn involved_paths(&self) -> Vec<&str> {
+        match self {
+            DfsNamespaceOperation::Mkdir { path }
+            | DfsNamespaceOperation::MkdirAll { path }
+            | DfsNamespaceOperation::Rmdir { path }
+            | DfsNamespaceOperation::Unlink { path }
+            | DfsNamespaceOperation::SetMode { path, .. }
+            | DfsNamespaceOperation::SetOwner { path, .. }
+            | DfsNamespaceOperation::SetTimes { path, .. }
+            | DfsNamespaceOperation::ClearDirRecursive { path }
+            | DfsNamespaceOperation::SyncPath { path } => vec![path],
+            DfsNamespaceOperation::Rename { from, to } => vec![from, to],
+            DfsNamespaceOperation::Hardlink {
+                existing_path,
+                link_path,
+            } => vec![existing_path, link_path],
+            DfsNamespaceOperation::AdoptObjectAtPath { object, .. } => vec![object.path.as_str()],
+            DfsNamespaceOperation::AdoptHardlinkAlias { alias } => vec![alias.path.as_str()],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceResponse {
+    pub request_id: String,
+    pub result: DfsNamespaceResult,
+    /// Journal catch-up batches for every shard the operation touched, built
+    /// from the requester's reported cursors.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metadata_journal_batches: Vec<DfsMetadataJournalBatch>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespaceResult {
+    Applied,
+    Rejected {
+        reason: String,
+        /// Structured POSIX error so the requester surfaces the same errno
+        /// semantics as a local operation. `None` for transport, authority,
+        /// or internal failures.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        posix_error: Option<DfsNamespacePosixError>,
+    },
+}
+
+/// Wire form of the `DfsPosixError` variants that namespace operations can
+/// produce, so errno mapping survives routing.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsNamespacePosixError {
+    NotFound { path: String },
+    AlreadyExists { path: String },
+    NotDirectory { path: String },
+    IsDirectory { path: String },
+    NotSymlink { path: String },
+    MissingParent { path: String },
+    InvalidPath { path: String },
+    DirectoryNotEmpty { path: String },
+    Conflict { path: String, reason: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -428,6 +593,8 @@ pub enum DfsNetworkMessage {
     WriteResponse(DfsWriteResponse),
     DistributedWriteRequest(DfsDistributedWriteCommand),
     DistributedWriteResponse(DfsDistributedWriteResponse),
+    NamespaceRequest(DfsNamespaceCommand),
+    NamespaceResponse(DfsNamespaceResponse),
     StageBlob(DfsStageBlobCommand),
     StageBlobChunk(DfsStageBlobChunkCommand),
     StagePatch(DfsStagePatchCommand),
