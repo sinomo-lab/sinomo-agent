@@ -226,6 +226,20 @@ impl DaemonClusterRpcMode {
     }
 }
 
+/// `Handle::block_on` only makes progress when something else drives the
+/// runtime's IO and timer drivers. The daemon owner runtime is multi-threaded
+/// (its workers drive them); a current-thread handle that nobody is driving
+/// deadlocks silently — even `tokio::time::timeout` never fires. Reject it
+/// loudly instead.
+fn owner_runtime_handle_can_block(runtime: &tokio::runtime::Handle) -> bool {
+    matches!(
+        runtime.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    )
+}
+
+const OWNER_RUNTIME_NOT_BLOCKABLE_DETAIL: &str = "daemon cluster owner-runtime bridge requires a multi-threaded owner runtime; blocking on an undriven current-thread Tokio runtime handle would deadlock — use the async cluster API";
+
 fn block_on_cluster_network_future_on_owner_runtime<F, T>(
     runtime: &tokio::runtime::Handle,
     future: F,
@@ -234,6 +248,12 @@ where
     F: std::future::Future<Output = Result<T, sinomo_network::NetworkError>> + Send,
     T: Send,
 {
+    if !owner_runtime_handle_can_block(runtime) {
+        return Err(sinomo_network::NetworkError::Io {
+            operation: "daemon cluster runtime".to_string(),
+            detail: OWNER_RUNTIME_NOT_BLOCKABLE_DETAIL.to_string(),
+        });
+    }
     if let Ok(current) = tokio::runtime::Handle::try_current() {
         return if matches!(
             current.runtime_flavor(),
@@ -258,6 +278,12 @@ where
     F: std::future::Future<Output = Result<T, DaemonError>> + Send,
     T: Send,
 {
+    if !owner_runtime_handle_can_block(runtime) {
+        return Err(DaemonError::Network {
+            address: "daemon cluster runtime".to_string(),
+            detail: OWNER_RUNTIME_NOT_BLOCKABLE_DETAIL.to_string(),
+        });
+    }
     if let Ok(current) = tokio::runtime::Handle::try_current() {
         return if matches!(
             current.runtime_flavor(),
@@ -276,7 +302,12 @@ where
 
 #[cfg(test)]
 fn daemon_cluster_test_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+    // Multi-threaded on purpose: tests hand this runtime's HANDLE to daemon
+    // hosts whose sync bridges `Handle::block_on` from the test thread. A
+    // current-thread runtime that nobody drives would deadlock there (and is
+    // now rejected by the owner-runtime bridges).
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("daemon cluster test runtime")
@@ -3213,16 +3244,17 @@ impl sinomo_network::ClusterLocalDaemonMembershipObserver
         };
         let timestamp = OffsetDateTime::now_utc();
         let runtime_for_future = self.runtime.clone();
-        let observation = self
-            .runtime
-            .block_on(local_daemon_membership_observation_async(
+        let observation = block_on_daemon_cluster_future_on_owner_runtime(
+            &self.runtime,
+            local_daemon_membership_observation_async(
                 data_dir,
                 state,
                 &main_options,
                 &shadow_options,
                 timestamp,
                 &runtime_for_future,
-            ));
+            ),
+        );
         observation
             .map(Some)
             .map_err(|error| daemon_host_network_error("cluster state membership sync", error))
@@ -4233,14 +4265,17 @@ fn local_daemon_membership_observation_from_daemon_paths_on_runtime(
         )
     };
     let runtime_for_future = runtime.clone();
-    runtime.block_on(local_daemon_membership_observation_async(
-        data_dir,
-        state,
-        &main_options,
-        &shadow_options,
-        now,
-        &runtime_for_future,
-    ))
+    block_on_daemon_cluster_future_on_owner_runtime(
+        runtime,
+        local_daemon_membership_observation_async(
+            data_dir,
+            state,
+            &main_options,
+            &shadow_options,
+            now,
+            &runtime_for_future,
+        ),
+    )
 }
 
 async fn local_daemon_membership_observation_from_daemon_paths_async(
@@ -4310,14 +4345,17 @@ fn refresh_local_daemon_membership_on_runtime(
         detail: "cluster paths have no data directory parent".to_string(),
     })?;
     let runtime_for_future = runtime.clone();
-    let observation = runtime.block_on(local_daemon_membership_observation_async(
-        data_dir,
-        state,
-        main_options,
-        shadow_options,
-        timestamp,
-        &runtime_for_future,
-    ))?;
+    let observation = block_on_daemon_cluster_future_on_owner_runtime(
+        runtime,
+        local_daemon_membership_observation_async(
+            data_dir,
+            state,
+            main_options,
+            shadow_options,
+            timestamp,
+            &runtime_for_future,
+        ),
+    )?;
     sinomo_network::refresh_local_daemon_membership_from_disk(paths, state, observation)
         .map_err(Into::into)
 }
@@ -6763,8 +6801,9 @@ mod tests {
             sinomo_node::main_daemon_capabilities(&state.members[0].role);
         state.members[0].allowed_capabilities = state.members[0].capabilities.clone();
         sinomo_network::write_cluster_state(&cluster_paths, &state).expect("write cluster state");
-        sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
-            .expect("sync cluster state");
+        let synced =
+            sinomo_network::sync_cluster_state_to_local_raft_unchecked(&cluster_paths, &state)
+                .expect("sync cluster state");
 
         let authenticated = AuthenticatedDaemonCommand {
             command: "cluster-member-publish".to_string(),
@@ -6772,20 +6811,23 @@ mod tests {
             signer_node_id: local.to_string(),
             signer_public_key: state.members[0].node_public_key.clone(),
         };
-        let request = ObjectRpcRequest::encode_body(
-            sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE,
-            sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
-            &ClusterMemberPublishRequest {
-                members: vec![state.members[0].clone()],
-                local_kv_revision: None,
-            },
-        )
-        .expect("member publish rpc request");
         let runtime = daemon_cluster_test_runtime();
         let mut member_host = daemon_cluster_control_plane_driver_on_runtime(runtime.handle());
         let mut invite_host = daemon_cluster_control_plane_driver_on_runtime(runtime.handle());
         let mut join_host =
             DaemonClusterJoinRegistrationHost::new_on_runtime(&daemon_paths, runtime.handle());
+
+        // A publisher already at the responder's revision: stable publish,
+        // nothing to converge, no snapshot in the response.
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE,
+            sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            &ClusterMemberPublishRequest {
+                members: vec![state.members[0].clone()],
+                local_kv_revision: Some(synced.revision),
+            },
+        )
+        .expect("member publish rpc request");
         let response = sinomo_network::handle_cluster_membership_rpc_request_with_hosts(
             &cluster_paths,
             request,
@@ -6804,7 +6846,40 @@ mod tests {
         assert_eq!(response.detail, "member endpoints already current");
         assert!(
             response.kv_snapshot.is_none(),
-            "stable member publish responses should not send unrelated full KV snapshots"
+            "a publisher at the responder's revision should not receive a snapshot"
+        );
+
+        // A publisher with no readable local KV reports no revision; only a
+        // full snapshot converges it, so the stable publish still ships one.
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_network::CLUSTER_MEMBER_PUBLISH_ROUTE,
+            sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
+            &ClusterMemberPublishRequest {
+                members: vec![state.members[0].clone()],
+                local_kv_revision: None,
+            },
+        )
+        .expect("member publish rpc request without revision");
+        let response = sinomo_network::handle_cluster_membership_rpc_request_with_hosts(
+            &cluster_paths,
+            request,
+            &authenticated.signer_node_id,
+            &authenticated.signer_public_key,
+            now,
+            &mut join_host,
+            &mut member_host,
+            &mut invite_host,
+        )
+        .expect("member publish response without revision");
+        let response: ClusterMemberPublishResponse = response
+            .decode_body()
+            .expect("member publish body without revision");
+
+        assert!(response.accepted);
+        assert_eq!(
+            response.kv_snapshot.map(|snapshot| snapshot.revision),
+            Some(synced.revision),
+            "a publisher without a readable local KV snapshot converges via the full snapshot"
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -8385,7 +8460,7 @@ mod tests {
     }
 
     #[test]
-    fn connectivity_probe_suppresses_rerouted_unhealthy_endpoint() {
+    fn connectivity_probe_retries_rerouted_unhealthy_endpoint() {
         let now = OffsetDateTime::now_utc();
         let due_at =
             now + time::Duration::seconds(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL.as_secs() as i64);
@@ -8438,8 +8513,13 @@ mod tests {
             ],
         );
 
+        // A healthy alternate route must NOT suppress re-probing a due
+        // non-healthy direct endpoint: a healed direct dial always beats
+        // relaying, and during cold formation the "route" can itself traverse
+        // stale edges — suppression used to pin late joiners as degraded until
+        // record expiry.
         assert!(
-            !sinomo_network::cluster_connectivity_probe_due_with_graph(
+            sinomo_network::cluster_connectivity_probe_due_with_graph(
                 &unreachable_direct,
                 &target_endpoint,
                 due_at,
@@ -8449,10 +8529,10 @@ mod tests {
                 &local,
                 false,
             ),
-            "an unreachable direct endpoint should not be reprobed at workstation cadence while a healthy alternate route exists"
+            "a due unreachable direct endpoint should be reprobed even while a healthy alternate route exists"
         );
         assert!(
-            !sinomo_network::cluster_connectivity_probe_due_with_graph(
+            sinomo_network::cluster_connectivity_probe_due_with_graph(
                 &degraded_direct,
                 &target_endpoint,
                 due_at,
@@ -8462,7 +8542,7 @@ mod tests {
                 &local,
                 false,
             ),
-            "a degraded direct endpoint should not be reprobed at workstation cadence while a healthy alternate route exists"
+            "a due degraded direct endpoint should be reprobed even while a healthy alternate route exists"
         );
     }
 
@@ -9868,6 +9948,18 @@ mod tests {
             "pk-local",
             now,
         );
+        // Give the founding local member real main-daemon capabilities: this
+        // test is about relay next-hop selection, and a capability-less local
+        // member is not a raft voter, which would make the connectivity
+        // remember helper publish to quorum — dialing the (unroutable) target
+        // endpoints below with real sockets.
+        let local_member = state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == local_node)
+            .expect("local member");
+        local_member.capabilities = sinomo_node::main_daemon_capabilities(&local_member.role);
+        local_member.allowed_capabilities = local_member.capabilities.clone();
         let stale_endpoint =
             sinomo_network::daemon_lan_endpoint(&target_node, "10.10.0.5:21353".to_string(), 10);
         let learned_endpoint =
@@ -9893,7 +9985,6 @@ mod tests {
             Some(1),
             None,
         );
-
         let endpoints = sinomo_network::cluster_relay_next_hop_endpoints(
             &paths,
             &state,
