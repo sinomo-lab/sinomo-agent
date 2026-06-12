@@ -18966,6 +18966,149 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
     std::fs::remove_dir_all(root).ok();
 }
 
+/// Simulates a forwarding learner: commits land in the "voter's" in-memory
+/// store and the response snapshot reflects them, but the local paths-backed
+/// KV never advances (no fan-out, no import). The async sync loop must
+/// terminate against the response snapshot instead of spinning on the stale
+/// local view (the cold-formation maintenance-loop wedge).
+struct ForwardingOnlyConnectivityPublishAsyncHost {
+    voter_store: InProcessKvStore,
+    commits: usize,
+    apply_commits: bool,
+}
+
+impl ClusterConnectivityPublishAsyncHost for ForwardingOnlyConnectivityPublishAsyncHost {
+    type Error = NetworkError;
+
+    fn commit_cluster_kv_txn_with_quorum_async<'a>(
+        &'a mut self,
+        _paths: &'a ClusterPaths,
+        _state: &'a mut ClusterBootstrapState,
+        txn: KvTxn,
+    ) -> ClusterMembershipRpcFuture<'a, KvSnapshot> {
+        Box::pin(async move {
+            self.commits += 1;
+            if self.commits > 8 {
+                return Err(NetworkError::Io {
+                    operation: "test connectivity commit".to_string(),
+                    detail: "connectivity sync loop did not converge".to_string(),
+                });
+            }
+            if self.apply_commits {
+                self.voter_store.txn(txn).map_err(NetworkError::from)?;
+            }
+            Ok(self.voter_store.snapshot())
+        })
+    }
+}
+
+#[test]
+fn async_connectivity_quorum_sync_terminates_when_local_kv_lags_forwarded_commits() {
+    let root = std::env::temp_dir().join(format!(
+        "sinomo-network-connectivity-forward-lag-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    ));
+    let data_dir = SinomoDataDir::new(&root);
+    let paths = ClusterPaths::new(&data_dir);
+    paths.ensure().expect("cluster paths");
+    let now = OffsetDateTime::now_utc();
+    let cluster_id =
+        ClusterId::from_legacy_named("cluster_connectivity_forward_lag").expect("cluster");
+    let source_node =
+        NodeId::from_legacy_named("node_connectivity_forward_lag_source").expect("source");
+    let target_node =
+        NodeId::from_legacy_named("node_connectivity_forward_lag_target").expect("target");
+    let state = ClusterBootstrapState::initialized_locally(
+        cluster_id,
+        "connectivity forward lag",
+        source_node.clone(),
+        "source",
+        "pk-source",
+        now,
+    );
+    write_cluster_state(&paths, &state).expect("write state");
+    sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state to kv");
+
+    let endpoint = daemon_lan_endpoint(&target_node, "10.55.0.1:21353".to_string(), 10);
+    let record = cluster_connectivity_record(
+        &state,
+        &endpoint,
+        ClusterConnectivityState::Healthy,
+        Some(6),
+        0,
+        Some("ok".to_string()),
+        None,
+        now,
+        600,
+    );
+    let key = cluster_connectivity_key(
+        &record.source_node_id,
+        &record.target_node_id,
+        &record.endpoint_id,
+    );
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // Forwarded commits succeed at the voter; the local store stays stale.
+    // The loop must converge from the response snapshot after one commit.
+    let mut host = ForwardingOnlyConnectivityPublishAsyncHost {
+        voter_store: InProcessKvStore::new(),
+        commits: 0,
+        apply_commits: true,
+    };
+    let result = runtime
+        .block_on(sync_cluster_connectivity_records_to_quorum_async_with_host(
+            runtime.handle(),
+            &paths,
+            &source_node,
+            vec![record.clone()],
+            &mut host,
+        ))
+        .expect("forward-lagged connectivity sync should converge");
+    assert_eq!(
+        host.commits, 1,
+        "one commit should converge the loop via the response snapshot"
+    );
+    let snapshot = result.expect("committed snapshot");
+    assert!(
+        snapshot.get(&key).is_some(),
+        "response snapshot should hold the published record"
+    );
+
+    // Pathological voter that acknowledges commits without applying them: the
+    // loop must fail loudly instead of spinning inside the maintenance tick.
+    let mut stale_host = ForwardingOnlyConnectivityPublishAsyncHost {
+        voter_store: InProcessKvStore::new(),
+        commits: 0,
+        apply_commits: false,
+    };
+    let error = runtime
+        .block_on(sync_cluster_connectivity_records_to_quorum_async_with_host(
+            runtime.handle(),
+            &paths,
+            &source_node,
+            vec![record],
+            &mut stale_host,
+        ))
+        .expect_err("no-progress sync must error out, not spin");
+    assert_eq!(
+        stale_host.commits, 1,
+        "no-progress must be detected on the iteration after the first commit"
+    );
+    assert!(
+        error.to_string().contains("no progress"),
+        "error should name the no-progress condition: {error}"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn connectivity_full_sync_batches_large_stale_deletions() {
     let root = std::env::temp_dir().join(format!(

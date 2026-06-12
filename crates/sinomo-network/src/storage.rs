@@ -5740,10 +5740,11 @@ pub fn select_cluster_connectivity_probe_batch(
             .into_iter()
             .filter(|record| record.source_node_id == state.local_node_id)
         {
-            let key = cluster_connectivity_key(
-                &record.source_node_id,
-                &record.target_node_id,
-                &record.endpoint_id,
+            // Must match `cluster_connectivity_probe_key` ("src:tgt:endpoint"),
+            // not the KV key, or the seed never lands in the probe cache.
+            let key = format!(
+                "{}:{}:{}",
+                record.source_node_id, record.target_node_id, record.endpoint_id
             );
             if active_keys.contains(&key) {
                 connectivity.insert(key, ClusterConnectivityProbeState { record });
@@ -10588,13 +10589,35 @@ where
         options,
         host,
     };
-    sinomo_kv::commit_cluster_kv_txn_with_quorum_async_with_host(
+    let result = sinomo_kv::commit_cluster_kv_txn_with_quorum_async_with_host(
         state,
         txn,
         sinomo_kv::ClusterKvTxnQuorumDriverOptions { allow_forwarding },
         &mut kv_host,
     )
-    .await
+    .await?;
+    // A forwarded commit observes the voter's post-commit snapshot; import it
+    // when it advances the local view so the forwarding node reads its own
+    // write immediately. The committed-append fan-out runs on the voter and
+    // can miss this node (cold formation: no relay route back yet), and
+    // re-committing the same payload is a semantic no-effect that triggers no
+    // new fan-out — without this import a forwarded write can stay invisible
+    // locally until the periodic snapshot pull.
+    let import_paths = paths.clone();
+    let import_snapshot = result.snapshot.clone();
+    runtime
+        .spawn_blocking(move || {
+            if imported_snapshot_advances_local_kv(&import_paths, &import_snapshot) {
+                write_imported_cluster_kv_snapshot_if_changed(&import_paths, &import_snapshot)?;
+            }
+            Ok::<_, NetworkError>(())
+        })
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster kv snapshot import".to_string(),
+            detail: format!("cluster kv snapshot import task failed: {source}"),
+        })??;
+    Ok(result)
 }
 
 pub async fn handle_cluster_kv_txn_request_async_with_host<H>(
@@ -12579,33 +12602,65 @@ where
     }
 
     let mut state = None;
-    let mut latest = None;
+    let mut latest: Option<KvSnapshot> = None;
+    let mut previous_ops: Option<Vec<KvOp>> = None;
     loop {
-        let batch_paths = paths.clone();
-        let batch_source_node_id = source_node_id.clone();
-        let batch_records = records.clone();
-        let success = runtime
-            .spawn_blocking(move || {
-                cluster_connectivity_full_sync_batch_ops(
-                    &batch_paths,
-                    &batch_source_node_id,
-                    &batch_records,
-                    sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
-                )
-            })
-            .await
-            .map_err(|source| {
-                H::Error::from(NetworkError::Io {
-                    operation: "build cluster connectivity sync batch".to_string(),
-                    detail: source.to_string(),
-                })
-            })?
-            .map_err(H::Error::from)?;
+        let success = match latest.as_ref() {
+            // After a forwarded commit the local store may not reflect the txn
+            // yet (a learner depends on the voter's fan-out or a snapshot
+            // import to observe it), so diff against the authoritative
+            // post-commit snapshot: the loop must terminate on what the quorum
+            // contains, not on local replay catching up.
+            Some(snapshot) => cluster_connectivity_full_sync_batch_ops_from_snapshot(
+                snapshot,
+                source_node_id,
+                &records,
+                OffsetDateTime::now_utc(),
+                sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+            )
+            .map_err(H::Error::from)?,
+            None => {
+                let batch_paths = paths.clone();
+                let batch_source_node_id = source_node_id.clone();
+                let batch_records = records.clone();
+                runtime
+                    .spawn_blocking(move || {
+                        cluster_connectivity_full_sync_batch_ops(
+                            &batch_paths,
+                            &batch_source_node_id,
+                            &batch_records,
+                            sinomo_kv::MAX_KV_MUTATION_EVENTS_PER_COMMAND,
+                        )
+                    })
+                    .await
+                    .map_err(|source| {
+                        H::Error::from(NetworkError::Io {
+                            operation: "build cluster connectivity sync batch".to_string(),
+                            detail: source.to_string(),
+                        })
+                    })?
+                    .map_err(H::Error::from)?
+            }
+        };
         if success.is_empty() {
             host.remember_published_connectivity_record_set_async(paths, source_node_id, &records)
                 .await?;
             return Ok(latest);
         }
+        // Identical ops after a successful commit mean neither the commit nor
+        // its returned snapshot made progress. Failing loudly beats spinning
+        // forever inside the maintenance tick; the caller retries on the next
+        // probe interval.
+        if previous_ops.as_ref() == Some(&success) {
+            return Err(H::Error::from(NetworkError::Io {
+                operation: "cluster connectivity publish".to_string(),
+                detail: format!(
+                    "connectivity sync made no progress after a successful commit ({} ops still pending)",
+                    success.len()
+                ),
+            }));
+        }
+        previous_ops = Some(success.clone());
         if state.is_none() {
             let state_paths = paths.clone();
             state = Some(
@@ -13797,11 +13852,11 @@ fn imported_snapshot_advances_local_kv(paths: &ClusterPaths, snapshot: &KvSnapsh
 }
 
 /// The KV snapshot a member-publish response should carry back to the
-/// publisher: nothing when the publisher reported exactly our revision, the
-/// full current snapshot otherwise. Any MISMATCH ships the snapshot — not
-/// just "publisher behind" — because the publisher's counter can evolve
-/// independently of ours (locally-applied writes before or during the join)
-/// and a diverged-ahead publisher would otherwise never converge. Reporting
+/// publisher: the full current snapshot when the publisher is strictly behind
+/// our revision, nothing otherwise. Revisions are positions in the leader's
+/// single linear history, so a publisher can only lag — a publisher ahead of
+/// this node means WE are the stale side and must not ship a rollback (and a
+/// publisher ahead of a voter trips the divergence warning below). Reporting
 /// no revision at all means the publisher has no readable snapshot (or
 /// predates the hint) and also receives the full snapshot; the importer
 /// deduplicates unchanged content.
