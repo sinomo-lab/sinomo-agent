@@ -9136,8 +9136,48 @@ fn read_metadata_table_state(root: &Path) -> Result<DfsMetadataTableState> {
     if table_path.is_file() {
         state.table_log_offset =
             replay_metadata_table_batches_from(&table_path, 0, &mut state.tables)?;
+        truncate_torn_metadata_table_log_tail(&table_path, state.table_log_offset)?;
     }
     Ok(state)
+}
+
+/// A crash mid-append leaves a torn record at the table log tail. Replay
+/// stops at the last complete record, but the torn bytes must also be cut
+/// off the file: appends land at file end, so a surviving torn record would
+/// break the length framing of every record written after it (reads then
+/// fail with "invalid magic" and never recover). Only called at open, when
+/// this process owns the log and no append is in flight; live suffix
+/// replays keep the lenient stop-at-boundary behavior instead.
+fn truncate_torn_metadata_table_log_tail(path: &Path, offset: u64) -> Result<()> {
+    let len = fs::metadata(path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?
+        .len();
+    if offset >= len {
+        return Ok(());
+    }
+    eprintln!(
+        "sinomo dfs: truncating torn metadata table log tail at {} (keeping {} of {} bytes)",
+        path.display(),
+        offset,
+        len
+    );
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.set_len(offset)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| MetadataBackendError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(())
 }
 
 fn read_metadata_table_snapshot(root: &Path) -> Result<DfsMetadataTableState> {
@@ -9241,7 +9281,6 @@ fn replay_metadata_table_batches(
             }
         }
         let length = u32::from_le_bytes(length_bytes) as usize;
-        offset = offset.saturating_add(4);
         let mut bytes = vec![0_u8; length];
         match file.read_exact(&mut bytes) {
             Ok(()) => {}
@@ -9258,7 +9297,14 @@ fn replay_metadata_table_batches(
         for op in batch.ops {
             tables.apply(op);
         }
-        offset = offset.saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
+        // Only advance past fully decoded records: a torn record at the tail
+        // (crash mid-append, or a reader racing the writer) must leave the
+        // cursor at the last complete-record boundary so the next replay
+        // re-reads it from the start instead of treating torn bytes as a
+        // length prefix.
+        offset = offset
+            .saturating_add(4)
+            .saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
     }
     Ok(offset)
 }
@@ -12270,6 +12316,74 @@ mod tests {
                 Some(object)
             );
         }
+        cleanup(&root);
+    }
+
+    #[test]
+    fn local_backend_reopen_truncates_torn_table_log_tail() {
+        let root = temp_root("local_backend_truncates_torn_table_log");
+        let shard_id = DfsMetadataShardId::new("shard-root");
+        let object_a = object(version("version_1"));
+        {
+            let mut backend =
+                LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("backend");
+            backend.put_file_system(&file_system()).expect("filesystem");
+            backend.put_object(&object_a).expect("object");
+        }
+        let table_path = metadata_table_path(&root);
+        let good_len = fs::metadata(&table_path).expect("table log").len();
+        assert!(good_len > 0);
+
+        // Crash mid-append: a full length prefix promising more bytes than
+        // the writer managed to flush.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&table_path)
+            .expect("open table log");
+        file.write_all(&512_u32.to_le_bytes())
+            .and_then(|()| file.write_all(&[0xAB; 17]))
+            .expect("torn append");
+        drop(file);
+
+        let mut object_b = object(version("version_2"));
+        object_b.object_id =
+            DfsObjectId::from_legacy_named("obj_after_crash").expect("valid object id");
+        object_b.path = "docs/after-crash.md".to_string();
+        {
+            let mut reopened = LocalSobjMetadataBackend::new(shard_id.clone(), &root)
+                .expect("reopen tolerates torn tail");
+            assert_eq!(
+                reopened
+                    .get_object(&object_a.object_id)
+                    .expect("object lookup"),
+                Some(object_a.clone()),
+                "complete records before the torn tail must replay"
+            );
+            assert_eq!(
+                fs::metadata(&table_path).expect("table log").len(),
+                good_len,
+                "open must cut the torn record off the log so later appends stay framed"
+            );
+            // The append that lands after the crash: without the truncation it
+            // would be entombed behind the torn record and break every later
+            // replay with an sobj framing error.
+            reopened.put_object(&object_b).expect("post-crash append");
+        }
+
+        let reopened =
+            LocalSobjMetadataBackend::new(shard_id, &root).expect("reopen after post-crash append");
+        assert_eq!(
+            reopened
+                .get_object(&object_a.object_id)
+                .expect("object lookup"),
+            Some(object_a)
+        );
+        assert_eq!(
+            reopened
+                .get_object(&object_b.object_id)
+                .expect("object lookup"),
+            Some(object_b)
+        );
         cleanup(&root);
     }
 
