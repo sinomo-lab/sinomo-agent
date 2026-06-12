@@ -427,10 +427,8 @@ mod tests {
 
     #[test]
     fn file_session_store_live_streams_appended_records_for_matching_session() {
-        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
-            "sinomo-agent-live-session-store-{}",
-            TaskId::generate()
-        )));
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-live-session-store");
+        let data_dir = SinomoDataDir::new(&data_root);
         let store = FileAgentSessionStore::for_data_dir(&data_dir);
         let session_id = SessionId::from_legacy_named("sess_live_store").expect("session");
         let other_session_id =

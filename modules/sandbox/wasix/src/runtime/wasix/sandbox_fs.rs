@@ -1257,20 +1257,19 @@ mod tests {
     use sinomo_node::NodeId;
     use time::OffsetDateTime;
 
-    fn test_layout() -> LocalSandboxInstanceLayout {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-wasix-sandbox-fs-{}", SandboxId::generate()));
-        let layout = LocalSandboxInstanceLayout::new(root, &SandboxId::generate());
+    fn test_layout() -> (sinomo_testdir::TestDir, LocalSandboxInstanceLayout) {
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs");
+        let layout = LocalSandboxInstanceLayout::new(&root, &SandboxId::generate());
         for dir in layout.required_dirs() {
             std::fs::create_dir_all(dir).unwrap();
         }
-        layout
+        (root, layout)
     }
 
     fn sifs_wasix_fs(
         name: &str,
     ) -> (
-        std::path::PathBuf,
+        sinomo_testdir::TestDir,
         Arc<Mutex<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>>,
         WasixSandboxFileSystem<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>,
     ) {
@@ -1281,11 +1280,11 @@ mod tests {
         name: &str,
         mode: crate::SandboxMountMode,
     ) -> (
-        std::path::PathBuf,
+        sinomo_testdir::TestDir,
         Arc<Mutex<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>>,
         WasixSandboxFileSystem<SifsSandboxFileSystem<sinomo_network::InProcessTransport>>,
     ) {
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named(format!("node_{name}")).unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -1313,7 +1312,7 @@ mod tests {
     #[test]
     fn wasix_sandbox_filesystem_root_preopen_lists_nested_sifs_mount_ancestors() {
         let name = "wasix_nested_sifs_mount";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named(format!("node_{name}")).unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -1404,14 +1403,12 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
             .unwrap();
         assert_eq!(bytes, b"mounted");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_metadata_fetches_remote_intermediate_symlink() {
         let name = "wasix_remote_intermediate_symlink_metadata";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named(format!("node_{name}_owner")).unwrap();
         let reader = NodeId::from_legacy_named(format!("node_{name}_reader")).unwrap();
@@ -1509,14 +1506,12 @@ mod tests {
                 .expect("cached remote symlink readlink"),
             PathBuf::from("shared")
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_hard_link_fetches_remote_intermediate_symlink() {
         let name = "wasix_remote_intermediate_symlink_hardlink";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named(format!("node_{name}_owner")).unwrap();
         let reader = NodeId::from_legacy_named(format!("node_{name}_reader")).unwrap();
@@ -1619,14 +1614,12 @@ mod tests {
                 .expect("original metadata");
         assert_eq!(alias_metadata.ino, original_metadata.ino);
         assert_eq!(alias_metadata.nlink, 2);
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn sifs_sandbox_filesystem_write_at_fetches_remote_intermediate_symlink() {
         let name = "sifs_remote_intermediate_symlink_write_at";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named(format!("node_{name}_owner")).unwrap();
         let reader = NodeId::from_legacy_named(format!("node_{name}_reader")).unwrap();
@@ -1726,14 +1719,12 @@ mod tests {
             sifs_fs.read_unchecked_mut(&path, None).unwrap(),
             b"remote update"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_only_read_dir_fetches_remote_intermediate_symlink() {
         let name = "wasix_ro_remote_intermediate_symlink_read_dir";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named(format!("node_{name}_owner")).unwrap();
         let reader = NodeId::from_legacy_named(format!("node_{name}_reader")).unwrap();
@@ -1826,14 +1817,12 @@ mod tests {
             .collect::<Vec<_>>();
         owner_worker.join().unwrap();
         assert_eq!(entries, vec!["file.txt"]);
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_write_read_dir_fetches_remote_intermediate_symlink() {
         let name = "wasix_rw_remote_intermediate_symlink_read_dir";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named(format!("node_{name}_owner")).unwrap();
         let reader = NodeId::from_legacy_named(format!("node_{name}_reader")).unwrap();
@@ -1926,14 +1915,12 @@ mod tests {
             .collect::<Vec<_>>();
         owner_worker.join().unwrap();
         assert_eq!(entries, vec!["file.txt"]);
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_only_readlink_fetches_remote_symlink_target() {
         let name = "wasix_ro_remote_symlink_readlink";
-        let root = std::env::temp_dir().join(format!("{name}-{}", SandboxId::generate()));
+        let root = sinomo_testdir::TestDir::new(name);
         let network = InProcessNetwork::new();
         let owner = NodeId::from_legacy_named(format!("node_{name}_owner")).unwrap();
         let reader = NodeId::from_legacy_named(format!("node_{name}_reader")).unwrap();
@@ -2016,12 +2003,11 @@ mod tests {
             PathBuf::from("target.txt")
         );
         owner_worker.join().unwrap();
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_reads_and_writes_through_sandbox_fs() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/input.txt").unwrap();
         local_fs.write(&path, b"hello").unwrap();
@@ -2054,12 +2040,11 @@ mod tests {
             local_fs.lock().unwrap().read(&path, None).unwrap(),
             b"jello"
         );
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_rejects_read_only_truncate() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/input.txt").unwrap();
         local_fs.write(&path, b"keep").unwrap();
@@ -2077,13 +2062,11 @@ mod tests {
             .expect_err("read-only truncate must fail");
         assert_eq!(error, virtual_fs::FsError::PermissionDenied);
         assert_eq!(local_fs.lock().unwrap().read(&path, None).unwrap(), b"keep");
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_enforces_read_only_mount_in_vfs() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/input.txt").unwrap();
         local_fs.write(&path, b"keep").unwrap();
@@ -2121,13 +2104,11 @@ mod tests {
             virtual_fs::FsError::PermissionDenied
         );
         assert_eq!(local_fs.lock().unwrap().read(&path, None).unwrap(), b"keep");
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_refreshes_open_files_before_io() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/shared.txt").unwrap();
         local_fs.write(&path, b"0000").unwrap();
@@ -2176,13 +2157,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(bytes, b"ABC0");
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_seek_end_refreshes_backing_sifs_size() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_seek_end_refreshes_sifs_size");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_seek_end_refreshes_sifs_size");
         let path = SandboxPath::new("/work/seek-end-refresh.txt").unwrap();
         {
             let mut guard = sifs_fs.lock().unwrap();
@@ -2211,12 +2190,11 @@ mod tests {
             sifs_fs.lock().unwrap().read(&path, None).unwrap(),
             b"abc\0\0\0\0\0ZA"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_append_handles_preserve_all_writes() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/append.txt").unwrap();
         local_fs.write(&path, b"").unwrap();
@@ -2245,15 +2223,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(local_fs.lock().unwrap().read(&path, None).unwrap(), b"ABC");
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_write_handle_survives_later_chmod() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-sifs-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_sandbox_fs_chmod").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -2293,15 +2267,11 @@ mod tests {
         assert_eq!(guard.read_unchecked(&path, None).unwrap(), b"oldX");
         assert_eq!(guard.stat_unchecked(&path).unwrap().mode, 0);
         drop(guard);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_read_handle_survives_later_chmod() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-sifs-read-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-read");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_sandbox_fs_read_chmod").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -2344,12 +2314,11 @@ mod tests {
             sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap().mode,
             0
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_descriptor_read_updates_sifs_atime() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_read_updates_atime");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_read_updates_atime");
         let path = SandboxPath::new("/work/read-atime.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2369,12 +2338,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap();
         assert!(metadata.accessed_at_unix_nanos > 12_345);
         assert_eq!(metadata.modified_at_unix_nanos, 67_890);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_only_descriptor_read_does_not_update_sifs_atime() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs_with_mode(
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs_with_mode(
             "wasix_ro_read_keeps_atime",
             crate::SandboxMountMode::ReadOnly,
         );
@@ -2397,12 +2365,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap();
         assert_eq!(metadata.accessed_at_unix_nanos, 12_345);
         assert_eq!(metadata.modified_at_unix_nanos, 67_890);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_descriptor_created_time_reports_wasi_ctime() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_created_is_ctime");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_created_is_ctime");
         let path = SandboxPath::new("/work/created.txt").unwrap();
         let changed_at = {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2421,12 +2388,11 @@ mod tests {
             .unwrap();
 
         assert_eq!(file.created_time(), changed_at);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_descriptor_write_refreshes_handle_times() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_write_refreshes_handle_times");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_write_refreshes_handle_times");
         let path = SandboxPath::new("/work/write-metadata.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2452,12 +2418,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap();
         assert_eq!(file.last_modified(), metadata.modified_at_unix_nanos);
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_set_len_refreshes_handle_times() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_set_len_refreshes_handle_times");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_set_len_refreshes_handle_times");
         let path = SandboxPath::new("/work/truncate-metadata.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2481,12 +2446,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap();
         assert_eq!(file.last_modified(), metadata.modified_at_unix_nanos);
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_set_len_preserves_descriptor_offset() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_set_len_preserves_offset");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_set_len_preserves_offset");
         let path = SandboxPath::new("/work/ftruncate-offset.txt").unwrap();
         sifs_fs.lock().unwrap().write(&path, b"abcdef").unwrap();
 
@@ -2506,12 +2470,11 @@ mod tests {
             sifs_fs.lock().unwrap().read(&path, None).unwrap(),
             b"\0\0\0\0\0\0\0\0Z"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_fd_set_mode_refreshes_handle_metadata() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_set_mode_refreshes_metadata");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_set_mode_refreshes_metadata");
         let path = SandboxPath::new("/work/mode-metadata.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2528,12 +2491,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap();
         assert_eq!(metadata.mode, 0o600);
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_fd_set_owner_refreshes_handle_metadata() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_set_owner_refreshes_metadata");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_set_owner_refreshes_metadata");
         let path = SandboxPath::new("/work/owner-metadata.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2550,12 +2512,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&path).unwrap();
         assert_eq!((metadata.uid, metadata.gid), (1001, 1002));
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_fd_set_times_refreshes_handle_metadata() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_set_times_refreshes_metadata");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_set_times_refreshes_metadata");
         let path = SandboxPath::new("/work/times-metadata.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2577,12 +2538,11 @@ mod tests {
         assert_eq!(file.last_accessed(), metadata.accessed_at_unix_nanos);
         assert_eq!(file.last_modified(), metadata.modified_at_unix_nanos);
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_fd_metadata_refreshes_after_alias_write() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_metadata_refresh_alias_write");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_fd_metadata_refresh_alias_write");
         let original = SandboxPath::new("/work/original.txt").unwrap();
         let alias = SandboxPath::new("/work/alias.txt").unwrap();
         {
@@ -2610,12 +2570,11 @@ mod tests {
         assert_eq!(file.last_modified(), metadata.modified_at_unix_nanos);
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
         assert_eq!(file.link_count(), Some(2));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_note_link_added_refreshes_handle_metadata() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_note_link_added_refreshes_metadata");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_note_link_added_refreshes_metadata");
         let original = SandboxPath::new("/work/original.txt").unwrap();
         let alias = SandboxPath::new("/work/alias.txt").unwrap();
         {
@@ -2640,12 +2599,12 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat_unchecked(&alias).unwrap();
         assert_eq!(metadata.link_count, 2);
         assert_eq!(file.created_time(), metadata.changed_at_unix_nanos);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_note_link_removed_refreshes_handle_metadata() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_note_link_removed_refreshes_metadata");
+        let (_root, sifs_fs, wasix_fs) =
+            sifs_wasix_fs("wasix_note_link_removed_refreshes_metadata");
         let original = SandboxPath::new("/work/original.txt").unwrap();
         let alias = SandboxPath::new("/work/alias.txt").unwrap();
         {
@@ -2671,12 +2630,11 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
             .expect("open descriptor should keep reading through surviving alias");
         assert_eq!(bytes, b"content");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_file_survives_unlink() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/remove-open.txt").unwrap();
         local_fs.write(&path, b"before").unwrap();
@@ -2710,13 +2668,11 @@ mod tests {
             local_fs.lock().unwrap().stat(&path),
             Err(SandboxFsError::NotFound { .. })
         ));
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_fd_times_update_unlinked_open_file_metadata() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_unlinked_fd_times");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_unlinked_fd_times");
         let path = SandboxPath::new("/work/remove-open-times.txt").unwrap();
         {
             let mut fs = sifs_fs.lock().unwrap();
@@ -2743,12 +2699,11 @@ mod tests {
             sifs_fs.lock().unwrap().stat(&path),
             Err(SandboxFsError::NotFound { .. })
         ));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_file_survives_unlink_and_recreate() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_recreate_after_unlink");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_recreate_after_unlink");
         let path = SandboxPath::new("/work/recreated.txt").unwrap();
         sifs_fs.lock().unwrap().write(&path, b"old").unwrap();
         let old_inode = sifs_fs.lock().unwrap().stat(&path).unwrap().inode;
@@ -2771,12 +2726,11 @@ mod tests {
         assert_eq!(bytes, b"old");
         assert_eq!(file.link_count(), Some(0));
         assert_eq!(sifs_fs.lock().unwrap().read(&path, None).unwrap(), b"new");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_reopen_after_recreate_uses_new_sifs_inode() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_reopen_recreate");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_reopen_recreate");
         let path = SandboxPath::new("/work/recreated-open.txt").unwrap();
         sifs_fs.lock().unwrap().write(&path, b"old").unwrap();
         let old_inode = sifs_fs.lock().unwrap().stat(&path).unwrap().inode;
@@ -2814,12 +2768,11 @@ mod tests {
         .expect("read old descriptor after path recreation");
         assert_eq!(old_bytes, b"old");
         assert_eq!(old_file.link_count(), Some(0));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_write_after_recreate_does_not_replace_new_path() {
-        let (root, sifs_fs, wasix_fs) =
+        let (_root, sifs_fs, wasix_fs) =
             sifs_wasix_fs("wasix_sandbox_fs_write_recreate_after_unlink");
         let path = SandboxPath::new("/work/recreated-write.txt").unwrap();
         sifs_fs.lock().unwrap().write(&path, b"old").unwrap();
@@ -2840,12 +2793,11 @@ mod tests {
         ))
         .expect("write old descriptor after path recreation");
         assert_eq!(sifs_fs.lock().unwrap().read(&path, None).unwrap(), b"new");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_fd_unlink_after_recreate_does_not_remove_new_path() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_fd_unlink_recreate");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_fd_unlink_recreate");
         let path = SandboxPath::new("/work/recreated-unlink.txt").unwrap();
         sifs_fs.lock().unwrap().write(&path, b"old").unwrap();
 
@@ -2864,12 +2816,11 @@ mod tests {
             .expect("fd unlink should detach the opened inode only");
         assert_eq!(file.link_count(), Some(0));
         assert_eq!(sifs_fs.lock().unwrap().read(&path, None).unwrap(), b"new");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_write_follows_rename() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_write_after_rename");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_write_after_rename");
         let old_path = SandboxPath::new("/work/old.txt").unwrap();
         let new_path = SandboxPath::new("/work/new.txt").unwrap();
         sifs_fs.lock().unwrap().write(&old_path, b"old").unwrap();
@@ -2896,15 +2847,11 @@ mod tests {
         assert_eq!(guard.read(&new_path, None).unwrap(), b"old-renamed");
         assert_eq!(guard.stat(&new_path).unwrap().inode, old_inode);
         drop(guard);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_write_identity_prefers_workspace_over_read_only_alias() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-identity-workspace-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-identity-workspace");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_identity_workspace").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -2960,12 +2907,11 @@ mod tests {
             b"old-renamed"
         );
         drop(guard);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_replaced_destination_stays_detached() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_rename_replace_open_dst");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_sandbox_fs_rename_replace_open_dst");
         let source = SandboxPath::new("/work/source.txt").unwrap();
         let target = SandboxPath::new("/work/target.txt").unwrap();
         {
@@ -3010,12 +2956,11 @@ mod tests {
             "fd set_times after replacement must not update the replacement path"
         );
         drop(guard);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_set_mode_uses_sandbox_fs_metadata() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/mode.txt").unwrap();
         local_fs.write(&path, b"mode").unwrap();
@@ -3033,13 +2978,11 @@ mod tests {
 
         assert_eq!(metadata.mode(), 0o700);
         assert_eq!(local_fs.lock().unwrap().stat(&path).unwrap().mode, 0o700);
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_set_owner_uses_sandbox_fs_metadata() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/owner.txt").unwrap();
         local_fs.write(&path, b"owner").unwrap();
@@ -3060,13 +3003,11 @@ mod tests {
         let sandbox_metadata = local_fs.lock().unwrap().stat(&path).unwrap();
         assert_eq!(sandbox_metadata.uid, 1001);
         assert_eq!(sandbox_metadata.gid, 1002);
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_set_times_uses_sandbox_fs_metadata() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut local_fs = LocalSandboxFileSystem::new(layout.clone());
         let path = SandboxPath::new("/work/times.txt").unwrap();
         local_fs.write(&path, b"times").unwrap();
@@ -3092,13 +3033,11 @@ mod tests {
         let sandbox_metadata = local_fs.lock().unwrap().stat(&path).unwrap();
         assert_eq!(sandbox_metadata.accessed_at_unix_nanos, 12_345);
         assert_eq!(sandbox_metadata.modified_at_unix_nanos, 67_890);
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_create_dir_and_list_use_sandbox_fs() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let local_fs = Arc::new(Mutex::new(LocalSandboxFileSystem::new(layout.clone())));
         let wasix_fs = WasixSandboxFileSystem::new(
             Arc::clone(&local_fs),
@@ -3133,12 +3072,11 @@ mod tests {
                 .unwrap(),
             b"ok"
         );
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_dir_updates_sifs_atime() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("sifs-wasix-dir-atime");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("sifs-wasix-dir-atime");
         let dir = SandboxPath::new("/work/generated").unwrap();
         let file = SandboxPath::new("/work/generated/result.txt").unwrap();
         {
@@ -3158,12 +3096,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat(&dir).expect("stat dir");
         assert!(metadata.accessed_at_unix_nanos > 12_345);
         assert_eq!(metadata.modified_at_unix_nanos, 67_890);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_only_read_dir_does_not_update_sifs_atime() {
-        let (root, sifs_fs, wasix_fs) =
+        let (_root, sifs_fs, wasix_fs) =
             sifs_wasix_fs_with_mode("sifs-wasix-ro-dir-atime", crate::SandboxMountMode::ReadOnly);
         let dir = SandboxPath::new("/work/generated").unwrap();
         let file = SandboxPath::new("/work/generated/result.txt").unwrap();
@@ -3184,12 +3121,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat(&dir).expect("stat dir");
         assert_eq!(metadata.accessed_at_unix_nanos, 12_345);
         assert_eq!(metadata.modified_at_unix_nanos, 67_890);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_read_only_readlink_does_not_update_sifs_atime() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs_with_mode(
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs_with_mode(
             "sifs-wasix-ro-readlink-atime",
             crate::SandboxMountMode::ReadOnly,
         );
@@ -3213,12 +3149,11 @@ mod tests {
         let metadata = sifs_fs.lock().unwrap().stat(&link).expect("stat link");
         assert_eq!(metadata.accessed_at_unix_nanos, 12_345);
         assert_eq!(metadata.modified_at_unix_nanos, 67_890);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_create_dir_is_not_recursive() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let local_fs = Arc::new(Mutex::new(LocalSandboxFileSystem::new(layout.clone())));
         let wasix_fs = WasixSandboxFileSystem::new(
             Arc::clone(&local_fs),
@@ -3236,13 +3171,11 @@ mod tests {
                 .stat(&SandboxPath::new("/work/missing").unwrap()),
             Err(SandboxFsError::NotFound { .. })
         ));
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_preopen_root_rejects_parent_escape() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut fs = LocalSandboxFileSystem::new(layout.clone());
         let work_path = SandboxPath::new("/work/file.txt").unwrap();
         let tmp_path = SandboxPath::new("/tmp/file.txt").unwrap();
@@ -3269,13 +3202,11 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
             .unwrap();
         assert_eq!(bytes, b"work");
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_preopen_root_rejects_absolute_symlink_escape() {
-        let (root, sifs_fs, _root_wasix_fs) = sifs_wasix_fs("wasix_preopen_symlink_escape");
+        let (_root, sifs_fs, _root_wasix_fs) = sifs_wasix_fs("wasix_preopen_symlink_escape");
         let work_link = SandboxPath::new("/work/link.txt").unwrap();
         let work_dangling_link = SandboxPath::new("/work/dangling.txt").unwrap();
         let work_dir_link = SandboxPath::new("/work/dir-link").unwrap();
@@ -3478,13 +3409,11 @@ mod tests {
                 .expect("readlink itself does not follow the symlink"),
             PathBuf::from("/tmp/secret.txt")
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_rename_is_not_recursive() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut fs = LocalSandboxFileSystem::new(layout.clone());
         let source = SandboxPath::new("/work/source.txt").unwrap();
         fs.write(&source, b"data").unwrap();
@@ -3520,13 +3449,11 @@ mod tests {
                 .stat(&SandboxPath::new("/work/missing").unwrap()),
             Err(SandboxFsError::NotFound { .. })
         ));
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_create_is_not_recursive() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let local_fs = Arc::new(Mutex::new(LocalSandboxFileSystem::new(layout.clone())));
         let wasix_fs = WasixSandboxFileSystem::new(
             Arc::clone(&local_fs),
@@ -3547,13 +3474,11 @@ mod tests {
                 .stat(&SandboxPath::new("/work/missing").unwrap()),
             Err(SandboxFsError::NotFound { .. })
         ));
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_reports_file_parent_as_not_directory() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let mut fs = LocalSandboxFileSystem::new(layout.clone());
         let parent = SandboxPath::new("/work/file-parent").unwrap();
         let source = SandboxPath::new("/work/source.txt").unwrap();
@@ -3580,16 +3505,11 @@ mod tests {
         ))
         .expect_err("rename through file parent must fail as not-directory");
         assert_eq!(error, virtual_fs::FsError::BaseNotDirectory);
-
-        std::fs::remove_dir_all(layout.runtime_root).unwrap();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_follows_sifs_symlink_for_open_and_metadata() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-sifs-link-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-link");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_sifs_link").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -3638,13 +3558,11 @@ mod tests {
         virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
             .unwrap();
         assert_eq!(bytes, b"target");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_preserves_trailing_slash_directory_requirement() {
-        let (root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_trailing_slash");
+        let (_root, sifs_fs, wasix_fs) = sifs_wasix_fs("wasix_trailing_slash");
         let real_dir = SandboxPath::new("/work/real-dir").unwrap();
         let file_path = SandboxPath::new("/work/file.txt").unwrap();
         let link_dir = SandboxPath::new("/work/link-dir").unwrap();
@@ -3785,16 +3703,11 @@ mod tests {
                 .expect("directory target remains")
                 .is_dir
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_create_new_rejects_broken_sifs_symlink() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-sifs-create-new-link-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-create-new-link");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_create_new_link").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -3837,16 +3750,11 @@ mod tests {
                 .stat(&SandboxPath::new("/work/missing.txt").unwrap()),
             Err(SandboxFsError::NotFound { .. })
         ));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_open_create_existing_file_does_not_rewrite_sifs() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-sifs-create-existing-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-sifs-create-existing");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_create_existing").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -3887,16 +3795,11 @@ mod tests {
             sifs_fs.lock().unwrap().read(&path, None).unwrap(),
             b"content"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_separates_remove_file_and_remove_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-remove-kind-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-remove-kind");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_remove_kind").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -3936,16 +3839,11 @@ mod tests {
         virtual_fs::FileSystem::remove_file(&wasix_fs, "/work/file.txt".as_ref())
             .expect("remove file");
         virtual_fs::FileSystem::remove_dir(&wasix_fs, "/work/dir".as_ref()).expect("remove dir");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn wasix_sandbox_filesystem_hard_link_uses_sandbox_fs() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-wasix-sandbox-fs-hardlink-{}",
-            SandboxId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-wasix-sandbox-fs-hardlink");
         let network = InProcessNetwork::new();
         let node_id = NodeId::from_legacy_named("node_wasix_hardlink").unwrap();
         let mut dfs = NetworkedDfsService::new(
@@ -4037,7 +3935,5 @@ mod tests {
             .read(&SandboxPath::new("/work/file.txt").unwrap(), None)
             .expect("read original");
         assert_eq!(bytes, b"updated");
-
-        std::fs::remove_dir_all(root).ok();
     }
 }

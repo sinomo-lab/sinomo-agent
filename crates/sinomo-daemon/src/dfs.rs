@@ -672,9 +672,7 @@ mod tests {
     use sinomo_node::NodeId;
     use std::collections::BTreeMap;
     use std::fs;
-    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn append_cluster_raft_command(
         paths: &ClusterPaths,
@@ -779,8 +777,6 @@ mod tests {
             target.get_object(&object.object_id).expect("target object"),
             Some(object)
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -836,8 +832,6 @@ mod tests {
                 .join("frag")
                 .exists()
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -926,8 +920,6 @@ mod tests {
                 .is_none(),
             "rejected non-primary journal batch must not mutate the local replica"
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -970,8 +962,6 @@ mod tests {
         assert_eq!(status.file_system_count, 1);
         assert_eq!(status.object_count, 1);
         assert_eq!(status.version_count, 1);
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1069,8 +1059,6 @@ mod tests {
             b"daemon namespace job"
         );
         assert!(service.posix_read_file(&old_file).is_err());
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1182,8 +1170,6 @@ mod tests {
             .exists(),
             "completed scans should clear their cursor"
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1325,8 +1311,6 @@ mod tests {
         assert_eq!(file_system_view.object_count, 1);
         assert_eq!(file_system_view.open_conflict_count, 0);
         assert_eq!(file_system_view.pending_repair_count, 0);
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1388,8 +1372,6 @@ mod tests {
 
         assert_eq!(status.metadata_shards.len(), 1);
         assert!(status.metadata_shards[0].replica_lag.is_empty());
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1547,8 +1529,6 @@ mod tests {
             3
         );
         assert!(!legacy_path.exists());
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1683,8 +1663,6 @@ mod tests {
                 DfsMetadataShardId::new("services")
             ]
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1838,8 +1816,6 @@ mod tests {
                 .expect("backend cursor"),
             expected_entries as u64
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -1942,8 +1918,6 @@ mod tests {
                 .expect("backend cursor"),
             0
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2057,8 +2031,6 @@ mod tests {
                 .expect("backend cursor"),
             0
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2190,8 +2162,6 @@ mod tests {
                 .expect("backend cursor"),
             1
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2312,8 +2282,6 @@ mod tests {
             &[lan_primary.address, public.address, iroh.address],
             "metadata replication should try one LAN, one public TCP, and one iroh fallback instead of walking every stale endpoint"
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2457,8 +2425,6 @@ mod tests {
                 .is_none(),
             "non-primary content replicas must not append authoritative metadata while handling DFS protocol frames"
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2495,8 +2461,6 @@ mod tests {
         )
         .expect_err("wrong target rejected");
         assert!(error.to_string().contains("does not match local node"));
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2674,8 +2638,6 @@ mod tests {
         )
         .expect("stable shard");
         assert_eq!(stable, migrated);
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2732,8 +2694,6 @@ mod tests {
             by_id.get("root").expect("root shard").primary_node_id,
             "default path-prefix shards start on the root primary until explicit primary transfer is used"
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2828,8 +2788,6 @@ mod tests {
                 .iter()
                 .any(|node_id| node_id == &state.local_node_id)
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2934,8 +2892,6 @@ mod tests {
             .map(|object| object.kind.clone()),
             Some(DfsObjectKind::Tombstone)
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -2998,8 +2954,6 @@ mod tests {
                 .is_empty(),
             "non-primary bootstrap must not create root-shard journal entries"
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -3059,8 +3013,6 @@ mod tests {
                     DfsMetadataJournalReplicationOutcome::MissingShard { .. }
                 ))
         );
-
-        cleanup(&root);
     }
 
     #[test]
@@ -3179,15 +3131,7 @@ mod tests {
         }
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-daemon-dfs-{name}-{nanos}"))
-    }
-
-    fn cleanup(path: &std::path::Path) {
-        let _ = fs::remove_dir_all(path);
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-daemon-dfs-{name}"))
     }
 }

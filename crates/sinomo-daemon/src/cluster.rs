@@ -4767,7 +4767,6 @@ fn cluster_raft_append_attempt_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn append_cluster_raft_command(
         paths: &ClusterPaths,
@@ -4813,14 +4812,8 @@ mod tests {
         }
     }
 
-    fn unique_cluster_test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ))
+    fn unique_cluster_test_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(name)
     }
 
     fn run_cluster_network_maintenance_tick_for_test(
@@ -5039,8 +5032,6 @@ mod tests {
                 .iter()
                 .all(|endpoint| endpoint.address != "127.0.0.1:21354")
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5133,8 +5124,6 @@ mod tests {
                 .iter()
                 .all(|endpoint| endpoint.address != "127.0.0.1:21354")
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5172,7 +5161,6 @@ mod tests {
             sinomo_network::cluster_state_needs_join_registration(&stored),
             "pending join state should remain pending and owned by the join command"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     struct TestClusterJoinRegistrationHost;
@@ -5305,7 +5293,6 @@ mod tests {
             stored.members.iter().any(|member| member.node_id == joined),
             "bridge should learn the member it forwarded to the voter"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5813,7 +5800,6 @@ mod tests {
             snapshot.disk_reads_cluster_state, 0,
             "mobile maintenance should not read cluster state before its role-aware interval"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5941,7 +5927,6 @@ mod tests {
                 <= DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL,
             "pending join maintenance should wake on the convergence cadence, not the full publish interval"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -6047,7 +6032,6 @@ mod tests {
             ClusterNodeRole::Mobile,
             "role updates must patch local state so maintenance adopts mobile cadence"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -6092,8 +6076,6 @@ mod tests {
             daemon_cluster_publish_interval(&daemon_paths),
             sinomo_network::CLUSTER_NETWORK_SENSOR_PUBLISH_INTERVAL
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -6164,8 +6146,6 @@ mod tests {
             !daemon_paths_have_settled_solo_cluster(&daemon_paths).expect("remote cluster"),
             "remote members should disable solo idle suppression"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6234,7 +6214,6 @@ mod tests {
             snapshot.disk_reads_cluster_state, 0,
             "discovery-only ticks without a socket should not read cluster state"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6316,8 +6295,6 @@ mod tests {
             ),
             "absent cluster state should advance probe timer"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6420,7 +6397,6 @@ mod tests {
                     && record.target_node_id == remote_node),
             "pending async probe should record the remote endpoint result"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6520,7 +6496,6 @@ mod tests {
                 && status.availability == ClusterNodeAvailability::Online),
             "pending async status refresh should publish this daemon's node status"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6622,7 +6597,6 @@ mod tests {
             members.iter().any(|member| member.node_id == local_node),
             "pending async member publish should publish the local member"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6714,8 +6688,6 @@ mod tests {
             ),
             "settled solo tick should advance probe timer"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6881,7 +6853,6 @@ mod tests {
             Some(synced.revision),
             "a publisher without a readable local KV snapshot converges via the full snapshot"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6947,7 +6918,6 @@ mod tests {
             store.get("/test/local-lock-wait").expect("committed").value,
             b"ok"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7030,7 +7000,6 @@ mod tests {
             wal_len_before,
             "no-effect daemon txn must not append to the raft WAL"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7092,7 +7061,6 @@ mod tests {
                 .value,
             b"ok"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7221,7 +7189,6 @@ mod tests {
             wal_len_before,
             "stable connectivity refreshes must not append to the raft WAL"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7353,7 +7320,6 @@ mod tests {
             wal_len_before,
             "source-only member publishes must not append to the raft WAL"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7408,7 +7374,6 @@ mod tests {
             daemon_cluster_raft_known_leader_id(&paths, &state).expect("known leader"),
             None
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -7449,8 +7414,6 @@ mod tests {
         assert_eq!(status.process, crate::DAEMON_SHADOW_CLUSTER_ROLE);
         assert_eq!(status.member_role, ClusterMemberRole::NonVoting);
         assert_eq!(status.member_state, ClusterMemberState::NonVoting);
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -7506,8 +7469,6 @@ mod tests {
                 .all(|member| member.node_id != remote_node),
             "the without-kv helper must not merge cached kv members"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -7575,8 +7536,6 @@ mod tests {
                 && endpoint.address
                     == "iroh://iroh_public_key_shadow_repair_route?relay=https://relay.example./"
         }));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -7631,9 +7590,6 @@ mod tests {
             !cached_connectivity_matches(&paths_b, &near_expiry),
             "stable cached connectivity must be publishable before its KV record expires"
         );
-
-        std::fs::remove_dir_all(root_a).ok();
-        std::fs::remove_dir_all(root_b).ok();
     }
 
     #[test]
@@ -7653,8 +7609,6 @@ mod tests {
             cached_connectivity_record_set_matches(&paths, &source_node, &[]),
             "an explicitly synced empty source can be cached"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     fn doctor_connectivity_record(
@@ -7885,8 +7839,6 @@ mod tests {
                 .is_none(),
             "stored-match caching should avoid repeated stable KV snapshot reads"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -7957,7 +7909,6 @@ mod tests {
             materialized.get(&member_key).is_none(),
             "stable sync should not rewrite the intentionally stale materialized cache"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8081,7 +8032,6 @@ mod tests {
         assert_eq!(records, vec![record]);
         assert_eq!(records[0].source_node_id, local_node);
         assert_eq!(records[0].target_node_id, remote_node);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8189,7 +8139,6 @@ mod tests {
             !paths.connectivity_local.exists(),
             "clearing persisted local probe state should remove the object file"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8280,7 +8229,6 @@ mod tests {
             0,
             "fresh unreachable endpoints should not burn battery by probing every tick"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8746,8 +8694,6 @@ mod tests {
             Some(&tcp.endpoint_id),
             "recovered direct command endpoint should become the preferred path again"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8855,7 +8801,6 @@ mod tests {
             expected_batch_len,
             "only the probed mobile batch should become publishable records"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -8950,7 +8895,6 @@ mod tests {
             !maintenance.connectivity.contains_key(&key),
             "removed endpoint connectivity should be dropped from the local cache"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9086,7 +9030,6 @@ mod tests {
             snapshot.get(&stale_key).is_none(),
             "stale connectivity should be deleted even when current records are cached"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9196,7 +9139,6 @@ mod tests {
                 .is_none(),
             "daemon connectivity sync should delete large stale prefixes in bounded batches"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9295,7 +9237,6 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.endpoint_id == tcp.endpoint_id)
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9403,7 +9344,6 @@ mod tests {
                 .any(|endpoint| endpoint.node_id == voter_endpoint.node_id),
             "voter endpoints should remain fallback publish targets"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9555,8 +9495,6 @@ mod tests {
             )),
             "local join-channel bridge routes must survive KV overlays and outrank stale advertised IPs"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9585,7 +9523,6 @@ mod tests {
 
         publish_local_members_via_voter(&paths, &state)
             .expect("stable local members should not be republished");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9670,7 +9607,6 @@ mod tests {
                 .iter()
                 .any(|endpoint| endpoint.endpoint_id == private_tcp.endpoint_id)
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -9923,7 +9859,6 @@ mod tests {
             .map(|endpoint| endpoint.endpoint_id),
             Some(target_endpoint.endpoint_id)
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10002,7 +9937,6 @@ mod tests {
                 .any(|endpoint| endpoint.address == learned_endpoint.address),
             "relay should retain the locally learned hostname as a fallback for segmented startup"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10077,7 +10011,6 @@ mod tests {
             Some(&voter_endpoint.endpoint_id),
             "join bootstrap must still try voter command targets even when local health is stale/offline"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10168,7 +10101,6 @@ mod tests {
             second_tcp_position < first_iroh_position,
             "raft/KV forwarding should try another voter's best endpoint before fallbacks for one voter"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10276,7 +10208,6 @@ mod tests {
             1,
             "an unreachable member must remain a voter while connectivity is recovering"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

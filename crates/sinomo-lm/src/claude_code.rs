@@ -190,7 +190,6 @@ mod tests {
     use crate::{LanguageModelMessage, LanguageModelResponseFormat, LanguageModelRole};
     use std::fs;
     use std::io::Write;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -222,12 +221,7 @@ mod tests {
     fn complete_uses_claude_code_print_mode_process() {
         use std::os::unix::fs::PermissionsExt;
 
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sinomo-claude-code-test-{stamp}"));
-        fs::create_dir_all(&dir).expect("test dir");
+        let dir = sinomo_testdir::TestDir::new("sinomo-claude-code-test");
         let script = dir.join("fake-claude");
         {
             let mut file = fs::File::create(&script).expect("script create");
@@ -255,7 +249,6 @@ mod tests {
                 .starts_with("claude-code:system:\nReturn a concise answer.")
         );
         assert!(response.content.contains("user:\nSay hello."));
-        fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

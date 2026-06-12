@@ -24,3 +24,4 @@ sinomo-storage = { path = "../sinomo-storage" }
 
 [dev-dependencies]
 sinomo-node = { path = "../sinomo-node" }
+sinomo-testdir = { path = "../sinomo-testdir" }

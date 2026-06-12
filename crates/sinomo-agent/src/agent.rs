@@ -8466,26 +8466,23 @@ mod tests {
 
     #[test]
     fn agent_config_workspace_root_populates_local_workspace_ref() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-workspace-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-workspace");
 
         let config = AgentConfig::new("fake", "fake").with_workspace_root(&root);
 
-        assert_eq!(config.workspace_root.as_deref(), Some(root.as_path()));
+        assert_eq!(config.workspace_root.as_deref(), Some(root.path()));
         let workspace = config
             .run_context
             .workspace
             .as_ref()
             .expect("workspace ref");
-        assert_eq!(workspace.local_root.as_deref(), Some(root.as_path()));
+        assert_eq!(workspace.local_root.as_deref(), Some(root.path()));
         assert_eq!(workspace.write_policy.as_deref(), Some("local"));
     }
 
     #[test]
     fn agent_run_context_reaches_model_metadata_and_events() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-run-context-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace root");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-run-context");
         let task = AgentTaskRef::new("coding", "fix run context propagation")
             .with_owner_role(AgentRole::Deliberation);
         let placement = AgentPlacementMetadata::local_current_process()
@@ -9052,8 +9049,8 @@ mod tests {
 
     #[test]
     fn file_trace_store_records_run_evidence_as_jsonl() {
-        let trace_path =
-            std::env::temp_dir().join(format!("sinomo-agent-trace-{}.jsonl", TaskId::generate()));
+        let trace_root = sinomo_testdir::TestDir::new("sinomo-agent-trace");
+        let trace_path = trace_root.join("trace.jsonl");
         let model = SequencedModel::new([
             r#"{
                 "response_mode": "defer",
@@ -9124,9 +9121,8 @@ mod tests {
 
     #[test]
     fn agent_storage_paths_use_sinomo_data_dir_layout() {
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-storage-{}", TaskId::generate())),
-        );
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-storage");
+        let data_dir = SinomoDataDir::new(&data_root);
         let session_id = SessionId::from_legacy_named("sess_agent_storage").expect("session");
         let paths = AgentStoragePaths::from_data_dir(&data_dir);
 
@@ -9200,9 +9196,8 @@ mod tests {
 
     #[test]
     fn file_trace_store_can_write_to_agent_data_dir_layout() {
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-trace-layout-{}", TaskId::generate())),
-        );
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-trace-layout");
+        let data_dir = SinomoDataDir::new(&data_root);
         let session_id = SessionId::from_legacy_named("sess_agent_trace").expect("session");
         let store = FileAgentTraceStore::for_data_dir_session(&data_dir, &session_id);
 
@@ -9234,9 +9229,8 @@ mod tests {
 
     #[test]
     fn file_session_store_persists_and_reloads_session_snapshot() {
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-session-{}", TaskId::generate())),
-        );
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-session");
+        let data_dir = SinomoDataDir::new(&data_root);
         let session_id = SessionId::from_legacy_named("sess_agent_store").expect("session");
         let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
         let mut session = AgentSession::new(session_id.clone(), AgentRole::Deliberation);
@@ -9277,9 +9271,8 @@ mod tests {
 
     #[test]
     fn agent_session_store_records_turns_and_queue_updates() {
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-session-run-{}", TaskId::generate())),
-        );
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-session-run");
+        let data_dir = SinomoDataDir::new(&data_root);
         let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
         let model = SequencedModel::new([r#"{
             "response_mode": "answer",
@@ -9555,10 +9548,8 @@ mod tests {
 
     #[test]
     fn file_session_store_records_items_and_projections_append_only() {
-        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
-            "sinomo-agent-session-projection-{}",
-            TaskId::generate()
-        )));
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-session-projection");
+        let data_dir = SinomoDataDir::new(&data_root);
         let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
         let model = SequencedModel::new([r#"{
             "response_mode": "answer",
@@ -10626,8 +10617,7 @@ mod tests {
 
     #[test]
     fn context_assembler_expands_prompt_file_and_directory_references() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-prompt-ref-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-prompt-ref");
         fs::create_dir_all(root.join("docs")).expect("workspace");
         fs::write(root.join("note.txt"), "important context\n").expect("note");
         fs::write(root.join("docs").join("a.md"), "a").expect("doc");
@@ -10681,9 +10671,7 @@ mod tests {
 
     #[test]
     fn context_assembler_can_disable_prompt_reference_expansion() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-no-prompt-ref-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-no-prompt-ref");
         fs::write(root.join("note.txt"), "important context\n").expect("note");
         let input = agent_input("inspect @note.txt and @missing.txt");
         let config = AgentConfig::new("fake", "fake")
@@ -10736,9 +10724,7 @@ mod tests {
 
     #[test]
     fn context_assembler_loads_workspace_instruction_files() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-instructions-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-instructions");
         fs::write(
             root.join("AGENTS.md"),
             "# Repo Instructions\n\nPrefer deterministic context.\n",
@@ -10780,11 +10766,7 @@ mod tests {
 
     #[test]
     fn context_assembler_loads_large_instruction_files_without_default_truncation() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-large-instructions-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-large-instructions");
         let content = format!("# Repo Instructions\n\n{}\n", "x".repeat(500 * 1024));
         fs::write(root.join("AGENTS.md"), &content).expect("instructions");
         let input = agent_input("inspect");
@@ -10883,8 +10865,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_lists_files_with_bounds_and_hidden_filter() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-list-files-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-list-files");
         fs::create_dir_all(root.join("src")).expect("workspace");
         fs::write(root.join("README.md"), "hello").expect("readme");
         fs::write(root.join(".secret"), "hidden").expect("hidden");
@@ -10964,11 +10945,7 @@ mod tests {
 
     #[test]
     fn local_workspace_read_file_supports_one_based_line_ranges() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-read-line-range-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-read-line-range");
         fs::write(root.join("sample.txt"), "one\ntwo\nthree\nfour\n").expect("seed file");
         let registry = AgentToolRegistry::local_workspace(&root);
         let input = agent_input("read range");
@@ -11019,9 +10996,8 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_preserves_truncated_read_evidence() {
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-test-{}", TaskId::generate())),
-        );
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-test");
+        let data_dir = SinomoDataDir::new(&data_root);
         let input = agent_input("read");
         let mut config = LocalWorkspaceAgentConfig::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
             .with_data_dir_evidence(&data_dir, &input.session.session_id);
@@ -11053,8 +11029,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_can_mirror_evidence_to_sifs_mount() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-sifs-evidence-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-sifs-evidence");
         let mount_dir = root.join("sifs-mount");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("large.txt"), "alpha\nbeta\ngamma\n").expect("seed file");
@@ -11102,11 +11077,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_records_output_evidence_for_readonly_tools() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-readonly-evidence-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-readonly-evidence");
         fs::write(root.join("a.txt"), "needle\n").expect("seed a");
         fs::write(root.join("b.txt"), "other\n").expect("seed b");
         let mut config = LocalWorkspaceAgentConfig::new(&root);
@@ -11138,8 +11109,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_reports_changed_files_and_git_diff() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-git-tools-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-git-tools");
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
@@ -11237,10 +11207,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn local_workspace_run_command_honors_timeout_and_cwd() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-command-timeout-{}",
-            TaskId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-command-timeout");
         let subdir = root.join("subdir");
         fs::create_dir_all(&subdir).expect("workspace");
         let registry = AgentToolRegistry::local_workspace_with_config(
@@ -11289,11 +11256,7 @@ mod tests {
         if !Path::new("/bin/bash").exists() && !Path::new("/usr/bin/bash").exists() {
             return;
         }
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-command-pipefail-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-command-pipefail");
         let registry = AgentToolRegistry::local_workspace_with_config(
             LocalWorkspaceAgentConfig::new(&root).allowing_shell_commands(true),
         );
@@ -11332,14 +11295,9 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn local_workspace_run_command_records_structured_output_and_stream_refs() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-command-structured-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-command-data-{}", TaskId::generate())),
-        );
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-command-structured");
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-command-data");
+        let data_dir = SinomoDataDir::new(&data_root);
         let input = agent_input("structured command output");
         let mut config = LocalWorkspaceAgentConfig::new(&root)
             .allowing_shell_commands(true)
@@ -11465,8 +11423,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_rejects_unified_diff_patches() {
-        let root = std::env::temp_dir().join(format!("sinomo-agent-patch-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-patch");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
@@ -11498,11 +11455,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_applies_freeform_patch_when_file_writes_enabled() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-freeform-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-freeform-patch");
         fs::write(root.join("old.txt"), "old\n").expect("seed old file");
         fs::write(root.join("multi.txt"), "line1\nline2\nline3\nline4\n").expect("seed multi file");
         fs::write(root.join("move.txt"), "before\n").expect("seed move file");
@@ -11603,11 +11556,7 @@ mod tests {
 
     #[test]
     fn local_workspace_registry_accepts_raw_string_apply_patch_input() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-raw-string-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-raw-string-patch");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
@@ -11636,10 +11585,7 @@ mod tests {
 
     #[test]
     fn local_workspace_apply_patch_records_diff_artifact_metadata() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-patch-diff-evidence-{}",
-            TaskId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-patch-diff-evidence");
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&evidence_dir).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
@@ -11686,11 +11632,7 @@ mod tests {
 
     #[test]
     fn local_workspace_apply_patch_preflights_all_changes_before_mutating() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-preflight-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-preflight-patch");
         fs::write(root.join("target.txt"), "actual\n").expect("seed file");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
@@ -11733,11 +11675,7 @@ mod tests {
 
     #[test]
     fn local_workspace_apply_patch_preserves_crlf_and_missing_final_newline() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-line-ending-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-line-ending-patch");
         fs::write(root.join("crlf.txt"), "old\r\nsecond\r\n").expect("seed crlf");
         fs::write(root.join("nonewline.txt"), "old").expect("seed no newline");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
@@ -11783,9 +11721,7 @@ mod tests {
     fn local_workspace_apply_patch_preserves_existing_file_mode() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-mode-patch-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-mode-patch");
         let script = root.join("script.sh");
         fs::write(&script, "old\n").expect("seed script");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -11828,8 +11764,7 @@ mod tests {
     fn local_workspace_apply_patch_rejects_symlink_path_components() {
         use std::os::unix::fs::symlink;
 
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-symlink-patch-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-symlink-patch");
         fs::create_dir_all(root.join("real")).expect("workspace");
         symlink(root.join("real"), root.join("link")).expect("symlink");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
@@ -11860,11 +11795,7 @@ mod tests {
 
     #[test]
     fn local_workspace_apply_patch_honors_context_and_eof_anchors() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-anchored-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-anchored-patch");
         fs::write(
             root.join("anchors.txt"),
             "section a\nvalue\nsection b\nvalue\nfooter\n",
@@ -11907,11 +11838,7 @@ mod tests {
 
     #[test]
     fn local_workspace_apply_patch_inserts_addition_only_hunk_after_context() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-context-add-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-context-add-patch");
         fs::write(root.join("insert.txt"), "before\nanchor\nafter\n").expect("seed file");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
@@ -11944,9 +11871,7 @@ mod tests {
 
     #[test]
     fn local_workspace_apply_patch_rejects_malformed_update_without_mutating() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-bad-patch-{}", TaskId::generate()));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-bad-patch");
         fs::write(root.join("bad.txt"), "old\n").expect("seed file");
         let config = LocalWorkspaceAgentConfig::new(&root).allowing_file_writes(true);
         let registry = AgentToolRegistry::local_workspace_with_config(config);
@@ -11987,11 +11912,7 @@ old
 
     #[test]
     fn local_workspace_registry_applies_structured_patch_changes() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-structured-patch-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-structured-patch");
         fs::write(root.join("replace.txt"), "old\n").expect("seed replace file");
         fs::write(root.join("move.txt"), "move me\n").expect("seed move file");
         fs::write(root.join("delete.txt"), "delete me\n").expect("seed delete file");
@@ -12060,8 +11981,7 @@ old
 
     #[test]
     fn agent_records_patch_snapshot_items_for_apply_patch() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-agent-loop-patch-{}", TaskId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-loop-patch");
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
@@ -12131,10 +12051,7 @@ old
 
     #[test]
     fn coding_state_stops_after_patch_with_environment_blocked_validation() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-coding-stop-env-{}",
-            TaskId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-coding-stop-env");
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
@@ -12248,10 +12165,7 @@ old
 
     #[test]
     fn agent_run_collects_candidate_evidence_bundle() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-candidate-evidence-{}",
-            TaskId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-candidate-evidence");
         let evidence_dir = root.join("evidence");
         fs::create_dir_all(&root).expect("workspace");
         fs::write(root.join("hello.txt"), "old\n").expect("seed file");
@@ -12686,9 +12600,8 @@ old
 
     #[test]
     fn agent_session_control_plane_persists_progress_and_terminal_result() {
-        let data_dir = SinomoDataDir::new(
-            std::env::temp_dir().join(format!("sinomo-agent-control-store-{}", TaskId::generate())),
-        );
+        let data_root = sinomo_testdir::TestDir::new("sinomo-agent-control-store");
+        let data_dir = SinomoDataDir::new(&data_root);
         let store = crate::FileAgentSessionStore::for_data_dir(&data_dir);
         let task = AgentTaskRef::new("coding", "persisted control-plane task")
             .with_owner_role(AgentRole::Deliberation);
@@ -12920,11 +12833,7 @@ old
     #[cfg(not(windows))]
     #[test]
     fn agent_session_runtime_interrupts_active_command_turn() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-runtime-cancel-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-runtime-cancel");
         let task = AgentTaskRef::new("coding", "runtime cancellable command")
             .with_owner_role(AgentRole::Deliberation);
         let marker = root.join("started.txt");

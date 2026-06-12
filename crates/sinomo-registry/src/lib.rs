@@ -1342,7 +1342,7 @@ mod tests {
         ActorKind, ActorRef, ArtifactManifest, ArtifactProvenance, CapabilityDiff, Id,
         ModuleManifest, PolicyAction, PolicyDecision, RollbackPolicy, RolloutStrategy, TrustRing,
     };
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     type PolicyDecisionId = Id;
 
@@ -1429,8 +1429,6 @@ mod tests {
                 .expect("content hash")
         );
         assert!(registry.artifact_evidence(&manifest.evidence_id).is_some());
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1474,8 +1472,6 @@ mod tests {
                 .artifact_evidence(&record.evidence_id)
                 .is_some_and(|loaded| loaded.content_hash == record.content_hash)
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1522,7 +1518,6 @@ mod tests {
 
         assert_eq!(path, verified_release_material_path(&root, &release_id));
         assert_eq!(loaded, record);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1602,7 +1597,6 @@ mod tests {
                 .failed_checks()
                 .contains(&"release-id".to_string())
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1628,8 +1622,6 @@ mod tests {
             error,
             RegistryError::ArtifactEvidenceIntegrityFailed { .. }
         ));
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1703,8 +1695,6 @@ mod tests {
             .expect("load signers");
         assert_eq!(loaded, 1);
         assert!(registry.trusted_signer(&signer.public_key).is_some());
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1758,11 +1748,8 @@ mod tests {
         ));
     }
 
-    fn unique_test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "sinomo-registry-{name}-{}",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
+    fn unique_test_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-registry-{name}"))
     }
 
     fn signed_artifact_fixture(signer_id: &str) -> (ArtifactManifest, TrustedArtifactSigner) {
@@ -1797,7 +1784,6 @@ mod tests {
         );
         let signer =
             TrustedArtifactSigner::local_ed25519(signer_id, identity.public_key, "test signer");
-        let _ = fs::remove_dir_all(root);
         (artifact, signer)
     }
 

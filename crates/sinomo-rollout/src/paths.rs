@@ -585,8 +585,6 @@ source = "rollout:modules/remote/management"
                 .join("debug")
                 .join(native_dylib_library_name("sinomo_remote_management_module"))
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -645,8 +643,6 @@ default = false
                 .iter()
                 .any(|module| module.package == "sinomo-benchmarks")
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -718,16 +714,7 @@ default = false
         );
     }
 
-    fn unique_temp(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "sinomo-rollout-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let _ = fs::remove_dir_all(&path);
-        path
+    fn unique_temp(label: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-rollout-{label}"))
     }
 }

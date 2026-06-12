@@ -2063,7 +2063,6 @@ mod tests {
     use std::cell::RefCell;
     use std::fs;
     use std::rc::Rc;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn request() -> LanguageModelRequest {
         LanguageModelRequest {
@@ -2654,13 +2653,7 @@ mod tests {
 
     #[test]
     fn codex_auth_json_round_trips_official_chatgpt_shape() {
-        let dir = std::env::temp_dir().join(format!(
-            "sinomo-codex-auth-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_nanos()
-        ));
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-auth");
         let credentials_path = Some(dir.join("credentials.json"));
         let id_token = fake_chatgpt_id_token("account_123", true);
 
@@ -2693,8 +2686,6 @@ mod tests {
             .expect("tokens");
         assert_eq!(tokens.access_token, "access-token");
         assert_eq!(tokens.account_id.as_deref(), Some("account_123"));
-
-        fs::remove_dir_all(dir).ok();
     }
 
     fn fake_chatgpt_id_token(account_id: &str, fedramp: bool) -> String {

@@ -1494,7 +1494,6 @@ mod tests {
     };
     use sinomo_runtime::events::EventId;
     use sinomo_runtime::node::NodeId;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     type ScorecardId = Id;
 
@@ -1525,8 +1524,6 @@ mod tests {
             config
         );
         assert_eq!(read_config(&paths).expect("read config"), config);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1550,7 +1547,6 @@ mod tests {
         )
         .expect("config document");
         assert_eq!(document.key.as_str(), EVOLUTION_CONFIG_KEY);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1658,7 +1654,6 @@ mod tests {
             read_json_file(&bundle_dir.join(CANDIDATE_SIFS_MIRROR_RELATIVE_PATH))
                 .expect("local mirror report");
         assert_eq!(local_report, report);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1761,7 +1756,6 @@ mod tests {
         let stored = read_stored_job(&paths.job_path(&job_id)).expect("stored job");
         assert_eq!(stored.job.status, EvolutionJobStatus::Rejected);
         assert_eq!(stored.decision.unwrap().decided_by, "test-reviewer");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1873,7 +1867,6 @@ mod tests {
             Some(recorded.scorecard_path.display().to_string())
         );
         assert_eq!(stored.verification_outcome, Some(EvaluationOutcome::Passed));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1958,7 +1951,6 @@ mod tests {
             stored_job_artifact_path(&record, StoredJobArtifactKind::Scorecard),
             Err(EvolutionPersistenceError::MissingArtifact { .. })
         ));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1983,7 +1975,6 @@ mod tests {
         )
         .expect("explicit");
         assert_eq!(explicit.job.job_id, terminal.job.job_id);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2006,7 +1997,6 @@ mod tests {
                 ..
             } if status == "approved" && expected == "awaiting-approval"
         ));
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2107,7 +2097,6 @@ mod tests {
                 .expect("stage scorecards jsonl")
                 .contains(&stored.campaign_id)
         );
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2226,7 +2215,6 @@ mod tests {
             read_recent_proposed_regression_gate_memory(&paths, 8).expect("recent gates");
         assert_eq!(recent_lessons.len(), 1);
         assert_eq!(recent_gates.len(), 1);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2379,7 +2367,6 @@ mod tests {
             .lines()
             .count();
         assert_eq!(gate_jsonl_count, recent_gates.len());
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2467,15 +2454,10 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.ends_with("background-scoped-job.json"))
         }));
-        let _ = fs::remove_dir_all(root);
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-evolution-persistence-{name}-{stamp}"))
+    fn temp_dir(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-evolution-persistence-{name}"))
     }
 
     fn stored_record_fixture(root: &Path, status: EvolutionJobStatus) -> StoredEvolutionJob {

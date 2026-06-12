@@ -3148,7 +3148,6 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn rollout_binary_upload_chunks_append_at_expected_offsets() {
@@ -3181,7 +3180,6 @@ mod tests {
         let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
             .expect("upload path");
         assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello world");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3236,7 +3234,6 @@ mod tests {
             "matching duplicate chunks should not rewrite low-write-cycle storage"
         );
         assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello world");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3273,7 +3270,6 @@ mod tests {
         let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
             .expect("upload path");
         assert_eq!(fs::read(uploaded).expect("uploaded bytes"), b"hello ");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3300,8 +3296,6 @@ mod tests {
         assert!(!pending_main_activation_ready_for_shutdown(&rollout_paths));
         std::thread::sleep(MAIN_ACTIVATION_SHUTDOWN_GRACE + Duration::from_millis(100));
         assert!(pending_main_activation_ready_for_shutdown(&rollout_paths));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3345,7 +3339,6 @@ mod tests {
             .expect("read activation")
             .expect("activation staged");
         assert_eq!(staged, activation);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3361,7 +3354,6 @@ mod tests {
             .expect_err("main daemon needs staged binaries for main-only rollout");
         assert!(error.to_string().contains("main-only rollout requires"));
         assert!(!rollout_main_activation_path(&rollout_paths).exists());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3403,7 +3395,6 @@ mod tests {
             staged_names,
             vec![format!("sinomo{}", std::env::consts::EXE_SUFFIX)]
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3441,18 +3432,11 @@ mod tests {
         assert_eq!(plan.activation.main_port, 21353);
         assert_eq!(plan.activation.shadow_port, 21354);
         assert_eq!(plan.current_main_pid, None);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_rollout_activation_plan_uses_fallback_when_main_is_not_running() {
-        let root = env::temp_dir().join(format!(
-            "sinomo-daemon-local-rollout-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-rollout");
         let rollout_paths = SelfRolloutPaths::new(&root);
         let artifacts = LocalRolloutArtifacts {
             built_binary: root.join("build").join("sinomo"),
@@ -3555,7 +3539,6 @@ mod tests {
         );
         assert!(!shadow_reexec_request_path(&rollout_paths).exists());
         assert!(rollout_paths.shadow_binary.exists());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3598,7 +3581,6 @@ mod tests {
             .expect("status");
         assert_eq!(status.status, "accepted");
         assert_eq!(status.phase.as_deref(), Some("shadow-finalized"));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3652,7 +3634,6 @@ mod tests {
             .expect("status");
         assert_eq!(status.status, "in-progress");
         assert_eq!(status.phase.as_deref(), Some("main-promotion-pending"));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3696,18 +3677,10 @@ mod tests {
             handle_deferred_shadow_rollout_completion(&paths).expect("deferred helper"),
             "no pending shadow rollout\n"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
-    fn temp_rollout_test_root(label: &str) -> PathBuf {
-        env::temp_dir().join(format!(
-            "sinomo-daemon-rollout-{label}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
+    fn temp_rollout_test_root(label: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-daemon-rollout-{label}"))
     }
 
     fn test_daemon_status(pid: u32) -> DaemonStatus {

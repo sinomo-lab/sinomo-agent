@@ -1081,7 +1081,6 @@ fn same_path_if_exists(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::SelfRolloutPaths;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn source_heads_match_accepts_equal_or_prefix_heads() {
@@ -1156,7 +1155,6 @@ mod tests {
             fs::read(&artifacts.staged_shadow_binary).expect("shadow staged"),
             b"binary"
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1188,7 +1186,6 @@ default-members = [
     #[test]
     fn rollout_build_workspace_manifest_guard_restores_original_manifest() {
         let root = unique_temp("sinomo-rollout-build-manifest");
-        fs::create_dir_all(&root).expect("repo dir");
         let manifest = root.join("Cargo.toml");
         let original =
             "[workspace]\nresolver = \"3\"\ndefault-members = [\n    \"crates/sinomo-app\",\n]\n";
@@ -1202,7 +1199,6 @@ default-members = [
         }
 
         assert_eq!(fs::read_to_string(&manifest).expect("restored"), original);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1226,7 +1222,6 @@ default-members = [
         assert!(!bundle.is_empty());
         assert_eq!(head, expected_head);
         assert!(paths.root.join("staged").exists());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1252,7 +1247,6 @@ default-members = [
         assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
         assert!(!status.has_external_remotes);
         assert!(paths.source_repo.join("Cargo.toml").exists());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1286,7 +1280,6 @@ default-members = [
 
         assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
         assert!(!status.has_external_remotes);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1332,7 +1325,6 @@ default-members = [
         assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
         assert_eq!(backup, diverged_head);
         assert!(!paths.source_repo.join("local.txt").exists());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1393,7 +1385,6 @@ default-members = [
         );
         assert!(!paths.source_repo.join("untracked.txt").exists());
         assert!(stash.contains("sinomo-managed-source-force-overwrite-"));
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1441,7 +1432,6 @@ default-members = [
         );
         assert!(!paths.source_repo.join("untracked.txt").exists());
         assert!(stash.contains("sinomo-managed-source-force-overwrite-"));
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1473,18 +1463,10 @@ default-members = [
         assert!(status.is_git_repo);
         assert!(!status.has_external_remotes);
         assert!(paths.source_repo.join("Cargo.toml").exists());
-        fs::remove_dir_all(root).ok();
     }
 
-    fn unique_temp(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            prefix,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
+    fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(prefix)
     }
 
     fn run_git_for_test(repo: &Path, args: &[&str]) {

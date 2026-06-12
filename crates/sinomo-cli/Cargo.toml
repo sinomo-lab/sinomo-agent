@@ -40,5 +40,6 @@ libc = "0.2"
 
 [dev-dependencies]
 sinomo-sandbox-wasix-module = { path = "../../modules/sandbox/wasix", features = ["wasix-runtime"] }
+sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 wat = "1.248.0"

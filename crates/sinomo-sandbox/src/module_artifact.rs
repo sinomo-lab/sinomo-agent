@@ -145,14 +145,9 @@ mod tests {
             Some(expected_hash.as_str())
         );
         assert_eq!(read_back, registry);
-        let _ = fs::remove_dir_all(root);
     }
 
-    fn unique_temp(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            prefix,
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
+    fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(prefix)
     }
 }

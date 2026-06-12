@@ -1001,17 +1001,10 @@ fn vbs_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn installed_daemon_start_specs_describe_main_and_shadow_daemons() {
-        let root = env::temp_dir().join(format!(
-            "sinomo-daemon-install-specs-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-install-specs");
         let data_dir = SinomoDataDir::new(&root);
         let layout = InstallLayout::new(&data_dir, root.join("startup"));
 
@@ -1125,13 +1118,7 @@ mod tests {
 
     #[test]
     fn installed_daemon_install_plan_describes_non_starting_install() {
-        let root = env::temp_dir().join(format!(
-            "sinomo-daemon-install-plan-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-install-plan");
         let data_dir = SinomoDataDir::new(&root);
         let layout = InstallLayout::new(&data_dir, root.join("startup"));
 

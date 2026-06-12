@@ -953,12 +953,10 @@ const ROLLOUT_OBJECT_VERSION: u16 = 1;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn read_tail_lossy_limits_bytes_and_handles_missing_file() {
         let root = unique_temp("sinomo-rollout-tail");
-        fs::create_dir_all(&root).expect("root");
         let path = root.join("tail.log");
         fs::write(&path, "0123456789").expect("log");
 
@@ -970,7 +968,6 @@ mod tests {
             read_tail_lossy(&root.join("missing.log"), 4).expect("missing"),
             None
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1011,7 +1008,6 @@ mod tests {
         assert!(report.contains("[build log]"));
         assert!(report.contains("build log"));
         assert!(report.contains("[last main exit]"));
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1047,7 +1043,6 @@ mod tests {
             read_rollout_status(&paths).expect("status"),
             Some(replacement)
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1081,7 +1076,6 @@ mod tests {
             read_rollout_telemetry_gate_config(&paths).expect("read config"),
             Some(config)
         );
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1109,7 +1103,6 @@ mod tests {
         )
         .expect("config document");
         assert_eq!(document.key.as_str(), ROLLOUT_TELEMETRY_GATE_CONFIG_KEY);
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1146,18 +1139,9 @@ mod tests {
         assert_eq!(read_rollout_status(&paths).expect("status"), None);
         assert!(rollout_shadow_finalize_path(&paths).exists());
         assert!(!clear_rollout_status(&paths).expect("clear missing"));
-
-        fs::remove_dir_all(root).ok();
     }
 
-    fn unique_temp(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            prefix,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
+    fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(prefix)
     }
 }

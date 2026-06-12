@@ -857,8 +857,7 @@ mod tests {
 
     #[test]
     fn jsonl_event_store_persists_and_replays_events() {
-        let root =
-            std::env::temp_dir().join(format!("sinomo-events-jsonl-test-{}", EventId::generate()));
+        let root = sinomo_testdir::TestDir::new("sinomo-events-jsonl-test");
         let path = root.join("events").join("event-log.jsonl");
         let mut store = JsonlEventStore::new(&path);
         let event = fixture_event("evt_jsonl", None, "sandbox.instance.created");
@@ -874,15 +873,11 @@ mod tests {
         assert_eq!(events[0].sequence, EventSequence(1));
         assert_eq!(events[0].event.event_id, event.event_id);
         assert_eq!(events[0].event.kind.as_str(), "sandbox.instance.created");
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn jsonl_event_store_rejects_duplicate_event_ids() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-events-jsonl-duplicate-test-{}",
-            EventId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-events-jsonl-duplicate-test");
         let path = root.join("events").join("event-log.jsonl");
         let mut store = JsonlEventStore::new(&path);
         let event = fixture_event("evt_jsonl_duplicate", None, "sandbox.instance.created");
@@ -890,7 +885,6 @@ mod tests {
         store.append(event.clone()).expect("first append");
         let error = store.append(event).expect_err("duplicate append");
         assert!(matches!(error, EventStoreError::DuplicateEventId { .. }));
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1017,10 +1011,7 @@ mod tests {
 
     #[test]
     fn interactive_artifact_store_writes_under_registered_tree() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-events-artifact-test-{}",
-            InteractiveTrajectoryId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-events-artifact-test");
         let store = InteractiveArtifactStore::new(&root);
         let trajectory_id =
             InteractiveTrajectoryId::from_legacy_named("traj_artifact").expect("trajectory");
@@ -1042,12 +1033,12 @@ mod tests {
             .join(trajectory_id.as_str())
             .join("step-0001/state.json");
         assert!(written.exists());
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn interactive_artifact_store_rejects_path_escape() {
-        let store = InteractiveArtifactStore::new(std::env::temp_dir());
+        let root = sinomo_testdir::TestDir::new("sinomo-events-artifact-escape");
+        let store = InteractiveArtifactStore::new(&root);
         let trajectory_id =
             InteractiveTrajectoryId::from_legacy_named("traj_escape").expect("trajectory");
         let error = store

@@ -115,7 +115,7 @@ use std::process::Command;
 #[cfg(feature = "sandbox")]
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use time::OffsetDateTime;
 
 fn append_cluster_raft_command(
@@ -2227,13 +2227,7 @@ fn sandbox_lifecycle_parser_accepts_checkpoint_resume_reboot_and_destroy() {
 
 #[test]
 fn sandbox_create_and_status_use_local_store() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-store-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-store");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -2343,18 +2337,11 @@ fn sandbox_create_and_status_use_local_store() {
     )
     .expect_err("invalid env value rejected");
     assert!(format!("{invalid_env_value:?}").contains("embedded NUL byte"));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_doctor_reports_missing_toolchain_and_policy_denial() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-doctor-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -2403,19 +2390,11 @@ fn sandbox_doctor_reports_missing_toolchain_and_policy_denial() {
     assert!(findings.iter().any(|finding| {
         finding.severity == SandboxDoctorSeverity::Error && finding.code == "policy-denied"
     }));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_doctor_warns_when_policy_allows_wasix_unpinned_child_exec() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-doctor-policy-unpinned-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-policy-unpinned");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -2443,19 +2422,11 @@ fn sandbox_doctor_warns_when_policy_allows_wasix_unpinned_child_exec() {
         }),
         "doctor should report when policy allows the temporary WASIX child-exec escape hatch"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-doctor-resource-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-resource");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -2597,20 +2568,12 @@ fn sandbox_doctor_reports_recent_resource_exhaustion_for_target_sandbox() {
             .filter(|finding| finding.code == "recent-policy-denied")
             .all(|finding| !finding.detail.contains("sandbox unknown"))
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_doctor_reports_coding_toolchain_readiness() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-doctor-coding-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-coding");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -2833,19 +2796,11 @@ fn sandbox_doctor_reports_coding_toolchain_readiness() {
                 && finding.severity == SandboxDoctorSeverity::Error
                 && finding.detail.contains("genuine shell/process substrate"))
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-doctor-shell-substrate-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-shell-substrate");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -2909,19 +2864,11 @@ fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
             .iter()
             .any(|finding| finding.code == "shell-command-missing")
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgement() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-doctor-wasix-unpinned-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-doctor-wasix-unpinned");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -2987,19 +2934,11 @@ fn sandbox_doctor_warns_when_wasix_shell_uses_unpinned_child_exec_acknowledgemen
         }),
         "doctor should identify sandboxes whose WASIX shell relies on the temporary child-exec escape hatch"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_ls_cat_and_write_use_local_filesystem() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-files-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-files");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3213,7 +3152,6 @@ fn sandbox_ls_cat_and_write_use_local_filesystem() {
         .expect("read after rejected write"),
         b"fn main() {}\n"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3238,13 +3176,7 @@ fn sandbox_fetch_uses_mediated_transport_and_persists_output_and_audit() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-fetch-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-fetch");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3351,7 +3283,6 @@ fn sandbox_fetch_uses_mediated_transport_and_persists_output_and_audit() {
         file_events[0].event.payload["request_id"],
         result.request_id.to_string()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3374,13 +3305,7 @@ fn sandbox_fetch_records_resource_exhaustion_when_output_write_exceeds_quota() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-fetch-quota-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-fetch-quota");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3479,7 +3404,6 @@ fn sandbox_fetch_records_resource_exhaustion_when_output_write_exceeds_quota() {
         network_events[0].event.payload["workspace_root"],
         sinomo_runtime::sandbox::sandbox_instance_root(&sandbox_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3501,13 +3425,7 @@ fn sandbox_fetch_audits_failed_post_policy_transport_attempt() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-fetch-failed-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-fetch-failed");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3573,7 +3491,6 @@ fn sandbox_fetch_audits_failed_post_policy_transport_attempt() {
     );
     assert!(events[0].event.payload["status"].is_null());
     assert_eq!(events[0].event.payload["response_bytes"], 0);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3592,13 +3509,7 @@ fn sandbox_fetch_audits_policy_denial() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-fetch-policy-denied-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-fetch-policy-denied");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3657,18 +3568,11 @@ fn sandbox_fetch_audits_policy_denial() {
     );
     assert_eq!(events[0].event.payload["phase"], "sandbox-fetch");
     assert_eq!(events[0].event.payload["code"], "network-host-denied");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-lifecycle-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-lifecycle");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3748,18 +3652,11 @@ fn sandbox_checkpoint_resume_and_destroy_use_local_store() {
     )
     .expect("destroy");
     assert!(!layout.root.exists());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-reboot-retain-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-reboot-retain");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
 
@@ -3796,19 +3693,12 @@ fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
         std::fs::read(layout.tmp.join("session-cache.txt")).expect("read retained tmp"),
         b"tmp"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_persists_stdout_and_stderr_logs() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-run-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-run");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let module_path = root.join("stdout.wat");
@@ -3914,19 +3804,12 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
         &store,
     )
     .expect("command logs");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_returns_error_when_guest_exits_nonzero() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-run-nonzero-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-run-nonzero");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let module_path = root.join("exit7.wat");
@@ -3982,20 +3865,12 @@ fn sandbox_run_returns_error_when_guest_exits_nonzero() {
         matches!(error, SandboxCliError::Process { status: 7, .. }),
         "unexpected error: {error:?}"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_rejects_mounts_outside_default_policy() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-mount-policy-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-mount-policy");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let module_path = root.join("noop.wat");
@@ -4041,20 +3916,12 @@ fn sandbox_run_rejects_mounts_outside_default_policy() {
     )
     .expect_err("mount source denied");
     assert!(matches!(error, SandboxCliError::SandboxPolicyDenied { .. }));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_uses_pinned_toolchain_command() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-toolchain-run-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-toolchain-run");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -4189,19 +4056,12 @@ fn sandbox_run_uses_pinned_toolchain_command() {
         .path
         .clone();
     assert_eq!(fs.read(&stdout_log, None).expect("stdout"), b"hello\n");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-process-plan-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-process-plan");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -4321,19 +4181,12 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
             .iter()
             .any(|entry| fs.read(&entry.path, None).expect("stdout") == b"hello\n")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_shell_invokes_pinned_sh_command() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-shell-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-shell");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -4402,19 +4255,12 @@ fn sandbox_shell_invokes_pinned_sh_command() {
         fs.read(&stdout_logs[0].path, None).expect("stdout"),
         b"echo shell\n"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_shell_rejects_toolchain_without_real_sh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-shell-missing-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-shell-missing");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -4475,18 +4321,11 @@ fn sandbox_shell_rejects_toolchain_without_real_sh() {
         }
         other => panic!("unexpected missing shell error: {other:?}"),
     }
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_add_command_installs_local_command_module() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-toolchain-add-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-toolchain-add");
     let module_path = root.join("hello.wasm");
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(
@@ -4549,19 +4388,11 @@ fn sandbox_toolchain_add_command_installs_local_command_module() {
             .expect("module"),
         std::fs::read(module_path).expect("module bytes")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-module-artifact-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("root");
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-module-artifact");
     let source_path = root.join("source.wasm");
     std::fs::write(&source_path, b"module bytes").expect("source");
     let artifact_id = sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_cli_module")
@@ -4626,19 +4457,11 @@ fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
     assert_eq!(artifact.env, env);
     assert_eq!(artifact.limits, limits);
     assert_eq!(artifact.timeout_ms, Some(1_500));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-module-rollout-material-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("root");
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-module-rollout-material");
     let source_path = root.join("candidate.wasm");
     std::fs::write(&source_path, b"candidate module bytes").expect("source");
     let bundle_dir = root.join("candidate-bundle");
@@ -4747,18 +4570,11 @@ fn sandbox_module_artifact_register_writes_candidate_rollout_material() {
     );
     sinomo_runtime::module::verify_artifact_signature(&material.artifact)
         .expect("artifact signature verifies");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_add_artifact_installs_local_support_file() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-artifact-add-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-artifact-add");
     let artifact_path = root.join("os.py");
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(&artifact_path, b"print('support')\n").expect("artifact");
@@ -4791,18 +4607,11 @@ fn sandbox_toolchain_add_artifact_installs_local_support_file() {
             .expect("artifact bytes"),
         std::fs::read(artifact_path).expect("artifact bytes")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_installs_local_commands_and_artifacts() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-import-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-import");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::create_dir_all(root.join("share")).expect("share");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
@@ -4873,18 +4682,11 @@ fn sandbox_toolchain_import_package_installs_local_commands_and_artifacts() {
             .expect("artifact"),
         b"stdlib"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_verify_package_accepts_valid_package_without_importing() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-verify-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-verify");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::create_dir_all(root.join("share")).expect("share");
     std::fs::write(root.join("bin/script.wasm"), b"script wasm").expect("module");
@@ -4920,18 +4722,11 @@ fn sandbox_toolchain_verify_package_accepts_valid_package_without_importing() {
         !cache_root.exists(),
         "verify-package must not import package bytes into the local toolchain cache"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_verify_package_rejects_invalid_package_without_importing() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-verify-invalid-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-verify-invalid");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -4974,18 +4769,11 @@ fn sandbox_toolchain_verify_package_rejects_invalid_package_without_importing() 
         !cache_root.exists(),
         "verify-package must not create a toolchain cache on failure"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_verify_package_rejects_invalid_default_env_name() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-verify-bad-env-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-verify-bad-env");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5020,18 +4808,11 @@ fn sandbox_toolchain_verify_package_rejects_invalid_default_env_name() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_verify_package_rejects_invalid_default_env_value() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-verify-bad-env-value-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-verify-bad-env-value");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5068,18 +4849,11 @@ fn sandbox_toolchain_verify_package_rejects_invalid_default_env_value() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_verify_package_rejects_invalid_argv_prefix_value() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-verify-bad-argv-prefix-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-verify-bad-argv-prefix");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5112,18 +4886,11 @@ fn sandbox_toolchain_verify_package_rejects_invalid_argv_prefix_value() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_verify_package_rejects_invalid_required_capability() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-verify-bad-capability-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-verify-bad-capability");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/fetch.wasm"), b"fetch wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5157,18 +4924,11 @@ fn sandbox_toolchain_verify_package_rejects_invalid_required_capability() {
         }
         other => panic!("unexpected error: {other:?}"),
     }
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-extend-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-extend");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/script.wasm"), b"script wasm").expect("module");
     let package_toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5249,18 +5009,11 @@ fn sandbox_toolchain_import_package_can_extend_existing_local_toolchain() {
         toolchain_store.load_manifest(&package_toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-preflight-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-preflight");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/script.wasm"), b"script wasm").expect("script");
     std::fs::write(root.join("bin/cat.wasm"), b"duplicate cat").expect("cat");
@@ -5325,20 +5078,11 @@ fn sandbox_toolchain_import_package_preflights_existing_manifest_conflicts() {
         .expect("manifest");
     assert!(manifest.command("cat").is_ok());
     assert!(manifest.command("script").is_err());
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_rejects_host_path_escape() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-escape-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("root");
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-escape");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
     let package_path = root.join("package.json");
     std::fs::write(
@@ -5378,19 +5122,11 @@ fn sandbox_toolchain_import_package_rejects_host_path_escape() {
         toolchain_store.load_manifest(&toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_rejects_absolute_module_path() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-absolute-module-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("root");
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-absolute-module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
     let package_path = root.join("package.json");
     std::fs::write(
@@ -5430,18 +5166,11 @@ fn sandbox_toolchain_import_package_rejects_absolute_module_path() {
         toolchain_store.load_manifest(&toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_rejects_artifact_file_path_escape() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-artifact-escape-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-artifact-escape");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5487,18 +5216,11 @@ fn sandbox_toolchain_import_package_rejects_artifact_file_path_escape() {
         toolchain_store.load_manifest(&toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_rejects_invalid_artifact_relative_path() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-artifact-destination-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-artifact-destination");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::create_dir_all(root.join("data")).expect("data");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
@@ -5548,18 +5270,11 @@ fn sandbox_toolchain_import_package_rejects_invalid_artifact_relative_path() {
         toolchain_store.load_manifest(&toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_rejects_hash_mismatch() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-hash-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-hash");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"tampered wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5601,18 +5316,11 @@ fn sandbox_toolchain_import_package_rejects_hash_mismatch() {
         toolchain_store.load_manifest(&toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_package_validates_before_writing_manifest() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-package-duplicate-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-package-duplicate");
     std::fs::create_dir_all(root.join("bin")).expect("bin");
     std::fs::write(root.join("bin/python.wasm"), b"python wasm").expect("module");
     let toolchain_id = sinomo_runtime::sandbox::SandboxToolchainId::generate();
@@ -5662,18 +5370,11 @@ fn sandbox_toolchain_import_package_validates_before_writing_manifest() {
         toolchain_store.load_manifest(&toolchain_id),
         Err(sinomo_runtime::sandbox::SandboxToolchainError::NotFound { .. })
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_toolchain_import_busybox_installs_core_applets() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-busybox-import-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-busybox-import");
     let module_path = root.join("busybox.wasm");
     std::fs::create_dir_all(&root).expect("root");
     std::fs::write(
@@ -5729,18 +5430,11 @@ fn sandbox_toolchain_import_busybox_installs_core_applets() {
         manifest.commands.len(),
         sinomo_runtime::sandbox::BUSYBOX_TOOLCHAIN_COMMANDS.len()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_run_applies_toolchain_command_default_limits() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-command-limits-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-command-limits");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
         sinomo_runtime::sandbox::LocalSandboxToolchainStore::new(root.join("cache"));
@@ -5815,7 +5509,6 @@ fn sandbox_run_applies_toolchain_command_default_limits() {
     .expect_err("command output limit");
 
     assert!(matches!(error, SandboxCliError::Parse { .. }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn wasi_stdin_to_stdout_module() -> &'static str {
@@ -5860,13 +5553,7 @@ fn wasi_stdin_to_stdout_module() -> &'static str {
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_rejects_written_bytes_over_limit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-sandbox-quota-run-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-quota-run");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
     let module_path = root.join("write.wat");
@@ -5998,7 +5685,6 @@ fn sandbox_run_rejects_written_bytes_over_limit() {
             .as_deref()
             .is_some_and(|error| error.contains("written-bytes-per-command"))
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -6179,13 +5865,7 @@ fn invite_introducers_keep_fresh_iroh_endpoint_for_same_key() {
 
 #[test]
 fn cluster_join_registration_works_over_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-iroh-join-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-iroh-join");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     paths.ensure().expect("cluster paths");
     let cluster_id = ClusterId::from_legacy_named("cluster_iroh_join").expect("cluster");
@@ -6383,18 +6063,11 @@ fn cluster_join_registration_works_over_iroh() {
     assert!(response.accepted);
     assert_eq!(response.state.cluster_id, cluster_id);
     fixture.join().expect("fake iroh join daemon");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-endpoint-key-cleanup-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-endpoint-key-cleanup");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6464,8 +6137,6 @@ fn cluster_state_sync_txn_removes_stale_member_endpoint_keys_before_republishing
         stale_delete_index < current_put_index,
         "stale endpoint must be deleted before canonical endpoints are put"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -6537,13 +6208,7 @@ fn cluster_raft_role_update_sets_state_and_capabilities() {
 
 #[test]
 fn cluster_network_expiration_keeps_local_owned_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-local-network-expiration-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-local-network-expiration");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6620,18 +6285,11 @@ fn cluster_network_expiration_keeps_local_owned_records() {
         !paths.kv_paths().raft_wal_paths(&node_id).wal.exists(),
         "skipping local expiration must not append a raft delete transaction"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-imported-daemon-snapshot-defer-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-imported-daemon-snapshot-defer");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6694,18 +6352,11 @@ fn imported_daemon_snapshot_defers_volatile_only_materialized_refresh() {
             .is_none(),
         "deferred volatile network info should stay out of the materialized fallback"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-stable-connectivity-sync-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-stable-connectivity-sync");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6757,7 +6408,6 @@ fn stable_connectivity_sync_does_not_rewrite_source_prefix() {
         .expect("connectivity sync ops");
 
     assert!(ops.is_empty());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -6866,13 +6516,7 @@ fn cluster_doctor_reports_duplicate_iroh_endpoint_public_keys() {
 
 #[test]
 fn cluster_peer_members_preserves_pending_local_member() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-peers-offline-introducer-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-peers-offline-introducer");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -6912,18 +6556,11 @@ fn cluster_peer_members_preserves_pending_local_member() {
             == NodeId::from_legacy_named("node_peers_joined").expect("node"))
     );
     read_cluster_kv_snapshot(&paths).expect("repaired kv snapshot");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-install-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-install");
     let data_dir = SinomoDataDir::new(&root);
     let layout = InstallLayout::new(&data_dir, root.join("startup"));
 
@@ -6975,19 +6612,11 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
     assert!(layout.data_dir.exists());
     assert!(layout.binary.exists());
     assert!(layout.shadow_binary.exists());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn install_reports_unregistered_storage_without_blocking_startup() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-install-storage-warning-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("data dir");
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-install-storage-warning");
     std::fs::write(root.join("unexpected-local-file"), b"debug").expect("unexpected file");
     let data_dir = SinomoDataDir::new(&root);
     let layout = InstallLayout::new(&data_dir, root.join("startup"));
@@ -7010,18 +6639,11 @@ fn install_reports_unregistered_storage_without_blocking_startup() {
     }));
 
     uninstall_with_layout(UninstallOptions { stop: false }, &layout).expect("uninstall");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn install_detects_existing_binary_update() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-install-update-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-install-update");
     let destination = root.join("bin").join(if cfg!(windows) {
         "sinomo.exe"
     } else {
@@ -7032,7 +6654,6 @@ fn install_detects_existing_binary_update() {
     std::fs::create_dir_all(destination.parent().expect("parent")).expect("mkdir");
     std::fs::write(&destination, b"old binary").expect("write old binary");
     assert!(install_should_update_binary(&destination).expect("existing destination"));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -7169,13 +6790,7 @@ fn daemonless_cli_uses_degraded_local_mode_for_local_capable_commands() {
 
 #[test]
 fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-daemon-guard-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-daemon-guard");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -7201,8 +6816,6 @@ fn cluster_runtime_quorum_requires_local_daemon_even_with_local_voter_quorum() {
         }
         other => panic!("unexpected error: {other}"),
     }
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn signed_test_invite_uri(
@@ -7233,7 +6846,7 @@ fn signed_test_invite_uri(
 
 #[test]
 fn dfs_parser_accepts_operator_and_pin_commands() {
-    let metadata_root = std::env::temp_dir().join("sinomo-cli-dfs-meta");
+    let metadata_root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-meta");
     assert_eq!(
         parse_dfs_command(&[
             "status".to_string(),
@@ -7243,7 +6856,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         ])
         .expect("dfs status"),
         DfsCliCommand::Status(DfsCommonOptions {
-            metadata_root: Some(metadata_root.clone()),
+            metadata_root: Some(metadata_root.to_path_buf()),
             cluster: false,
             json: true,
         })
@@ -7367,13 +6980,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
 
 #[test]
 fn dfs_operator_inspection_uses_configured_metadata_shards() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-dfs-sharded-inspection-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-sharded-inspection");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -7476,7 +7083,6 @@ fn dfs_operator_inspection_uses_configured_metadata_shards() {
 
     assert_eq!(inspected.object.object_id, object.object_id);
     assert_eq!(inspected.object.path, object.path);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -7583,13 +7189,7 @@ fn cluster_parser_accepts_init_and_join_options() {
 
 #[test]
 fn cluster_init_persists_local_cluster_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-init-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-init");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
 
     cluster_init_with_paths(
@@ -7659,18 +7259,11 @@ fn cluster_init_persists_local_cluster_state() {
         cluster_raft_known_leader_id(&paths, &state).expect("reelected leader"),
         Some(NodeId::from_legacy_named("node_local").expect("node"))
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-unsafe-voter-config-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-unsafe-voter-config");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -7711,18 +7304,11 @@ fn cluster_state_sync_rejects_unsafe_voter_reconfiguration() {
     let added_error =
         sync_cluster_state_to_kv(&paths, &direct_voter_state).expect_err("reject direct voter add");
     assert!(matches!(added_error, CliError::ClusterReadOnly { .. }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-remove-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-remove");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -7782,18 +7368,11 @@ fn cluster_remove_deletes_non_voter_members_from_state_and_kv() {
             .iter()
             .any(|member| member.node_id == non_voter_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_voter_republishes_local_members_missing_from_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-local-member-republish-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-local-member-republish");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -7849,18 +7428,11 @@ fn local_voter_republishes_local_members_missing_from_kv() {
             .iter()
             .any(|member| member.node_id == shadow_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-auth-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-auth");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -7926,25 +7498,12 @@ fn daemon_auth_accepts_signed_local_command_and_rejects_tampering() {
         ),
         Err(super::DaemonError::AuthDenied)
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_auth_only_accepts_active_signed_join_invites() {
-    let host_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-join-auth-host-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let join_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-join-auth-join-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let host_root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-join-auth-host");
+    let join_root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-join-auth-join");
     let host_data_dir = SinomoDataDir::new(&host_root);
     let host_cluster_paths = ClusterPaths::new(&host_data_dir);
     cluster_init_with_paths(
@@ -8025,8 +7584,6 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
         ),
         Err(super::DaemonError::AuthDenied)
     ));
-    std::fs::remove_dir_all(host_root).ok();
-    std::fs::remove_dir_all(join_root).ok();
 }
 
 #[test]
@@ -8339,13 +7896,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
 
 #[test]
 fn cluster_join_records_pending_learner_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-join-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
 
     cluster_join_with_paths(
@@ -8384,18 +7935,11 @@ fn cluster_join_records_pending_learner_state() {
         .expect("shadow daemon member");
     assert_eq!(shadow.role, ClusterMemberRole::NonVoting);
     assert_eq!(shadow.state, ClusterMemberState::Pending);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_invite_generates_portable_join_payload() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-invite-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-invite");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     let output = root.join("join.txt");
     cluster_init_with_paths(
@@ -8497,18 +8041,11 @@ fn cluster_invite_generates_portable_join_payload() {
             .address,
         parsed.communication_channels[0].endpoint.address
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn join_registration_skips_loopback_when_remote_invite_channels_exist() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-invite-channel-filter-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-invite-channel-filter");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -8538,18 +8075,11 @@ fn join_registration_skips_loopback_when_remote_invite_channels_exist() {
 
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].endpoint.address, "192.168.1.10:21353");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn join_registration_keeps_loopback_when_it_is_the_only_invite_channel() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-invite-loopback-only-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-invite-loopback-only");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -8576,18 +8106,11 @@ fn join_registration_keeps_loopback_when_it_is_the_only_invite_channel() {
 
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].endpoint.address, "127.0.0.1:21353");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn explicit_invite_introducer_uses_known_member_endpoint_identity() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-explicit-introducer-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-explicit-introducer");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -8622,25 +8145,12 @@ fn explicit_invite_introducer_uses_known_member_endpoint_identity() {
     assert_eq!(channels.len(), 1);
     assert_eq!(channels[0].endpoint.node_id, remote_node);
     assert_eq!(channels[0].node_public_key, "known-public-key");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_join_uses_structured_invite_cluster_identity() {
-    let host_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-host-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let join_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-join-invite-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let host_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-host");
+    let join_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-join-invite");
     let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
     let join_paths = ClusterPaths::new(&SinomoDataDir::new(&join_root));
     cluster_init_with_paths(
@@ -8692,26 +8202,12 @@ fn cluster_join_uses_structured_invite_cluster_identity() {
             && member.role == ClusterMemberRole::Learner
             && member.state == ClusterMemberState::Pending
     }));
-    std::fs::remove_dir_all(host_root).ok();
-    std::fs::remove_dir_all(join_root).ok();
 }
 
 #[test]
 fn introducer_records_joined_members_and_returns_peer_view() {
-    let host_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-introducer-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let join_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-joining-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let host_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-introducer");
+    let join_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-joining");
     let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
     let join_paths = ClusterPaths::new(&SinomoDataDir::new(&join_root));
     cluster_init_with_paths(
@@ -8805,19 +8301,11 @@ fn introducer_records_joined_members_and_returns_peer_view() {
     assert!(response.state.members.iter().any(|member| {
         member.node_id == NodeId::from_legacy_named("node_remote").expect("node")
     }));
-    std::fs::remove_dir_all(host_root).ok();
-    std::fs::remove_dir_all(join_root).ok();
 }
 
 #[test]
 fn daemon_cluster_kv_txn_persists_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-kv-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-kv");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -8848,18 +8336,11 @@ fn daemon_cluster_kv_txn_persists_snapshot() {
     let store = super::read_cluster_kv_store(&paths).expect("kv store");
     let service = store.get("/services/test").expect("service entry");
     assert_eq!(service.value, br#"{"healthy":true}"#.to_vec());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_sandbox_http_fetch_uses_cluster_policy_and_returns_body() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-http-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -8912,19 +8393,12 @@ fn daemon_sandbox_http_fetch_uses_cluster_policy_and_returns_body() {
     server.join().expect("server");
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"hello world");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-http-to-file-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -9068,19 +8542,12 @@ fn daemon_sandbox_http_fetch_to_file_persists_body_audit_and_event_in_sifs() {
         file_events[0].event.payload["request_id"],
         result.request_id.to_string()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-http-to-file-quota-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file-quota");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -9194,19 +8661,12 @@ fn daemon_sandbox_http_fetch_to_file_records_resource_exhaustion_event() {
         network_events[0].event.payload["workspace_root"],
         sinomo_runtime::sandbox::sandbox_instance_root(&sandbox_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-http-to-file-denied-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file-denied");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -9292,19 +8752,13 @@ fn daemon_sandbox_http_fetch_to_file_audits_policy_denial_without_sifs_writes() 
         .replay(ReplayQuery::by_kind_prefix("sandbox.network"))
         .expect("network events");
     assert!(network_events.is_empty());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-http-to-file-transport-failure-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root =
+        sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-http-to-file-transport-failure");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -9421,19 +8875,12 @@ fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
     );
     assert!(network_events[0].event.payload["status"].is_null());
     assert_eq!(network_events[0].event.payload["response_bytes"], 0);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-busybox-policy-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-busybox-policy");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -9491,20 +8938,12 @@ fn daemon_sandbox_import_busybox_preflights_policy_before_sifs_writes() {
             .iter()
             .any(|event| event.event.payload["phase"] == "sandbox-toolchain-import-busybox")
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-create-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-create");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10051,19 +9490,12 @@ fn daemon_sandbox_create_status_and_busybox_import_use_sifs() {
         toolchain_events[1].event.payload["toolchain_id"],
         import_response.manifest.toolchain_id.to_string()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-toolchain-add-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-toolchain-add");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10186,20 +9618,12 @@ fn daemon_sandbox_toolchain_add_command_persists_sifs_command() {
             .iter()
             .any(|event| event.event.payload["phase"] == "sandbox-toolchain-add-command")
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-toolchain-artifact-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-toolchain-artifact");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10298,20 +9722,12 @@ fn daemon_sandbox_toolchain_add_artifact_persists_sifs_support_file() {
             .iter()
             .any(|event| event.event.payload["phase"] == "sandbox-toolchain-add-artifact")
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-toolchain-package-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-toolchain-package");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10542,20 +9958,12 @@ fn daemon_sandbox_toolchain_import_package_persists_sifs_package() {
             .iter()
             .any(|event| event.event.payload["phase"] == "sandbox-toolchain-import-package")
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-run-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-run");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10674,19 +10082,12 @@ fn daemon_sandbox_run_toolchain_executes_sifs_pinned_command() {
         events[2].event.payload["stdout_ref"],
         outcome.response.stdout_ref
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-process-plan-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-process-plan");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10815,19 +10216,12 @@ fn daemon_sandbox_run_process_plan_executes_sifs_pinned_commands() {
             && event.event.payload["stream"] == "stdout"
             && event.event.payload["byte_len"] == 6
     }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-process-plan-exhausted-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-process-plan-exhausted");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -10979,19 +10373,12 @@ fn daemon_sandbox_run_process_plan_records_events_for_resource_exhausted_step() 
                 .unwrap_or_default()
                 .contains("input limit")
     }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_audits_policy_denial() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-run-denied-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-run-denied");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11064,19 +10451,12 @@ fn daemon_sandbox_run_toolchain_audits_policy_denial() {
     );
     assert_eq!(events[0].event.payload["phase"], "sandbox-run");
     assert_eq!(events[0].event.payload["code"], "toolchain-unsigned-denied");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_run_toolchain_audits_mount_policy_denial() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-run-mount-denied-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-run-mount-denied");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     let execution_node = NodeId::from_legacy_named("node_sandbox_run_mount_exec").expect("node");
     let owner_node = NodeId::from_legacy_named("node_sandbox_run_mount_owner").expect("owner");
@@ -11211,19 +10591,12 @@ fn daemon_sandbox_run_toolchain_audits_mount_policy_denial() {
             .exists(),
         "denied run should not create a daemon staging workspace"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-sandbox-write-ro-mount-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-sandbox-write-ro-mount");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11330,19 +10703,11 @@ fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
         mount_events[0].event.payload["code"],
         "mount-read-only-denied"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-kv-no-quorum-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-kv-no-quorum");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11398,18 +10763,11 @@ fn daemon_cluster_kv_txn_does_not_ack_without_append_quorum() {
             .iter()
             .any(|entry| entry.key == "/config/unsafe")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_cluster_kv_is_read_only_without_cluster_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-kv-no-cluster-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-kv-no-cluster");
     let daemon_paths = DaemonPaths::with_root(root.join("daemon"));
     let txn = KvTxn {
         compares: Vec::new(),
@@ -11436,18 +10794,11 @@ fn daemon_cluster_kv_is_read_only_without_cluster_state() {
             .expect("range"),
         Vec::new()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn single_node_cluster_has_local_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-single-node-quorum-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-single-node-quorum");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11463,18 +10814,11 @@ fn single_node_cluster_has_local_quorum() {
     let state = read_cluster_state(&paths).expect("cluster state");
 
     assert!(cluster_has_local_quorum(&paths, &state));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn network_raft_handlers_reject_mismatched_authenticated_peer() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-raft-auth-binding-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-raft-auth-binding");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11571,18 +10915,11 @@ fn network_raft_handlers_reject_mismatched_authenticated_peer() {
     let forged_vote_response = handle_cluster_raft_vote_rpc(&paths, forged_vote, &forged_auth)
         .expect("forged vote response");
     assert!(!forged_vote_response.accepted);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-stale-snapshot-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-stale-snapshot");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11631,18 +10968,11 @@ fn stale_raft_snapshot_append_does_not_roll_back_local_state() {
             .iter()
             .any(|entry| entry.key == "/config/current" && entry.value == b"current")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn raft_append_request_can_target_follower_next_index() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-targeted-append-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-targeted-append");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     cluster_init_with_paths(
         ClusterInitOptions {
@@ -11699,18 +11029,11 @@ fn raft_append_request_can_target_follower_next_index() {
         heartbeat.append.prev_log_index,
         full.append.entries.last().expect("last entry").index
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_node_status_publishes_version_and_rollout_to_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-node-status-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-node-status");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -11761,7 +11084,7 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         executable: None,
         rollout: None,
         started_at: "2026-05-04T00:00:00Z".to_string(),
-        data_dir: root.clone(),
+        data_dir: root.to_path_buf(),
         lock_file: daemon_paths.lock.clone(),
         cluster: Some(DaemonClusterStatus {
             cluster_id: ClusterId::from_legacy_named("cluster_status").expect("cluster"),
@@ -11804,25 +11127,12 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
             .mode,
         Some("cluster-remote-build".to_string())
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
-    let host_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-sync-host-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    let peer_root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-sync-peer-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let host_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-sync-host");
+    let peer_root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-sync-peer");
     let host_paths = ClusterPaths::new(&SinomoDataDir::new(&host_root));
     let peer_paths = ClusterPaths::new(&SinomoDataDir::new(&peer_root));
     let cluster_id = ClusterId::from_legacy_named("cluster_sync").expect("cluster");
@@ -11997,8 +11307,6 @@ fn daemon_cluster_raft_append_replicates_leader_kv_to_peer() {
     )
     .expect("drain peer watch again");
     assert!(drained_again.events.is_empty());
-    std::fs::remove_dir_all(host_root).ok();
-    std::fs::remove_dir_all(peer_root).ok();
 }
 
 #[test]
@@ -12460,13 +11768,7 @@ fn rollout_cluster_targets_deduplicate_explicit_targets() {
 
 #[test]
 fn rollout_cluster_targets_include_shadow_only_repair_route() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-shadow-only-repair-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-shadow-only-repair");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12518,18 +11820,11 @@ fn rollout_cluster_targets_include_shadow_only_repair_route() {
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, shadow_iroh.address);
     assert_eq!(targets[0].rollout_node_id.as_ref(), Some(&remote_main_id));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_cluster_targets_keep_one_route_per_main_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-one-route-per-main-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-one-route-per-main");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12587,7 +11882,6 @@ fn rollout_cluster_targets_keep_one_route_per_main_node() {
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].address, main_tcp.address);
     assert_eq!(targets[0].rollout_node_id.as_ref(), Some(&remote_main_id));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -12702,13 +11996,7 @@ fn rollout_cluster_target_can_preserve_connectivity_order() {
 
 #[test]
 fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-connectivity-order-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-connectivity-order");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12783,18 +12071,11 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         endpoints.first().expect("endpoint").endpoint_id,
         iroh_endpoint.endpoint_id
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-main-fallback-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-main-fallback");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12870,18 +12151,11 @@ fn rollout_target_uses_main_endpoint_when_shadow_is_unreachable() {
 
     assert_eq!(selected.node_id, main_node_id);
     assert_eq!(selected.endpoint_id, main_endpoint.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_prefers_unknown_private_tcp_over_shadow_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-shadow-iroh-private-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-shadow-iroh-private");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12918,18 +12192,11 @@ fn rollout_target_prefers_unknown_private_tcp_over_shadow_iroh() {
 
     assert_eq!(selected.node_id, shadow_node_id);
     assert_eq!(selected.endpoint_id, private_shadow.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-shadow-private-before-public-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-shadow-private-before-public");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12964,18 +12231,11 @@ fn rollout_target_prefers_unknown_private_shadow_tcp_over_public_tcp() {
 
     assert_eq!(selected.node_id, shadow_node_id);
     assert_eq!(selected.endpoint_id, private_shadow.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-shadow-before-main-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-shadow-before-main");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13041,18 +12301,11 @@ fn rollout_target_prefers_healthy_main_tcp_over_shadow_iroh_backup() {
 
     assert_eq!(selected.node_id, main_node_id);
     assert_eq!(selected.endpoint_id, main_endpoint.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-kv-endpoint-candidates-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-kv-endpoint-candidates");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13083,7 +12336,6 @@ fn rollout_endpoint_candidates_include_kv_only_endpoint_records() {
             .iter()
             .any(|endpoint| endpoint.endpoint_id == iroh_endpoint.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -13098,13 +12350,7 @@ fn rollout_cluster_target_ignores_local_only_shadow_endpoint() {
 
 #[test]
 fn daemon_rollout_build_rejects_missing_remote_repo() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-build-missing-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-build-missing");
     let request = ClusterRolloutBuildRequest {
         source: "test".to_string(),
         remote_repo: None,
@@ -13126,18 +12372,11 @@ fn daemon_rollout_build_rejects_missing_remote_repo() {
             .detail
             .contains("remote source repo is not initialized")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemon_rollout_build_imports_source_bundle_before_building() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-build-bundle-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-build-bundle");
     let source_repo = root.join("source");
     let bundle = root.join("source.bundle");
     std::fs::create_dir_all(&source_repo).expect("source repo dir");
@@ -13218,18 +12457,12 @@ fn daemon_rollout_build_imports_source_bundle_before_building() {
     );
     assert_eq!(source_status.head.as_deref(), Some(expected_head.as_str()));
     assert!(!source_status.has_external_remotes);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_main_activation_without_shadow_requires_staged_binary() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-main-shadow-bootstrap-staged-required-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root =
+        sinomo_testdir::TestDir::new("sinomo-cli-rollout-main-shadow-bootstrap-staged-required");
     let rollout_paths = SelfRolloutPaths::new(&root);
     ensure_rollout_layout(&rollout_paths).expect("layout");
     let error = stage_rollout_main_activation(
@@ -13253,18 +12486,11 @@ fn rollout_main_activation_without_shadow_requires_staged_binary() {
 
     assert!(matches!(error, CliError::DaemonNotRunning { .. }));
     assert!(!super::rollout_main_activation_path(&rollout_paths).exists());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_advance_with_data_dir_records_persisted_runtime_transition() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-advance-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-advance");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let rollout_paths = SelfRolloutPaths::new(&root);
@@ -13335,18 +12561,11 @@ fn rollout_advance_with_data_dir_records_persisted_runtime_transition() {
             .expect("read module state"),
         Some(applied.module_state)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_advance_with_data_dir_accepts_module_replay_report_evidence() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-advance-replay-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-advance-replay");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let rollout_paths = SelfRolloutPaths::new(&root);
@@ -13416,18 +12635,11 @@ fn rollout_advance_with_data_dir_accepts_module_replay_report_evidence() {
     assert_eq!(applied.transition.candidate_artifact_id, Some(artifact_id));
     let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
     assert!(transition.contains(&format!("module-replay-report:{}", report_path.display())));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_advance_with_data_dir_accepts_shadow_telemetry_evidence() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-advance-shadow-telemetry-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-advance-shadow-telemetry");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let rollout_paths = SelfRolloutPaths::new(&root);
@@ -13493,18 +12705,11 @@ fn rollout_advance_with_data_dir_accepts_shadow_telemetry_evidence() {
     assert_eq!(applied.transition.candidate_artifact_id, Some(artifact_id));
     let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
     assert!(transition.contains("module-shadow-telemetry:events/event-log.jsonl?limit=10"));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_telemetry_gates_set_with_data_dir_persists_config() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-rollout-telemetry-gates-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-rollout-telemetry-gates");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let rollout_paths = SelfRolloutPaths::new(&root);
@@ -13530,7 +12735,6 @@ fn rollout_telemetry_gates_set_with_data_dir_persists_config() {
     assert_eq!(stored.minimum_event_count, 20);
     assert_eq!(stored.maximum_automatic_weight_bps, None);
     assert_eq!(stored.maximum_candidate_latency_p95_ms, Some(125));
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn module_shadow_telemetry_event(
@@ -13615,13 +12819,7 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
 
 #[test]
 fn daemon_paths_for_shadow_are_separate_from_main_daemon() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-shadow-paths-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-shadow-paths");
     let data_dir = SinomoDataDir::new(&root);
     let main = super::DaemonPaths::new(&data_dir);
     let shadow = super::DaemonPaths::for_shadow(&data_dir);
@@ -13666,13 +12864,7 @@ fn daemon_parser_uses_port_21353_by_default() {
 
 #[test]
 fn daemon_paths_live_under_data_directory() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-paths-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-paths");
     let paths = super::DaemonPaths::new(&SinomoDataDir::new(&root));
 
     assert_eq!(paths.root, root.join("daemon"));
@@ -13682,13 +12874,7 @@ fn daemon_paths_live_under_data_directory() {
 
 #[test]
 fn daemon_lock_prevents_duplicate_instances_and_preserves_probe_status() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemon-lock-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemon-lock");
     let paths = super::DaemonPaths::new(&SinomoDataDir::new(&root));
     paths.ensure().expect("daemon paths");
 
@@ -13705,7 +12891,6 @@ fn daemon_lock_prevents_duplicate_instances_and_preserves_probe_status() {
         super::probe_daemon_status(&paths, Duration::from_millis(1)),
         DaemonProbeStatus::NotRunning
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -13760,14 +12945,7 @@ fn captured_cli_command_collects_registered_command_stdout() {
 
 #[test]
 fn debug_sobj_command_prints_typed_text() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-debug-sobj-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&root).expect("root");
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-debug-sobj");
     let path = root.join("state.sobj");
     let document = sinomo_runtime::object::Document::dynamic(
         1,
@@ -13797,7 +12975,6 @@ fn debug_sobj_command_prints_typed_text() {
     assert!(stdout.contains("\"node\": \"aarch64\""));
     assert!(stdout.contains("\"port\": uint16(21353)"));
     assert!(captured.output.stderr.is_empty());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(unix)]
@@ -14164,13 +13341,7 @@ fn minicpm_tool_call_response_maps_to_agent_decision_json() {
 
 #[test]
 fn cui_entry_starts_without_daemon_using_local_runtime_config() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-tui-no-daemon-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-no-daemon");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -14225,8 +13396,6 @@ fn cui_entry_starts_without_daemon_using_local_runtime_config() {
     assert!(output.contains("Sinomo main agent"));
     assert!(output.contains("daemon: not connected"));
     assert!(output.contains("ending session"));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -14542,13 +13711,7 @@ fn model_options_parser_distinguishes_clear_from_none() {
 
 #[test]
 fn models_default_writes_global_model_config() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-models-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-models");
     let data_dir = SinomoDataDir::new(&root);
 
     models_default_with_data_dir(
@@ -14571,19 +13734,11 @@ fn models_default_writes_global_model_config() {
     assert_eq!(config["default_provider"], "openai");
     assert_eq!(config["default_account"], "default");
     assert_eq!(config["default_model"], "gpt-5.5");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn main_agent_config_tool_registry_exposes_host_config_catalog() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-agent-config-tools-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-config-tools");
     let data_dir = SinomoDataDir::new(&root);
     let registry = main_agent_config_tool_registry(&data_dir).expect("config tool registry");
     let names: Vec<_> = registry
@@ -14633,19 +13788,11 @@ fn main_agent_config_tool_registry_exposes_host_config_catalog() {
     ] {
         assert!(keys.iter().any(|key| key == &expected), "{expected}");
     }
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-models-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-models");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -14689,19 +13836,11 @@ fn models_default_writes_cluster_model_config_to_kv_for_clustered_node() {
     assert_eq!(config.default_provider.as_deref(), Some("openai"));
     assert_eq!(config.default_account.as_deref(), Some("work"));
     assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_mode_forces_model_config_to_local_file_on_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-local-mode-models-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-local-mode-models");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -14745,19 +13884,11 @@ fn local_mode_forces_model_config_to_local_file_on_clustered_node() {
             .expect("cluster kv"),
     );
     assert!(store.get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY).is_none());
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-daemonless-models-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-daemonless-models");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -14809,19 +13940,11 @@ fn daemonless_cli_model_defaults_use_local_file_on_clustered_node() {
             .expect("cluster kv"),
     );
     assert!(store.get(sinomo_lm::LM_PROVIDER_CONFIG_KV_KEY).is_none());
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-model-runtime-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-model-runtime");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -14871,19 +13994,11 @@ fn models_runtime_writes_cluster_runtime_config_to_kv_for_clustered_node() {
     let saved: sinomo_lm::ModelRuntimeConfig =
         serde_json::from_value(document.value).expect("runtime config");
     assert_eq!(saved, config);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_mode_writes_model_runtime_config_to_local_file_on_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-local-mode-model-runtime-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-local-mode-model-runtime");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -14922,19 +14037,11 @@ fn local_mode_writes_model_runtime_config_to_local_file_on_clustered_node() {
             .expect("cluster kv"),
     );
     assert!(store.get(sinomo_lm::LM_RUNTIME_CONFIG_KV_KEY).is_none());
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sandbox_policy_writes_cluster_policy_config_to_kv_for_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-cluster-sandbox-policy-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-cluster-sandbox-policy");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -15002,19 +14109,11 @@ fn sandbox_policy_writes_cluster_policy_config_to_kv_for_clustered_node() {
     let saved: sinomo_runtime::sandbox::SandboxClusterPolicyConfig =
         serde_json::from_value(document.value).expect("sandbox policy config");
     assert_eq!(saved, config);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-cli-local-mode-sandbox-policy-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-local-mode-sandbox-policy");
     let data_dir = SinomoDataDir::new(&root);
     let cluster_paths = ClusterPaths::new(&data_dir);
     cluster_init_with_paths(
@@ -15063,8 +14162,6 @@ fn local_mode_writes_sandbox_policy_to_local_file_on_clustered_node() {
             .get(sinomo_runtime::sandbox::SANDBOX_POLICY_CONFIG_KV_KEY)
             .is_none()
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

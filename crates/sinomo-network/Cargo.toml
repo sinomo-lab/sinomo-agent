@@ -38,3 +38,6 @@ sinomo-local = { path = "../sinomo-local" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-storage = { path = "../sinomo-storage" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

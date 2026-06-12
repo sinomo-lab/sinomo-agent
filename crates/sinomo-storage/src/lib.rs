@@ -799,13 +799,7 @@ mod tests {
 
     #[test]
     fn verifier_walks_data_dir_files_with_registered_escapes() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-storage-verify-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-storage-verify");
         std::fs::create_dir_all(root.join("cluster/iroh")).expect("cluster iroh");
         std::fs::create_dir_all(root.join("config")).expect("config");
         std::fs::create_dir_all(root.join("providers/openai")).expect("provider");
@@ -911,6 +905,5 @@ mod tests {
 
         assert_eq!(report.unregistered, vec!["unknown/file.bin"]);
         assert_eq!(report.covered.len(), 10);
-        std::fs::remove_dir_all(root).ok();
     }
 }

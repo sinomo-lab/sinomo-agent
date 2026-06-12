@@ -4772,9 +4772,6 @@ mod tests {
                 .expect("read state")
                 .expect("state");
         assert_eq!(read_state, result.state);
-
-        let _ = std::fs::remove_dir_all(data_root);
-        let _ = std::fs::remove_dir_all(package_root);
     }
 
     #[test]
@@ -4782,7 +4779,8 @@ mod tests {
         use std::io::Write as _;
 
         let data_root = unique_temp("declarative-module-zip-data");
-        let zip_path = unique_temp("declarative-module-package").with_extension("zip");
+        let zip_root = unique_temp("declarative-module-package");
+        let zip_path = zip_root.join("package.zip");
         let package_manifest = DeclarativeModulePackageManifest {
             module_id: "module.prompts.system_management".to_string(),
             version: "0.2.0".to_string(),
@@ -4825,9 +4823,6 @@ mod tests {
         assert_eq!(result.registration.surfaces.declarative_resources.len(), 1);
         assert!(result.payload_path.join("prompts/repair.md").exists());
         assert!(result.state_path.as_ref().expect("state path").exists());
-
-        let _ = std::fs::remove_dir_all(data_root);
-        let _ = std::fs::remove_file(zip_path);
     }
 
     #[test]
@@ -4947,7 +4942,6 @@ mod tests {
             .expect("read state")
             .expect("state");
         assert_eq!(read_back, state);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5006,7 +5000,6 @@ mod tests {
             .expect("read unload record")
             .expect("record");
         assert_eq!(read_back, record);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5039,8 +5032,6 @@ mod tests {
         assert_eq!(state.module_id, module_id);
         assert!(!state.enabled);
         assert_eq!(state.source, "test");
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5079,7 +5070,6 @@ mod tests {
             read_module_loader_runtime_state(&root, &module_id).expect("read state"),
             Some(state)
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5147,7 +5137,6 @@ mod tests {
         assert_eq!(active_route.primary_lane, ModuleRouteLane::Active);
         assert_eq!(active_route.primary_artifact_id, active_artifact_id);
         assert_eq!(candidate_route.traffic_weight_bps, 500);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5220,7 +5209,6 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].lane, ModuleInvocationLane::Active);
         assert_eq!(calls[1].lane, ModuleInvocationLane::Shadow);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5326,7 +5314,6 @@ mod tests {
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.events[0].kind.as_str(), "module.shadow.decision");
         assert_eq!(report.events[0].payload["shadow_matched"], true);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5381,7 +5368,6 @@ mod tests {
         assert_eq!(report.event_count, 1);
         assert_eq!(report.matched_count, 1);
         assert_eq!(report.mismatch_count, 0);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5466,7 +5452,6 @@ mod tests {
         assert_eq!(report.active_primary_count, 0);
         assert_eq!(report.candidate_error_count, 0);
         assert_eq!(report.candidate_latency_sample_count, 1);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5728,7 +5713,6 @@ mod tests {
         assert_eq!(report.shadow_mismatch_count, 1);
         assert_eq!(report.cases[0].shadow_matched, Some(false));
         assert_eq!(report.events[0].payload["shadow_matched"], false);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5755,7 +5739,6 @@ mod tests {
             Some("sh")
         );
         assert_eq!(read_back, registry);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5801,7 +5784,6 @@ mod tests {
         assert_eq!(outcome.primary.lane, ModuleInvocationLane::Active);
         assert_eq!(outcome.primary.output.as_deref(), Some("active:payload"));
         assert!(outcome.shadow.is_none());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5863,7 +5845,6 @@ mod tests {
                 .and_then(|result| result.output.as_deref()),
             Some("shadow:payload")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5927,15 +5908,10 @@ mod tests {
         .expect("route");
 
         assert_eq!(route, None);
-        let _ = std::fs::remove_dir_all(root);
     }
 
-    fn unique_temp(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}-{}",
-            prefix,
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
+    fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(prefix)
     }
 
     fn runtime_state(

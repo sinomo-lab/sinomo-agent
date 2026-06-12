@@ -565,16 +565,11 @@ fn set_process_group(pid: i32, pgid: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
 
     #[cfg(not(windows))]
     #[test]
     fn process_manager_streams_stdin_output_and_cancels() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-process-manager-{}",
-            TaskId::generate()
-        ));
-        fs::create_dir_all(&root).expect("workspace");
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-process-manager");
         let manager = AgentProcessManager::new();
         let initial = manager
             .start(

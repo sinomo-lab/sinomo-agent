@@ -2057,7 +2057,11 @@ fn default_root() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock after epoch")
         .as_nanos();
-    env::temp_dir().join(format!("sinomo-dfs-scale-bench-{}-{nanos}", process::id()))
+    // Under the sinomo-tests parent so a forgotten bench root is reclaimed by
+    // sinomo-testdir's stale sweep; the bench itself manages cleanup (--keep).
+    env::temp_dir()
+        .join("sinomo-tests")
+        .join(format!("sinomo-dfs-scale-bench-{}-{nanos}", process::id()))
 }
 
 fn remove_dir_all_if_exists(path: &Path) -> BenchResult<()> {

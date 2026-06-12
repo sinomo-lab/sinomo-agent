@@ -719,18 +719,14 @@ mod tests {
         }
     }
 
-    fn unique_auth_test_root(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{name}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ))
+    fn unique_auth_test_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(name)
     }
 
-    fn unique_auth_test_paths(name: &str) -> DaemonPaths {
-        DaemonPaths::with_root(unique_auth_test_root(name))
+    fn unique_auth_test_paths(name: &str) -> (sinomo_testdir::TestDir, DaemonPaths) {
+        let root = unique_auth_test_root(name);
+        let paths = DaemonPaths::with_root(root.to_path_buf());
+        (root, paths)
     }
 
     fn has_byte_window(haystack: &[u8], needle: &[u8]) -> bool {
@@ -775,7 +771,7 @@ mod tests {
 
     #[test]
     fn daemon_auth_nonce_rejects_replays_without_touching_disk() {
-        let paths = unique_auth_test_paths("sinomo-daemon-auth-nonce-mem");
+        let (_root, paths) = unique_auth_test_paths("sinomo-daemon-auth-nonce-mem");
         let first = signed_nonce("nonce-one");
         remember_daemon_auth_nonce(&paths, &first).expect("remember first nonce");
 
@@ -796,8 +792,8 @@ mod tests {
 
     #[test]
     fn daemon_auth_nonce_sets_are_isolated_per_daemon_root() {
-        let paths_a = unique_auth_test_paths("sinomo-daemon-auth-nonce-root-a");
-        let paths_b = unique_auth_test_paths("sinomo-daemon-auth-nonce-root-b");
+        let (_root_a, paths_a) = unique_auth_test_paths("sinomo-daemon-auth-nonce-root-a");
+        let (_root_b, paths_b) = unique_auth_test_paths("sinomo-daemon-auth-nonce-root-b");
         let nonce = signed_nonce("shared-nonce");
         remember_daemon_auth_nonce(&paths_a, &nonce).expect("remember under root a");
         // Replay under the same root is rejected...

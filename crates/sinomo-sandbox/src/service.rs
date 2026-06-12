@@ -261,11 +261,9 @@ mod tests {
         }
     }
 
-    fn local_context(sink: CollectingSink) -> ServiceContext {
+    fn local_context(dir: &std::path::Path, sink: CollectingSink) -> ServiceContext {
         ServiceContext {
-            data_dir: Arc::new(SinomoDataDir::new(
-                std::env::temp_dir().join("sinomo-service-sandbox-test"),
-            )),
+            data_dir: Arc::new(SinomoDataDir::new(dir)),
             cluster: None,
             signer: ServiceSigner::Local,
             sink: Box::new(sink),
@@ -306,10 +304,11 @@ mod tests {
         .build();
         assert!(registry.owns(SANDBOX_STATUS_ROUTE));
 
+        let dir = sinomo_testdir::TestDir::new("sinomo-service-sandbox-test");
         let request =
             ObjectRpcRequest::encode_body(SANDBOX_STATUS_ROUTE, "sandbox", &()).expect("encode");
         let error = registry
-            .dispatch(local_context(CollectingSink::default()), request)
+            .dispatch(local_context(&dir, CollectingSink::default()), request)
             .await
             .expect_err("factory failure should surface");
         assert!(

@@ -310,12 +310,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn complete_uses_codex_exec_process_and_reads_last_message_file() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sinomo-codex-test-{stamp}"));
-        fs::create_dir_all(&dir).expect("test dir");
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-test");
         let script = dir.join("exec");
         {
             let mut file = fs::File::create(&script).expect("script create");
@@ -329,7 +324,7 @@ mod tests {
         let provider = CodexCliProvider::new(CodexCliConfig {
             program: "/bin/sh".to_string(),
             skip_git_repo_check: true,
-            working_dir: Some(dir.clone()),
+            working_dir: Some(dir.to_path_buf()),
             ..CodexCliConfig::default()
         });
 
@@ -342,7 +337,6 @@ mod tests {
                 .starts_with("last-message:system:\nReturn a concise answer.")
         );
         assert!(response.content.contains("user:\nSay hello."));
-        fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

@@ -52,3 +52,4 @@ tower-layer = "0.3"
 tower-service = "0.3"
 
 [dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

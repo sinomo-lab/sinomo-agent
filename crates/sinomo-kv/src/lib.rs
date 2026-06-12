@@ -10304,7 +10304,7 @@ mod tests {
     #[test]
     fn cluster_kv_paths_prefix_read_uses_materialized_snapshot_limits() {
         let root = temp_raft_root("sinomo-kv-cluster-prefix-read");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let cache = paths.local_cache();
         let mut store = InProcessKvStore::new();
         for (key, value) in [
@@ -10336,14 +10336,12 @@ mod tests {
                 max_entries: 1,
             }
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_paths_read_missing_materialized_snapshot_as_empty() {
         let root = temp_raft_root("sinomo-kv-cluster-missing-snapshot-read");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
 
         assert_eq!(
             read_cluster_kv_entry(&paths, "/missing").expect("read missing entry"),
@@ -10353,8 +10351,6 @@ mod tests {
             read_cluster_kv_prefix_entries(&paths, "/missing/").expect("read missing prefix"),
             Vec::new()
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10601,8 +10597,6 @@ mod tests {
                 .as_slice(),
             b"new"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -10665,9 +10659,6 @@ mod tests {
                 .as_slice(),
             b"a"
         );
-
-        std::fs::remove_dir_all(root).ok();
-        std::fs::remove_dir_all(restored_root).ok();
     }
 
     #[test]
@@ -11012,7 +11003,7 @@ mod tests {
     #[test]
     fn cluster_kv_watch_event_log_open_for_append_creates_and_reopens_log() {
         let root = temp_raft_root("sinomo-kv-watch-event-log-open");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
 
         let first = open_cluster_kv_watch_event_log_for_append(&paths).expect("open new log");
         lock_cluster_kv_watch_event_log_for_append(&paths, &first).expect("lock new log");
@@ -11033,7 +11024,6 @@ mod tests {
 
         let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
         assert_eq!(read.records, 1);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -11066,7 +11056,7 @@ mod tests {
     #[test]
     fn cluster_kv_watch_event_log_batch_appends_to_log_file() {
         let root = temp_raft_root("sinomo-kv-watch-event-log-append");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let parent = paths.watch_events_log.parent().expect("log parent");
         std::fs::create_dir_all(parent).expect("create log parent");
         let mut log_file = std::fs::OpenOptions::new()
@@ -11091,13 +11081,12 @@ mod tests {
         let read = read_cluster_kv_watch_event_log(&paths).expect("read log");
         assert_eq!(read.events, events);
         assert_eq!(read.records, 2);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_event_log_truncates_log_file() {
         let root = temp_raft_root("sinomo-kv-watch-event-log-truncate");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let parent = paths.watch_events_log.parent().expect("log parent");
         std::fs::create_dir_all(parent).expect("create log parent");
         let mut log_file = std::fs::OpenOptions::new()
@@ -11126,13 +11115,12 @@ mod tests {
                 .len(),
             0
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_events_read_merges_checkpoint_and_log() {
         let root = temp_raft_root("sinomo-kv-watch-events-read");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let checkpoint = vec![
             test_kv_put_event(1, "/svc/a", b"a"),
             test_kv_put_event(2, "/svc/b", b"b"),
@@ -11172,13 +11160,12 @@ mod tests {
             vec![KvRevision(1), KvRevision(2), KvRevision(3), KvRevision(4)]
         );
         assert_eq!(observed_read_bytes, batch.bytes);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_events_append_to_storage_uses_cache_view() {
         let root = temp_raft_root("sinomo-kv-watch-events-append-storage");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let first = test_kv_put_event(1, "/svc/a", b"a");
         let second = test_kv_put_event(2, "/svc/b", b"b");
         let mut observed_read_bytes = 0_u64;
@@ -11258,13 +11245,12 @@ mod tests {
                 .events,
             second_report.retained
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_registration_file_validates_watch_id_and_removes() {
         let root = temp_raft_root("sinomo-kv-watch-registration-file");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let path = paths.watch_path(WatchId(7));
         let registration = ClusterKvWatchRegistration {
             watch_id: WatchId(7),
@@ -11296,13 +11282,12 @@ mod tests {
             !remove_cluster_kv_watch_registration_file_if_exists(&path)
                 .expect("remove absent registration")
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_allocator_state_defaults_and_normalizes_next_id() {
         let root = temp_raft_root("sinomo-kv-watch-allocator-state");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
 
         assert_eq!(
             read_cluster_kv_watch_allocator_state(&paths).expect("default allocator"),
@@ -11323,19 +11308,17 @@ mod tests {
                 pruned_compacted_revision: Some(KvRevision(11)),
             }
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_allocator_lock_creates_durable_lock_file() {
         let root = temp_raft_root("sinomo-kv-watch-allocator-lock");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
 
         let lock = lock_cluster_kv_watch_allocator(&paths).expect("lock allocator");
 
         assert!(paths.watches_lock.exists());
         lock.unlock().expect("unlock allocator");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -11442,7 +11425,7 @@ mod tests {
     #[test]
     fn cluster_kv_watch_registration_create_allocates_and_reports_allocator() {
         let root = temp_raft_root("sinomo-kv-watch-create");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
 
         let first = create_cluster_kv_watch_registration(
             &paths,
@@ -11488,13 +11471,12 @@ mod tests {
         assert_eq!(second.registration.watch_id, WatchId(2));
         assert!(second.scan.is_none());
         assert_eq!(second.allocator.active_watch_count, Some(2));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_lifecycle_helpers_create_drain_append_and_cancel() {
         let root = temp_raft_root("sinomo-kv-watch-lifecycle-helper");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let node_id = NodeId::from_legacy_named("node_kv_watch_lifecycle").expect("node");
         let mut store = InProcessKvStore::new();
         store
@@ -11590,13 +11572,12 @@ mod tests {
             .expect("cancel already removed watch")
             .cancelled
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_event_handler_skips_storage_without_active_watchers() {
         let root = temp_raft_root("sinomo-kv-watch-fanout-no-active-watchers");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         write_cluster_kv_snapshot(&paths, &InProcessKvStore::new().snapshot())
             .expect("write empty snapshot");
         let cluster_id =
@@ -11636,13 +11617,12 @@ mod tests {
             !paths.watch_events_log.exists(),
             "no active watcher should avoid log appends"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_event_handler_rejects_invalid_source_before_storage() {
         let root = temp_raft_root("sinomo-kv-watch-fanout-reject-invalid-source");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let cluster_id = Id::from_legacy_named("cluster_kv_watch_fanout_reject").expect("cluster");
         let leader_id =
             NodeId::from_legacy_named("node_kv_watch_fanout_reject_leader").expect("leader");
@@ -11705,13 +11685,12 @@ mod tests {
         );
         assert!(!paths.watch_events.exists());
         assert!(!paths.watch_events_log.exists());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_registration_create_prunes_and_keeps_high_watermark() {
         let root = temp_raft_root("sinomo-kv-watch-create-scan");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         std::fs::create_dir_all(&paths.watches).expect("watch dir");
         let stale_path = paths.watch_path(WatchId(7));
         let live_path = paths.watch_path(WatchId(9));
@@ -11754,7 +11733,6 @@ mod tests {
         assert_eq!(scan.retained, 1);
         assert_eq!(scan.removed, 1);
         assert_eq!(scan.max_seen_id, 9);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -11871,7 +11849,7 @@ mod tests {
     #[test]
     fn cluster_kv_watch_registration_remove_reports_allocator_update() {
         let root = temp_raft_root("sinomo-kv-watch-remove");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let registration = ClusterKvWatchRegistration {
             watch_id: WatchId(7),
             prefix: "/svc/".to_string(),
@@ -11910,13 +11888,12 @@ mod tests {
                 .expect("remove absent registration")
                 .removed
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_drain_cursor_persistence_writes_only_when_needed() {
         let root = temp_raft_root("sinomo-kv-watch-drain-cursor-persist");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let watch_path = paths.watch_path(WatchId(7));
         let registration = ClusterKvWatchRegistration {
             watch_id: WatchId(7),
@@ -11980,13 +11957,12 @@ mod tests {
                 .expect("read unchanged durable registration"),
             advanced
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_watch_scan_prunes_stale_and_invalid_registrations() {
         let root = temp_raft_root("sinomo-kv-watch-scan");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         std::fs::create_dir_all(&paths.watches).expect("watch dir");
         let stale_path = paths.watch_path(WatchId(7));
         let live_path = paths.watch_path(WatchId(9));
@@ -12045,13 +12021,12 @@ mod tests {
         assert!(scan.removed_paths.contains(&stale_path));
         assert!(scan.removed_paths.contains(&mismatched_path));
         assert!(scan.removed_paths.contains(&corrupt_path));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_active_watch_registration_report_updates_allocator_after_scan() {
         let root = temp_raft_root("sinomo-kv-active-watch-report");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         std::fs::create_dir_all(&paths.watches).expect("watch dir");
         let stale = ClusterKvWatchRegistration {
             watch_id: WatchId(2),
@@ -12097,7 +12072,6 @@ mod tests {
             !paths.watch_path(stale.watch_id).exists(),
             "stale registration should be pruned by report scan"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -12114,7 +12088,7 @@ mod tests {
     #[test]
     fn cluster_kv_watch_registration_listing_ignores_invalid_files() {
         let root = temp_raft_root("sinomo-kv-watch-registration-list");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         std::fs::create_dir_all(&paths.watches).expect("watch dir");
         let first = ClusterKvWatchRegistration {
             watch_id: WatchId(3),
@@ -12148,7 +12122,6 @@ mod tests {
         registrations.sort_by_key(|registration| registration.watch_id);
 
         assert_eq!(registrations, vec![first, second]);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -12273,14 +12246,7 @@ mod tests {
             .lock()
             .expect("object mark cache mutex");
         // Unique path so the test is independent of any shared state.
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-objfile-guard-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-objfile-guard");
         let path = root.join("obj.sobj");
 
         let record = TestRecord {
@@ -12320,8 +12286,6 @@ mod tests {
             restored, record,
             "a file changed since our last write must be rewritten, not skipped"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -12373,14 +12337,7 @@ mod tests {
 
     #[test]
     fn write_object_file_cleans_temp_file_after_replace_failure() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-objfile-temp-cleanup-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-objfile-temp-cleanup");
         let path = root.join("obj.sobj");
         std::fs::create_dir(&path).expect("target directory");
 
@@ -12407,20 +12364,11 @@ mod tests {
             leftovers, 0,
             "failed object replacement should not leave staged temp files"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn read_optional_object_returns_none_only_for_missing_file() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-optional-objfile-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-optional-objfile");
         let missing_path = root.join("missing.sobj");
         assert_eq!(
             read_optional_object::<TestRecord>(&missing_path).expect("missing optional object"),
@@ -12446,20 +12394,11 @@ mod tests {
             error.to_string().contains("directory.sobj"),
             "present unreadable objects should stay errors, got {error}"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn read_object_file_rejects_oversized_object_before_reading() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-objfile-oversized-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-objfile-oversized");
         let path = root.join("snapshot.sobj");
         OpenOptions::new()
             .create(true)
@@ -12482,8 +12421,6 @@ mod tests {
             ),
             "unexpected error for oversized object: {error:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -14506,13 +14443,7 @@ mod tests {
 
     #[test]
     fn materialized_cache_round_trips_snapshot_as_store() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-materialized-cache-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-cache");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let mut store = InProcessKvStore::new();
         store
@@ -14533,18 +14464,11 @@ mod tests {
         );
         let restored = cache.read_store().expect("read cache");
         assert_eq!(restored.get("alpha").expect("alpha").value, b"one");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_initial_write_skips_required_snapshot_read() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-materialized-cache-initial-write-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-cache-initial-write");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let mut store = InProcessKvStore::new();
         store
@@ -14562,18 +14486,11 @@ mod tests {
             0,
             "initial materialized-cache writes should use the optional snapshot read path, not a required missing-file read"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_optional_snapshot_read_handles_absent_present_and_invalid() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-materialized-optional-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-optional");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         assert!(
             cache
@@ -14604,18 +14521,11 @@ mod tests {
             error.to_string().contains("kv-cache.sobj"),
             "present invalid snapshots should stay errors, got {error}"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_canonicalizes_external_snapshot_entries_on_read() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-materialized-canonical-read-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-canonical-read");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let entry = |key: &str, value: &[u8]| KvEntry {
             key: key.to_string(),
@@ -14662,18 +14572,11 @@ mod tests {
         assert_eq!(read.get("alpha").expect("alpha").value, b"one");
         assert_eq!(read.leases.len(), 1);
         assert_eq!(read.leases[0].ttl_ticks, 20);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_skips_rewrite_on_revision_only_changes() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-durable-skip-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-durable-skip");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let mut store = InProcessKvStore::new();
         store.put("alpha", b"one".to_vec(), None).expect("seed");
@@ -14712,7 +14615,6 @@ mod tests {
                 .value,
             b"two"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -14760,18 +14662,11 @@ mod tests {
             0,
             "raft-view reads should derive durable-state presence from the identity probe"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_persists_lease_decay() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-lease-decay-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-lease-decay");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let mut store = InProcessKvStore::new();
         store
@@ -14818,18 +14713,11 @@ mod tests {
                 .remaining_ticks,
             6
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_reports_exact_materialized_snapshot_changes() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-materialized-exact-change-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-exact-change");
         let cache = KvMaterializedCache::new(root.join("kv-cache.sobj"));
         let mut store = InProcessKvStore::new();
         store.put("alpha", b"one".to_vec(), None).expect("seed");
@@ -14863,18 +14751,11 @@ mod tests {
         let persisted = cache.read_snapshot().expect("read exact snapshot");
         assert_eq!(persisted.revision, event_only_change.revision);
         assert_eq!(persisted.events, event_only_change.events);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_compacts_event_history_to_configured_limit() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-materialized-compact-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-materialized-compact");
         let cache =
             KvMaterializedCache::new(root.join("kv-cache.sobj")).with_max_materialized_events(4);
         let mut store = InProcessKvStore::new();
@@ -14903,18 +14784,11 @@ mod tests {
                 .write_snapshot_if_changed(&store.snapshot())
                 .expect("skip unchanged")
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_does_not_replace_existing_raft_log() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-cache-does-not-replace-log-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-cache-does-not-replace-log");
         let node_id = NodeId::from_legacy_named("node_cache_existing_log").expect("node");
         let wal_paths = KvWalPaths::new(root.join("raft"));
         {
@@ -14944,18 +14818,11 @@ mod tests {
             .expect("open with cache");
         assert_eq!(node.last_log_index(), 1);
         assert!(node.store().get("/cache").is_none());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_current_snapshot_does_not_initialize_empty_raft_root() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-empty-raft-read-only-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-empty-raft-read-only");
         let node_id = NodeId::from_legacy_named("node_empty_raft_read_only").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         let wal_paths = cache.raft_wal_paths(&node_id);
@@ -14986,18 +14853,11 @@ mod tests {
             !wal_paths.snapshot.exists(),
             "read should not create raft snapshot"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_empty_snapshot_does_not_initialize_empty_raft_root() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-empty-raft-empty-read-only-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-empty-raft-empty-read-only");
         let node_id = NodeId::from_legacy_named("node_empty_raft_empty_read_only").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         let wal_paths = cache.raft_wal_paths(&node_id);
@@ -15017,18 +14877,11 @@ mod tests {
             !wal_paths.snapshot.exists(),
             "read should not create raft snapshot"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_raft_view_reports_invalid_snapshot_without_initializing_empty_raft() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-empty-raft-invalid-cache-read-only-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-empty-raft-invalid-cache-read-only");
         let node_id = NodeId::from_legacy_named("node_invalid_cache_read_only").expect("node");
         let cache = KvMaterializedCache::new(root.join("cache.sobj"));
         let wal_paths = KvWalPaths::new(root.join("raft"));
@@ -15053,18 +14906,11 @@ mod tests {
             !wal_paths.snapshot.exists(),
             "read should not create raft snapshot"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn materialized_cache_open_validates_fallback_before_quarantining_raft() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-invalid-fallback-before-quarantine-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-invalid-fallback-before-quarantine");
         let node_id =
             NodeId::from_legacy_named("node_invalid_fallback_before_quarantine").expect("node");
         let wal_paths = KvWalPaths::new(root.join("raft"));
@@ -15106,18 +14952,11 @@ mod tests {
             !quarantined,
             "invalid fallback cache must not create a raft quarantine directory"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_current_store_prefers_raft_and_refreshes_materialized_cache() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache");
         let node_id = NodeId::from_legacy_named("node_local_cache").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         {
@@ -15155,18 +14994,11 @@ mod tests {
                 .value,
             b"current"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_current_store_falls_back_to_snapshot_when_raft_node_is_busy() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-busy-fallback-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache-busy-fallback");
         let node_id = NodeId::from_legacy_named("node_local_cache_busy").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         let mut cached_store = InProcessKvStore::new();
@@ -15187,18 +15019,11 @@ mod tests {
             current.get("/cached").expect("cached value").value,
             b"available"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_current_store_uses_raft_view_cache_when_lock_is_busy() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-raft-view-cache-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache-raft-view-cache");
         let node_id = NodeId::from_legacy_named("node_local_cache_raft_view_cache").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         {
@@ -15242,18 +15067,11 @@ mod tests {
             cached.get("/raft-cached").expect("cached raft value").value,
             b"current"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_point_and_prefix_reads_use_cached_raft_view_when_lock_is_busy() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-snapshot-read-cache-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache-snapshot-read-cache");
         let node_id = NodeId::from_legacy_named("node_local_cache_snapshot_read").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         {
@@ -15322,18 +15140,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/apps/service/a", "/apps/service/b"]
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_raft_view_cache_invalidates_after_wal_change() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-raft-view-invalidate-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache-raft-view-invalidate");
         let node_id =
             NodeId::from_legacy_named("node_local_cache_raft_view_invalidate").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
@@ -15377,18 +15188,11 @@ mod tests {
             .expect("read after wal changed");
         assert!(refreshed.get("/raft/first").is_some());
         assert!(refreshed.get("/raft/second").is_some());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn durable_raft_node_open_waits_for_transient_lock_holder() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-raft-lock-wait-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-raft-lock-wait");
         let node_id = NodeId::from_legacy_named("node_raft_lock_wait").expect("node");
         let paths = KvWalPaths::new(root.join("raft"));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
@@ -15405,7 +15209,6 @@ mod tests {
         let node = DurableRaftKvNode::open(node_id, paths).expect("wait for raft node lock");
         assert_eq!(node.last_log_index(), 0);
         holder.join().expect("join holder");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -15425,13 +15228,7 @@ mod tests {
 
     #[test]
     fn local_cache_reads_entries_without_exposing_snapshot_files() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-read-interface-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache-read-interface");
         let node_id = NodeId::from_legacy_named("node_local_cache_read").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
         let mut store = InProcessKvStore::new();
@@ -15457,18 +15254,11 @@ mod tests {
                 .expect("range values"),
             vec!["node-a".to_string(), "node-b".to_string()]
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn local_cache_typed_prefix_reads_are_bounded() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-local-cache-typed-range-limit-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-local-cache-typed-range-limit");
         let node_id =
             NodeId::from_legacy_named("node_local_cache_typed_range_limit").expect("node");
         let cache = KvLocalCache::new(root.join("cache.sobj"), root.join("raft"));
@@ -15516,8 +15306,6 @@ mod tests {
                 ..
             } if prefix == "/dfs/services/content/"
         ));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -16000,14 +15788,7 @@ mod tests {
 
     #[test]
     fn become_leader_refuses_terms_below_observed() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-become-leader-stale-term-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-become-leader-stale-term");
         let node_id = NodeId::from_legacy_named("node_become_leader_stale").expect("node");
         let mut node =
             DurableRaftKvNode::open(node_id, KvWalPaths::new(root.join("raft"))).expect("open");
@@ -16022,19 +15803,11 @@ mod tests {
         node.become_leader(10)
             .expect("become leader at observed term");
         assert_eq!(node.hard_state().current_term, 10);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn quorum_commit_sequence_lock_serializes_concurrent_committers() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-kv-commit-sequence-race-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-kv-commit-sequence-race");
         let kv_paths = ClusterKvPaths::new(&root);
         let local = NodeId::from_legacy_named("node_commit_sequence_race").expect("local");
         let remote = NodeId::from_legacy_named("node_commit_sequence_remote").expect("remote");
@@ -16092,7 +15865,6 @@ mod tests {
                 );
             }
         }
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -16832,7 +16604,6 @@ mod tests {
         assert_eq!(node.store().get("/config/a").expect("a").value, b"one");
         assert_eq!(node.store().get("/config/b").expect("b").value, b"two");
         assert_eq!(node.hard_state().commit_index, 2);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -16877,7 +16648,6 @@ mod tests {
                 "unchanged snapshot save should not rewrite an identical snapshot object"
             );
         }
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -16920,7 +16690,6 @@ mod tests {
             snapshot_after.modified().ok()
         );
         drop(node);
-        std::fs::remove_dir_all(root).ok();
     }
 
     struct ClusterKvRaftSnapshotByteLimitGuard {
@@ -16946,7 +16715,7 @@ mod tests {
         let _limit_guard = ClusterKvRaftSnapshotByteLimitGuard::install(1);
         let root = temp_raft_root("sinomo-kv-raft-oversized-snapshot-idle");
         let node_id = NodeId::from_legacy_named("node_oversized_snapshot_idle").expect("node");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let wal_paths = paths.raft_wal_paths(&node_id);
 
         {
@@ -16989,7 +16758,6 @@ mod tests {
             after.modified().ok(),
             "oversized snapshots without compactable event history should not be re-saved on idle open"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17037,7 +16805,6 @@ mod tests {
         assert_eq!(node.snapshot_index(), command_count);
         assert!(node.log().len() <= RAFT_COMPACTION_RETAINED_ENTRIES as usize);
         drop(node);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17045,7 +16812,7 @@ mod tests {
         let root = temp_raft_root("sinomo-kv-raft-store-async-open-compacts");
         let node_id =
             NodeId::from_legacy_named("node_raft_store_async_open_compacts").expect("node");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let wal_paths = paths.raft_wal_paths(&node_id);
         let command_count = RAFT_COMPACTION_RETAINED_ENTRIES
             .saturating_mul(2)
@@ -17086,7 +16853,6 @@ mod tests {
         assert_eq!(node.snapshot_index(), command_count);
         assert!(node.log().len() <= RAFT_COMPACTION_RETAINED_ENTRIES as usize);
         drop(node);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17095,7 +16861,7 @@ mod tests {
         let node_id = NodeId::from_legacy_named("node_raft_store_vote_leader").expect("node");
         let candidate_id =
             NodeId::from_legacy_named("node_raft_store_candidate").expect("candidate");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let store = ClusterKvRaftStore::new(
             paths.clone(),
             ClusterKvRaftCompactionPolicy {
@@ -17178,8 +16944,6 @@ mod tests {
                 .expect("known leader after clear"),
             None
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17188,7 +16952,7 @@ mod tests {
         let follower_id =
             NodeId::from_legacy_named("node_raft_store_append_follower").expect("follower");
         let leader_id = NodeId::from_legacy_named("node_raft_store_append_leader").expect("leader");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let store = ClusterKvRaftStore::new(
             paths.clone(),
             ClusterKvRaftCompactionPolicy {
@@ -17265,14 +17029,12 @@ mod tests {
                 vote_granted: false,
             }
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_raft_store_builds_vote_responses() {
         let root = temp_raft_root("sinomo-kv-raft-store-vote-response");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let local_id =
             NodeId::from_legacy_named("node_raft_store_vote_response_local").expect("local");
         let candidate_id = NodeId::from_legacy_named("node_raft_store_vote_response_candidate")
@@ -17331,15 +17093,13 @@ mod tests {
         assert!(!rejected.vote.vote_granted);
         assert_eq!(rejected.vote.term, 1);
         assert!(rejected.detail.contains("unauthorized"));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_raft_store_appends_commits_and_detects_no_effect_commands() {
         let root = temp_raft_root("sinomo-kv-raft-store-command");
         let node_id = NodeId::from_legacy_named("node_raft_store_command").expect("node");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let store = ClusterKvRaftStore::new(
             paths.clone(),
             ClusterKvRaftCompactionPolicy {
@@ -17424,15 +17184,13 @@ mod tests {
                 .value,
             b"pending".to_vec()
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn cluster_kv_raft_local_command_storage_appends_commits_and_discards() {
         let root = temp_raft_root("sinomo-kv-local-command-storage");
         let node_id = NodeId::from_legacy_named("node_kv_local_command_storage").expect("node");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let store = ClusterKvRaftStore::new(
             paths.clone(),
             ClusterKvRaftCompactionPolicy {
@@ -17481,8 +17239,6 @@ mod tests {
             .expect("discard tail");
         assert!(discarded.get("/raft-local-storage/discarded").is_none());
         assert_eq!(storage.take_last_snapshot_publish_wrote(), Some(false));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17491,7 +17247,7 @@ mod tests {
         let node_id = NodeId::from_legacy_named("node_raft_store_append_request").expect("node");
         let leader_id =
             NodeId::from_legacy_named("node_raft_store_append_request_leader").expect("leader");
-        let paths = ClusterKvPaths::new(root.clone());
+        let paths = ClusterKvPaths::new(root.to_path_buf());
         let store = ClusterKvRaftStore::new(
             paths.clone(),
             ClusterKvRaftCompactionPolicy {
@@ -17553,8 +17309,6 @@ mod tests {
             )
             .expect("far");
         assert!(far.snapshot.is_some());
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17603,7 +17357,6 @@ mod tests {
             node.store().get("/retain/400").expect("entry").value,
             400u64.to_le_bytes().to_vec()
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17620,7 +17373,6 @@ mod tests {
             .expect("open async");
 
         assert_eq!(node.node_id(), &node_id);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17654,7 +17406,6 @@ mod tests {
                 .value,
             b"lost"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17687,7 +17438,6 @@ mod tests {
         );
         assert_eq!(node.hard_state(), &RaftHardState::default());
         assert!(node.store().get("/rollback/local").is_none());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17741,8 +17491,6 @@ mod tests {
         );
         assert_eq!(follower.hard_state(), &RaftHardState::default());
         assert!(follower.store().get("/rollback/follower").is_none());
-        std::fs::remove_dir_all(leader_root).ok();
-        std::fs::remove_dir_all(follower_root).ok();
     }
 
     #[test]
@@ -17805,8 +17553,6 @@ mod tests {
                 .is_none(),
             "failed hard-state persistence must not expose the committed value"
         );
-        std::fs::remove_dir_all(leader_root).ok();
-        std::fs::remove_dir_all(follower_root).ok();
     }
 
     #[test]
@@ -17851,7 +17597,6 @@ mod tests {
             entry.index,
             "the durable uncommitted WAL entry should remain available in memory"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17877,7 +17622,6 @@ mod tests {
             0,
             "rejected commits must not persist impossible hard state"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17911,7 +17655,6 @@ mod tests {
             0,
             "repair should be durable so the next open stays cheap"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -17997,8 +17740,6 @@ mod tests {
             1,
             "unchanged replacement should be cached after the first read"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18207,7 +17948,6 @@ mod tests {
         assert_eq!(node.last_log_index(), 2);
         assert_eq!(node.hard_state().commit_index, 1);
         assert!(node.store().get("/config/replacement").is_none());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18249,7 +17989,6 @@ mod tests {
         assert_eq!(node.hard_state().current_term, 5);
         assert!(node.hard_state().voted_for.is_none());
         assert!(node.hard_state().leader_id.is_none());
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18282,7 +18021,6 @@ mod tests {
                 .value,
             b"survives"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18334,7 +18072,6 @@ mod tests {
                 .value,
             b"local"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18379,7 +18116,6 @@ mod tests {
             .expect("hard state modified after");
 
         assert_eq!(before, after);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18464,7 +18200,6 @@ mod tests {
 
         assert_eq!(hard_state_before, hard_state_after);
         assert_eq!(wal_before, wal_after);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18511,7 +18246,6 @@ mod tests {
             paths.hard_state.exists(),
             "real hard-state changes must still be persisted"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18576,8 +18310,6 @@ mod tests {
             .len();
 
         assert_eq!(before_len, after_len);
-        std::fs::remove_dir_all(leader_root).ok();
-        std::fs::remove_dir_all(follower_root).ok();
     }
 
     #[test]
@@ -18670,8 +18402,6 @@ mod tests {
                 .value,
             b"two"
         );
-        std::fs::remove_dir_all(leader_root).ok();
-        std::fs::remove_dir_all(follower_root).ok();
     }
 
     #[test]
@@ -18730,8 +18460,6 @@ mod tests {
                 .value,
             b"from-snapshot"
         );
-        std::fs::remove_dir_all(leader_root).ok();
-        std::fs::remove_dir_all(follower_root).ok();
     }
 
     #[test]
@@ -18814,7 +18542,6 @@ mod tests {
                 .all(|name| !name.starts_with(".wal.sobjlog.tmp-")),
             "WAL repair must not leave rewrite temp files behind"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18881,7 +18608,6 @@ mod tests {
                 .is_some_and(|entry| entry.index > overgrown_log[0].index),
             "repaired WAL should start after the redundant pre-retention records"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -18950,7 +18676,6 @@ mod tests {
             "WAL rewrite should keep only the contiguous safe prefix"
         );
         assert!(!repaired.truncated);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -19017,7 +18742,6 @@ mod tests {
             })
         );
         assert!(!repaired.truncated);
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -19047,8 +18771,6 @@ mod tests {
                 .all(|name| !name.starts_with(".wal.sobjlog.tmp-")),
             "failed WAL rewrite must not leave staged temp files behind"
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -19111,7 +18833,6 @@ mod tests {
             recovered.store().get("/temp-only").is_none(),
             "leftover WAL rewrite temp files must not be replayed"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -19144,7 +18865,6 @@ mod tests {
             !paths.wal.exists(),
             "oversized command should be rejected before WAL creation"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -19193,7 +18913,6 @@ mod tests {
                 .any(|window| window == b"ignored"),
             "oversized WAL tail should be truncated without allocating its advertised size"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -19201,7 +18920,8 @@ mod tests {
         let _guard = KV_READ_CACHE_TEST_MUTEX.lock().expect("cache mutex");
         // Inode discrimination: a same-(mtime, len) rewrite lands on a fresh inode
         // (temp + atomic rename), so it must miss rather than serve a stale parse.
-        let path = temp_raft_root("kv-snapshot-cache-identity").join("snap.sobj");
+        let root = temp_raft_root("kv-snapshot-cache-identity");
+        let path = root.join("snap.sobj");
         let snapshot = Arc::new(InProcessKvStore::new().snapshot());
         let mtime = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000));
         let id = FileIdentity {
@@ -19424,16 +19144,9 @@ mod tests {
             leftover.is_empty(),
             "no temporary object files should remain, found {leftover:?}"
         );
-        std::fs::remove_dir_all(&root).ok();
     }
 
-    fn temp_raft_root(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
+    fn temp_raft_root(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(prefix)
     }
 }

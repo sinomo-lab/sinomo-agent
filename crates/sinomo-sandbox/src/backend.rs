@@ -445,11 +445,7 @@ mod tests {
     /// with no cluster and no daemon.
     #[test]
     fn local_backend_round_trips_without_a_cluster() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-local-sandbox-backend-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = sinomo_testdir::TestDir::new("sinomo-local-sandbox-backend");
         let mut backend = LocalSandboxBackend::new(&root);
 
         let created = backend
@@ -513,7 +509,5 @@ mod tests {
             backend.status(SandboxStatusRequest { sandbox_id }).is_err(),
             "status should fail after destroy"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

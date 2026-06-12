@@ -2249,10 +2249,7 @@ mod tests {
 
     #[test]
     fn file_agent_definition_store_round_trips_custom_definition() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-definition-store-{}",
-            TaskId::generate()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-definition-store");
         let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
         let store = FileAgentDefinitionStore::for_data_dir(&data_dir);
         let definition =
@@ -2271,8 +2268,6 @@ mod tests {
         assert_eq!(loaded[0].key(), "docs-agent");
         assert_eq!(loaded[0].temperature, Some(0.3));
         assert_eq!(loaded[0].model_policy.max_output_tokens, Some(456));
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]

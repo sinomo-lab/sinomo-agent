@@ -608,20 +608,9 @@ mod tests {
         manager.delete_selected("DELETE").expect("delete file");
         manager.go_parent().expect("parent");
         manager.delete_selected("DELETE").expect("delete dir");
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
-    fn temp_sifs_data_dir(name: &str) -> std::path::PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-tui-sifs-file-manager-{name}-{}-{unique}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        root
+    fn temp_sifs_data_dir(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-tui-sifs-file-manager-{name}"))
     }
 }

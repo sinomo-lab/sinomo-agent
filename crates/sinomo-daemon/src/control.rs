@@ -3224,7 +3224,7 @@ mod tests {
     use sinomo_local::SinomoDataDir;
     use sinomo_node::NodeId;
     use std::net::{TcpListener, TcpStream};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     fn append_cluster_raft_command(
         paths: &sinomo_network::ClusterPaths,
@@ -3244,13 +3244,7 @@ mod tests {
 
     #[test]
     fn authenticated_rpc_auth_failure_returns_framed_error() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-auth-rpc-error-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-auth-rpc-error");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let paths = DaemonPaths::new(&data_dir);
@@ -3318,7 +3312,6 @@ mod tests {
             .expect_err("auth failures are RPC errors");
         assert!(matches!(error, sinomo_network::NetworkError::AuthDenied));
         server.join().expect("server thread");
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3342,13 +3335,7 @@ mod tests {
 
     #[test]
     fn daemon_rollout_telemetry_tick_advances_from_event_log() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-rollout-telemetry-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-telemetry");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let daemon_paths = DaemonPaths::new(&data_dir);
@@ -3409,18 +3396,11 @@ mod tests {
                 .expect("checkpoint")
                 .is_some()
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_rollout_telemetry_tick_respects_configured_promotion_gates() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-rollout-telemetry-gated-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-telemetry-gated");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let daemon_paths = DaemonPaths::new(&data_dir);
@@ -3478,18 +3458,11 @@ mod tests {
                 .expect("runtime state"),
             state
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_rollout_telemetry_tick_uses_canary_events_in_canary_stage() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-rollout-canary-telemetry-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-canary-telemetry");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let daemon_paths = DaemonPaths::new(&data_dir);
@@ -3556,18 +3529,11 @@ mod tests {
                 .telemetry_kind,
             "module.invocation.decision"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_publishes_module_rollout_status_to_cluster_kv() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-module-rollout-status-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-status");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
@@ -3650,18 +3616,11 @@ mod tests {
         );
         assert_eq!(published.telemetry_last_consumed_sequence, Some(7));
         assert_eq!(statuses, vec![published]);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_reconciles_missing_local_module_rollout_material_as_blocked() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-module-rollout-desired-blocked-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-blocked");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
@@ -3743,18 +3702,11 @@ mod tests {
                 .expect("read second reconciliations");
         assert_eq!(second_reconciliations, vec![first_record.clone()]);
         assert_eq!(second_records, vec![first_record]);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_prepares_verified_local_material_for_desired_module_rollout() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-module-rollout-desired-prepared-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-prepared");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
@@ -3878,18 +3830,11 @@ mod tests {
             Some(&artifact_id)
         );
         assert_eq!(runtime_state.stage, sinomo_rollout::RolloutStage::Shadow);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_reconciles_matching_local_module_rollout_runtime_state() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-module-rollout-desired-matched-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-desired-matched");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
@@ -3971,20 +3916,13 @@ mod tests {
                 .reason
                 .contains("already matches desired rollout plan")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_opens_configured_sharded_dfs_metadata_backend() {
         use sinomo_dfs::DfsMetadataBackend as _;
 
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-sharded-dfs-metadata-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-sharded-dfs-metadata");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data dir");
         let cluster_paths = sinomo_network::ClusterPaths::new(&data_dir);
@@ -4073,19 +4011,11 @@ mod tests {
             entry.mutation,
             sinomo_dfs::DfsMetadataMutation::PutObject { .. }
         )));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn daemon_control_loop_answers_status_while_idle_probe_connection_is_open() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-control-concurrent-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-control-concurrent");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data dir");
         let port_listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
@@ -4121,7 +4051,6 @@ mod tests {
             .join()
             .expect("daemon thread")
             .expect("daemon exits cleanly");
-        std::fs::remove_dir_all(root).ok();
 
         assert!(
             status_result.is_ok(),
@@ -4131,13 +4060,7 @@ mod tests {
 
     #[test]
     fn accepted_rollout_stops_main_but_not_shadow() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-control-rollout-main-stop-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-control-rollout-main-stop");
         std::fs::create_dir_all(root.join("daemon")).expect("main root");
         std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
         let main_paths = DaemonPaths::with_root(root.join("daemon"));
@@ -4158,7 +4081,6 @@ mod tests {
             &shadow_paths,
             &accepted
         ));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -4230,13 +4152,7 @@ mod tests {
 
     #[test]
     fn shadow_rollout_finalization_poll_backs_off_when_idle() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-shadow-finalization-poll-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-shadow-finalization-poll");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("layout");
         let paths = DaemonPaths::new(&data_dir);
@@ -4257,20 +4173,13 @@ mod tests {
             DAEMON_CLUSTER_TICK_INTERVAL,
             "active shadow finalization keeps the short fallback poll interval"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[cfg(feature = "sandbox")]
     #[test]
     fn sandbox_active_execution_guard_enforces_policy_limits_and_releases() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-sandbox-active-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let paths = DaemonPaths::with_root(root.clone());
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-sandbox-active");
+        let paths = DaemonPaths::with_root(root.to_path_buf());
         let mut policy = sinomo_sandbox::SandboxPolicy {
             max_concurrent_commands_per_sandbox: 1,
             max_concurrent_sandboxes_per_node: 1,
@@ -4309,7 +4218,6 @@ mod tests {
                 .code,
             "concurrent-commands-denied"
         );
-        std::fs::remove_dir_all(root).ok();
     }
 
     fn signed_daemon_test_artifact(
