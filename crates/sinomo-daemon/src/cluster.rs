@@ -1346,7 +1346,7 @@ impl sinomo_network::ClusterMembershipRpcAsyncForwardHost
             send_daemon_rpc_to_endpoint_async(
                 endpoint,
                 request,
-                sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
                 &runtime,
             )
             .await
@@ -1507,7 +1507,7 @@ fn relay_rpc_to_node_via_peer(
             crate::daemon_rpc_command(&rpc_request.route),
             &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
             sinomo_network::ClusterSignedRelayRpcOptions {
-                timeouts: sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+                timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             },
             &mut host,
         ),
@@ -1534,7 +1534,7 @@ async fn relay_rpc_to_node_via_peer_async(
         crate::daemon_rpc_command(&rpc_request.route),
         &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
         sinomo_network::ClusterSignedRelayRpcOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         },
         &mut host,
     )
@@ -2441,8 +2441,22 @@ fn connectivity_record_for_daemon_status_probe(
     timestamp: &str,
     now: time::OffsetDateTime,
 ) -> (String, ClusterConnectivityRecord) {
-    let healthy =
-        result.is_ok_and(|status| daemon_cluster_status_matches(state, &entry.endpoint, &status));
+    let healthy = match &result {
+        Ok(status) => {
+            let matches = daemon_cluster_status_matches(state, &entry.endpoint, status);
+            if !matches {
+                eprintln!(
+                    "sinomo daemon connectivity probe identity mismatch: endpoint {} expected node {}, responder reported cluster={:?} node={:?}",
+                    entry.endpoint.address,
+                    entry.endpoint.node_id,
+                    status.cluster.as_ref().map(|c| c.cluster_id.to_string()),
+                    status.cluster.as_ref().map(|c| c.node_id.to_string()),
+                );
+            }
+            matches
+        }
+        Err(_) => false,
+    };
     let record = sinomo_network::cluster_connectivity_record_for_probe_outcome(
         state,
         &entry.endpoint,
@@ -2490,7 +2504,7 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         detail: format!("cluster connectivity probe signing task failed: {source}"),
     })??;
     let command = crate::daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE);
-    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_only(timeout);
+    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
     let response = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
         endpoint,
         &command,
@@ -2884,7 +2898,7 @@ async fn fetch_local_cluster_health_rows_from_member_async(
         let Ok(response) = send_daemon_rpc_to_endpoint_async(
             &endpoint,
             &request,
-            sinomo_network::DaemonRpcTimeouts::connect_only(CLUSTER_HEALTH_PEER_ROWS_TIMEOUT),
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(CLUSTER_HEALTH_PEER_ROWS_TIMEOUT),
             runtime,
         )
         .await
@@ -2973,19 +2987,34 @@ async fn probe_member_daemon_status_async(
         detail: format!("cluster health target selection task failed: {source}"),
     })?;
     for endpoint in endpoints {
-        let Ok(status) = fetch_daemon_status_from_endpoint_async(
+        let status = match fetch_daemon_status_from_endpoint_async(
             &endpoint,
             CLUSTER_HEALTH_PROBE_TIMEOUT,
             runtime,
         )
         .await
-        else {
-            continue;
+        {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!(
+                    "sinomo daemon cluster health probe of {} via {} failed: {error}",
+                    member.node_id, endpoint.address
+                );
+                continue;
+            }
         };
         let Some(cluster) = status.cluster.as_ref() else {
+            eprintln!(
+                "sinomo daemon cluster health probe of {} via {}: status has no cluster section",
+                member.node_id, endpoint.address
+            );
             continue;
         };
         if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+            eprintln!(
+                "sinomo daemon cluster health probe of {} via {}: identity mismatch (responder {})",
+                member.node_id, endpoint.address, cluster.node_id
+            );
             continue;
         }
         return Ok(Some(cluster_node_status_from_daemon_status(
@@ -4523,7 +4552,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
         &local_node_id,
         envelope,
         sinomo_network::ClusterRelayOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_only(
+            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
             ),
         },

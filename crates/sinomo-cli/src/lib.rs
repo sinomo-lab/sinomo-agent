@@ -117,6 +117,7 @@ use sinomo_runtime::daemon::{
     send_daemon_rollout_diagnostics as daemon_send_daemon_rollout_diagnostics,
     send_daemon_rpc as daemon_send_daemon_rpc,
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
+    send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
     shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
     shadow_main_options_from_env as daemon_shadow_main_options_from_env,

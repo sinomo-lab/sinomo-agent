@@ -605,7 +605,7 @@ pub(crate) async fn probe_daemon_status_async(
 ) -> DaemonProbeStatus {
     probe_daemon_status_with_timeouts_async(
         paths,
-        DaemonRpcTimeouts::connect_only(timeout),
+        DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
     )
     .await

@@ -635,6 +635,12 @@ fn service_signer_cluster_identity(
 /// Daemon adapter for cluster membership object-RPC routes. The domain join decision
 /// lives in `sinomo-network`; the daemon handler still supplies host-local member refresh,
 /// voter forwarding, and quorum persistence.
+/// Server-side budgets for join handling, deliberately below the joiner's
+/// 30s idle deadline so a stuck step yields a structured error the retry
+/// loop can act on.
+const CLUSTER_JOIN_CHALLENGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+const CLUSTER_JOIN_REGISTRATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
+
 struct ClusterMembershipService {
     paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
@@ -665,43 +671,67 @@ impl Service for ClusterMembershipService {
             if request.route == CLUSTER_JOIN_CHALLENGE_ROUTE {
                 let challenge: sinomo_network::ClusterInviteChallengeRequest =
                     request.decode_body()?;
-                let challenge_paths = paths.clone();
-                let challenge_for_local = challenge.clone();
-                let local_proof = tokio::task::spawn_blocking(move || {
-                    crate::auth::create_cluster_invite_challenge_proof(
-                        &challenge_paths,
-                        &challenge_for_local,
-                    )
-                })
-                .await
-                .map_err(|source| {
-                    ServiceError::Service(format!(
-                        "cluster join challenge route {CLUSTER_JOIN_CHALLENGE_ROUTE} task failed: {source}"
-                    ))
-                })?;
-                let proof = match local_proof {
-                    Ok(proof) => proof,
-                    Err(local_error) => {
-                        // A bridge introducer may hold the invite but not be proof-capable.
-                        // Relay to a voter that can produce an issuer-signed proof.
-                        let runtime =
-                            require_service_runtime(runtime.as_ref(), "cluster join challenge")?;
-                        match forward_cluster_invite_challenge_to_voter_async_on_runtime(
-                            &paths, &challenge, runtime,
+                // The whole proof acquisition (local attempt + voter forward)
+                // runs under a hard budget: a hung step must surface an error
+                // to the joiner — never hold its stream open silently, or the
+                // joiner's bounded retry loop can wedge for its whole window.
+                let proof_paths = paths.clone();
+                let proof_runtime = runtime.clone();
+                let proof_challenge = challenge.clone();
+                let proof = tokio::time::timeout(CLUSTER_JOIN_CHALLENGE_BUDGET, async move {
+                    let challenge_paths = proof_paths.clone();
+                    let challenge_for_local = proof_challenge.clone();
+                    let local_proof = tokio::task::spawn_blocking(move || {
+                        crate::auth::create_cluster_invite_challenge_proof(
+                            &challenge_paths,
+                            &challenge_for_local,
                         )
-                        .await
-                        {
-                            Ok(proof) => proof,
-                            Err(forward_error) => {
-                                eprintln!(
-                                    "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
-                                    challenge.invite_id
-                                );
-                                return Err(daemon_error(local_error));
+                    })
+                    .await
+                    .map_err(|source| {
+                        ServiceError::Service(format!(
+                            "cluster join challenge route {CLUSTER_JOIN_CHALLENGE_ROUTE} task failed: {source}"
+                        ))
+                    })?;
+                    match local_proof {
+                        Ok(proof) => Ok(proof),
+                        Err(local_error) => {
+                            // A bridge introducer may hold the invite but not be proof-capable.
+                            // Relay to a voter that can produce an issuer-signed proof.
+                            let runtime = require_service_runtime(
+                                proof_runtime.as_ref(),
+                                "cluster join challenge",
+                            )?;
+                            match forward_cluster_invite_challenge_to_voter_async_on_runtime(
+                                &proof_paths,
+                                &proof_challenge,
+                                runtime,
+                            )
+                            .await
+                            {
+                                Ok(proof) => Ok(proof),
+                                Err(forward_error) => {
+                                    eprintln!(
+                                        "sinomo daemon join challenge for invite {} failed (local: {local_error}; forward-to-voter: {forward_error})",
+                                        proof_challenge.invite_id
+                                    );
+                                    Err(daemon_error(local_error))
+                                }
                             }
                         }
                     }
-                };
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    eprintln!(
+                        "sinomo daemon join challenge for invite {} timed out after {}s",
+                        challenge.invite_id,
+                        CLUSTER_JOIN_CHALLENGE_BUDGET.as_secs()
+                    );
+                    Err(ServiceError::Service(
+                        "cluster join challenge timed out".to_string(),
+                    ))
+                })?;
                 ctx.respond(ObjectRpcResponse::encode_body(
                     CLUSTER_JOIN_CHALLENGE_ROUTE,
                     &proof,
@@ -713,7 +743,8 @@ impl Service for ClusterMembershipService {
                 let payload = request.decode_body().map_err(ServiceError::from)?;
                 let service_runtime =
                     require_service_runtime(runtime.as_ref(), "cluster join registration")?;
-                let response =
+                let response = tokio::time::timeout(
+                    CLUSTER_JOIN_REGISTRATION_BUDGET,
                     sinomo_network::handle_cluster_join_registration_request_async_with_host(
                         service_runtime,
                         &cluster_paths,
@@ -723,9 +754,17 @@ impl Service for ClusterMembershipService {
                             &paths,
                             service_runtime,
                         ),
-                    )
-                    .await
-                    .map_err(ServiceError::from)?;
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    eprintln!(
+                        "sinomo daemon join registration timed out after {}s",
+                        CLUSTER_JOIN_REGISTRATION_BUDGET.as_secs()
+                    );
+                    ServiceError::Service("cluster join registration timed out".to_string())
+                })?
+                .map_err(ServiceError::from)?;
                 ctx.respond(ObjectRpcResponse::encode_body(
                     CLUSTER_JOIN_REGISTER_ROUTE,
                     &response,

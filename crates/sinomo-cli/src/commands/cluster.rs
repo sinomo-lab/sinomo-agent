@@ -1143,9 +1143,27 @@ fn send_join_rpc(
         ClusterTransportKind::Iroh => {
             daemon_send_daemon_rpc_to_endpoint(endpoint, request, timeout).map_err(Into::into)
         }
-        _ => daemon_send_daemon_rpc(&endpoint.address, request, timeout).map_err(Into::into),
+        // Join RPCs must carry an idle deadline, not just a connect timeout:
+        // an introducer that accepts the stream and never answers otherwise
+        // hangs the join forever, and the caller's bounded retry loop (the
+        // only recovery during cold formation) never reaches a second
+        // attempt. The idle budget is generous because a healthy introducer
+        // may legitimately relay the registration to a voter across bridges.
+        _ => crate::daemon_send_daemon_rpc_with_timeouts(
+            &endpoint.address,
+            request,
+            sinomo_runtime::network::DaemonRpcTimeouts {
+                connect_timeout: Some(timeout),
+                idle_timeout: Some(CLUSTER_JOIN_RPC_IDLE_TIMEOUT),
+            },
+        )
+        .map_err(Into::into),
     }
 }
+
+/// Idle deadline for join challenge/registration streams; covers a
+/// bridge-relayed registration round-trip while still bounding a silent peer.
+const CLUSTER_JOIN_RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn parse_cluster_join_invite_argument(raw: &str) -> Result<ClusterJoinInvite, CliError> {
     let raw = raw.trim();
