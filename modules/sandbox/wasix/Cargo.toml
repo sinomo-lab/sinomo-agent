@@ -11,6 +11,13 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "r1"
 
+[package.metadata.sinomo.native-dylib]
+module-id = "module.sandbox.wasix"
+interface-version = "sinomo.sandbox.wasix.v1"
+cache-key = "module/sandbox/wasix"
+source = "rollout:modules/sandbox/wasix"
+features = ["sinomo-sandbox-wasix-module/wasix-runtime"]
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 

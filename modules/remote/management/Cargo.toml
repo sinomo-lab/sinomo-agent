@@ -9,6 +9,12 @@ rust-version.workspace = true
 [package.metadata.sinomo]
 ring = "r1"
 
+[package.metadata.sinomo.native-dylib]
+module-id = "module.remote-management"
+interface-version = "sinomo.remote-management.v1"
+cache-key = "module/remote/management"
+source = "rollout:modules/remote/management"
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 

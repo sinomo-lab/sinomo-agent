@@ -90,6 +90,7 @@ pub use paths::{
     SelfRolloutPlan, append_native_dylib_module_build_args, benchmark_native_dylib_module_build,
     benchmarks_native_module_library_name, default_native_dylib_module_builds,
     dfs_cloud_files_native_dylib_module_build, dfs_cloud_files_native_module_library_name,
+    discover_default_native_dylib_module_builds, discover_native_dylib_module_builds,
     ensure_rollout_layout, executable_name, native_dylib_library_name,
     sandbox_wasix_native_module_library_name,
 };

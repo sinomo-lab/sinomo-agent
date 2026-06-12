@@ -12,7 +12,7 @@ pub use native_host::*;
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::signature::{ED25519, UnparsedPublicKey};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::{
     ArtifactManifest, CapabilityName, Confidence, EventEnvelope, EventKind, HotSwapState,
     LatencyClass, ModuleCapabilities, ModuleKind, ModuleLoaderState, PrivacyClass, RoutingMetadata,
@@ -144,6 +144,18 @@ pub struct NativeDylibModuleLoaderState {
     pub interface_version: String,
     pub activated_at: String,
     pub source: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeDylibModuleCacheEntry {
+    pub module_id: ModuleId,
+    pub content_hash: String,
+    pub cache_key: String,
+    pub library_name: String,
+    pub platform_triple: String,
+    pub native_abi_version: u32,
+    pub interface_version: String,
+    pub library_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1952,6 +1964,13 @@ pub fn native_dylib_module_loader_state_path(
     native_dylib_module_loader_state_dir(data_dir_root).join(format!("{module_id}.sobj"))
 }
 
+pub fn native_dylib_module_cache_dir(data_dir_root: &Path) -> PathBuf {
+    data_dir_root
+        .join("module")
+        .join("cache")
+        .join("native-dylib")
+}
+
 pub fn native_rust_module_loader_state_dir(data_dir_root: &Path) -> PathBuf {
     module_loader_state_dir(data_dir_root).join("native-rust")
 }
@@ -2062,11 +2081,152 @@ pub fn read_native_dylib_module_loader_state(
 pub fn read_native_dylib_module_loader_states(
     data_dir_root: &Path,
 ) -> Result<Vec<NativeDylibModuleLoaderState>, ModuleLoaderStoreError> {
-    let dir = native_dylib_module_loader_state_dir(data_dir_root);
+    read_objects_from_dir(&native_dylib_module_loader_state_dir(data_dir_root))
+}
+
+pub fn read_native_dylib_module_cache_entries(
+    data_dir_root: &Path,
+) -> Result<Vec<NativeDylibModuleCacheEntry>, ModuleLoaderStoreError> {
+    read_native_dylib_module_cache_entries_excluding_cache_keys(data_dir_root, &BTreeSet::new())
+}
+
+pub fn read_native_dylib_module_cache_entries_excluding_cache_keys(
+    data_dir_root: &Path,
+    excluded_cache_keys: &BTreeSet<String>,
+) -> Result<Vec<NativeDylibModuleCacheEntry>, ModuleLoaderStoreError> {
+    let cache_root = native_dylib_module_cache_dir(data_dir_root);
+    if !cache_root.exists() {
+        return Ok(Vec::new());
+    }
+    let excluded_cache_dirs = excluded_cache_keys
+        .iter()
+        .map(|cache_key| cache_root.join(cache_key))
+        .collect::<BTreeSet<_>>();
+    let mut paths = Vec::new();
+    collect_native_dylib_module_cache_files(
+        &cache_root,
+        &cache_root,
+        &excluded_cache_dirs,
+        &mut paths,
+    )?;
+    paths.sort();
+    let mut entries = Vec::new();
+    for path in paths {
+        if let Ok(Some(entry)) = native_dylib_module_cache_entry_from_path(&cache_root, &path) {
+            entries.push(entry);
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.module_id
+            .cmp(&right.module_id)
+            .then(left.interface_version.cmp(&right.interface_version))
+            .then(left.content_hash.cmp(&right.content_hash))
+            .then(left.library_path.cmp(&right.library_path))
+    });
+    Ok(entries)
+}
+
+fn collect_native_dylib_module_cache_files(
+    cache_root: &Path,
+    dir: &Path,
+    excluded_cache_dirs: &BTreeSet<PathBuf>,
+    paths: &mut Vec<PathBuf>,
+) -> Result<(), ModuleLoaderStoreError> {
+    for entry in fs::read_dir(dir).map_err(|source| ModuleLoaderStoreError::Io {
+        path: dir.display().to_string(),
+        detail: source.to_string(),
+    })? {
+        let entry = entry.map_err(|source| ModuleLoaderStoreError::Io {
+            path: dir.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|source| ModuleLoaderStoreError::Io {
+                path: path.display().to_string(),
+                detail: source.to_string(),
+            })?;
+        if file_type.is_dir() {
+            if excluded_cache_dirs.contains(&path)
+                || path.file_name().and_then(|name| name.to_str()) == Some(".staged")
+            {
+                continue;
+            }
+            collect_native_dylib_module_cache_files(cache_root, &path, excluded_cache_dirs, paths)?;
+        } else if file_type.is_file()
+            && path
+                .strip_prefix(cache_root)
+                .ok()
+                .and_then(|relative| relative.parent())
+                .is_some()
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn native_dylib_module_cache_entry_from_path(
+    cache_root: &Path,
+    path: &Path,
+) -> Result<Option<NativeDylibModuleCacheEntry>, NativeDylibModuleInstallError> {
+    let relative = path.strip_prefix(cache_root).map_err(|source| {
+        NativeDylibModuleInstallError::Descriptor {
+            detail: format!(
+                "native module cache path `{}` is not under `{}`: {source}",
+                path.display(),
+                cache_root.display()
+            ),
+        }
+    })?;
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_string_lossy().into_owned(),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>();
+    if components.len() < 3 || components.iter().any(|component| component.is_empty()) {
+        return Ok(None);
+    }
+    let library_name = components.last().expect("component length checked").clone();
+    let hash_key = &components[components.len() - 2];
+    let Some(hash_suffix) = hash_key.strip_prefix("blake3_") else {
+        return Ok(None);
+    };
+    let content_hash = format!("blake3:{hash_suffix}");
+    let cache_key = components[..components.len() - 2].join("/");
+    let cache_key = validate_native_dylib_module_cache_key(&cache_key)?;
+    let library_name = validate_native_dylib_module_library_name(&library_name)?;
+    let descriptor =
+        unsafe { NativeModule::descriptor_from_content_addressed_path(path, &content_hash) }?;
+    let module_id = parse_native_dylib_module_id(&descriptor.module_id)?;
+    Ok(Some(NativeDylibModuleCacheEntry {
+        module_id,
+        content_hash,
+        cache_key,
+        library_name,
+        platform_triple: descriptor.platform_triple,
+        native_abi_version: descriptor.native_abi_version,
+        interface_version: descriptor.interface_version,
+        library_path: path.to_path_buf(),
+    }))
+}
+
+pub fn read_native_rust_module_runtime_states(
+    data_dir_root: &Path,
+) -> Result<Vec<NativeRustModuleRuntimeState>, ModuleLoaderStoreError> {
+    read_objects_from_dir(&native_rust_module_loader_state_dir(data_dir_root))
+}
+
+fn read_objects_from_dir<T: DeserializeOwned>(
+    dir: &Path,
+) -> Result<Vec<T>, ModuleLoaderStoreError> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut paths = fs::read_dir(&dir)
+    let mut paths = fs::read_dir(dir)
         .map_err(|source| ModuleLoaderStoreError::Io {
             path: dir.display().to_string(),
             detail: source.to_string(),
@@ -2081,14 +2241,14 @@ pub fn read_native_dylib_module_loader_states(
         })
         .collect::<Result<Vec<_>, _>>()?;
     paths.sort();
-    let mut states = Vec::new();
+    let mut objects = Vec::new();
     for path in paths {
         if path.extension().and_then(|extension| extension.to_str()) != Some("sobj") {
             continue;
         }
-        states.push(read_object(&path)?);
+        objects.push(read_object(&path)?);
     }
-    Ok(states)
+    Ok(objects)
 }
 
 pub fn write_native_dylib_module_loader_state(
@@ -2220,11 +2380,6 @@ fn native_descriptor_surfaces_to_module_surfaces(
         surfaces = surfaces
             .with_declarative_resource(native_descriptor_resource_to_module_resource(resource)?);
     }
-    let capability_exports = if descriptor.surfaces.capability_exports.is_empty() {
-        &descriptor.capabilities
-    } else {
-        &descriptor.surfaces.capability_exports
-    };
     surfaces.capabilities = ModuleCapabilities {
         imports: descriptor
             .surfaces
@@ -2232,7 +2387,9 @@ fn native_descriptor_surfaces_to_module_surfaces(
             .iter()
             .map(|capability| native_descriptor_capability(capability))
             .collect::<Result<Vec<_>, _>>()?,
-        exports: capability_exports
+        exports: descriptor
+            .surfaces
+            .capability_exports
             .iter()
             .map(|capability| native_descriptor_capability(capability))
             .collect::<Result<Vec<_>, _>>()?,
@@ -2451,6 +2608,12 @@ pub fn read_declarative_module_registration(
     read_object(&path).map(Some)
 }
 
+pub fn read_declarative_module_registrations(
+    data_dir_root: &Path,
+) -> Result<Vec<ModuleRegistration>, ModuleLoaderStoreError> {
+    read_objects_from_dir(&declarative_module_catalog_dir(data_dir_root))
+}
+
 pub fn write_declarative_module_registration(
     data_dir_root: &Path,
     registration: &ModuleRegistration,
@@ -2469,6 +2632,12 @@ pub fn read_declarative_module_loader_state(
         return Ok(None);
     }
     read_object(&path).map(Some)
+}
+
+pub fn read_declarative_module_loader_states(
+    data_dir_root: &Path,
+) -> Result<Vec<DeclarativeModuleLoaderState>, ModuleLoaderStoreError> {
+    read_objects_from_dir(&declarative_module_loader_state_dir(data_dir_root))
 }
 
 pub fn write_declarative_module_loader_state(
@@ -4496,6 +4665,42 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str() == "filesystem.read")
         );
+    }
+
+    #[test]
+    fn native_dylib_descriptor_legacy_capabilities_do_not_become_catalog_exports() {
+        let module_id = ModuleId::from_legacy_named("module.legacy-native").expect("module");
+        let state = NativeDylibModuleLoaderState {
+            module_id: module_id.clone(),
+            artifact_id: None,
+            content_hash: "blake3:abc".to_string(),
+            cache_key: "module/legacy-native".to_string(),
+            library_name: "liblegacy_native_module.so".to_string(),
+            platform_triple: "x86_64-linux-unix".to_string(),
+            native_abi_version: sinomo_module_api::SINOMO_NATIVE_MODULE_ABI_VERSION,
+            interface_version: "sinomo.legacy-native.v1".to_string(),
+            activated_at: "2026-06-12T00:00:00Z".to_string(),
+            source: "test".to_string(),
+        };
+        let descriptor = NativeModuleDescriptor {
+            module_id: "module.legacy-native".to_string(),
+            module_version: "0.1.0".to_string(),
+            owner: "legacy-native".to_string(),
+            native_abi_version: sinomo_module_api::SINOMO_NATIVE_MODULE_ABI_VERSION,
+            backend: sinomo_module_api::NativeModuleBackend::NativeDylib,
+            interface_version: "sinomo.legacy-native.v1".to_string(),
+            platform_triple: "x86_64-linux-unix".to_string(),
+            supported_operations: vec!["legacy.probe".to_string()],
+            capabilities: vec!["wasix".to_string()],
+            surfaces: Default::default(),
+        };
+
+        let registration =
+            native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
+                .expect("legacy descriptor registration");
+
+        assert_eq!(registration.module_id(), &module_id);
+        assert!(registration.surfaces.capabilities.exports.is_empty());
     }
 
     #[test]

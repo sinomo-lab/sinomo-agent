@@ -1076,6 +1076,15 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
             interface_version:
                 sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION,
         });
+    let module_config = SinomoDataDir::from_env_or_home()
+        .ok()
+        .and_then(|data_dir| {
+            module_config
+                .clone()
+                .with_installed_native_dylib_modules_from_data_dir(&data_dir.root())
+                .ok()
+        })
+        .unwrap_or(module_config);
     CliCommandRegistry::new()
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,

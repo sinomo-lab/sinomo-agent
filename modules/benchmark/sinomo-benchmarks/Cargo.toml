@@ -11,6 +11,13 @@ include = ["**/*.rs", "Cargo.toml", "harbor/**", "mcu/**", "minestudio/**", "swe
 [package.metadata.sinomo]
 ring = "application"
 
+[package.metadata.sinomo.native-dylib]
+module-id = "module.benchmarks"
+interface-version = "sinomo.benchmarks.v1"
+cache-key = "module/benchmark/sinomo-benchmarks"
+source = "rollout:modules/benchmark/sinomo-benchmarks"
+default = false
+
 [features]
 default = []
 env-bench = []

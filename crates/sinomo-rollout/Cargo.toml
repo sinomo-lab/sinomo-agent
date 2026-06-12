@@ -17,6 +17,7 @@ serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+toml.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-events = { path = "../sinomo-events" }

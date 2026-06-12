@@ -97,26 +97,17 @@ impl NativeModule {
         library_path: impl AsRef<Path>,
     ) -> Result<Self, NativeModuleHostError> {
         let library_path = library_path.as_ref();
-        let library = unsafe { Library::new(library_path) }.map_err(|source| {
-            NativeModuleHostError::Load {
-                path: library_path.display().to_string(),
-                detail: source.to_string(),
-            }
-        })?;
-        let api_version = unsafe {
-            load_symbol::<SinomoModuleApiVersionFn>(
-                &library,
-                b"sinomo_module_api_version\0",
-                library_path,
-            )?
-        };
-        let descriptor_fn = unsafe {
-            load_symbol::<SinomoModuleDescriptorFn>(
-                &library,
-                b"sinomo_module_descriptor\0",
-                library_path,
-            )?
-        };
+        let library = unsafe { load_native_module_library(library_path) }?;
+        let api_version = unsafe { native_module_api_version(&library, library_path) }?;
+        if api_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
+            return Err(NativeModuleHostError::AbiMismatch {
+                expected: SINOMO_NATIVE_MODULE_ABI_VERSION,
+                actual: api_version,
+            });
+        }
+        let descriptor = unsafe { native_module_descriptor(&library, library_path) }?;
+        validate_descriptor(&descriptor)?;
+
         let init = unsafe {
             load_symbol::<SinomoModuleInitFn>(&library, b"sinomo_module_init\0", library_path)?
         };
@@ -137,17 +128,6 @@ impl NativeModule {
                 library_path,
             )?
         };
-
-        let actual_abi = unsafe { api_version() };
-        if actual_abi != SINOMO_NATIVE_MODULE_ABI_VERSION {
-            return Err(NativeModuleHostError::AbiMismatch {
-                expected: SINOMO_NATIVE_MODULE_ABI_VERSION,
-                actual: actual_abi,
-            });
-        }
-
-        let descriptor = unsafe { read_descriptor(descriptor_fn, free_buffer)? };
-        validate_descriptor(&descriptor)?;
 
         let callbacks = Box::new(NativeModuleHostCallbackState::default());
         let host_api = SinomoModuleHostApiV1 {
@@ -175,6 +155,78 @@ impl NativeModule {
         })
     }
 
+    pub unsafe fn descriptor_from_content_addressed_path(
+        library_path: impl AsRef<Path>,
+        expected_content_hash: &str,
+    ) -> Result<NativeModuleDescriptor, NativeModuleHostError> {
+        let library_path = library_path.as_ref();
+        verify_native_module_hash(library_path, expected_content_hash)?;
+        unsafe { Self::descriptor_from_verified_path(library_path) }
+    }
+
+    pub unsafe fn descriptor_from_verified_path(
+        library_path: impl AsRef<Path>,
+    ) -> Result<NativeModuleDescriptor, NativeModuleHostError> {
+        let library_path = library_path.as_ref();
+        let library = unsafe { load_native_module_library(library_path) }?;
+        let api_version = unsafe { native_module_api_version(&library, library_path) }?;
+        if api_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
+            return Err(NativeModuleHostError::AbiMismatch {
+                expected: SINOMO_NATIVE_MODULE_ABI_VERSION,
+                actual: api_version,
+            });
+        }
+        let descriptor = unsafe { native_module_descriptor(&library, library_path) }?;
+        validate_descriptor(&descriptor)?;
+        Ok(descriptor)
+    }
+}
+
+unsafe fn load_native_module_library(
+    library_path: &Path,
+) -> Result<Library, NativeModuleHostError> {
+    unsafe { Library::new(library_path) }.map_err(|source| NativeModuleHostError::Load {
+        path: library_path.display().to_string(),
+        detail: source.to_string(),
+    })
+}
+
+unsafe fn native_module_api_version(
+    library: &Library,
+    library_path: &Path,
+) -> Result<u32, NativeModuleHostError> {
+    let api_version = unsafe {
+        load_symbol::<SinomoModuleApiVersionFn>(
+            library,
+            b"sinomo_module_api_version\0",
+            library_path,
+        )?
+    };
+    Ok(unsafe { api_version() })
+}
+
+unsafe fn native_module_descriptor(
+    library: &Library,
+    library_path: &Path,
+) -> Result<NativeModuleDescriptor, NativeModuleHostError> {
+    let descriptor_fn = unsafe {
+        load_symbol::<SinomoModuleDescriptorFn>(
+            library,
+            b"sinomo_module_descriptor\0",
+            library_path,
+        )?
+    };
+    let free_buffer = unsafe {
+        load_symbol::<SinomoModuleFreeBufferFn>(
+            library,
+            b"sinomo_module_free_buffer\0",
+            library_path,
+        )?
+    };
+    unsafe { read_descriptor(descriptor_fn, free_buffer) }
+}
+
+impl NativeModule {
     pub fn descriptor(&self) -> &NativeModuleDescriptor {
         &self.descriptor
     }

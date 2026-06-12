@@ -1,6 +1,6 @@
 use crate::{
     RolloutError, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
-    append_native_dylib_module_build_args, default_native_dylib_module_builds,
+    append_native_dylib_module_build_args, discover_default_native_dylib_module_builds,
     ensure_rollout_layout, rollout_staged_main_binary, rollout_staged_shadow_binary,
     stage_rollout_file,
 };
@@ -112,7 +112,7 @@ pub fn rollout_build_dev_artifacts(
     repo: &Path,
     build_log: &Path,
 ) -> Result<RolloutBuiltArtifacts, RolloutError> {
-    let modules = default_native_dylib_module_builds(repo);
+    let modules = discover_default_native_dylib_module_builds(repo)?;
     let build_args = rollout_build_args(&modules);
     let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
     let build = Command::new("cargo")
@@ -168,7 +168,7 @@ fn rollout_build_dev_native_dylib_modules(
     repo: &Path,
     build_log: &Path,
 ) -> Result<Vec<LocalRolloutNativeDylibModuleArtifact>, RolloutError> {
-    let modules = default_native_dylib_module_builds(repo);
+    let modules = discover_default_native_dylib_module_builds(repo)?;
     let build_args = rollout_module_build_args(&modules);
     let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
     let build = Command::new("cargo")

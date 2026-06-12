@@ -4,9 +4,13 @@ use crate::{
     ModuleUnloadRecord, NativeDylibModuleInstallError, NativeDylibModuleInstallRequest,
     NativeModule, install_declarative_module_package, install_native_dylib_module_from_file,
     module_loader_applied_at_now, native_module_cache_path, read_declarative_module_loader_state,
-    read_declarative_module_registration, remove_native_dylib_module_loader_state,
-    set_native_rust_module_enabled, validate_native_dylib_module_cache_key,
-    validate_native_dylib_module_library_name, write_module_unload_record,
+    read_declarative_module_loader_states, read_declarative_module_registration,
+    read_declarative_module_registrations,
+    read_native_dylib_module_cache_entries_excluding_cache_keys,
+    read_native_dylib_module_loader_states, read_native_rust_module_runtime_states,
+    remove_native_dylib_module_loader_state, set_native_rust_module_enabled,
+    validate_native_dylib_module_cache_key, validate_native_dylib_module_library_name,
+    write_module_unload_record,
 };
 use sinomo_cli_registry::{
     CliAutocompleteChoice, CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue,
@@ -15,8 +19,9 @@ use sinomo_cli_registry::{
 };
 use sinomo_core::ModuleKind;
 use sinomo_local::SinomoDataDir;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MODULE_POLICY: CliCommandPolicy = CliCommandPolicy {
     requires_cluster_state: false,
@@ -26,6 +31,7 @@ const MODULE_POLICY: CliCommandPolicy = CliCommandPolicy {
 #[derive(Clone, Debug, Default)]
 pub struct ModuleCliCommandConfig {
     pub toggleable_native_rust_modules: Vec<ModuleNativeRustToggleTarget>,
+    pub native_dylib_modules: Vec<ModuleNativeDylibKnownTarget>,
     pub wasix: Option<ModuleWasixCliConfig>,
 }
 
@@ -63,6 +69,104 @@ impl ModuleCliCommandConfig {
         Ok(self)
     }
 
+    pub fn with_known_native_dylib_module(
+        mut self,
+        module_id: ModuleId,
+        detail: impl Into<String>,
+    ) -> Self {
+        let value = module_id.to_string();
+        self.native_dylib_modules
+            .push(ModuleNativeDylibKnownTarget {
+                module_id,
+                value,
+                detail: detail.into(),
+            });
+        self
+    }
+
+    pub fn with_installed_native_dylib_modules_from_data_dir(
+        mut self,
+        data_dir_root: &Path,
+    ) -> Result<Self, ModuleLoaderStoreError> {
+        let mut modules = BTreeMap::<ModuleId, ModuleNativeDylibKnownTarget>::new();
+        let mut active_cache_keys = BTreeSet::new();
+        for state in read_native_dylib_module_loader_states(data_dir_root)? {
+            active_cache_keys.insert(state.cache_key.clone());
+            let cache_path = native_module_cache_path(
+                data_dir_root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            );
+            let value = state.module_id.to_string();
+            modules.insert(
+                state.module_id.clone(),
+                ModuleNativeDylibKnownTarget {
+                    module_id: state.module_id,
+                    value,
+                    detail: format!(
+                        "active native dylib {} ({})",
+                        if cache_path.exists() {
+                            "cached"
+                        } else {
+                            "missing-cache"
+                        },
+                        state.interface_version
+                    ),
+                },
+            );
+        }
+        for entry in read_native_dylib_module_cache_entries_excluding_cache_keys(
+            data_dir_root,
+            &active_cache_keys,
+        )? {
+            modules.entry(entry.module_id.clone()).or_insert_with(|| {
+                ModuleNativeDylibKnownTarget {
+                    value: entry.module_id.to_string(),
+                    module_id: entry.module_id,
+                    detail: format!("installed native dylib ({})", entry.interface_version),
+                }
+            });
+        }
+        self.native_dylib_modules.extend(modules.into_values());
+        self.native_dylib_modules
+            .sort_by(|left, right| left.value.cmp(&right.value));
+        self.native_dylib_modules
+            .dedup_by(|left, right| left.module_id == right.module_id);
+        Ok(self)
+    }
+
+    pub fn with_active_native_dylib_modules_from_data_dir(
+        mut self,
+        data_dir_root: &Path,
+    ) -> Result<Self, ModuleLoaderStoreError> {
+        for state in read_native_dylib_module_loader_states(data_dir_root)? {
+            let cache_path = native_module_cache_path(
+                data_dir_root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            );
+            self = self.with_known_native_dylib_module(
+                state.module_id,
+                format!(
+                    "native dylib {} ({})",
+                    if cache_path.exists() {
+                        "cached"
+                    } else {
+                        "missing-cache"
+                    },
+                    state.interface_version
+                ),
+            );
+        }
+        self.native_dylib_modules
+            .sort_by(|left, right| left.value.cmp(&right.value));
+        self.native_dylib_modules
+            .dedup_by(|left, right| left.module_id == right.module_id);
+        Ok(self)
+    }
+
     pub fn with_wasix(mut self, wasix: ModuleWasixCliConfig) -> Self {
         self.wasix = Some(wasix);
         self
@@ -77,6 +181,13 @@ pub struct ModuleNativeRustToggleTarget {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModuleNativeDylibKnownTarget {
+    pub module_id: ModuleId,
+    pub value: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleWasixCliConfig {
     pub module_id: &'static str,
     pub interface_version: &'static str,
@@ -85,6 +196,7 @@ pub struct ModuleWasixCliConfig {
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ModuleCliCommand {
     Help,
+    List,
     Install(ModuleInstallOptions),
     Inspect(ModuleInspectOptions),
     NativeDylib(ModuleNativeDylibCliCommand),
@@ -223,6 +335,8 @@ fn module_cli_help(config: &ModuleCliCommandConfig) -> CliCommandHelp {
     let mut lines = vec![
         "  sinomo module".to_string(),
         "      Show module commands.".to_string(),
+        "  sinomo module list".to_string(),
+        "      List locally registered and activated modules.".to_string(),
         "  sinomo module install [--inactive] [--source <text>] <folder>".to_string(),
         "      Import a declarative module package, cache its payload, register its catalog data, and activate it by default.".to_string(),
         "  sinomo module inspect <module-id>".to_string(),
@@ -255,8 +369,21 @@ fn module_cli_autocomplete(config: &ModuleCliCommandConfig) -> CliAutocompleteSp
         .collect::<Vec<_>>();
     let module_value =
         || CliAutocompleteValue::new("module-id", "module id", module_choices.iter().cloned());
+    let native_dylib_choices = config
+        .native_dylib_modules
+        .iter()
+        .map(|target| CliAutocompleteChoice::new(target.value.clone(), target.detail.clone()))
+        .collect::<Vec<_>>();
+    let native_dylib_module_value = || {
+        CliAutocompleteValue::new(
+            "module-id",
+            "module id",
+            native_dylib_choices.iter().cloned(),
+        )
+    };
 
     let mut children = vec![
+        CliAutocompleteSpec::new("list", "list locally registered and activated modules"),
         CliAutocompleteSpec::new("install", "install a declarative module package")
             .with_options([
                 CliAutocompleteOption::flag("--inactive", "register without activating"),
@@ -317,9 +444,9 @@ fn module_cli_autocomplete(config: &ModuleCliCommandConfig) -> CliAutocompleteSp
                     .with_options([CliAutocompleteOption::with_value(
                         "--module",
                         "module id",
-                        CliAutocompleteValue::new("module-id", "module id", []),
+                        native_dylib_module_value(),
                     )])
-                    .with_values([CliAutocompleteValue::new("module-id", "module id", [])]),
+                    .with_values([native_dylib_module_value()]),
             ]),
         CliAutocompleteSpec::new("native-rust", "manage built-in native Rust modules")
             .with_children([
@@ -385,6 +512,7 @@ fn parse_module_command(
         Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
             Ok(ModuleCliCommand::Help)
         }
+        Some((command, [])) if command == "list" => Ok(ModuleCliCommand::List),
         Some((command, rest)) if command == "install" => Ok(ModuleCliCommand::Install(
             parse_module_install_options(rest)?,
         )),
@@ -702,6 +830,7 @@ fn run_module_cli_command(
 ) -> Result<(), CliCommandError> {
     match command {
         ModuleCliCommand::Help => module_cli_help(config).write(context),
+        ModuleCliCommand::List => list_modules(context, config),
         ModuleCliCommand::Install(options) => install_declarative_module(context, options),
         ModuleCliCommand::Inspect(options) => inspect_declarative_module(context, options),
         ModuleCliCommand::NativeDylib(ModuleNativeDylibCliCommand::Activate(options)) => {
@@ -723,6 +852,122 @@ fn run_module_cli_command(
             unload_wasix_native_module(context, config)
         }
     }
+}
+
+fn list_modules(
+    context: &mut CliCommandContext<'_>,
+    config: &ModuleCliCommandConfig,
+) -> Result<(), CliCommandError> {
+    let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
+    data_dir.ensure_root_layout().map_err(command_error)?;
+    let root = data_dir.root();
+    list_modules_from_root(context, config, &root)
+}
+
+fn list_modules_from_root(
+    context: &mut CliCommandContext<'_>,
+    config: &ModuleCliCommandConfig,
+    root: &Path,
+) -> Result<(), CliCommandError> {
+    let declarative_states = read_declarative_module_loader_states(root)
+        .map_err(module_loader_store_error_to_command)?
+        .into_iter()
+        .map(|state| (state.module_id.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+    let mut declarative_registrations = read_declarative_module_registrations(root)
+        .map_err(module_loader_store_error_to_command)?;
+    declarative_registrations.sort_by(|left, right| left.module_id().cmp(right.module_id()));
+    let mut native_dylib_states = read_native_dylib_module_loader_states(root)
+        .map_err(module_loader_store_error_to_command)?;
+    native_dylib_states.sort_by(|left, right| left.module_id.cmp(&right.module_id));
+    let active_native_dylib_cache_keys = native_dylib_states
+        .iter()
+        .map(|state| state.cache_key.clone())
+        .collect::<BTreeSet<_>>();
+    let native_dylib_cache_entries = read_native_dylib_module_cache_entries_excluding_cache_keys(
+        root,
+        &active_native_dylib_cache_keys,
+    )
+    .map_err(module_loader_store_error_to_command)?;
+    let native_rust_states = read_native_rust_module_runtime_states(root)
+        .map_err(module_loader_store_error_to_command)?
+        .into_iter()
+        .map(|state| (state.module_id.clone(), state))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut count = 0usize;
+    for registration in declarative_registrations {
+        count += 1;
+        let state = declarative_states.get(registration.module_id());
+        context.stdout_line(format_args!(
+            "module: {} backend=declarative state={} version={} resources={}",
+            registration.module_id(),
+            state
+                .map(|state| if state.active { "active" } else { "inactive" })
+                .unwrap_or("registered"),
+            registration.manifest.version,
+            registration.surfaces.declarative_resources.len()
+        ))?;
+    }
+    let mut active_native_dylib_module_ids = BTreeSet::new();
+    for state in native_dylib_states {
+        count += 1;
+        let cache_path = native_module_cache_path(
+            &root,
+            &state.cache_key,
+            &state.content_hash,
+            &state.library_name,
+        );
+        active_native_dylib_module_ids.insert(state.module_id.clone());
+        context.stdout_line(format_args!(
+            "module: {} backend=native-dylib state=active interface={} cache={} library={} source={}",
+            state.module_id,
+            state.interface_version,
+            if cache_path.exists() { "present" } else { "missing" },
+            cache_path.display(),
+            state.source
+        ))?;
+    }
+    let mut cached_native_dylib_by_module = BTreeMap::<ModuleId, Vec<_>>::new();
+    for entry in native_dylib_cache_entries {
+        if active_native_dylib_module_ids.contains(&entry.module_id) {
+            continue;
+        }
+        cached_native_dylib_by_module
+            .entry(entry.module_id.clone())
+            .or_default()
+            .push(entry);
+    }
+    for entries in cached_native_dylib_by_module.into_values() {
+        let Some(entry) = entries.last() else {
+            continue;
+        };
+        count += 1;
+        context.stdout_line(format_args!(
+            "module: {} backend=native-dylib state=installed interface={} cache=present variants={} library={} source=cache:{}",
+            entry.module_id,
+            entry.interface_version,
+            entries.len(),
+            entry.library_path.display(),
+            entry.cache_key
+        ))?;
+    }
+    for target in &config.toggleable_native_rust_modules {
+        count += 1;
+        let state = native_rust_states.get(&target.module_id);
+        context.stdout_line(format_args!(
+            "module: {} backend=native-rust state={} detail={}",
+            target.value,
+            state
+                .map(|state| if state.enabled { "enabled" } else { "disabled" })
+                .unwrap_or("default"),
+            target.detail
+        ))?;
+    }
+    if count == 0 {
+        context.stdout_line(format_args!("modules: none"))?;
+    }
+    Ok(())
 }
 
 fn install_declarative_module(
@@ -1135,6 +1380,7 @@ fn command_error(error: impl fmt::Display) -> CliCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_config() -> ModuleCliCommandConfig {
         ModuleCliCommandConfig::new()
@@ -1147,6 +1393,41 @@ mod tests {
                 module_id: "module.sandbox.wasix",
                 interface_version: "sinomo.sandbox.wasix.v1",
             })
+    }
+
+    fn unique_temp(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "sinomo-module-cli-{prefix}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    fn test_native_dylib_state(module_id: ModuleId) -> crate::NativeDylibModuleLoaderState {
+        crate::NativeDylibModuleLoaderState {
+            module_id,
+            artifact_id: Some(
+                ArtifactId::from_legacy_named("artifact_remote_management_dylib")
+                    .expect("artifact"),
+            ),
+            content_hash: "blake3:abc".to_string(),
+            cache_key: "module/remote/management".to_string(),
+            library_name: if cfg!(windows) {
+                "sinomo_remote_management_module.dll".to_string()
+            } else if cfg!(target_os = "macos") {
+                "libsinomo_remote_management_module.dylib".to_string()
+            } else {
+                "libsinomo_remote_management_module.so".to_string()
+            },
+            platform_triple: "x86_64-unknown-linux-gnu".to_string(),
+            native_abi_version: 1,
+            interface_version: "sinomo.remote-management.v1".to_string(),
+            activated_at: module_loader_applied_at_now(),
+            source: "test".to_string(),
+        }
     }
 
     #[test]
@@ -1173,6 +1454,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("module install"))
         );
+        assert!(help.lines.iter().any(|line| line.contains("module list")));
         assert!(
             help.lines
                 .iter()
@@ -1181,6 +1463,12 @@ mod tests {
 
         let autocomplete = handler.autocomplete();
         assert_eq!(autocomplete.word, "module");
+        assert!(
+            autocomplete
+                .children
+                .iter()
+                .any(|child| child.word == "list")
+        );
         assert!(
             autocomplete
                 .children
@@ -1209,6 +1497,9 @@ mod tests {
 
     #[test]
     fn module_handler_parses_declarative_install_and_inspect() {
+        let list = parse_module_command(&["list".to_string()], &test_config()).expect("list parse");
+        assert!(matches!(list, ModuleCliCommand::List));
+
         let install = parse_module_command(
             &[
                 "install".to_string(),
@@ -1242,5 +1533,65 @@ mod tests {
             inspect,
             ModuleCliCommand::Inspect(ModuleInspectOptions { .. })
         ));
+    }
+
+    #[test]
+    fn module_config_discovers_native_dylib_loader_state_for_autocomplete() {
+        let root = unique_temp("native-dylib-autocomplete");
+        let module_id = ModuleId::from_legacy_named("module.remote-management").expect("module id");
+        crate::write_native_dylib_module_loader_state(
+            &root,
+            &test_native_dylib_state(module_id.clone()),
+        )
+        .expect("write state");
+
+        let config = ModuleCliCommandConfig::new()
+            .with_installed_native_dylib_modules_from_data_dir(&root)
+            .expect("discover modules");
+        let autocomplete = module_cli_autocomplete(&config);
+        let native_dylib = autocomplete
+            .children
+            .iter()
+            .find(|child| child.word == "native-dylib")
+            .expect("native-dylib");
+        let unload = native_dylib
+            .children
+            .iter()
+            .find(|child| child.word == "unload")
+            .expect("unload");
+
+        assert!(
+            unload.values.iter().any(|value| {
+                value
+                    .choices
+                    .iter()
+                    .any(|choice| choice.value == module_id.to_string())
+            }),
+            "missing unload choice for {module_id:?}: {unload:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn module_list_reports_native_dylib_loader_state() {
+        let root = unique_temp("native-dylib-list");
+        let module_id = ModuleId::from_legacy_named("module.remote-management").expect("module id");
+        crate::write_native_dylib_module_loader_state(
+            &root,
+            &test_native_dylib_state(module_id.clone()),
+        )
+        .expect("write state");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        {
+            let mut context = CliCommandContext::new(&mut stdout, &mut stderr);
+            list_modules_from_root(&mut context, &test_config(), &root).expect("list modules");
+        }
+        let output = String::from_utf8(stdout).expect("utf8");
+        assert!(output.contains("backend=native-dylib"));
+        assert!(output.contains("state=active"));
+        assert!(output.contains(&module_id.to_string()));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
