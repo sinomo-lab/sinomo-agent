@@ -1,20 +1,59 @@
-# Sinomo segmented dev cluster (Docker) — network-hardening test bed
+# Sinomo Docker clusters
 
-A disposable **6-node** Sinomo cluster partitioned into three network segments, with
-**iroh disabled**, used to develop native (non-iroh) peer **discovery and routing**.
+Compose layout:
 
-For a minimal one-node cluster used to validate local DFS and self-evolution without
-the incomplete sandbox path, use the separate compose file:
+- `../docker-compose.yml` — **production node**: full image (toolchain + managed
+  source baked in, self-rollout capable), iroh enabled, one configurable
+  seed/joiner service.
+- `docker/docker-compose.dev.yml` — **6-node segmented dev cluster** (this
+  README): network-hardening test bed running the **host-built binary**.
+- `docker/docker-compose.single-node.yml` — minimal one-node cluster for local
+  DFS and self-evolution smoke testing (full image; the smoke path needs the
+  in-container toolchain):
 
 ```bash
-docker compose -f docker-compose.single-node.yml up --build -d sinomo-single
-docker compose -f docker-compose.single-node.yml run --rm sinomo-single-smoke
-docker compose -f docker-compose.single-node.yml down -v
+docker compose -f docker/docker-compose.single-node.yml up --build -d sinomo-single
+docker compose -f docker/docker-compose.single-node.yml run --rm sinomo-single-smoke
+docker compose -f docker/docker-compose.single-node.yml down -v
 ```
 
 `sinomo-single` keeps state in the persistent `single-node-data` volume. The smoke
 service uses container-local data and is discarded after each run so repeated
 smoke tests remain a true one-node cluster.
+
+# Segmented dev cluster — network-hardening test bed
+
+A disposable **6-node** Sinomo cluster partitioned into three network segments, with
+**iroh disabled**, used to develop native (non-iroh) peer **discovery and routing**
+and to exercise cluster features (DFS, rollout supervision, routing) on a real
+multi-node topology.
+
+## Host-built binary (fast iteration)
+
+The dev nodes run a thin runtime image (`docker/Dockerfile.dev`, no Rust
+toolchain) and bind-mount the **host-built** `target/debug/sinomo` read-only
+into every container, so the edit-test loop never rebuilds an image:
+
+```bash
+cargo build -p sinomo                                      # build on the host
+docker compose -f docker/docker-compose.dev.yml up --build -d
+docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health
+
+cargo build -p sinomo                                      # iterate...
+docker compose -f docker/docker-compose.dev.yml restart    # ...nodes pick up the new binary
+```
+
+`--build` only (re)creates the small runtime image; it never compiles Rust. The
+entrypoint script is bind-mounted too, so script edits also apply on restart.
+
+Compatibility: the base image is `debian:trixie-slim` (glibc 2.41); a binary
+built on any current mainstream distro runs as is. If your host glibc is newer
+than the base image's, bump the base in `docker/Dockerfile.dev`.
+
+Trade-off: the thin image has no toolchain or `/sinomo-src`, so in-container
+self-rollout builds (`rollout apply` from the managed source repo) are
+unavailable here — use the root production compose or the single-node compose
+when testing rollout-from-source.
 
 ## Topology
 
@@ -66,50 +105,89 @@ the connectivity graph's **healthy** links. So every node integrates into one cl
 
 Joins are best-effort and time-bounded, so **no node hangs**; a cross-segment joiner retries
 while its upstream bridge finishes joining, so cohesion typically settles within ~a minute of
-startup. (Historically this was the "expected broken" red baseline for the routing work; it
-now coheres.)
+startup.
 
 ## Layout
 
-- `docker/Dockerfile` — node image (Rust toolchain + source + built `sinomo`). Builds from
-  a git worktree or a clone.
+- `docker/Dockerfile` — full node image (Rust toolchain + source + built `sinomo`);
+  used by the root production compose and the single-node smoke compose.
+- `docker/Dockerfile.dev` — thin runtime image for the dev cluster (host binary
+  bind-mounted in).
 - `docker/entrypoint.sh` — best-effort multi-hop formation (seed → bridges re-publish
-  invites → joiners), `SINOMO_DISABLE_IROH=1`, then runs the shadow supervisor (PID 1).
-- `../docker-compose.yml` — 6 services + 3 bridge networks (`seg_a`, `seg_ab`, `seg_b`).
+  invites → joiners), then runs the shadow supervisor (PID 1). Shared by all
+  composes.
+- `docker/docker-compose.dev.yml` — 6 services + 3 bridge networks (`seg_a`,
+  `seg_ab`, `seg_b`).
 
-Each node: main daemon `0.0.0.0:21353`, shadow `0.0.0.0:21354`, own `/data` volume, a
-managed rollout source repo at `/data/source/sinomo`, and a shared `/shared` volume that
-carries the per-segment invite files. `restart: "no"` so a failure stays visible.
+Each node: main daemon `0.0.0.0:21353`, shadow `0.0.0.0:21354`, own `/data` volume, and a
+shared `/shared` volume that carries the per-segment invite files. `restart:
+unless-stopped` lets Docker bring a node back when rollout intentionally replaces the
+shadow supervisor running as PID 1.
 
 ## Usage
 
+The helper scripts under `docker/` export `COMPOSE_FILE` pointing at the dev
+cluster, so they work from any directory; plain `docker compose` commands need
+`-f docker/docker-compose.dev.yml` (shown as `-f …dev.yml` below):
+
 ```bash
-# Build the image and start all 6 nodes (first build is slow / cold).
-docker compose up --build -d
+cargo build -p sinomo
+
+# Build the runtime image and start all 6 nodes.
+docker compose -f docker/docker-compose.dev.yml up --build -d
 
 # Watch formation.
-docker compose logs -f node1
-docker compose logs node4         # see the cross-segment join attempt + result
+docker compose -f docker/docker-compose.dev.yml logs -f node1
+docker compose -f docker/docker-compose.dev.yml logs node4   # cross-segment join
 
 # Cluster view from each segment.
-docker compose exec node1 sinomo cluster health   # expect all 6 main daemons
-docker compose exec node5 sinomo cluster status   # expect: integrated (a cluster member)
-
-# Confirm iroh is off (no iroh:// endpoint advertised).
-docker compose logs node1 | grep -i iroh
+docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health   # expect all 6
+docker compose -f docker/docker-compose.dev.yml exec node5 sinomo cluster status   # expect: integrated
 
 # Reachability sanity (segmentation): from node1, node3 resolves, node5 does not.
-docker compose exec node1 getent hosts node3      # resolves
-docker compose exec node1 getent hosts node5 || echo "unreachable (expected)"
+docker compose -f docker/docker-compose.dev.yml exec node1 getent hosts node3
+docker compose -f docker/docker-compose.dev.yml exec node1 getent hosts node5 || echo "unreachable (expected)"
 
-docker compose ps                  # container state (all Up)
-docker compose down -v             # tear down + wipe volumes
+docker compose -f docker/docker-compose.dev.yml ps        # container state (all Up)
+docker compose -f docker/docker-compose.dev.yml down -v   # tear down + wipe volumes
+```
+
+## Automated DFS correctness suite
+
+`docker/test-cluster.sh` runs the cluster-wide POSIX/DFS correctness suite in a
+**dedicated compose project** (`sinomo-dfs-test` by default, so it never touches a
+manually started dev cluster): it builds the host binary if missing, brings up the
+6 nodes, waits for clean formation, then drives the in-binary `cluster-dfs` runtime
+test cases from different nodes:
+
+```bash
+docker/test-cluster.sh                       # up, test, down -v
+SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
+SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
+```
+
+Scenarios: per-node DFS invariants, read-your-write roundtrips (both segments),
+cross-segment write→read in both directions plus a routed delete, a
+/users→/services rename issued by a non-writer node, member restart durability,
+and a final invariant sweep. Failure evidence (probe JSON, compose ps, cluster
+health/doctor, per-node logs) lands in `target/cluster-test-artifacts/<run>/`.
+
+The scenarios are composed from runtime test cases registered in the binary
+itself (list them with `sinomo test list --tag cluster-dfs`), so any probe can
+also be run by hand on any live node:
+
+```bash
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  exec node5 sinomo test run cluster.dfs.read-your-write --require-cluster --json
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  exec node2 sinomo test run cluster.dfs.expect-file --require-cluster \
+  --param path=/services/x.txt --param payload=hello --param timeout-seconds=60
 ```
 
 ## Validation gates
 
 The hardening harnesses are designed to fail with useful evidence instead of only printing
-diagnostics:
+diagnostics. They target the dev cluster automatically (override with `COMPOSE_FILE`):
 
 ```bash
 # Full production gate: build/start the 6-node cluster, wait for clean formation,
@@ -156,19 +234,6 @@ hard stabilization requirement after role changes. When launched by
 `docker/measure-final.sh`, these values inherit the top-level gate quiescence
 settings.
 
-## Iterating on code
-
-The image bakes a build of the current source; after host changes, `docker compose up
---build -d` rebuilds (cold). For a faster daemon-only iteration without a full image
-rebuild, copy the changed file into a node, rebuild incrementally against its warm
-`target/`, install over the baked binary, and restart that node:
-
-```bash
-docker compose cp crates/<crate>/src/<file>.rs node1:/sinomo-src/crates/<crate>/src/<file>.rs
-docker compose exec -T node1 sh -c 'cd /sinomo-src && cargo build -p sinomo && install -Dm755 target/debug/sinomo /usr/local/bin/sinomo'
-docker compose restart node1
-```
-
 ## Notes
 
 - Within a segment, nodes discover each other via LAN multicast + direct TCP; across
@@ -176,5 +241,6 @@ docker compose restart node1
   (node3, node4) over the connectivity graph's healthy links.
 - `SINOMO_DISABLE_IROH` is a runtime switch (the iroh code is still compiled in); unset it
   (or set to `0`) to restore iroh.
-- The git commit each node was built from shows in `sinomo cluster health` (`commit`
-  column).
+- After a self-rollout the stable binaries live in `/data/bin` and are preferred
+  over the mounted bootstrap binary on restart (see `entrypoint.sh`); `down -v`
+  wipes them and returns the nodes to the host binary.

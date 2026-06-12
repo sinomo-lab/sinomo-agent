@@ -7836,6 +7836,7 @@ fn local_voter_republishes_local_members_missing_from_kv() {
         &merged_state,
         network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: Duration::from_secs(1),
+            force_kv_snapshot_sync: false,
         },
         &mut CliLocalMemberPublishHost,
     )

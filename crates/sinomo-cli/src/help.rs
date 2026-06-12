@@ -305,7 +305,7 @@ pub(super) fn print_test_help() {
     println!("  sinomo test list [--tag <tag>] [--json]");
     println!("      List registered runtime tests.");
     println!(
-        "  sinomo test run <test-id> [--provider <provider>] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json]"
+        "  sinomo test run <test-id> [--provider <provider>] [--account <account>] [--model <model>] [--live] [--require-cluster] [--json] [--param <key=value> ...]"
     );
     println!("      Run one registered runtime test.");
     println!(

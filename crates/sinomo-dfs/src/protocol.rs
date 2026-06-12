@@ -298,6 +298,11 @@ pub enum DfsNamespaceResult {
         /// or internal failures.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         posix_error: Option<DfsNamespacePosixError>,
+        /// Set on authority rejections: the shard primary the responder
+        /// currently knows. A requester routing on a stale shard view retries
+        /// against this node instead of failing the operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_primary_node_id: Option<NodeId>,
     },
 }
 

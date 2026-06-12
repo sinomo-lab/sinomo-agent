@@ -8,7 +8,7 @@ use crate::rpc::{
     ObjectRpcResponse,
 };
 use crate::{
-    cluster_route_next_hop, discover_default_public_ip_candidates_for_local_ips_async,
+    discover_default_public_ip_candidates_for_local_ips_async,
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
     format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
@@ -23,7 +23,7 @@ use sinomo_kv::{
     CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, ClusterKvRaftCommitResult, ClusterKvRaftConfigRecord,
     ClusterKvRaftLeaderElectionOptions, ClusterKvRaftLocalVoteMetadata,
     ClusterKvRaftUncommittedAppend, ClusterRaftAppendRequest, ClusterRaftAppendResponse,
-    ClusterRaftVoteRequest, ClusterRaftVoteResponse,
+    ClusterRaftVoteRequest, ClusterRaftVoteResponse, KvRevision,
 };
 #[cfg(test)]
 use sinomo_kv::{
@@ -2500,6 +2500,13 @@ pub struct ClusterInvitePublishResponse {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterMemberPublishRequest {
     pub members: Vec<ClusterMemberRecord>,
+    /// The publisher's local cluster KV snapshot revision. When present, the
+    /// voter includes its current KV snapshot in the response only if the
+    /// publisher is behind — this is how learners (which cannot always dial a
+    /// voter directly; member publish is bridge-relayable) converge their
+    /// local KV snapshot without re-shipping it on every publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_kv_revision: Option<KvRevision>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3576,6 +3583,31 @@ pub trait ClusterKvSnapshotRefreshHost {
         local_node_id: &NodeId,
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError>;
+
+    /// Peers that can relay an RPC toward a voter when no voter is directly
+    /// dialable (cross-segment learners reach voters only through bridges).
+    /// Hosts without relay support keep the default and the refresh simply
+    /// skips the relay fallback.
+    fn relay_peers(
+        &mut self,
+        _paths: &ClusterPaths,
+        _state: &ClusterBootstrapState,
+    ) -> Vec<ClusterEndpointRecord> {
+        Vec::new()
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        _state: &ClusterBootstrapState,
+        _target_node_id: &NodeId,
+        _peer: &ClusterEndpointRecord,
+        _request: &ObjectRpcRequest,
+        _timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        Err(NetworkError::ClusterReadOnly {
+            detail: "cluster KV snapshot relay is not supported by this host".to_string(),
+        })
+    }
 }
 
 struct LocalClusterKvSnapshotRefreshHost<F> {
@@ -4180,6 +4212,26 @@ where
         snapshot: KvSnapshot,
     ) -> Result<bool, NetworkError> {
         locked_restore_cluster_raft_from_snapshot_if_newer(paths, local_node_id, snapshot)
+    }
+
+    fn relay_peers(
+        &mut self,
+        paths: &ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Vec<ClusterEndpointRecord> {
+        cluster_member_publish_targets(paths, state)
+    }
+
+    fn relay_rpc_to_node(
+        &mut self,
+        state: &ClusterBootstrapState,
+        target_node_id: &NodeId,
+        peer: &ClusterEndpointRecord,
+        request: &ObjectRpcRequest,
+        timeout: Duration,
+    ) -> Result<ObjectRpcResponse, NetworkError> {
+        self.transport
+            .relay_rpc_to_node(state, target_node_id, peer, request, timeout)
     }
 }
 
@@ -5164,6 +5216,13 @@ pub trait ClusterConnectivityPublishAsyncHost {
 
 pub struct ClusterLocalMemberPublishOptions {
     pub member_publish_timeout: Duration,
+    /// Publish even when the local KV snapshot already reflects the local
+    /// member records. Learners set this on their periodic publish so the
+    /// voter can hand back a newer KV snapshot (see
+    /// `ClusterMemberPublishRequest::local_kv_revision`); without it a learner
+    /// whose own records are stable never publishes again and its local KV
+    /// snapshot never converges.
+    pub force_kv_snapshot_sync: bool,
 }
 
 pub trait ClusterLocalMemberPublishHost {
@@ -5855,9 +5914,16 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     {
         return retry_due;
     }
-    record.state == ClusterConnectivityState::Healthy
-        && record.consecutive_failures > 0
-        && retry_due
+    if record.state != ClusterConnectivityState::Healthy {
+        // The failure budget is exhausted, but the endpoint must not freeze
+        // as degraded until record expiry: a peer that becomes reachable
+        // later — the canonical case is a cold-formation late joiner whose
+        // pre-join window burned the budget — has to be rediscovered. Retry
+        // at a slower cadence than healthy refreshes.
+        let degraded_retry_seconds = retry_seconds.saturating_mul(2);
+        return record.observed_at + time::Duration::seconds(degraded_retry_seconds) <= now;
+    }
+    record.consecutive_failures > 0 && retry_due
 }
 
 pub fn cluster_connectivity_probe_due_with_graph(
@@ -5888,7 +5954,12 @@ pub fn cluster_connectivity_probe_due_with_graph(
     if record.state == ClusterConnectivityState::Healthy {
         return true;
     }
-    cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_none()
+    // A due non-healthy record re-probes even when a relay route exists:
+    // a healed DIRECT endpoint always beats relaying, and the route may
+    // itself traverse stale edges. The slow degraded cadence in the base
+    // check keeps the probe volume negligible.
+    let _ = (graph, local_node_id, endpoint);
+    true
 }
 
 impl ClusterConnectivityGraph {
@@ -9325,6 +9396,15 @@ where
 {
     type Error = NetworkError;
 
+    fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<std::fs::File>, NetworkError> {
+        sinomo_kv::lock_cluster_kv_commit_sequence(
+            &self.paths.kv_paths(),
+            sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
+        )
+        .map(Some)
+        .map_err(Into::into)
+    }
+
     fn append_cluster_raft_command_uncommitted_or_no_effect(
         &mut self,
         command: KvCommand,
@@ -9461,6 +9541,29 @@ where
 {
     type Error = NetworkError;
     type Target = ClusterEndpointRecord;
+
+    fn lock_cluster_raft_commit_sequence_async<'a>(
+        &'a mut self,
+    ) -> sinomo_kv::ClusterKvRaftQuorumFuture<'a, Option<std::fs::File>, NetworkError> {
+        let runtime = self.runtime;
+        let kv_paths = self.paths.kv_paths();
+        Box::pin(async move {
+            runtime
+                .spawn_blocking(move || {
+                    sinomo_kv::lock_cluster_kv_commit_sequence(
+                        &kv_paths,
+                        sinomo_kv::CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT,
+                    )
+                })
+                .await
+                .map_err(|source| NetworkError::Io {
+                    operation: "cluster raft commit sequence lock".to_string(),
+                    detail: format!("cluster raft commit sequence lock task failed: {source}"),
+                })?
+                .map(Some)
+                .map_err(Into::into)
+        })
+    }
 
     fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
         &'a mut self,
@@ -9654,7 +9757,7 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
 ) -> Result<ClusterRaftCommittedFanoutReport, NetworkError> {
     let mut report = ClusterRaftCommittedFanoutReport::default();
     let mut replicated_nodes = BTreeSet::new();
-    for endpoint in cluster_raft_live_voter_targets_async(runtime, paths, state).await? {
+    for endpoint in cluster_raft_member_replication_targets_async(runtime, paths, state).await? {
         if replicated_nodes.contains(&endpoint.node_id) {
             continue;
         }
@@ -9938,6 +10041,7 @@ pub fn refresh_current_cluster_kv_store_with_host(
     }
 
     let deadline = Instant::now() + options.refresh_budget(!snapshots.is_empty());
+    let mut fetched_remote = false;
     for endpoint in &targets {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -9949,6 +10053,36 @@ pub fn refresh_current_cluster_kv_store_with_host(
             .fetch_cluster_kv_snapshot(endpoint, options.fair_command_timeout(endpoint, remaining))
         {
             snapshots.push(snapshot);
+            fetched_remote = true;
+        }
+    }
+    // Cross-segment learners cannot dial any voter directly; fall back to
+    // relaying the snapshot fetch through a bridge peer, mirroring how KV txn
+    // forwarding relays toward a voter.
+    if !fetched_remote {
+        'relay_targets: for voter in &targets {
+            for peer in host
+                .relay_peers(paths, state)
+                .into_iter()
+                .filter(|peer| peer.node_id != voter.node_id)
+            {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    break 'relay_targets;
+                }
+                if let Ok(snapshot) = relay_fetch_cluster_kv_snapshot_via_peer(
+                    state,
+                    voter,
+                    &peer,
+                    options.fair_command_timeout(&peer, remaining),
+                    host,
+                ) {
+                    snapshots.push(snapshot);
+                    break 'relay_targets;
+                }
+            }
         }
     }
     let snapshot = snapshots
@@ -9964,6 +10098,21 @@ pub fn refresh_current_cluster_kv_store_with_host(
         snapshot.clone(),
     )?;
     Ok(InProcessKvStore::restore(snapshot))
+}
+
+fn relay_fetch_cluster_kv_snapshot_via_peer(
+    state: &ClusterBootstrapState,
+    voter: &ClusterEndpointRecord,
+    peer: &ClusterEndpointRecord,
+    timeout: Duration,
+    host: &mut impl ClusterKvSnapshotRefreshHost,
+) -> Result<KvSnapshot, NetworkError> {
+    let payload = sinomo_kv::cluster_kv_snapshot_rpc_payload()?;
+    let request =
+        ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
+    let response = host.relay_rpc_to_node(state, &voter.node_id, peer, &request, timeout)?;
+    response.error_detail()?;
+    sinomo_kv::decode_cluster_kv_snapshot_rpc_body(&response.body).map_err(Into::into)
 }
 
 pub fn refresh_current_cluster_kv_store_with_local_storage_and_transport<F>(
@@ -10886,6 +11035,49 @@ pub fn cluster_raft_live_voter_targets(
         .collect()
 }
 
+/// Replication targets for the committed-command fan-out: every authorized
+/// main-daemon member (learners included), connectivity-aware. Learners are
+/// pure raft followers — pushing committed appends to them on commit is the
+/// event-driven convergence path; nothing is sent when nothing commits.
+pub fn cluster_raft_member_replication_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let node_statuses = cluster_node_status_map_from_kv(paths);
+    cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id != state.local_node_id)
+        .filter(|endpoint| {
+            state.members.iter().any(|member| {
+                member.node_id == endpoint.node_id
+                    && member.state.is_authorized()
+                    && cluster_member_has_main_daemon_capability(member)
+            })
+        })
+        .filter(|endpoint| {
+            !node_statuses
+                .get(&endpoint.node_id)
+                .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
+        })
+        .collect()
+}
+
+pub async fn cluster_raft_member_replication_targets_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let paths = paths.clone();
+    let state = state.clone();
+    runtime
+        .spawn_blocking(move || cluster_raft_member_replication_targets(&paths, &state))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft member replication target selection".to_string(),
+            detail: format!("member replication target selection task failed: {source}"),
+        })
+}
+
 pub async fn cluster_raft_live_voter_targets_async(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -10974,6 +11166,23 @@ pub fn cluster_main_daemon_command_endpoint_candidates(
                 && main_daemon_node_ids.contains(&endpoint.node_id)
         })
         .collect()
+}
+
+/// Member-publish targets with voters first. The publish doubles as the
+/// learner's KV snapshot sync (`ClusterMemberPublishRequest::local_kv_revision`),
+/// and the snapshot in the response comes from whichever node answers — a
+/// sibling learner with an equally stale snapshot answers "current" and the
+/// sync silently stalls. Preferring voters (then bridges, whose own snapshots
+/// converge the same way) forms a convergence chain rooted at the voter.
+pub fn cluster_member_publish_targets_voter_first(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut targets = cluster_member_publish_targets(paths, state);
+    targets.sort_by_key(|endpoint| {
+        !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id)
+    });
+    targets
 }
 
 pub fn cluster_member_publish_targets(
@@ -13262,16 +13471,23 @@ pub fn publish_local_members_via_voter_with_host(
     if members.is_empty() {
         return Ok(());
     }
-    if cluster_member_publish_matches_kv(paths, &members).unwrap_or(false) {
+    if !options.force_kv_snapshot_sync
+        && cluster_member_publish_matches_kv(paths, &members).unwrap_or(false)
+    {
         return Ok(());
     }
-    let request = ClusterMemberPublishRequest { members };
+    let request = ClusterMemberPublishRequest {
+        members,
+        local_kv_revision: local_cluster_kv_snapshot_revision(paths),
+    };
     let mut failures = Vec::new();
-    for endpoint in cluster_member_publish_targets(paths, state) {
+    for endpoint in cluster_member_publish_targets_voter_first(paths, state) {
         match host.send_cluster_member_publish(&endpoint, &request, options.member_publish_timeout)
         {
             Ok(response) if response.accepted => {
-                if let Some(snapshot) = response.kv_snapshot {
+                if let Some(snapshot) = response.kv_snapshot
+                    && imported_snapshot_advances_local_kv(paths, &snapshot)
+                {
                     write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
                 }
                 return Ok(());
@@ -13309,32 +13525,46 @@ pub async fn publish_local_members_via_voter_async_with_host(
     if members.is_empty() {
         return Ok(());
     }
-    let paths_for_match = paths.clone();
-    let members_for_match = members.clone();
-    let already_published = runtime
-        .spawn_blocking(move || {
-            cluster_member_publish_matches_kv(&paths_for_match, &members_for_match).unwrap_or(false)
-        })
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "cluster local member publish match".to_string(),
-            detail: format!("member publish match task failed: {source}"),
-        })?;
-    if already_published {
-        return Ok(());
+    if !options.force_kv_snapshot_sync {
+        let paths_for_match = paths.clone();
+        let members_for_match = members.clone();
+        let already_published = runtime
+            .spawn_blocking(move || {
+                cluster_member_publish_matches_kv(&paths_for_match, &members_for_match)
+                    .unwrap_or(false)
+            })
+            .await
+            .map_err(|source| NetworkError::Io {
+                operation: "cluster local member publish match".to_string(),
+                detail: format!("member publish match task failed: {source}"),
+            })?;
+        if already_published {
+            return Ok(());
+        }
     }
     let paths_for_targets = paths.clone();
     let state_for_targets = state.clone();
     let targets = runtime
         .spawn_blocking(move || {
-            cluster_member_publish_targets(&paths_for_targets, &state_for_targets)
+            cluster_member_publish_targets_voter_first(&paths_for_targets, &state_for_targets)
         })
         .await
         .map_err(|source| NetworkError::Io {
             operation: "cluster local member publish target selection".to_string(),
             detail: format!("member publish target selection task failed: {source}"),
         })?;
-    let request = ClusterMemberPublishRequest { members };
+    let paths_for_revision = paths.clone();
+    let local_kv_revision = runtime
+        .spawn_blocking(move || local_cluster_kv_snapshot_revision(&paths_for_revision))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster local member publish revision read".to_string(),
+            detail: format!("member publish revision read task failed: {source}"),
+        })?;
+    let request = ClusterMemberPublishRequest {
+        members,
+        local_kv_revision,
+    };
     let mut failures = Vec::new();
     for endpoint in targets {
         match host
@@ -13346,6 +13576,9 @@ pub async fn publish_local_members_via_voter_async_with_host(
                     let paths_for_write = paths.clone();
                     runtime
                         .spawn_blocking(move || {
+                            if !imported_snapshot_advances_local_kv(&paths_for_write, &snapshot) {
+                                return Ok(false);
+                            }
                             write_imported_cluster_kv_snapshot_if_changed(
                                 &paths_for_write,
                                 &snapshot,
@@ -13529,17 +13762,78 @@ fn prepare_cluster_member_publish_request(
         }
     }
     if cluster_member_publish_matches_kv(paths, &request.members)? {
+        let kv_snapshot =
+            cluster_member_publish_response_snapshot(paths, &state, request.local_kv_revision)?;
         return Ok(PreparedClusterMemberPublish::Response(
             ClusterMemberPublishResponse {
                 accepted: true,
                 detail: "member endpoints already current".to_string(),
                 state,
-                kv_snapshot: None,
+                kv_snapshot,
             },
         ));
     }
     let txn = cluster_member_publish_txn_from_kv(paths, &request.members)?;
     Ok(PreparedClusterMemberPublish::Commit { state, txn })
+}
+
+/// The local node's current cluster KV snapshot revision, if one is readable;
+/// `None` asks the voter to ship its full snapshot back.
+fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision> {
+    read_cluster_kv_current_snapshot(paths)
+        .ok()
+        .map(|snapshot| snapshot.revision)
+}
+
+/// Direction guard for snapshot imports: under raft's lag-only invariant an
+/// imported snapshot must move local history FORWARD. A responder that lags
+/// the local node (a stale bridge answering a fresher publisher) must never
+/// roll the local KV back.
+fn imported_snapshot_advances_local_kv(paths: &ClusterPaths, snapshot: &KvSnapshot) -> bool {
+    match local_cluster_kv_snapshot_revision(paths) {
+        Some(local) => snapshot.revision > local,
+        None => true,
+    }
+}
+
+/// The KV snapshot a member-publish response should carry back to the
+/// publisher: nothing when the publisher reported exactly our revision, the
+/// full current snapshot otherwise. Any MISMATCH ships the snapshot — not
+/// just "publisher behind" — because the publisher's counter can evolve
+/// independently of ours (locally-applied writes before or during the join)
+/// and a diverged-ahead publisher would otherwise never converge. Reporting
+/// no revision at all means the publisher has no readable snapshot (or
+/// predates the hint) and also receives the full snapshot; the importer
+/// deduplicates unchanged content.
+fn cluster_member_publish_response_snapshot(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    publisher_revision: Option<KvRevision>,
+) -> Result<Option<KvSnapshot>, NetworkError> {
+    let snapshot = read_cluster_kv_current_snapshot(paths)?;
+    let Some(publisher_revision) = publisher_revision else {
+        // No readable snapshot at the publisher (or it predates the revision
+        // hint): only a full import converges it.
+        return Ok(Some(snapshot));
+    };
+    if publisher_revision < snapshot.revision {
+        return Ok(Some(snapshot));
+    }
+    if publisher_revision > snapshot.revision {
+        // Lag-only invariant: revisions are positions in the leader's single
+        // linear history. A publisher ahead of THIS node means this node is
+        // the stale one (normal when a fresh learner syncs through a lagging
+        // bridge) — never ship our older snapshot backwards. A publisher
+        // ahead of the LEADER is impossible and indicates replicated-state
+        // divergence worth surfacing loudly.
+        if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+            eprintln!(
+                "warning: member publish reported KV revision {} ahead of this voter's {} — replicated KV history may have diverged",
+                publisher_revision.0, snapshot.revision.0
+            );
+        }
+    }
+    Ok(None)
 }
 
 pub fn handle_cluster_member_publish_request_with_host<H>(

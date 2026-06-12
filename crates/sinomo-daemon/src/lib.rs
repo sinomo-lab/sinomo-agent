@@ -31,7 +31,7 @@ pub use client::{
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,
     send_daemon_rollout_diagnostics, send_daemon_rpc, send_daemon_rpc_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
-    send_daemon_rpc_to_endpoint_async, send_daemon_shutdown_request,
+    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
     send_dfs_metadata_snapshot_install_to_endpoint_async, send_dfs_protocol_frame_to_endpoint,
     send_dfs_protocol_frame_to_endpoint_async,

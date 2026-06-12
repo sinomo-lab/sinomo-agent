@@ -566,7 +566,14 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
         return Ok(None);
     }
 
-    let deadline = ClusterEndpointRpcDeadline::new(options.timeouts.connect_timeout);
+    // A relay spans several hop attempts plus the remote leg; callers tuned
+    // for fast direct probes (sub-second connect timeouts) must not starve
+    // the whole relay after a single dead endpoint.
+    let relay_budget = options
+        .timeouts
+        .connect_timeout
+        .map(|timeout| timeout.max(CLUSTER_RELAY_MIN_BUDGET));
+    let deadline = ClusterEndpointRpcDeadline::new(relay_budget);
     let request_auth = request_auth.into();
     let request_command = request_command.into();
     let mut failures = Vec::new();
@@ -630,6 +637,8 @@ pub async fn relay_rpc_to_endpoint_async_with_host(
         ),
     })
 }
+
+const CLUSTER_RELAY_MIN_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 
 async fn relay_route_plan(
     runtime: &tokio::runtime::Handle,

@@ -1,133 +1,64 @@
-# Sinomo 6-node SEGMENTED dev cluster for network-layer hardening (discovery + routing).
+# Sinomo production node.
 #
-#   docker compose up --build -d        # build the image + start all 6 nodes
-#   docker compose exec node1 sinomo cluster health
-#   docker compose down -v              # tear down + wipe volumes
+# Runs ONE cluster node from the full image (docker/Dockerfile): the shadow
+# supervisor as PID 1 supervising the main daemon, with the Rust toolchain and
+# managed source repo baked in so self-rollout (`rollout apply` / `rollout
+# cluster`) can build new binaries in-container. iroh stays ENABLED so roaming
+# nodes reach the cluster through the relay when no direct route exists.
 #
-# Topology -- three bridge networks, with node3 and node4 dual-homed as the only
-# cross-segment links:
+# Bootstrap the first node (seed):
 #
-#     seg_a {node1,node2,node3} ── node3 ──[seg_ab]── node4 ── seg_b {node4,node5,node6}
+#   docker compose up --build -d
+#   docker compose exec sinomo sinomo cluster invite --ttl-seconds 86400 --output /shared/invite.json
+#   docker compose cp sinomo:/shared/invite.json ./invite.json   # hand to the joining node
 #
-# node1,2,3 reach each other; node4,5,6 reach each other; node3<->node4 is the single
-# bridge. node1 cannot reach node5/6 (no shared network). Docker's embedded DNS only
-# resolves peers on a shared network, so each node's INTRODUCER is a *reachable* neighbor
-# (node2,3->node1; node4->node3; node5,6->node4).
+# Join an existing cluster from another host:
 #
-# IROH IS DISABLED here on purpose (SINOMO_DISABLE_IROH=1) so the cluster runs on direct
-# LAN-TCP only -- there is no external relay to paper over the segmentation. Cross-segment
-# cohesion depends on native multi-hop routing through node3/node4. The restart policy lets
-# Docker bring a node back when rollout intentionally replaces the shadow supervisor running
-# as PID 1; logical rollout failures still remain visible through `sinomo cluster health`.
-
-x-node-defaults: &node-defaults
-  image: sinomo-dev-node
-  restart: unless-stopped
+#   docker compose cp ./invite.json sinomo:/shared/invite.json
+#   SINOMO_ROLE=joiner SINOMO_JOIN_INVITE=/shared/invite.json \
+#     SINOMO_INTRODUCER=<seed-host>:21353 docker compose up -d
+#
+# Configuration (environment, all optional):
+#   SINOMO_ROLE            seed | joiner                 (default: seed)
+#   SINOMO_NODE_NAME       cluster node name             (default: sinomo)
+#   SINOMO_CLUSTER_NAME    cluster name, seed only       (default: sinomo)
+#   SINOMO_INTRODUCER      host:port to join through     (joiners)
+#   SINOMO_JOIN_INVITE     invite file path in-container (joiners)
+#   SINOMO_ADVERTISE_HOST  address advertised to peers   (default: node name)
+#
+# The development clusters live under docker/ and run the HOST-BUILT binary to
+# avoid in-image builds:
+#   docker/docker-compose.dev.yml          6-node segmented network test bed
+#   docker/docker-compose.single-node.yml  single-node DFS / self-evolution smoke
 
 services:
-  node1:
-    <<: *node-defaults
+  sinomo:
+    image: sinomo-node
     build:
       context: .
       dockerfile: docker/Dockerfile
-    hostname: node1
+    restart: unless-stopped
+    hostname: ${SINOMO_NODE_NAME:-sinomo}
     environment:
-      ROLE: seed
-      NODE_NAME: node1
-      CLUSTER_NAME: dev-cluster
-      SINOMO_DISABLE_IROH: "1"
-      # The seed (voter) publishes a join invite for every segment, each naming the
-      # reachable bridge as that segment's introducer (node2,3 reach node1; node4 reaches
-      # node3; node5,6 reach node4). Bridge learners cannot mint invites, so only node1 does.
-      PUBLISH_INVITES: "node1:21353=/shared/seg-a-invite.json node3:21353=/shared/seg-ab-invite.json node4:21353=/shared/seg-b-invite.json"
-    volumes: [node1-data:/data, invite:/shared]
-    networks: [seg_a]
-
-  node2:
-    <<: *node-defaults
-    hostname: node2
-    depends_on: [node1]
-    environment:
-      ROLE: joiner
-      NODE_NAME: node2
-      CLUSTER_NAME: dev-cluster
-      SINOMO_DISABLE_IROH: "1"
-      INTRODUCER: node1:21353
-      JOIN_INVITE: /shared/seg-a-invite.json
-    volumes: [node2-data:/data, invite:/shared]
-    networks: [seg_a]
-
-  # node3: member of seg_a AND bridge into seg_ab (re-publishes an invite for node4).
-  node3:
-    <<: *node-defaults
-    hostname: node3
-    depends_on: [node1]
-    environment:
-      ROLE: joiner
-      NODE_NAME: node3
-      CLUSTER_NAME: dev-cluster
-      SINOMO_DISABLE_IROH: "1"
-      INTRODUCER: node1:21353
-      JOIN_INVITE: /shared/seg-a-invite.json
-    volumes: [node3-data:/data, invite:/shared]
-    networks: [seg_a, seg_ab]
-
-  # node4: member of seg_b AND bridge into seg_ab (joins via node3, re-publishes for seg_b).
-  node4:
-    <<: *node-defaults
-    hostname: node4
-    depends_on: [node3]
-    environment:
-      ROLE: joiner
-      NODE_NAME: node4
-      CLUSTER_NAME: dev-cluster
-      SINOMO_DISABLE_IROH: "1"
-      INTRODUCER: node3:21353
-      JOIN_INVITE: /shared/seg-ab-invite.json
-    volumes: [node4-data:/data, invite:/shared]
-    networks: [seg_ab, seg_b]
-
-  node5:
-    <<: *node-defaults
-    hostname: node5
-    depends_on: [node4]
-    environment:
-      ROLE: joiner
-      NODE_NAME: node5
-      CLUSTER_NAME: dev-cluster
-      SINOMO_DISABLE_IROH: "1"
-      INTRODUCER: node4:21353
-      JOIN_INVITE: /shared/seg-b-invite.json
-    volumes: [node5-data:/data, invite:/shared]
-    networks: [seg_b]
-
-  node6:
-    <<: *node-defaults
-    hostname: node6
-    depends_on: [node4]
-    environment:
-      ROLE: joiner
-      NODE_NAME: node6
-      CLUSTER_NAME: dev-cluster
-      SINOMO_DISABLE_IROH: "1"
-      INTRODUCER: node4:21353
-      JOIN_INVITE: /shared/seg-b-invite.json
-    volumes: [node6-data:/data, invite:/shared]
-    networks: [seg_b]
-
-networks:
-  seg_a:
-    driver: bridge
-  seg_ab:
-    driver: bridge
-  seg_b:
-    driver: bridge
+      ROLE: ${SINOMO_ROLE:-seed}
+      NODE_NAME: ${SINOMO_NODE_NAME:-sinomo}
+      CLUSTER_NAME: ${SINOMO_CLUSTER_NAME:-sinomo}
+      INTRODUCER: ${SINOMO_INTRODUCER:-}
+      JOIN_INVITE: ${SINOMO_JOIN_INVITE:-}
+      # Production keeps iroh enabled (relay-assisted reachability for roaming
+      # peers); the dev cluster disables it on purpose.
+      SINOMO_DISABLE_IROH: "0"
+      # Bootstrap the default cluster-backed SIFS filesystem (metadata shards
+      # published to cluster KV) so DFS works across nodes out of the box.
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      SINOMO_DAEMON_ADVERTISE_HOST: ${SINOMO_ADVERTISE_HOST:-}
+    ports:
+      - "21353:21353" # main daemon
+      - "21354:21354" # shadow supervisor
+    volumes:
+      - sinomo-data:/data
+      - sinomo-shared:/shared
 
 volumes:
-  node1-data:
-  node2-data:
-  node3-data:
-  node4-data:
-  node5-data:
-  node6-data:
-  invite:
+  sinomo-data:
+  sinomo-shared:

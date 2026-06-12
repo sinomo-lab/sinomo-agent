@@ -6,6 +6,12 @@
 #
 #   docker/watch-nodes.sh            # poll until interrupted
 #   docker/watch-nodes.sh 120        # poll for ~120s then exit
+
+# These helpers target the dev cluster compose file regardless of the caller's
+# working directory (the root docker-compose.yml is the production node).
+SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

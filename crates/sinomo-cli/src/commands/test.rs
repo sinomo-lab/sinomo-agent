@@ -27,6 +27,7 @@ pub(crate) struct TestRunOptions {
     pub live: bool,
     pub require_cluster: bool,
     pub json: bool,
+    pub params: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -89,6 +90,7 @@ fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
     let mut live = false;
     let mut require_cluster = false;
     let mut json = false;
+    let mut params = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -117,6 +119,21 @@ fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
             "--live" => live = true,
             "--require-cluster" => require_cluster = true,
             "--json" => json = true,
+            "--param" => {
+                index += 1;
+                let raw = args.get(index).ok_or_else(|| CliError::Parse {
+                    detail: "--param requires a key=value argument".to_string(),
+                })?;
+                let (key, value) = raw.split_once('=').ok_or_else(|| CliError::Parse {
+                    detail: format!("--param expects key=value, got `{raw}`"),
+                })?;
+                if key.is_empty() {
+                    return Err(CliError::Parse {
+                        detail: format!("--param expects a non-empty key, got `{raw}`"),
+                    });
+                }
+                params.push((key.to_string(), value.to_string()));
+            }
             value if id.is_none() => id = Some(value.to_string()),
             value => {
                 return Err(CliError::Parse {
@@ -136,6 +153,7 @@ fn parse_test_run_options(args: &[String]) -> Result<TestRunOptions, CliError> {
         live,
         require_cluster,
         json,
+        params,
     })
 }
 
@@ -213,11 +231,11 @@ pub(crate) fn run_test_command(command: TestCliCommand) -> Result<(), CliError> 
 }
 
 fn test_registry() -> Result<SinomoTestRegistry, CliError> {
-    sinomo_lm::register_lm_test_cases(SinomoTestRegistry::builder())
-        .try_build()
-        .map_err(|source| CliError::Parse {
-            detail: source.to_string(),
-        })
+    let builder = sinomo_lm::register_lm_test_cases(SinomoTestRegistry::builder());
+    let builder = crate::commands::test_cases_dfs::register_dfs_cluster_test_cases(builder);
+    builder.try_build().map_err(|source| CliError::Parse {
+        detail: source.to_string(),
+    })
 }
 
 fn test_list(options: TestListOptions) -> Result<(), CliError> {
@@ -255,6 +273,7 @@ fn test_run(options: TestRunOptions) -> Result<(), CliError> {
         options.model.as_deref(),
         options.live,
         options.require_cluster,
+        &options.params,
     )?;
     let report = registry
         .run(&options.id, &mut context)
@@ -287,6 +306,7 @@ fn test_smoke(options: TestSmokeOptions) -> Result<(), CliError> {
         live: options.live,
         require_cluster: options.require_cluster,
         json: options.json,
+        params: Vec::new(),
     })
 }
 
@@ -296,6 +316,7 @@ fn test_context(
     model: Option<&str>,
     live: bool,
     require_cluster: bool,
+    params: &[(String, String)],
 ) -> Result<SinomoTestContext, CliError> {
     let data_dir = SinomoDataDir::from_env_or_home()?;
     let mut context = SinomoTestContext::new(data_dir.root())
@@ -307,6 +328,9 @@ fn test_context(
     }
     if let Some(model) = model {
         context = context.with_parameter("model", model.to_string());
+    }
+    for (key, value) in params {
+        context = context.with_parameter(key.clone(), value.clone());
     }
     if model_config_uses_cluster(&data_dir) {
         let paths = ClusterPaths::new(&data_dir);
@@ -372,4 +396,63 @@ fn print_test_report(report: &SinomoTestReport, json: bool) -> Result<(), CliErr
         report.summary
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn run_options_parse_repeatable_params() {
+        let options = parse_test_run_options(&args(&[
+            "cluster.dfs.write",
+            "--require-cluster",
+            "--param",
+            "path=/services/x.txt",
+            "--param",
+            "payload=hello=world",
+        ]))
+        .expect("options");
+        assert_eq!(options.id, "cluster.dfs.write");
+        assert!(options.require_cluster);
+        assert_eq!(
+            options.params,
+            vec![
+                ("path".to_string(), "/services/x.txt".to_string()),
+                ("payload".to_string(), "hello=world".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_options_reject_malformed_params() {
+        assert!(parse_test_run_options(&args(&["x", "--param"])).is_err());
+        assert!(parse_test_run_options(&args(&["x", "--param", "no-equals"])).is_err());
+        assert!(parse_test_run_options(&args(&["x", "--param", "=value"])).is_err());
+    }
+
+    #[test]
+    fn registry_includes_dfs_cluster_cases() {
+        let registry = test_registry().expect("registry");
+        let ids: Vec<String> = registry
+            .metadata()
+            .into_iter()
+            .map(|case| case.id)
+            .collect();
+        for id in [
+            "cluster.dfs.read-your-write",
+            "cluster.dfs.invariants",
+            "cluster.dfs.write",
+            "cluster.dfs.expect-file",
+            "cluster.dfs.expect-absent",
+            "cluster.dfs.rename",
+            "cluster.dfs.remove",
+        ] {
+            assert!(ids.iter().any(|candidate| candidate == id), "missing {id}");
+        }
+    }
 }

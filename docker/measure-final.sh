@@ -17,6 +17,12 @@
 #   SINOMO_GATE_EXPECTED_MAINS  expected online main-daemon rows
 #   SINOMO_GATE_QUIESCE_WAIT    seconds allowed for writes to settle after readiness
 #   SINOMO_GATE_QUIESCE_WINDOW  zero-write window required after the settle deadline
+
+# These helpers target the dev cluster compose file regardless of the caller's
+# working directory (the root docker-compose.yml is the production node).
+SINOMO_DOCKER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export COMPOSE_FILE="${COMPOSE_FILE:-$SINOMO_DOCKER_DIR/docker-compose.dev.yml}"
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

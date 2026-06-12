@@ -1,0 +1,182 @@
+# Sinomo 6-node SEGMENTED dev cluster for network-layer hardening (discovery + routing).
+#
+# The nodes run the HOST-BUILT binary (bind-mounted read-only), so iterating on
+# the daemon never rebuilds an image:
+#
+#   cargo build -p sinomo                                    # build on the host
+#   docker compose -f docker/docker-compose.dev.yml up --build -d
+#   docker compose -f docker/docker-compose.dev.yml exec node1 sinomo cluster health
+#   cargo build -p sinomo                                    # iterate...
+#   docker compose -f docker/docker-compose.dev.yml restart  # ...nodes pick up the new binary
+#   docker compose -f docker/docker-compose.dev.yml down -v  # tear down + wipe volumes
+#
+# `--build` only rebuilds the thin runtime image (docker/Dockerfile.dev); the
+# binary itself always comes from ../target/debug/sinomo on the host. The
+# entrypoint script is also bind-mounted, so script edits apply on restart too.
+# In-container self-rollout builds are unavailable here (no toolchain); use the
+# root docker-compose.yml (full image) when testing rollout-from-source.
+#
+# Topology -- three bridge networks, with node3 and node4 dual-homed as the only
+# cross-segment links:
+#
+#     seg_a {node1,node2,node3} ── node3 ──[seg_ab]── node4 ── seg_b {node4,node5,node6}
+#
+# node1,2,3 reach each other; node4,5,6 reach each other; node3<->node4 is the single
+# bridge. node1 cannot reach node5/6 (no shared network). Docker's embedded DNS only
+# resolves peers on a shared network, so each node's INTRODUCER is a *reachable* neighbor
+# (node2,3->node1; node4->node3; node5,6->node4).
+#
+# IROH IS DISABLED here on purpose (SINOMO_DISABLE_IROH=1) so the cluster runs on direct
+# LAN-TCP only -- there is no external relay to paper over the segmentation. Cross-segment
+# cohesion depends on native multi-hop routing through node3/node4. The restart policy lets
+# Docker bring a node back when rollout intentionally replaces the shadow supervisor running
+# as PID 1; logical rollout failures still remain visible through `sinomo cluster health`.
+
+x-node-defaults: &node-defaults
+  image: sinomo-dev-runtime
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *node-defaults
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    hostname: node1
+    environment:
+      ROLE: seed
+      NODE_NAME: node1
+      CLUSTER_NAME: dev-cluster
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      # The seed (voter) publishes a join invite for every segment, each naming the
+      # reachable bridge as that segment's introducer (node2,3 reach node1; node4 reaches
+      # node3; node5,6 reach node4). Bridge learners cannot mint invites, so only node1 does.
+      PUBLISH_INVITES: "node1:21353=/shared/seg-a-invite.json node3:21353=/shared/seg-ab-invite.json node4:21353=/shared/seg-b-invite.json"
+    volumes:
+      - node1-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [seg_a]
+
+  node2:
+    <<: *node-defaults
+    hostname: node2
+    depends_on: [node1]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node2
+      CLUSTER_NAME: dev-cluster
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      INTRODUCER: node1:21353
+      JOIN_INVITE: /shared/seg-a-invite.json
+    volumes:
+      - node2-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [seg_a]
+
+  # node3: member of seg_a AND bridge into seg_ab (re-publishes an invite for node4).
+  node3:
+    <<: *node-defaults
+    hostname: node3
+    depends_on: [node1]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node3
+      CLUSTER_NAME: dev-cluster
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      INTRODUCER: node1:21353
+      JOIN_INVITE: /shared/seg-a-invite.json
+    volumes:
+      - node3-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [seg_a, seg_ab]
+
+  # node4: member of seg_b AND bridge into seg_ab (joins via node3, re-publishes for seg_b).
+  node4:
+    <<: *node-defaults
+    hostname: node4
+    depends_on: [node3]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node4
+      CLUSTER_NAME: dev-cluster
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      INTRODUCER: node3:21353
+      JOIN_INVITE: /shared/seg-ab-invite.json
+      # Two segments deep: node3 must finish joining before node4 can; give it
+      # a longer (still bounded) retry window than the default 60.
+      JOIN_ATTEMPTS: "180"
+    volumes:
+      - node4-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [seg_ab, seg_b]
+
+  node5:
+    <<: *node-defaults
+    hostname: node5
+    depends_on: [node4]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node5
+      CLUSTER_NAME: dev-cluster
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      INTRODUCER: node4:21353
+      JOIN_INVITE: /shared/seg-b-invite.json
+      # Three segments deep (waits on node4, which waits on node3).
+      JOIN_ATTEMPTS: "240"
+    volumes:
+      - node5-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [seg_b]
+
+  node6:
+    <<: *node-defaults
+    hostname: node6
+    depends_on: [node4]
+    environment:
+      ROLE: joiner
+      NODE_NAME: node6
+      CLUSTER_NAME: dev-cluster
+      SINOMO_DISABLE_IROH: "1"
+      SINOMO_ENABLE_DEFAULT_DISTRIBUTED_DFS: "1"
+      INTRODUCER: node4:21353
+      JOIN_INVITE: /shared/seg-b-invite.json
+      # Three segments deep (waits on node4, which waits on node3).
+      JOIN_ATTEMPTS: "240"
+    volumes:
+      - node6-data:/data
+      - invite:/shared
+      - ../target/debug/sinomo:/usr/local/bin/sinomo:ro
+      - ./entrypoint.sh:/usr/local/bin/sinomo-node-entrypoint:ro
+    networks: [seg_b]
+
+networks:
+  seg_a:
+    driver: bridge
+  seg_ab:
+    driver: bridge
+  seg_b:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
+  node6-data:
+  invite:

@@ -62,7 +62,7 @@ pub(crate) fn send_daemon_rpc_on_runtime(
         send_daemon_rpc_async(
             address,
             request,
-            sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             &runtime_for_future,
         ),
     )
@@ -106,7 +106,26 @@ pub(crate) fn send_daemon_rpc_raw(
         command,
         auth,
         request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )
+}
+
+/// Like [`send_daemon_rpc`], but with an idle deadline on the stream as well
+/// as the connect timeout. Use for RPCs that must never hang on a silent
+/// peer (e.g. cluster join, where an unresponsive introducer otherwise wedges
+/// the caller's retry loop forever).
+pub fn send_daemon_rpc_with_timeouts(
+    address: &str,
+    request: &ObjectRpcRequest,
+    timeouts: sinomo_network::DaemonRpcTimeouts,
+) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
+    let signed = sign_daemon_rpc_request_for_local_node(request)?;
+    send_daemon_rpc_raw_with_timeouts(
+        address,
+        &daemon_rpc_command(&request.route),
+        Some(&signed),
+        request,
+        timeouts,
     )
 }
 
@@ -261,7 +280,7 @@ pub fn send_daemon_rpc_to_endpoint(
     request: &ObjectRpcRequest,
     timeout: Duration,
 ) -> Result<sinomo_network::ObjectRpcResponse, DaemonError> {
-    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_only(timeout);
+    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -309,7 +328,7 @@ pub(crate) fn send_daemon_rpc_to_endpoint_on_runtime(
         send_daemon_rpc_to_endpoint_async(
             endpoint,
             request,
-            sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             &runtime_for_future,
         ),
     )
@@ -524,7 +543,7 @@ where
         send_daemon_rpc_request_to_endpoint_with_decoder_async(
             endpoint,
             request,
-            sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             &runtime_for_future,
             decode,
         ),
@@ -891,7 +910,7 @@ pub async fn fetch_daemon_status_from_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         |response| response.decode_body(),
     )
@@ -924,7 +943,7 @@ pub async fn send_dfs_metadata_journal_batch_to_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(connect_timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
         runtime,
         |response| sinomo_dfs::decode_dfs_metadata_journal_batch_rpc_response(response),
     )
@@ -957,7 +976,7 @@ pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(connect_timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
         runtime,
         |response| sinomo_dfs::decode_dfs_metadata_snapshot_install_rpc_response(response),
     )
@@ -1010,7 +1029,7 @@ pub async fn send_dfs_protocol_frame_to_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(connect_timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(connect_timeout),
         runtime,
         |response| sinomo_dfs::decode_dfs_protocol_frame_rpc_response(response),
     )
@@ -1104,7 +1123,7 @@ pub(crate) async fn fetch_cluster_kv_snapshot_from_endpoint_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         decode_cluster_kv_snapshot_rpc_response,
     )
@@ -1139,7 +1158,7 @@ pub(crate) async fn send_cluster_kv_txn_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         decode_cluster_kv_txn_rpc_response,
     )
@@ -1174,7 +1193,7 @@ pub(crate) async fn send_cluster_raft_append_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         decode_cluster_raft_append_rpc_response,
     )
@@ -1209,7 +1228,7 @@ pub(crate) async fn send_cluster_raft_vote_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         decode_cluster_raft_vote_rpc_response,
     )
@@ -1246,7 +1265,7 @@ pub(crate) async fn send_cluster_member_publish_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         |response| response.decode_body(),
     )
@@ -1268,7 +1287,7 @@ pub(crate) async fn send_cluster_kv_watch_events_async(
     send_daemon_rpc_request_to_endpoint_with_decoder_async(
         endpoint,
         &rpc_request,
-        sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+        sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         runtime,
         decode_cluster_kv_watch_events_rpc_response,
     )
@@ -1472,7 +1491,7 @@ mod tests {
                 "RPC /daemon/status",
                 None,
                 &request,
-                sinomo_network::DaemonRpcTimeouts::connect_only(Duration::from_millis(1)),
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(Duration::from_millis(1)),
             )
             .expect_err("sync client must not create an ephemeral runtime from async code")
         });

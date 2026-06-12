@@ -83,6 +83,15 @@ impl SifsFileManagerBackend {
         Ok(())
     }
 
+    pub(crate) fn operational_metrics(
+        &self,
+    ) -> Result<sinomo_runtime::dfs::DfsOperationalMetrics, String> {
+        let service = self.lock_service()?;
+        service
+            .operational_metrics()
+            .map_err(|error| format!("cannot read SIFS operational metrics: {error}"))
+    }
+
     pub(crate) fn create_dir_all(&self, path: &str) -> Result<(), String> {
         let path = normalize_sifs_path(path)?;
         let mut service = self.lock_service()?;

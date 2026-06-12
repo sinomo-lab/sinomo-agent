@@ -74,6 +74,18 @@ const DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL: Duration =
 pub const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration =
     sinomo_network::CLUSTER_NETWORK_PUBLISH_INTERVAL;
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
+/// First-failure publish backoff; doubles per consecutive failure up to
+/// `DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF`. Cold cluster formation depends on
+/// quick retries: deep-segment nodes race the bridge's first connectivity
+/// publication, and a flat long backoff freezes the loser past the formation
+/// window (relay routes need connectivity records, which need relayed
+/// publishes — only fast retry breaks the cycle once the bridge publishes).
+pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(15);
+/// Learner KV snapshot pull cadence. Convergence is event-driven — the voter
+/// pushes committed raft appends to every member on commit — so this pull is
+/// only a recovery net for lost pushes and restarts, deliberately slow to keep
+/// an idle cluster quiet.
+pub const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL: Duration = Duration::from_secs(600);
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration =
     sinomo_network::CLUSTER_NETWORK_DISCOVERY_INTERVAL;
 const DAEMON_CLUSTER_STARTUP_SETTLE_DURATION: Duration = Duration::from_secs(8);
@@ -175,7 +187,7 @@ struct ClusterMemberPublishPendingWork {
 
 enum ClusterMemberPublishPendingMode {
     ToQuorumIfNeeded,
-    ViaVoter,
+    ViaVoter { force_kv_snapshot_sync: bool },
 }
 
 struct ClusterNodeStatusPendingRefresh {
@@ -1334,7 +1346,7 @@ impl sinomo_network::ClusterMembershipRpcAsyncForwardHost
             send_daemon_rpc_to_endpoint_async(
                 endpoint,
                 request,
-                sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+                sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
                 &runtime,
             )
             .await
@@ -1495,7 +1507,7 @@ fn relay_rpc_to_node_via_peer(
             crate::daemon_rpc_command(&rpc_request.route),
             &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
             sinomo_network::ClusterSignedRelayRpcOptions {
-                timeouts: sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+                timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
             },
             &mut host,
         ),
@@ -1522,7 +1534,7 @@ async fn relay_rpc_to_node_via_peer_async(
         crate::daemon_rpc_command(&rpc_request.route),
         &crate::daemon_rpc_command(sinomo_network::CLUSTER_RELAY_ROUTE),
         sinomo_network::ClusterSignedRelayRpcOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_only(timeout),
+            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout),
         },
         &mut host,
     )
@@ -1594,6 +1606,7 @@ pub(crate) fn publish_local_members_via_voter_on_runtime(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
+            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -1603,6 +1616,7 @@ pub(crate) fn publish_local_members_via_voter_on_runtime(
 pub(crate) async fn publish_local_members_via_voter_async(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
+    force_kv_snapshot_sync: bool,
     runtime: tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
     let mut host = DaemonClusterControlPlaneTransport {
@@ -1614,6 +1628,7 @@ pub(crate) async fn publish_local_members_via_voter_async(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
+            force_kv_snapshot_sync,
         },
         &mut host,
     )
@@ -1635,6 +1650,7 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
         state,
         sinomo_network::ClusterLocalMemberPublishOptions {
             member_publish_timeout: DAEMON_CLUSTER_MEMBER_PUBLISH_TIMEOUT,
+            force_kv_snapshot_sync: false,
         },
         &mut host,
     )
@@ -1656,6 +1672,8 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub solo_cluster_idle: bool,
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
+    pub publish_failure_streak: u32,
+    pub last_kv_snapshot_pull: Instant,
     pub last_publish: Instant,
     pub last_discovery: Instant,
     pub last_probe: Instant,
@@ -1695,6 +1713,10 @@ impl ClusterNetworkMaintenance {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now
+                .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
+                .unwrap_or(now),
             // Fire the first maintenance cycle immediately instead of after a full
             // interval, so a freshly started/joined node publishes its records and
             // probes its peers right away. Combined with parallel probing this lets
@@ -1959,23 +1981,36 @@ impl ClusterNetworkMaintenance {
                 }
             } else if !sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
                 self.idle_stats.incr_kv_publish_member();
+                // The forced publish doubles as the KV snapshot pull; pushes
+                // from the voter keep learners converged event-driven, so the
+                // pull runs on its own slow recovery cadence.
+                let kv_snapshot_pull_due = self.last_kv_snapshot_pull.elapsed()
+                    >= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
+                if kv_snapshot_pull_due {
+                    self.last_kv_snapshot_pull = Instant::now();
+                }
                 pending_work
                     .member_publishes
                     .push(ClusterMemberPublishPendingWork {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
-                        mode: ClusterMemberPublishPendingMode::ViaVoter,
+                        mode: ClusterMemberPublishPendingMode::ViaVoter {
+                            force_kv_snapshot_sync: kv_snapshot_pull_due,
+                        },
                     });
             }
             if publish_failed {
+                self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
                 self.last_publish =
                     sinomo_network::cluster_network_maintenance_last_timestamp_for_next_due(
                         now,
                         sinomo_network::cluster_network_publish_interval_for_role(
                             &self.local_node_role,
                         ),
-                        DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+                        self.publish_failure_backoff(),
                     );
+            } else {
+                self.publish_failure_streak = 0;
             }
         }
 
@@ -2191,7 +2226,10 @@ impl ClusterNetworkMaintenance {
         runtime: tokio::runtime::Handle,
     ) {
         match refresh_daemon_node_status_in_kv_async(&pending.paths, runtime).await {
-            Ok(published) => self.record_node_status_publish(&published),
+            Ok(published) => {
+                self.record_node_status_publish(&published);
+                self.record_publish_success();
+            }
             Err(error) => {
                 eprintln!("sinomo daemon {} publish failed: {error}", pending.label);
                 self.record_publish_failure();
@@ -2214,23 +2252,49 @@ impl ClusterNetworkMaintenance {
                 .await
                 .map(|_| ())
             }
-            ClusterMemberPublishPendingMode::ViaVoter => {
-                publish_local_members_via_voter_async(&pending.paths, &pending.state, runtime).await
+            ClusterMemberPublishPendingMode::ViaVoter {
+                force_kv_snapshot_sync,
+            } => {
+                publish_local_members_via_voter_async(
+                    &pending.paths,
+                    &pending.state,
+                    force_kv_snapshot_sync,
+                    runtime,
+                )
+                .await
             }
         };
-        if let Err(error) = result {
-            eprintln!("sinomo daemon cluster member publish failed: {error}");
-            self.record_publish_failure();
+        match result {
+            Ok(()) => self.record_publish_success(),
+            Err(error) => {
+                eprintln!("sinomo daemon cluster member publish failed: {error}");
+                self.record_publish_failure();
+            }
         }
     }
 
     fn record_publish_failure(&mut self) {
+        self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
         let now = Instant::now();
         self.last_publish = sinomo_network::cluster_network_maintenance_last_timestamp_for_next_due(
             now,
             sinomo_network::cluster_network_publish_interval_for_role(&self.local_node_role),
-            DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+            self.publish_failure_backoff(),
         );
+    }
+
+    /// Exponential backoff over consecutive publish failures: quick retries
+    /// while the cluster is still forming, the full backoff once a failure
+    /// looks persistent.
+    fn publish_failure_backoff(&self) -> Duration {
+        let exponent = self.publish_failure_streak.saturating_sub(1).min(8);
+        DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+            .saturating_mul(1_u32 << exponent)
+            .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+    }
+
+    fn record_publish_success(&mut self) {
+        self.publish_failure_streak = 0;
     }
 
     pub(crate) async fn run_pending_connectivity_probe_async(
@@ -2377,8 +2441,22 @@ fn connectivity_record_for_daemon_status_probe(
     timestamp: &str,
     now: time::OffsetDateTime,
 ) -> (String, ClusterConnectivityRecord) {
-    let healthy =
-        result.is_ok_and(|status| daemon_cluster_status_matches(state, &entry.endpoint, &status));
+    let healthy = match &result {
+        Ok(status) => {
+            let matches = daemon_cluster_status_matches(state, &entry.endpoint, status);
+            if !matches {
+                eprintln!(
+                    "sinomo daemon connectivity probe identity mismatch: endpoint {} expected node {}, responder reported cluster={:?} node={:?}",
+                    entry.endpoint.address,
+                    entry.endpoint.node_id,
+                    status.cluster.as_ref().map(|c| c.cluster_id.to_string()),
+                    status.cluster.as_ref().map(|c| c.node_id.to_string()),
+                );
+            }
+            matches
+        }
+        Err(_) => false,
+    };
     let record = sinomo_network::cluster_connectivity_record_for_probe_outcome(
         state,
         &entry.endpoint,
@@ -2426,7 +2504,7 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
         detail: format!("cluster connectivity probe signing task failed: {source}"),
     })??;
     let command = crate::daemon_rpc_command(sinomo_network::DAEMON_STATUS_ROUTE);
-    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_only(timeout);
+    let timeouts = sinomo_network::DaemonRpcTimeouts::connect_and_idle(timeout);
     let response = sinomo_network::send_daemon_rpc_to_cluster_endpoint_async(
         endpoint,
         &command,
@@ -2820,7 +2898,7 @@ async fn fetch_local_cluster_health_rows_from_member_async(
         let Ok(response) = send_daemon_rpc_to_endpoint_async(
             &endpoint,
             &request,
-            sinomo_network::DaemonRpcTimeouts::connect_only(CLUSTER_HEALTH_PEER_ROWS_TIMEOUT),
+            sinomo_network::DaemonRpcTimeouts::connect_and_idle(CLUSTER_HEALTH_PEER_ROWS_TIMEOUT),
             runtime,
         )
         .await
@@ -2909,19 +2987,34 @@ async fn probe_member_daemon_status_async(
         detail: format!("cluster health target selection task failed: {source}"),
     })?;
     for endpoint in endpoints {
-        let Ok(status) = fetch_daemon_status_from_endpoint_async(
+        let status = match fetch_daemon_status_from_endpoint_async(
             &endpoint,
             CLUSTER_HEALTH_PROBE_TIMEOUT,
             runtime,
         )
         .await
-        else {
-            continue;
+        {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!(
+                    "sinomo daemon cluster health probe of {} via {} failed: {error}",
+                    member.node_id, endpoint.address
+                );
+                continue;
+            }
         };
         let Some(cluster) = status.cluster.as_ref() else {
+            eprintln!(
+                "sinomo daemon cluster health probe of {} via {}: status has no cluster section",
+                member.node_id, endpoint.address
+            );
             continue;
         };
         if cluster.cluster_id != state.cluster_id || cluster.node_id != member.node_id {
+            eprintln!(
+                "sinomo daemon cluster health probe of {} via {}: identity mismatch (responder {})",
+                member.node_id, endpoint.address, cluster.node_id
+            );
             continue;
         }
         return Ok(Some(cluster_node_status_from_daemon_status(
@@ -4459,7 +4552,7 @@ pub(crate) async fn handle_daemon_cluster_relay_request_on_runtime(
         &local_node_id,
         envelope,
         sinomo_network::ClusterRelayOptions {
-            timeouts: sinomo_network::DaemonRpcTimeouts::connect_only(
+            timeouts: sinomo_network::DaemonRpcTimeouts::connect_and_idle(
                 DAEMON_CLUSTER_RELAY_CONNECT_TIMEOUT,
             ),
         },
@@ -5481,6 +5574,38 @@ mod tests {
     }
 
     #[test]
+    fn publish_failure_backoff_grows_exponentially_and_resets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+        ));
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+        );
+        maintenance.publish_failure_streak = 1;
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+        );
+        maintenance.publish_failure_streak = 2;
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF * 2
+        );
+        maintenance.publish_failure_streak = 12;
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF
+        );
+        maintenance.record_publish_success();
+        assert_eq!(maintenance.publish_failure_streak, 0);
+    }
+
+    #[test]
     fn maintenance_failure_backoff_retries_after_configured_delay() {
         let now = Instant::now();
         let last_publish = sinomo_network::cluster_network_maintenance_last_timestamp_for_next_due(
@@ -5540,6 +5665,8 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -5575,6 +5702,8 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -5614,6 +5743,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .expect("publish instant"),
@@ -5662,6 +5793,8 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL + Duration::from_secs(1))
@@ -5693,6 +5826,8 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now,
             last_discovery: now,
@@ -5737,6 +5872,8 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -6029,6 +6166,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
@@ -6081,6 +6220,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6205,6 +6346,8 @@ mod tests {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now
@@ -6307,6 +6450,8 @@ mod tests {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6405,6 +6550,8 @@ mod tests {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6476,6 +6623,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6628,6 +6777,7 @@ mod tests {
             sinomo_network::CLUSTER_MEMBERSHIP_RPC_CATEGORY,
             &ClusterMemberPublishRequest {
                 members: vec![state.members[0].clone()],
+                local_kv_revision: None,
             },
         )
         .expect("member publish rpc request");
@@ -7842,6 +7992,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -7931,6 +8083,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: Instant::now(),
             last_publish: Instant::now(),
             last_discovery: Instant::now(),
             last_probe: Instant::now(),
@@ -8034,6 +8188,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8573,6 +8729,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8693,6 +8851,8 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,

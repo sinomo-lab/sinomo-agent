@@ -158,6 +158,39 @@ pub fn lock_cluster_kv_raft_operation() -> Result<ClusterKvRaftOperationGuard, K
         })
 }
 
+pub const CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+/// Locks the cluster raft commit sequence (append → replicate → commit) against
+/// concurrent committers from other tasks and other processes sharing this data
+/// dir. The quorum commit is a multi-step protocol over separately-locked store
+/// operations; without this outer lock two concurrent committers race: each
+/// append opens the WAL discarding the other's uncommitted entry, so the first
+/// committer's commit step no longer finds its entry (`missing committed raft
+/// entry`) and the publishers livelock retrying against each other.
+///
+/// The returned file holds an exclusive advisory lock released on drop.
+pub fn lock_cluster_kv_commit_sequence(
+    paths: &ClusterKvPaths,
+    wait: Duration,
+) -> Result<File, KvError> {
+    fs::create_dir_all(&paths.raft).map_err(|source| KvError::Io {
+        path: paths.raft.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let lock_path = paths.raft.join("commit-sequence.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|source| KvError::Io {
+            path: lock_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    lock_node_exclusive(&lock, &lock_path, wait)?;
+    Ok(lock)
+}
+
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
 ) -> Result<(), sinomo_storage::StorageContractError> {
@@ -4673,6 +4706,14 @@ where
 pub trait ClusterKvRaftCommandStorage {
     type Error: From<KvError>;
 
+    /// Locks the whole commit sequence against concurrent committers (see
+    /// [`lock_cluster_kv_commit_sequence`]). Hosts backed by a shared on-disk
+    /// store must implement this; the default (no lock) is only safe for
+    /// single-committer hosts such as tests.
+    fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<File>, Self::Error> {
+        Ok(None)
+    }
+
     fn append_cluster_raft_command_uncommitted_or_no_effect(
         &mut self,
         command: KvCommand,
@@ -4995,6 +5036,14 @@ pub trait ClusterKvRaftQuorumCommitAsyncHost {
     type Error: From<KvError> + ToString;
     type Target: Clone + Send + Sync;
 
+    /// Async counterpart of
+    /// [`ClusterKvRaftCommandStorage::lock_cluster_raft_commit_sequence`].
+    fn lock_cluster_raft_commit_sequence_async<'a>(
+        &'a mut self,
+    ) -> ClusterKvRaftQuorumFuture<'a, Option<File>, Self::Error> {
+        Box::pin(async { Ok(None) })
+    }
+
     fn append_cluster_raft_command_uncommitted_or_no_effect_async<'a>(
         &'a mut self,
         command: KvCommand,
@@ -5068,6 +5117,7 @@ where
     H: ClusterKvRaftQuorumCommitHost,
     H::Error: ToString,
 {
+    let _commit_sequence_lock = host.lock_cluster_raft_commit_sequence()?;
     let entry = match host.append_cluster_raft_command_uncommitted_or_no_effect(command)? {
         ClusterKvRaftUncommittedAppend::Appended(entry) => entry,
         ClusterKvRaftUncommittedAppend::NoEffect {
@@ -5162,9 +5212,10 @@ where
     }
 
     let commit = host.commit_cluster_raft_index_with_events(entry.index)?;
-    if !targets.is_empty() {
-        host.fan_out_committed_cluster_raft_command(state.clone(), commit.events.clone(), targets)?;
-    }
+    // The fan-out replicates the committed history to every member (learners
+    // included — they converge event-driven on commit), so it runs even when
+    // there are no REMOTE VOTER targets (single-voter clusters).
+    host.fan_out_committed_cluster_raft_command(state.clone(), commit.events.clone(), targets)?;
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
@@ -5180,6 +5231,7 @@ pub async fn commit_cluster_kv_raft_command_with_quorum_async<H>(
 where
     H: ClusterKvRaftQuorumCommitAsyncHost,
 {
+    let _commit_sequence_lock = host.lock_cluster_raft_commit_sequence_async().await?;
     let entry = match host
         .append_cluster_raft_command_uncommitted_or_no_effect_async(command)
         .await?
@@ -5288,14 +5340,12 @@ where
     let commit = host
         .commit_cluster_raft_index_with_events_async(entry.index)
         .await?;
-    if !targets.is_empty() {
-        host.fan_out_committed_cluster_raft_command_async(
-            state.clone(),
-            commit.events.clone(),
-            targets,
-        )
-        .await?;
-    }
+    host.fan_out_committed_cluster_raft_command_async(
+        state.clone(),
+        commit.events.clone(),
+        targets,
+    )
+    .await?;
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
@@ -8997,8 +9047,18 @@ impl DurableRaftKvNode {
     }
 
     pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
+        // Leadership was won for exactly `term`; a higher local term means a
+        // concurrent vote or append advanced the node past this election and
+        // claiming leadership for the newer term would not be backed by a
+        // quorum of votes.
+        if self.node.hard_state.current_term > term {
+            return Err(KvError::StaleLeadershipTerm {
+                term,
+                current_term: self.node.hard_state.current_term,
+            });
+        }
         let hard_state_before = self.node.hard_state.clone();
-        self.node.hard_state.current_term = term.max(self.node.hard_state.current_term);
+        self.node.hard_state.current_term = term;
         self.node.hard_state.voted_for = Some(self.node_id.clone());
         self.node.hard_state.leader_id = Some(self.node_id.clone());
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
@@ -9724,6 +9784,10 @@ pub enum KvError {
     ConflictingLogEntry { index: u64 },
     #[error("missing committed raft entry at index {index}")]
     MissingCommittedEntry { index: u64 },
+    #[error(
+        "cannot claim raft leadership for term {term}: local term already advanced to {current_term}"
+    )]
+    StaleLeadershipTerm { term: u64, current_term: u64 },
     #[error("invalid raft config transition: {detail}")]
     InvalidRaftConfigTransition { detail: String },
 }
@@ -15844,6 +15908,191 @@ mod tests {
         fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
             QuorumCommitTestError::ReadOnly(detail)
         }
+    }
+
+    /// Storage-backed quorum-commit host mirroring the production hosts: a
+    /// shared on-disk raft store plus the commit-sequence lock. Used to prove
+    /// concurrent committers no longer clobber each other's uncommitted
+    /// entries (each append used to discard the other committer's tail, so the
+    /// first commit step failed with `missing committed raft entry` and the
+    /// publishers livelocked retrying).
+    struct RacingCommitTestHost {
+        kv_paths: ClusterKvPaths,
+        node_id: NodeId,
+    }
+
+    impl ClusterKvRaftCommandStorage for RacingCommitTestHost {
+        type Error = QuorumCommitTestError;
+
+        fn lock_cluster_raft_commit_sequence(&mut self) -> Result<Option<File>, Self::Error> {
+            lock_cluster_kv_commit_sequence(&self.kv_paths, CLUSTER_KV_COMMIT_SEQUENCE_LOCK_WAIT)
+                .map(Some)
+                .map_err(Into::into)
+        }
+
+        fn append_cluster_raft_command_uncommitted_or_no_effect(
+            &mut self,
+            command: KvCommand,
+        ) -> Result<ClusterKvRaftUncommittedAppend, Self::Error> {
+            self.kv_paths
+                .raft_store()
+                .locked_append_command_uncommitted_or_no_effect(&self.node_id, command)
+                .map_err(Into::into)
+        }
+
+        fn discard_cluster_raft_uncommitted_tail_and_clear_leader(
+            &mut self,
+        ) -> Result<(), Self::Error> {
+            self.kv_paths
+                .raft_store()
+                .discard_uncommitted_tail_and_clear_leader(&self.node_id)
+                .map(|_| ())
+                .map_err(Into::into)
+        }
+
+        fn commit_cluster_raft_index_with_events(
+            &mut self,
+            index: u64,
+        ) -> Result<ClusterKvRaftCommitResult, Self::Error> {
+            self.kv_paths
+                .raft_store()
+                .commit_index_with_events(&self.node_id, index)
+                .map_err(Into::into)
+        }
+    }
+
+    impl ClusterKvRaftQuorumCommitHost for RacingCommitTestHost {
+        type Target = NodeId;
+
+        fn remote_voter_targets(
+            &mut self,
+            _state: &ClusterBootstrapState,
+        ) -> Result<Vec<Self::Target>, Self::Error> {
+            Ok(Vec::new())
+        }
+
+        fn target_node_id<'a>(&self, target: &'a Self::Target) -> &'a NodeId {
+            target
+        }
+
+        fn replicate_cluster_raft_to_target(
+            &mut self,
+            state: &ClusterBootstrapState,
+            _target: &Self::Target,
+            _timeout: Duration,
+        ) -> Result<ClusterRaftAppendResponse, Self::Error> {
+            Ok(ClusterRaftAppendResponse {
+                accepted: false,
+                detail: "no remote voters in this test".to_string(),
+                state: state.clone(),
+                append: RaftAppendEntriesResponse {
+                    term: 1,
+                    success: false,
+                    match_index: 0,
+                },
+            })
+        }
+
+        fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
+            QuorumCommitTestError::ReadOnly(detail)
+        }
+    }
+
+    #[test]
+    fn become_leader_refuses_terms_below_observed() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-become-leader-stale-term-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let node_id = NodeId::from_legacy_named("node_become_leader_stale").expect("node");
+        let mut node =
+            DurableRaftKvNode::open(node_id, KvWalPaths::new(root.join("raft"))).expect("open");
+        assert!(node.observe_term(10).expect("observe term"));
+        assert!(matches!(
+            node.become_leader(5),
+            Err(KvError::StaleLeadershipTerm {
+                term: 5,
+                current_term: 10
+            })
+        ));
+        node.become_leader(10)
+            .expect("become leader at observed term");
+        assert_eq!(node.hard_state().current_term, 10);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quorum_commit_sequence_lock_serializes_concurrent_committers() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-commit-sequence-race-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let kv_paths = ClusterKvPaths::new(&root);
+        let local = NodeId::from_legacy_named("node_commit_sequence_race").expect("local");
+        let remote = NodeId::from_legacy_named("node_commit_sequence_remote").expect("remote");
+        let mut state = quorum_commit_test_state(&local, &remote);
+        state.members.truncate(1); // single-voter cluster: quorum of one, no remote targets
+
+        const COMMITS_PER_THREAD: u64 = 20;
+        let threads = (0..2)
+            .map(|writer| {
+                let kv_paths = kv_paths.clone();
+                let node_id = local.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    let mut host = RacingCommitTestHost { kv_paths, node_id };
+                    let mut state = state;
+                    for index in 0..COMMITS_PER_THREAD {
+                        commit_cluster_kv_raft_command_with_quorum(
+                            &mut state,
+                            KvCommand::Op(KvOp::Put {
+                                key: format!("/kv/race/{writer}/{index}"),
+                                value: b"committed".to_vec(),
+                                lease_id: None,
+                            }),
+                            ClusterKvRaftQuorumCommitOptions {
+                                timeout: Duration::from_secs(5),
+                            },
+                            &mut host,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("writer {writer} commit {index} failed: {error}")
+                        });
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("writer thread");
+        }
+
+        let node = kv_paths
+            .raft_store()
+            .open_node(&local)
+            .expect("reopen node");
+        let total = 2 * COMMITS_PER_THREAD;
+        assert_eq!(node.applied_index(), total);
+        assert_eq!(node.last_log_index(), total);
+        let snapshot = node.store().snapshot();
+        for writer in 0..2 {
+            for index in 0..COMMITS_PER_THREAD {
+                assert!(
+                    snapshot
+                        .get(&format!("/kv/race/{writer}/{index}"))
+                        .is_some(),
+                    "missing committed key /kv/race/{writer}/{index}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

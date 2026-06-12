@@ -16,7 +16,7 @@ use crate::{
     NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome,
     NetworkedDfsService, NetworkedDfsWriteOutcome, ObjectVersionReader, sifs_file_system_id,
 };
-use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
+use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsVersion};
 use sinomo_core::{DfsObjectPolicy, DfsWriteRequest};
 use sinomo_events::EventId;
 use sinomo_node::NodeId;
@@ -39,6 +39,12 @@ const CROSS_SHARD_MOVE_VERSION_HISTORY_LIMIT: usize = 32;
 /// Follow-up sync rounds a routed-operation wrapper performs when bounded
 /// response replay has not yet surfaced the mutation locally.
 const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
+/// Routed-operation attempts when authority rejections redirect to the
+/// current shard primary (a stale local shard view names a former primary).
+const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
+/// Budget for the best-effort freshness pull a distributed read performs on
+/// foreign-shard paths; reads fall back to the local mirror when it elapses.
+const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Error)]
@@ -250,26 +256,122 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         })
     }
 
+    /// The local journal cursor of the shard owning `path`, used to detect
+    /// whether a sync round actually advanced the local mirror.
+    fn metadata_shard_cursor_for_path(&mut self, path: &str) -> Result<u64> {
+        let Some(kv) = self.control_plane.as_mut() else {
+            return Ok(0);
+        };
+        let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
+            .select_metadata_shard_for_path(&sifs_file_system_id(), path)
+            .map_err(DfsError::from)?
+        else {
+            return Ok(0);
+        };
+        let shard_id = DfsMetadataShardId::new(shard.shard_id);
+        Ok(self
+            .local_metadata_shard_cursors()?
+            .into_iter()
+            .find(|cursor| cursor.shard_id == shard_id)
+            .map(|cursor| cursor.after_sequence)
+            .unwrap_or(0))
+    }
+
+    /// Distributed path lookup with mirror catch-up: when the path is missing
+    /// (or tombstoned) locally and its shard belongs to a foreign primary,
+    /// pulls the shard journal from that primary and retries. Nodes outside a
+    /// shard's replica set receive no pushed replication stream — their local
+    /// mirror only converges through routed-response batches and these pulls.
+    /// Stops as soon as a pull no longer advances the local cursor: the miss
+    /// is then authoritative.
+    fn lookup_sifs_path_distributed_synced(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<(String, Option<DfsObjectMetadata>)> {
+        let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        // A foreign-shard mirror can be stale in BOTH directions: a missing
+        // entry the primary has since created, and a present entry the
+        // primary has since unlinked or moved. One up-front pull bounds the
+        // staleness of found entries (deletions become visible). It is
+        // best-effort with a short budget: an unreachable primary must not
+        // take down reads the local mirror can serve.
+        if let Some(primary) = self.routed_namespace_primary_for_path(&resolved)?
+            && self
+                .route_namespace_operation_to_metadata_primary_with_timeout(
+                    sifs_file_system_id(),
+                    primary,
+                    DfsNamespaceOperation::SyncPath {
+                        path: resolved.clone(),
+                    },
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                )
+                .is_ok()
+        {
+            resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        }
+        for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
+            if let Some(object) = self.lookup_sifs_path(&resolved)?
+                && object.kind != DfsObjectKind::Tombstone
+            {
+                return Ok((resolved, Some(object)));
+            }
+            if self.routed_namespace_primary_for_path(&resolved)?.is_none() {
+                break;
+            }
+            let cursor_before = self.metadata_shard_cursor_for_path(&resolved)?;
+            self.sync_remote_namespace_path(&resolved)?;
+            if self.metadata_shard_cursor_for_path(&resolved)? <= cursor_before {
+                break;
+            }
+            resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        }
+        let object = self.lookup_sifs_path(&resolved)?;
+        Ok((resolved, object))
+    }
+
     /// Routes a namespace mutation to the shard primary, blocks for the
     /// response, and maps a structured rejection back to the same
     /// `DfsPosixError` a local execution would have produced. On success the
     /// response journal batches are already replayed locally.
+    ///
+    /// A node routing on a stale shard view can address a former primary;
+    /// the authority rejection names the current primary, and the operation
+    /// is retried against it (bounded) instead of failing.
     fn route_namespace_operation(
         &mut self,
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<()> {
-        match self.route_namespace_operation_to_metadata_primary(
-            sifs_file_system_id(),
-            primary_node_id,
-            operation,
-        )? {
-            DfsNamespaceResult::Applied => Ok(()),
-            DfsNamespaceResult::Rejected {
-                reason,
-                posix_error,
-            } => Err(posix_error_for_namespace_rejection(reason, posix_error)),
+        let mut primary = primary_node_id;
+        for _ in 0..POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT {
+            match self.route_namespace_operation_to_metadata_primary(
+                sifs_file_system_id(),
+                primary.clone(),
+                operation.clone(),
+            )? {
+                DfsNamespaceResult::Applied => return Ok(()),
+                DfsNamespaceResult::Rejected {
+                    reason,
+                    posix_error,
+                    current_primary_node_id,
+                } => match current_primary_node_id {
+                    Some(current) if current == self.node_id => {
+                        // Authority moved to this node; execute locally.
+                        return self.execute_namespace_operation_local(&operation);
+                    }
+                    Some(current) if current != primary => {
+                        primary = current;
+                    }
+                    _ => return Err(posix_error_for_namespace_rejection(reason, posix_error)),
+                },
+            }
         }
+        Err(DfsPosixError::Dfs(DfsError::Distributed {
+            message: format!(
+                "routed namespace operation exceeded {POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT} authority redirects"
+            ),
+        }))
     }
 
     /// Executes a routed namespace operation on the namespace authority.
@@ -2210,10 +2312,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
@@ -2236,10 +2336,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_update_access(&mut self, path: &str) -> Result<Vec<u8>> {
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, true)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
@@ -3400,10 +3498,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        let path = self.resolve_existing_posix_path_distributed(path, false)?;
-        let object = self
-            .lookup_sifs_path(&path)?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
+        let object = object.ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
         if object.kind == DfsObjectKind::Tombstone {
             return Err(DfsPosixError::NotFound { path });
         }
