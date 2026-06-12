@@ -5212,9 +5212,10 @@ where
     }
 
     let commit = host.commit_cluster_raft_index_with_events(entry.index)?;
-    if !targets.is_empty() {
-        host.fan_out_committed_cluster_raft_command(state.clone(), commit.events.clone(), targets)?;
-    }
+    // The fan-out replicates the committed history to every member (learners
+    // included — they converge event-driven on commit), so it runs even when
+    // there are no REMOTE VOTER targets (single-voter clusters).
+    host.fan_out_committed_cluster_raft_command(state.clone(), commit.events.clone(), targets)?;
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,
@@ -5339,14 +5340,12 @@ where
     let commit = host
         .commit_cluster_raft_index_with_events_async(entry.index)
         .await?;
-    if !targets.is_empty() {
-        host.fan_out_committed_cluster_raft_command_async(
-            state.clone(),
-            commit.events.clone(),
-            targets,
-        )
-        .await?;
-    }
+    host.fan_out_committed_cluster_raft_command_async(
+        state.clone(),
+        commit.events.clone(),
+        targets,
+    )
+    .await?;
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot: commit.snapshot,
         txn_response: commit.txn_response,

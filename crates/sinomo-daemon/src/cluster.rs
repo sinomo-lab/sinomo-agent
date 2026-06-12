@@ -81,6 +81,11 @@ pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs
 /// window (relay routes need connectivity records, which need relayed
 /// publishes — only fast retry breaks the cycle once the bridge publishes).
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(15);
+/// Learner KV snapshot pull cadence. Convergence is event-driven — the voter
+/// pushes committed raft appends to every member on commit — so this pull is
+/// only a recovery net for lost pushes and restarts, deliberately slow to keep
+/// an idle cluster quiet.
+pub const DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL: Duration = Duration::from_secs(600);
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration =
     sinomo_network::CLUSTER_NETWORK_DISCOVERY_INTERVAL;
 const DAEMON_CLUSTER_STARTUP_SETTLE_DURATION: Duration = Duration::from_secs(8);
@@ -182,7 +187,7 @@ struct ClusterMemberPublishPendingWork {
 
 enum ClusterMemberPublishPendingMode {
     ToQuorumIfNeeded,
-    ViaVoter,
+    ViaVoter { force_kv_snapshot_sync: bool },
 }
 
 struct ClusterNodeStatusPendingRefresh {
@@ -1668,6 +1673,7 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
     pub publish_failure_streak: u32,
+    pub last_kv_snapshot_pull: Instant,
     pub last_publish: Instant,
     pub last_discovery: Instant,
     pub last_probe: Instant,
@@ -1708,6 +1714,9 @@ impl ClusterNetworkMaintenance {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: now
+                .checked_sub(DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL)
+                .unwrap_or(now),
             // Fire the first maintenance cycle immediately instead of after a full
             // interval, so a freshly started/joined node publishes its records and
             // probes its peers right away. Combined with parallel probing this lets
@@ -1972,12 +1981,22 @@ impl ClusterNetworkMaintenance {
                 }
             } else if !sinomo_kv::cluster_kv_raft_local_is_voter(&state) {
                 self.idle_stats.incr_kv_publish_member();
+                // The forced publish doubles as the KV snapshot pull; pushes
+                // from the voter keep learners converged event-driven, so the
+                // pull runs on its own slow recovery cadence.
+                let kv_snapshot_pull_due = self.last_kv_snapshot_pull.elapsed()
+                    >= DAEMON_CLUSTER_KV_SNAPSHOT_PULL_INTERVAL;
+                if kv_snapshot_pull_due {
+                    self.last_kv_snapshot_pull = Instant::now();
+                }
                 pending_work
                     .member_publishes
                     .push(ClusterMemberPublishPendingWork {
                         paths: cluster_paths.clone(),
                         state: state.clone(),
-                        mode: ClusterMemberPublishPendingMode::ViaVoter,
+                        mode: ClusterMemberPublishPendingMode::ViaVoter {
+                            force_kv_snapshot_sync: kv_snapshot_pull_due,
+                        },
                     });
             }
             if publish_failed {
@@ -2233,13 +2252,16 @@ impl ClusterNetworkMaintenance {
                 .await
                 .map(|_| ())
             }
-            ClusterMemberPublishPendingMode::ViaVoter => {
-                // Learners force the publish each round so the voter can hand
-                // back a newer KV snapshot (tiny response when already
-                // current); this is the only push-free path by which a
-                // learner's local KV snapshot converges.
-                publish_local_members_via_voter_async(&pending.paths, &pending.state, true, runtime)
-                    .await
+            ClusterMemberPublishPendingMode::ViaVoter {
+                force_kv_snapshot_sync,
+            } => {
+                publish_local_members_via_voter_async(
+                    &pending.paths,
+                    &pending.state,
+                    force_kv_snapshot_sync,
+                    runtime,
+                )
+                .await
             }
         };
         match result {
@@ -5615,6 +5637,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -5651,6 +5674,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -5691,6 +5715,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .expect("publish instant"),
@@ -5740,6 +5765,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL + Duration::from_secs(1))
@@ -5772,6 +5798,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now,
             last_discovery: now,
@@ -5817,6 +5844,7 @@ mod tests {
 
             startup_settle_until: None,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: now,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -6110,6 +6138,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
@@ -6163,6 +6192,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6288,6 +6318,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now
@@ -6391,6 +6422,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6490,6 +6522,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6562,6 +6595,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -7930,6 +7964,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8020,6 +8055,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: Instant::now(),
             last_publish: Instant::now(),
             last_discovery: Instant::now(),
             last_probe: Instant::now(),
@@ -8124,6 +8160,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8664,6 +8701,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8785,6 +8823,7 @@ mod tests {
             startup_settle_until: None,
             tick: 0,
             publish_failure_streak: 0,
+            last_kv_snapshot_pull: maintenance_now,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,

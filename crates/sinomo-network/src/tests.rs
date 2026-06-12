@@ -29768,6 +29768,10 @@ fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
     // report no revision at all) — this is how learner KV snapshots converge.
     for (publisher_revision, expects_snapshot) in [
         (Some(current_revision), false),
+        // Lag-only invariant: a publisher AHEAD of the responder means the
+        // responder is the stale one; it must never ship its snapshot
+        // backwards.
+        (Some(KvRevision(current_revision.0 + 1)), false),
         (Some(KvRevision(0)), true),
         (None, true),
     ] {
@@ -29922,6 +29926,44 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
             .get("/kv/forced-sync/imported")
             .is_some(),
         "forced sync must import the voter's newer snapshot"
+    );
+
+    // A stale responder (e.g. a lagging bridge) answering with an OLDER
+    // snapshot must never roll the local KV back.
+    let local_revision_before = read_cluster_kv_current_snapshot(&paths)
+        .expect("snapshot before stale response")
+        .revision;
+    let mut stale_store = InProcessKvStore::new();
+    stale_store
+        .put("/kv/forced-sync/stale-marker", b"old".to_vec(), None)
+        .expect("stale marker");
+    let stale_snapshot = stale_store.snapshot();
+    assert!(stale_snapshot.revision < local_revision_before);
+    let mut stale_host = RecordingClusterLocalMemberPublishHost {
+        has_quorum: false,
+        response: Some(ClusterMemberPublishResponse {
+            accepted: true,
+            detail: "published".to_string(),
+            state: state.clone(),
+            kv_snapshot: Some(stale_snapshot),
+        }),
+        ..Default::default()
+    };
+    publish_local_members_via_voter_with_host(
+        &paths,
+        &state,
+        ClusterLocalMemberPublishOptions {
+            member_publish_timeout: Duration::from_secs(5),
+            force_kv_snapshot_sync: true,
+        },
+        &mut stale_host,
+    )
+    .expect("forced publish against stale responder");
+    let after = read_cluster_kv_current_snapshot(&paths).expect("snapshot after stale response");
+    assert_eq!(after.revision, local_revision_before);
+    assert!(
+        after.get("/kv/forced-sync/stale-marker").is_none(),
+        "an older responder snapshot must not be imported"
     );
 
     std::fs::remove_dir_all(root).ok();

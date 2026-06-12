@@ -9745,7 +9745,7 @@ pub async fn fan_out_committed_cluster_raft_command_async_with_host(
 ) -> Result<ClusterRaftCommittedFanoutReport, NetworkError> {
     let mut report = ClusterRaftCommittedFanoutReport::default();
     let mut replicated_nodes = BTreeSet::new();
-    for endpoint in cluster_raft_live_voter_targets_async(runtime, paths, state).await? {
+    for endpoint in cluster_raft_member_replication_targets_async(runtime, paths, state).await? {
         if replicated_nodes.contains(&endpoint.node_id) {
             continue;
         }
@@ -11021,6 +11021,49 @@ pub fn cluster_raft_live_voter_targets(
                 .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
         })
         .collect()
+}
+
+/// Replication targets for the committed-command fan-out: every authorized
+/// main-daemon member (learners included), connectivity-aware. Learners are
+/// pure raft followers — pushing committed appends to them on commit is the
+/// event-driven convergence path; nothing is sent when nothing commits.
+pub fn cluster_raft_member_replication_targets(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let node_statuses = cluster_node_status_map_from_kv(paths);
+    cluster_raft_command_targets(paths, state)
+        .into_iter()
+        .filter(|endpoint| endpoint.node_id != state.local_node_id)
+        .filter(|endpoint| {
+            state.members.iter().any(|member| {
+                member.node_id == endpoint.node_id
+                    && member.state.is_authorized()
+                    && cluster_member_has_main_daemon_capability(member)
+            })
+        })
+        .filter(|endpoint| {
+            !node_statuses
+                .get(&endpoint.node_id)
+                .is_some_and(|status| status.availability == ClusterNodeAvailability::Offline)
+        })
+        .collect()
+}
+
+pub async fn cluster_raft_member_replication_targets_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+    let paths = paths.clone();
+    let state = state.clone();
+    runtime
+        .spawn_blocking(move || cluster_raft_member_replication_targets(&paths, &state))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "cluster raft member replication target selection".to_string(),
+            detail: format!("member replication target selection task failed: {source}"),
+        })
 }
 
 pub async fn cluster_raft_live_voter_targets_async(
@@ -13430,7 +13473,9 @@ pub fn publish_local_members_via_voter_with_host(
         match host.send_cluster_member_publish(&endpoint, &request, options.member_publish_timeout)
         {
             Ok(response) if response.accepted => {
-                if let Some(snapshot) = response.kv_snapshot {
+                if let Some(snapshot) = response.kv_snapshot
+                    && imported_snapshot_advances_local_kv(paths, &snapshot)
+                {
                     write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
                 }
                 return Ok(());
@@ -13519,6 +13564,9 @@ pub async fn publish_local_members_via_voter_async_with_host(
                     let paths_for_write = paths.clone();
                     runtime
                         .spawn_blocking(move || {
+                            if !imported_snapshot_advances_local_kv(&paths_for_write, &snapshot) {
+                                return Ok(false);
+                            }
                             write_imported_cluster_kv_snapshot_if_changed(
                                 &paths_for_write,
                                 &snapshot,
@@ -13702,15 +13750,14 @@ fn prepare_cluster_member_publish_request(
         }
     }
     if cluster_member_publish_matches_kv(paths, &request.members)? {
+        let kv_snapshot =
+            cluster_member_publish_response_snapshot(paths, &state, request.local_kv_revision)?;
         return Ok(PreparedClusterMemberPublish::Response(
             ClusterMemberPublishResponse {
                 accepted: true,
                 detail: "member endpoints already current".to_string(),
                 state,
-                kv_snapshot: cluster_member_publish_response_snapshot(
-                    paths,
-                    request.local_kv_revision,
-                )?,
+                kv_snapshot,
             },
         ));
     }
@@ -13726,6 +13773,17 @@ fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision
         .map(|snapshot| snapshot.revision)
 }
 
+/// Direction guard for snapshot imports: under raft's lag-only invariant an
+/// imported snapshot must move local history FORWARD. A responder that lags
+/// the local node (a stale bridge answering a fresher publisher) must never
+/// roll the local KV back.
+fn imported_snapshot_advances_local_kv(paths: &ClusterPaths, snapshot: &KvSnapshot) -> bool {
+    match local_cluster_kv_snapshot_revision(paths) {
+        Some(local) => snapshot.revision > local,
+        None => true,
+    }
+}
+
 /// The KV snapshot a member-publish response should carry back to the
 /// publisher: nothing when the publisher reported exactly our revision, the
 /// full current snapshot otherwise. Any MISMATCH ships the snapshot — not
@@ -13737,13 +13795,33 @@ fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision
 /// deduplicates unchanged content.
 fn cluster_member_publish_response_snapshot(
     paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
     publisher_revision: Option<KvRevision>,
 ) -> Result<Option<KvSnapshot>, NetworkError> {
     let snapshot = read_cluster_kv_current_snapshot(paths)?;
-    if publisher_revision.is_some_and(|revision| revision == snapshot.revision) {
-        return Ok(None);
+    let Some(publisher_revision) = publisher_revision else {
+        // No readable snapshot at the publisher (or it predates the revision
+        // hint): only a full import converges it.
+        return Ok(Some(snapshot));
+    };
+    if publisher_revision < snapshot.revision {
+        return Ok(Some(snapshot));
     }
-    Ok(Some(snapshot))
+    if publisher_revision > snapshot.revision {
+        // Lag-only invariant: revisions are positions in the leader's single
+        // linear history. A publisher ahead of THIS node means this node is
+        // the stale one (normal when a fresh learner syncs through a lagging
+        // bridge) — never ship our older snapshot backwards. A publisher
+        // ahead of the LEADER is impossible and indicates replicated-state
+        // divergence worth surfacing loudly.
+        if sinomo_kv::cluster_kv_raft_local_is_voter(state) {
+            eprintln!(
+                "warning: member publish reported KV revision {} ahead of this voter's {} — replicated KV history may have diverged",
+                publisher_revision.0, snapshot.revision.0
+            );
+        }
+    }
+    Ok(None)
 }
 
 pub fn handle_cluster_member_publish_request_with_host<H>(
