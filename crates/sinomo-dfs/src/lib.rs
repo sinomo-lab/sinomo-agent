@@ -13105,7 +13105,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         primary_node_id: &NodeId,
         batch: &DfsMetadataJournalBatch,
     ) -> Result<(), DfsError> {
-        if let Some(reason) = self.validate_metadata_journal_batch_source(primary_node_id, batch)? {
+        let _ = primary_node_id;
+        if let Some(reason) = self.validate_routed_response_journal_batch(batch)? {
             return Err(DfsError::Distributed { message: reason });
         }
         if let Some(backend) = self.metadata_backend.as_mut() {
@@ -13113,6 +13114,39 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         }
         self.apply_metadata_journal_batch_to_service_state(batch)?;
         Ok(())
+    }
+
+    /// Validation for journal batches carried in a ROUTED-OPERATION response.
+    /// The responder was addressed as the shard authority — possibly through
+    /// an authority redirect the local shard view does not reflect yet — and
+    /// the response transport source was already verified against the
+    /// addressed node, so the batch source is NOT re-checked against the
+    /// (possibly stale) local shard config. The local node still refuses to
+    /// overwrite a shard it itself owns.
+    fn validate_routed_response_journal_batch(
+        &mut self,
+        batch: &DfsMetadataJournalBatch,
+    ) -> Result<Option<String>, DfsError> {
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(None);
+        };
+        let Some(file_system_id) = metadata_journal_batch_file_system_id(batch) else {
+            return Ok(None);
+        };
+        let Some(shard) = DfsControlPlaneStore::new(control_plane.as_mut())
+            .get_metadata_shard(&file_system_id, &batch.shard_id.0)?
+        else {
+            return Ok(Some(format!(
+                "metadata journal batch has no configured shard {}",
+                batch.shard_id.0
+            )));
+        };
+        if shard.primary_node_id == self.node_id {
+            return Ok(Some(
+                "metadata primary must not apply a replica journal batch".to_string(),
+            ));
+        }
+        Ok(None)
     }
 
     fn handle_distributed_write_response(
@@ -13317,6 +13351,9 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let request_id = command.request_id.clone();
         let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
+        // The authority the requester should retry against when this node is
+        // not the shard primary (the requester routed on a stale shard view).
+        let mut authority_redirect: Option<NodeId> = None;
         let result = if requester_node_id != command.requesting_node_id {
             DfsNamespaceResult::Rejected {
                 reason: format!(
@@ -13324,6 +13361,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     requester_node_id, command.requesting_node_id
                 ),
                 posix_error: None,
+                current_primary_node_id: None,
             }
         } else if let Some(reason) = self.adoption_source_authority_rejection(
             &command.file_system_id,
@@ -13333,12 +13371,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             DfsNamespaceResult::Rejected {
                 reason,
                 posix_error: None,
+                current_primary_node_id: None,
             }
         } else {
             match self.affected_namespace_shards(&command.file_system_id, &command.operation) {
                 Err(error) => DfsNamespaceResult::Rejected {
                     reason: error.to_string(),
                     posix_error: None,
+                    current_primary_node_id: None,
                 },
                 Ok(shards) => {
                     // Response batches may only carry shards this node is
@@ -13383,6 +13423,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                             )
                         }
                         (Some(shard), _) => {
+                            authority_redirect = Some(shard.primary_node_id.clone());
                             Err(crate::posix::DfsPosixError::Dfs(DfsError::Distributed {
                                 message: format!(
                                     "node {} is not the metadata primary for shard {} (primary {}, epoch {})",
@@ -13399,6 +13440,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                         Err(error) => DfsNamespaceResult::Rejected {
                             posix_error: crate::posix::namespace_posix_error_for(&error),
                             reason: error.to_string(),
+                            current_primary_node_id: authority_redirect,
                         },
                     }
                 }
@@ -13732,6 +13774,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     pending.result = Some(DfsNamespaceResult::Rejected {
                         reason: reason.clone(),
                         posix_error: None,
+                        current_primary_node_id: None,
                     });
                 }
                 return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
@@ -14102,10 +14145,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 Some(shard) if shard.primary_node_id == self.node_id => {
                     Some("metadata primary must not install a replica snapshot".to_string())
                 }
-                Some(shard) if !shard.replica_node_ids.contains(&self.node_id) => Some(format!(
-                    "local node {} is not configured as a replica for metadata shard {}",
-                    self.node_id, shard.shard_id
-                )),
+                // Non-replica follower mirrors accept primary-sourced snapshot
+                // repair too; their journals are fed by routed-response and
+                // SyncPath batches and can need the same divergence repair as
+                // configured replicas.
                 _ => None,
             }
         };
@@ -14409,12 +14452,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 "metadata primary must not apply a replica journal batch".to_string(),
             ));
         }
-        if !shard.replica_node_ids.contains(&self.node_id) {
-            return Ok(Some(format!(
-                "local node {} is not configured as a replica for metadata shard {}",
-                self.node_id, shard.shard_id
-            )));
-        }
+        // Nodes outside the shard's replica set still apply primary-sourced
+        // batches: routed operations carry journal catch-up batches so any
+        // requester keeps a local follower mirror for read-your-write, and
+        // non-replica mirrors converge the same way through SyncPath pulls.
         Ok(None)
     }
 

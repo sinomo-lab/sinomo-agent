@@ -19998,3 +19998,286 @@ fn sifs_cluster_in_service_publish_repairs_forked_replica_with_snapshot() {
 
     std::fs::remove_dir_all(root).ok();
 }
+
+/// A 3-node SIFS cluster where `observer` is NOT in the root shard's replica
+/// set: the primary is the namespace authority, `writer` receives the pushed
+/// journal stream, and the outsider observer only converges its local mirror
+/// through routed-response batches and SyncPath pulls.
+fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
+    let root = temp_root(name);
+    let node_prefix = name.replace('-', "_");
+    let primary_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_primary")).expect("primary node");
+    let writer_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_writer")).expect("writer node");
+    let observer_node =
+        NodeId::from_legacy_named(&format!("node_{node_prefix}_outsider")).expect("outsider node");
+
+    let network = InProcessNetwork::new();
+    let shared_kv = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary_node.clone()]).expect("control plane kv"),
+    );
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                primary_node.clone(),
+            )))
+            .expect("sifs filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: primary_node.clone(),
+                replica_node_ids: vec![writer_node.clone()],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("sifs root metadata shard config");
+    });
+
+    let mut primary =
+        sifs_posix_cluster_node(&network, &shared_kv, &root, "primary", primary_node.clone());
+    let writer =
+        sifs_posix_cluster_node(&network, &shared_kv, &root, "writer", writer_node.clone());
+    let observer = sifs_posix_cluster_node(
+        &network,
+        &shared_kv,
+        &root,
+        "outsider",
+        observer_node.clone(),
+    );
+
+    primary
+        .bootstrap_distributed_sifs()
+        .expect("primary SIFS bootstrap");
+
+    let mut cluster = SifsPosixCluster {
+        root,
+        primary_node,
+        writer_node,
+        observer_node,
+        primary,
+        writer,
+        observer,
+        rejections: Vec::new(),
+    };
+    // Only the configured replica is fed by journal publication; the outsider
+    // intentionally stays empty until it pulls.
+    sifs_cluster_publish_metadata_until(&mut cluster, "replica catch-up", |cluster| {
+        cluster.writer.posix_stat(SIFS_USERS_PATH).is_ok()
+    });
+    assert!(
+        cluster.rejections.is_empty(),
+        "replica catch-up must not reject journal batches: {:?}",
+        cluster.rejections
+    );
+    assert!(
+        cluster.observer.posix_stat(SIFS_USERS_PATH).is_err(),
+        "outsider must not have been fed by the replica stream"
+    );
+    cluster
+}
+
+#[test]
+fn sifs_non_replica_requester_routes_namespace_op_with_read_your_write() {
+    let cluster = sifs_outsider_cluster("sifs-outsider-routed-namespace");
+    let SifsPosixCluster {
+        root,
+        primary,
+        mut observer,
+        ..
+    } = cluster;
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    // The outsider is not in the shard's replica set; the routed mkdir's
+    // response batches must still replay into its local mirror.
+    observer
+        .posix_mkdir_all("/users/outsider/nested")
+        .expect("routed mkdir from non-replica requester");
+
+    // Read-your-write without any further pumping: the mirror was updated by
+    // the response replay alone.
+    assert_eq!(
+        observer
+            .posix_stat("/users/outsider/nested")
+            .expect("outsider reads its own routed namespace write")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
+    let cluster = sifs_outsider_cluster("sifs-outsider-sync-pull-reads");
+    let SifsPosixCluster {
+        root,
+        primary_node,
+        primary,
+        mut observer,
+        ..
+    } = cluster;
+
+    let path = "/users/sync-pull.txt";
+    let bytes = b"pulled through SyncPath".to_vec();
+    let mut primary = primary;
+    primary
+        .posix_write_file(
+            path,
+            &bytes,
+            DfsWriteOptions::replicated_eventual(vec![primary_node.clone()]),
+        )
+        .expect("primary local write");
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        let mut primary = primary;
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    // The outsider never received a journal push; the distributed stat must
+    // pull the shard journal from the primary and surface the file.
+    let stat = observer
+        .posix_stat_distributed(path)
+        .expect("outsider stat converges via sync pull");
+    assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+
+    // Content reads fetch remotely as before.
+    assert_eq!(
+        observer
+            .posix_read_file_distributed(path)
+            .expect("outsider distributed read"),
+        bytes
+    );
+
+    // A genuinely missing path stays NotFound: the pull catches the mirror up
+    // and then reports the authoritative miss instead of spinning.
+    assert!(matches!(
+        observer.posix_stat_distributed("/users/never-created.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sifs_routed_namespace_op_follows_authority_redirect() {
+    let root = temp_root("sifs-authority-redirect");
+    let primary_node =
+        NodeId::from_legacy_named("node_sifs_redirect_old_primary").expect("old primary");
+    let writer_node =
+        NodeId::from_legacy_named("node_sifs_redirect_new_primary").expect("new primary");
+    let observer_node =
+        NodeId::from_legacy_named("node_sifs_redirect_requester").expect("requester");
+
+    let network = InProcessNetwork::new();
+    let shard_config = |primary: &NodeId, epoch: u64| DfsMetadataShardConfig {
+        file_system_id: sifs_file_system_id(),
+        shard_id: "root".to_string(),
+        primary_node_id: primary.clone(),
+        replica_node_ids: vec![primary_node.clone(), writer_node.clone()],
+        epoch,
+        assignment: DfsMetadataShardAssignment::Root,
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+
+    // Current control-plane view: the shard moved to `writer_node` at epoch 2.
+    let kv_current = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![primary_node.clone()]).expect("current kv"),
+    );
+    kv_current.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                writer_node.clone(),
+            )))
+            .expect("current filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&writer_node, 2))
+            .expect("current shard config");
+    });
+    // The requester's stale view still names the old primary at epoch 1.
+    let kv_stale = SharedDfsControlPlaneKvClient::new(
+        InProcessRaftKvCluster::new(vec![observer_node.clone()]).expect("stale kv"),
+    );
+    kv_stale.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(
+                writer_node.clone(),
+            )))
+            .expect("stale filesystem config");
+        control
+            .put_metadata_shard(&shard_config(&primary_node, 1))
+            .expect("stale shard config");
+    });
+
+    let old_primary =
+        sifs_posix_cluster_node(&network, &kv_current, &root, "old-primary", primary_node);
+    let mut new_primary =
+        sifs_posix_cluster_node(&network, &kv_current, &root, "new-primary", writer_node);
+    let mut requester =
+        sifs_posix_cluster_node(&network, &kv_stale, &root, "requester", observer_node);
+    new_primary
+        .bootstrap_distributed_sifs()
+        .expect("new primary SIFS bootstrap");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let old_stop = Arc::clone(&stop);
+    let old_thread = std::thread::spawn(move || {
+        let mut node = old_primary;
+        while !old_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("old primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let new_stop = Arc::clone(&stop);
+    let new_thread = std::thread::spawn(move || {
+        let mut node = new_primary;
+        while !new_stop.load(Ordering::SeqCst) {
+            node.process_incoming().expect("new primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    // The requester routes on its stale view to the old primary, which
+    // rejects with the current authority; the operation must follow the
+    // redirect and succeed at the new primary.
+    requester
+        .posix_mkdir_all("/users/redirected")
+        .expect("routed mkdir follows authority redirect");
+    assert_eq!(
+        requester
+            .posix_stat("/users/redirected")
+            .expect("requester reads its own redirected write")
+            .kind,
+        DfsObjectKind::Directory
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    old_thread.join().expect("old primary thread");
+    new_thread.join().expect("new primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
