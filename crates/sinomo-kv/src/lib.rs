@@ -9048,8 +9048,18 @@ impl DurableRaftKvNode {
     }
 
     pub fn become_leader(&mut self, term: u64) -> Result<(), KvError> {
+        // Leadership was won for exactly `term`; a higher local term means a
+        // concurrent vote or append advanced the node past this election and
+        // claiming leadership for the newer term would not be backed by a
+        // quorum of votes.
+        if self.node.hard_state.current_term > term {
+            return Err(KvError::StaleLeadershipTerm {
+                term,
+                current_term: self.node.hard_state.current_term,
+            });
+        }
         let hard_state_before = self.node.hard_state.clone();
-        self.node.hard_state.current_term = term.max(self.node.hard_state.current_term);
+        self.node.hard_state.current_term = term;
         self.node.hard_state.voted_for = Some(self.node_id.clone());
         self.node.hard_state.leader_id = Some(self.node_id.clone());
         if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
@@ -9775,6 +9785,10 @@ pub enum KvError {
     ConflictingLogEntry { index: u64 },
     #[error("missing committed raft entry at index {index}")]
     MissingCommittedEntry { index: u64 },
+    #[error(
+        "cannot claim raft leadership for term {term}: local term already advanced to {current_term}"
+    )]
+    StaleLeadershipTerm { term: u64, current_term: u64 },
     #[error("invalid raft config transition: {detail}")]
     InvalidRaftConfigTransition { detail: String },
 }
@@ -15983,6 +15997,33 @@ mod tests {
         fn cluster_read_only_error(&mut self, detail: String) -> Self::Error {
             QuorumCommitTestError::ReadOnly(detail)
         }
+    }
+
+    #[test]
+    fn become_leader_refuses_terms_below_observed() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-kv-become-leader-stale-term-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("root");
+        let node_id = NodeId::from_legacy_named("node_become_leader_stale").expect("node");
+        let mut node =
+            DurableRaftKvNode::open(node_id, KvWalPaths::new(root.join("raft"))).expect("open");
+        assert!(node.observe_term(10).expect("observe term"));
+        assert!(matches!(
+            node.become_leader(5),
+            Err(KvError::StaleLeadershipTerm {
+                term: 5,
+                current_term: 10
+            })
+        ));
+        node.become_leader(10)
+            .expect("become leader at observed term");
+        assert_eq!(node.hard_state().current_term, 10);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
