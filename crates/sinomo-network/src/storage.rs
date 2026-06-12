@@ -13710,16 +13710,20 @@ fn local_cluster_kv_snapshot_revision(paths: &ClusterPaths) -> Option<KvRevision
 }
 
 /// The KV snapshot a member-publish response should carry back to the
-/// publisher: nothing when the publisher reported a revision at least as new
-/// as ours, the full current snapshot otherwise (including when the publisher
-/// reported no revision at all — that means it has no readable snapshot, or it
-/// predates the revision hint; either way it can only converge by importing).
+/// publisher: nothing when the publisher reported exactly our revision, the
+/// full current snapshot otherwise. Any MISMATCH ships the snapshot — not
+/// just "publisher behind" — because the publisher's counter can evolve
+/// independently of ours (locally-applied writes before or during the join)
+/// and a diverged-ahead publisher would otherwise never converge. Reporting
+/// no revision at all means the publisher has no readable snapshot (or
+/// predates the hint) and also receives the full snapshot; the importer
+/// deduplicates unchanged content.
 fn cluster_member_publish_response_snapshot(
     paths: &ClusterPaths,
     publisher_revision: Option<KvRevision>,
 ) -> Result<Option<KvSnapshot>, NetworkError> {
     let snapshot = read_cluster_kv_current_snapshot(paths)?;
-    if publisher_revision.is_some_and(|revision| revision >= snapshot.revision) {
+    if publisher_revision.is_some_and(|revision| revision == snapshot.revision) {
         return Ok(None);
     }
     Ok(Some(snapshot))

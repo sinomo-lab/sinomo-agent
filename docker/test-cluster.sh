@@ -228,6 +228,13 @@ capture_failure_context() {
     # The shadow supervisor redirects the main daemon's output into /data.
     compose exec -T "$node" cat /data/daemon/main.stderr.log \
       > "$ARTIFACTS/$node.daemon.stderr.log" 2>/dev/null || true
+    compose exec -T "$node" cat /data/daemon/main.stdout.log \
+      > "$ARTIFACTS/$node.daemon.stdout.log" 2>/dev/null || true
+    # Local cluster-KV view: snapshot revision + invitation/shard keys, the
+    # usual suspects when a node's view has diverged.
+    compose exec -T "$node" sh -c \
+      'sinomo debug sobj /data/cluster/kv-snapshot.sobj 2>/dev/null | grep -o "\"revision\": uint64([0-9]*)" | head -1' \
+      > "$ARTIFACTS/$node.kv-revision.txt" 2>/dev/null || true
   done
 }
 
