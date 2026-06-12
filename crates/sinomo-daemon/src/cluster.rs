@@ -74,6 +74,13 @@ const DAEMON_CLUSTER_CONVERGENCE_TICK_INTERVAL: Duration =
 pub const DAEMON_CLUSTER_PUBLISH_INTERVAL: Duration =
     sinomo_network::CLUSTER_NETWORK_PUBLISH_INTERVAL;
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
+/// First-failure publish backoff; doubles per consecutive failure up to
+/// `DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF`. Cold cluster formation depends on
+/// quick retries: deep-segment nodes race the bridge's first connectivity
+/// publication, and a flat long backoff freezes the loser past the formation
+/// window (relay routes need connectivity records, which need relayed
+/// publishes — only fast retry breaks the cycle once the bridge publishes).
+pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration = Duration::from_secs(15);
 pub const DAEMON_CLUSTER_DISCOVERY_INTERVAL: Duration =
     sinomo_network::CLUSTER_NETWORK_DISCOVERY_INTERVAL;
 const DAEMON_CLUSTER_STARTUP_SETTLE_DURATION: Duration = Duration::from_secs(8);
@@ -1660,6 +1667,7 @@ pub(crate) struct ClusterNetworkMaintenance {
     pub solo_cluster_idle: bool,
     pub startup_settle_until: Option<Instant>,
     pub tick: u64,
+    pub publish_failure_streak: u32,
     pub last_publish: Instant,
     pub last_discovery: Instant,
     pub last_probe: Instant,
@@ -1699,6 +1707,7 @@ impl ClusterNetworkMaintenance {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             // Fire the first maintenance cycle immediately instead of after a full
             // interval, so a freshly started/joined node publishes its records and
             // probes its peers right away. Combined with parallel probing this lets
@@ -1972,14 +1981,17 @@ impl ClusterNetworkMaintenance {
                     });
             }
             if publish_failed {
+                self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
                 self.last_publish =
                     sinomo_network::cluster_network_maintenance_last_timestamp_for_next_due(
                         now,
                         sinomo_network::cluster_network_publish_interval_for_role(
                             &self.local_node_role,
                         ),
-                        DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+                        self.publish_failure_backoff(),
                     );
+            } else {
+                self.publish_failure_streak = 0;
             }
         }
 
@@ -2195,7 +2207,10 @@ impl ClusterNetworkMaintenance {
         runtime: tokio::runtime::Handle,
     ) {
         match refresh_daemon_node_status_in_kv_async(&pending.paths, runtime).await {
-            Ok(published) => self.record_node_status_publish(&published),
+            Ok(published) => {
+                self.record_node_status_publish(&published);
+                self.record_publish_success();
+            }
             Err(error) => {
                 eprintln!("sinomo daemon {} publish failed: {error}", pending.label);
                 self.record_publish_failure();
@@ -2227,19 +2242,37 @@ impl ClusterNetworkMaintenance {
                     .await
             }
         };
-        if let Err(error) = result {
-            eprintln!("sinomo daemon cluster member publish failed: {error}");
-            self.record_publish_failure();
+        match result {
+            Ok(()) => self.record_publish_success(),
+            Err(error) => {
+                eprintln!("sinomo daemon cluster member publish failed: {error}");
+                self.record_publish_failure();
+            }
         }
     }
 
     fn record_publish_failure(&mut self) {
+        self.publish_failure_streak = self.publish_failure_streak.saturating_add(1);
         let now = Instant::now();
         self.last_publish = sinomo_network::cluster_network_maintenance_last_timestamp_for_next_due(
             now,
             sinomo_network::cluster_network_publish_interval_for_role(&self.local_node_role),
-            DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF,
+            self.publish_failure_backoff(),
         );
+    }
+
+    /// Exponential backoff over consecutive publish failures: quick retries
+    /// while the cluster is still forming, the full backoff once a failure
+    /// looks persistent.
+    fn publish_failure_backoff(&self) -> Duration {
+        let exponent = self.publish_failure_streak.saturating_sub(1).min(8);
+        DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+            .saturating_mul(1_u32 << exponent)
+            .min(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
+    }
+
+    fn record_publish_success(&mut self) {
+        self.publish_failure_streak = 0;
     }
 
     pub(crate) async fn run_pending_connectivity_probe_async(
@@ -5490,6 +5523,38 @@ mod tests {
     }
 
     #[test]
+    fn publish_failure_backoff_grows_exponentially_and_resets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
+            Arc::new(IdleStatsAtomics::new()),
+        ));
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+        );
+        maintenance.publish_failure_streak = 1;
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF
+        );
+        maintenance.publish_failure_streak = 2;
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF * 2
+        );
+        maintenance.publish_failure_streak = 12;
+        assert_eq!(
+            maintenance.publish_failure_backoff(),
+            DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF
+        );
+        maintenance.record_publish_success();
+        assert_eq!(maintenance.publish_failure_streak, 0);
+    }
+
+    #[test]
     fn maintenance_failure_backoff_retries_after_configured_delay() {
         let now = Instant::now();
         let last_publish = sinomo_network::cluster_network_maintenance_last_timestamp_for_next_due(
@@ -5549,6 +5614,7 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -5584,6 +5650,7 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
             tick: 7,
             last_publish: now
                 .checked_sub(Duration::from_secs(10))
@@ -5623,6 +5690,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .expect("publish instant"),
@@ -5671,6 +5739,7 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL + Duration::from_secs(1))
@@ -5702,6 +5771,7 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
             tick: 7,
             last_publish: now,
             last_discovery: now,
@@ -5746,6 +5816,7 @@ mod tests {
             solo_cluster_idle: false,
 
             startup_settle_until: None,
+            publish_failure_streak: 0,
             tick: 7,
             last_publish: now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
@@ -6038,6 +6109,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_DISCOVERY_INTERVAL)
@@ -6090,6 +6162,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6214,6 +6287,7 @@ mod tests {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now
@@ -6316,6 +6390,7 @@ mod tests {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6414,6 +6489,7 @@ mod tests {
             solo_cluster_idle: false,
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -6485,6 +6561,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now
                 .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
                 .unwrap_or(maintenance_now),
@@ -7852,6 +7929,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -7941,6 +8019,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: Instant::now(),
             last_discovery: Instant::now(),
             last_probe: Instant::now(),
@@ -8044,6 +8123,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8583,6 +8663,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,
@@ -8703,6 +8784,7 @@ mod tests {
 
             startup_settle_until: None,
             tick: 0,
+            publish_failure_streak: 0,
             last_publish: maintenance_now,
             last_discovery: maintenance_now,
             last_probe: maintenance_now,

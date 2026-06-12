@@ -11113,6 +11113,23 @@ pub fn cluster_main_daemon_command_endpoint_candidates(
         .collect()
 }
 
+/// Member-publish targets with voters first. The publish doubles as the
+/// learner's KV snapshot sync (`ClusterMemberPublishRequest::local_kv_revision`),
+/// and the snapshot in the response comes from whichever node answers — a
+/// sibling learner with an equally stale snapshot answers "current" and the
+/// sync silently stalls. Preferring voters (then bridges, whose own snapshots
+/// converge the same way) forms a convergence chain rooted at the voter.
+pub fn cluster_member_publish_targets_voter_first(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+) -> Vec<ClusterEndpointRecord> {
+    let mut targets = cluster_member_publish_targets(paths, state);
+    targets.sort_by_key(|endpoint| {
+        !sinomo_kv::cluster_kv_raft_node_is_voter(state, &endpoint.node_id)
+    });
+    targets
+}
+
 pub fn cluster_member_publish_targets(
     paths: &ClusterPaths,
     state: &ClusterBootstrapState,
@@ -13409,7 +13426,7 @@ pub fn publish_local_members_via_voter_with_host(
         local_kv_revision: local_cluster_kv_snapshot_revision(paths),
     };
     let mut failures = Vec::new();
-    for endpoint in cluster_member_publish_targets(paths, state) {
+    for endpoint in cluster_member_publish_targets_voter_first(paths, state) {
         match host.send_cluster_member_publish(&endpoint, &request, options.member_publish_timeout)
         {
             Ok(response) if response.accepted => {
@@ -13472,7 +13489,7 @@ pub async fn publish_local_members_via_voter_async_with_host(
     let state_for_targets = state.clone();
     let targets = runtime
         .spawn_blocking(move || {
-            cluster_member_publish_targets(&paths_for_targets, &state_for_targets)
+            cluster_member_publish_targets_voter_first(&paths_for_targets, &state_for_targets)
         })
         .await
         .map_err(|source| NetworkError::Io {

@@ -101,7 +101,8 @@ wait_for_dfs_ready() {
     still=""
     for node in $pending; do
       if compose exec -T "$node" sinomo test run cluster.dfs.invariants \
-          --require-cluster --param timeout-seconds=5 >/dev/null 2>&1; then
+          --require-cluster --param timeout-seconds=5 \
+          >"$ARTIFACTS/dfs-ready-$node.last.json" 2>&1; then
         log "  dfs-ready: $node"
       else
         still="$still $node"
@@ -111,6 +112,10 @@ wait_for_dfs_ready() {
     [ -z "$pending" ] && return 0
     if [ "$(date +%s)" -ge "$deadline" ]; then
       log "dfs-ready: nodes never became ready: $pending"
+      for node in $pending; do
+        log "  $node last probe output:"
+        sed 's/^/      /' "$ARTIFACTS/dfs-ready-$node.last.json" | tail -4
+      done
       return 1
     fi
     sleep "$POLL_INTERVAL"

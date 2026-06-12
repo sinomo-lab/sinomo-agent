@@ -420,54 +420,59 @@ fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(
     rows: &mut [ClusterHealthRow],
     probe: &P,
 ) {
-    if !rows
-        .iter()
-        .any(|row| row.availability != ClusterNodeAvailability::Online)
-    {
-        return;
+    // Iterative frontier merge: peers that become known-online through another
+    // peer's view are queried too. In a segmented topology liveness is only
+    // observable transitively (node1 learns of the far segment from the
+    // bridge's view), so a single pass over the initially-online peers misses
+    // every node more than one bridge away.
+    let mut queried = std::collections::BTreeSet::new();
+    queried.insert(state.local_node_id.clone());
+    while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
+        if !rows
+            .iter()
+            .any(|row| row.availability != ClusterNodeAvailability::Online)
+        {
+            return;
+        }
+        let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
+            return;
+        };
+        queried.insert(member.node_id.clone());
+        let Some(peer_rows) = probe.peer_local_health_rows(state, &member) else {
+            continue;
+        };
+        merge_online_peer_health_rows(rows, peer_rows);
     }
+}
 
-    let mut peer_members = rows
-        .iter()
+/// The best not-yet-queried online peer: most non-local endpoints first
+/// (bridges are dual-homed, so this prefers them), node id as tie-breaker.
+fn next_online_peer_to_query(
+    state: &ClusterBootstrapState,
+    rows: &[ClusterHealthRow],
+    queried: &std::collections::BTreeSet<NodeId>,
+) -> Option<ClusterMemberRecord> {
+    rows.iter()
         .filter(|row| {
             row.availability == ClusterNodeAvailability::Online
-                && row.member.node_id != state.local_node_id
+                && !queried.contains(&row.member.node_id)
                 && row
                     .member
                     .capabilities
                     .iter()
                     .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
         })
-        .map(|row| row.member.clone())
-        .collect::<Vec<_>>();
-    peer_members.sort_by_key(|member| {
-        (
-            std::cmp::Reverse(
-                member
+        .max_by_key(|row| {
+            (
+                row.member
                     .endpoints
                     .iter()
                     .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
                     .count(),
-            ),
-            member.node_id.clone(),
-        )
-    });
-
-    for member in peer_members
-        .into_iter()
-        .take(CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS)
-    {
-        let Some(peer_rows) = probe.peer_local_health_rows(state, &member) else {
-            continue;
-        };
-        merge_online_peer_health_rows(rows, peer_rows);
-        if rows
-            .iter()
-            .all(|row| row.availability == ClusterNodeAvailability::Online)
-        {
-            break;
-        }
-    }
+                std::cmp::Reverse(row.member.node_id.clone()),
+            )
+        })
+        .map(|row| row.member.clone())
 }
 
 async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Sized>(
@@ -475,53 +480,23 @@ async fn merge_reachable_peer_health_rows_async<P: ClusterStatusAsyncProbe + ?Si
     rows: &mut [ClusterHealthRow],
     probe: &P,
 ) -> Result<(), NetworkError> {
-    if !rows
-        .iter()
-        .any(|row| row.availability != ClusterNodeAvailability::Online)
-    {
-        return Ok(());
-    }
-
-    let mut peer_members = rows
-        .iter()
-        .filter(|row| {
-            row.availability == ClusterNodeAvailability::Online
-                && row.member.node_id != state.local_node_id
-                && row
-                    .member
-                    .capabilities
-                    .iter()
-                    .any(|capability| capability.as_str() == DAEMON_MAIN_RUN_CAPABILITY)
-        })
-        .map(|row| row.member.clone())
-        .collect::<Vec<_>>();
-    peer_members.sort_by_key(|member| {
-        (
-            std::cmp::Reverse(
-                member
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.privacy != ClusterEndpointPrivacy::LocalOnly)
-                    .count(),
-            ),
-            member.node_id.clone(),
-        )
-    });
-
-    for member in peer_members
-        .into_iter()
-        .take(CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS)
-    {
+    let mut queried = std::collections::BTreeSet::new();
+    queried.insert(state.local_node_id.clone());
+    while queried.len() <= CLUSTER_HEALTH_PEER_ROWS_MAX_PEERS {
+        if !rows
+            .iter()
+            .any(|row| row.availability != ClusterNodeAvailability::Online)
+        {
+            return Ok(());
+        }
+        let Some(member) = next_online_peer_to_query(state, rows, &queried) else {
+            return Ok(());
+        };
+        queried.insert(member.node_id.clone());
         let Some(peer_rows) = probe.peer_local_health_rows_async(state, &member).await? else {
             continue;
         };
         merge_online_peer_health_rows(rows, peer_rows);
-        if rows
-            .iter()
-            .all(|row| row.availability == ClusterNodeAvailability::Online)
-        {
-            break;
-        }
     }
     Ok(())
 }
