@@ -42,6 +42,9 @@ const POSIX_ROUTED_SYNC_RETRY_ROUNDS: usize = 4;
 /// Routed-operation attempts when authority rejections redirect to the
 /// current shard primary (a stale local shard view names a former primary).
 const POSIX_ROUTED_AUTHORITY_REDIRECT_LIMIT: usize = 3;
+/// Budget for the best-effort freshness pull a distributed read performs on
+/// foreign-shard paths; reads fall back to the local mirror when it elapses.
+const POSIX_READ_FRESHNESS_SYNC_TIMEOUT: Duration = Duration::from_secs(3);
 const POSIX_REMOTE_READ_IDLE_WAIT_MAX: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Error)]
@@ -287,6 +290,26 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         follow_final: bool,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        // A foreign-shard mirror can be stale in BOTH directions: a missing
+        // entry the primary has since created, and a present entry the
+        // primary has since unlinked or moved. One up-front pull bounds the
+        // staleness of found entries (deletions become visible). It is
+        // best-effort with a short budget: an unreachable primary must not
+        // take down reads the local mirror can serve.
+        if let Some(primary) = self.routed_namespace_primary_for_path(&resolved)?
+            && self
+                .route_namespace_operation_to_metadata_primary_with_timeout(
+                    sifs_file_system_id(),
+                    primary,
+                    DfsNamespaceOperation::SyncPath {
+                        path: resolved.clone(),
+                    },
+                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                )
+                .is_ok()
+        {
+            resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        }
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             if let Some(object) = self.lookup_sifs_path(&resolved)?
                 && object.kind != DfsObjectKind::Tombstone

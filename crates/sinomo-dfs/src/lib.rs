@@ -4606,7 +4606,10 @@ pub struct DfsProtocolFrameProcessResult {
 pub const DEFAULT_DFS_METADATA_REPLICATION_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DEFAULT_DFS_METADATA_REPLICATION_BATCH_TARGET_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_DFS_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
-pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(5);
+// Cross-shard coordination (rename/hardlink sagas) does several primary-to-
+// primary roundtrips plus journal publication before the requester's answer;
+// over bridge-relayed segments that legitimately exceeds a small budget.
+pub const DFS_ROUTED_NAMESPACE_OP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Nested coordination depth (serving a namespace request while settling
 /// another) beyond which new coordination rejects as Busy instead of growing
 /// the stack.
@@ -13823,6 +13826,21 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         primary_node_id: NodeId,
         operation: DfsNamespaceOperation,
     ) -> Result<DfsNamespaceResult, DfsError> {
+        self.route_namespace_operation_to_metadata_primary_with_timeout(
+            file_system_id,
+            primary_node_id,
+            operation,
+            DFS_ROUTED_NAMESPACE_OP_TIMEOUT,
+        )
+    }
+
+    pub(crate) fn route_namespace_operation_to_metadata_primary_with_timeout(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        operation: DfsNamespaceOperation,
+        timeout: Duration,
+    ) -> Result<DfsNamespaceResult, DfsError> {
         let request_id = self.next_request_id();
         let sent = self.send_dfs_message_if_routable(
             &primary_node_id,
@@ -13848,15 +13866,16 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 result: None,
             },
         );
-        self.settle_routed_namespace_op(&request_id)
+        self.settle_routed_namespace_op(&request_id, timeout)
     }
 
     fn settle_routed_namespace_op(
         &mut self,
         request_id: &str,
+        timeout: Duration,
     ) -> Result<DfsNamespaceResult, DfsError> {
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_add(1);
-        let result = self.settle_routed_namespace_op_inner(request_id);
+        let result = self.settle_routed_namespace_op_inner(request_id, timeout);
         self.routed_namespace_settle_depth = self.routed_namespace_settle_depth.saturating_sub(1);
         result
     }
@@ -13864,6 +13883,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     fn settle_routed_namespace_op_inner(
         &mut self,
         request_id: &str,
+        timeout: Duration,
     ) -> Result<DfsNamespaceResult, DfsError> {
         let started_at = Instant::now();
         loop {
@@ -13886,7 +13906,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 return Ok(pending.result.expect("settled result checked above"));
             }
             let elapsed = started_at.elapsed();
-            if elapsed >= DFS_ROUTED_NAMESPACE_OP_TIMEOUT {
+            if elapsed >= timeout {
                 self.pending_routed_namespace_ops.remove(request_id);
                 return Err(DfsError::Network {
                     message: format!(
@@ -13895,8 +13915,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 });
             }
             if events.is_empty() {
-                let wait = DFS_ROUTED_NAMESPACE_IDLE_WAIT
-                    .min(DFS_ROUTED_NAMESPACE_OP_TIMEOUT.saturating_sub(elapsed));
+                let wait = DFS_ROUTED_NAMESPACE_IDLE_WAIT.min(timeout.saturating_sub(elapsed));
                 self.transport
                     .wait_for_incoming(wait)
                     .map_err(DfsError::from_network)?;
