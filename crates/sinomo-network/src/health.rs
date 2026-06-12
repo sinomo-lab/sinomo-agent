@@ -448,7 +448,7 @@ fn merge_reachable_peer_health_rows<P: ClusterStatusProbe + ?Sized>(
 /// The best not-yet-queried online peer: most non-local endpoints first
 /// (bridges are dual-homed, so this prefers them), node id as tie-breaker.
 fn next_online_peer_to_query(
-    state: &ClusterBootstrapState,
+    _state: &ClusterBootstrapState,
     rows: &[ClusterHealthRow],
     queried: &std::collections::BTreeSet<NodeId>,
 ) -> Option<ClusterMemberRecord> {

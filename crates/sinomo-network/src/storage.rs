@@ -8,7 +8,7 @@ use crate::rpc::{
     ObjectRpcResponse,
 };
 use crate::{
-    cluster_route_next_hop, discover_default_public_ip_candidates_for_local_ips_async,
+    discover_default_public_ip_candidates_for_local_ips_async,
     discover_local_ip_candidates_for_targets, discover_local_ip_candidates_for_targets_async,
     format_ip_port, is_invitable_ip, is_loopback_connect_address,
 };
@@ -5914,9 +5914,16 @@ pub fn cluster_connectivity_probe_due_with_startup_settle(
     {
         return retry_due;
     }
-    record.state == ClusterConnectivityState::Healthy
-        && record.consecutive_failures > 0
-        && retry_due
+    if record.state != ClusterConnectivityState::Healthy {
+        // The failure budget is exhausted, but the endpoint must not freeze
+        // as degraded until record expiry: a peer that becomes reachable
+        // later — the canonical case is a cold-formation late joiner whose
+        // pre-join window burned the budget — has to be rediscovered. Retry
+        // at a slower cadence than healthy refreshes.
+        let degraded_retry_seconds = retry_seconds.saturating_mul(2);
+        return record.observed_at + time::Duration::seconds(degraded_retry_seconds) <= now;
+    }
+    record.consecutive_failures > 0 && retry_due
 }
 
 pub fn cluster_connectivity_probe_due_with_graph(
@@ -5947,7 +5954,12 @@ pub fn cluster_connectivity_probe_due_with_graph(
     if record.state == ClusterConnectivityState::Healthy {
         return true;
     }
-    cluster_route_next_hop(graph, local_node_id, &endpoint.node_id).is_none()
+    // A due non-healthy record re-probes even when a relay route exists:
+    // a healed DIRECT endpoint always beats relaying, and the route may
+    // itself traverse stale edges. The slow degraded cadence in the base
+    // check keeps the probe volume negligible.
+    let _ = (graph, local_node_id, endpoint);
+    true
 }
 
 impl ClusterConnectivityGraph {
