@@ -2992,7 +2992,6 @@ fn temporary_path_for(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::UNIX_EPOCH;
 
     #[test]
     fn put_object_version_writes_blob_and_manifest() {
@@ -4152,12 +4151,8 @@ mod tests {
         cleanup(&root);
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-dfs-{name}-{nanos}"))
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
     }
 
     fn cleanup(root: &Path) {

@@ -1339,7 +1339,6 @@ mod tests {
     };
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
     use sinomo_events::EventId;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn operator_inspector_reports_status_object_conflicts_and_repairs() {
@@ -2344,11 +2343,7 @@ mod tests {
         NodeId::from_legacy_named(value).expect("node")
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-dfs-{name}-{nanos}"))
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
     }
 }

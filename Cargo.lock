@@ -5903,6 +5903,7 @@ dependencies = [
  "sinomo-object",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6419,6 +6420,10 @@ dependencies = [
  "sinomo-kv",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "sinomo-testdir"
+version = "0.1.0"
 
 [[package]]
 name = "sinomo-video"
