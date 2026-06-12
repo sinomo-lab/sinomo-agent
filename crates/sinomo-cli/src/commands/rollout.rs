@@ -1545,6 +1545,7 @@ fn push_unique_rollout_target(targets: &mut Vec<RolloutTarget>, target: RolloutT
 
 const ROLLOUT_PROGRESS_POLL_INTERVAL: Duration = Duration::from_millis(750);
 const ROLLOUT_TERMINAL_STATUS_GRACE: Duration = Duration::from_secs(45);
+const ROLLOUT_ACTIVE_STATUS_ERROR_GRACE: Duration = Duration::from_secs(15 * 60);
 const ROLLOUT_PROGRESS_BAR_WIDTH: usize = 24;
 
 pub(crate) fn rollout_progress_bar(status: Option<&ClusterNodeRolloutStatus>) -> String {
@@ -1662,6 +1663,19 @@ pub(crate) fn rollout_terminal_response(
     })
 }
 
+pub(crate) fn rollout_pending_error_grace(
+    status: Option<&ClusterNodeRolloutStatus>,
+    expectation: &RolloutProgressExpectation,
+) -> Duration {
+    let Some(status) = status else {
+        return ROLLOUT_TERMINAL_STATUS_GRACE;
+    };
+    if !expectation.matches(status) || rollout_terminal_response(status, expectation).is_some() {
+        return ROLLOUT_TERMINAL_STATUS_GRACE;
+    }
+    ROLLOUT_ACTIVE_STATUS_ERROR_GRACE
+}
+
 fn send_rollout_request_with_progress<F>(
     target: &RolloutTarget,
     operation: &'static str,
@@ -1728,9 +1742,10 @@ where
             println!();
             return Ok(response);
         }
-        if pending_error_started_at
-            .is_some_and(|started_at| started_at.elapsed() >= ROLLOUT_TERMINAL_STATUS_GRACE)
-        {
+        if pending_error_started_at.is_some_and(|started_at| {
+            started_at.elapsed()
+                >= rollout_pending_error_grace(rollout_status.as_ref(), &expectation)
+        }) {
             if let Some(error) = pending_error {
                 if drew_progress {
                     println!();

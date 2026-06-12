@@ -40,16 +40,16 @@ use super::{
     read_cluster_members_from_kv, read_cluster_node_statuses_from_kv, read_cluster_rollout_status,
     read_cluster_state, require_cluster_runtime_quorum_with_paths_and_daemon,
     rollout_advance_with_data_dir, rollout_cluster_targets, rollout_cluster_targets_from_state,
-    rollout_endpoint_candidates, rollout_progress_bar, rollout_status_matches_expectation,
-    rollout_target_endpoint_for_main, rollout_target_endpoint_for_main_in_order,
-    rollout_target_endpoint_for_main_with_connectivity, rollout_telemetry_gates_set_with_data_dir,
-    rollout_terminal_response, run_tui_with_handler_io, run_tui_with_handler_io_and_daemon,
-    send_cluster_join_registration_over_iroh, shadow_daemon_node_id, sign_cluster_join_invite,
-    sign_daemon_rpc_request_from_data_dir, sort_rollout_endpoints_by_connectivity,
-    stage_rollout_main_activation, sync_cluster_state_to_kv, test_command_requires_cluster_state,
-    tui_default_daemon_status, uninstall_with_layout, with_cli_force_local_mode,
-    write_daemon_status, write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node,
-    write_rollout_status,
+    rollout_endpoint_candidates, rollout_pending_error_grace, rollout_progress_bar,
+    rollout_status_matches_expectation, rollout_target_endpoint_for_main,
+    rollout_target_endpoint_for_main_in_order, rollout_target_endpoint_for_main_with_connectivity,
+    rollout_telemetry_gates_set_with_data_dir, rollout_terminal_response, run_tui_with_handler_io,
+    run_tui_with_handler_io_and_daemon, send_cluster_join_registration_over_iroh,
+    shadow_daemon_node_id, sign_cluster_join_invite, sign_daemon_rpc_request_from_data_dir,
+    sort_rollout_endpoints_by_connectivity, stage_rollout_main_activation,
+    sync_cluster_state_to_kv, test_command_requires_cluster_state, tui_default_daemon_status,
+    uninstall_with_layout, with_cli_force_local_mode, write_daemon_status,
+    write_imported_cluster_kv_snapshot, write_model_runtime_config_for_node, write_rollout_status,
 };
 #[cfg(feature = "sandbox")]
 use super::{
@@ -12363,6 +12363,57 @@ fn rollout_terminal_response_preserves_expected_source_head() {
 }
 
 #[test]
+fn rollout_pending_error_grace_extends_for_matching_active_status() {
+    let expectation = RolloutProgressExpectation {
+        source: "repo-a".to_string(),
+        requested_at: "2026-06-02T00:00:01Z".to_string(),
+        source_head: Some("head-new".to_string()),
+    };
+    let mut status = sinomo_runtime::core::ClusterNodeRolloutStatus {
+        status: "in-progress".to_string(),
+        mode: Some("cluster-remote-build".to_string()),
+        detail: Some("cargo build running".to_string()),
+        phase: Some("building".to_string()),
+        progress_current: Some(2),
+        progress_total: Some(5),
+        progress_message: Some("cargo build running".to_string()),
+        source: Some("repo-a".to_string()),
+        requested_at: Some("2026-06-02T00:00:01Z".to_string()),
+        staged_at: None,
+        updated_at: None,
+        failed_at: None,
+        diagnostics: None,
+        stdout_log: None,
+        stderr_log: None,
+        stdout_tail: None,
+        stderr_tail: None,
+    };
+
+    assert_eq!(
+        rollout_pending_error_grace(None, &expectation),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        rollout_pending_error_grace(Some(&status), &expectation),
+        Duration::from_secs(15 * 60)
+    );
+
+    status.requested_at = Some("2026-06-02T00:00:00Z".to_string());
+    assert_eq!(
+        rollout_pending_error_grace(Some(&status), &expectation),
+        Duration::from_secs(45)
+    );
+
+    status.requested_at = Some("2026-06-02T00:00:01Z".to_string());
+    status.status = "accepted".to_string();
+    status.phase = Some("shadow-finalized".to_string());
+    assert_eq!(
+        rollout_pending_error_grace(Some(&status), &expectation),
+        Duration::from_secs(45)
+    );
+}
+
+#[test]
 fn rollout_cluster_targets_deduplicate_explicit_targets() {
     let targets = rollout_cluster_targets(&RolloutOptions {
         targets: vec![
@@ -12652,6 +12703,8 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         "local-public-key",
         OffsetDateTime::now_utc(),
     );
+    sinomo_runtime::network::write_cluster_state(&paths, &state).expect("write state");
+    super::network::sync_cluster_state_to_local_raft_unchecked(&paths, &state).expect("sync state");
 
     let lan_endpoint = invite_introducer_endpoint(&remote_node_id, "192.0.2.42:21354".to_string());
     let iroh_endpoint = invite_introducer_endpoint(
@@ -12660,8 +12713,7 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
     );
 
     let now = OffsetDateTime::now_utc();
-    let mut store = InProcessKvStore::new();
-    for (endpoint, connectivity_state) in [
+    let records = [
         (
             &lan_endpoint,
             sinomo_runtime::network::ClusterConnectivityState::Unreachable,
@@ -12670,7 +12722,9 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
             &iroh_endpoint,
             sinomo_runtime::network::ClusterConnectivityState::Healthy,
         ),
-    ] {
+    ]
+    .into_iter()
+    .map(|(endpoint, connectivity_state)| {
         let consecutive_failures = if matches!(
             connectivity_state,
             sinomo_runtime::network::ClusterConnectivityState::Unreachable
@@ -12679,35 +12733,25 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
         } else {
             0
         };
-        let record = sinomo_runtime::network::ClusterConnectivityRecord {
-            cluster_id: cluster_id.clone(),
-            source_node_id: local_node_id.clone(),
-            target_node_id: remote_node_id.clone(),
-            endpoint_id: endpoint.endpoint_id.clone(),
-            transport: endpoint.transport.clone(),
-            address: endpoint.address.clone(),
-            state: connectivity_state,
-            latency_ms: None,
+        sinomo_runtime::network::cluster_connectivity_record(
+            &state,
+            endpoint,
+            connectivity_state,
+            None,
             consecutive_failures,
-            last_success_at: None,
-            last_failure_at: None,
-            observed_at: now,
-            expires_at: now + time::Duration::seconds(120),
-        };
-        store
-            .put_serde(
-                sinomo_runtime::network::cluster_connectivity_key(
-                    &record.source_node_id,
-                    &record.target_node_id,
-                    &record.endpoint_id,
-                ),
-                &record,
-                None,
-            )
-            .expect("connectivity record");
-    }
-    sinomo_runtime::kv::write_cluster_kv_snapshot(&paths.kv_paths(), &store.snapshot())
-        .expect("cluster kv snapshot");
+            None,
+            None,
+            now,
+            120,
+        )
+    })
+    .collect::<Vec<_>>();
+    sinomo_runtime::network::sync_cluster_connectivity_records_to_kv(
+        &paths,
+        &local_node_id,
+        records,
+    )
+    .expect("connectivity records");
 
     let mut endpoints = vec![lan_endpoint, iroh_endpoint.clone()];
     sort_rollout_endpoints_by_connectivity(&paths, &state, &mut endpoints);
