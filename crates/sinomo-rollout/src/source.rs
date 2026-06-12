@@ -1,8 +1,8 @@
 use crate::{
     RolloutError, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
-    append_native_dylib_module_build_args, discover_default_native_dylib_module_builds,
-    ensure_rollout_layout, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    stage_rollout_file,
+    append_native_dylib_module_build_args, discover_all_native_dylib_module_builds,
+    discover_default_native_dylib_module_builds, ensure_rollout_layout, rollout_staged_main_binary,
+    rollout_staged_shadow_binary, stage_rollout_file,
 };
 use std::env;
 use std::fs;
@@ -208,6 +208,68 @@ fn rollout_build_dev_native_dylib_modules(
     Ok(artifacts)
 }
 
+pub fn rollout_build_dev_native_dylib_module(
+    repo: &Path,
+    build_log: &Path,
+    selector: &str,
+) -> Result<LocalRolloutNativeDylibModuleArtifact, RolloutError> {
+    let modules = discover_all_native_dylib_module_builds(repo)?;
+    let matches = modules
+        .into_iter()
+        .filter(|module| rollout_module_selector_matches(module, selector))
+        .collect::<Vec<_>>();
+    let module = match matches.as_slice() {
+        [module] => module.clone(),
+        [] => {
+            return Err(RolloutError::InvalidArtifact {
+                detail: format!("no native-dylib module matches `{selector}`"),
+            });
+        }
+        many => {
+            return Err(RolloutError::InvalidArtifact {
+                detail: format!(
+                    "native-dylib module selector `{selector}` matched multiple modules: {}",
+                    many.iter()
+                        .map(|module| module.module_id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        }
+    };
+    let build_args = rollout_single_module_build_args(&module);
+    let _workspace_manifest = prepare_rollout_build_workspace_manifest(repo)?;
+    let build = Command::new("cargo")
+        .args(&build_args)
+        .current_dir(repo)
+        .output()
+        .map_err(|source| RolloutError::Io {
+            path: format!("cargo {}", build_args.join(" ")),
+            detail: source.to_string(),
+        })?;
+    let command = format!("cargo {}", build_args.join(" "));
+    let log = format!(
+        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
+        repo.display(),
+        build.status,
+        String::from_utf8_lossy(&build.stdout),
+        String::from_utf8_lossy(&build.stderr)
+    );
+    fs::write(build_log, log).map_err(|source| RolloutError::Io {
+        path: build_log.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if !build.status.success() {
+        return Err(RolloutError::Process {
+            command,
+            status: build.status.code().unwrap_or(-1),
+            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
+        });
+    }
+    ensure_artifact_exists(&module.built_library)?;
+    Ok(LocalRolloutNativeDylibModuleArtifact::from(module))
+}
+
 fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
     let mut args = vec!["build".to_string(), "-p".to_string(), "sinomo".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
@@ -218,6 +280,29 @@ fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> V
     let mut args = vec!["build".to_string()];
     append_native_dylib_module_build_args(&mut args, modules);
     args
+}
+
+fn rollout_single_module_build_args(module: &SelfRolloutNativeDylibModuleBuild) -> Vec<String> {
+    let mut args = vec![
+        "build".to_string(),
+        "-p".to_string(),
+        module.package.clone(),
+    ];
+    if !module.features.is_empty() {
+        args.push("--features".to_string());
+        args.push(module.features.join(","));
+    }
+    args
+}
+
+fn rollout_module_selector_matches(
+    module: &SelfRolloutNativeDylibModuleBuild,
+    selector: &str,
+) -> bool {
+    module.module_id == selector
+        || module.package == selector
+        || module.cache_key == selector
+        || module.source == selector
 }
 
 fn ensure_artifact_exists(path: &Path) -> Result<(), RolloutError> {

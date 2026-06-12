@@ -29,7 +29,8 @@ pub use client::{
     send_daemon_rollout_binary_upload_finalize,
     send_daemon_rollout_binary_upload_finalize_to_endpoint, send_daemon_rollout_build,
     send_daemon_rollout_build_to_endpoint, send_daemon_rollout_clear_status,
-    send_daemon_rollout_diagnostics, send_daemon_rpc, send_daemon_rpc_async,
+    send_daemon_rollout_diagnostics, send_daemon_rollout_native_dylib_module,
+    send_daemon_rollout_native_dylib_module_to_endpoint, send_daemon_rpc, send_daemon_rpc_async,
     send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
     send_daemon_rpc_to_endpoint_async, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
     send_dfs_metadata_journal_batch_to_endpoint_async,
@@ -93,10 +94,11 @@ pub(crate) use process::{
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
-    handle_deferred_shadow_rollout_completion, prepare_local_rollout_main_activation,
-    run_shadow_daemon_supervision_loop, shadow_main_binary_from_env, shadow_main_options_from_env,
-    sleep_for_shadow_start_delay, stage_rollout_main_activation,
-    wait_for_local_shadow_rollout_completion, wait_for_main_daemon_health,
+    handle_daemon_rollout_native_dylib_module_request, handle_deferred_shadow_rollout_completion,
+    prepare_local_rollout_main_activation, run_shadow_daemon_supervision_loop,
+    shadow_main_binary_from_env, shadow_main_options_from_env, sleep_for_shadow_start_delay,
+    stage_rollout_main_activation, wait_for_local_shadow_rollout_completion,
+    wait_for_main_daemon_health,
 };
 pub(crate) use rollout::{
     daemon_paths_are_shadow, handle_daemon_clear_rollout_status,

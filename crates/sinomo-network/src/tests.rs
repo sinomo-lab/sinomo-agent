@@ -2826,6 +2826,7 @@ fn iroh_daemon_response_retry_is_limited_to_idempotent_routes() {
     for route in [
         ROLLOUT_BINARY_ROUTE,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+        ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
         ROLLOUT_BUILD_ROUTE,
         ROLLOUT_FINALIZE_SHADOW_ROUTE,
     ] {

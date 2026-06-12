@@ -164,6 +164,12 @@ pub(super) fn print_rollout_help() {
         "      --force-source stashes local changes in the managed source repo before overwriting it with the rollout source."
     );
     println!(
+        "  sinomo rollout module native-dylib <module-id|package|source|cache-key> [--repo <path>] [--target <host:port>] [--skip-local]"
+    );
+    println!(
+        "      Build one native-dylib module artifact, install it on rollout targets, and refresh the daemon through shadow supervision."
+    );
+    println!(
         "  sinomo rollout advance [--node <node-id>] [--scorecard <path> | --module-replay-report <path> | --shadow-telemetry [--shadow-telemetry-limit <n>]] [--incident <event-id>] [--user-corrections <n>] [--rollback-trigger <trigger>] [--evidence <ref>]"
     );
     println!(

@@ -87,6 +87,7 @@ pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
 pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
 pub const ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE: &str = "/rollout/binary-upload-chunk";
 pub const ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE: &str = "/rollout/binary-upload-finalize";
+pub const ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE: &str = "/rollout/native-dylib-module";
 pub const ROLLOUT_BUILD_ROUTE: &str = "/rollout/build";
 pub const ROLLOUT_FINALIZE_SHADOW_ROUTE: &str = "/rollout/finalize-shadow";
 pub const ROLLOUT_CLEAR_STATUS_ROUTE: &str = "/rollout/clear-status";

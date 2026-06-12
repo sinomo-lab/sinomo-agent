@@ -141,10 +141,38 @@ pub fn discover_default_native_dylib_module_builds(
 pub fn discover_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
+    discover_native_dylib_module_builds_with_options(
+        build_dir,
+        NativeDylibModuleDiscoveryOptions::default(),
+    )
+}
+
+pub fn discover_all_native_dylib_module_builds(
+    build_dir: &Path,
+) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
+    discover_native_dylib_module_builds_with_options(
+        build_dir,
+        NativeDylibModuleDiscoveryOptions {
+            include_non_default: true,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct NativeDylibModuleDiscoveryOptions {
+    include_non_default: bool,
+}
+
+fn discover_native_dylib_module_builds_with_options(
+    build_dir: &Path,
+    options: NativeDylibModuleDiscoveryOptions,
+) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
     let manifests = discover_module_package_manifests(build_dir)?;
     let mut modules = Vec::new();
     for manifest in manifests {
-        if let Some(module) = native_dylib_module_build_from_manifest(build_dir, &manifest)? {
+        if let Some(module) =
+            native_dylib_module_build_from_manifest(build_dir, &manifest, options)?
+        {
             modules.push(module);
         }
     }
@@ -224,6 +252,7 @@ fn read_sorted_dirs(path: &Path) -> Result<Vec<PathBuf>, RolloutError> {
 fn native_dylib_module_build_from_manifest(
     build_dir: &Path,
     manifest_path: &Path,
+    options: NativeDylibModuleDiscoveryOptions,
 ) -> Result<Option<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
     let manifest = fs::read_to_string(manifest_path).map_err(|source| RolloutError::Io {
         path: manifest_path.display().to_string(),
@@ -242,7 +271,8 @@ fn native_dylib_module_build_from_manifest(
     else {
         return Ok(None);
     };
-    if !metadata_bool(native_dylib, "default", true, manifest_path)? {
+    if !options.include_non_default && !metadata_bool(native_dylib, "default", true, manifest_path)?
+    {
         return Ok(None);
     }
     if !metadata_platform_matches(native_dylib, manifest_path)? {
@@ -596,6 +626,8 @@ default = false
         .expect("benchmark manifest");
 
         let modules = discover_default_native_dylib_module_builds(&root).expect("discover modules");
+        let all_modules =
+            discover_all_native_dylib_module_builds(&root).expect("discover all modules");
 
         assert_eq!(
             modules
@@ -607,6 +639,11 @@ default = false
             modules
                 .iter()
                 .all(|module| module.package != "sinomo-benchmarks")
+        );
+        assert!(
+            all_modules
+                .iter()
+                .any(|module| module.package == "sinomo-benchmarks")
         );
 
         let _ = fs::remove_dir_all(root);

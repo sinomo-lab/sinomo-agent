@@ -25,9 +25,11 @@ use sinomo_network::{
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
     ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
-    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest, ROLLOUT_BINARY_ROUTE,
+    ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleRequest, ROLLOUT_BINARY_ROUTE,
     ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
-    ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_RPC_CATEGORY,
+    ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+    ROLLOUT_RPC_CATEGORY,
 };
 use std::time::{Duration, Instant};
 
@@ -1372,6 +1374,34 @@ pub fn send_daemon_rollout_binary_upload_finalize_to_endpoint(
     send_daemon_rpc_body_to_endpoint(
         endpoint,
         ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+        timeout,
+    )
+}
+
+pub fn send_daemon_rollout_native_dylib_module(
+    address: &str,
+    request: &ClusterRolloutNativeDylibModuleRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    send_daemon_rpc_body(
+        address,
+        ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+        ROLLOUT_RPC_CATEGORY,
+        request,
+        timeout,
+    )
+}
+
+pub fn send_daemon_rollout_native_dylib_module_to_endpoint(
+    endpoint: &ClusterEndpointRecord,
+    request: &ClusterRolloutNativeDylibModuleRequest,
+    timeout: Duration,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    send_daemon_rpc_body_to_endpoint(
+        endpoint,
+        ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
         ROLLOUT_RPC_CATEGORY,
         request,
         timeout,

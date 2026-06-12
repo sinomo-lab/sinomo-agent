@@ -16,6 +16,7 @@ use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
     ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
     ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleRequest, ClusterRolloutNativeDylibModuleResponse,
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutProgressUpdate,
     ClusterRolloutUploadArtifactSpec, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
     MainExitObservation, ManagedSourceDeployOptions, PendingShadowRolloutContext,
@@ -1262,6 +1263,150 @@ pub fn handle_daemon_rollout_binary_request(
         shadow_binary,
         source_head: None,
     })
+}
+
+pub fn handle_daemon_rollout_native_dylib_module_request(
+    paths: &DaemonPaths,
+    request: ClusterRolloutNativeDylibModuleRequest,
+) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let rollout_paths = SelfRolloutPaths::new(data_dir);
+    ensure_rollout_layout(&rollout_paths)?;
+    let source = request.source.clone();
+    let requested_at = request.requested_at.clone();
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-module-native-dylib",
+        Some(format!(
+            "installing native module artifact {}",
+            request.artifact.module_id
+        )),
+        &source,
+        &requested_at,
+        "staging-module",
+        1,
+        "installing native module artifact",
+    )?;
+
+    let main_binary = rollout_paths.main_binary.clone();
+    let shadow_binary = rollout_paths.shadow_binary.clone();
+    let staged_main_binary = rollout_staged_main_binary(&rollout_paths);
+    let staged_shadow_binary = rollout_staged_shadow_binary(&rollout_paths);
+    stage_rollout_file(&main_binary, &staged_main_binary)?;
+    stage_rollout_file(
+        if shadow_binary.exists() {
+            &shadow_binary
+        } else {
+            &main_binary
+        },
+        &staged_shadow_binary,
+    )?;
+
+    let install_result = match install_cluster_rollout_native_dylib_module(data_dir, &request) {
+        Ok(result) => result,
+        Err(error) => {
+            let detail = format!("install native module artifact failed: {error}");
+            let _ = write_cluster_rollout_progress(
+                paths,
+                &rollout_paths,
+                "rejected",
+                "cluster-module-native-dylib",
+                Some(detail.clone()),
+                &source,
+                &requested_at,
+                "module-install-failed",
+                CLUSTER_ROLLOUT_PROGRESS_TOTAL,
+                "module install failed",
+            );
+            return Ok(ClusterRolloutBinaryResponse {
+                status: "rejected".to_string(),
+                detail,
+                main_binary: PathBuf::new(),
+                shadow_binary: PathBuf::new(),
+                source_head: None,
+            });
+        }
+    };
+
+    write_cluster_rollout_progress(
+        paths,
+        &rollout_paths,
+        "in-progress",
+        "cluster-module-native-dylib",
+        Some("preparing daemon refresh".to_string()),
+        &source,
+        &requested_at,
+        "preparing-activation",
+        4,
+        "preparing daemon refresh",
+    )?;
+    let plan = prepare_cluster_rollout_main_activation(
+        paths,
+        data_dir,
+        source,
+        main_binary.clone(),
+        shadow_binary.clone(),
+        Some(staged_main_binary),
+        Some(staged_shadow_binary),
+        request.host,
+        request.port,
+        request.shadow_port,
+        requested_at,
+        "cluster-module-native-dylib",
+    )?;
+    let activation_strategy =
+        stage_rollout_main_activation(paths, data_dir, &rollout_paths, plan.activation)?;
+    publish_rollout_progress_to_cluster(paths);
+    Ok(ClusterRolloutBinaryResponse {
+        status: "accepted".to_string(),
+        detail: format!(
+            "{}; {}",
+            module_rollout_response_detail(&install_result),
+            rollout_staged_detail(
+                "daemon refresh staged",
+                plan.current_main_pid,
+                activation_strategy
+            )
+        ),
+        main_binary,
+        shadow_binary,
+        source_head: None,
+    })
+}
+
+fn install_cluster_rollout_native_dylib_module(
+    data_dir: &Path,
+    request: &ClusterRolloutNativeDylibModuleRequest,
+) -> Result<ClusterRolloutNativeDylibModuleResponse, DaemonError> {
+    let mut installed = sinomo_rollout::install_cluster_rollout_native_dylib_modules(
+        data_dir,
+        std::slice::from_ref(&request.artifact),
+    )?;
+    let result = installed.pop().ok_or_else(|| DaemonError::Parse {
+        detail: "native module install returned no result".to_string(),
+    })?;
+    Ok(ClusterRolloutNativeDylibModuleResponse {
+        status: "accepted".to_string(),
+        detail: "native module artifact installed".to_string(),
+        module_id: result.state.module_id.to_string(),
+        artifact_id: result.state.artifact_id.as_ref().map(ToString::to_string),
+        interface_version: result.state.interface_version,
+        cache_key: result.state.cache_key,
+        content_hash: result.state.content_hash,
+        cache_path: result.cache_path,
+        state_path: result.state_path,
+    })
+}
+
+fn module_rollout_response_detail(response: &ClusterRolloutNativeDylibModuleResponse) -> String {
+    format!(
+        "native module {} activated at {} ({})",
+        response.module_id,
+        response.cache_path.display(),
+        response.content_hash
+    )
 }
 
 pub fn handle_daemon_rollout_binary_upload_chunk_request(

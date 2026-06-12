@@ -32,6 +32,30 @@ pub struct ClusterRolloutNativeDylibModuleArtifact {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutNativeDylibModuleRequest {
+    pub source: String,
+    pub host: String,
+    pub port: u16,
+    pub shadow_port: u16,
+    pub requested_at: String,
+    pub artifact: ClusterRolloutNativeDylibModuleArtifact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterRolloutNativeDylibModuleResponse {
+    pub status: String,
+    pub detail: String,
+    pub module_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    pub interface_version: String,
+    pub cache_key: String,
+    pub content_hash: String,
+    pub cache_path: PathBuf,
+    pub state_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterRolloutUploadArtifactSpec {
     pub artifact_id: String,
     pub total_bytes: u64,
@@ -159,6 +183,24 @@ fn cluster_native_dylib_module_artifact_from_local(
         library_name: artifact.library_name.clone(),
         source: artifact.source.clone(),
         library,
+    })
+}
+
+pub fn prepare_cluster_rollout_native_dylib_module_request(
+    source: impl Into<String>,
+    artifact: &LocalRolloutNativeDylibModuleArtifact,
+    host: impl Into<String>,
+    port: u16,
+    shadow_port: u16,
+    requested_at: impl Into<String>,
+) -> Result<ClusterRolloutNativeDylibModuleRequest, RolloutError> {
+    Ok(ClusterRolloutNativeDylibModuleRequest {
+        source: source.into(),
+        host: host.into(),
+        port,
+        shadow_port,
+        requested_at: requested_at.into(),
+        artifact: cluster_native_dylib_module_artifact_from_local(artifact)?,
     })
 }
 
@@ -311,6 +353,39 @@ mod tests {
         assert_eq!(artifact.library_name, "libmodule.so");
         assert_eq!(artifact.source, "test");
         assert_eq!(artifact.library, b"module-bytes".to_vec());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prepare_cluster_rollout_native_dylib_module_request_reads_module_artifact() {
+        let root = temp_root("cluster-module-request");
+        std::fs::create_dir_all(&root).expect("root");
+        let module = root.join("libmodule.so");
+        std::fs::write(&module, b"module-bytes").expect("module");
+
+        let request = prepare_cluster_rollout_native_dylib_module_request(
+            "source",
+            &LocalRolloutNativeDylibModuleArtifact {
+                module_id: "module.test".to_string(),
+                interface_version: "test.v1".to_string(),
+                cache_key: "module/test".to_string(),
+                library_name: "libmodule.so".to_string(),
+                built_library: module,
+                source: "test".to_string(),
+            },
+            "127.0.0.1",
+            21353,
+            21354,
+            "now",
+        )
+        .expect("request");
+
+        assert_eq!(request.source, "source");
+        assert_eq!(request.host, "127.0.0.1");
+        assert_eq!(request.port, 21353);
+        assert_eq!(request.shadow_port, 21354);
+        assert_eq!(request.artifact.module_id, "module.test");
+        assert_eq!(request.artifact.library, b"module-bytes".to_vec());
         let _ = std::fs::remove_dir_all(root);
     }
 

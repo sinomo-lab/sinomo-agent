@@ -10,10 +10,11 @@ use super::{
     ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
     ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
     ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation, RolloutOptions,
-    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
-    SelfRolloutPaths, TestCliCommand, UninstallOptions, advertised_peer_route_targets,
-    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_control_request,
+    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
+    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
+    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
+    TestCliCommand, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
+    apply_cluster_raft_role, authenticate_daemon_control_request,
     build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
     cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
     cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
@@ -12099,6 +12100,28 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
             targets: vec!["192.0.2.11:21353".to_string()],
             skip_local: true,
             ..RolloutOptions::default()
+        })
+    );
+    assert_eq!(
+        parse_rollout_command(&[
+            "module".to_string(),
+            "native-dylib".to_string(),
+            "module.remote-management".to_string(),
+            "--repo".to_string(),
+            "/work/sinomo".to_string(),
+            "--target".to_string(),
+            "192.0.2.11:21353".to_string(),
+            "--skip-local".to_string(),
+        ])
+        .expect("module native-dylib rollout"),
+        RolloutCliCommand::ModuleNativeDylib(RolloutModuleNativeDylibOptions {
+            module_selector: "module.remote-management".to_string(),
+            rollout: RolloutOptions {
+                repo: Some(std::path::PathBuf::from("/work/sinomo")),
+                targets: vec!["192.0.2.11:21353".to_string()],
+                skip_local: true,
+                ..RolloutOptions::default()
+            },
         })
     );
     assert_eq!(

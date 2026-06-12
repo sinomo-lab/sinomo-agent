@@ -9,6 +9,7 @@ pub(crate) enum RolloutCliCommand {
     ApplyExternal(RolloutOptions),
     Apply(RolloutOptions),
     Cluster(RolloutOptions),
+    ModuleNativeDylib(RolloutModuleNativeDylibOptions),
     Advance(RolloutAdvanceOptions),
     TelemetryGatesShow,
     TelemetryGatesSet(RolloutTelemetryGateSetOptions),
@@ -46,6 +47,12 @@ impl Default for RolloutOptions {
             force_source_overwrite: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct RolloutModuleNativeDylibOptions {
+    pub(crate) module_selector: String,
+    pub(crate) rollout: RolloutOptions,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
@@ -147,6 +154,7 @@ pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand
         Some((command, rest)) if matches!(command.as_str(), "cluster" | "apply-cluster") => {
             Ok(RolloutCliCommand::Cluster(parse_rollout_options(rest)?))
         }
+        Some((command, rest)) if command == "module" => parse_rollout_module_command(rest),
         Some((command, rest)) if command == "advance" => Ok(RolloutCliCommand::Advance(
             parse_rollout_advance_options(rest)?,
         )),
@@ -162,6 +170,15 @@ pub(crate) fn parse_rollout_command(args: &[String]) -> Result<RolloutCliCommand
             Ok(RolloutCliCommand::ClearStatus(parse_rollout_options(rest)?))
         }
         Some((command, [])) if command == "status" => Ok(RolloutCliCommand::Status),
+        _ => Err(CliError::Usage),
+    }
+}
+
+fn parse_rollout_module_command(args: &[String]) -> Result<RolloutCliCommand, CliError> {
+    match args.split_first() {
+        Some((kind, rest)) if kind == "native-dylib" => Ok(RolloutCliCommand::ModuleNativeDylib(
+            parse_rollout_module_native_dylib_options(rest)?,
+        )),
         _ => Err(CliError::Usage),
     }
 }
@@ -232,6 +249,87 @@ pub(crate) fn parse_rollout_options(args: &[String]) -> Result<RolloutOptions, C
         index += 1;
     }
     Ok(options)
+}
+
+fn parse_rollout_module_native_dylib_options(
+    args: &[String],
+) -> Result<RolloutModuleNativeDylibOptions, CliError> {
+    let mut rollout_args = Vec::new();
+    let mut selector = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--module" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(CliError::Usage);
+                };
+                if selector
+                    .replace(non_empty_rollout_module_selector(value)?)
+                    .is_some()
+                {
+                    return Err(CliError::Usage);
+                }
+            }
+            value if value.starts_with('-') => {
+                rollout_args.push(args[index].clone());
+                if matches!(
+                    value,
+                    "--repo"
+                        | "--binary"
+                        | "--remote-repo"
+                        | "--target"
+                        | "--host"
+                        | "--port"
+                        | "--shadow-port"
+                ) {
+                    index += 1;
+                    let Some(next) = args.get(index) else {
+                        return Err(CliError::Usage);
+                    };
+                    rollout_args.push(next.clone());
+                }
+            }
+            value => {
+                if selector
+                    .replace(non_empty_rollout_module_selector(value)?)
+                    .is_some()
+                {
+                    return Err(CliError::Usage);
+                }
+            }
+        }
+        index += 1;
+    }
+    let Some(module_selector) = selector else {
+        return Err(CliError::Usage);
+    };
+    let rollout = parse_rollout_options(&rollout_args)?;
+    if rollout.binary.is_some()
+        || rollout.remote_build
+        || rollout.remote_repo.is_some()
+        || rollout.force_source_overwrite
+    {
+        return Err(CliError::Parse {
+            detail:
+                "module native-dylib rollout supports --repo, --target, --host, --port, --shadow-port, and --skip-local"
+                    .to_string(),
+        });
+    }
+    Ok(RolloutModuleNativeDylibOptions {
+        module_selector,
+        rollout,
+    })
+}
+
+fn non_empty_rollout_module_selector(value: &str) -> Result<String, CliError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliError::Parse {
+            detail: "module selector must not be empty".to_string(),
+        });
+    }
+    Ok(value.to_string())
 }
 
 pub(crate) fn parse_rollout_advance_options(
@@ -488,6 +586,7 @@ pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), 
         RolloutCliCommand::ApplyExternal(options) => rollout_apply_external(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
         RolloutCliCommand::Cluster(options) => rollout_cluster(options),
+        RolloutCliCommand::ModuleNativeDylib(options) => rollout_module_native_dylib(options),
         RolloutCliCommand::Advance(options) => rollout_advance(options),
         RolloutCliCommand::TelemetryGatesShow => rollout_telemetry_gates_show(),
         RolloutCliCommand::TelemetryGatesSet(options) => rollout_telemetry_gates_set(options),
@@ -501,6 +600,69 @@ pub(crate) fn rollout_paths_from_defaults() -> Result<SelfRolloutPaths, CliError
     let data_dir = SinomoDataDir::from_env_or_home()?;
     data_dir.ensure_root_layout()?;
     Ok(SelfRolloutPaths::new(&data_dir.root()))
+}
+
+pub(crate) fn rollout_module_native_dylib(
+    options: RolloutModuleNativeDylibOptions,
+) -> Result<(), CliError> {
+    let targets = rollout_cluster_targets(&options.rollout)?;
+    if targets.is_empty() {
+        return Err(CliError::Parse {
+            detail: "no module rollout targets found; pass --target <host:port> or start a clustered local daemon".to_string(),
+        });
+    }
+    let paths = rollout_paths_from_defaults()?;
+    ensure_rollout_layout(&paths)?;
+    let repo = rollout_source_repo_from_options(&options.rollout)?;
+    let requested_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "unknown".to_string());
+    let artifact = rollout_build_dev_native_dylib_module(
+        &repo,
+        &paths.plan().build_log,
+        &options.module_selector,
+    )?;
+    println!(
+        "module rollout artifact: {}",
+        artifact.built_library.display()
+    );
+    println!("  module: {}", artifact.module_id);
+    println!("  interface: {}", artifact.interface_version);
+    println!("  source: {}", artifact.source);
+    let request = prepare_cluster_rollout_native_dylib_module_request(
+        artifact.source.clone(),
+        &artifact,
+        options.rollout.host.clone(),
+        options.rollout.port,
+        options.rollout.shadow_port,
+        requested_at,
+    )?;
+
+    for target in targets {
+        let target_status = match read_rollout_target_status(&target) {
+            Ok(status) => status,
+            Err(error) => {
+                println!("{}: failed: {error}", target.label());
+                continue;
+            }
+        };
+        if let Err(error) =
+            ensure_rollout_target_platform_from_status(target.label(), &target_status)
+        {
+            println!("{}: skipped: {error}", target.label());
+            continue;
+        }
+        match send_daemon_rollout_native_dylib_module(&target, &request) {
+            Ok(response) => {
+                println!("{}: {}", target.label(), response.status);
+                if !response.detail.is_empty() {
+                    println!("  {}", response.detail);
+                }
+            }
+            Err(error) => println!("{}: failed: {error}", target.label()),
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn rollout_init_source(options: RolloutOptions) -> Result<(), CliError> {
@@ -2080,6 +2242,27 @@ fn send_daemon_rollout_binary_finalize_direct(
         .map_err(Into::into)
     } else {
         daemon_send_daemon_rollout_binary_upload_finalize(
+            &target.address,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+        .map_err(Into::into)
+    }
+}
+
+pub(crate) fn send_daemon_rollout_native_dylib_module(
+    target: &RolloutTarget,
+    request: &ClusterRolloutNativeDylibModuleRequest,
+) -> Result<ClusterRolloutBinaryResponse, CliError> {
+    if let Some(endpoint) = &target.endpoint {
+        daemon_send_daemon_rollout_native_dylib_module_to_endpoint(
+            endpoint,
+            request,
+            DAEMON_ROLLOUT_TIMEOUT,
+        )
+        .map_err(Into::into)
+    } else {
+        daemon_send_daemon_rollout_native_dylib_module(
             &target.address,
             request,
             DAEMON_ROLLOUT_TIMEOUT,

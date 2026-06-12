@@ -45,7 +45,7 @@ use sinomo_network::{
 use sinomo_network_module::network_module_surfaces;
 use sinomo_rollout::{
     ClusterRolloutBinaryResponse, ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
-    ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE,
+    ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     register_services as register_rollout_services, rollout_module_surfaces,
 };
 use sinomo_sandbox::{
@@ -104,6 +104,7 @@ use crate::paths::DaemonPaths;
 use crate::rollout::{
     handle_daemon_rollout_binary_request, handle_daemon_rollout_binary_upload_chunk_request,
     handle_daemon_rollout_binary_upload_finalize_request, handle_daemon_rollout_build_request,
+    handle_daemon_rollout_native_dylib_module_request,
 };
 
 fn daemon_error(error: DaemonError) -> ServiceError {
@@ -877,6 +878,7 @@ impl Service for RolloutBinaryService {
             ROLLOUT_BINARY_ROUTE,
             ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
             ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             ROLLOUT_BUILD_ROUTE,
         ]
     }
@@ -942,6 +944,25 @@ impl Service for RolloutBinaryService {
                             ),
                         )
                     })
+                    .await?
+                }
+                ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE => {
+                    let payload = request.decode_body()?;
+                    let rollout_paths = paths.clone();
+                    run_blocking_service_task(
+                        route.clone(),
+                        "rollout native dylib module",
+                        move || {
+                            Self::finish(
+                                &rollout_paths,
+                                ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+                                handle_daemon_rollout_native_dylib_module_request(
+                                    &rollout_paths,
+                                    payload,
+                                ),
+                            )
+                        },
+                    )
                     .await?
                 }
                 ROLLOUT_BUILD_ROUTE => {
@@ -3014,6 +3035,7 @@ mod tests {
             ROLLOUT_BINARY_ROUTE,
             ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
             ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
             ROLLOUT_BUILD_ROUTE,
         ] {
             let service_route = route_metadata

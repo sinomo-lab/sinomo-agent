@@ -20,7 +20,7 @@ use sinomo_node::{
 use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE, ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
     ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
-    ROLLOUT_FINALIZE_SHADOW_ROUTE,
+    ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -360,6 +360,7 @@ pub fn authorize_authenticated_daemon_command(
             if command == daemon_rpc_command(ROLLOUT_BINARY_ROUTE)
                 || command == daemon_rpc_command(ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE)
                 || command == daemon_rpc_command(ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE)
+                || command == daemon_rpc_command(ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE)
                 || command == daemon_rpc_command(ROLLOUT_BUILD_ROUTE) =>
         {
             authenticated.signer.can_run_admin_command()
@@ -959,6 +960,7 @@ mod tests {
         for route in [
             ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
             ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
         ] {
             let command = daemon_rpc_command(route);
             for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {

@@ -28,6 +28,7 @@ pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
 pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
 pub const ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE: &str = "/rollout/binary-upload-chunk";
 pub const ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE: &str = "/rollout/binary-upload-finalize";
+pub const ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE: &str = "/rollout/native-dylib-module";
 pub const ROLLOUT_BUILD_ROUTE: &str = "/rollout/build";
 pub const ROLLOUT_FINALIZE_SHADOW_ROUTE: &str = "/rollout/finalize-shadow";
 pub const ROLLOUT_CLEAR_STATUS_ROUTE: &str = "/rollout/clear-status";
@@ -40,6 +41,7 @@ pub const ROLLOUT_OBJECT_RPC_ROUTES: &[&str] = &[
     ROLLOUT_BINARY_ROUTE,
     ROLLOUT_BINARY_UPLOAD_CHUNK_ROUTE,
     ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
+    ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     ROLLOUT_BUILD_ROUTE,
     ROLLOUT_FINALIZE_SHADOW_ROUTE,
     ROLLOUT_CLEAR_STATUS_ROUTE,
@@ -90,9 +92,9 @@ pub use paths::{
     SelfRolloutPlan, append_native_dylib_module_build_args, benchmark_native_dylib_module_build,
     benchmarks_native_module_library_name, default_native_dylib_module_builds,
     dfs_cloud_files_native_dylib_module_build, dfs_cloud_files_native_module_library_name,
-    discover_default_native_dylib_module_builds, discover_native_dylib_module_builds,
-    ensure_rollout_layout, executable_name, native_dylib_library_name,
-    sandbox_wasix_native_module_library_name,
+    discover_all_native_dylib_module_builds, discover_default_native_dylib_module_builds,
+    discover_native_dylib_module_builds, ensure_rollout_layout, executable_name,
+    native_dylib_library_name, sandbox_wasix_native_module_library_name,
 };
 pub use process::{MainExitKind, MainExitObservation, classify_main_exit};
 pub use progress::{
@@ -104,9 +106,11 @@ pub use protocol::{
     ClusterRolloutBinaryUploadChunkRequest, ClusterRolloutBinaryUploadChunkResponse,
     ClusterRolloutBinaryUploadFinalizeRequest, ClusterRolloutBinaryUploadManifest,
     ClusterRolloutBuildRequest, ClusterRolloutNativeDylibModuleArtifact,
+    ClusterRolloutNativeDylibModuleRequest, ClusterRolloutNativeDylibModuleResponse,
     ClusterRolloutNativeDylibModuleUploadSpec, ClusterRolloutUploadArtifactSpec,
     cluster_rollout_targets_from_state, prepare_cluster_rollout_binary_request,
-    prepare_cluster_rollout_build_request, prepare_rollout_cluster_targets, unique_rollout_targets,
+    prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
+    prepare_rollout_cluster_targets, unique_rollout_targets,
 };
 pub use service::{RolloutService, register_services};
 pub use source::{
@@ -120,8 +124,9 @@ pub use source::{
     prepare_local_rollout_artifacts, prepare_local_rollout_artifacts_with_options,
     prepare_rollout_dev_artifacts, prepare_rollout_dev_binary, prepare_rollout_source_bundle,
     remove_dir_if_exists, rollout_artifact_suffix, rollout_build_dev_artifacts,
-    rollout_build_dev_binary, rollout_remote_repo_path, rollout_source_head, rollout_status_view,
-    source_heads_match, stage_local_rollout_artifacts, sync_external_repo_from_managed,
+    rollout_build_dev_binary, rollout_build_dev_native_dylib_module, rollout_remote_repo_path,
+    rollout_source_head, rollout_status_view, source_heads_match, stage_local_rollout_artifacts,
+    sync_external_repo_from_managed,
 };
 pub use state::{
     PendingShadowRollout, PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES,
@@ -204,6 +209,12 @@ pub fn rollout_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::Admin,
         ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+            ROLLOUT_RPC_CATEGORY,
+            "rollout.module.native-dylib.apply",
+            ModuleRouteAuth::Admin,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             ROLLOUT_BUILD_ROUTE,
             ROLLOUT_RPC_CATEGORY,
             "rollout.build.apply",
@@ -241,6 +252,7 @@ pub fn rollout_module_capabilities() -> sinomo_core::ModuleCapabilities {
             rollout_capability("rollout.binary.apply"),
             rollout_capability("rollout.binary-upload.chunk"),
             rollout_capability("rollout.binary-upload.finalize"),
+            rollout_capability("rollout.module.native-dylib.apply"),
             rollout_capability("rollout.build.apply"),
             rollout_capability("rollout.shadow.finalize"),
             rollout_capability("rollout.status.clear"),
@@ -451,6 +463,10 @@ mod module_registration_tests {
         assert_eq!(
             ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE,
             sinomo_network::ROLLOUT_BINARY_UPLOAD_FINALIZE_ROUTE
+        );
+        assert_eq!(
+            ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
+            sinomo_network::ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE
         );
         assert_eq!(ROLLOUT_BUILD_ROUTE, sinomo_network::ROLLOUT_BUILD_ROUTE);
         assert_eq!(
