@@ -18,6 +18,7 @@ pub fn print_usage() {
     println!("  sinomo models");
     println!("  sinomo usage");
     println!("  sinomo providers");
+    println!("  sinomo voice");
     println!("  sinomo test");
     println!();
     println!("Global flags:");
@@ -44,6 +45,25 @@ pub fn print_usage() {
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!("  NVIDIA_API_KEY              Used by `providers auth/test nvidia`");
     println!("  Cluster runtime settings live in KV; see `sinomo models runtime`.");
+}
+
+pub(super) fn print_voice_help() {
+    println!("Voice:");
+    println!("  sinomo voice");
+    println!("      Show voice commands.");
+    println!(
+        "  sinomo voice call [--provider openai|minicpm-o] [--model <model>] [--input <raw-pcm>|-] [--output <raw-pcm>|-]"
+    );
+    println!(
+        "      Stream mono raw PCM to a realtime voice model, persist session audio chunks, and write raw response audio."
+    );
+    println!("      OpenAI defaults: gpt-realtime-2, 24 kHz pcm16-le input/output.");
+    println!(
+        "      MiniCPM-o defaults: MiniCPM-o-4.5, 16 kHz f32-le input and 24 kHz f32-le output."
+    );
+    println!(
+        "      Useful options: --instructions <text>, --voice <voice-or-base64-ref-audio>, --endpoint <url>, --session <session_id>, --chunk-ms <n>, --turn manual|semantic-vad, --no-pacing."
+    );
 }
 
 pub(super) fn print_cluster_help() {

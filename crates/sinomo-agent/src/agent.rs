@@ -503,6 +503,15 @@ impl AgentStoragePaths {
             .join("projections.jsonl")
     }
 
+    pub fn session_audio_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_dir_for_session(session_id).join("audio")
+    }
+
+    pub fn session_audio_segments_path_for_session(&self, session_id: &SessionId) -> PathBuf {
+        self.session_audio_dir_for_session(session_id)
+            .join("segments.jsonl")
+    }
+
     pub fn evidence_dir_for_session(&self, session_id: &SessionId) -> PathBuf {
         self.evidence_dir.join(session_id.as_str())
     }

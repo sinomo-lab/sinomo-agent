@@ -10,6 +10,7 @@ mod gemini;
 mod github_copilot;
 mod nvidia;
 mod openai;
+mod realtime_audio;
 mod test_cases;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
@@ -42,6 +43,13 @@ pub use github_copilot::{
 };
 pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_nvidia_model_id};
 pub use openai::{OpenAiConfig, OpenAiProvider};
+pub use realtime_audio::{
+    RealtimeAudioError, RealtimeAudioEvent, RealtimeAudioInputChunk, RealtimeAudioProvider,
+    RealtimeAudioSampleFormat, RealtimeAudioSession, RealtimeAudioSessionConfig,
+    RealtimeAudioTurnDetection, minicpm_input_audio_append_payload, minicpm_realtime_ws_url,
+    minicpm_session_update_payload, openai_input_audio_append_payload, openai_realtime_ws_url,
+    openai_session_update_payload, parse_realtime_audio_event, realtime_audio_event_from_value,
+};
 pub use test_cases::register_lm_test_cases;
 
 use serde::{Deserialize, Serialize};
@@ -2422,6 +2430,14 @@ pub fn provider_api_key_env_vars(provider: &str) -> Option<&'static [&'static st
         NvidiaProvider::PROVIDER_ID => {
             Some(&["SINOMO_NVIDIA_API_KEY", "NVIDIA_API_KEY", "NIM_API_KEY"])
         }
+        "minicpm-o" | "minicpm" | "modelbest" => Some(&[
+            "SINOMO_MINICPM_API_KEY",
+            "SINOMO_MINICPM_O_API_KEY",
+            "SINOMO_MODELBEST_API_KEY",
+            "MINICPM_API_KEY",
+            "MINICPM_O_API_KEY",
+            "MODELBEST_API_KEY",
+        ]),
         _ => None,
     }
 }

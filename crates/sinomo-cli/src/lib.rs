@@ -250,6 +250,7 @@ mod sandbox_host;
 #[cfg(test)]
 mod tests;
 mod tui;
+mod voice;
 
 /// GUI-facing surface over the main-agent chat runtime (used by `sinomo-app`).
 pub mod app_api;
@@ -260,6 +261,7 @@ pub use providers::*;
 use sandbox_host::SinomoCliSandboxHost;
 use time::format_description::well_known::Rfc3339;
 pub use tui::*;
+pub(crate) use voice::*;
 
 struct CliClusterVoterReachabilityHost;
 
@@ -1062,6 +1064,7 @@ pub(crate) enum CliCommand {
     Dfs(DfsCliCommand),
     Models(ModelsCliCommand),
     Providers(ProviderCliCommand),
+    Voice(VoiceCliCommand),
     Test(TestCliCommand),
     Agent(AgentCliCommand),
     Registered(RegisteredCliCommand),
@@ -1152,6 +1155,9 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
         }
         Some((command, rest)) if command == "providers" => {
             Ok(CliCommand::Providers(parse_provider_command(rest)?))
+        }
+        Some((command, rest)) if command == "voice" => {
+            Ok(CliCommand::Voice(parse_voice_command(rest)?))
         }
         Some((command, rest)) if command == "test" => {
             Ok(CliCommand::Test(parse_test_command(rest)?))
@@ -1664,6 +1670,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
         CliCommand::Dfs(command) => run_dfs_cli_command(command),
         CliCommand::Models(command) => run_models_command(command),
         CliCommand::Providers(command) => run_provider_command(command),
+        CliCommand::Voice(command) => run_voice_command(command),
         CliCommand::Test(command) => run_test_command(command),
         CliCommand::Agent(command) => run_agent_command(command),
         CliCommand::Registered(command) => {

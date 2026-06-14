@@ -5734,6 +5734,7 @@ dependencies = [
 name = "sinomo-agent"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "serde",
  "serde_json",
  "sinomo-lm",
@@ -6020,12 +6021,16 @@ name = "sinomo-lm"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "futures-util",
+ "http",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sinomo-runtime",
  "thiserror 2.0.18",
  "time",
+ "tokio",
+ "tokio-websockets",
 ]
 
 [[package]]
@@ -6961,6 +6966,7 @@ dependencies = [
  "httparse",
  "rand 0.10.1",
  "ring",
+ "rustls-native-certs",
  "rustls-pki-types",
  "sha1_smol",
  "simdutf8",
