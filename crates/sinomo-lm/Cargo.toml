@@ -23,3 +23,6 @@ time.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
 tokio-websockets = { version = "0.13.2", default-features = false, features = ["client", "getrandom", "ring", "rustls-native-roots"] }
 sinomo-runtime = { path = "../sinomo-runtime" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

@@ -10353,7 +10353,7 @@ mod tests {
     use super::*;
     use crate::DfsMetadataShardAssignment;
     use sinomo_core::DfsObjectPolicy;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -12522,7 +12522,7 @@ mod tests {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(writer_count));
         let mut handles = Vec::new();
         for writer_index in 0..writer_count {
-            let root = root.clone();
+            let root = root.to_path_buf();
             let barrier = barrier.clone();
             handles.push(std::thread::spawn(move || {
                 let mut backend =
@@ -12591,7 +12591,7 @@ mod tests {
         // more objects than the writer has committed.
         let mut readers = Vec::new();
         for _ in 0..reader_count {
-            let root = root.clone();
+            let root = root.to_path_buf();
             let stop = stop.clone();
             let barrier = barrier.clone();
             readers.push(std::thread::spawn(move || {
@@ -15826,12 +15826,8 @@ mod tests {
         cleanup(&root);
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-dfs-metadata-{name}-{nanos}"))
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-dfs-metadata-{name}"))
     }
 
     fn cleanup(root: &Path) {

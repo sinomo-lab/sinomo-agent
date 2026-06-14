@@ -20,3 +20,6 @@ blake3.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-storage = { path = "../sinomo-storage" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

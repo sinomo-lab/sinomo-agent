@@ -1076,17 +1076,9 @@ mod tests {
         .expect("conditional append")
         .expect("record");
         assert_eq!(record.message, "recorded");
-
-        let _ = fs::remove_dir_all(root);
     }
 
-    fn unique_temp(prefix: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{}",
-            std::process::id(),
-            Id::generate()
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        path
+    fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(prefix)
     }
 }

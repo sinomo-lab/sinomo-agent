@@ -3134,13 +3134,7 @@ mod tests {
 
     #[test]
     fn write_default_model_config_persists_model_defaults() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-lm-models-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-models");
         let data_dir = SinomoDataDir::new(&root);
 
         let update =
@@ -3155,8 +3149,6 @@ mod tests {
         let config = load_model_config(&ModelPaths::new(&data_dir)).expect("model config");
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
         assert_eq!(config.default_model.as_deref(), Some("gpt-5.5"));
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3246,13 +3238,7 @@ mod tests {
 
     #[test]
     fn provider_credentials_write_shared_config_document() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-lm-credentials-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-credentials");
         let path = root
             .join("configs")
             .join("lm")
@@ -3285,19 +3271,11 @@ mod tests {
                 .expect("read credentials")
                 .expect("credentials");
         assert_eq!(value["api_key"], "sk-test");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn provider_credentials_read_legacy_file_and_migrate_to_shared_config_document() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-lm-credentials-migrate-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-credentials-migrate");
         let legacy_path = root
             .join("providers")
             .join("openai")
@@ -3336,8 +3314,6 @@ mod tests {
             &provider_credentials_config_key(OpenAiProvider::PROVIDER_ID).expect("key")
         );
         assert_eq!(document.value["api_key"], "sk-legacy");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -3764,14 +3740,8 @@ mod tests {
 
     #[test]
     fn complete_configured_model_request_reports_unknown_provider() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-lm-complete-unknown-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_nanos()
-        ));
-        let data_dir = SinomoDataDir::new(root);
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-complete-unknown");
+        let data_dir = SinomoDataDir::new(&root);
 
         let error = complete_configured_model_request(
             &data_dir,
@@ -3811,13 +3781,7 @@ mod tests {
 
     #[test]
     fn stored_provider_api_key_reads_config_document_credentials() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-lm-stored-api-key-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-lm-stored-api-key");
         let data_dir = SinomoDataDir::new(&root);
 
         set_provider_api_key(&data_dir, DeepSeekProvider::PROVIDER_ID, "sk-test")
@@ -3828,8 +3792,6 @@ mod tests {
                 .expect("read stored provider api key"),
             Some("sk-test".to_string())
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

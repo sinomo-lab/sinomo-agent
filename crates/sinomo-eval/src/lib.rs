@@ -1035,7 +1035,6 @@ mod tests {
     #[test]
     fn executing_harness_ingests_module_replay_report() {
         let root = temp_dir("module-replay-report");
-        fs::create_dir_all(&root).expect("temp dir");
         let report_path = root.join("module-replay-report.json");
         let report = ModuleReplayReport {
             fixture_id: Id::from_legacy_named("fixture_module_replay").expect("fixture"),
@@ -1273,11 +1272,7 @@ mod tests {
         "printf 'sinomo-stdout\\n'; printf 'sinomo-stderr\\n' >&2".to_string()
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let stamp = OffsetDateTime::now_utc()
-            .unix_timestamp_nanos()
-            .abs()
-            .to_string();
-        env::temp_dir().join(format!("sinomo-eval-{name}-{stamp}"))
+    fn temp_dir(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-eval-{name}"))
     }
 }

@@ -21,3 +21,6 @@ sinomo-events = { path = "../sinomo-events" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-rollout = { path = "../sinomo-rollout" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

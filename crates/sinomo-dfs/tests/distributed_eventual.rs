@@ -5,8 +5,7 @@ use sinomo_dfs::{
 };
 use sinomo_node::NodeId;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 #[test]
 fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() {
@@ -101,12 +100,8 @@ fn distributed_eventual_commit_advances_metadata_then_repairs_missing_replica() 
     cleanup(&root);
 }
 
-fn temp_root(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("sinomo-dfs-{name}-{nanos}"))
+fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+    sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
 }
 
 fn cleanup(root: &Path) {

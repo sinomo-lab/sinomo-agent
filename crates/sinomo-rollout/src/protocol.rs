@@ -285,7 +285,6 @@ mod tests {
         CapabilityName, ClusterEndpointRecord, ClusterMemberRecord, ClusterTransportKind, Id,
     };
     use sinomo_node::NodeId;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use time::OffsetDateTime;
 
     type ClusterId = Id;
@@ -293,7 +292,6 @@ mod tests {
     #[test]
     fn prepare_cluster_rollout_binary_request_reads_and_encodes_binary() {
         let root = temp_root("cluster-binary-request");
-        std::fs::create_dir_all(&root).expect("root");
         let binary = root.join("sinomo");
         std::fs::write(&binary, b"binary-bytes").expect("binary");
 
@@ -315,13 +313,11 @@ mod tests {
         assert_eq!(request.shadow_port, 21354);
         assert!(!request.target_os.is_empty());
         assert!(!request.target_arch.is_empty());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn prepare_cluster_rollout_binary_request_includes_native_module_artifacts() {
         let root = temp_root("cluster-binary-module-request");
-        std::fs::create_dir_all(&root).expect("root");
         let binary = root.join("sinomo");
         let module = root.join("libmodule.so");
         std::fs::write(&binary, b"binary-bytes").expect("binary");
@@ -353,13 +349,11 @@ mod tests {
         assert_eq!(artifact.library_name, "libmodule.so");
         assert_eq!(artifact.source, "test");
         assert_eq!(artifact.library, b"module-bytes".to_vec());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn prepare_cluster_rollout_native_dylib_module_request_reads_module_artifact() {
         let root = temp_root("cluster-module-request");
-        std::fs::create_dir_all(&root).expect("root");
         let module = root.join("libmodule.so");
         std::fs::write(&module, b"module-bytes").expect("module");
 
@@ -386,7 +380,6 @@ mod tests {
         assert_eq!(request.shadow_port, 21354);
         assert_eq!(request.artifact.module_id, "module.test");
         assert_eq!(request.artifact.library, b"module-bytes".to_vec());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -570,11 +563,7 @@ mod tests {
         );
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-rollout-{name}-{stamp}"))
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-rollout-{name}"))
     }
 }

@@ -418,14 +418,8 @@ mod tests {
 
     #[test]
     fn config_tools_search_get_and_set_local_values() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-agent-config-tool-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        let registry = registry(test_config(root.clone()));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-config-tool");
+        let registry = registry(test_config(root.to_path_buf()));
         let session = session();
 
         let search = registry.execute(
@@ -482,14 +476,12 @@ mod tests {
                 .join("enabled.json")
                 .exists()
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn config_set_can_be_disabled_by_runtime() {
-        let root = std::env::temp_dir().join("sinomo-agent-config-tool-disabled");
-        let registry = registry(test_config(root.clone()).allowing_writes(false));
+        let root = sinomo_testdir::TestDir::new("sinomo-agent-config-tool-disabled");
+        let registry = registry(test_config(root.to_path_buf()).allowing_writes(false));
         let outcome = registry.execute(
             &session(),
             0,
@@ -507,7 +499,6 @@ mod tests {
             },
         );
         assert_eq!(outcome.status, super::super::AgentToolStatus::Blocked);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

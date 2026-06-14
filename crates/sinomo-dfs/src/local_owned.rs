@@ -667,7 +667,6 @@ fn local_owned_durable_file_error(error: durable_file::DurableFileError) -> Loca
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn default_config_exposes_data_files_under_node_sifs_path() {
@@ -867,11 +866,7 @@ mod tests {
         }
     }
 
-    fn temp_root(name: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos();
-        std::env::temp_dir().join(format!("sinomo-dfs-{name}-{stamp}"))
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
     }
 }

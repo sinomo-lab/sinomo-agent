@@ -185,13 +185,7 @@ mod tests {
 
     #[test]
     fn rollout_cluster_kv_helpers_own_rollout_records() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-rollout-cluster-kv-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-cluster-kv");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("cluster paths");
@@ -316,7 +310,5 @@ mod tests {
                 .expect("read reconciliations"),
             vec![reconciliation]
         );
-
-        std::fs::remove_dir_all(root).ok();
     }
 }

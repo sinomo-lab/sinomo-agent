@@ -4548,18 +4548,8 @@ mod tui_tests {
         }
     }
 
-    fn temp_file_browser_root(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = env::temp_dir().join(format!(
-            "sinomo-tui-file-browser-{name}-{}-{unique}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp root");
-        root
+    fn temp_file_browser_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-tui-file-browser-{name}"))
     }
 
     fn session_record(session_id: SessionId, title: &str) -> TuiSessionRecord {
@@ -5105,7 +5095,7 @@ mod tui_tests {
         let root = temp_file_browser_root("f1");
         let mut state = fixture_tui_state();
 
-        state.open_file_browser_at(root.clone());
+        state.open_file_browser_at(root.to_path_buf());
         assert_eq!(state.view_mode, TuiViewMode::Files);
         assert_eq!(
             state.apply_key_event(press(KeyCode::F(1))),
@@ -5132,8 +5122,6 @@ mod tui_tests {
             TuiInputAction::None
         );
         assert_eq!(state.view_mode, TuiViewMode::Chat);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5172,7 +5160,6 @@ mod tui_tests {
         assert!(keys.iter().any(|key| *key == "rollout.telemetry.gates"));
         assert!(keys.iter().any(|key| *key == "lm.credentials.openai"));
         assert!(keys.iter().any(|key| *key == "evolution.config"));
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5202,15 +5189,13 @@ mod tui_tests {
             TuiInputAction::OpenSettings
         );
 
-        state.open_file_browser_at(root.clone());
+        state.open_file_browser_at(root.to_path_buf());
         assert_eq!(state.view_mode, TuiViewMode::Files);
         assert_eq!(
             state.apply_mouse_event(mouse(MouseEventKind::Down(MouseButton::Left), 1, 0), area),
             TuiInputAction::None
         );
         assert_eq!(state.view_mode, TuiViewMode::Chat);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5242,7 +5227,7 @@ mod tui_tests {
             Some(0)
         );
 
-        state.open_file_browser_at(root.clone());
+        state.open_file_browser_at(root.to_path_buf());
         let layout = tui_layout_areas(area, &state);
         let (entries_area, _) = tui_file_browser_areas(layout.main);
         let entries_inner = tui_inner_rect(entries_area);
@@ -5285,8 +5270,6 @@ mod tui_tests {
                 .selected_session_id(),
             Some(session_b)
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5323,7 +5306,7 @@ mod tui_tests {
         );
         assert_eq!(state.scrollback, 0);
 
-        state.open_file_browser_at(root.clone());
+        state.open_file_browser_at(root.to_path_buf());
         let (entries_area, _) = tui_file_browser_areas(tui_layout_areas(area, &state).main);
         let entries_inner = tui_inner_rect(entries_area);
         state.apply_mouse_event(
@@ -5347,8 +5330,6 @@ mod tui_tests {
             area,
         );
         assert_eq!(state.session_list.as_ref().expect("sessions").selected, 2);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5432,8 +5413,6 @@ mod tui_tests {
         browser.update_preview();
         assert!(browser.preview.lines.iter().any(|line| line == "hello"));
         assert!(browser.preview.lines.iter().any(|line| line == "world"));
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5502,8 +5481,6 @@ mod tui_tests {
                 .iter()
                 .any(|line| line.contains("\"payload\": bytes(5 B): 00 01 02 03 04"))
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5524,8 +5501,6 @@ mod tui_tests {
         browser.create_dir("docs").expect("create dir");
         assert!(root.join("docs").is_dir());
         assert!(browser.create_file("../escape.txt").is_err());
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5533,7 +5508,7 @@ mod tui_tests {
         let root = temp_file_browser_root("state");
         let mut state = fixture_tui_state();
 
-        state.open_file_browser_at(root.clone());
+        state.open_file_browser_at(root.to_path_buf());
         assert_eq!(state.view_mode, TuiViewMode::Files);
         assert!(state.completions.is_none());
 
@@ -5556,8 +5531,6 @@ mod tui_tests {
             TuiInputAction::None
         );
         assert_eq!(state.view_mode, TuiViewMode::Chat);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5634,7 +5607,7 @@ mod tui_tests {
     #[test]
     fn tui_session_store_saves_lists_and_loads_transcript() {
         let root = temp_file_browser_root("sessions");
-        let data_dir = SinomoDataDir::new(root.clone());
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
         let store = TuiSessionStore::for_data_dir(&data_dir);
         let session = InteractionSession::new(
             SessionId::generate(),
@@ -5666,14 +5639,12 @@ mod tui_tests {
         assert_eq!(transcript.messages, state.messages);
         assert_eq!(transcript.last_model_usage, state.last_model_usage);
         assert_eq!(transcript.session_token_usage, state.session_token_usage);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn tui_session_store_discards_empty_sessions() {
         let root = temp_file_browser_root("empty-sessions");
-        let data_dir = SinomoDataDir::new(root.clone());
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
         let store = TuiSessionStore::for_data_dir(&data_dir);
         let session = InteractionSession::new(
             SessionId::generate(),
@@ -5686,14 +5657,12 @@ mod tui_tests {
 
         assert!(!store.session_dir(&session.session_id).exists());
         assert!(store.list_sessions().expect("list").is_empty());
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn tui_session_store_discards_command_only_sessions() {
         let root = temp_file_browser_root("command-only-sessions");
-        let data_dir = SinomoDataDir::new(root.clone());
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
         let store = TuiSessionStore::for_data_dir(&data_dir);
         let session = InteractionSession::new(
             SessionId::generate(),
@@ -5710,8 +5679,6 @@ mod tui_tests {
 
         assert!(!store.session_dir(&session.session_id).exists());
         assert!(store.list_sessions().expect("list").is_empty());
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -5852,7 +5819,7 @@ mod tui_tests {
     #[test]
     fn tui_model_switch_replaces_active_handler_model() {
         let root = temp_file_browser_root("model-switch");
-        let data_dir = SinomoDataDir::new(root.clone());
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
         let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
             &data_dir,
             ModelRuntimeConfig::default(),
@@ -5876,14 +5843,12 @@ mod tui_tests {
         assert_eq!(info.model, "gpt-5");
         assert_eq!(info.account.as_deref(), Some("default"));
         assert_eq!(handler.tui_agent_runtime_info(), info);
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn tui_agent_switch_replaces_active_handler_definition() {
         let root = temp_file_browser_root("agent-switch");
-        let data_dir = SinomoDataDir::new(root.clone());
+        let data_dir = SinomoDataDir::new(root.to_path_buf());
         let mut handler = RuntimeMainAgentInteractionHandler::from_runtime_config(
             &data_dir,
             ModelRuntimeConfig::default(),
@@ -5898,8 +5863,6 @@ mod tui_tests {
 
         assert_eq!(info.agent, "ops-agent");
         assert_eq!(handler.tui_agent_runtime_info().agent, "ops-agent");
-
-        fs::remove_dir_all(root).ok();
     }
 }
 

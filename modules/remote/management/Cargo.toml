@@ -22,3 +22,6 @@ crate-type = ["rlib", "cdylib"]
 serde.workspace = true
 serde_bytes.workspace = true
 sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../../../crates/sinomo-testdir" }

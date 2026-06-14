@@ -1101,14 +1101,8 @@ fn platform_triple() -> String {
 mod tests {
     use super::*;
 
-    fn temp_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-remote-management-module-{name}-{}",
-            std::process::id()
-        ));
-        fs::remove_dir_all(&root).ok();
-        fs::create_dir_all(&root).expect("create temp root");
-        root
+    fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-remote-management-module-{name}"))
     }
 
     #[test]
@@ -1199,8 +1193,6 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path.ends_with("hello.txt"))
         );
-
-        fs::remove_dir_all(root).ok();
     }
 
     #[test]

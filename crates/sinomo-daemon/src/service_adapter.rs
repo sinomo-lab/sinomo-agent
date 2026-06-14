@@ -2341,10 +2341,7 @@ mod tests {
 
     #[test]
     fn daemon_service_registry_host_dispatches_registry_service_and_records_stop() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-service-router-adapter-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-router-adapter");
         let registry = ServiceRegistry::builder().register(TestStopService).build();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2403,15 +2400,11 @@ mod tests {
                 .map(String::as_str),
             Some("stop")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_service_registry_host_dispatches_limited_registry_service() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-service-router-concurrency-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-router-concurrency");
         let registry = ServiceRegistry::builder()
             .register(TestConcurrencyLimitService)
             .build();
@@ -2457,7 +2450,6 @@ mod tests {
                 .map(String::as_str),
             Some("continue")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2500,10 +2492,7 @@ mod tests {
             }
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-service-router-readiness-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-router-readiness");
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let registry = ServiceRegistry::builder()
@@ -2558,15 +2547,11 @@ mod tests {
             .expect("recovered service route readiness");
         assert_eq!(recovered.available_concurrency, Some(1));
         assert!(recovered.is_ready());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_service_registry_host_denies_route_scope_before_handler() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-service-router-auth-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-router-auth");
         let registry = ServiceRegistry::builder().register(TestStopService).build();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2591,15 +2576,11 @@ mod tests {
             .expect_err("member must not run admin route");
 
         assert_eq!(error, NetworkError::AuthDenied);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn cluster_kv_snapshot_service_dispatches_async_snapshot_route() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-cluster-kv-snapshot-service-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-cluster-kv-snapshot-service");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         let paths = DaemonPaths::new(data_dir.as_ref());
         let cluster_paths = ClusterPaths::new(data_dir.as_ref());
@@ -2664,15 +2645,11 @@ mod tests {
                 .map(String::as_str),
             Some("continue")
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn observe_service_registration_tracks_native_rust_enablement() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-observe-module-toggle-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-observe-module-toggle");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
@@ -2688,16 +2665,11 @@ mod tests {
             .expect("enable observe");
         let registry = daemon_service_registry(&paths, None);
         assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_service_registry_host_uses_observe_enablement_for_route_snapshot() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-observe-module-snapshot-toggle-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-observe-module-snapshot-toggle");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
@@ -2731,16 +2703,11 @@ mod tests {
                 .contains_key(sinomo_observe::OBSERVE_EVENTS_ROUTE),
             "disabled observe service should not leave an object RPC route behind"
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn daemon_service_registry_host_installs_module_snapshot_routes() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-module-snapshot-routes-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-snapshot-routes");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         let paths = DaemonPaths::new(data_dir.as_ref());
         let registry = daemon_service_registry(&paths, None);
@@ -2805,8 +2772,6 @@ mod tests {
                 .observability
                 .contains_key("daemon.module_route")
         );
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2826,16 +2791,7 @@ mod tests {
             .clone();
         drop(module);
 
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-active-native-dylib-routes-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system time after epoch")
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create test data dir");
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-active-native-dylib-routes");
         let library_name = library_path
             .file_name()
             .and_then(|name| name.to_str())
@@ -2883,8 +2839,6 @@ mod tests {
             .expect("native dylib route response");
         assert_eq!(response.route, route.route);
         assert!(!response.body.is_empty());
-
-        let _ = std::fs::remove_dir_all(root);
     }
 
     fn resolve_test_dylib_path(path: std::path::PathBuf) -> std::path::PathBuf {
@@ -2941,10 +2895,7 @@ mod tests {
 
     #[test]
     fn cluster_registry_hosts_cluster_routes() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-daemon-cluster-kv-registry-routes-{}",
-            std::process::id()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-cluster-kv-registry-routes");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
@@ -3059,7 +3010,5 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
-
-        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -24,3 +24,4 @@ time.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+sinomo-testdir = { path = "../sinomo-testdir" }

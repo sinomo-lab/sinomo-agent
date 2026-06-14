@@ -27,3 +27,4 @@ time.workspace = true
 
 [dev-dependencies]
 tokio = { version = "1.44", features = ["macros", "rt"] }
+sinomo-testdir = { path = "../sinomo-testdir" }

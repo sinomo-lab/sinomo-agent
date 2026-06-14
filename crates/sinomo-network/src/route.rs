@@ -1393,13 +1393,7 @@ mod tests {
 
     #[tokio::test]
     async fn signed_relay_endpoint_async_from_paths_prefers_graph_next_hop() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-network-signed-relay-endpoint-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-network-signed-relay-endpoint");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("paths");
@@ -1507,18 +1501,11 @@ mod tests {
         assert_eq!(envelope.inner.command, "RPC /cluster/kv/range");
         assert_eq!(envelope.inner.auth, Some(b"inner-auth".to_vec()));
         assert_eq!(envelope.inner.rpc.as_ref(), Some(&request));
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
     async fn signed_relay_endpoint_async_helper_routes_via_graph_next_hop() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-network-signed-relay-endpoint-async-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-network-signed-relay-endpoint-async");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("paths");
@@ -1621,7 +1608,6 @@ mod tests {
         assert_eq!(envelope.inner.command, "RPC /cluster/kv/range");
         assert_eq!(envelope.inner.auth, Some(b"inner-auth".to_vec()));
         assert_eq!(envelope.inner.rpc.as_ref(), Some(&request));
-        std::fs::remove_dir_all(root).ok();
     }
 
     struct RecordingSignedEndpointRpcHost {
@@ -1882,13 +1868,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_driver_forwards_to_next_hop_endpoint() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-network-relay-driver-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-network-relay-driver");
         let data_dir = SinomoDataDir::new(&root);
         let paths = ClusterPaths::new(&data_dir);
         paths.ensure().expect("paths");
@@ -1979,6 +1959,5 @@ mod tests {
         assert_eq!(async_host.sent[0].1.target_node_id, target);
         assert_eq!(async_host.sent[0].1.ttl, CLUSTER_RELAY_DEFAULT_TTL - 1);
         assert_eq!(async_host.sent[0].1.visited, vec![local]);
-        std::fs::remove_dir_all(root).ok();
     }
 }

@@ -20,3 +20,6 @@ time.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-runtime = { path = "../sinomo-runtime" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

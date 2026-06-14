@@ -1389,14 +1389,10 @@ mod tests {
     #[test]
     fn managed_mock_server_requires_supervisor_auth_token() {
         let port = unused_loopback_port();
-        let log_dir = std::env::temp_dir().join(format!(
-            "sinomo-pytorch-test-{}-{}",
-            std::process::id(),
-            port
-        ));
+        let log_dir = sinomo_testdir::TestDir::new("sinomo-pytorch-test");
         let mut server = ManagedPytorchServer::new(ManagedPytorchServerConfig {
             port,
-            log_dir: log_dir.clone(),
+            log_dir: log_dir.to_path_buf(),
             mock: true,
             ..ManagedPytorchServerConfig::default()
         });
@@ -1426,7 +1422,6 @@ mod tests {
         .expect_err("missing token is denied");
         assert!(unauthorized.to_string().contains("403"));
         server.stop();
-        let _ = std::fs::remove_dir_all(log_dir);
     }
 
     fn unused_loopback_port() -> u16 {

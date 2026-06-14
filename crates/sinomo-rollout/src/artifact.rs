@@ -211,18 +211,10 @@ fn set_executable(_destination: &Path) -> Result<(), RolloutError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn install_binary_atomically_preserves_executable_suffix_in_previous_backup() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-rollout-artifact-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&root).expect("root");
+        let root = sinomo_testdir::TestDir::new("sinomo-rollout-artifact");
         let source = root.join("candidate.exe");
         let destination = root.join("sinomo.exe");
         fs::write(&source, b"candidate").expect("source");
@@ -239,6 +231,5 @@ mod tests {
             b"previous"
         );
         assert!(!root.join("sinomo.previous").exists());
-        let _ = fs::remove_dir_all(root);
     }
 }

@@ -1172,13 +1172,7 @@ mod tests {
 
     #[test]
     fn local_configs_are_written_as_human_readable_documents_under_configs_dir() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-config-local-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-config-local");
         let data_dir = SinomoDataDir::new(&root);
         let store = ConfigStore::new(registry());
 
@@ -1205,13 +1199,7 @@ mod tests {
 
     #[test]
     fn legacy_local_json_is_migrated_on_read() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-config-migrate-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-config-migrate");
         fs::create_dir_all(root.join("config")).expect("legacy dir");
         fs::write(root.join("config").join("test-enabled.json"), "true\n").expect("legacy");
         let data_dir = SinomoDataDir::new(&root);
@@ -1283,13 +1271,7 @@ mod tests {
 
     #[tokio::test]
     async fn cluster_override_local_prefers_cluster_when_available() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-config-cluster-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-config-cluster");
         let data_dir = SinomoDataDir::new(&root);
         let store = ConfigStore::new(registry());
         store
@@ -1334,13 +1316,7 @@ mod tests {
 
     #[tokio::test]
     async fn config_service_searches_and_sets_local_values() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-config-service-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-config-service");
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
         let ctx = ServiceContext {

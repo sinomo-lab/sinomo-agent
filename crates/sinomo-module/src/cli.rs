@@ -1380,7 +1380,6 @@ fn command_error(error: impl fmt::Display) -> CliCommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn test_config() -> ModuleCliCommandConfig {
         ModuleCliCommandConfig::new()
@@ -1395,15 +1394,8 @@ mod tests {
             })
     }
 
-    fn unique_temp(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "sinomo-module-cli-{prefix}-{}-{nanos}",
-            std::process::id()
-        ))
+    fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(&format!("sinomo-module-cli-{prefix}"))
     }
 
     fn test_native_dylib_state(module_id: ModuleId) -> crate::NativeDylibModuleLoaderState {
@@ -1569,7 +1561,6 @@ mod tests {
             }),
             "missing unload choice for {module_id:?}: {unload:?}"
         );
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1592,6 +1583,5 @@ mod tests {
         assert!(output.contains("backend=native-dylib"));
         assert!(output.contains("state=active"));
         assert!(output.contains(&module_id.to_string()));
-        let _ = std::fs::remove_dir_all(root);
     }
 }

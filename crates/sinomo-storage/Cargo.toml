@@ -16,3 +16,6 @@ blake3.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

@@ -167,13 +167,7 @@ fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-direct-rpc-unknown-route-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-direct-rpc-unknown-route");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let now = OffsetDateTime::now_utc();
@@ -258,19 +252,11 @@ fn direct_cluster_rpc_handlers_return_unknown_route_errors() {
     assert!(
         matches!(membership_error, NetworkError::UnknownRoute { ref route } if route == unknown_route)
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn iroh_endpoint_record_async_helpers_round_trip_on_passed_runtime() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-iroh-endpoint-async-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-endpoint-async");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let cluster_id = ClusterId::from_legacy_named("cluster_iroh_endpoint_async").expect("cluster");
@@ -305,19 +291,12 @@ fn iroh_endpoint_record_async_helpers_round_trip_on_passed_runtime() {
         .expect("read iroh endpoint record async");
 
     assert_eq!(loaded, record);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(feature = "iroh-transport")]
 #[test]
 fn iroh_secret_key_creation_is_atomic_under_concurrency() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-iroh-secret-concurrent-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-secret-concurrent");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let node_id = NodeId::from_legacy_named("node_iroh_secret_concurrent").expect("node");
@@ -372,20 +351,12 @@ fn iroh_secret_key_creation_is_atomic_under_concurrency() {
         !key_lock_path.exists(),
         "steady-state Iroh secret loads should read the existing key without creating a lock file"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(feature = "iroh-transport")]
 #[test]
 fn iroh_secret_key_async_helper_uses_passed_runtime() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-iroh-secret-async-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-secret-async");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let node_id = NodeId::from_legacy_named("node_iroh_secret_async").expect("node");
@@ -407,7 +378,6 @@ fn iroh_secret_key_async_helper_uses_passed_runtime() {
         .to_string();
 
     assert_eq!(public_key, persisted_public_key);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[cfg(feature = "iroh-transport")]
@@ -415,13 +385,7 @@ fn iroh_secret_key_async_helper_uses_passed_runtime() {
 fn iroh_secret_key_lock_wait_is_bounded() {
     use fs2::FileExt;
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-iroh-secret-lock-timeout-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-secret-lock-timeout");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let node_id = NodeId::from_legacy_named("node_iroh_secret_lock_timeout").expect("node");
@@ -459,7 +423,6 @@ fn iroh_secret_key_lock_wait_is_bounded() {
     );
 
     holder.join().expect("join lock holder");
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn object_rpc_router_from_registry(registry: Arc<ObjectRpcRouteRegistry>) -> ObjectRpcRouter {
@@ -2017,13 +1980,7 @@ fn iroh_daemon_proxy_explicit_runtime_reports_missing_transport_feature() {
         .enable_all()
         .build()
         .expect("current-thread runtime");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-no-iroh-proxy-runtime-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-no-iroh-proxy-runtime");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
 
     let error = match runtime.block_on(start_iroh_daemon_proxy(
@@ -2313,13 +2270,7 @@ fn join_registration_channels_keep_lan_before_iroh_fallback() {
 fn cluster_invite_challenge_proof_verification_uses_network_contract() {
     use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-challenge-proof-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-challenge-proof");
     let issuer_identity =
         sinomo_node::load_or_create_main_node_identity(&root).expect("issuer identity");
     let cluster_id =
@@ -2374,19 +2325,11 @@ fn cluster_invite_challenge_proof_verification_uses_network_contract() {
         verify_cluster_invite_challenge_proof(&invite, "different-challenge", &proof),
         Err(NetworkError::AuthDenied)
     ));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_invite_challenge_proof_creation_uses_network_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-challenge-create-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-challenge-create");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -2436,8 +2379,6 @@ fn cluster_invite_challenge_proof_creation_uses_network_state() {
     assert_eq!(proof.responder_public_key, identity.public_key);
     verify_cluster_invite_challenge_proof(&invite, &request.challenge, &proof)
         .expect("created proof verifies");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3186,13 +3127,7 @@ fn iroh_daemon_proxy_frame_reader_charges_budget_before_body_read() {
 
 #[test]
 fn connectivity_sort_uses_iroh_after_direct_tcp_is_known_unavailable() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-sort-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-sort");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -3263,18 +3198,11 @@ fn connectivity_sort_uses_iroh_after_direct_tcp_is_known_unavailable() {
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_graph_keys_records_by_source_target_and_endpoint() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-graph-key-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-graph-key");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -3351,7 +3279,6 @@ fn connectivity_graph_keys_records_by_source_target_and_endpoint() {
         targets.first().map(|endpoint| &endpoint.node_id),
         Some(&node_c)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3530,13 +3457,7 @@ fn cluster_network_maintenance_policy_throttles_mobile_and_sensor_roles() {
 
 #[test]
 fn cluster_network_publish_interval_for_node_tracks_local_role() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-node-publish-interval-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-node-publish-interval");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -3573,8 +3494,6 @@ fn cluster_network_publish_interval_for_node_tracks_local_role() {
         CLUSTER_NETWORK_PUBLISH_INTERVAL,
         "missing nodes should fall back to workstation/server cadence"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -3885,10 +3804,7 @@ fn cluster_connectivity_probe_policy_honors_role_cadence_startup_and_routes() {
 
 #[test]
 fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-probe-batch-{}",
-        std::process::id()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-probe-batch");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -3977,19 +3893,11 @@ fn cluster_connectivity_probe_batch_and_outcome_transition_are_network_owned() {
     );
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].state, ClusterConnectivityState::Degraded);
-
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-noop-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4084,19 +3992,11 @@ fn cluster_connectivity_sync_is_noop_detects_stable_changed_and_removed() {
         !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
         "removed record should not be a no-op"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-noop-large-prefix-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop-large-prefix");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4158,19 +4058,11 @@ fn connectivity_noop_handles_prefix_larger_than_public_range_limit() {
         !cluster_connectivity_sync_is_noop(&paths, &node_a, &[]).expect("noop check"),
         "large prefixes should be scanned completely so missing records are detected as deletes"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_partial_sync_ignores_unrelated_malformed_large_prefix() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-partial-large-prefix-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-partial-large-prefix");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4237,19 +4129,11 @@ fn connectivity_partial_sync_ignores_unrelated_malformed_large_prefix() {
         ops.is_empty(),
         "stable incoming connectivity should remain a no-op without retaining unrelated prefix records"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_connectivity_sync_does_not_open_raft_node() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-noop-no-raft-open-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-noop-no-raft-open");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4298,8 +4182,6 @@ fn stable_connectivity_sync_does_not_open_raft_node() {
         vec![healthy(now + time::Duration::seconds(5))],
     )
     .expect("stable connectivity sync should not open raft");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -4307,13 +4189,7 @@ fn local_connectivity_records_persist_across_cache_loss_without_rewrite() {
     let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
         .lock()
         .expect("object mark cache mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-persist-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-persist");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4412,19 +4288,11 @@ fn local_connectivity_records_persist_across_cache_loss_without_rewrite() {
         read_cluster_connectivity_graph(&paths).expect("read persisted merged graph"),
         vec![record]
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-local-kv-stale-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-local-kv-stale");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4526,8 +4394,6 @@ fn local_route_graph_uses_persisted_self_connectivity_after_cache_loss() {
         Some(&iroh.endpoint_id),
         "the persisted local route graph should avoid endpoints already known unreachable"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 struct FixedConnectivityRecordQuery {
@@ -4545,13 +4411,7 @@ impl ClusterConnectivityRecordQuery for FixedConnectivityRecordQuery {
 
 #[test]
 fn connectivity_graph_reads_kv_records_through_query_boundary() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-query-boundary-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-query-boundary");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4633,8 +4493,6 @@ fn connectivity_graph_reads_kv_records_through_query_boundary() {
         graph.healthy_target_refs(&node_b).collect::<Vec<_>>(),
         vec![&node_c]
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -4642,13 +4500,7 @@ fn local_connectivity_cache_retains_recent_root_under_path_churn() {
     let _guard = LOCAL_CONNECTIVITY_CACHE_TEST_MUTEX
         .lock()
         .expect("connectivity cache mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-cache-churn-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-cache-churn");
     let now = OffsetDateTime::now_utc();
     let cluster_id = ClusterId::from_legacy_named("cluster_conn_cache_churn").expect("cluster");
     let node_a = NodeId::from_legacy_named("node_conn_cache_churn_a").expect("node a");
@@ -4722,18 +4574,11 @@ fn local_connectivity_cache_retains_recent_root_under_path_churn() {
         vec![record],
     );
     remove_local_cluster_connectivity_record_cache_entries_under_root_for_test(&root);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_connectivity_cache_rejects_mismatched_source_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-source-mismatch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-source-mismatch");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4778,19 +4623,11 @@ fn local_connectivity_cache_rejects_mismatched_source_records() {
         !local_cluster_connectivity_record_cache_contains_for_test(&paths),
         "rejected records must not allocate a per-root connectivity cache"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_connectivity_cache_rejects_oversized_source_record_sets() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-source-limit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-source-limit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4842,19 +4679,11 @@ fn local_connectivity_cache_rejects_oversized_source_record_sets() {
         !local_cluster_connectivity_record_cache_contains_for_test(&paths),
         "rejected oversized records must not be retained in memory"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_connectivity_cache_does_not_retain_empty_roots() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-empty-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-empty-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4906,19 +4735,11 @@ fn local_connectivity_cache_does_not_retain_empty_roots() {
         !local_cluster_connectivity_record_cache_contains_for_test(&paths),
         "expired-only local connectivity writes must not leave a per-root cache entry"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_full_sync_replaces_local_source_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-local-replace-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-local-replace");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -4993,19 +4814,11 @@ fn connectivity_full_sync_replaces_local_source_records() {
             .any(|record| record.endpoint_id == stale_record.endpoint_id),
         "stale local connectivity should not survive a full source sync"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-public-tcp-sort-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-public-tcp-sort");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5035,18 +4848,11 @@ fn connectivity_sort_prefers_private_tcp_over_unknown_public_tcp() {
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&private.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-route-unknown-tcp-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-route-unknown-tcp");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5100,18 +4906,11 @@ fn raft_command_targets_try_unknown_tcp_before_unknown_iroh_fallbacks() {
         .position(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
         .expect("iroh");
     assert!(public_position < iroh_position);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-route-connectivity-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-route-connectivity");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5185,18 +4984,11 @@ fn raft_command_targets_preserve_verified_connectivity_before_unknown_tcp() {
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn raft_command_targets_keep_degraded_direct_before_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-route-degraded-private-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-route-degraded-private");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5308,18 +5100,11 @@ fn raft_command_targets_keep_degraded_direct_before_iroh() {
         .position(|endpoint| endpoint.endpoint_id == public_tcp.endpoint_id)
         .expect("public target");
     assert!(public_position < iroh_position);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-route-unreachable-voter-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-route-unreachable-voter");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5418,18 +5203,11 @@ fn raft_command_targets_prefer_reachable_voter_over_unreachable_voter() {
         targets.first().map(|endpoint| &endpoint.node_id),
         Some(&reachable)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn main_daemon_command_targets_select_one_route_per_remote_main() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-main-daemon-targets-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-targets");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5488,18 +5266,11 @@ fn main_daemon_command_targets_select_one_route_per_remote_main() {
 
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].endpoint_id, remote_tcp.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-main-daemon-candidate-order-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-main-daemon-candidate-order");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5557,18 +5328,11 @@ fn main_daemon_endpoint_candidates_keep_static_fallback_order() {
         ordered_endpoint_ids,
         vec![lan.endpoint_id, public.endpoint_id, iroh.endpoint_id]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn member_publish_targets_prefer_locally_learned_bridge_endpoint() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-publish-local-bridge-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-local-bridge");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5625,18 +5389,11 @@ fn member_publish_targets_prefer_locally_learned_bridge_endpoint() {
             .any(|endpoint| endpoint.node_id == voter_endpoint.node_id),
         "voter endpoints should remain publish fallbacks"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-rollout-shadow-route-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-shadow-route");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5666,18 +5423,11 @@ fn rollout_target_selection_prefers_main_route_before_shadow_backup() {
     .expect("rollout endpoint");
 
     assert_eq!(selected.endpoint_id, main_endpoint.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-rollout-equivalent-route-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-equivalent-route");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5728,18 +5478,11 @@ fn rollout_target_selection_applies_connectivity_to_equivalent_tcp_route() {
     .expect("rollout endpoint");
 
     assert_eq!(selected.endpoint_id, public.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-rollout-transient-public-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-transient-public");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5792,18 +5535,11 @@ fn rollout_target_selection_keeps_transient_public_tcp_before_iroh() {
             .expect("rollout endpoint");
 
     assert_eq!(selected.endpoint_id, public.endpoint_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-rollout-shadow-context-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-shadow-context");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -5882,8 +5618,6 @@ fn rollout_target_selection_uses_command_route_context_for_shadow_fallbacks() {
     )
     .expect("private-context rollout endpoint");
     assert_eq!(selected.endpoint_id, private_main.endpoint_id);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -6768,13 +6502,7 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
         .expect("write daemon fixture response");
     });
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-iroh-proxy-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-proxy");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     paths.ensure().expect("cluster paths");
     let proxy = start_iroh_daemon_proxy(
@@ -6800,7 +6528,6 @@ async fn iroh_daemon_proxy_round_trips_rpc_request() {
 
     assert_eq!(response.decode_body::<String>().expect("decode"), "PONG");
     fixture.join().expect("daemon fixture");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -6836,13 +6563,7 @@ fn sinomo_iroh_relay_env_ignores_empty_entries() {
 
 #[test]
 fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-uncommitted-raft-snapshot-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-uncommitted-raft-snapshot");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6875,18 +6596,11 @@ fn uncommitted_raft_append_does_not_rewrite_materialized_snapshot() {
         std::fs::read(&paths.kv_snapshot).expect("read snapshot"),
         b"sentinel snapshot"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-empty-txn-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-empty-txn-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6930,18 +6644,11 @@ fn empty_cluster_kv_txn_does_not_append_raft_log_entry() {
         wal_len_before, wal_len_after,
         "empty transactions should not consume WAL writes"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-no-effect-op-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-no-effect-op-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -6976,18 +6683,11 @@ fn no_effect_cluster_kv_op_does_not_append_raft_log_entry() {
         wal_len_before, wal_len_after,
         "direct no-effect operations should not consume WAL writes"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_put_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-stable-put-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-stable-put-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7048,18 +6748,11 @@ fn stable_put_does_not_append_raft_log_entry() {
         wal_len_changed > wal_len_after,
         "changed puts must still append to the WAL"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_cluster_member_put_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-stable-member-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-stable-member-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7122,19 +6815,11 @@ fn stable_cluster_member_put_does_not_append_raft_log_entry() {
             > wal_len_after,
         "changed cluster member records must still append durable raft entries"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_lease_grant_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-stable-lease-grant-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-stable-lease-grant-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7205,18 +6890,11 @@ fn stable_lease_grant_does_not_append_raft_log_entry() {
             > wal_len_after_noop,
         "changing a lease TTL must still append a durable raft entry"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-empty-selected-branch-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-empty-selected-branch-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7275,18 +6953,12 @@ fn cluster_kv_txn_with_empty_selected_branch_does_not_append_raft_log_entry() {
             .value,
         b"committed"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-no-effect-selected-branch-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root =
+        sinomo_testdir::TestDir::new("sinomo-network-no-effect-selected-branch-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7385,18 +7057,11 @@ fn cluster_kv_txn_with_no_effect_selected_branch_does_not_append_raft_log_entry(
             > wal_len_after,
         "changed puts inside transactions must still append durable raft entries"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_semantic_txn_no_effect_accepts_stable_connectivity_refresh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-semantic-connectivity-no-effect-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-semantic-connectivity-no-effect");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7500,7 +7165,6 @@ fn cluster_semantic_txn_no_effect_accepts_stable_connectivity_refresh() {
             }],
         }
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -7571,13 +7235,7 @@ fn cluster_kv_watch_event_fanout_batches_split_on_payload_size() {
 
 #[tokio::test]
 async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_events() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-async-committed-raft-fanout-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-async-committed-raft-fanout");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -7651,7 +7309,6 @@ async fn async_cluster_raft_committed_fanout_uses_async_host_and_batches_watch_e
             .map(|event| event.revision)
             .collect::<Vec<_>>()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -7991,13 +7648,7 @@ fn cluster_member_removal_txns_bound_large_endpoint_prefix_cleanup() {
 
 #[test]
 fn raft_heartbeat_does_not_rewrite_materialized_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-heartbeat-snapshot-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-heartbeat-snapshot");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -8034,7 +7685,6 @@ fn raft_heartbeat_does_not_rewrite_materialized_snapshot() {
         std::fs::read(&paths.kv_snapshot).expect("read snapshot"),
         b"sentinel snapshot"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn mark_test_member_as_voter(member: &mut ClusterMemberRecord) {
@@ -8082,13 +7732,7 @@ fn cluster_raft_handler_test_state(
 
 #[test]
 fn cluster_raft_append_handler_applies_authorized_heartbeat() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-append-handler-authorized-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-handler-authorized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -8124,18 +7768,11 @@ fn cluster_raft_append_handler_applies_authorized_heartbeat() {
 
     assert!(response.accepted);
     assert!(response.append.success);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_append_handler_rejects_unauthorized_leader() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-append-handler-unauthorized-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-handler-unauthorized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -8171,18 +7808,11 @@ fn cluster_raft_append_handler_rejects_unauthorized_leader() {
 
     assert!(!response.accepted);
     assert!(response.detail.contains("unauthorized"));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_rpc_dispatch_decodes_and_encodes_append_and_vote() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-rpc-dispatch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-rpc-dispatch");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -8256,18 +7886,11 @@ fn cluster_raft_rpc_dispatch_decodes_and_encodes_append_and_vote() {
         .expect("vote response");
     assert!(vote_response.accepted);
     assert!(vote_response.vote.vote_granted);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_vote_handler_grants_authorized_candidate() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-vote-handler-authorized-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-vote-handler-authorized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -8300,18 +7923,11 @@ fn cluster_raft_vote_handler_grants_authorized_candidate() {
 
     assert!(response.accepted);
     assert!(response.vote.vote_granted);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_cluster_raft_command_storage_appends_commits_and_discards_under_network_lock() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-raft-command-storage-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-raft-command-storage");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -8361,8 +7977,6 @@ fn local_cluster_raft_command_storage_appends_commits_and_discards_under_network
         snapshot.get("/raft/local-storage/discarded").is_none(),
         "discarded uncommitted command must not become materialized"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 struct RecordingRaftAppendHost {
@@ -9116,13 +8730,7 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
         "pk-local",
         now,
     );
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-membership-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-membership-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let voter_endpoint = daemon_lan_endpoint(&voter, "10.81.0.2:21353".to_string(), 10);
@@ -9179,7 +8787,6 @@ fn cluster_control_plane_driver_owns_membership_forwarding_and_endpoint_memory()
         transport.connectivity,
         vec![(peer, ClusterConnectivityState::Healthy, None)]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -9284,13 +8891,7 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
         "pk-main",
         now,
     );
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-driver-observer-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-driver-observer");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let observation = ClusterLocalDaemonMembershipObservation {
@@ -9317,7 +8918,6 @@ fn cluster_join_registration_driver_uses_local_membership_observer() {
 
     assert_eq!(observed, Some(observation));
     assert_eq!(driver.observer_mut().calls, 1);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -9425,13 +9025,7 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
         "old-main-public-key",
         now,
     );
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-mutation-driver-observer-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-mutation-driver-observer");
     let data_dir = SinomoDataDir::new(&root);
     data_dir.ensure_root_layout().expect("root layout");
     let paths = ClusterPaths::new(&data_dir);
@@ -9480,7 +9074,6 @@ fn cluster_member_mutation_driver_prepares_state_from_local_membership_observer(
         .expect("shadow member");
     assert_eq!(shadow_member.node_public_key, "new-shadow-public-key");
     assert!(shadow_member.endpoints.contains(&shadow_endpoint));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -9627,13 +9220,7 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
     let node_id = NodeId::from_legacy_named("node_driver_publish_cache_hooks").expect("node");
     let target_node =
         NodeId::from_legacy_named("node_driver_publish_cache_hooks_target").expect("target");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-driver-publish-cache-hooks-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-driver-publish-cache-hooks");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     let info = ClusterNetworkInfoRecord {
@@ -9717,18 +9304,11 @@ fn cluster_control_plane_driver_delegates_publish_cache_hooks_to_transport() {
     assert_eq!(transport.node_remembers, 1);
     assert_eq!(transport.connectivity_checks, 1);
     assert_eq!(transport.connectivity_remembers, 1);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-refresh-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-refresh-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -9819,18 +9399,11 @@ fn cluster_kv_snapshot_refresh_driver_prefers_known_leader_and_imports_newest_sn
             .revision,
         leader_snapshot.revision
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-refresh-local-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-refresh-local-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -9885,18 +9458,11 @@ fn cluster_kv_snapshot_refresh_local_driver_owns_local_raft_storage() {
             .revision,
         remote_snapshot.revision
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn forwarded_cluster_kv_txn_driver_does_not_start_local_election() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-forwarded-kv-no-election-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-forwarded-kv-no-election");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -9937,18 +9503,11 @@ fn forwarded_cluster_kv_txn_driver_does_not_start_local_election() {
     assert_eq!(host.leader_checks, 1);
     assert_eq!(host.elect_calls, 0);
     assert_eq!(host.commit_calls, 0);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_txn_request_driver_reports_read_only_without_cluster_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-txn-request-orphan-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-txn-request-orphan");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -9974,18 +9533,11 @@ fn cluster_kv_txn_request_driver_reports_read_only_without_cluster_state() {
     assert_eq!(host.leader_checks, 0);
     assert_eq!(host.elect_calls, 0);
     assert_eq!(host.commit_calls, 0);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_voter_reachability_counts_single_local_voter_without_probe() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-voter-reachability-single-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-single");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10021,18 +9573,11 @@ fn cluster_voter_reachability_counts_single_local_voter_without_probe() {
         voter_reachability_test_options(),
         &mut host,
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-voter-reachability-remote-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-remote");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10077,18 +9622,11 @@ fn cluster_voter_reachability_probes_remote_live_voters_until_quorum() {
         2
     );
     assert_eq!(host.probes, vec![(remote, Duration::from_secs(2))]);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_voter_reachability_async_probes_remote_live_voters_until_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-voter-reachability-async-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-voter-reachability-async");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10138,18 +9676,11 @@ fn cluster_voter_reachability_async_probes_remote_live_voters_until_quorum() {
 
     assert!(has_quorum);
     assert_eq!(host.probes, vec![(remote, Duration::from_secs(2))]);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-quorum-commit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-quorum-commit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10208,18 +9739,11 @@ fn cluster_raft_quorum_commit_driver_commits_after_remote_voter_ack() {
     );
     assert_eq!(host.fanout_targets, vec![peer_node_id]);
     assert_eq!(host.fanout_events, 1);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fanout() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-local-quorum-helper-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-local-quorum-helper");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10333,18 +9857,11 @@ fn cluster_raft_local_storage_quorum_helper_uses_callbacks_for_transport_and_fan
         fanout.lock().expect("fanout").as_slice(),
         &[(1, vec![peer_node_id])]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-leader-election-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-leader-election");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10399,18 +9916,11 @@ fn cluster_raft_leader_election_driver_sets_leader_after_remote_voter_grants() {
         host.sent_votes,
         vec![(peer_node_id, expected_term, Duration::from_secs(1))]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-forward-direct-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-direct");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10467,18 +9977,11 @@ fn cluster_kv_txn_forward_driver_prefers_known_leader_and_fetches_snapshot() {
     assert_eq!(host.direct_sends, vec![peer_node_id.clone()]);
     assert_eq!(host.snapshot_fetches, vec![peer_node_id]);
     assert!(host.relays.is_empty());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-forward-relay-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-forward-relay");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10551,18 +10054,11 @@ fn cluster_kv_txn_forward_driver_relays_after_direct_voter_failure() {
             )
         ]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_append_replication_retries_from_rejected_match_index() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-append-replication-retry-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-replication-retry");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10633,18 +10129,11 @@ fn cluster_raft_append_replication_retries_from_rejected_match_index() {
     assert_eq!(host.sent_count, 2);
     assert_eq!(host.sent_prev_log_indexes, vec![1, 0]);
     assert_eq!(host.sent_timeouts[0], Duration::from_secs(1));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_local_append_replication_host_builds_from_local_raft() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-raft-append-replication-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-raft-append-replication");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10714,7 +10203,6 @@ fn cluster_raft_local_append_replication_host_builds_from_local_raft() {
         "local append host should build the first replication request from the local raft log"
     );
     assert_eq!(*sent_count.lock().expect("sent count lock"), 1);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -10788,13 +10276,7 @@ fn cluster_raft_append_request_only_fans_out_watch_events_missing_from_snapshot(
 
 #[test]
 fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-store-cache-only-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-store-cache-only");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10808,18 +10290,11 @@ fn cluster_kv_store_reads_materialized_snapshot_without_opening_raft() {
     let store = read_cluster_kv_store(&paths).expect("read cluster kv store");
     assert!(store.get("/snapshot-only").is_some());
     assert!(!paths.kv_raft.exists());
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_prefix_range_limited_rejects_large_external_ranges() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-range-limited-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-range-limited");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10874,18 +10349,11 @@ fn cluster_kv_prefix_range_limited_rejects_large_external_ranges() {
                 + "/external/range/b".len()
             && max_bytes == max_payload_bytes
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_prefix_range_default_reader_is_bounded() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-range-default-bounded-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-range-default-bounded");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10907,7 +10375,6 @@ fn cluster_kv_prefix_range_default_reader_is_bounded() {
             max_entries: CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
         }) if prefix == "/external/default/"
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn seed_raw_prefix_over_default_limit(store: &mut InProcessKvStore, prefix: &str) {
@@ -10930,13 +10397,7 @@ fn assert_default_range_limit(error: NetworkError, expected_prefix: &str) {
 
 #[test]
 fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-internal-read-bounded-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-internal-read-bounded");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10975,19 +10436,11 @@ fn cluster_kv_read_views_reject_oversized_internal_prefixes() {
             .expect_err("connectivity graph range limit"),
         "/cluster/network/connectivity/",
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_prefix_values_reader_is_bounded() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-prefix-values-bounded-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-prefix-values-bounded");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -10999,19 +10452,11 @@ fn cluster_kv_prefix_values_reader_is_bounded() {
     let error =
         read_cluster_kv_prefix_entries(&paths, "/typed/default/").expect_err("typed range limit");
     assert_default_range_limit(error, "/typed/default/");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-store-raft-over-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-store-raft-over-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11074,18 +10519,11 @@ fn cluster_kv_store_prefers_local_raft_over_stale_materialized_snapshot() {
         materialized.get("/stale-cache-only").is_some(),
         "the stale materialized cache remains only a fallback until an explicit flush"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-volatile-deferred-materialized-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-volatile-deferred-materialized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11226,18 +10664,11 @@ fn volatile_raft_commits_defer_materialized_snapshot_until_structural_change() {
             .display_name,
         renamed_local.display_name
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structural_import() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-imported-volatile-deferred-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-imported-volatile-deferred");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11315,19 +10746,11 @@ fn imported_volatile_snapshot_delta_defers_materialized_snapshot_until_structura
             .display_name,
         "renamed imported local"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn refresh_cluster_connectivity_environment_clears_stale_local_probe_state() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-environment-clear-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-environment-clear");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11416,19 +10839,11 @@ fn refresh_cluster_connectivity_environment_clears_stale_local_probe_state() {
         environment_id.as_deref(),
         Some(expected_environment_id.as_str())
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-read-raft-over-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-read-raft-over-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11468,18 +10883,11 @@ fn cluster_invitation_read_prefers_raft_over_stale_materialized_snapshot() {
         read_cluster_invitation_from_kv(&paths, &invite.invite_id).expect("read invitation"),
         invite
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_join_registration_prepare_accepts_signed_learner_and_rejects_role_escalation() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-prepare-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-prepare");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11564,7 +10972,6 @@ fn cluster_join_registration_prepare_accepts_signed_learner_and_rejects_role_esc
 
     assert!(!rejected.accepted);
     assert!(rejected.detail.contains("role not allowed"));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -11777,13 +11184,7 @@ impl ClusterJoinRegistrationHost for RecordingJoinEndpointHost {
 
 #[test]
 fn join_registration_host_default_remembers_remote_nonlocal_endpoints() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-remember-targets-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-remember-targets");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11823,18 +11224,11 @@ fn join_registration_host_default_remembers_remote_nonlocal_endpoints() {
     .expect("remember targets");
 
     assert_eq!(host.remembered, vec![remote_endpoint]);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_join_registration_handler_voter_commits_through_host() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-handler-voter-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-handler-voter");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -11944,18 +11338,11 @@ fn cluster_join_registration_handler_voter_commits_through_host() {
     assert!(stored.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
     }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_join_registration_async_handler_voter_commits_through_host() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-async-handler-voter-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-async-handler-voter");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12073,7 +11460,6 @@ fn cluster_join_registration_async_handler_voter_commits_through_host() {
     assert!(stored.members.iter().any(|member| {
         member.node_id == joined_node_id && member.state == ClusterMemberState::Learner
     }));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -12391,13 +11777,7 @@ impl ClusterJoinReconciliationHost for RecordingJoinReconciliationHost {
 
 #[test]
 fn cluster_join_reconciliation_driver_merges_acceptance_through_host() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-reconcile-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-reconcile-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12497,7 +11877,6 @@ fn cluster_join_reconciliation_driver_merges_acceptance_through_host() {
             member.node_id == joined && member.state == ClusterMemberState::Learner
         })
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -12627,13 +12006,7 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-driver-join-reconcile-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-driver-join-reconcile");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12726,18 +12099,11 @@ fn cluster_control_plane_driver_owns_join_reconciliation_transport() {
         !cluster_state_needs_join_registration(&pending),
         "driver-owned reconciliation should merge accepted state"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-targets-ignore-offline-status-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-targets-ignore-offline-status");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12805,7 +12171,6 @@ fn join_voter_targets_do_not_filter_offline_status_during_bootstrap() {
         Some(&voter_endpoint.endpoint_id),
         "join bootstrap must still try voter command targets even when local health is stale/offline"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -12841,13 +12206,7 @@ fn membership_forwarding_tries_voter_then_peer_relay() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-membership-forward-order-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-membership-forward-order");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -12922,7 +12281,6 @@ fn membership_forwarding_tries_voter_then_peer_relay() {
 
     assert_eq!(host.direct, vec![voter_node.clone()]);
     assert_eq!(host.relays, vec![(voter_node, peer_node)]);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -12996,13 +12354,7 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-join-challenge-forward-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-join-challenge-forward");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13090,18 +12442,11 @@ fn join_challenge_forwarding_uses_membership_voter_policy() {
     assert_eq!(async_proof, "proof");
     assert_eq!(async_host.direct, vec![voter_node.clone()]);
     assert_eq!(async_host.relays, vec![(voter_node, peer_node)]);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_invitation_sync_batches_invite_and_state_in_one_revision() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-sync-batched-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-sync-batched");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13170,8 +12515,6 @@ fn cluster_invitation_sync_batches_invite_and_state_in_one_revision() {
         .expect("invite state");
     assert_eq!(state.invite_id, invite.invite_id);
     assert_eq!(state.state, "active");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[derive(Default)]
@@ -13220,13 +12563,7 @@ impl ClusterMemberMutationAsyncHost for RecordingClusterInvitePublishHost {
 
 #[test]
 fn cluster_invite_publish_request_with_host_validates_and_delegates_commit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-publish-request-host-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-publish-request-host");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13355,19 +12692,11 @@ fn cluster_invite_publish_request_with_host_validates_and_delegates_commit() {
     .expect("unauthorized invite publish response");
     assert!(!rejected.accepted);
     assert_eq!(unauthorized_host.commits, 0);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-sync-noop-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-sync-noop");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13440,19 +12769,11 @@ fn stable_cluster_invitation_sync_does_not_append_raft_log_entries() {
         1,
         "repeat invite sync should not create another raft log entry"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stale_cluster_kv_restore_refreshes_materialized_cache_from_raft() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-stale-restore-refresh-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-stale-restore-refresh");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13490,18 +12811,11 @@ fn stale_cluster_kv_restore_refreshes_materialized_cache_from_raft() {
             .get("/current")
             .is_some()
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-append-compacted-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-append-compacted");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -13580,18 +12894,11 @@ fn raft_append_request_omits_snapshot_for_up_to_date_compacted_follower() {
         far.snapshot.is_some(),
         "follower behind the retained tail must receive a snapshot"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_sort_prefers_unknown_private_tcp_over_unknown_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-unknown-iroh-sort-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-unknown-iroh-sort");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -13635,18 +12942,11 @@ fn connectivity_sort_prefers_unknown_private_tcp_over_unknown_iroh() {
             .iter()
             .any(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_sort_prefers_unknown_public_tcp_over_unknown_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-unknown-public-tcp-sort-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-unknown-public-tcp-sort");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -13702,7 +13002,6 @@ fn connectivity_sort_prefers_unknown_public_tcp_over_unknown_iroh() {
             .iter()
             .any(|endpoint| endpoint.endpoint_id == iroh.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -13766,13 +13065,7 @@ fn cluster_sync_targets_keep_lan_public_iroh_order_before_connectivity() {
 
 #[test]
 fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-lan-public-iroh-sort-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-lan-public-iroh-sort");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -13872,18 +13165,11 @@ fn connectivity_sort_uses_lan_public_iroh_fallback_order() {
             iroh.endpoint_id.clone(),
         ]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-target-order-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-target-order");
     let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
     let cluster_id = ClusterId::from_legacy_named("cluster_invite_target_order").expect("cluster");
     let local_node = NodeId::from_legacy_named("node_invite_local").expect("node");
@@ -13926,18 +13212,11 @@ fn cluster_invite_publish_targets_prefer_tcp_voters_over_iroh_when_available() {
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].transport, ClusterTransportKind::LanTcp);
     assert_eq!(targets[0].address, "192.0.2.11:21353");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-invite-target-connectivity-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-invite-target-connectivity");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -14053,18 +13332,11 @@ fn cluster_invite_publish_targets_use_connectivity_graph_for_fallback() {
         targets.first().map(|endpoint| &endpoint.endpoint_id),
         Some(&iroh.endpoint_id)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-status-route-connectivity-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-status-route-connectivity");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -14252,19 +13524,11 @@ fn member_daemon_status_targets_use_connectivity_without_promoting_iroh() {
     .expect("connectivity records");
     let targets = cluster_member_daemon_status_targets_with_connectivity(&paths, &state, &member);
     assert_eq!(targets[0].endpoint_id, iroh.endpoint_id);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-rollout-lan-public-iroh-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-lan-public-iroh");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -14366,19 +13630,11 @@ fn rollout_target_selection_uses_lan_public_iroh_fallback_order() {
     let selected = cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &candidates)
         .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, iroh.endpoint_id);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn rollout_target_selection_treats_hostname_tcp_as_direct_before_iroh() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-rollout-hostname-direct-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-rollout-hostname-direct");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -14414,19 +13670,11 @@ fn rollout_target_selection_treats_hostname_tcp_as_direct_before_iroh() {
         cluster_rollout_target_endpoint_for_main(&paths, &state, &main, &[iroh, hostname.clone()])
             .expect("rollout endpoint");
     assert_eq!(selected.endpoint_id, hostname.endpoint_id);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_sync_txn_is_empty_when_kv_already_matches() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-sync-idempotent-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-sync-idempotent");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -14485,19 +13733,11 @@ fn cluster_state_sync_txn_is_empty_when_kv_already_matches() {
         !third.success.is_empty(),
         "a real config change must publish"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn sync_cluster_state_to_kv_with_host_prepares_commits_and_skips_noop() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-sync-host-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-sync-host");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -14571,19 +13811,11 @@ fn sync_cluster_state_to_kv_with_host_prepares_commits_and_skips_noop() {
     assert_eq!(host.prepares, 2);
     assert_eq!(host.commits, 1, "matching prepared state must skip commit");
     assert_eq!(second.revision, first.revision);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_sync_txn_diffs_member_endpoint_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-sync-endpoint-diff-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-sync-endpoint-diff");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -14670,8 +13902,6 @@ fn cluster_state_sync_txn_diffs_member_endpoint_records() {
             .all(|op| !matches!(op, KvOp::Put { key, .. } if key == &unchanged_key)),
         "unchanged endpoint should not be re-put"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -14750,13 +13980,7 @@ fn merge_cluster_join_registration_preserves_locally_learned_remote_route_endpoi
 
 #[test]
 fn cluster_state_sync_txn_deletes_replaced_member_identity_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-sync-identity-replace-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-sync-identity-replace");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -14865,8 +14089,6 @@ fn cluster_state_sync_txn_deletes_replaced_member_identity_records() {
         )),
         "identity replacement should avoid broad endpoint prefix deletes"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn endpoint_limit_fixture(node_id: &NodeId, label: &str, index: usize) -> ClusterEndpointRecord {
@@ -14903,13 +14125,7 @@ fn seed_member_endpoint_prefix_over_limit(
 
 #[test]
 fn read_cluster_members_from_kv_allows_large_aggregate_endpoint_sets() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-endpoint-aggregate-limit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-endpoint-aggregate-limit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -14964,8 +14180,6 @@ fn read_cluster_members_from_kv_allows_large_aggregate_endpoint_sets() {
         read_cluster_endpoints_from_kv(&paths).expect_err("aggregate endpoint range limit"),
         "/cluster/endpoints/",
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -15000,13 +14214,7 @@ fn cluster_member_publish_txn_rejects_oversized_no_snapshot_endpoint_set() {
 
 #[test]
 fn cluster_state_sync_txn_rejects_oversized_member_endpoint_prefix() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-sync-endpoint-limit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-sync-endpoint-limit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15034,8 +14242,6 @@ fn cluster_state_sync_txn_rejects_oversized_member_endpoint_prefix() {
             max_entries: MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
         }) if prefix == &cluster_endpoint_prefix(&node_id)
     ));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -15129,13 +14335,7 @@ fn cluster_member_publish_txn_from_snapshot_diffs_endpoint_records() {
 
 #[test]
 fn cluster_member_publish_matches_kv_rejects_oversized_member_endpoint_prefix() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-publish-match-endpoint-limit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-match-endpoint-limit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15167,8 +14367,6 @@ fn cluster_member_publish_matches_kv_rejects_oversized_member_endpoint_prefix() 
             max_entries: MAX_CLUSTER_MEMBER_ENDPOINT_RECORDS,
         }) if prefix == &cluster_endpoint_prefix(&node_id)
     ));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -15299,13 +14497,7 @@ fn cluster_member_publish_txn_from_snapshot_skips_stable_member_records() {
 
 #[test]
 fn cluster_member_publish_treats_mdns_and_observed_sources_as_stable() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-publish-source-stable-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-source-stable");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15369,19 +14561,11 @@ fn cluster_member_publish_treats_mdns_and_observed_sources_as_stable() {
         "source-only member publish should not emit raft writes: {:?}",
         txn.success
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_member_publish_ignores_stable_endpoint_order() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-publish-endpoint-order-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-endpoint-order");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15456,8 +14640,6 @@ fn cluster_member_publish_ignores_stable_endpoint_order() {
         "endpoint reorder should not emit raft writes: {:?}",
         txn.success
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[derive(Default)]
@@ -15650,13 +14832,7 @@ impl ClusterLocalMemberPublishAsyncHost for RecordingClusterLocalMemberPublishHo
 
 #[test]
 fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-publish-request-host-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-request-host");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15769,19 +14945,11 @@ fn cluster_member_publish_request_with_host_validates_and_delegates_commit() {
     .expect("unauthorized member publish response");
     assert!(!rejected.accepted);
     assert_eq!(unauthorized_host.commits, 0);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_membership_rpc_dispatch_decodes_and_encodes_member_publish() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-membership-rpc-member-publish-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-membership-rpc-member-publish");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15845,18 +15013,11 @@ fn cluster_membership_rpc_dispatch_decodes_and_encodes_member_publish() {
             .is_some(),
         "network membership RPC dispatch should commit endpoint publication through the host"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-member-publish-commit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-member-publish-commit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15899,18 +15060,11 @@ fn local_member_publish_with_host_commits_when_local_voter_has_quorum() {
         snapshot.get(&cluster_member_key(&local)).is_some(),
         "local voter quorum commit should publish the local member record"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-member-publish-async-commit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-member-publish-async-commit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -15959,18 +15113,11 @@ fn local_member_publish_async_with_host_commits_when_local_voter_has_quorum() {
         snapshot.get(&cluster_member_key(&local)).is_some(),
         "async local voter quorum commit should publish the local member record"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-member-publish-forward-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-member-publish-forward");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16046,18 +15193,11 @@ fn local_member_publish_with_host_forwards_when_local_commit_is_unavailable() {
             .is_some(),
         "accepted voter publish responses should refresh the local KV snapshot"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_member_publish_async_with_host_forwards_when_local_commit_is_unavailable() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-member-publish-async-forward-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-member-publish-async-forward");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16140,7 +15280,6 @@ fn local_member_publish_async_with_host_forwards_when_local_commit_is_unavailabl
             .is_some(),
         "accepted async voter publish responses should refresh the local KV snapshot"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -16165,13 +15304,7 @@ fn cluster_member_publish_authorizes_signer_shadow_daemon() {
 
 #[test]
 fn cluster_state_sync_treats_mdns_and_observed_sources_as_stable() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-state-source-stable-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-source-stable");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16216,19 +15349,11 @@ fn cluster_state_sync_treats_mdns_and_observed_sources_as_stable() {
         "cluster state sync should skip source-only endpoint changes: {:?}",
         txn.success
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-unchecked-sync-noop-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-unchecked-sync-noop");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16281,19 +15406,11 @@ fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
             .len(),
         "stable unchecked cluster-state sync should not append no-op raft entries"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_storage_syncs_members_and_node_status_to_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-storage-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-storage");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16422,19 +15539,11 @@ fn cluster_storage_syncs_members_and_node_status_to_kv() {
         ))
         .expect("async open");
     assert_eq!(async_node.node_id(), &state.local_node_id);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn async_cluster_raft_append_request_builder_matches_sync_builder() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-async-raft-append-build-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-async-raft-append-build");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16482,7 +15591,6 @@ fn async_cluster_raft_append_request_builder_matches_sync_builder() {
 
     assert_eq!(async_request, sync_request);
     assert!(last_log_index >= async_request.append.leader_commit);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -16564,13 +15672,7 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-async-raft-append-retry-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-async-raft-append-retry");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16622,7 +15724,6 @@ fn async_cluster_raft_append_replication_retries_from_rejected_match_index() {
     assert_eq!(host.next_indexes, vec![6, 3]);
     assert_eq!(host.sent, 2);
     assert_eq!(host.timeouts.len(), 2);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -16726,13 +15827,7 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         }
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-async-raft-quorum-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-async-raft-quorum");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -16815,7 +15910,6 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         vec![(remote.clone(), ClusterConnectivityState::Healthy)]
     );
     assert!(host.fanout_targets.contains(&remote));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -16928,13 +16022,7 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
             .is_empty()
     );
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-health-probe-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-health-probe");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17200,8 +16288,6 @@ fn cluster_health_rows_with_probe_owns_liveness_and_peer_view_merge() {
         async_current_state_rows.len(),
         current_state_response_rows.len()
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn doctor_connectivity_record(
@@ -17503,13 +16589,7 @@ impl ClusterNodeStatusPublishAsyncHost for RecordingClusterNodeStatusPublishHost
 
 #[test]
 fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-node-status-quorum-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-node-status-quorum-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17580,8 +16660,6 @@ fn node_status_quorum_publish_driver_delegates_and_cleans_rollout_sidecar() {
             .expect("cached node status");
     assert!(cached.is_none());
     assert_eq!(stored_match_host.commits, 0);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -17590,13 +16668,7 @@ fn node_status_async_quorum_publish_driver_delegates() {
         .enable_all()
         .build()
         .expect("runtime");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-node-status-async-quorum-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-node-status-async-quorum-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17657,19 +16729,11 @@ fn node_status_async_quorum_publish_driver_delegates() {
             .any(|op| matches!(op, KvOp::Put { key, .. } if key == &status_key)),
         "async network driver should plan node-status publication"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-info-quorum-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-info-quorum-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17741,19 +16805,11 @@ fn network_info_quorum_publish_driver_delegates_and_uses_publish_cache() {
     assert!(cached.is_none());
     assert_eq!(host.commits, 0);
     assert_eq!(host.remembers, 1, "cache hit should not re-remember");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-stable-status-network-no-raft-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-stable-status-network-no-raft-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17828,8 +16884,6 @@ fn stable_status_and_network_info_sync_do_not_append_raft_log_entries() {
             .len(),
         "stable fresh network-info publishes should not append no-op raft entries"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn sobj_reported_len(bytes: &[u8]) -> usize {
@@ -17843,13 +16897,7 @@ fn sobj_reported_len(bytes: &[u8]) -> usize {
 fn cluster_state_read_rejects_trailing_file_bytes() {
     use std::io::Write;
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-state-trailing-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-trailing");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17878,20 +16926,13 @@ fn cluster_state_read_rejects_trailing_file_bytes() {
         read_cluster_state(&paths).is_err(),
         "stored SOBJ files with trailing bytes violate the object length invariant"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_rewrite_removes_trailing_file_bytes() {
     use std::io::Write;
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-state-rewrite-trailing-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-rewrite-trailing");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17927,18 +16968,11 @@ fn cluster_state_rewrite_removes_trailing_file_bytes() {
         .expect("strict state decode");
     assert_eq!(strict.cluster_id, cluster_id);
     assert_eq!(strict.cluster_name, "rewritten trailing state");
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_read_rejects_prefixed_or_truncated_file_bytes() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-state-invalid-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-invalid");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17970,18 +17004,11 @@ fn cluster_state_read_rejects_prefixed_or_truncated_file_bytes() {
         read_cluster_state(&paths).is_err(),
         "truncated objects must not be accepted"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_read_rejects_oversized_object_file_before_reading() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-state-oversized-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-oversized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -17999,18 +17026,11 @@ fn cluster_state_read_rejects_oversized_object_file_before_reading() {
         matches!(error, NetworkError::StorageIo { ref detail, .. } if detail.contains("max is")),
         "unexpected error for oversized state: {error}"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_load_preserves_newer_local_member_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-state-merge-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-state-merge");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18043,19 +17063,11 @@ fn cluster_state_load_preserves_newer_local_member_records() {
     assert_eq!(loaded.members[0].node_id, node_id);
     assert_eq!(loaded.members[0].role, ClusterMemberRole::Voter);
     assert_eq!(loaded.members[0].state, ClusterMemberState::Voter);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_load_does_not_downgrade_local_member_from_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-local-member-merge-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-local-member-merge");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18088,19 +17100,11 @@ fn cluster_state_load_does_not_downgrade_local_member_from_kv() {
     assert_eq!(loaded.members[0].node_id, node_id);
     assert_eq!(loaded.members[0].role, ClusterMemberRole::Voter);
     assert_eq!(loaded.members[0].state, ClusterMemberState::Voter);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_state_load_drops_remote_members_removed_from_kv() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-removed-member-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-removed-member");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18148,19 +17152,11 @@ fn cluster_state_load_drops_remote_members_removed_from_kv() {
             .collect::<Vec<_>>(),
         vec![local_node_id]
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-cluster-corrupt-read-view-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-cluster-corrupt-read-view");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18185,18 +17181,11 @@ fn cluster_read_view_falls_back_to_snapshot_when_local_raft_state_is_corrupt() {
 
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].node_id, node_id);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_network_records_publish_overwrite_and_expire() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-graph-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-graph");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18353,19 +17342,11 @@ fn cluster_network_records_publish_overwrite_and_expire() {
             .expect("read expired graph")
             .is_empty()
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-expire-large-prefix-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-large-prefix");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18447,19 +17428,11 @@ fn expire_cluster_network_records_handles_prefix_larger_than_public_range_limit(
             .is_none(),
         "expiration should clear all records even when the prefix exceeds the public range limit"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-expire-bounded-ops-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-bounded-ops");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18541,8 +17514,6 @@ fn expire_cluster_network_record_ops_returns_bounded_compare_batches() {
         expire_cluster_network_record_ops(&paths, &state, now).expect("remaining expire ops");
     assert_eq!(remaining_compares.len(), 1);
     assert_eq!(remaining_success.len(), 1);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[derive(Default)]
@@ -18572,13 +17543,7 @@ impl ClusterNetworkRecordExpiryHost for RecordingNetworkRecordExpiryHost {
 
 #[test]
 fn expire_cluster_network_records_with_host_delegates_commit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-expire-host-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-expire-host");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18646,19 +17611,11 @@ fn expire_cluster_network_records_with_host_delegates_commit() {
         .expect("idle");
     assert!(idle.is_none(), "no remaining records should skip commit");
     assert_eq!(idle_host.commits, 0);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_full_sync_batch_skips_exact_expired_noop() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-expired-noop-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-expired-noop");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18714,19 +17671,11 @@ fn connectivity_full_sync_batch_skips_exact_expired_noop() {
         ops.is_empty(),
         "exact expired records should not loop by planning no-effect puts"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_full_sync_plans_bounded_batches() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-bounded-planner-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-bounded-planner");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -18863,8 +17812,6 @@ fn connectivity_full_sync_plans_bounded_batches() {
             .iter()
             .all(|key| snapshot.get(key.as_str()).is_none())
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[derive(Default)]
@@ -18912,13 +17859,7 @@ impl ClusterConnectivityPublishHost for RecordingClusterConnectivityPublishHost 
 
 #[test]
 fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-quorum-driver-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-quorum-driver");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19007,8 +17948,6 @@ fn connectivity_quorum_sync_driver_delegates_commits_and_remembers() {
     assert!(cached.is_none(), "host cache hit should skip KV planning");
     assert_eq!(host.commits, Vec::<usize>::new());
     assert_eq!(host.remembers, 1, "cache-hit path should not re-remember");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 /// Simulates a forwarding learner: commits land in the "voter's" in-memory
@@ -19049,13 +17988,7 @@ impl ClusterConnectivityPublishAsyncHost for ForwardingOnlyConnectivityPublishAs
 
 #[test]
 fn async_connectivity_quorum_sync_terminates_when_local_kv_lags_forwarded_commits() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-forward-lag-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-forward-lag");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19150,19 +18083,11 @@ fn async_connectivity_quorum_sync_terminates_when_local_kv_lags_forwarded_commit
         error.to_string().contains("no progress"),
         "error should name the no-progress condition: {error}"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_full_sync_batches_large_stale_deletions() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-large-delete-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-large-delete");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19234,19 +18159,11 @@ fn connectivity_full_sync_batches_large_stale_deletions() {
             .is_none(),
         "full sync should delete stale source records in bounded batches"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn connectivity_sync_refreshes_stable_records_near_expiry() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-connectivity-refresh-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-connectivity-refresh");
     let data_dir = sinomo_local::SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19321,8 +18238,6 @@ fn connectivity_sync_refreshes_stable_records_near_expiry() {
         ops.is_empty(),
         "fresh stable connectivity records should not be rewritten just to update timestamps"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -19384,13 +18299,7 @@ fn raft_config_rejects_voter_removal_without_old_quorum_overlap() {
 
 #[test]
 fn cluster_kv_watch_event_log_is_bounded() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19419,18 +18328,11 @@ fn cluster_kv_watch_event_log_is_bounded() {
         retained.last().expect("last retained").revision,
         KvRevision(MAX_CLUSTER_KV_WATCH_EVENTS as u64 + 10)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-append-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-append");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19482,18 +18384,11 @@ fn cluster_kv_watch_events_append_log_suppresses_duplicate_batches() {
         cluster_kv_watch_events(&paths).expect("read watch events"),
         vec![event]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-no-snapshot-probe-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-no-snapshot-probe");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19524,18 +18419,11 @@ fn cluster_kv_watch_events_append_skips_missing_snapshot_probe() {
         cluster_kv_watch_events(&paths).expect("read watch events"),
         vec![event]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-no-active-watchers-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-no-active-watchers");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19649,18 +18537,12 @@ fn cluster_kv_watch_event_fanout_skips_storage_without_active_watchers() {
     .expect("drain active watch");
     assert_eq!(drained.events, vec![event]);
     assert_eq!(drained.next_revision, KvRevision(2));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_receiver_skips_storage_without_active_watchers() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-receiver-no-active-watchers-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root =
+        sinomo_testdir::TestDir::new("sinomo-network-watch-events-receiver-no-active-watchers");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19710,18 +18592,11 @@ fn cluster_kv_watch_events_receiver_skips_storage_without_active_watchers() {
         !paths.kv_watch_events_log.exists(),
         "no active watcher should avoid log appends"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-active-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-active-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19882,19 +18757,11 @@ fn cluster_kv_watch_event_fanout_reuses_active_registration_cache() {
         (1..=2).contains(&durable_flush_scans),
         "durable cursor flush replaces the watch file, so the changed directory mark should force a bounded cache rebuild; got {durable_flush_scans} scans"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-large-direct-checkpoint-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-large-direct-checkpoint");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19936,19 +18803,11 @@ fn cluster_kv_watch_events_large_batch_checkpoints_without_log_append_write() {
         cluster_kv_watch_events(&paths).expect("read retained large event"),
         vec![event]
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-duplicate-checkpoint-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-duplicate-checkpoint");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -19984,19 +18843,11 @@ fn cluster_kv_watch_events_duplicate_checkpoint_append_does_not_create_empty_log
         cluster_kv_watch_events(&paths).expect("read retained large event"),
         vec![event]
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-duplicate-repair-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-duplicate-repair");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20034,19 +18885,11 @@ fn cluster_kv_watch_events_duplicate_append_repairs_damaged_log() {
             .any(|window| window == b"partial"),
         "duplicate append should still repair a damaged watch-event log tail"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_events_append_log_uses_warm_cache_without_rescan() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-warm-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-warm-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20086,18 +18929,11 @@ fn cluster_kv_watch_events_append_log_uses_warm_cache_without_rescan() {
         cluster_kv_watch_events(&paths).expect("read watch events"),
         vec![first, second]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-compact-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-compact");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20133,18 +18969,11 @@ fn cluster_kv_watch_event_log_compacts_to_checkpoint_after_large_batch() {
         0,
         "compaction should clear the append log after checkpointing"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_repairs_overgrown_valid_log_before_append() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-overgrown-valid-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-overgrown-valid");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20207,18 +19036,11 @@ fn cluster_kv_watch_event_log_repairs_overgrown_valid_log_before_append() {
             < overgrown_len,
         "repaired log should not keep the overgrown valid tail"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_keeps_complete_boundary_revision() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-boundary-revision-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-boundary-revision");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20258,18 +19080,11 @@ fn cluster_kv_watch_event_log_keeps_complete_boundary_revision() {
         "all events in the boundary revision should be retained together"
     );
     assert_eq!(retained.len(), MAX_CLUSTER_KV_WATCH_EVENTS + 1);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-drop-stale-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-drop-stale");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20311,18 +19126,11 @@ fn cluster_kv_watch_event_log_drops_delayed_events_older_than_retention_floor() 
             .expect("read watch events")
             .contains(&stale)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-drop-stale-batch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-drop-stale-batch");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20370,18 +19178,11 @@ fn cluster_kv_watch_event_log_drops_large_stale_batches_without_rewrite() {
         log_len,
         "stale delayed batches should not append log records"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-partial-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-partial");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20420,18 +19221,11 @@ fn cluster_kv_watch_event_log_repairs_partial_tail_before_append() {
         cluster_kv_watch_events(&paths).expect("read repaired events"),
         vec![first, second]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-oversized-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-oversized");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20476,18 +19270,11 @@ fn cluster_kv_watch_event_log_repairs_oversized_tail_before_append() {
             .any(|window| window == b"ignored"),
         "oversized watch-event tail should be truncated before appending"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-unreadable-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-unreadable");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20526,18 +19313,11 @@ fn cluster_kv_watch_event_log_repairs_unreadable_tail_before_append() {
         cluster_kv_watch_events(&paths).expect("read repaired events"),
         vec![first, second]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-events-concurrent-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-events-concurrent");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20572,18 +19352,11 @@ fn cluster_kv_watch_event_log_serializes_concurrent_duplicate_appends() {
         cluster_kv_watch_events(&paths).expect("read concurrent events"),
         vec![event]
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-current-raft-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-current-raft");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20635,18 +19408,11 @@ fn cluster_kv_watch_drain_reads_current_raft_view_when_snapshot_is_stale() {
             .iter()
             .any(|event| event.key == "/watch/current")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_reader_node_id_cache_tracks_state_rewrites_and_removal() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-reader-node-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-reader-node-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20698,18 +19464,11 @@ fn cluster_kv_reader_node_id_cache_tracks_state_rewrites_and_removal() {
         cached_cluster_kv_reader_node_id_for_test(&paths).is_none(),
         "state removal should invalidate the cached reader node id"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-metadata-no-snapshot-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-metadata-no-snapshot");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20787,18 +19546,11 @@ fn cluster_kv_metadata_reads_are_empty_without_materialized_snapshot() {
         0,
         "missing materialized snapshots should not be counted as cached snapshot reads"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_put_sync_skips_noop_probe_without_materialized_snapshot() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-put-no-snapshot-probe-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-put-no-snapshot-probe");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20840,8 +19592,6 @@ fn cluster_kv_put_sync_skips_noop_probe_without_materialized_snapshot() {
         paths.kv_snapshot.exists(),
         "the actual raft append should still materialize the snapshot"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -20849,13 +19599,7 @@ fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
     let _guard = CLUSTER_KV_METADATA_CACHE_TEST_MUTEX
         .lock()
         .expect("metadata cache mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-kv-metadata-cache-lru-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-kv-metadata-cache-lru");
     let hot_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("000-hot-allocator")));
     for index in 0..cluster_kv_metadata_cache_capacity_for_test().saturating_sub(1) {
         let quiet_paths = ClusterPaths::new(&SinomoDataDir::new(
@@ -20900,13 +19644,7 @@ fn cluster_kv_metadata_caches_retain_recent_entries_at_capacity() {
 
 #[test]
 fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-wait-fanout-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-wait-fanout");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -20954,7 +19692,6 @@ fn cluster_kv_watch_drain_waits_for_fanned_out_events() {
         "waiting drain should be notified instead of timing out after {elapsed:?}"
     );
     assert_eq!(drained.events, vec![event]);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -20962,13 +19699,7 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
         .lock()
         .expect("notifier mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-prefix-notify-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-prefix-notify");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21096,7 +19827,6 @@ fn cluster_kv_watch_long_poll_ignores_unrelated_prefix_notification() {
     );
     assert_eq!(drained.events, vec![matching]);
     assert_eq!(drained.next_revision, KvRevision(3));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -21104,13 +19834,7 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
         .lock()
         .expect("notifier mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-targeted-notify-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-targeted-notify");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21207,7 +19931,6 @@ fn cluster_kv_watch_long_poll_ignores_other_matching_watch_notification() {
     );
     assert_eq!(drained.events, vec![watch_a_event]);
     assert_eq!(drained.next_revision, KvRevision(3));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -21215,13 +19938,7 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
     let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
         .lock()
         .expect("notifier mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-notifier-churn-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-notifier-churn");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     touch_cluster_kv_watch_notifier_for_test(&paths);
@@ -21268,7 +19985,6 @@ fn cluster_kv_watch_notifier_retains_active_waiters_under_path_churn() {
         elapsed < Duration::from_secs(2),
         "active waiter should be notified instead of falling back to timeout after {elapsed:?}"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -21276,13 +19992,7 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
     let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
         .lock()
         .expect("notifier mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-notifier-active-capacity-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-notifier-active-capacity");
     remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
     let active_keys = (0..cluster_kv_watch_notifier_capacity_for_test())
         .map(|index| root.join(format!("active-{index:04}")))
@@ -21303,18 +20013,11 @@ fn cluster_kv_watch_notifier_does_not_evict_active_waiters_at_capacity() {
         );
     }
     remove_cluster_kv_watch_notifier_entries_under_root_for_test(&root);
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-drain-payload-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-drain-payload");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21363,18 +20066,11 @@ fn cluster_kv_watch_drain_payload_limit_does_not_skip_events() {
     .expect("second bounded drain");
     assert_eq!(drained.events, vec![second]);
     assert_eq!(drained.next_revision, KvRevision(3));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-drain-revision-group-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-drain-revision-group");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21430,18 +20126,11 @@ fn cluster_kv_watch_drain_payload_limit_keeps_revision_groups() {
     .expect("second bounded drain");
     assert_eq!(drained.events, vec![third]);
     assert_eq!(drained.next_revision, KvRevision(3));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-drain-dedup-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-drain-dedup");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21485,7 +20174,6 @@ fn cluster_kv_watch_drain_deduplicates_snapshot_and_fanout_events() {
 
     assert_eq!(drained.events, vec![duplicate]);
     assert_eq!(drained.next_revision, KvRevision(2));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -21493,13 +20181,7 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
     let _guard = CLUSTER_KV_WATCH_NOTIFIER_TEST_MUTEX
         .lock()
         .expect("notifier mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-long-poll-empty-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-long-poll-empty");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21530,18 +20212,11 @@ fn cluster_kv_watch_drain_long_poll_avoids_redundant_pre_wait_poll() {
         1,
         "empty long-poll timeout should not reread snapshot/log state when no watch generation changed"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-zero-timeout-empty-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-zero-timeout-empty");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21613,18 +20288,11 @@ fn cluster_kv_watch_drain_zero_timeout_reuses_empty_result_until_change() {
         2,
         "watch event generation changes must invalidate the cached empty result"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-identical-snapshot-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-identical-snapshot");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21673,18 +20341,11 @@ fn write_cluster_kv_snapshot_identical_does_not_wake_waiting_watch() {
         1,
         "identical snapshot materialization should not wake quiet watchers"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_cancel_wakes_waiting_drain() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-cancel-wake-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-cancel-wake");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21735,18 +20396,11 @@ fn cluster_kv_watch_cancel_wakes_waiting_drain() {
         Err(NetworkError::Kv(KvError::UnknownWatch { watch_id }))
             if watch_id == expected_watch_id
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-missing-drain-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-missing-drain");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21765,18 +20419,11 @@ fn cluster_kv_watch_drain_reports_unknown_watch_for_missing_registration() {
         error,
         NetworkError::Kv(KvError::UnknownWatch { watch_id: returned }) if returned == watch_id
     ));
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-wait-raft-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-wait-raft");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21842,18 +20489,11 @@ fn cluster_kv_watch_drain_waits_for_local_raft_commit() {
             .iter()
             .any(|event| event.key == "/watch/wait/raft")
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-create-concurrent-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-create-concurrent");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21906,18 +20546,11 @@ fn cluster_kv_watch_create_allocates_unique_ids_concurrently() {
             read_object_file(&watch_path).expect("read watch registration");
         assert_eq!(stored, registration);
     }
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-cancel-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-cancel");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -21982,19 +20615,11 @@ fn cluster_kv_watch_cancel_removes_registration_without_reusing_id() {
         allocator.next_watch_id > second.watch_id.0,
         "watch allocator should advance past the newest watch id"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-create-no-scan-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-create-no-scan");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22065,19 +20690,11 @@ fn create_cluster_kv_watch_uses_allocator_count_without_directory_scan() {
     let allocator: ClusterKvWatchAllocatorState =
         read_object_file(&paths.kv_watches_next_id).expect("read allocator after replacement");
     assert_eq!(allocator.active_watch_count, Some(2));
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-create-rescan-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-create-rescan");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22117,19 +20734,11 @@ fn create_cluster_kv_watch_rescans_after_watch_directory_changes() {
         repaired.watch_id.0 > 99,
         "watch ids must not reuse ids from externally observed registrations"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failure() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-create-persist-failure-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-create-persist-failure");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22171,19 +20780,11 @@ fn create_cluster_kv_watch_rolls_back_registration_after_allocator_persist_failu
         WatchId(1),
         "rolled-back failed creates should not consume a watch id"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-registration-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-registration-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22243,19 +20844,11 @@ fn cluster_kv_watch_registration_cache_tracks_create_drain_and_cancel() {
         cached_cluster_kv_watch_registration_for_test(&paths, watch.watch_id).is_none(),
         "cancel should invalidate the cached registration"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-deferred-cursor-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-deferred-cursor");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22342,19 +20935,11 @@ fn cluster_kv_watch_drain_defers_small_cursor_writes_until_lag_bound() {
         KvRevision(lag_bound + 1),
         "the durable cursor must flush before replay lag can exceed the retained watch-event window"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_enforces_active_registration_limit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-active-limit-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-active-limit");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22392,19 +20977,11 @@ fn create_cluster_kv_watch_enforces_active_registration_limit() {
             .count(),
         MAX_CLUSTER_KV_ACTIVE_WATCHES
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-active-limit-cancel-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-active-limit-cancel");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22456,19 +21033,11 @@ fn create_cluster_kv_watch_allows_replacement_after_cancel_at_limit() {
             .count(),
         MAX_CLUSTER_KV_ACTIVE_WATCHES
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_watch_drain_removes_compacted_registration() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-compacted-drain-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-compacted-drain");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22513,18 +21082,11 @@ fn cluster_kv_watch_drain_removes_compacted_registration() {
         !watch_path.exists(),
         "compacted watch registration should be removed after failed drain"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_prunes_compacted_registrations() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-compacted-create-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-compacted-create");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22587,18 +21149,11 @@ fn create_cluster_kv_watch_prunes_compacted_registrations() {
         newest.watch_id > live.watch_id,
         "new watch ids should continue after retained registrations"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_prunes_unreadable_registration_without_reusing_id() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-unreadable-create-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-unreadable-create");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22624,19 +21179,11 @@ fn create_cluster_kv_watch_prunes_unreadable_registration_without_reusing_id() {
         watch.watch_id.0 > 99,
         "watch ids must not be reused after pruning an unreadable high-id registration"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-mismatched-create-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-mismatched-create");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22670,19 +21217,11 @@ fn create_cluster_kv_watch_prunes_mismatched_registration_without_reusing_id() {
         watch.watch_id.0 > 99,
         "watch ids must not be reused after pruning a mismatched high-id registration"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-create-scan-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-create-scan");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22747,19 +21286,11 @@ fn create_cluster_kv_watch_prunes_and_allocates_with_one_directory_scan() {
         watch.watch_id.0 > 11,
         "watch ids must not be reused after pruning the highest seen registration"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_kv_materialized_snapshot_event_history_is_bounded() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-materialized-events-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-materialized-events");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22790,18 +21321,11 @@ fn cluster_kv_materialized_snapshot_event_history_is_bounded() {
         stored.events.last().expect("last retained").revision,
         KvRevision(sinomo_kv::MAX_CLUSTER_KV_MATERIALIZED_EVENTS as u64 + 10)
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn committed_raft_index_reports_only_new_events() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-committed-events-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-committed-events");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22854,18 +21378,11 @@ fn committed_raft_index_reports_only_new_events() {
             .iter()
             .all(|event| event.revision > KvRevision(1))
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-raft-snapshot-events-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-raft-snapshot-events");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -22897,7 +21414,6 @@ fn cluster_raft_snapshot_event_history_is_bounded_when_compacted() {
         stored.kv.events.len() <= MAX_CLUSTER_KV_RAFT_SNAPSHOT_EVENTS,
         "raft snapshots should not retain an unbounded event tail"
     );
-    std::fs::remove_dir_all(root).ok();
 }
 
 fn node(id: &str) -> NodeProfile {
@@ -23970,13 +22486,7 @@ fn cluster_iroh_endpoint_advertisement_updates_state_once() {
 
 #[test]
 fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-refresh-local-iroh-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-local-iroh");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -24102,19 +22612,11 @@ fn refresh_local_iroh_endpoints_from_disk_updates_local_daemon_members() {
         .expect("async membership refresh");
     assert!(membership_refresh.iroh_endpoints_changed);
     assert!(membership_refresh.public_keys_changed);
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-iroh-kv-cleanup-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-iroh-kv-cleanup");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -24184,8 +22686,6 @@ fn read_cluster_members_from_kv_collapses_duplicate_iroh_endpoint_records() {
     assert_eq!(iroh.len(), 1);
     assert_eq!(iroh[0].endpoint_id, stable.endpoint_id);
     assert_eq!(iroh[0].address, "iroh://same_public_key");
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -29440,13 +27940,7 @@ static IO_OBSERVER_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
 fn cluster_kv_watch_events_cache_reuses_unchanged_event_view() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-event-cache-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-event-cache");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -29509,8 +28003,6 @@ fn cluster_kv_watch_events_cache_reuses_unchanged_event_view() {
         cluster_kv_watch_events(&paths).expect("cached read after append"),
         vec![first, second]
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -29518,13 +28010,7 @@ fn cluster_kv_watch_caches_retain_recent_entries_at_capacity() {
     let _guard = CLUSTER_KV_WATCH_CACHE_TEST_MUTEX
         .lock()
         .expect("watch cache mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-watch-cache-lru-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-watch-cache-lru");
 
     let hot_event_paths = ClusterPaths::new(&SinomoDataDir::new(root.join("000-hot-events")));
     for index in 0..cluster_kv_watch_event_cache_capacity_for_test().saturating_sub(1) {
@@ -29575,13 +28061,7 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
     let previous: Option<Arc<dyn IoObserver>> =
         set_io_observer(Some(observer.clone() as Arc<dyn IoObserver>));
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-storage-observer-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-storage-observer");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -29623,7 +28103,6 @@ fn write_cluster_state_observer_counts_actual_then_skipped() {
 
     // Restore the previous observer so we don't poison sibling tests.
     let _ = set_io_observer(previous);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -29634,13 +28113,7 @@ fn write_object_file_skips_compare_read_when_length_differs() {
     let previous: Option<Arc<dyn IoObserver>> =
         set_io_observer(Some(observer.clone() as Arc<dyn IoObserver>));
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-sparse-objfile-rewrite-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-sparse-objfile-rewrite");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("paths");
@@ -29675,7 +28148,6 @@ fn write_object_file_skips_compare_read_when_length_differs() {
     );
 
     let _ = set_io_observer(previous);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -29685,13 +28157,7 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
         value: u64,
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-optional-object-read-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-optional-object-read");
     std::fs::create_dir_all(&root).expect("root");
 
     let missing = root.join("missing.sobj");
@@ -29717,8 +28183,6 @@ fn read_optional_object_file_treats_only_missing_file_as_absent() {
         crate::storage::read_optional_object_file::<OptionalObjectFixture>(&directory).is_err(),
         "a directory at an optional object path is a storage error, not absence"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -29728,13 +28192,7 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
         value: u64,
     }
 
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-create-new-link-fallback-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-create-new-link-fallback");
     std::fs::create_dir_all(&root).expect("root");
     let path = root.join("object.sobj");
 
@@ -29772,7 +28230,6 @@ fn write_object_file_create_new_falls_back_when_hard_links_are_unsupported() {
         "create-new fallback should not leave staged temp files behind"
     );
     crate::storage::clear_write_object_file_create_new_unsupported_link_for_test(&path);
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -29781,13 +28238,7 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
         .lock()
         .expect("object mark cache mutex");
     // Unique path so this test is independent of the process-wide I/O observer.
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-objfile-guard-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-objfile-guard");
     std::fs::create_dir_all(&root).expect("root");
     let path = root.join("obj.sobj");
 
@@ -29827,8 +28278,6 @@ fn write_object_file_skips_identical_and_rewrites_after_external_change() {
         restored, value,
         "a file changed since our last write must be rewritten, not skipped"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -29836,13 +28285,7 @@ fn object_file_write_mark_cache_retains_recent_entry_at_capacity() {
     let _guard = OBJECT_FILE_WRITE_MARK_CACHE_TEST_MUTEX
         .lock()
         .expect("object mark cache mutex");
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-object-mark-lru-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-object-mark-lru");
     let hot_path = root.join("000-hot.sobj");
     for index in 0..object_file_write_mark_cache_capacity_for_test().saturating_sub(1) {
         record_object_file_write_mark_for_test(&root.join(format!("100-quiet-{index:04}.sobj")));
@@ -29864,13 +28307,7 @@ fn object_file_write_mark_cache_retains_recent_entry_at_capacity() {
 
 #[test]
 fn write_object_file_cleans_temp_file_after_replace_failure() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-objfile-temp-cleanup-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-objfile-temp-cleanup");
     std::fs::create_dir_all(&root).expect("root");
     let path = root.join("obj.sobj");
     std::fs::create_dir(&path).expect("target directory");
@@ -29895,19 +28332,11 @@ fn write_object_file_cleans_temp_file_after_replace_failure() {
         leftovers, 0,
         "failed object replacement should not leave staged temp files"
     );
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-member-publish-stale-snapshot-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-member-publish-stale-snapshot");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -29990,19 +28419,11 @@ fn member_publish_already_current_hands_back_snapshot_to_stale_publisher() {
             assert_eq!(snapshot.revision, current_revision);
         }
     }
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn local_member_publish_forced_sync_publishes_even_when_records_current() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-local-member-publish-forced-sync-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-local-member-publish-forced-sync");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -30156,8 +28577,6 @@ fn local_member_publish_forced_sync_publishes_even_when_records_current() {
         after.get("/kv/forced-sync/stale-marker").is_none(),
         "an older responder snapshot must not be imported"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }
 
 #[derive(Default)]
@@ -30228,13 +28647,7 @@ impl ClusterKvSnapshotRefreshHost for RelayOnlySnapshotRefreshHost {
 
 #[test]
 fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-network-refresh-relay-fallback-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = sinomo_testdir::TestDir::new("sinomo-network-refresh-relay-fallback");
     let data_dir = SinomoDataDir::new(&root);
     let paths = ClusterPaths::new(&data_dir);
     paths.ensure().expect("cluster paths");
@@ -30304,6 +28717,4 @@ fn refresh_current_cluster_kv_store_falls_back_to_relayed_snapshot_fetch() {
             .is_some(),
         "relayed snapshot must be written locally"
     );
-
-    std::fs::remove_dir_all(root).ok();
 }

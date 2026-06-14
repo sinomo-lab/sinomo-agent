@@ -668,14 +668,14 @@ fn parse_container_bool(
 mod tests {
     use super::*;
 
-    fn test_layout() -> LocalSandboxInstanceLayout {
-        let root = std::env::temp_dir().join("sinomo-container-runner-test");
+    fn test_layout() -> (sinomo_testdir::TestDir, LocalSandboxInstanceLayout) {
+        let root = sinomo_testdir::TestDir::new("sinomo-container-runner-test");
         let sandbox_id = SandboxId::from_legacy_named("container_sandbox").expect("sandbox");
-        let layout = LocalSandboxInstanceLayout::new(root, &sandbox_id);
+        let layout = LocalSandboxInstanceLayout::new(root.to_path_buf(), &sandbox_id);
         for dir in layout.required_dirs() {
             let _ = fs::create_dir_all(dir);
         }
-        layout
+        (root, layout)
     }
 
     #[test]
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn container_run_args_include_isolation_and_mounts() {
-        let layout = test_layout();
+        let (_root, layout) = test_layout();
         let config =
             SandboxContainerBackendConfig::new(SandboxContainerRuntime::Docker, "alpine:3.20")
                 .expect("config");
@@ -739,7 +739,6 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "alpine:3.20"));
         assert!(args.iter().any(|arg| arg == "sh"));
         assert!(container_name(&command_id).starts_with("sinomo-sandbox-"));
-        let _ = fs::remove_dir_all(layout.runtime_root);
     }
 
     #[cfg(unix)]
@@ -747,12 +746,7 @@ mod tests {
     fn container_runner_persists_outputs_and_command_history_with_fake_runtime() {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-container-runner-e2e-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("runtime root");
+        let root = sinomo_testdir::TestDir::new("sinomo-container-runner-e2e");
         let fake_runtime = root.join("fake-container-runtime.sh");
         fs::write(
             &fake_runtime,
@@ -821,7 +815,5 @@ exec "$@"
                 .expect("stdout"),
             b"hello"
         );
-
-        let _ = fs::remove_dir_all(root);
     }
 }

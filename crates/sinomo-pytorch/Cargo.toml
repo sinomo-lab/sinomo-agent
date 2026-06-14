@@ -18,3 +18,6 @@ serde_json.workspace = true
 sinomo-runtime = { path = "../sinomo-runtime" }
 thiserror.workspace = true
 sinomo-lm = { path = "../sinomo-lm" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

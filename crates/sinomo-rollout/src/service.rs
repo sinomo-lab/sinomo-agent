@@ -132,13 +132,7 @@ mod tests {
     #[tokio::test]
     async fn rollout_diagnostics_serves_in_local_mode() {
         let registry = register_services(ServiceRegistry::builder()).build();
-        let dir = std::env::temp_dir().join(format!(
-            "sinomo-rollout-service-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
+        let dir = sinomo_testdir::TestDir::new("sinomo-rollout-service");
         let data_dir = Arc::new(SinomoDataDir::new(&dir));
         let sink = VecSink::default();
         let frames = Arc::clone(&sink.frames);
@@ -165,7 +159,5 @@ mod tests {
             .decode_body()
             .expect("decode report");
         assert!(report.contains("rollout root:"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

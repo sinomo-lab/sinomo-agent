@@ -1,19 +1,14 @@
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-fn unique_stage_layout(name: &str) -> (LocalSandboxInstanceLayout, PathBuf) {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let root = std::env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()));
+fn unique_stage_layout(name: &str) -> (LocalSandboxInstanceLayout, sinomo_testdir::TestDir) {
+    let root = sinomo_testdir::TestDir::new(name);
     let sandbox_id = SandboxId::from_legacy_named(name).expect("sandbox id");
     (LocalSandboxInstanceLayout::new(&root, &sandbox_id), root)
 }
 
 #[test]
 fn toolchain_runtime_cache_reuses_content_addressed_stage() {
-    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-reuse");
+    let (layout, _root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-reuse");
     let artifacts = vec![
         ("share/pkg/data.txt".to_string(), b"support".to_vec()),
         ("Lib/site.py".to_string(), b"stdlib".to_vec()),
@@ -70,13 +65,11 @@ fn toolchain_runtime_cache_reuses_content_addressed_stage() {
             .len(),
         1
     );
-
-    fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn toolchain_runtime_cache_changes_when_content_changes() {
-    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-change");
+    let (layout, _root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-change");
     let artifacts = vec![("share/pkg/data.txt".to_string(), b"support".to_vec())];
     let commands = vec![("sh".to_string(), b"sh module".to_vec())];
     stage_toolchain_runtime_to_local(&layout, &artifacts, &commands).expect("first stage");
@@ -90,13 +83,11 @@ fn toolchain_runtime_cache_changes_when_content_changes() {
         .collect::<Result<Vec<_>, _>>()
         .expect("cache entries");
     assert_eq!(cache_entries.len(), 2);
-
-    fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn toolchain_runtime_cache_repairs_incomplete_or_extra_complete_stage() {
-    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-repair");
+    let (layout, _root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-repair");
     let artifacts = vec![("share/pkg/data.txt".to_string(), b"support".to_vec())];
     let commands = vec![("sh".to_string(), b"sh module".to_vec())];
 
@@ -127,13 +118,11 @@ fn toolchain_runtime_cache_repairs_incomplete_or_extra_complete_stage() {
     );
     assert!(!repaired_dir.join("share/pkg/stale").exists());
     assert!(!repaired_dir.join("share/pkg/empty").exists());
-
-    fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn toolchain_runtime_cache_repairs_stale_complete_manifest() {
-    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-marker");
+    let (layout, _root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-marker");
     let artifacts = vec![("share/pkg/data.txt".to_string(), b"support".to_vec())];
     let commands = vec![("sh".to_string(), b"sh module".to_vec())];
 
@@ -153,13 +142,11 @@ fn toolchain_runtime_cache_repairs_stale_complete_manifest() {
     assert!(complete_marker.starts_with("sinomo-toolchain-runtime-cache-v1\n"));
     assert!(complete_marker.contains("artifact\tshare/pkg/data.txt\t7\tblake3:"));
     assert!(complete_marker.contains("command\tsh\t9\tblake3:"));
-
-    fs::remove_dir_all(root).ok();
 }
 
 #[test]
 fn toolchain_runtime_cache_rejects_reserved_sandbox_mount_top_level() {
-    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-reserved");
+    let (layout, _root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-reserved");
     let error = stage_toolchain_runtime_to_local(
         &layout,
         &[("etc/resolv.conf".to_string(), b"shadow".to_vec())],
@@ -173,7 +160,6 @@ fn toolchain_runtime_cache_rejects_reserved_sandbox_mount_top_level() {
             .contains("would shadow a sandbox filesystem mount"),
         "{error}"
     );
-    fs::remove_dir_all(root).ok();
 }
 
 #[cfg(feature = "wasix-runtime")]
@@ -181,7 +167,7 @@ fn toolchain_runtime_cache_rejects_reserved_sandbox_mount_top_level() {
 fn toolchain_runtime_virtual_preopens_do_not_depend_on_host_cache_after_staging() {
     use virtual_fs::FileSystem as _;
 
-    let (layout, root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-virtual");
+    let (layout, _root) = unique_stage_layout("sinomo-sandbox-toolchain-cache-virtual");
     let preopens = stage_toolchain_runtime_to_virtual(
         &[("share/pkg/data.txt".to_string(), b"support".to_vec())],
         &[("echo".to_string(), b"echo module".to_vec())],
@@ -207,6 +193,4 @@ fn toolchain_runtime_virtual_preopens_do_not_depend_on_host_cache_after_staging(
     virtual_mio::block_on(virtual_fs::AsyncReadExt::read_to_end(&mut file, &mut bytes))
         .expect("read virtual artifact");
     assert_eq!(bytes, b"support");
-
-    fs::remove_dir_all(root).ok();
 }

@@ -23,3 +23,6 @@ tokio = { version = "1.44", features = ["rt"] }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-node = { path = "../sinomo-node" }
 sinomo-storage = { path = "../sinomo-storage" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }

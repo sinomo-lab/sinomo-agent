@@ -312,7 +312,6 @@ fn swebench_benchmark_gate_records_progress_path() {
             .as_ref()
             .is_some_and(|path| execution.command.command.contains(path))
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -546,7 +545,6 @@ fn background_tick_estimates_require_campaign_context() {
 #[test]
 fn evolution_language_model_mutation_model_reports_unknown_provider() {
     let root = temp_dir("unknown-provider-model");
-    fs::create_dir_all(&root).expect("root");
     let packet = MutationPacket {
         job_id: EvolutionJobId::from_legacy_named("evojob_unknown_provider").expect("job"),
         objective: "test unknown provider".to_string(),
@@ -1556,7 +1554,6 @@ fn stage_evaluation_uses_failed_candidate_lesson_for_adaptation() {
                 evidence.contains("evolution-lesson:") && evidence.contains("evolution-lesson.json")
             })
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1712,7 +1709,6 @@ fn repeated_failed_campaign_iteration_proposes_reusable_regression_gates() {
             .flat_map(|stage| stage.regression_gates.iter())
             .any(|gate| gate.contains("replays/timeout-replay.json"))
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2913,7 +2909,6 @@ fn mutation_prompt_contains_objective_verification_and_recovery() {
 #[test]
 fn bridge_prompt_exposes_candidate_workspace_tools_and_json_contract() {
     let root = temp_dir("bridge-prompt");
-    fs::create_dir_all(&root).expect("root");
     let workspace = candidate_workspace(&root);
     let packet = MutationPacket {
         job_id: workspace.job_id.clone(),
@@ -2949,7 +2944,6 @@ fn bridge_prompt_exposes_candidate_workspace_tools_and_json_contract() {
     assert!(prompt.contains("no further stdout/stderr"));
     assert!(prompt.contains("Required JSON Response"));
     assert!(prompt.contains("json object"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3030,7 +3024,6 @@ fn mutation_packet_collects_relevant_source_excerpts_from_intended_paths() {
             .iter()
             .any(|file| file.path == "crates/example/src/lib.rs")
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3089,7 +3082,6 @@ fn language_model_bridge_requests_json_and_applies_returned_patch() {
     assert_eq!(result.tool_results[0].status, ToolCallStatus::Succeeded);
     let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
     assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3165,7 +3157,6 @@ fn language_model_bridge_runs_tool_rounds_before_final_patch() {
     assert_eq!(result.tool_results[1].tool, "apply_patch");
     let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
     assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3228,7 +3219,6 @@ fn language_model_bridge_treats_http_tool_providers_as_structured_patch_mode() {
     );
     let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
     assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3277,7 +3267,6 @@ fn language_model_bridge_errors_when_final_patch_fails_to_apply() {
         .expect_err("bad patch");
 
     assert!(matches!(error, MutationModelError::ToolExecution { .. }));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3307,7 +3296,6 @@ fn local_bundle_store_writes_packet_and_manifest_paths() {
 
     assert!(PathBuf::from(&manifest.bundle_path).exists());
     assert!(PathBuf::from(&manifest.mutation_packet_path).exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3317,7 +3305,7 @@ fn orchestrator_dry_run_writes_bundle_and_runs_verification() {
     fs::create_dir_all(&candidate).expect("candidate dir");
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
-            root: root.clone(),
+            root: root.to_path_buf(),
             candidate: candidate.clone(),
         },
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
@@ -3352,7 +3340,6 @@ fn orchestrator_dry_run_writes_bundle_and_runs_verification() {
         EvaluationOutcome::Passed
     );
     assert!(PathBuf::from(&report.bundle.mutation_packet_path).exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3362,7 +3349,7 @@ fn orchestrator_writes_model_turn_and_tool_evidence_artifacts() {
     fs::create_dir_all(&candidate).expect("candidate dir");
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
-            root: root.clone(),
+            root: root.to_path_buf(),
             candidate: candidate.clone(),
         },
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
@@ -3397,7 +3384,6 @@ fn orchestrator_writes_model_turn_and_tool_evidence_artifacts() {
     assert!(bundle.join("model-result.json").exists());
     assert!(bundle.join("model-turns.json").exists());
     assert!(bundle.join("model-tool-results.json").exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3407,7 +3393,7 @@ fn orchestrator_writes_agent_run_artifacts() {
     fs::create_dir_all(&candidate).expect("candidate dir");
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
-            root: root.clone(),
+            root: root.to_path_buf(),
             candidate: candidate.clone(),
         },
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
@@ -3516,7 +3502,6 @@ fn orchestrator_writes_agent_run_artifacts() {
             .iter()
             .any(|reference| reference.ends_with("agent-run.json"))
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3564,7 +3549,7 @@ fn orchestrator_records_benchmark_summary_metrics() {
     );
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
-            root: root.clone(),
+            root: root.to_path_buf(),
             candidate: candidate.clone(),
         },
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
@@ -3682,7 +3667,6 @@ fn orchestrator_records_benchmark_summary_metrics() {
             && metric.value == MetricValue::Integer(1)
     }));
     assert!(benchmark_results_path.exists());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3707,7 +3691,7 @@ fn orchestrator_fails_unresolved_swebench_summary() {
     );
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
-            root: root.clone(),
+            root: root.to_path_buf(),
             candidate: candidate.clone(),
         },
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
@@ -3769,7 +3753,6 @@ fn orchestrator_fails_unresolved_swebench_summary() {
             && gate.outcome == EvaluationOutcome::Failed
             && gate.summary.contains("resolved 0/1")
     }));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3797,7 +3780,7 @@ fn orchestrator_writes_reusable_regression_evidence_and_lesson_for_failed_candid
     fs::create_dir_all(&candidate).expect("candidate dir");
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
-            root: root.clone(),
+            root: root.to_path_buf(),
             candidate: candidate.clone(),
         },
         ExecutingEvalHarness::new(LocalCommandRunner::new()),
@@ -3883,7 +3866,6 @@ fn orchestrator_writes_reusable_regression_evidence_and_lesson_for_failed_candid
             .expect("summary")
             .contains("Replay Minimization")
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4224,7 +4206,6 @@ fn regression_evidence_summary_preserves_telemetry_and_event_refs_as_trace_fixtu
 #[test]
 fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
     let root = temp_dir("agent-mutation-worker");
-    fs::create_dir_all(&root).expect("workspace dir");
     fs::write(root.join("hello.txt"), "old\n").expect("fixture");
     let job = create_bootstrap_job(
         &EvolutionRequest {
@@ -4242,7 +4223,7 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
     );
     let workspace = CandidateWorkspace {
         job_id: job.job_id.clone(),
-        path: root.clone(),
+        path: root.to_path_buf(),
         branch_name: "codex/evolve/agent-worker".to_string(),
         source_revision: Some("test".to_string()),
     };
@@ -4320,7 +4301,6 @@ fn agent_mutation_worker_edits_workspace_and_returns_run_artifacts() {
         result.summary.as_deref(),
         Some("Changed hello.txt from old to new. Verification not requested.")
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -4357,8 +4337,6 @@ fn git_workspace_adapter_places_worktree_inside_job_folder() {
         &source,
         &format!("git worktree remove --force {}", workspace.path.display()),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
 }
 
 #[test]
@@ -4498,9 +4476,6 @@ fn verify_stored_evolution_job_runs_plan_and_records_scorecard() {
         &source,
         &format!("git worktree remove --force {}", workspace.path.display()),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
@@ -4575,12 +4550,11 @@ fn decide_stored_evolution_job_records_rejected_decision() {
     let stored = read_stored_job(&paths.job_path(&job.job_id)).expect("stored");
     assert_eq!(stored.job.status, EvolutionJobStatus::Rejected);
     assert_eq!(stored.decision.expect("decision").note, "not ready");
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
 fn approve_refuses_failed_preflight_without_override() {
-    let (source, jobs_root, data_root, record) =
+    let (source, _jobs_root, data_root, record) =
         approval_record_fixture("approve-refuses-preflight", EvaluationOutcome::Failed);
     let error = decide_stored_evolution_job(
         &EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root)),
@@ -4604,14 +4578,11 @@ fn approve_refuses_failed_preflight_without_override() {
             record.candidate_workspace.path.display()
         ),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
 fn approve_refuses_tampered_bundle_integrity_without_override() {
-    let (source, jobs_root, data_root, record) =
+    let (source, _jobs_root, data_root, record) =
         approval_record_fixture("approve-refuses-tampered-bundle", EvaluationOutcome::Passed);
     fs::write(
         &record.bundle.mutation_packet_path,
@@ -4643,14 +4614,11 @@ fn approve_refuses_tampered_bundle_integrity_without_override() {
             record.candidate_workspace.path.display()
         ),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
 fn approve_override_records_preflight_and_candidate_summary() {
-    let (source, jobs_root, data_root, record) =
+    let (source, _jobs_root, data_root, record) =
         approval_record_fixture("approve-override-preflight", EvaluationOutcome::Failed);
     let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
 
@@ -4732,14 +4700,11 @@ fn approve_override_records_preflight_and_candidate_summary() {
             record.candidate_workspace.path.display()
         ),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
 fn approve_materializes_verified_rollout_material_from_candidate_bundle() {
-    let (source, jobs_root, data_root, mut record) =
+    let (source, _jobs_root, data_root, mut record) =
         approval_record_fixture("approve-rollout-material", EvaluationOutcome::Passed);
     let paths = EvolutionPaths::new(&sinomo_runtime::local::SinomoDataDir::new(&data_root));
     let (material, signer) =
@@ -4822,14 +4787,11 @@ fn approve_materializes_verified_rollout_material_from_candidate_bundle() {
             record.candidate_workspace.path.display()
         ),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
 fn approve_override_skips_invalid_rollout_material_materialization() {
-    let (source, jobs_root, data_root, mut record) = approval_record_fixture(
+    let (source, _jobs_root, data_root, mut record) = approval_record_fixture(
         "approve-invalid-rollout-material",
         EvaluationOutcome::Passed,
     );
@@ -4886,9 +4848,6 @@ fn approve_override_skips_invalid_rollout_material_materialization() {
             record.candidate_workspace.path.display()
         ),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
@@ -4964,8 +4923,6 @@ fn approved_candidate_commit_fast_forwards_source_checkout() {
         &source,
         &format!("git worktree remove --force {}", workspace.path.display()),
     );
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(jobs_root);
 }
 
 #[test]
@@ -5041,9 +4998,6 @@ fn cleanup_stored_evolution_job_removes_worktree_job_and_bundle_dirs() {
     assert!(!summary.worktree_path.exists());
     assert!(!summary.job_dir.exists());
     assert!(!bundle_dir.exists());
-    let _ = fs::remove_dir_all(source);
-    let _ = fs::remove_dir_all(worktrees_root);
-    let _ = fs::remove_dir_all(data_root);
 }
 
 #[test]
@@ -5070,7 +5024,6 @@ fn bootstrap_tool_registry_exposes_minimal_phase_three_tools() {
 #[test]
 fn read_file_tool_returns_content_and_path_evidence() {
     let root = temp_dir("read-file-tool");
-    fs::create_dir_all(&root).expect("root");
     fs::write(root.join("notes.txt"), "hello tools").expect("write note");
     let workspace = candidate_workspace(&root);
     let result = EvolutionToolRegistry::bootstrap().execute(
@@ -5084,7 +5037,6 @@ fn read_file_tool_returns_content_and_path_evidence() {
     assert_eq!(result.status, ToolCallStatus::Succeeded);
     assert_eq!(result.output["content"], "hello tools");
     assert_eq!(result.evidence.paths, vec!["notes.txt".to_string()]);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5118,13 +5070,11 @@ fn tool_registry_can_emit_execution_event_with_result_and_changed_files() {
         serde_json::json!(["tracked.txt"])
     );
     assert_eq!(event.evidence.refs.len(), 1);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn run_command_tool_captures_exit_code_stdout_and_stderr() {
     let root = temp_dir("run-command-tool");
-    fs::create_dir_all(&root).expect("root");
     let workspace = candidate_workspace(&root);
     let result = EvolutionToolRegistry::bootstrap().execute(
         &workspace,
@@ -5150,13 +5100,11 @@ fn run_command_tool_captures_exit_code_stdout_and_stderr() {
             .contains("sinomo-stderr")
     );
     assert!(result.evidence.command.is_some());
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
 fn command_control_tool_reports_unknown_run_id() {
     let root = temp_dir("command-control-tool");
-    fs::create_dir_all(&root).expect("root");
     let workspace = candidate_workspace(&root);
     let result = EvolutionToolRegistry::bootstrap().execute(
         &workspace,
@@ -5172,7 +5120,6 @@ fn command_control_tool_reports_unknown_run_id() {
         "{}",
         result.evidence.summary
     );
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5181,7 +5128,6 @@ fn kill_command_tool_can_terminate_active_run_command() {
     use std::thread;
 
     let root = temp_dir("kill-command-tool");
-    fs::create_dir_all(&root).expect("root");
     let workspace = candidate_workspace(&root);
     let registry = std::sync::Arc::new(EvolutionToolRegistry::bootstrap());
     let running_registry = registry.clone();
@@ -5208,7 +5154,6 @@ fn kill_command_tool_can_terminate_active_run_command() {
 
     assert_eq!(control.status, ToolCallStatus::Succeeded);
     assert_ne!(result.output["exit_code"], 0);
-    let _ = fs::remove_dir_all(root);
 }
 
 #[cfg(unix)]
@@ -5256,7 +5201,6 @@ fn run_command_can_report_git_status_and_diff_from_candidate_workspace() {
     );
     assert_eq!(diff.status, ToolCallStatus::Succeeded);
     assert!(diff.output["stdout"].as_str().unwrap().contains("+after"));
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5286,7 +5230,6 @@ index 3b18e51..6320cd2 100644
     assert_eq!(result.status, ToolCallStatus::Succeeded);
     let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
     assert_eq!(patched.replace("\r\n", "\n"), "new\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -5317,7 +5260,6 @@ fn apply_patch_tool_applies_v4a_update_patch_in_candidate_workspace() {
     assert_eq!(result.status, ToolCallStatus::Succeeded);
     let patched = fs::read_to_string(root.join("patched.txt")).expect("read patched");
     assert_eq!(patched.replace("\r\n", "\n"), "# Title\n\nnew\n");
-    let _ = fs::remove_dir_all(root);
 }
 
 #[derive(Clone, Debug)]
@@ -5544,12 +5486,8 @@ impl WorkspaceAdapter for FakeWorkspace {
     }
 }
 
-fn temp_dir(name: &str) -> PathBuf {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos();
-    std::env::temp_dir().join(format!("sinomo-evolution-{name}-{stamp}"))
+fn temp_dir(name: &str) -> sinomo_testdir::TestDir {
+    sinomo_testdir::TestDir::new(&format!("sinomo-evolution-{name}"))
 }
 
 fn candidate_workspace(root: &Path) -> CandidateWorkspace {
@@ -5564,7 +5502,12 @@ fn candidate_workspace(root: &Path) -> CandidateWorkspace {
 fn approval_record_fixture(
     name: &str,
     verification_outcome: EvaluationOutcome,
-) -> (PathBuf, PathBuf, PathBuf, StoredEvolutionJob) {
+) -> (
+    sinomo_testdir::TestDir,
+    sinomo_testdir::TestDir,
+    sinomo_testdir::TestDir,
+    StoredEvolutionJob,
+) {
     let source = git_repo(&format!("{name}-source"));
     fs::write(source.join("README.md"), "# source\n").expect("readme");
     run_in(&source, "git add README.md").expect("git add");
@@ -5730,9 +5673,8 @@ fn rollout_material_fixture(
     (material, signer)
 }
 
-fn git_repo(name: &str) -> PathBuf {
+fn git_repo(name: &str) -> sinomo_testdir::TestDir {
     let root = temp_dir(name);
-    fs::create_dir_all(&root).expect("root");
     run_in(&root, "git init").expect("git init");
     run_in(&root, "git config user.email sinomo@example.test").expect("git email");
     run_in(&root, "git config user.name Sinomo").expect("git name");

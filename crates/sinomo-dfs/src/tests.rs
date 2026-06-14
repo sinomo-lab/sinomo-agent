@@ -4,7 +4,7 @@ use sinomo_kv::InProcessRaftKvCluster;
 use sinomo_network::{AsyncInProcessNetwork, InProcessNetwork};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 struct ReceiveOnlyTransport {
@@ -1501,13 +1501,7 @@ fn local_owned_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
 
 #[test]
 fn networked_dfs_process_incoming_skips_drain_when_transport_reports_empty() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-dfs-empty-inbound-hint-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
+    let root = temp_root("empty-inbound-hint");
     let node = NodeId::from_legacy_named("node_networked_empty_hint").expect("node");
     let drain_calls = Arc::new(Mutex::new(0));
     let transport = CountingEmptyTransport::new(node, drain_calls.clone());
@@ -1600,14 +1594,8 @@ fn metadata_store_path_index_matches_scan_semantics() {
     assert!(store.objects_by_path.is_empty());
 }
 
-fn temp_root(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "sinomo-dfs-{name}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    ))
+fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+    sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
 }
 
 #[test]
@@ -3978,7 +3966,7 @@ fn metadata_journal_publisher_routes_primary_shards_and_reports_non_primary() {
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         },
     ];
-    let mut host = RecordingMetadataJournalPublisherHost::new(root.clone());
+    let mut host = RecordingMetadataJournalPublisherHost::new(root.to_path_buf());
     let mut transport = ApplyingMetadataJournalTransport::new(replica.clone());
 
     let report = publish_dfs_metadata_journal_with_host(
@@ -16504,7 +16492,7 @@ const SIFS_CLUSTER_PUMP_DEADLINE: Duration = Duration::from_secs(10);
 const SIFS_CLUSTER_PUMP_IDLE_SLEEP: Duration = Duration::from_millis(2);
 
 struct SifsPosixCluster {
-    root: PathBuf,
+    root: sinomo_testdir::TestDir,
     primary_node: NodeId,
     writer_node: NodeId,
     observer_node: NodeId,
@@ -18162,7 +18150,7 @@ fn sifs_cluster_posix_routed_namespace_ops_converge_across_replicas() {
 // ---------------------------------------------------------------------------
 
 struct SifsTwoPrimaryCluster {
-    root: PathBuf,
+    root: sinomo_testdir::TestDir,
     users_primary_node: NodeId,
     services_primary_node: NodeId,
     replica_node: NodeId,

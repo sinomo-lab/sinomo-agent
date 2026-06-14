@@ -191,13 +191,7 @@ mod tests {
 
     #[test]
     fn node_identity_persists_main_and_shadow_keys() {
-        let root = std::env::temp_dir().join(format!(
-            "sinomo-node-identity-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
+        let root = sinomo_testdir::TestDir::new("sinomo-node-identity");
         let main = load_or_create_main_node_identity(&root).expect("main identity");
         let shadow = load_or_create_shadow_node_identity(&root).expect("shadow identity");
         let main_again = load_or_create_main_node_identity(&root).expect("main identity reload");
@@ -208,8 +202,6 @@ mod tests {
         assert_ne!(main.public_key, shadow.public_key);
         main.key_pair().expect("main key pair");
         shadow.key_pair().expect("shadow key pair");
-
-        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

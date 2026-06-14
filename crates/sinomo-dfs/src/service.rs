@@ -460,15 +460,10 @@ mod tests {
         }
     }
 
-    fn temp_data_dir() -> Arc<SinomoDataDir> {
-        let dir = std::env::temp_dir().join(format!(
-            "sinomo-service-dfs-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos()
-        ));
-        Arc::new(SinomoDataDir::new(dir))
+    fn temp_data_dir() -> (sinomo_testdir::TestDir, Arc<SinomoDataDir>) {
+        let root = sinomo_testdir::TestDir::new("sinomo-service-dfs");
+        let data_dir = Arc::new(SinomoDataDir::new(&root));
+        (root, data_dir)
     }
 
     async fn dispatch_local<B: serde::Serialize>(
@@ -542,8 +537,10 @@ mod tests {
     #[tokio::test]
     async fn dfs_status_serves_in_local_mode_without_a_cluster() {
         let registry = register_services(ServiceRegistry::builder()).build();
-        let (disposition, response) =
-            dispatch_local(&registry, temp_data_dir(), DFS_STATUS_ROUTE, &()).await;
+        let (disposition, response) = {
+            let (_root, data_dir) = temp_data_dir();
+            dispatch_local(&registry, data_dir, DFS_STATUS_ROUTE, &()).await
+        };
         assert_eq!(disposition, ServiceDisposition::Continue);
         let _status: DfsOperatorStatus = response.decode_body().expect("decode status");
     }
@@ -551,8 +548,10 @@ mod tests {
     #[tokio::test]
     async fn dfs_expose_config_serves_default_in_local_mode() {
         let registry = register_services(ServiceRegistry::builder()).build();
-        let (disposition, response) =
-            dispatch_local(&registry, temp_data_dir(), DFS_EXPOSE_CONFIG_ROUTE, &()).await;
+        let (disposition, response) = {
+            let (_root, data_dir) = temp_data_dir();
+            dispatch_local(&registry, data_dir, DFS_EXPOSE_CONFIG_ROUTE, &()).await
+        };
         assert_eq!(disposition, ServiceDisposition::Continue);
         let json: String = response.decode_body().expect("decode json string");
         // The wire body is pretty-JSON that parses back into a DfsExposeConfig.
@@ -572,9 +571,10 @@ mod tests {
                 next_after_sequence: 0,
             },
         };
+        let (_test_root, test_data_dir) = temp_data_dir();
         let (disposition, response) = dispatch_local(
             &registry,
-            temp_data_dir(),
+            test_data_dir.clone(),
             DFS_METADATA_JOURNAL_BATCH_ROUTE,
             &command,
         )
@@ -590,7 +590,7 @@ mod tests {
     #[tokio::test]
     async fn dfs_metadata_snapshot_install_rejects_without_local_shard_config() {
         let registry = register_services(ServiceRegistry::builder()).build();
-        let data_dir = temp_data_dir();
+        let (_root, data_dir) = temp_data_dir();
         let snapshot = LocalSobjMetadataBackend::new(
             DfsMetadataShardId::new("snapshot-source"),
             data_dir.root().join("snapshot-source"),
@@ -631,9 +631,10 @@ mod tests {
     #[tokio::test]
     async fn dfs_inspection_status_serves_in_local_mode() {
         let registry = register_services(ServiceRegistry::builder()).build();
+        let (_test_root, test_data_dir) = temp_data_dir();
         let (disposition, response) = dispatch_local(
             &registry,
-            temp_data_dir(),
+            test_data_dir.clone(),
             DFS_INSPECTION_ROUTE,
             &DaemonDfsInspectionRequest::Status,
         )
@@ -651,8 +652,10 @@ mod tests {
         assert!(registry.owns(DFS_SMOKE_ROUTE));
         assert!(registry.owns(DFS_PROTOCOL_FRAME_ROUTE));
 
-        let (disposition, smoke_response) =
-            dispatch_local(&registry, temp_data_dir(), DFS_SMOKE_ROUTE, &()).await;
+        let (disposition, smoke_response) = {
+            let (_root, data_dir) = temp_data_dir();
+            dispatch_local(&registry, data_dir, DFS_SMOKE_ROUTE, &()).await
+        };
         assert_eq!(disposition, ServiceDisposition::Continue);
         let smoke: DfsSmokeReport = smoke_response.decode_body().expect("decode smoke");
         assert_eq!(smoke.path, "/services/dfs-smoke/service-route.txt");
@@ -678,9 +681,10 @@ mod tests {
                 },
             },
         };
+        let (_test_root, test_data_dir) = temp_data_dir();
         let (disposition, frame_response) = dispatch_local(
             &registry,
-            temp_data_dir(),
+            test_data_dir.clone(),
             DFS_PROTOCOL_FRAME_ROUTE,
             &command,
         )

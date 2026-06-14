@@ -5739,6 +5739,7 @@ dependencies = [
  "serde_json",
  "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
 ]
@@ -5786,6 +5787,7 @@ dependencies = [
  "sinomo-pytorch",
  "sinomo-runtime",
  "sinomo-sandbox-wasix-module",
+ "sinomo-testdir",
  "time",
  "tokenizers",
  "tokio",
@@ -5807,6 +5809,7 @@ dependencies = [
  "sinomo-network",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -5855,6 +5858,7 @@ dependencies = [
  "sinomo-sandbox-wasix-host",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -5904,6 +5908,7 @@ dependencies = [
  "sinomo-object",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -5947,6 +5952,7 @@ dependencies = [
  "sinomo-module",
  "sinomo-node",
  "sinomo-rollout",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
 ]
@@ -5961,6 +5967,7 @@ dependencies = [
  "sinomo-core",
  "sinomo-node",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
 ]
@@ -5975,6 +5982,7 @@ dependencies = [
  "sinomo-agent",
  "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
 ]
@@ -6011,6 +6019,7 @@ dependencies = [
  "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6027,6 +6036,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-runtime",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6086,6 +6096,7 @@ dependencies = [
  "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "zip",
@@ -6121,6 +6132,7 @@ dependencies = [
  "sinomo-node",
  "sinomo-object",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6148,6 +6160,7 @@ dependencies = [
  "sinomo-core",
  "sinomo-object",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
 ]
@@ -6174,6 +6187,7 @@ dependencies = [
  "sinomo-network",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6197,6 +6211,7 @@ dependencies = [
  "serde_json",
  "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-testdir",
  "thiserror 2.0.18",
 ]
 
@@ -6212,6 +6227,7 @@ dependencies = [
  "sinomo-module",
  "sinomo-node",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
 ]
@@ -6223,6 +6239,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "sinomo-module-api",
+ "sinomo-testdir",
 ]
 
 [[package]]
@@ -6246,6 +6263,7 @@ dependencies = [
  "sinomo-sandbox-wasix-api",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "time",
  "tokio",
@@ -6308,6 +6326,7 @@ dependencies = [
  "sinomo-registry",
  "sinomo-service",
  "sinomo-storage",
+ "sinomo-testdir",
  "tar",
  "thiserror 2.0.18",
  "time",
@@ -6361,6 +6380,7 @@ dependencies = [
  "sinomo-sandbox",
  "sinomo-sandbox-wasix-api",
  "sinomo-storage",
+ "sinomo-testdir",
  "tar",
  "thiserror 2.0.18",
  "time",
@@ -6388,6 +6408,7 @@ dependencies = [
  "sinomo-kv",
  "sinomo-local",
  "sinomo-network",
+ "sinomo-testdir",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -6399,6 +6420,7 @@ dependencies = [
  "blake3",
  "serde",
  "sinomo-object",
+ "sinomo-testdir",
  "thiserror 2.0.18",
 ]
 
@@ -6424,6 +6446,10 @@ dependencies = [
  "sinomo-kv",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "sinomo-testdir"
+version = "0.1.0"
 
 [[package]]
 name = "sinomo-video"

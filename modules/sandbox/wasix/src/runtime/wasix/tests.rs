@@ -11,7 +11,6 @@ use crate::{
 use std::collections::BTreeMap;
 use std::{
     fs, io,
-    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -43,11 +42,7 @@ fn wasix_capabilities_disable_ambient_authority_and_cap_tasks() {
 
 #[test]
 fn wasix_read_only_filesystem_rejects_mutating_operations() {
-    let root = std::env::temp_dir().join(format!(
-        "sinomo-wasix-read-only-fs-{}",
-        crate::SandboxId::generate()
-    ));
-    fs::create_dir_all(&root).unwrap();
+    let root = sinomo_testdir::TestDir::new("sinomo-wasix-read-only-fs");
     fs::write(root.join("file.txt"), b"hello").unwrap();
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -89,8 +84,6 @@ fn wasix_read_only_filesystem_rejects_mutating_operations() {
         Err(virtual_fs::FsError::PermissionDenied)
     ));
     assert_eq!(fs::read(root.join("file.txt")).unwrap(), b"hello");
-
-    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -468,14 +461,13 @@ fn wasix_runner_cancels_thread_blocked_in_futex_wait() {
 #[test]
 fn wasix_runner_rejects_unmapped_cwd_when_preopens_exist() {
     let host_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-cwd-unmapped");
-    fs::create_dir_all(&host_dir).expect("host dir");
 
     let error = super::run_wasix_module(
         wasix_noop_module().as_slice(),
         wasix_test_request(1_000),
         SandboxWasiRunOptions {
             preopened_dirs: vec![SandboxWasiPreopen {
-                host_path: host_dir.clone(),
+                host_path: host_dir.to_path_buf(),
                 guest_path: SandboxPath::new("/tmp").expect("guest"),
                 mode: SandboxMountMode::ReadWrite,
             }],
@@ -485,13 +477,11 @@ fn wasix_runner_rejects_unmapped_cwd_when_preopens_exist() {
     .expect_err("unmapped cwd should be rejected before WASIX starts");
 
     assert!(format!("{error}").contains("WASIX cwd `/work` is not mounted"));
-    fs::remove_dir_all(host_dir).ok();
 }
 
 #[test]
 fn wasix_runner_rejects_file_cwd() {
     let host_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-cwd-file");
-    fs::create_dir_all(&host_dir).expect("host dir");
     fs::write(host_dir.join("not-a-dir"), b"file").expect("cwd file");
     let mut request = wasix_test_request(1_000);
     request.cwd = SandboxPath::new("/work/not-a-dir").expect("cwd");
@@ -501,7 +491,7 @@ fn wasix_runner_rejects_file_cwd() {
         request,
         SandboxWasiRunOptions {
             preopened_dirs: vec![SandboxWasiPreopen {
-                host_path: host_dir.clone(),
+                host_path: host_dir.to_path_buf(),
                 guest_path: SandboxPath::new("/work").expect("guest"),
                 mode: SandboxMountMode::ReadWrite,
             }],
@@ -515,7 +505,6 @@ fn wasix_runner_rejects_file_cwd() {
         message.contains("is not a directory"),
         "unexpected error: {message}"
     );
-    fs::remove_dir_all(host_dir).ok();
 }
 
 #[test]
@@ -556,7 +545,6 @@ fn wasix_runner_rejects_file_cwd_inside_virtual_preopen() {
         message.contains("is not a directory"),
         "unexpected error: {message}"
     );
-    fs::remove_dir_all(runtime_root).ok();
 }
 
 #[test]
@@ -589,7 +577,6 @@ fn wasix_runner_rejects_missing_cwd_inside_virtual_preopen() {
     .expect_err("missing virtual cwd should be rejected before WASIX starts");
 
     assert!(format!("{error}").contains("is invalid"));
-    fs::remove_dir_all(runtime_root).ok();
 }
 
 #[cfg(unix)]
@@ -597,8 +584,6 @@ fn wasix_runner_rejects_missing_cwd_inside_virtual_preopen() {
 fn wasix_runner_rejects_symlink_escape_cwd() {
     let host_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-cwd-symlink-root");
     let outside_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-cwd-symlink-outside");
-    fs::create_dir_all(&host_dir).expect("host dir");
-    fs::create_dir_all(&outside_dir).expect("outside dir");
     std::os::unix::fs::symlink(&outside_dir, host_dir.join("outside")).expect("symlink");
     let mut request = wasix_test_request(1_000);
     request.cwd = SandboxPath::new("/work/outside").expect("cwd");
@@ -608,7 +593,7 @@ fn wasix_runner_rejects_symlink_escape_cwd() {
         request,
         SandboxWasiRunOptions {
             preopened_dirs: vec![SandboxWasiPreopen {
-                host_path: host_dir.clone(),
+                host_path: host_dir.to_path_buf(),
                 guest_path: SandboxPath::new("/work").expect("guest"),
                 mode: SandboxMountMode::ReadWrite,
             }],
@@ -618,8 +603,6 @@ fn wasix_runner_rejects_symlink_escape_cwd() {
     .expect_err("symlink escape cwd should be rejected before WASIX starts");
 
     assert!(format!("{error}").contains("WASIX preopen contains symlink"));
-    fs::remove_dir_all(host_dir).ok();
-    fs::remove_dir_all(outside_dir).ok();
 }
 
 #[cfg(unix)]
@@ -627,8 +610,6 @@ fn wasix_runner_rejects_symlink_escape_cwd() {
 fn wasix_runner_rejects_symlink_inside_mapped_preopen() {
     let host_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-preopen-symlink-root");
     let outside_dir = wasix_unique_test_dir("sinomo-sandbox-wasix-preopen-symlink-outside");
-    fs::create_dir_all(&host_dir).expect("host dir");
-    fs::create_dir_all(&outside_dir).expect("outside dir");
     std::os::unix::fs::symlink(outside_dir.join("secret.txt"), host_dir.join("link"))
         .expect("symlink");
 
@@ -637,7 +618,7 @@ fn wasix_runner_rejects_symlink_inside_mapped_preopen() {
         wasix_test_request(1_000),
         SandboxWasiRunOptions {
             preopened_dirs: vec![SandboxWasiPreopen {
-                host_path: host_dir.clone(),
+                host_path: host_dir.to_path_buf(),
                 guest_path: SandboxPath::new("/work").expect("guest"),
                 mode: SandboxMountMode::ReadWrite,
             }],
@@ -647,8 +628,6 @@ fn wasix_runner_rejects_symlink_inside_mapped_preopen() {
     .expect_err("symlink inside mapped preopen should be rejected before WASIX starts");
 
     assert!(format!("{error}").contains("WASIX preopen contains symlink"));
-    fs::remove_dir_all(host_dir).ok();
-    fs::remove_dir_all(outside_dir).ok();
 }
 
 #[test]
@@ -714,8 +693,8 @@ fn wasix_test_request(timeout_ms: u64) -> SandboxCommandRequest {
     }
 }
 
-fn wasix_unique_test_dir(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("{}-{}", name, crate::SandboxCommandId::generate()))
+fn wasix_unique_test_dir(name: &str) -> sinomo_testdir::TestDir {
+    sinomo_testdir::TestDir::new(name)
 }
 
 fn wasix_noop_module() -> Vec<u8> {

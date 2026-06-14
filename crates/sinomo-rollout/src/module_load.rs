@@ -258,7 +258,7 @@ mod tests {
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
-        let identity_path = unique_identity_path("valid-artifact-signature");
+        let (_identity_dir, identity_path) = unique_identity_path("valid-artifact-signature");
         let identity = sinomo_node::load_or_create_node_identity(&identity_path).expect("identity");
         let mut artifact = artifact_manifest(&artifact_id, &module_id, "blake3:abc", Vec::new());
         artifact.signature =
@@ -279,7 +279,6 @@ mod tests {
             .expect("load");
 
         assert_eq!(decision.action, LoaderAction::AcceptShadow);
-        let _ = std::fs::remove_file(identity_path);
     }
 
     #[test]
@@ -288,7 +287,7 @@ mod tests {
         let module_id =
             ModuleId::from_legacy_named("module.trigger.silence_policy").expect("module");
         let artifact_id = ArtifactId::from_legacy_named("artifact_candidate").expect("artifact");
-        let identity_path = unique_identity_path("tampered-artifact-signature");
+        let (_identity_dir, identity_path) = unique_identity_path("tampered-artifact-signature");
         let identity = sinomo_node::load_or_create_node_identity(&identity_path).expect("identity");
         let mut artifact = artifact_manifest(&artifact_id, &module_id, "blake3:abc", Vec::new());
         artifact.signature =
@@ -307,7 +306,6 @@ mod tests {
 
         assert_eq!(decision.action, LoaderAction::Reject);
         assert!(decision.reason.contains("signature verification failed"));
-        let _ = std::fs::remove_file(identity_path);
     }
 
     #[test]
@@ -390,10 +388,9 @@ mod tests {
         }
     }
 
-    fn unique_identity_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "sinomo-rollout-{name}-{}.sobj",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
+    fn unique_identity_path(name: &str) -> (sinomo_testdir::TestDir, std::path::PathBuf) {
+        let dir = sinomo_testdir::TestDir::new(&format!("sinomo-rollout-{name}"));
+        let path = dir.join("identity.sobj");
+        (dir, path)
     }
 }

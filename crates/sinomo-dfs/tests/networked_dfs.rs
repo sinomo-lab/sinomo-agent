@@ -26,7 +26,6 @@ use std::fs;
 use std::io::{Read, Result as IoResult};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 
 #[test]
@@ -12298,12 +12297,8 @@ fn networked_dfs_owner_handoff_uses_backend_current_metadata() {
     cleanup(&root);
 }
 
-fn temp_root(name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("sinomo-dfs-{name}-{nanos}"))
+fn temp_root(name: &str) -> sinomo_testdir::TestDir {
+    sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"))
 }
 
 fn content_hash(bytes: &[u8]) -> String {

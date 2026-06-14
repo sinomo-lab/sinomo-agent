@@ -578,9 +578,8 @@ mod tests {
     }
 
     fn test_data_dir() -> Arc<SinomoDataDir> {
-        Arc::new(SinomoDataDir::new(
-            std::env::temp_dir().join("sinomo-service-seam-test"),
-        ))
+        let root = sinomo_testdir::TestDir::new("sinomo-service-seam-test");
+        Arc::new(SinomoDataDir::new(&root))
     }
 
     fn local_context(sink: CollectingSink) -> ServiceContext {

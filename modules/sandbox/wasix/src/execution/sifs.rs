@@ -1030,11 +1030,8 @@ mod tests {
     use sinomo_dfs::{DfsMetadataShardId, LocalContentStore, LocalSobjMetadataBackend};
     use sinomo_network::InProcessNetwork;
 
-    fn unique_test_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{name}-{}",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ))
+    fn unique_test_dir(name: &str) -> sinomo_testdir::TestDir {
+        sinomo_testdir::TestDir::new(name)
     }
 
     #[test]
@@ -1143,7 +1140,5 @@ mod tests {
             Some(SandboxFilesystemSnapshotEntry::Symlink { target, .. })
                 if target == &PathBuf::from("target.txt")
         ));
-
-        fs::remove_dir_all(runtime_root).ok();
     }
 }
