@@ -1,25 +1,34 @@
 use super::*;
 
+pub(crate) const BUILTIN_TOP_LEVEL_USAGE_COMMANDS: &[&str] = &[
+    "help",
+    "cluster",
+    "install",
+    "uninstall",
+    "daemon",
+    "debug",
+    "rollout",
+    "dfs",
+    "models",
+    "model",
+    "usage",
+    "providers",
+    "voice",
+    "agent",
+    "test",
+];
+
 pub fn print_usage() {
     println!("Usage:");
     println!("  sinomo");
-    println!("  sinomo help");
-    println!("  sinomo cluster");
-    println!("  sinomo install");
-    println!("  sinomo uninstall");
-    println!("  sinomo daemon");
-    println!("  sinomo debug");
-    println!("  sinomo rollout");
-    for command in cli_command_registry().metadata() {
-        println!("  sinomo {}", command.name);
+    for command in BUILTIN_TOP_LEVEL_USAGE_COMMANDS {
+        println!("  sinomo {command}");
     }
-    println!("  sinomo dfs");
-    println!("  sinomo sandbox");
-    println!("  sinomo models");
-    println!("  sinomo usage");
-    println!("  sinomo providers");
-    println!("  sinomo voice");
-    println!("  sinomo test");
+    for command in cli_command_registry().metadata() {
+        if !BUILTIN_TOP_LEVEL_USAGE_COMMANDS.contains(&command.name) {
+            println!("  sinomo {}", command.name);
+        }
+    }
     println!();
     println!("Global flags:");
     println!(
@@ -45,6 +54,16 @@ pub fn print_usage() {
     println!("  GEMINI_API_KEY              Used by `providers auth/test gemini`");
     println!("  NVIDIA_API_KEY              Used by `providers auth/test nvidia`");
     println!("  Cluster runtime settings live in KV; see `sinomo models runtime`.");
+}
+
+pub(super) fn print_agent_help() {
+    println!("Agent:");
+    println!("  sinomo agent");
+    println!("      Show agent commands.");
+    println!(
+        "  sinomo agent run [--prompt <text>] [--provider <provider>] [--model <model>] [--account <account>]"
+    );
+    println!("      Run one main-agent turn and print the final response.");
 }
 
 pub(super) fn print_voice_help() {
@@ -265,6 +284,8 @@ pub(super) fn print_models_help() {
     println!("Models:");
     println!("  sinomo models");
     println!("      Show the current default model and this help.");
+    println!("  sinomo model");
+    println!("      Alias for `sinomo models`.");
     println!("  sinomo models list [--provider <provider>]");
     println!("      List available or known models.");
     println!("  sinomo models default --provider <provider> --model <model>");

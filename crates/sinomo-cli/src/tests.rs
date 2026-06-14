@@ -1,40 +1,40 @@
 use super::{
-    AgentCliCommand, AgentRunOptions, CliClusterMemberMutationHost, CliCommand, CliError,
-    CliRuntimeOptions, ClusterCliCommand, ClusterInitOptions, ClusterInviteOptions,
-    ClusterJoinOptions, ClusterJoinRegistrationRequest, ClusterPaths, ClusterRaftRoleOptions,
-    ClusterRemoveOptions, ClusterRoleOptions, ClusterRolloutBuildRequest, DaemonCliCommand,
-    DaemonClusterStatus, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
-    DebugCliCommand, DfsCliCommand, DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions,
-    DfsMountOptions, DfsPinCliCommand, InstallLayout, InstallOptions, InteractionModel,
-    InteractionRuntime, InteractionSession, InteractionSurface, InteractionSurfaceKind,
-    ModelBackedInteractionHandler, ModelOptionValueUpdate, ModelOptionsCliCommand,
-    ModelOptionsSetOptions, ModelOptionsTarget, ModelRuntimeCliCommand, ModelRuntimeSetOptions,
-    ModelsCliCommand, ProviderCliCommand, ProviderCommandOptions, ProviderName,
-    RolloutAdvanceOptions, RolloutCliCommand, RolloutMainActivation,
-    RolloutModuleNativeDylibOptions, RolloutOptions, RolloutProgressExpectation,
-    RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler, SelfRolloutPaths,
-    TestCliCommand, UninstallOptions, advertised_peer_route_targets, apply_cluster_node_role,
-    apply_cluster_raft_role, authenticate_daemon_control_request,
-    build_cluster_raft_append_request_from_next_index, cli_command_requires_cluster_state,
-    cli_command_supports_degraded_local_mode, cli_invocation_force_local_mode,
-    cluster_connectivity_sync_ops, cluster_doctor_findings, cluster_has_local_quorum,
-    cluster_init_with_paths, cluster_invite_with_paths, cluster_join_with_paths,
-    cluster_node_status_from_daemon_status, cluster_peer_members, cluster_raft_known_leader_id,
-    cluster_state_sync_txn, cluster_sync_targets, compact_default_invite_introducers,
-    daemon_advertised_endpoints_for_state, daemon_handle_daemon_sandbox_http_fetch,
-    daemon_package_version, data_dir_storage_contract_findings, decode_cluster_join_invite,
-    encode_cluster_join_invite, ensure_rollout_layout, expire_cluster_network_records_in_kv,
-    extend_rollout_endpoints_from_kv, format_rollout_progress_line,
-    handle_daemon_cluster_join_request, handle_daemon_cluster_kv_txn_request,
-    handle_daemon_rollout_build_request, install_should_update_binary, install_with_layout,
-    invite_channels_for_join_registration, invite_communication_channels,
-    invite_introducer_endpoint, invite_introducer_endpoint_from_state,
-    load_tui_model_runtime_config, main_agent_config_tool_registry,
-    main_agent_handler_for_tui_with_data_dir, managed_source_status, model_config_uses_cluster,
-    models_default_with_data_dir, normalize_model_provider,
-    open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command, parse_cli_invocation,
-    parse_cluster_command, parse_cluster_join_invite_argument, parse_daemon_command,
-    parse_dfs_command, parse_install_options, parse_model_default_options,
+    AgentCliCommand, AgentRunOptions, BUILTIN_TOP_LEVEL_USAGE_COMMANDS,
+    CliClusterMemberMutationHost, CliCommand, CliError, CliRuntimeOptions, ClusterCliCommand,
+    ClusterInitOptions, ClusterInviteOptions, ClusterJoinOptions, ClusterJoinRegistrationRequest,
+    ClusterPaths, ClusterRaftRoleOptions, ClusterRemoveOptions, ClusterRoleOptions,
+    ClusterRolloutBuildRequest, DaemonCliCommand, DaemonClusterStatus, DaemonPaths,
+    DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DebugCliCommand, DfsCliCommand,
+    DfsCommonOptions, DfsExposeCliCommand, DfsFilterOptions, DfsMountOptions, DfsPinCliCommand,
+    InstallLayout, InstallOptions, InteractionModel, InteractionRuntime, InteractionSession,
+    InteractionSurface, InteractionSurfaceKind, ModelBackedInteractionHandler,
+    ModelOptionValueUpdate, ModelOptionsCliCommand, ModelOptionsSetOptions, ModelOptionsTarget,
+    ModelRuntimeCliCommand, ModelRuntimeSetOptions, ModelsCliCommand, ProviderCliCommand,
+    ProviderCommandOptions, ProviderName, RolloutAdvanceOptions, RolloutCliCommand,
+    RolloutMainActivation, RolloutModuleNativeDylibOptions, RolloutOptions,
+    RolloutProgressExpectation, RolloutTelemetryGateSetOptions, RuntimeMainAgentInteractionHandler,
+    SelfRolloutPaths, TestCliCommand, UninstallOptions, advertised_peer_route_targets,
+    apply_cluster_node_role, apply_cluster_raft_role, authenticate_daemon_control_request,
+    build_cluster_raft_append_request_from_next_index, cli_command_is_help,
+    cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
+    cli_invocation_force_local_mode, cluster_connectivity_sync_ops, cluster_doctor_findings,
+    cluster_has_local_quorum, cluster_init_with_paths, cluster_invite_with_paths,
+    cluster_join_with_paths, cluster_node_status_from_daemon_status, cluster_peer_members,
+    cluster_raft_known_leader_id, cluster_state_sync_txn, cluster_sync_targets,
+    compact_default_invite_introducers, daemon_advertised_endpoints_for_state,
+    daemon_handle_daemon_sandbox_http_fetch, daemon_package_version,
+    data_dir_storage_contract_findings, decode_cluster_join_invite, encode_cluster_join_invite,
+    ensure_rollout_layout, expire_cluster_network_records_in_kv, extend_rollout_endpoints_from_kv,
+    format_rollout_progress_line, handle_daemon_cluster_join_request,
+    handle_daemon_cluster_kv_txn_request, handle_daemon_rollout_build_request,
+    install_should_update_binary, install_with_layout, invite_channels_for_join_registration,
+    invite_communication_channels, invite_introducer_endpoint,
+    invite_introducer_endpoint_from_state, load_tui_model_runtime_config,
+    main_agent_config_tool_registry, main_agent_handler_for_tui_with_data_dir,
+    managed_source_status, model_config_uses_cluster, models_default_with_data_dir,
+    normalize_model_provider, open_dfs_metadata_for_inspection_with_data_dir, parse_cli_command,
+    parse_cli_invocation, parse_cluster_command, parse_cluster_join_invite_argument,
+    parse_daemon_command, parse_dfs_command, parse_install_options, parse_model_default_options,
     parse_model_options_command, parse_models_list_options, parse_models_runtime_command,
     parse_provider_command, parse_rollout_command, parse_slash_command, parse_test_command,
     parse_uninstall_options, parse_usage_options, push_unique_introducer, read_cluster_kv_snapshot,
@@ -312,6 +312,7 @@ fn write_sandbox_policy_config_for_node(
 struct TestRegisteredCommandHandler {
     name: &'static str,
     policy: CliCommandPolicy,
+    is_help: bool,
 }
 
 impl CliCommandHandler for TestRegisteredCommandHandler {
@@ -330,6 +331,7 @@ impl CliCommandHandler for TestRegisteredCommandHandler {
         Ok(Box::new(TestRegisteredCommand {
             name: self.name,
             policy: self.policy,
+            is_help: self.is_help,
         }))
     }
 }
@@ -338,6 +340,7 @@ impl CliCommandHandler for TestRegisteredCommandHandler {
 struct TestRegisteredCommand {
     name: &'static str,
     policy: CliCommandPolicy,
+    is_help: bool,
 }
 
 impl sinomo_runtime::cli_registry::CliCommand for TestRegisteredCommand {
@@ -349,13 +352,33 @@ impl sinomo_runtime::cli_registry::CliCommand for TestRegisteredCommand {
         self.policy
     }
 
+    fn is_help(&self) -> bool {
+        self.is_help
+    }
+
     fn run(self: Box<Self>, _context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {
         Ok(())
     }
 }
 
 fn registered_test_command(name: &'static str, policy: CliCommandPolicy) -> CliCommand {
-    let handler = TestRegisteredCommandHandler { name, policy };
+    registered_test_command_with_help(name, policy, false)
+}
+
+fn registered_test_help_command(name: &'static str, policy: CliCommandPolicy) -> CliCommand {
+    registered_test_command_with_help(name, policy, true)
+}
+
+fn registered_test_command_with_help(
+    name: &'static str,
+    policy: CliCommandPolicy,
+    is_help: bool,
+) -> CliCommand {
+    let handler = TestRegisteredCommandHandler {
+        name,
+        policy,
+        is_help,
+    };
     CliCommand::Registered(RegisteredCliCommand::new(
         handler.parse(&[]).expect("parse registered test command"),
     ))
@@ -574,6 +597,10 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Models(ModelsCliCommand::Help)
     ));
     assert!(matches!(
+        parse_cli_command(&["model".to_string()]).expect("model alias help"),
+        CliCommand::Models(ModelsCliCommand::Help)
+    ));
+    assert!(matches!(
         parse_cli_command(&["model".to_string(), "list".to_string()]).expect("model alias"),
         CliCommand::Models(ModelsCliCommand::List(_))
     ));
@@ -634,6 +661,14 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Registered(command) if command.name() == "sandbox"
     ));
     assert!(matches!(
+        parse_cli_command(&["agent".to_string()]).expect("agent help"),
+        CliCommand::Agent(AgentCliCommand::Help)
+    ));
+    assert!(matches!(
+        parse_cli_command(&["agent".to_string(), "help".to_string()]).expect("agent help"),
+        CliCommand::Agent(AgentCliCommand::Help)
+    ));
+    assert!(matches!(
         parse_cli_command(&[
             "agent".to_string(),
             "run".to_string(),
@@ -644,6 +679,15 @@ fn top_level_cli_parser_routes_subcommands() {
         CliCommand::Agent(AgentCliCommand::Run(_))
     ));
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
+}
+
+#[test]
+fn documented_builtin_top_level_commands_are_parseable() {
+    for command in BUILTIN_TOP_LEVEL_USAGE_COMMANDS {
+        parse_cli_command(&[command.to_string()]).unwrap_or_else(|error| {
+            panic!("documented command `{command}` did not parse: {error}")
+        });
+    }
 }
 
 #[test]
@@ -6694,6 +6738,15 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
     assert!(cli_command_requires_cluster_state(
         &registered_cluster_command
     ));
+    assert!(!cli_command_is_help(&registered_cluster_command));
+    let registered_cluster_help_command = registered_test_help_command(
+        "registered-cluster-help",
+        CliCommandPolicy::cluster_required(),
+    );
+    assert!(cli_command_requires_cluster_state(
+        &registered_cluster_help_command
+    ));
+    assert!(cli_command_is_help(&registered_cluster_help_command));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Cluster(
         ClusterCliCommand::Status
     )));
@@ -6713,6 +6766,9 @@ fn orphan_guard_applies_to_distributed_runtime_commands() {
         DfsCliCommand::MetadataPublish { json: false }
     )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Models(
+        ModelsCliCommand::Help
+    )));
+    assert!(cli_command_is_help(&CliCommand::Models(
         ModelsCliCommand::Help
     )));
     assert!(!cli_command_requires_cluster_state(&CliCommand::Providers(

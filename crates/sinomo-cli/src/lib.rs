@@ -967,6 +967,24 @@ pub(crate) fn cli_command_supports_degraded_local_mode(command: &CliCommand) -> 
     }
 }
 
+pub(crate) fn cli_command_is_help(command: &CliCommand) -> bool {
+    match command {
+        CliCommand::Help | CliCommand::InstallHelp => true,
+        CliCommand::Cluster(ClusterCliCommand::Help)
+        | CliCommand::Daemon(DaemonCliCommand::Help)
+        | CliCommand::Debug(DebugCliCommand::Help)
+        | CliCommand::Rollout(RolloutCliCommand::Help)
+        | CliCommand::Dfs(DfsCliCommand::Help)
+        | CliCommand::Models(ModelsCliCommand::Help)
+        | CliCommand::Providers(ProviderCliCommand::Help)
+        | CliCommand::Voice(VoiceCliCommand::Help)
+        | CliCommand::Test(TestCliCommand::Help)
+        | CliCommand::Agent(AgentCliCommand::Help) => true,
+        CliCommand::Registered(command) => command.is_help(),
+        _ => false,
+    }
+}
+
 fn cli_command_needs_daemon_probe(command: &CliCommand) -> bool {
     cli_command_requires_cluster_state(command) || cli_command_supports_degraded_local_mode(command)
 }
@@ -1177,6 +1195,7 @@ pub(crate) fn parse_cli_command(args: &[String]) -> Result<CliCommand, CliError>
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum AgentCliCommand {
+    Help,
     Run(AgentRunOptions),
 }
 
@@ -1190,6 +1209,10 @@ pub(crate) struct AgentRunOptions {
 
 pub(crate) fn parse_agent_command(args: &[String]) -> Result<AgentCliCommand, CliError> {
     match args.split_first() {
+        None => Ok(AgentCliCommand::Help),
+        Some((command, [])) if matches!(command.as_str(), "help" | "--help" | "-h") => {
+            Ok(AgentCliCommand::Help)
+        }
         Some((command, rest)) if command == "run" => {
             Ok(AgentCliCommand::Run(parse_agent_run_options(rest)?))
         }
@@ -1500,6 +1523,10 @@ fn ensure_local_pytorch_endpoint(endpoint: &str, model: &str) -> Result<(), Lang
 
 pub(crate) fn run_agent_command(command: AgentCliCommand) -> Result<(), CliError> {
     match command {
+        AgentCliCommand::Help => {
+            print_agent_help();
+            Ok(())
+        }
         AgentCliCommand::Run(options) => run_agent_once(options),
     }
 }
@@ -1628,12 +1655,16 @@ fn run_cli_command(args: &[String]) -> Result<(), CliError> {
 
 fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> {
     let command = invocation.command;
-    let daemon = if invocation.options.force_local || !cli_command_needs_daemon_probe(&command) {
+    let command_is_help = cli_command_is_help(&command);
+    let daemon = if invocation.options.force_local
+        || command_is_help
+        || !cli_command_needs_daemon_probe(&command)
+    {
         None
     } else {
         default_main_daemon_status()?
     };
-    let local_cluster_quorum = if invocation.options.force_local {
+    let local_cluster_quorum = if invocation.options.force_local || command_is_help {
         None
     } else {
         cli_local_cluster_quorum_if_relevant(&command, daemon.as_ref())?
@@ -1646,7 +1677,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
     );
     let _guard = enter_cli_force_local_mode(force_local);
 
-    if !cli_force_local_mode() && cli_command_requires_cluster_state(&command) {
+    if !cli_force_local_mode() && !command_is_help && cli_command_requires_cluster_state(&command) {
         let paths = cluster_paths_from_defaults()?;
         require_cluster_runtime_quorum_with_paths_and_daemon(&paths, daemon.as_ref())?;
     }

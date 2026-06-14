@@ -164,6 +164,14 @@ impl CliCommand for EvolveCliCommandRunner {
         EVOLVE_POLICY
     }
 
+    fn is_help(&self) -> bool {
+        matches!(
+            &self.command,
+            EvolveCliCommand::Help
+                | EvolveCliCommand::TrustedSigners(TrustedSignersCliCommand::Help)
+        )
+    }
+
     fn help(&self) -> CliCommandHelp {
         evolve_cli_help()
     }
@@ -174,11 +182,7 @@ impl CliCommand for EvolveCliCommandRunner {
 
     fn run(self: Box<Self>, context: &mut CliCommandContext<'_>) -> Result<(), CliCommandError> {
         let _guard = enter_evolution_cli_force_local_mode(context.force_local());
-        if matches!(
-            &self.command,
-            EvolveCliCommand::Help
-                | EvolveCliCommand::TrustedSigners(TrustedSignersCliCommand::Help)
-        ) {
+        if self.is_help() {
             return self.help().write(context);
         }
         run_evolve_cli_command(self.command).map_err(Into::into)
