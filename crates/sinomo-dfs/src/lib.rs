@@ -462,6 +462,10 @@ pub fn register_storage_paths(
             "durable per-replica DFS metadata journal replication cursors",
         ),
         (
+            "dfs/metadata",
+            "dynamic DFS metadata shard directories with object records and journal entries",
+        ),
+        (
             "dfs/operator",
             "dynamic DFS operator intent records stored as sinomo-object files",
         ),
@@ -583,6 +587,7 @@ mod module_registration_tests {
     use super::*;
     use sinomo_core::ModuleKind;
     use sinomo_module::{ModuleBackendRegistration, NativeRustBackendRegistration};
+    use sinomo_storage::StorageLayout;
 
     #[test]
     fn dfs_registers_as_r1_native_rust_module() {
@@ -643,6 +648,23 @@ mod module_registration_tests {
                 .any(|route| route.route == DFS_PROTOCOL_FRAME_ROUTE
                     && route.operation == "dfs.object.transfer")
         );
+    }
+
+    #[test]
+    fn dfs_storage_contract_covers_dynamic_metadata_shards() {
+        let mut layout = StorageLayout::new();
+        register_storage_paths(&mut layout).expect("register DFS storage paths");
+
+        for path in [
+            "dfs/metadata/services/records/tables/materialized.slog",
+            "dfs/metadata/users/journal/segments/00000000000000000001.slog",
+            "dfs/metadata/custom-shard/records/objects/example.sobj",
+        ] {
+            assert!(
+                layout.owner_for(path).is_some(),
+                "storage contract should cover {path}"
+            );
+        }
     }
 }
 
@@ -7489,6 +7511,90 @@ impl DfsFrameTransport for SingleDfsProtocolFrameTransport {
     }
 }
 
+#[derive(Debug)]
+struct EndpointServedDfsProtocolFrameTransport {
+    local_node_id: NodeId,
+    return_node_id: NodeId,
+    inbound_frames: VecDeque<InboundFrame>,
+    outbound_frames: Vec<NetworkFrame>,
+    endpoint_transport: DfsEndpointTransport,
+}
+
+impl EndpointServedDfsProtocolFrameTransport {
+    fn new(
+        local_node_id: NodeId,
+        inbound_frame: NetworkFrame,
+        endpoints: Vec<ClusterEndpointRecord>,
+        sender: DfsProtocolFrameSender,
+        connect_timeout: Duration,
+    ) -> Self {
+        let return_node_id = inbound_frame.source_node_id.clone();
+        let mut inbound_frames = VecDeque::new();
+        inbound_frames.push_back(InboundFrame {
+            received_by: local_node_id.clone(),
+            frame: inbound_frame,
+        });
+        let endpoint_transport = DfsEndpointTransport::with_senders(
+            local_node_id.clone(),
+            endpoints,
+            connect_timeout,
+            Some(sender),
+            None,
+        );
+        Self {
+            local_node_id,
+            return_node_id,
+            inbound_frames,
+            outbound_frames: Vec::new(),
+            endpoint_transport,
+        }
+    }
+}
+
+impl DfsTransportIdentity for EndpointServedDfsProtocolFrameTransport {
+    fn local_node_id(&self) -> &NodeId {
+        &self.local_node_id
+    }
+}
+
+impl DfsFrameTransport for EndpointServedDfsProtocolFrameTransport {
+    fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
+        if &frame.target_node_id != target_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: target_node_id.clone(),
+                frame_target_node_id: frame.target_node_id.clone(),
+            });
+        }
+        if target_node_id == &self.local_node_id {
+            self.inbound_frames.push_back(InboundFrame {
+                received_by: self.local_node_id.clone(),
+                frame,
+            });
+            return Ok(());
+        }
+        if target_node_id == &self.return_node_id {
+            self.outbound_frames.push(frame);
+            return Ok(());
+        }
+        self.endpoint_transport
+            .send_frame_to_endpoint(target_node_id, frame, true)
+    }
+
+    fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError> {
+        let mut frames = self.inbound_frames.drain(..).collect::<Vec<_>>();
+        frames.extend(self.endpoint_transport.drain_incoming()?);
+        Ok(frames)
+    }
+
+    fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
+        let nested = self
+            .endpoint_transport
+            .pending_incoming_count()?
+            .unwrap_or_default();
+        Ok(Some(self.inbound_frames.len().saturating_add(nested)))
+    }
+}
+
 pub fn process_dfs_protocol_frame(
     local_node_id: NodeId,
     inbound_frame: NetworkFrame,
@@ -7505,6 +7611,44 @@ pub fn process_dfs_protocol_frame(
         });
     }
     let transport = SingleDfsProtocolFrameTransport::new(local_node_id, inbound_frame);
+    let mut service = NetworkedDfsService::new(transport, content);
+    if let Some(control_plane) = control_plane {
+        service = service.with_boxed_control_plane(control_plane);
+    }
+    let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
+    let events = service.process_incoming()?;
+    let outbound_frames = service.into_transport().outbound_frames;
+    Ok(DfsProtocolFrameProcessResult {
+        outbound_frames,
+        events,
+    })
+}
+
+pub fn process_dfs_protocol_frame_with_endpoint_sender(
+    local_node_id: NodeId,
+    inbound_frame: NetworkFrame,
+    content: LocalContentStore,
+    metadata_backend: Box<dyn DfsMetadataBackend>,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    endpoints: Vec<ClusterEndpointRecord>,
+    sender: DfsProtocolFrameSender,
+    connect_timeout: Duration,
+) -> Result<DfsProtocolFrameProcessResult, DfsError> {
+    if inbound_frame.target_node_id != local_node_id {
+        return Err(DfsError::Network {
+            message: format!(
+                "dfs protocol frame target {} does not match local node {}",
+                inbound_frame.target_node_id, local_node_id
+            ),
+        });
+    }
+    let transport = EndpointServedDfsProtocolFrameTransport::new(
+        local_node_id,
+        inbound_frame,
+        endpoints,
+        sender,
+        connect_timeout,
+    );
     let mut service = NetworkedDfsService::new(transport, content);
     if let Some(control_plane) = control_plane {
         service = service.with_boxed_control_plane(control_plane);
@@ -7547,6 +7691,41 @@ pub fn process_cluster_dfs_protocol_frame(
     .map(Some)
 }
 
+pub fn process_cluster_dfs_protocol_frame_with_endpoint_sender(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    inbound_frame: NetworkFrame,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    sender: DfsProtocolFrameSender,
+    connect_timeout: Duration,
+) -> Result<Option<DfsProtocolFrameProcessResult>, DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    let local_node_id = state.local_node_id.clone();
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+    let metadata_backend = open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+    process_dfs_protocol_frame_with_endpoint_sender(
+        local_node_id,
+        inbound_frame,
+        content,
+        metadata_backend,
+        control_plane,
+        endpoints,
+        sender,
+        connect_timeout,
+    )
+    .map(Some)
+}
+
 #[derive(Clone, Debug)]
 pub struct DfsProtocolFrameCommandProcessResult {
     pub response: DfsProtocolFrameResponse,
@@ -7569,6 +7748,35 @@ pub fn process_cluster_dfs_protocol_frame_command(
     let request_id = command.request_id;
     let Some(result) =
         process_cluster_dfs_protocol_frame(data_dir, cluster_paths, command.frame, control_plane)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(DfsProtocolFrameCommandProcessResult {
+        response: DfsProtocolFrameResponse {
+            request_id,
+            outbound_frames: result.outbound_frames,
+        },
+        events: result.events,
+    }))
+}
+
+pub fn process_cluster_dfs_protocol_frame_command_with_endpoint_sender(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    command: DfsProtocolFrameCommand,
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    sender: DfsProtocolFrameSender,
+    connect_timeout: Duration,
+) -> Result<Option<DfsProtocolFrameCommandProcessResult>, DfsError> {
+    let request_id = command.request_id;
+    let Some(result) = process_cluster_dfs_protocol_frame_with_endpoint_sender(
+        data_dir,
+        cluster_paths,
+        command.frame,
+        control_plane,
+        sender,
+        connect_timeout,
+    )?
     else {
         return Ok(None);
     };
@@ -13509,7 +13717,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .as_mut()
             .expect("control plane checked above");
         let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-            .select_metadata_shard_for_path(file_system_id, &normalized)
+            .select_metadata_shard_for_path_strict_default_sifs_split(file_system_id, &normalized)
             .map_err(DfsError::from)?
         else {
             return Ok(Some(format!(
@@ -13571,7 +13779,10 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .as_mut()
                 .expect("control plane checked above");
             let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-                .select_metadata_shard_for_path(file_system_id, &candidate)
+                .select_metadata_shard_for_path_strict_default_sifs_split(
+                    file_system_id,
+                    &candidate,
+                )
                 .map_err(DfsError::from)?
             else {
                 continue;
@@ -13600,6 +13811,17 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 path: from.to_string(),
             }));
         }
+        if self.resume_running_cross_shard_namespace_job_for_paths(
+            file_system_id,
+            from,
+            to,
+            &[
+                DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+            ],
+        )? {
+            return Ok(());
+        }
         let destination_primary =
             self.namespace_coordinator_foreign_primary(file_system_id, from, to)?;
         let Some(destination_primary) = destination_primary else {
@@ -13618,6 +13840,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Err(crate::posix::DfsPosixError::Dfs(DfsError::Busy {
                 path: existing_path.to_string(),
             }));
+        }
+        if self.resume_running_cross_shard_namespace_job_for_paths(
+            file_system_id,
+            existing_path,
+            link_path,
+            &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
+        )? {
+            return Ok(());
         }
         let destination_primary =
             self.namespace_coordinator_foreign_primary(file_system_id, existing_path, link_path)?;

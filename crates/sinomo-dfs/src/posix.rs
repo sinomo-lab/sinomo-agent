@@ -162,6 +162,15 @@ pub struct DfsNamespaceJobFailure {
     pub reason: String,
 }
 
+fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> bool {
+    matches!(
+        kind,
+        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries
+            | DfsNamespaceJobKind::HardlinkAcrossShardPrimaries
+            | DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries
+    )
+}
+
 impl DfsWriteOptions {
     pub fn replicated_eventual(replica_candidates: Vec<NodeId>) -> Self {
         let desired = replica_candidates.len().max(1).min(2);
@@ -248,7 +257,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         let shard = DfsControlPlaneStore::new(kv.as_mut())
-            .select_metadata_shard_for_path(&sifs_file_system_id(), path)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), path)
             .map_err(DfsError::from)?;
         Ok(match shard {
             Some(shard) if shard.primary_node_id != self.node_id => Some(shard.primary_node_id),
@@ -263,7 +272,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(0);
         };
         let Some(shard) = DfsControlPlaneStore::new(kv.as_mut())
-            .select_metadata_shard_for_path(&sifs_file_system_id(), path)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), path)
             .map_err(DfsError::from)?
         else {
             return Ok(0);
@@ -381,6 +390,35 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         &mut self,
         operation: &DfsNamespaceOperation,
     ) -> Result<()> {
+        match operation {
+            DfsNamespaceOperation::Rename { from, to } => {
+                if self.resume_running_cross_shard_namespace_job_for_paths(
+                    &sifs_file_system_id(),
+                    from,
+                    to,
+                    &[
+                        DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                        DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+                    ],
+                )? {
+                    return Ok(());
+                }
+            }
+            DfsNamespaceOperation::Hardlink {
+                existing_path,
+                link_path,
+            } => {
+                if self.resume_running_cross_shard_namespace_job_for_paths(
+                    &sifs_file_system_id(),
+                    existing_path,
+                    link_path,
+                    &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
+                )? {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
         // Mutations must not interleave with an in-flight cross-shard move of
         // the same path; the coordinator releases the lock when the move
         // completes or aborts.
@@ -554,9 +592,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if from == to {
             return Ok(());
         }
-        let file_system_id = sifs_file_system_id();
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
         let source = self
             .lookup_sifs_path(&from)?
             .ok_or_else(|| DfsPosixError::NotFound { path: from.clone() })?;
@@ -572,11 +607,37 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     path: format!("{from} -> {to}"),
                 });
             }
+            let job_id = namespace_job_id(
+                "rename-dir-cross-shard",
+                &source.file_system_id,
+                &format!("{from}->{to}"),
+                &source.object_id,
+                &source.version,
+            );
+            if let Some(job) = self.namespace_job(&job_id)? {
+                return self.drive_cross_shard_namespace_job(job);
+            }
+            let file_system_id = sifs_file_system_id();
+            self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+            self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
             return self.coordinate_cross_shard_directory_rename(&from, &to, source);
         }
         if to_requires_directory {
             return Err(DfsPosixError::NotDirectory { path: to });
         }
+        let job_id = namespace_job_id(
+            "rename-cross-shard",
+            &source.file_system_id,
+            &format!("{from}->{to}"),
+            &source.object_id,
+            &source.version,
+        );
+        if let Some(job) = self.namespace_job(&job_id)? {
+            return self.drive_cross_shard_namespace_job(job);
+        }
+        let file_system_id = sifs_file_system_id();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &from)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &to)?;
         // Reject up front while writes are still settling so the caller sees
         // a clean retriable error with no job created.
         self.ensure_no_open_write_state_for_object(&source.object_id, &from)?;
@@ -585,13 +646,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         moved.path = to.clone();
         moved.changed_at_unix_nanos = now_unix_nanos();
         moved.version = next_version(&source.version);
-        let job_id = namespace_job_id(
-            "rename-cross-shard",
-            &source.file_system_id,
-            &format!("{from}->{to}"),
-            &source.object_id,
-            &source.version,
-        );
         let job = match self.namespace_job(&job_id)? {
             Some(job) => job,
             None => {
@@ -955,9 +1009,6 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if link_path == "/" {
             return Err(DfsPosixError::InvalidPath { path: link_path });
         }
-        let file_system_id = sifs_file_system_id();
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &existing_path)?;
-        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &link_path)?;
         let existing =
             self.lookup_sifs_path(&existing_path)?
                 .ok_or_else(|| DfsPosixError::NotFound {
@@ -1019,6 +1070,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             &target.object_id,
             &target.version,
         );
+        if let Some(job) = self.namespace_job(&job_id)? {
+            return self.drive_cross_shard_namespace_job(job);
+        }
+        let file_system_id = sifs_file_system_id();
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &existing_path)?;
+        self.ensure_path_not_in_cross_shard_flight(&file_system_id, &link_path)?;
         let job = match self.namespace_job(&job_id)? {
             Some(job) => job,
             None => {
@@ -3202,13 +3259,36 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     },
                     Err(error) => {
                         let reason = error.to_string();
-                        let failed = self.fail_namespace_job(job, reason.clone())?;
-                        report.failed_job_count = report.failed_job_count.saturating_add(1);
-                        report.failures.push(DfsNamespaceJobFailure {
-                            job_id: failed.job_id,
-                            kind: failed.kind,
-                            reason,
-                        });
+                        let latest = self.namespace_job(&job.job_id)?.unwrap_or(job);
+                        match latest.status {
+                            DfsNamespaceJobStatus::Completed => {
+                                report.completed_job_count =
+                                    report.completed_job_count.saturating_add(1);
+                            }
+                            DfsNamespaceJobStatus::Running
+                                if namespace_job_kind_is_cross_shard(&latest.kind) =>
+                            {
+                                report.remaining_running_job_count =
+                                    report.remaining_running_job_count.saturating_add(1);
+                            }
+                            DfsNamespaceJobStatus::Running => {
+                                let failed = self.fail_namespace_job(latest, reason.clone())?;
+                                report.failed_job_count = report.failed_job_count.saturating_add(1);
+                                report.failures.push(DfsNamespaceJobFailure {
+                                    job_id: failed.job_id,
+                                    kind: failed.kind,
+                                    reason,
+                                });
+                            }
+                            DfsNamespaceJobStatus::Failed => {
+                                report.failed_job_count = report.failed_job_count.saturating_add(1);
+                                report.failures.push(DfsNamespaceJobFailure {
+                                    job_id: latest.job_id,
+                                    kind: latest.kind,
+                                    reason: latest.failure_reason.unwrap_or(reason),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -4109,6 +4189,80 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             return Ok(None);
         };
         Ok(backend.get_namespace_job(job_id)?)
+    }
+
+    pub(crate) fn resume_running_cross_shard_namespace_job_for_paths(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+    ) -> Result<bool> {
+        let Some(job) = self.running_cross_shard_namespace_job_for_paths(
+            file_system_id,
+            root_path,
+            target_path,
+            kinds,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.drive_cross_shard_namespace_job(job)?;
+        Ok(true)
+    }
+
+    fn running_cross_shard_namespace_job_for_paths(
+        &self,
+        file_system_id: &DfsFileSystemId,
+        root_path: &str,
+        target_path: &str,
+        kinds: &[DfsNamespaceJobKind],
+    ) -> Result<Option<DfsNamespaceJobRecord>> {
+        let Some(backend) = self.metadata_backend.as_ref() else {
+            return Ok(None);
+        };
+        let root_path = match normalize_posix_path(root_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let target_path = match normalize_posix_path(target_path) {
+            Ok(path) => path,
+            Err(_) => return Ok(None),
+        };
+        let mut cursor = None;
+        loop {
+            let page = backend.list_namespace_jobs_page(
+                cursor.as_ref(),
+                POSIX_NAMESPACE_JOB_MAINTENANCE_PAGE_SIZE,
+            )?;
+            for job in page.jobs {
+                if job.file_system_id != *file_system_id
+                    || job.status != DfsNamespaceJobStatus::Running
+                    || !kinds.contains(&job.kind)
+                {
+                    continue;
+                }
+                let Ok(job_root_path) = normalize_posix_path(&job.root_path) else {
+                    continue;
+                };
+                if job_root_path != root_path {
+                    continue;
+                }
+                let Some(job_target_path) = job.target_path.as_ref() else {
+                    continue;
+                };
+                let Ok(job_target_path) = normalize_posix_path(job_target_path) else {
+                    continue;
+                };
+                if job_target_path == target_path {
+                    return Ok(Some(job));
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                return Ok(None);
+            };
+            cursor = Some(next_cursor);
+        }
     }
 
     fn persist_namespace_job(&mut self, job: &DfsNamespaceJobRecord) -> Result<()> {

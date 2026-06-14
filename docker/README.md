@@ -168,9 +168,10 @@ SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 
 Scenarios: per-node DFS invariants, read-your-write roundtrips (both segments),
 cross-segment write→read in both directions plus a routed delete, a
-/users→/services rename issued by a non-writer node, member restart durability,
-and a final invariant sweep. Failure evidence (probe JSON, compose ps, cluster
-health/doctor, per-node logs) lands in `target/cluster-test-artifacts/<run>/`.
+/users→/services rename issued by a non-writer node, cross-segment deterministic
+bulk write/read throughput, member restart durability, and a final invariant
+sweep. Failure evidence (probe JSON, compose ps, cluster health/doctor, per-node
+logs) lands in `target/cluster-test-artifacts/<run>/`.
 
 The scenarios are composed from runtime test cases registered in the binary
 itself (list them with `sinomo test list --tag cluster-dfs`), so any probe can
@@ -182,7 +183,26 @@ docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
 docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
   exec node2 sinomo test run cluster.dfs.expect-file --require-cluster \
   --param path=/services/x.txt --param payload=hello --param timeout-seconds=60
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  exec node2 sinomo test run cluster.dfs.bulk-write --require-cluster --json \
+  --param base=/services/perf-a --param files=128 --param bytes=4096 \
+  --param timeout-seconds=120
+docker compose -p sinomo-dfs-test -f docker/docker-compose.dev.yml \
+  exec node6 sinomo test run cluster.dfs.bulk-expect --require-cluster --json \
+  --param base=/services/perf-a --param files=128 --param bytes=4096 \
+  --param timeout-seconds=120
 ```
+
+The bulk-performance workload first runs a no-threshold warmup leg, then
+defaults to 64 measured files of 4096 bytes in each cross-segment direction and
+records elapsed time, file throughput, byte throughput, and exact payload
+verification in the JSON probe reports. The default Docker write floor is 0.75
+files/s and the default cross-node read/convergence floor is 1 file/s. Increase
+or gate it with
+`SINOMO_TEST_PERF_WARMUP_FILES`, `SINOMO_TEST_PERF_FILES`,
+`SINOMO_TEST_PERF_BYTES`, `SINOMO_TEST_PERF_TIMEOUT`,
+`SINOMO_TEST_PERF_MIN_WRITE_FILES_PER_SEC`, and
+`SINOMO_TEST_PERF_MIN_READ_FILES_PER_SEC`.
 
 ## Validation gates
 

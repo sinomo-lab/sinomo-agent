@@ -159,6 +159,9 @@ pub fn register_storage_paths(
     ] {
         layout.register_object_log("sinomo-daemon", StorageRing::R1, relative_path)?;
     }
+    for relative_path in ["daemon/main.stdout.log", "daemon/main.stderr.log"] {
+        layout.register_human_text("sinomo-daemon", StorageRing::R1, relative_path)?;
+    }
     layout.register_escape_path(
         "sinomo-daemon",
         StorageRing::Application,

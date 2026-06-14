@@ -438,12 +438,15 @@ async fn handle_daemon_dfs_protocol_frame_async(
     let control_plane = daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
     let process_data_dir = data_dir.clone();
     let process_cluster_paths = cluster_paths.clone();
+    let process_runtime = runtime.clone();
     let result = tokio::task::spawn_blocking(move || {
-        sinomo_dfs::process_cluster_dfs_protocol_frame_command(
+        sinomo_dfs::process_cluster_dfs_protocol_frame_command_with_endpoint_sender(
             &process_data_dir,
             &process_cluster_paths,
             command,
             control_plane,
+            daemon_dfs_protocol_frame_sender_on_runtime(&process_runtime),
+            sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
         )
     })
     .await
@@ -547,16 +550,22 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     if let Some(stats) = crate::process_idle_stats() {
         stats.incr_disk_reads_dfs_metadata();
     }
-    let Some(report) = sinomo_dfs::run_cluster_dfs_maintenance_tick_with_async_peer_transport(
-        runtime,
-        data_dir,
-        cluster_paths.clone(),
-        daemon_dfs_async_peer_transport(runtime),
-        daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime)),
-        DfsMaintenanceTickOptions::default(),
-    )
-    .await?
-    else {
+    let runtime = runtime.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        sinomo_dfs::run_cluster_dfs_maintenance_tick_with_peer_transport(
+            &data_dir,
+            &cluster_paths,
+            daemon_dfs_blocking_peer_transport_on_runtime(&runtime),
+            daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(&runtime)),
+            DfsMaintenanceTickOptions::default(),
+        )
+    })
+    .await
+    .map_err(|source| DaemonError::Network {
+        address: "DFS maintenance".to_string(),
+        detail: format!("DFS maintenance task failed: {source}"),
+    })??;
+    let Some(report) = report else {
         return Ok(());
     };
     let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);

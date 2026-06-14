@@ -18853,6 +18853,20 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
             .contains("moving between metadata shards"),
         "unexpected namespace lock error: {chmod_error}"
     );
+    let parked_report = cluster
+        .users_primary
+        .posix_resume_namespace_jobs_bounded(8, 512)
+        .expect("maintenance scan while destination is still unreachable");
+    assert_eq!(
+        (
+            parked_report.resumed_job_count,
+            parked_report.completed_job_count,
+            parked_report.failed_job_count,
+            parked_report.remaining_running_job_count,
+        ),
+        (1, 0, 0, 1),
+        "a transient resume failure must leave the cross-shard saga running: {parked_report:?}"
+    );
 
     // Heal the topology: transfer the services shard to its real primary and
     // resume the parked saga through the maintenance path.
@@ -18934,6 +18948,116 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
         )
         .expect("the freed source path accepts new files after recovery");
 
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_posix_cross_shard_rename_retry_resumes_existing_job() {
+    let mut cluster = sifs_two_primary_cluster("sifs-xshard-retry");
+    let ghost = NodeId::from_legacy_named("node_sifs_xshard_retry_ghost").expect("ghost node");
+    let bytes = b"rename retry resumes the same durable saga".to_vec();
+    cluster
+        .users_primary
+        .posix_write_file(
+            "/users/retry.txt",
+            &bytes,
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+                replica_candidates: vec![cluster.users_primary_node.clone()],
+                wait_for_commit: true,
+            },
+        )
+        .expect("primary local create");
+
+    let to_ghost = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &ghost,
+        3,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &to_ghost {
+            control.put_metadata_shard(shard).expect("ghost shard");
+        }
+    });
+    let error = cluster
+        .users_primary
+        .posix_rename("/users/retry.txt", "/services/retry-moved.txt")
+        .expect_err("first rename parks while destination primary is unreachable");
+    assert!(
+        matches!(error, DfsPosixError::Dfs(DfsError::Network { .. })),
+        "expected a transport error, got {error:?}"
+    );
+
+    let healed = sifs_two_primary_shard_configs(
+        &cluster.users_primary_node,
+        &cluster.services_primary_node,
+        4,
+        vec![
+            cluster.services_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+        vec![
+            cluster.users_primary_node.clone(),
+            cluster.replica_node.clone(),
+        ],
+    );
+    cluster.shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        for shard in &healed {
+            control.put_metadata_shard(shard).expect("healed shard");
+        }
+    });
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_pump_retry").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let services_thread = std::thread::spawn(move || {
+        let mut services_primary = services_primary;
+        while !services_stop.load(Ordering::SeqCst) {
+            services_primary
+                .process_incoming()
+                .expect("services primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        services_primary
+    });
+
+    cluster
+        .users_primary
+        .execute_namespace_operation_local(&DfsNamespaceOperation::Rename {
+            from: "/users/retry.txt".to_string(),
+            to: "/services/retry-moved.txt".to_string(),
+        })
+        .expect("routed retry resumes existing cross-shard rename job");
+    assert!(matches!(
+        cluster.users_primary.posix_stat("/users/retry.txt"),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+    assert_eq!(
+        cluster
+            .users_primary
+            .posix_read_file("/services/retry-moved.txt")
+            .expect("read moved"),
+        bytes
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    cluster.services_primary = services_thread.join().expect("services thread");
     std::fs::remove_dir_all(&cluster.root).ok();
 }
 
