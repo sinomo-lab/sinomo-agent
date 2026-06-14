@@ -6,6 +6,7 @@ use crate::cluster::{
 };
 use crate::dfs::{
     daemon_dfs_endpoint_transport, daemon_dfs_endpoint_transport_on_runtime,
+    daemon_dfs_maintenance_notify, daemon_dfs_pending_maintenance_work,
     ensure_default_distributed_dfs_async_on_runtime, ensure_default_local_dfs_expose,
     run_daemon_dfs_maintenance_tick_on_runtime,
 };
@@ -40,6 +41,7 @@ use time::OffsetDateTime;
 
 pub const DAEMON_COMMAND_MAX_BYTES: usize = sinomo_network::DAEMON_CONTROL_RPC_MAX_FRAME_BYTES;
 pub const DAEMON_DFS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub const DAEMON_ROLLOUT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(60);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
@@ -285,6 +287,8 @@ async fn run_daemon_background_maintenance_loop(
     let mut last_rollout_telemetry = maintenance_started
         .checked_sub(DAEMON_ROLLOUT_TELEMETRY_INTERVAL)
         .unwrap_or(maintenance_started);
+    let dfs_maintenance_notify = daemon_dfs_maintenance_notify();
+    let mut dfs_triggered_maintenance_requested = false;
 
     loop {
         if label == "daemon" {
@@ -323,15 +327,62 @@ async fn run_daemon_background_maintenance_loop(
             }
         }
 
+        if dfs_maintenance_enabled && label == "daemon" && !dfs_triggered_maintenance_requested {
+            let probe_paths = paths.clone();
+            match tokio::task::spawn_blocking(move || {
+                daemon_dfs_pending_maintenance_work(&probe_paths)
+            })
+            .await
+            {
+                Ok(Ok(work)) if work.has_work() => {
+                    dfs_triggered_maintenance_requested = true;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    eprintln!("sinomo {label} DFS maintenance probe failed: {error}");
+                }
+                Err(error) => {
+                    eprintln!("sinomo {label} DFS maintenance probe task failed: {error}");
+                }
+            }
+        }
+
         if dfs_maintenance_enabled
             && label == "daemon"
-            && last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
+            && (last_dfs_maintenance.elapsed() >= DAEMON_DFS_MAINTENANCE_INTERVAL
+                || (dfs_triggered_maintenance_requested
+                    && last_dfs_maintenance.elapsed()
+                        >= DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL))
         {
             let dfs_paths = paths.clone();
             let dfs_runtime = runtime.clone();
             match run_daemon_dfs_maintenance_tick_on_runtime(&dfs_paths, &dfs_runtime).await {
-                Ok(()) => {}
+                Ok(()) => {
+                    let probe_paths = paths.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        daemon_dfs_pending_maintenance_work(&probe_paths)
+                    })
+                    .await
+                    {
+                        Ok(Ok(work)) => {
+                            dfs_triggered_maintenance_requested = work.has_work();
+                        }
+                        Ok(Err(error)) => {
+                            dfs_triggered_maintenance_requested = false;
+                            eprintln!(
+                                "sinomo {label} DFS maintenance follow-up probe failed: {error}"
+                            );
+                        }
+                        Err(error) => {
+                            dfs_triggered_maintenance_requested = false;
+                            eprintln!(
+                                "sinomo {label} DFS maintenance follow-up probe task failed: {error}"
+                            );
+                        }
+                    }
+                }
                 Err(error) => {
+                    dfs_triggered_maintenance_requested = false;
                     eprintln!("sinomo {label} DFS maintenance tick failed: {error}");
                 }
             }
@@ -381,14 +432,37 @@ async fn run_daemon_background_maintenance_loop(
         } else {
             None
         };
-        tokio::time::sleep(daemon_maintenance_sleep_duration(
+        let dfs_triggered_maintenance_due = if dfs_maintenance_enabled
+            && label == "daemon"
+            && dfs_triggered_maintenance_requested
+        {
+            Some(daemon_maintenance_interval_remaining(
+                sleep_started,
+                last_dfs_maintenance,
+                DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
+            ))
+        } else {
+            None
+        };
+        let sleep_duration = daemon_maintenance_sleep_duration(
             sleep_started,
             cluster_network.next_due_duration(sleep_started),
             last_dfs_maintenance,
             last_rollout_telemetry,
+            dfs_triggered_maintenance_due,
             shadow_finalization_due,
-        ))
-        .await;
+        );
+        if dfs_maintenance_enabled && label == "daemon" {
+            let notify = Arc::clone(&dfs_maintenance_notify);
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_duration) => {}
+                _ = notify.notified() => {
+                    dfs_triggered_maintenance_requested = true;
+                }
+            }
+        } else {
+            tokio::time::sleep(sleep_duration).await;
+        }
     }
 }
 
@@ -696,6 +770,7 @@ fn daemon_maintenance_sleep_duration(
     cluster_next_due: Duration,
     last_dfs_maintenance: Instant,
     last_rollout_telemetry: Instant,
+    dfs_triggered_maintenance_due: Option<Duration>,
     shadow_finalization_due: Option<Duration>,
 ) -> Duration {
     let mut next_due = cluster_next_due;
@@ -710,6 +785,9 @@ fn daemon_maintenance_sleep_duration(
             last_rollout_telemetry,
             DAEMON_ROLLOUT_TELEMETRY_INTERVAL,
         ));
+    if let Some(dfs_triggered_maintenance_due) = dfs_triggered_maintenance_due {
+        next_due = next_due.min(dfs_triggered_maintenance_due);
+    }
     if let Some(shadow_finalization_due) = shadow_finalization_due {
         next_due = next_due.min(shadow_finalization_due);
     }
@@ -4099,6 +4177,7 @@ mod tests {
                 Duration::from_secs(30),
                 last_dfs,
                 last_rollout,
+                None,
                 Some(DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL),
             ),
             Duration::from_secs(30),
@@ -4110,10 +4189,23 @@ mod tests {
                 Duration::from_secs(30),
                 last_dfs,
                 last_rollout,
+                None,
                 Some(Duration::from_secs(5)),
             ),
             Duration::from_secs(5),
             "active rollout fallback polling can still wake sooner than cluster maintenance"
+        );
+        assert_eq!(
+            daemon_maintenance_sleep_duration(
+                now,
+                Duration::from_secs(600),
+                last_dfs,
+                last_rollout,
+                Some(Duration::from_secs(3)),
+                None,
+            ),
+            Duration::from_secs(3),
+            "pending DFS repair or namespace work should wake before the fixed five-minute tick"
         );
         let almost_due_dfs = now
             .checked_sub(DAEMON_DFS_MAINTENANCE_INTERVAL - Duration::from_secs(1))
@@ -4125,12 +4217,20 @@ mod tests {
                 almost_due_dfs,
                 now,
                 None,
+                None,
             ),
             Duration::from_secs(1),
             "DFS maintenance must wake on its own even when no shadow finalization is pending"
         );
         assert_eq!(
-            daemon_maintenance_sleep_duration(now, Duration::ZERO, last_dfs, last_rollout, None,),
+            daemon_maintenance_sleep_duration(
+                now,
+                Duration::ZERO,
+                last_dfs,
+                last_rollout,
+                None,
+                None,
+            ),
             Duration::from_millis(1),
             "overdue work should not create a zero-duration spin"
         );

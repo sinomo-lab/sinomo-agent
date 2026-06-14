@@ -19,20 +19,58 @@ use sinomo_dfs::{
 };
 use sinomo_dfs::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture,
-    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions, DfsEndpointTransport,
-    DfsMaintenanceTickOptions, DfsMetadataBackend, DfsMetadataJournalBatchCommand,
-    DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationOptions,
-    DfsMetadataJournalReplicationReport, DfsMetadataPeerTransportError,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsPeerTransport,
-    DfsPeerTransportError, DfsProtocolFrameCommand, DfsProtocolFrameResponse,
-    DfsProtocolFrameSender, NetworkedDfsService,
+    DfsDefaultClusterBootstrapOptions, DfsDefaultClusterSmokeOptions,
+    DfsEndpointServedProtocolFrameTransport, DfsEndpointTransport, DfsMaintenanceTickOptions,
+    DfsMetadataBackend, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
+    DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
+    DfsMetadataPeerTransportError, DfsMetadataSnapshotInstallCommand,
+    DfsMetadataSnapshotInstallResponse, DfsPeerTransport, DfsPeerTransportError,
+    DfsProtocolFrameCommand, DfsProtocolFrameResponse, DfsProtocolFrameSender, NetworkedDfsService,
 };
 use sinomo_kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse};
 use sinomo_local::SinomoDataDir;
 use sinomo_network::ClusterPaths;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 #[cfg(test)]
 use time::OffsetDateTime;
+
+const DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+
+type DaemonDfsProtocolFrameService = NetworkedDfsService<DfsEndpointServedProtocolFrameTransport>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DaemonDfsProtocolFrameServiceSignature {
+    local_node_id: sinomo_node::NodeId,
+    endpoints: Vec<ClusterEndpointRecord>,
+    kv_snapshot_available: bool,
+}
+
+#[derive(Debug)]
+struct DaemonDfsProtocolFrameServiceCacheEntry {
+    signature: DaemonDfsProtocolFrameServiceSignature,
+    service: DaemonDfsProtocolFrameService,
+    last_metadata_refresh: Instant,
+}
+
+static DAEMON_DFS_PROTOCOL_FRAME_SERVICE_CACHE: OnceLock<
+    Mutex<BTreeMap<PathBuf, DaemonDfsProtocolFrameServiceCacheEntry>>,
+> = OnceLock::new();
+static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DaemonDfsPendingMaintenanceWork {
+    pub pending_repair_count: usize,
+    pub pending_namespace_job_count: usize,
+}
+
+impl DaemonDfsPendingMaintenanceWork {
+    pub(crate) fn has_work(self) -> bool {
+        self.pending_repair_count > 0 || self.pending_namespace_job_count > 0
+    }
+}
 
 pub(crate) fn default_distributed_dfs_enabled() -> bool {
     matches!(
@@ -427,6 +465,120 @@ pub(crate) fn open_daemon_dfs_metadata_backend(
     sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths).map_err(Into::into)
 }
 
+pub(crate) fn daemon_dfs_maintenance_notify() -> Arc<tokio::sync::Notify> {
+    Arc::clone(DAEMON_DFS_MAINTENANCE_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new())))
+}
+
+pub(crate) fn notify_daemon_dfs_maintenance_work() {
+    daemon_dfs_maintenance_notify().notify_one();
+}
+
+pub(crate) fn daemon_dfs_pending_maintenance_work(
+    paths: &DaemonPaths,
+) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
+    let data_dir = daemon_data_dir(paths)?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(DaemonDfsPendingMaintenanceWork::default());
+    }
+    let metadata = open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths)?;
+    let summary = metadata.metadata_summary()?;
+    Ok(DaemonDfsPendingMaintenanceWork {
+        pending_repair_count: summary.pending_repair_count,
+        pending_namespace_job_count: summary.pending_namespace_job_count,
+    })
+}
+
+fn daemon_dfs_protocol_frame_service_cache()
+-> &'static Mutex<BTreeMap<PathBuf, DaemonDfsProtocolFrameServiceCacheEntry>> {
+    DAEMON_DFS_PROTOCOL_FRAME_SERVICE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn daemon_dfs_cache_lock_error() -> sinomo_dfs::DfsError {
+    sinomo_dfs::DfsError::Network {
+        message: "daemon DFS protocol frame service cache lock poisoned".to_string(),
+    }
+}
+
+fn daemon_dfs_network_error(source: sinomo_network::NetworkError) -> sinomo_dfs::DfsError {
+    sinomo_dfs::DfsError::Network {
+        message: source.to_string(),
+    }
+}
+
+fn process_daemon_dfs_protocol_frame_command_on_runtime(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    command: DfsProtocolFrameCommand,
+    runtime: &tokio::runtime::Handle,
+) -> Result<Option<sinomo_dfs::DfsProtocolFrameCommandProcessResult>, sinomo_dfs::DfsError> {
+    data_dir
+        .ensure_root_layout()
+        .map_err(|source| sinomo_dfs::DfsError::Metadata {
+            message: source.to_string(),
+        })?;
+    if !cluster_paths.state.exists() {
+        return Ok(None);
+    }
+
+    let state = sinomo_network::read_cluster_state_without_kv(cluster_paths)
+        .map_err(daemon_dfs_network_error)?;
+    let endpoints = sinomo_network::cluster_dfs_protocol_targets(cluster_paths, &state);
+    let signature = DaemonDfsProtocolFrameServiceSignature {
+        local_node_id: state.local_node_id.clone(),
+        endpoints: endpoints.clone(),
+        kv_snapshot_available: cluster_paths.kv_snapshot.exists(),
+    };
+    let cache_key = data_dir.root();
+    let mut cache = daemon_dfs_protocol_frame_service_cache()
+        .lock()
+        .map_err(|_| daemon_dfs_cache_lock_error())?;
+    let should_rebuild = cache
+        .get(&cache_key)
+        .is_none_or(|entry| entry.signature != signature);
+    if should_rebuild {
+        let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
+        let metadata_backend =
+            sinomo_dfs::open_cluster_aware_dfs_metadata_backend(data_dir, cluster_paths)?;
+        let transport = DfsEndpointServedProtocolFrameTransport::new(
+            signature.local_node_id.clone(),
+            endpoints,
+            daemon_dfs_protocol_frame_sender_on_runtime(runtime),
+            sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+        );
+        let service = NetworkedDfsService::new(transport, content);
+        let service =
+            with_daemon_dfs_control_plane_on_runtime(service, cluster_paths, Some(runtime))
+                .with_boxed_metadata_backend(metadata_backend)?;
+        cache.insert(
+            cache_key.clone(),
+            DaemonDfsProtocolFrameServiceCacheEntry {
+                signature: signature.clone(),
+                service,
+                last_metadata_refresh: Instant::now(),
+            },
+        );
+    }
+
+    let entry = cache
+        .get_mut(&cache_key)
+        .expect("daemon DFS protocol frame cache entry inserted");
+    if entry.last_metadata_refresh.elapsed() >= DAEMON_DFS_PROTOCOL_FRAME_CACHE_REFRESH_INTERVAL {
+        entry.service.hydrate_from_metadata_backend()?;
+        entry.last_metadata_refresh = Instant::now();
+    }
+    let request_id = command.request_id;
+    let result = entry.service.process_protocol_frame(command.frame)?;
+    Ok(Some(sinomo_dfs::DfsProtocolFrameCommandProcessResult {
+        response: DfsProtocolFrameResponse {
+            request_id,
+            outbound_frames: result.outbound_frames,
+        },
+        events: result.events,
+    }))
+}
+
 async fn handle_daemon_dfs_protocol_frame_async(
     paths: &DaemonPaths,
     command: DfsProtocolFrameCommand,
@@ -435,18 +587,15 @@ async fn handle_daemon_dfs_protocol_frame_async(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let control_plane = daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
     let process_data_dir = data_dir.clone();
     let process_cluster_paths = cluster_paths.clone();
     let process_runtime = runtime.clone();
     let result = tokio::task::spawn_blocking(move || {
-        sinomo_dfs::process_cluster_dfs_protocol_frame_command_with_endpoint_sender(
+        process_daemon_dfs_protocol_frame_command_on_runtime(
             &process_data_dir,
             &process_cluster_paths,
             command,
-            control_plane,
-            daemon_dfs_protocol_frame_sender_on_runtime(&process_runtime),
-            sinomo_dfs::DEFAULT_DFS_PROTOCOL_FRAME_CONNECT_TIMEOUT,
+            &process_runtime,
         )
     })
     .await
@@ -459,6 +608,7 @@ async fn handle_daemon_dfs_protocol_frame_async(
     };
     let sinomo_dfs::DfsProtocolFrameCommandProcessResult { response, events } = result;
     if sinomo_dfs::dfs_events_should_publish_metadata(&events) {
+        notify_daemon_dfs_maintenance_work();
         sinomo_dfs::schedule_cluster_dfs_metadata_publish_after_events_with_async_peer_transport_on_runtime(
             runtime.clone(),
             data_dir,
@@ -487,28 +637,28 @@ fn handle_daemon_dfs_protocol_frame_on_runtime(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    let control_plane = daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
-    let result = sinomo_dfs::run_cluster_dfs_protocol_frame_command_with_metadata_publish(
+    let result = process_daemon_dfs_protocol_frame_command_on_runtime(
         &data_dir,
         &cluster_paths,
         command,
+        runtime,
+    )?;
+    let Some(result) = result else {
+        return Err(DaemonError::ClusterOrphan);
+    };
+    let sinomo_dfs::DfsProtocolFrameCommandProcessResult { response, events } = result;
+    sinomo_dfs::run_cluster_dfs_metadata_publish_after_events_with_peer_transport(
+        &data_dir,
+        &cluster_paths,
         daemon_dfs_blocking_peer_transport_on_runtime(runtime),
-        control_plane,
+        &events,
         DfsMetadataJournalReplicationOptions::default(),
         log_dfs_metadata_replication_report,
         |error| {
             eprintln!("sinomo daemon DFS metadata publish after protocol mutation failed: {error}");
         },
-    )?;
-    let Some(result) = result else {
-        return Err(DaemonError::ClusterOrphan);
-    };
-    if let Some(error) = result.metadata_publish_schedule_error {
-        eprintln!(
-            "sinomo daemon failed to spawn DFS metadata publish after protocol mutation: {error}"
-        );
-    }
-    Ok(result.response)
+    );
+    Ok(response)
 }
 
 pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
@@ -1035,6 +1185,10 @@ mod tests {
         let status = sinomo_dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
             .expect("status before maintenance");
         assert_eq!(status.pending_namespace_job_count, 1);
+        let pending = daemon_dfs_pending_maintenance_work(&paths).expect("pending maintenance");
+        assert_eq!(pending.pending_namespace_job_count, 1);
+        assert_eq!(pending.pending_repair_count, 0);
+        assert!(pending.has_work());
 
         let runtime = daemon_test_runtime("daemon-dfs-maintenance-namespace-jobs");
         runtime
@@ -1048,6 +1202,11 @@ mod tests {
             .expect("status after maintenance");
         assert_eq!(status.pending_namespace_job_count, 0);
         assert_eq!(status.failed_namespace_job_count, 0);
+        assert!(
+            !daemon_dfs_pending_maintenance_work(&paths)
+                .expect("pending maintenance after tick")
+                .has_work()
+        );
         let backend =
             open_daemon_dfs_metadata_backend(&data_dir, &cluster_paths).expect("metadata backend");
         let job = backend
@@ -2470,6 +2629,88 @@ mod tests {
         )
         .expect_err("wrong target rejected");
         assert!(error.to_string().contains("does not match local node"));
+    }
+
+    #[test]
+    fn daemon_dfs_protocol_frame_reuses_warm_service_for_repeated_frames() {
+        let root = temp_root("daemon_dfs_protocol_frame_warm_cache");
+        let data_root = root.join("data");
+        let paths = DaemonPaths::with_root(data_root.join("daemon"));
+        let local = NodeId::from_legacy_named("node_dfs_protocol_warm_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_protocol_warm_remote").expect("remote");
+        write_test_cluster_state(&data_root, &local);
+        let runtime = daemon_test_runtime("daemon-dfs-protocol-frame-warm-cache");
+
+        for frame_id in 1..=2 {
+            let response = handle_daemon_dfs_protocol_frame_on_runtime(
+                &paths,
+                DfsProtocolFrameCommand {
+                    request_id: format!("dfs_protocol_frame_warm_cache_{frame_id}"),
+                    frame: NetworkFrame {
+                        frame_id: NetworkFrameId(frame_id),
+                        source_node_id: remote.clone(),
+                        target_node_id: local.clone(),
+                        message: MeshMessage {
+                            message_id: MeshMessageId(frame_id),
+                            origin_node_id: remote.clone(),
+                            target_node_id: local.clone(),
+                            body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                                node_id: remote.clone(),
+                                tick: frame_id,
+                            }),
+                        },
+                    },
+                },
+                runtime.handle(),
+            )
+            .expect("protocol frame");
+            assert_eq!(
+                response.request_id,
+                format!("dfs_protocol_frame_warm_cache_{frame_id}")
+            );
+            assert!(response.outbound_frames.is_empty());
+        }
+
+        let cache_key = SinomoDataDir::new(&data_root).root();
+        let first_refresh = daemon_dfs_protocol_frame_service_cache()
+            .lock()
+            .expect("cache lock")
+            .get(&cache_key)
+            .expect("cache entry")
+            .last_metadata_refresh;
+        let response = handle_daemon_dfs_protocol_frame_on_runtime(
+            &paths,
+            DfsProtocolFrameCommand {
+                request_id: "dfs_protocol_frame_warm_cache_3".to_string(),
+                frame: NetworkFrame {
+                    frame_id: NetworkFrameId(3),
+                    source_node_id: remote.clone(),
+                    target_node_id: local.clone(),
+                    message: MeshMessage {
+                        message_id: MeshMessageId(3),
+                        origin_node_id: remote.clone(),
+                        target_node_id: local.clone(),
+                        body: MeshMessageBody::Heartbeat(sinomo_network::Heartbeat {
+                            node_id: remote,
+                            tick: 3,
+                        }),
+                    },
+                },
+            },
+            runtime.handle(),
+        )
+        .expect("third protocol frame");
+        assert_eq!(response.request_id, "dfs_protocol_frame_warm_cache_3");
+        let second_refresh = daemon_dfs_protocol_frame_service_cache()
+            .lock()
+            .expect("cache lock")
+            .get(&cache_key)
+            .expect("cache entry")
+            .last_metadata_refresh;
+        assert_eq!(
+            first_refresh, second_refresh,
+            "back-to-back protocol frames should reuse the hydrated service cache"
+        );
     }
 
     #[test]

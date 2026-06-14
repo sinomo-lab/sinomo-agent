@@ -1369,6 +1369,19 @@ pub trait DfsMetadataBackend: std::fmt::Debug + Send {
         object_id: &DfsObjectId,
         version: &DfsVersion,
     ) -> Result<Option<DfsObjectVersionRecord>>;
+    fn get_object_version_pairs(
+        &self,
+        keys: &[(DfsObjectId, DfsVersion)],
+    ) -> Result<Vec<(Option<DfsObjectMetadata>, Option<DfsObjectVersionRecord>)>> {
+        keys.iter()
+            .map(|(object_id, version)| {
+                Ok((
+                    self.get_object(object_id)?,
+                    self.get_version(object_id, version)?,
+                ))
+            })
+            .collect()
+    }
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {
         let mut versions = Vec::new();
         let mut cursor = None;
@@ -6953,6 +6966,25 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             .versions
             .get(&(object_id.clone(), version.clone()))
             .cloned())
+    }
+
+    fn get_object_version_pairs(
+        &self,
+        keys: &[(DfsObjectId, DfsVersion)],
+    ) -> Result<Vec<(Option<DfsObjectMetadata>, Option<DfsObjectVersionRecord>)>> {
+        let tables = self.current_tables_snapshot()?;
+        Ok(keys
+            .iter()
+            .map(|(object_id, version)| {
+                (
+                    tables.objects.get(object_id).cloned(),
+                    tables
+                        .versions
+                        .get(&(object_id.clone(), version.clone()))
+                        .cloned(),
+                )
+            })
+            .collect())
     }
 
     fn versions_for_object(&self, object_id: &DfsObjectId) -> Result<Vec<DfsObjectVersionRecord>> {

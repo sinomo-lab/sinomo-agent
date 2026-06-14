@@ -150,9 +150,19 @@ impl DfsTransportIdentity for sinomo_network::AsyncInProcessTransport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DfsTransferProfile {
+    Conservative,
+    Lan,
+    Local,
+}
+
 pub trait DfsFrameTransport: DfsTransportIdentity {
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError>;
     fn drain_incoming(&mut self) -> Result<Vec<InboundFrame>, NetworkError>;
+    fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
+        DfsTransferProfile::Conservative
+    }
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         Ok(None)
     }
@@ -231,6 +241,10 @@ impl DfsFrameTransport for sinomo_network::InProcessTransport {
 
     fn wait_for_incoming(&self, timeout: Duration) -> Result<bool, NetworkError> {
         self.wait_for_incoming(timeout)
+    }
+
+    fn transfer_profile(&self, _target_node_id: &NodeId) -> DfsTransferProfile {
+        DfsTransferProfile::Local
     }
 }
 
@@ -416,6 +430,9 @@ const DFS_BLOB_CHUNK_BYTES: usize = 64 * 1024;
 const DFS_STAGE_CHUNK_WINDOW_SIZE: u32 = 64;
 const DFS_READ_CHUNK_WINDOW_SIZE: u32 = 64;
 const DFS_FETCH_CHUNK_WINDOW_SIZE: u32 = 64;
+const DFS_LAN_CHUNK_WINDOW_SIZE: u32 = 128;
+const DFS_LOCAL_CHUNK_WINDOW_SIZE: u32 = 256;
+const DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DFS_REMOTE_READ_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DFS_CHUNK_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE: usize = 4096;
@@ -429,6 +446,24 @@ const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 1024;
 #[cfg(test)]
 const DFS_CONFLICT_SCAN_PAGE_SIZE: usize = 2;
 
+fn dfs_adaptive_chunk_window_size(
+    profile: DfsTransferProfile,
+    total_size_bytes: u64,
+    base_window_chunks: u32,
+) -> u32 {
+    let total_chunks = total_size_bytes
+        .div_ceil(DFS_BLOB_CHUNK_BYTES as u64)
+        .clamp(1, u64::from(u32::MAX)) as u32;
+    let profile_window = match profile {
+        DfsTransferProfile::Conservative => base_window_chunks,
+        DfsTransferProfile::Lan => base_window_chunks.max(DFS_LAN_CHUNK_WINDOW_SIZE),
+        DfsTransferProfile::Local => base_window_chunks.max(DFS_LOCAL_CHUNK_WINDOW_SIZE),
+    };
+    let budget_window = (DFS_ADAPTIVE_TRANSFER_WINDOW_MAX_BYTES / DFS_BLOB_CHUNK_BYTES as u64)
+        .clamp(1, u64::from(u32::MAX)) as u32;
+    profile_window.min(budget_window).min(total_chunks).max(1)
+}
+
 pub fn register_storage_paths(
     layout: &mut sinomo_storage::StorageLayout,
 ) -> Result<(), sinomo_storage::StorageContractError> {
@@ -437,8 +472,20 @@ pub fn register_storage_paths(
     for (relative_path, reason) in [
         ("dfs/content/blobs", "content-addressed DFS blob bytes"),
         (
+            "dfs/content/blob-packs",
+            "packed small DFS blob segment files and index records",
+        ),
+        (
             "dfs/content/objects",
             "dynamic DFS object manifests stored as sinomo-object files",
+        ),
+        (
+            "dfs/content/stats.sobj",
+            "durable approximate DFS content-store counters",
+        ),
+        (
+            "dfs/content/stats.lock",
+            "advisory lock for DFS content-store counter updates",
         ),
         ("dfs/content/staging", "temporary DFS staging bytes"),
         (
@@ -656,6 +703,9 @@ mod module_registration_tests {
         register_storage_paths(&mut layout).expect("register DFS storage paths");
 
         for path in [
+            "dfs/content/blob-packs/index.sobj",
+            "dfs/content/blob-packs/segments/0000000000000000.pack",
+            "dfs/content/stats.sobj",
             "dfs/metadata/services/records/tables/materialized.slog",
             "dfs/metadata/users/journal/segments/00000000000000000001.slog",
             "dfs/metadata/custom-shard/records/objects/example.sobj",
@@ -7143,6 +7193,33 @@ impl std::fmt::Debug for DfsEndpointTransport {
     }
 }
 
+fn dfs_endpoint_transfer_profile(endpoint: &ClusterEndpointRecord) -> DfsTransferProfile {
+    match &endpoint.transport {
+        ClusterTransportKind::InProcess | ClusterTransportKind::Loopback => {
+            DfsTransferProfile::Local
+        }
+        ClusterTransportKind::LanTcp | ClusterTransportKind::LanQuic => DfsTransferProfile::Lan,
+        ClusterTransportKind::Iroh
+        | ClusterTransportKind::WebRtc
+        | ClusterTransportKind::TurnRelay
+        | ClusterTransportKind::HttpsRelay => DfsTransferProfile::Conservative,
+    }
+}
+
+fn dfs_endpoint_transfer_profile_for_targets<'a>(
+    endpoints: impl IntoIterator<Item = &'a ClusterEndpointRecord>,
+) -> DfsTransferProfile {
+    let mut profile = DfsTransferProfile::Conservative;
+    for endpoint in endpoints {
+        match dfs_endpoint_transfer_profile(endpoint) {
+            DfsTransferProfile::Local => return DfsTransferProfile::Local,
+            DfsTransferProfile::Lan => profile = DfsTransferProfile::Lan,
+            DfsTransferProfile::Conservative => {}
+        }
+    }
+    profile
+}
+
 impl DfsEndpointTransport {
     pub fn new(
         local_node_id: NodeId,
@@ -7256,6 +7333,16 @@ impl DfsEndpointTransport {
             sender,
             async_sender,
         }
+    }
+
+    fn transfer_profile_for_target(&self, target_node_id: &NodeId) -> DfsTransferProfile {
+        if target_node_id == &self.local_node_id {
+            return DfsTransferProfile::Local;
+        }
+        self.endpoints_by_node_id
+            .get(target_node_id)
+            .map(|endpoints| dfs_endpoint_transfer_profile_for_targets(endpoints.iter()))
+            .unwrap_or(DfsTransferProfile::Conservative)
     }
 
     fn send_frame_to_endpoint(
@@ -7468,6 +7555,10 @@ impl DfsFrameTransport for DfsEndpointTransport {
     fn pending_incoming_count(&self) -> Result<Option<usize>, NetworkError> {
         Ok(Some(self.incoming_frames.len()))
     }
+
+    fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
+        self.transfer_profile_for_target(target_node_id)
+    }
 }
 
 #[derive(Debug)]
@@ -7512,28 +7603,21 @@ impl DfsFrameTransport for SingleDfsProtocolFrameTransport {
 }
 
 #[derive(Debug)]
-struct EndpointServedDfsProtocolFrameTransport {
+pub struct DfsEndpointServedProtocolFrameTransport {
     local_node_id: NodeId,
-    return_node_id: NodeId,
+    return_node_id: Option<NodeId>,
     inbound_frames: VecDeque<InboundFrame>,
     outbound_frames: Vec<NetworkFrame>,
     endpoint_transport: DfsEndpointTransport,
 }
 
-impl EndpointServedDfsProtocolFrameTransport {
-    fn new(
+impl DfsEndpointServedProtocolFrameTransport {
+    pub fn new(
         local_node_id: NodeId,
-        inbound_frame: NetworkFrame,
         endpoints: Vec<ClusterEndpointRecord>,
         sender: DfsProtocolFrameSender,
         connect_timeout: Duration,
     ) -> Self {
-        let return_node_id = inbound_frame.source_node_id.clone();
-        let mut inbound_frames = VecDeque::new();
-        inbound_frames.push_back(InboundFrame {
-            received_by: local_node_id.clone(),
-            frame: inbound_frame,
-        });
         let endpoint_transport = DfsEndpointTransport::with_senders(
             local_node_id.clone(),
             endpoints,
@@ -7543,21 +7627,43 @@ impl EndpointServedDfsProtocolFrameTransport {
         );
         Self {
             local_node_id,
-            return_node_id,
-            inbound_frames,
+            return_node_id: None,
+            inbound_frames: VecDeque::new(),
             outbound_frames: Vec::new(),
             endpoint_transport,
         }
     }
+
+    pub fn enqueue_protocol_frame(&mut self, frame: NetworkFrame) -> Result<(), NetworkError> {
+        if frame.target_node_id != self.local_node_id {
+            return Err(NetworkError::FrameTargetMismatch {
+                requested_target_node_id: self.local_node_id.clone(),
+                frame_target_node_id: frame.target_node_id,
+            });
+        }
+        self.return_node_id = Some(frame.source_node_id.clone());
+        self.inbound_frames.push_back(InboundFrame {
+            received_by: self.local_node_id.clone(),
+            frame,
+        });
+        Ok(())
+    }
+
+    pub fn finish_protocol_frame(&mut self) -> Vec<NetworkFrame> {
+        self.return_node_id = None;
+        self.inbound_frames.clear();
+        self.endpoint_transport.incoming_frames.clear();
+        std::mem::take(&mut self.outbound_frames)
+    }
 }
 
-impl DfsTransportIdentity for EndpointServedDfsProtocolFrameTransport {
+impl DfsTransportIdentity for DfsEndpointServedProtocolFrameTransport {
     fn local_node_id(&self) -> &NodeId {
         &self.local_node_id
     }
 }
 
-impl DfsFrameTransport for EndpointServedDfsProtocolFrameTransport {
+impl DfsFrameTransport for DfsEndpointServedProtocolFrameTransport {
     fn send(&mut self, target_node_id: &NodeId, frame: NetworkFrame) -> Result<(), NetworkError> {
         if &frame.target_node_id != target_node_id {
             return Err(NetworkError::FrameTargetMismatch {
@@ -7572,7 +7678,11 @@ impl DfsFrameTransport for EndpointServedDfsProtocolFrameTransport {
             });
             return Ok(());
         }
-        if target_node_id == &self.return_node_id {
+        if self
+            .return_node_id
+            .as_ref()
+            .is_some_and(|return_node_id| target_node_id == return_node_id)
+        {
             self.outbound_frames.push(frame);
             return Ok(());
         }
@@ -7592,6 +7702,39 @@ impl DfsFrameTransport for EndpointServedDfsProtocolFrameTransport {
             .pending_incoming_count()?
             .unwrap_or_default();
         Ok(Some(self.inbound_frames.len().saturating_add(nested)))
+    }
+
+    fn transfer_profile(&self, target_node_id: &NodeId) -> DfsTransferProfile {
+        if target_node_id == &self.local_node_id {
+            return DfsTransferProfile::Local;
+        }
+        self.endpoint_transport
+            .transfer_profile_for_target(target_node_id)
+    }
+}
+
+impl NetworkedDfsService<DfsEndpointServedProtocolFrameTransport> {
+    pub fn process_protocol_frame(
+        &mut self,
+        inbound_frame: NetworkFrame,
+    ) -> Result<DfsProtocolFrameProcessResult, DfsError> {
+        if inbound_frame.target_node_id != self.node_id {
+            return Err(DfsError::Network {
+                message: format!(
+                    "dfs protocol frame target {} does not match local node {}",
+                    inbound_frame.target_node_id, self.node_id
+                ),
+            });
+        }
+        self.transport
+            .enqueue_protocol_frame(inbound_frame)
+            .map_err(DfsError::from_network)?;
+        let events = self.process_incoming();
+        let outbound_frames = self.transport.finish_protocol_frame();
+        Ok(DfsProtocolFrameProcessResult {
+            outbound_frames,
+            events: events?,
+        })
     }
 }
 
@@ -7642,20 +7785,22 @@ pub fn process_dfs_protocol_frame_with_endpoint_sender(
             ),
         });
     }
-    let transport = EndpointServedDfsProtocolFrameTransport::new(
+    let mut transport = DfsEndpointServedProtocolFrameTransport::new(
         local_node_id,
-        inbound_frame,
         endpoints,
         sender,
         connect_timeout,
     );
+    transport
+        .enqueue_protocol_frame(inbound_frame)
+        .map_err(DfsError::from_network)?;
     let mut service = NetworkedDfsService::new(transport, content);
     if let Some(control_plane) = control_plane {
         service = service.with_boxed_control_plane(control_plane);
     }
     let mut service = service.with_boxed_metadata_backend(metadata_backend)?;
     let events = service.process_incoming()?;
-    let outbound_frames = service.into_transport().outbound_frames;
+    let outbound_frames = service.into_transport().finish_protocol_frame();
     Ok(DfsProtocolFrameProcessResult {
         outbound_frames,
         events,
@@ -7953,6 +8098,8 @@ where
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
+            let max_chunks =
+                self.adaptive_stage_chunk_window(&job.missing_replica_node_id, pending.size_bytes);
             let outcome = self
                 .send_repair_replica_window_if_routable_async(
                     &job.missing_replica_node_id,
@@ -7967,7 +8114,7 @@ where
                     &pending.content_hash,
                     pending.size_bytes,
                     start_chunk_index,
-                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    max_chunks,
                     object_metadata,
                 )
                 .await?;
@@ -8089,6 +8236,8 @@ where
                     .get(&replica_node_id)
                     .copied()
                     .unwrap_or(0);
+                let max_chunks =
+                    self.adaptive_stage_chunk_window(&replica_node_id, pending.size_bytes);
                 let outcome = self
                     .send_stage_blob_window_if_routable_async(
                         &replica_node_id,
@@ -8101,7 +8250,7 @@ where
                         &pending.content_hash,
                         pending.size_bytes,
                         start_chunk_index,
-                        DFS_STAGE_CHUNK_WINDOW_SIZE,
+                        max_chunks,
                         object_metadata.clone(),
                     )
                     .await?;
@@ -8145,6 +8294,7 @@ where
             .get(replica_node_id)
             .copied()
             .unwrap_or(0);
+        let max_chunks = self.adaptive_stage_chunk_window(replica_node_id, patch.patch_size_bytes);
         let outcome = self
             .send_stage_patch_window_if_routable_async(
                 replica_node_id,
@@ -8159,7 +8309,7 @@ where
                 &patch.patch_hash,
                 patch.patch_size_bytes,
                 start_chunk_index,
-                DFS_STAGE_CHUNK_WINDOW_SIZE,
+                max_chunks,
                 object_metadata,
             )
             .await?;
@@ -8190,7 +8340,7 @@ where
                 .get(&source_node_id)
                 .copied()
                 .unwrap_or(0);
-            let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
+            let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
             let sent = self
                 .send_dfs_message_if_routable_async(
                     &source_node_id,
@@ -8248,7 +8398,7 @@ where
                 .get(&source_node_id)
                 .copied()
                 .unwrap_or(0);
-            let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
+            let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
             let sent = self
                 .send_dfs_message_if_routable_async(
                     &source_node_id,
@@ -8631,6 +8781,30 @@ where
 }
 
 impl<T: DfsFrameTransport> NetworkedDfsService<T> {
+    fn adaptive_stage_chunk_window(&self, target_node_id: &NodeId, total_size_bytes: u64) -> u32 {
+        dfs_adaptive_chunk_window_size(
+            self.transport.transfer_profile(target_node_id),
+            total_size_bytes,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        )
+    }
+
+    fn adaptive_read_chunk_window(&self, target_node_id: &NodeId, total_size_bytes: u64) -> u32 {
+        dfs_adaptive_chunk_window_size(
+            self.transport.transfer_profile(target_node_id),
+            total_size_bytes,
+            DFS_READ_CHUNK_WINDOW_SIZE,
+        )
+    }
+
+    fn adaptive_fetch_chunk_window(&self, target_node_id: &NodeId, total_size_bytes: u64) -> u32 {
+        dfs_adaptive_chunk_window_size(
+            self.transport.transfer_profile(target_node_id),
+            total_size_bytes,
+            DFS_FETCH_CHUNK_WINDOW_SIZE,
+        )
+    }
+
     pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + Send + 'static) -> Self {
         self.control_plane = Some(Box::new(kv));
         self
@@ -10307,7 +10481,13 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             BTreeMap::<DfsFileSystemId, Vec<(DfsObjectMetadata, DfsObjectVersionRecord)>>::new();
         for mut object in objects {
             normalize_current_locations(&mut object.current_locations);
-            let size_bytes = self.object_content_size_hint(&object)?;
+            let size_bytes = if matches!(object.kind, DfsObjectKind::File | DfsObjectKind::Symlink)
+                && object.content_size_bytes.is_some()
+            {
+                object.content_size_bytes
+            } else {
+                self.object_content_size_hint(&object)?
+            };
             let version = object_version_record(&object, size_bytes);
             grouped
                 .entry(object.file_system_id.clone())
@@ -10330,14 +10510,19 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
 
                 let mut transaction_objects = Vec::new();
                 let mut transaction_versions = Vec::new();
-                for (object, version) in records {
-                    if backend.get_object(&object.object_id)?.as_ref() != Some(object) {
+                let lookup_keys = records
+                    .iter()
+                    .map(|(object, version)| (object.object_id.clone(), version.version.clone()))
+                    .collect::<Vec<_>>();
+                let existing_pairs = backend.get_object_version_pairs(&lookup_keys)?;
+                for ((object, version), (existing_object, existing_version)) in
+                    records.iter().zip(existing_pairs.into_iter())
+                {
+                    if existing_object.as_ref() != Some(object) {
                         transaction_objects.push(object.clone());
                     }
                     let mut version = version.clone();
-                    if let Some(existing) =
-                        backend.get_version(&version.object_id, &version.version)?
-                    {
+                    if let Some(existing) = existing_version {
                         version.created_at = existing.created_at;
                         if existing == version {
                             continue;
@@ -10609,17 +10794,23 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         let request_id = self.next_request_id();
         let chunked_range =
             range.is_some_and(|(_, max_bytes)| max_bytes > DFS_BLOB_INLINE_LIMIT_BYTES);
+        let transfer_size_bytes = range
+            .map(|(_, max_bytes)| max_bytes as u64)
+            .or(object.content_size_bytes)
+            .unwrap_or((DFS_BLOB_CHUNK_BYTES as u64) * u64::from(DFS_READ_CHUNK_WINDOW_SIZE));
+        let adaptive_read_window =
+            self.adaptive_read_chunk_window(target_node_id, transfer_size_bytes);
         let (start_chunk_index, max_chunks, window_end_chunk_index) = match range {
             Some(_) if chunked_range => (
                 0,
-                DFS_READ_CHUNK_WINDOW_SIZE,
-                Self::read_window_end_chunk_index(0, DFS_READ_CHUNK_WINDOW_SIZE),
+                adaptive_read_window,
+                Self::read_window_end_chunk_index(0, adaptive_read_window),
             ),
             Some(_) => (0, 0, None),
             None => (
                 0,
-                DFS_READ_CHUNK_WINDOW_SIZE,
-                Self::read_window_end_chunk_index(0, DFS_READ_CHUNK_WINDOW_SIZE),
+                adaptive_read_window,
+                Self::read_window_end_chunk_index(0, adaptive_read_window),
             ),
         };
         let sent = self.send_dfs_message_if_routable(
@@ -10669,7 +10860,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         now: Instant,
     ) -> Result<bool, DfsError> {
         let start_chunk_index = pending.next_chunk_index;
-        let max_chunks = DFS_READ_CHUNK_WINDOW_SIZE;
+        let transfer_size_bytes = pending
+            .range_max_bytes
+            .map(|max_bytes| max_bytes as u64)
+            .or(pending.content_size_bytes)
+            .unwrap_or((DFS_BLOB_CHUNK_BYTES as u64) * u64::from(DFS_READ_CHUNK_WINDOW_SIZE));
+        let max_chunks = self.adaptive_read_chunk_window(target_node_id, transfer_size_bytes);
         let sent = self.send_dfs_message_if_routable(
             target_node_id,
             DfsNetworkMessage::ReadRequest(DfsReadRequest {
@@ -11641,6 +11837,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .collect::<Vec<_>>();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
+                let max_chunks =
+                    self.adaptive_stage_chunk_window(&replica_node_id, patch_size_bytes);
                 let outcome = self.send_stage_patch_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
@@ -11654,7 +11852,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &patch_hash,
                     patch_size_bytes,
                     0,
-                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    max_chunks,
                     Some(object.clone()),
                 )?;
                 if outcome.sent {
@@ -11856,6 +12054,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .collect::<Vec<_>>();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
+                let max_chunks =
+                    self.adaptive_stage_chunk_window(&replica_node_id, patch_size_bytes);
                 let outcome = self.send_stage_patch_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
@@ -11869,7 +12069,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &patch_hash,
                     patch_size_bytes,
                     0,
-                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    max_chunks,
                     Some(object.clone()),
                 )?;
                 if outcome.sent {
@@ -12330,6 +12530,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .collect();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
+                let max_chunks =
+                    self.adaptive_stage_chunk_window(&replica_node_id, manifest.size_bytes);
                 let outcome = self.send_stage_blob_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
@@ -12341,7 +12543,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &manifest.content_hash,
                     manifest.size_bytes,
                     0,
-                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    max_chunks,
                     Some(object.clone()),
                 )?;
                 if outcome.sent {
@@ -12820,6 +13022,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .collect();
             for replica_node_id in stage_targets {
                 let request_id = self.next_request_id();
+                let max_chunks =
+                    self.adaptive_stage_chunk_window(&replica_node_id, manifest.size_bytes);
                 let outcome = self.send_stage_blob_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
@@ -12831,7 +13035,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &manifest.content_hash,
                     manifest.size_bytes,
                     0,
-                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    max_chunks,
                     Some(object.clone()),
                 )?;
                 if outcome.sent {
@@ -14828,6 +15032,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
             let object_metadata = Some(self.current_object_for_write(&pending.object_id)?);
+            let max_chunks =
+                self.adaptive_stage_chunk_window(&job.missing_replica_node_id, pending.size_bytes);
             let outcome = self.send_repair_replica_window_if_routable(
                 &job.missing_replica_node_id,
                 request_id.clone(),
@@ -14841,7 +15047,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 &pending.content_hash,
                 pending.size_bytes,
                 start_chunk_index,
-                DFS_STAGE_CHUNK_WINDOW_SIZE,
+                max_chunks,
                 object_metadata,
             )?;
 
@@ -18511,7 +18717,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         let total_chunks = blob_chunk_count_for_size(range_size_bytes)?;
         let max_chunks = if request.max_chunks == 0 {
-            DFS_READ_CHUNK_WINDOW_SIZE
+            self.adaptive_read_chunk_window(requester_node_id, range_size_bytes)
         } else {
             request.max_chunks
         };
@@ -19627,6 +19833,12 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
         if next_chunk_index < window_end {
             return Ok(None);
         }
+        let transfer_size_bytes = pending
+            .range_max_bytes
+            .map(|max_bytes| max_bytes as u64)
+            .or(pending.content_size_bytes)
+            .unwrap_or_else(|| u64::from(total_chunks) * DFS_BLOB_CHUNK_BYTES as u64);
+        let max_chunks = self.adaptive_read_chunk_window(source_node_id, transfer_size_bytes);
         let sent = self.send_dfs_message_if_routable(
             source_node_id,
             DfsNetworkMessage::ReadRequest(DfsReadRequest {
@@ -19635,14 +19847,14 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 range_offset: pending.range_offset,
                 range_max_bytes: pending.range_max_bytes,
                 start_chunk_index: next_chunk_index,
-                max_chunks: DFS_READ_CHUNK_WINDOW_SIZE,
+                max_chunks,
             }),
         )?;
         if sent {
             if let Some(pending) = self.pending_reads.get_mut(request_id) {
                 pending.next_chunk_index = next_chunk_index;
                 pending.window_end_chunk_index =
-                    Self::read_window_end_chunk_index(next_chunk_index, DFS_READ_CHUNK_WINDOW_SIZE);
+                    Self::read_window_end_chunk_index(next_chunk_index, max_chunks);
                 pending.next_retry_at = Instant::now() + DFS_REMOTE_READ_RETRY_DELAY;
             }
             return Ok(None);
@@ -19867,6 +20079,8 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     .get(&replica_node_id)
                     .copied()
                     .unwrap_or(0);
+                let max_chunks =
+                    self.adaptive_stage_chunk_window(&replica_node_id, pending.size_bytes);
                 let outcome = self.send_stage_blob_window_if_routable(
                     &replica_node_id,
                     request_id.clone(),
@@ -19878,7 +20092,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                     &pending.content_hash,
                     pending.size_bytes,
                     start_chunk_index,
-                    DFS_STAGE_CHUNK_WINDOW_SIZE,
+                    max_chunks,
                     object_metadata.clone(),
                 )?;
                 if outcome.sent {
@@ -19921,6 +20135,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .get(replica_node_id)
             .copied()
             .unwrap_or(0);
+        let max_chunks = self.adaptive_stage_chunk_window(replica_node_id, patch.patch_size_bytes);
         let outcome = self.send_stage_patch_window_if_routable(
             replica_node_id,
             request_id,
@@ -19934,7 +20149,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             &patch.patch_hash,
             patch.patch_size_bytes,
             start_chunk_index,
-            DFS_STAGE_CHUNK_WINDOW_SIZE,
+            max_chunks,
             object_metadata,
         )?;
         Ok(Some(outcome))
@@ -20005,7 +20220,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .get(&source_node_id)
                 .copied()
                 .unwrap_or(0);
-            let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
+            let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
             let sent = self.send_dfs_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -20108,7 +20323,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
             .get(source_node_id)
             .cloned()
             .unwrap_or_else(|| self.next_request_id());
-        let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
+        let max_chunks = self.adaptive_fetch_chunk_window(source_node_id, pending.size_bytes);
         let sent = self.send_dfs_message_if_routable(
             source_node_id,
             DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -20380,7 +20595,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .get(&source_node_id)
                 .copied()
                 .unwrap_or(0);
-            let max_chunks = DFS_FETCH_CHUNK_WINDOW_SIZE;
+            let max_chunks = self.adaptive_fetch_chunk_window(&source_node_id, pending.size_bytes);
             let sent = self.send_dfs_message_if_routable(
                 &source_node_id,
                 DfsNetworkMessage::FetchBlob(DfsFetchBlobCommand {
@@ -20565,6 +20780,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 .get(&replica_node_id)
                 .cloned()
                 .unwrap_or_else(|| self.next_request_id());
+            let max_chunks = self.adaptive_stage_chunk_window(&replica_node_id, pending.size_bytes);
             let outcome = self.send_repair_replica_window_if_routable(
                 &replica_node_id,
                 request_id.clone(),
@@ -20576,7 +20792,7 @@ impl<T: DfsFrameTransport> NetworkedDfsService<T> {
                 &pending.content_hash,
                 pending.size_bytes,
                 start_chunk_index,
-                DFS_STAGE_CHUNK_WINDOW_SIZE,
+                max_chunks,
                 committed_metadata.clone(),
             )?;
             if outcome.sent {

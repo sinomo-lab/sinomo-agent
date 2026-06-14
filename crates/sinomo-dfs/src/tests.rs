@@ -262,6 +262,71 @@ fn test_endpoint(node_id: &NodeId, address: &str) -> ClusterEndpointRecord {
     }
 }
 
+#[test]
+fn adaptive_chunk_window_scales_by_profile_and_object_size() {
+    let large_object = 64 * 1024 * 1024;
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Conservative,
+            large_object,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        DFS_STAGE_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Lan,
+            large_object,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        DFS_LAN_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Local,
+            large_object,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        DFS_LOCAL_CHUNK_WINDOW_SIZE
+    );
+    assert_eq!(
+        dfs_adaptive_chunk_window_size(
+            DfsTransferProfile::Local,
+            DFS_BLOB_CHUNK_BYTES as u64 * 3,
+            DFS_STAGE_CHUNK_WINDOW_SIZE,
+        ),
+        3,
+        "small transfers should finish in one bounded window instead of advertising unused chunks"
+    );
+}
+
+#[test]
+fn endpoint_transport_transfer_profile_tracks_best_endpoint_kind() {
+    let local = NodeId::from_legacy_named("node_dfs_transfer_profile_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_transfer_profile_remote").expect("remote");
+    let unknown = NodeId::from_legacy_named("node_dfs_transfer_profile_unknown").expect("unknown");
+    let sender: DfsProtocolFrameSender =
+        Arc::new(|_endpoint, _command, _timeout| Err(DfsPeerTransportError::new("test sender")));
+
+    let lan = test_endpoint(&remote, "192.0.2.80:21353");
+    let mut loopback = test_endpoint(&remote, "127.0.0.1:21353");
+    loopback.transport = ClusterTransportKind::Loopback;
+    let transport = DfsEndpointTransport::new(local.clone(), vec![lan, loopback], sender);
+
+    assert_eq!(
+        transport.transfer_profile(&local),
+        DfsTransferProfile::Local
+    );
+    assert_eq!(
+        transport.transfer_profile(&remote),
+        DfsTransferProfile::Local
+    );
+    assert_eq!(
+        transport.transfer_profile(&unknown),
+        DfsTransferProfile::Conservative
+    );
+}
+
 #[derive(Default)]
 struct RecordingPeerTransport {
     calls: Mutex<Vec<String>>,
@@ -3044,6 +3109,50 @@ fn add_object_metadata_batch_persists_visible_versions_in_one_transaction() {
         assert_eq!(version.size_bytes, object.content_size_bytes);
         assert!(version.visible);
     }
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn add_object_metadata_batch_trusts_supplied_content_size() {
+    let root = temp_root("add-object-metadata-batch-trusts-size");
+    let owner = NodeId::from_legacy_named("node_batch_size_owner").expect("node");
+    let network = InProcessNetwork::new();
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let manifest = content
+        .put_object_version(
+            "obj_batch_trusted_size",
+            "version_batch_trusted_size",
+            b"local",
+        )
+        .expect("local content manifest");
+    let metadata =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))
+            .expect("metadata");
+    let mut dfs = NetworkedDfsService::new(network.add_node(owner.clone()), content)
+        .with_metadata_backend(metadata)
+        .expect("metadata backend");
+
+    let mut object = file_metadata(owner);
+    object.object_id = DfsObjectId::from_legacy_named("obj_batch_trusted_size").expect("object");
+    object.path = "/services/batch-visible/trusted-size.txt".to_string();
+    object.content_hash = Some(manifest.content_hash);
+    object.content_size_bytes = Some(128);
+    object.version = DfsVersion::from_legacy_named("version_batch_trusted_size").expect("version");
+
+    dfs.add_object_metadata_batch([object.clone()])
+        .expect("metadata batch");
+
+    let version = dfs
+        .metadata_backend()
+        .expect("metadata backend")
+        .get_version(&object.object_id, &object.version)
+        .expect("version lookup")
+        .expect("version");
+    assert_eq!(
+        version.size_bytes, object.content_size_bytes,
+        "metadata-only batch imports should not stat local content first"
+    );
 
     std::fs::remove_dir_all(root).ok();
 }
