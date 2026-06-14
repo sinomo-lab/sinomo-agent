@@ -7901,3 +7901,175 @@ fn sandbox_mount_mode_label(mode: &crate::SandboxMountMode) -> &'static str {
         crate::SandboxMountMode::ReadWrite => "rw",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_doctor_reports_coding_toolchain_readiness() {
+        let root = sinomo_testdir::TestDir::new("sinomo-sandbox-doctor-coding");
+        let store = crate::LocalSandboxInstanceStore::new(root.join("runtime"));
+        let toolchain_store = crate::LocalSandboxToolchainStore::new(root.join("cache"));
+        let sandbox_id = crate::SandboxId::generate();
+        let toolchain_id = crate::SandboxToolchainId::generate();
+        let mut toolchain = crate::SandboxToolchainManifest::new(
+            toolchain_id.clone(),
+            "coding-base-test",
+            crate::SandboxWasiAbi::Wasix,
+            "unit test",
+            OffsetDateTime::now_utc(),
+        )
+        .expect("toolchain");
+        toolchain_store
+            .put_command_module(
+                &mut toolchain,
+                "grep",
+                br#"
+                (module
+                  (import "wasi_snapshot_preview1" "fd_write"
+                    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+                  (memory (export "memory") 1 128)
+                  (func (export "_start")))
+                "#,
+                crate::SandboxResourceLimits::default(),
+            )
+            .expect("grep");
+        sandbox_create_with_store(
+            SandboxCreateOptions {
+                sandbox_id: Some(sandbox_id.clone()),
+                toolchain_id,
+                temp_policy: crate::SandboxTempPolicy::ClearOnSessionStart,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+                execution: SandboxMetadataExecution::Local,
+            },
+            &store,
+        )
+        .expect("create");
+
+        let findings = sandbox_doctor_findings_with_stores(
+            SandboxDoctorOptions {
+                sandbox_id: Some(sandbox_id),
+            },
+            &store,
+            &toolchain_store,
+            &crate::SandboxPolicy::default(),
+        )
+        .expect("doctor");
+        let coding_findings: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.code == "coding-command-missing")
+            .collect();
+        assert_eq!(
+            coding_findings.len(),
+            crate::BUSYBOX_TOOLCHAIN_COMMANDS.len() - 1
+        );
+        let required_rich_targets = crate::SANDBOX_RICH_TOOLCHAIN_TARGETS
+            .iter()
+            .filter(|target| matches!(target.status, crate::SandboxRichToolchainStatus::Required))
+            .count();
+        let required_toolchain_findings: Vec<_> = findings
+            .iter()
+            .filter(|finding| finding.code == "required-toolchain-command-missing")
+            .collect();
+        assert_eq!(required_toolchain_findings.len(), required_rich_targets);
+        for target in crate::SANDBOX_RICH_TOOLCHAIN_TARGETS
+            .iter()
+            .filter(|target| matches!(target.status, crate::SandboxRichToolchainStatus::Required))
+        {
+            assert!(
+                required_toolchain_findings.iter().any(|finding| {
+                    finding.detail.contains(&format!("`{}`", target.command))
+                        && finding.severity == SandboxDoctorSeverity::Error
+                }),
+                "doctor should treat missing {} as an error",
+                target.command
+            );
+        }
+        assert!(
+            !coding_findings
+                .iter()
+                .any(|finding| finding.detail.contains("`grep`"))
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.code == "ambient-wasi-network-disabled")
+        );
+    }
+
+    #[test]
+    fn sandbox_doctor_rejects_shell_when_process_substrate_is_missing() {
+        let root = sinomo_testdir::TestDir::new("sinomo-sandbox-doctor-shell-substrate");
+        let store = crate::LocalSandboxInstanceStore::new(root.join("runtime"));
+        let toolchain_store = crate::LocalSandboxToolchainStore::new(root.join("cache"));
+        let sandbox_id = crate::SandboxId::generate();
+        let toolchain_id = crate::SandboxToolchainId::generate();
+        let mut toolchain = crate::SandboxToolchainManifest::new(
+            toolchain_id.clone(),
+            "shell-substrate-test",
+            crate::SandboxWasiAbi::Wasix,
+            "unit test",
+            OffsetDateTime::now_utc(),
+        )
+        .expect("toolchain");
+        toolchain_store
+            .put_command_module_with_capabilities(
+                &mut toolchain,
+                "sh",
+                br#"
+                (module
+                  (memory (export "memory") 1 128)
+                  (func (export "_start")))
+                "#,
+                crate::SandboxResourceLimits::default(),
+                vec![crate::SANDBOX_CHILD_PROCESS_EXEC_CAPABILITY.to_string()],
+            )
+            .expect("sh");
+        sandbox_create_with_store(
+            SandboxCreateOptions {
+                sandbox_id: Some(sandbox_id.clone()),
+                toolchain_id,
+                temp_policy: crate::SandboxTempPolicy::ClearOnSessionStart,
+                memory_mb: None,
+                wall_time_ms: None,
+                max_input_bytes: None,
+                max_output_bytes: None,
+                max_workspace_bytes: None,
+                max_written_bytes_per_command: None,
+                max_file_count: None,
+                mounts: Vec::new(),
+                execution: SandboxMetadataExecution::Local,
+            },
+            &store,
+        )
+        .expect("create");
+
+        let findings = sandbox_doctor_findings_with_stores(
+            SandboxDoctorOptions {
+                sandbox_id: Some(sandbox_id),
+            },
+            &store,
+            &toolchain_store,
+            &crate::SandboxPolicy::default(),
+        )
+        .expect("doctor");
+        assert!(findings.iter().any(|finding| {
+            finding.code == "shell-process-substrate-missing"
+                && finding.severity == SandboxDoctorSeverity::Error
+                && finding.detail.contains("child-process-exec")
+        }));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.code == "shell-command-missing")
+        );
+    }
+}

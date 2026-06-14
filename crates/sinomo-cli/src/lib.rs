@@ -147,22 +147,12 @@ use sinomo_runtime::daemon::{
 };
 #[cfg(all(test, feature = "sandbox"))]
 use sinomo_runtime::daemon::{
-    handle_daemon_sandbox_checkpoint as daemon_handle_daemon_sandbox_checkpoint,
-    handle_daemon_sandbox_create as daemon_handle_daemon_sandbox_create,
-    handle_daemon_sandbox_destroy as daemon_handle_daemon_sandbox_destroy,
     handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
     handle_daemon_sandbox_import_busybox as daemon_handle_daemon_sandbox_import_busybox,
-    handle_daemon_sandbox_list as daemon_handle_daemon_sandbox_list,
     handle_daemon_sandbox_read as daemon_handle_daemon_sandbox_read,
-    handle_daemon_sandbox_reboot as daemon_handle_daemon_sandbox_reboot,
-    handle_daemon_sandbox_resume as daemon_handle_daemon_sandbox_resume,
-    handle_daemon_sandbox_run_process_plan as daemon_handle_daemon_sandbox_run_process_plan,
-    handle_daemon_sandbox_run_toolchain as daemon_handle_daemon_sandbox_run_toolchain,
-    handle_daemon_sandbox_status as daemon_handle_daemon_sandbox_status,
     handle_daemon_sandbox_toolchain_add_artifact as daemon_handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command as daemon_handle_daemon_sandbox_toolchain_add_command,
     handle_daemon_sandbox_toolchain_import_package as daemon_handle_daemon_sandbox_toolchain_import_package,
-    handle_daemon_sandbox_update as daemon_handle_daemon_sandbox_update,
     handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
     open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
 };
